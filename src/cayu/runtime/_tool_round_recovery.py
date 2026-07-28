@@ -27,6 +27,7 @@ from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
+    StructuredOutputValidation,
     copy_structured_output_spec,
 )
 from cayu.runtime.tool_policy import ToolPolicyResult
@@ -72,6 +73,7 @@ class PendingToolRound(BaseModel):
         ge=1,
         le=MAX_DURABLE_JSON_INTEGER,
     )
+    structured_output_validation: StructuredOutputValidation | None = None
 
     @field_validator("agent_name")
     @classmethod
@@ -123,6 +125,16 @@ class PendingToolRound(BaseModel):
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
 
+    @field_validator("structured_output_validation")
+    @classmethod
+    def copy_structured_output_validation(
+        cls,
+        value: StructuredOutputValidation | None,
+    ) -> StructuredOutputValidation | None:
+        if value is None:
+            return None
+        return value.model_copy(deep=True)
+
     @model_validator(mode="after")
     def validate_model_step_link(self) -> PendingToolRound:
         source_fields = (
@@ -142,6 +154,28 @@ class PendingToolRound(BaseModel):
         ):
             raise ValueError(
                 "structured_output_attempt requires a structured-output finalizer call."
+            )
+        if self.structured_output_validation is not None and (
+            self.structured_output_attempt is None
+            or self.structured_output is None
+            or not any(call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in self.tool_calls)
+        ):
+            raise ValueError(
+                "structured_output_validation requires a structured-output finalizer attempt."
+            )
+        if self.structured_output_validation is not None:
+            validation = self.structured_output_validation
+            if validation.valid and validation.errors:
+                raise ValueError(
+                    "Valid structured-output evidence cannot contain validation errors."
+                )
+            if not validation.valid and (validation.output is not None or not validation.errors):
+                raise ValueError(
+                    "Invalid structured-output evidence requires errors and no output."
+                )
+        if self.structured_output_attempt is not None and self.structured_output_validation is None:
+            raise ValueError(
+                "A structured-output finalizer attempt requires authoritative validation."
             )
         return self
 
@@ -226,6 +260,7 @@ def checkpoint_with_pending_tool_round(
     source_transcript_cursor: int | None = None,
     model_step: int | None = None,
     structured_output_attempt: int | None = None,
+    structured_output_validation: StructuredOutputValidation | None = None,
 ) -> tuple[dict[str, Any], PendingToolRound]:
     copied_checkpoint = (
         {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
@@ -257,6 +292,7 @@ def checkpoint_with_pending_tool_round(
         source_transcript_cursor=source_transcript_cursor,
         model_step=model_step,
         structured_output_attempt=structured_output_attempt,
+        structured_output_validation=structured_output_validation,
     )
     _require_executable_pending_tool_round(pending_round)
     pending_payload = pending_round.model_dump(mode="json")

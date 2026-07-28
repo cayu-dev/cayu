@@ -40,7 +40,9 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
+    StructuredOutputError,
     StructuredOutputSpec,
+    StructuredOutputValidation,
 )
 
 
@@ -166,6 +168,20 @@ def _structured_pending_round(
         source_transcript_cursor=0,
         model_step=3,
         structured_output_attempt=1,
+        structured_output_validation=(
+            StructuredOutputValidation(valid=True, output={"answer": "ok"})
+            if valid
+            else StructuredOutputValidation(
+                valid=False,
+                errors=[
+                    StructuredOutputError(
+                        path="$.answer",
+                        message="invalid answer",
+                        schema_path="$.properties.answer.type",
+                    )
+                ],
+            )
+        ),
         tool_calls=[
             PendingToolCallApproval(
                 tool_call_id="call-final",

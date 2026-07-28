@@ -295,6 +295,101 @@ def test_cancellation_requested_before_cleanup_starts_remains_authoritative() ->
     asyncio.run(scenario())
 
 
+def test_repeated_cancellation_during_run_initialization_waits_for_finalization() -> None:
+    class BlockingFinalizationStore(RecordingReleaseStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalization_started = asyncio.Event()
+            self.allow_finalization = asyncio.Event()
+            self.lifecycle_order: list[str] = []
+
+        async def transition_status(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+        ):
+            if to_status == SessionStatus.INTERRUPTED:
+                self.finalization_started.set()
+                await self.allow_finalization.wait()
+            result = await super().transition_status(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+            )
+            if to_status == SessionStatus.INTERRUPTED:
+                self.lifecycle_order.append("finalized")
+            return result
+
+        async def release_run_fence(self, session_id: str) -> None:
+            self.lifecycle_order.append("released")
+            await super().release_run_fence(session_id)
+
+    class BlockingUsageTracker:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def mark_current_position(self) -> None:
+            self.started.set()
+            await asyncio.Event().wait()
+
+        async def usage_events(self) -> list[Event]:
+            return []
+
+    store = BlockingFinalizationStore()
+    provider = FakeProvider([_batch("unused")])
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario() -> None:
+        session_id = "sess_repeated_cancel_during_run_initialization"
+        usage_tracker = BlockingUsageTracker()
+        app._run_limit_controller.usage_tracker = lambda _session_id: usage_tracker
+
+        async def run() -> None:
+            async for _ in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                pass
+
+        run_task = asyncio.create_task(run())
+        await asyncio.wait_for(usage_tracker.started.wait(), timeout=5)
+        run_task.cancel("first cancellation")
+        await asyncio.wait_for(store.finalization_started.wait(), timeout=5)
+        run_task.cancel("second cancellation")
+        await asyncio.sleep(0)
+
+        assert run_task.done() is False
+        assert store.lifecycle_order == []
+        assert store.release_calls.get(session_id, 0) == 0
+
+        store.allow_finalization.set()
+        try:
+            await asyncio.wait_for(run_task, timeout=5)
+        except asyncio.CancelledError as cancellation:
+            assert cancellation.args == ("first cancellation",)
+        else:
+            raise AssertionError("Repeated cancellation was swallowed.")
+
+        assert store.lifecycle_order == ["finalized", "released"]
+        assert store.release_calls[session_id] == 1
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        events = await store.load_events(session_id)
+        _assert_turn_completed_before_abandoned_terminal(events)
+        assert _abandoned_terminal_event(events).payload["abandoned"] is True
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
 def test_previously_delivered_cancellation_is_not_rediscovered_during_cleanup() -> None:
     h = _build([_batch("unused")])
 

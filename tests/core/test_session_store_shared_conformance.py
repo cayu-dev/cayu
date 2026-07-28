@@ -3524,6 +3524,11 @@ def test_session_store_conformance_structured_output_tool_round_auxiliary_public
                 "source_transcript_cursor": 0,
                 "model_step": 2,
                 "structured_output_attempt": 1,
+                "structured_output_validation": {
+                    "valid": True,
+                    "output": {"answer": "ok"},
+                    "errors": [],
+                },
                 "tool_calls": [
                     {
                         "tool_call_id": tool_call_id,
@@ -3705,6 +3710,19 @@ def _structured_output_coherence_publication(
             "source_transcript_cursor": 0,
             "model_step": 2,
             "structured_output_attempt": 1,
+            "structured_output_validation": (
+                {
+                    "valid": True,
+                    "output": {"answer": "ok"},
+                    "errors": [],
+                }
+                if claimed_valid or case == "authoritative_validity"
+                else {
+                    "valid": False,
+                    "output": None,
+                    "errors": primary_errors,
+                }
+            ),
             "tool_calls": [
                 {
                     "tool_call_id": tool_call_id,
@@ -3846,7 +3864,7 @@ def _structured_output_coherence_publication(
     [
         (
             "output_mismatch",
-            "valid structured-output event conflicts with its grouped tool result",
+            "outcome conflicts with its authoritative validation",
         ),
         (
             "valid_with_errors",
@@ -3857,8 +3875,8 @@ def _structured_output_coherence_publication(
             "outcome and retry events contain conflicting results",
         ),
         (
-            "deterministic_validity",
-            "validity conflicts with the durable tool calls",
+            "authoritative_validity",
+            "outcome conflicts with its authoritative validation",
         ),
     ],
 )

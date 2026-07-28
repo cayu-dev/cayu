@@ -11,6 +11,10 @@ from worker_harness import BackendConfig, RecoveryHarness
 
 from cayu.core import EventType, ToolResultPart
 from cayu.runtime import SessionStatus, TaskStatus
+from cayu.runtime._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    model_step_publication_from_checkpoint,
+)
 
 pytestmark = [
     pytest.mark.sigkill_recovery,
@@ -19,6 +23,13 @@ pytestmark = [
         reason="real SIGKILL recovery tests require a POSIX host",
     ),
 ]
+
+
+def _assert_only_model_step_publication(checkpoint: dict) -> None:
+    assert set(checkpoint) == {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
+    publication = model_step_publication_from_checkpoint(checkpoint)
+    assert publication is not None
+    assert publication.assistant_message_published is True
 
 
 def _postgres_recovery_requested() -> bool:
@@ -118,7 +129,7 @@ def test_sigkill_during_ordinary_tool_execution_recovers_without_reexecution(
         recovered = asyncio.run(harness.load_session_state(session_id))
         assert recovered.session is not None
         assert recovered.session.status == SessionStatus.COMPLETED
-        assert recovered.checkpoint == {}
+        _assert_only_model_step_publication(recovered.checkpoint)
         assert harness.read_marker() == marker
 
         started = [event for event in recovered.events if event.type == EventType.TOOL_CALL_STARTED]
@@ -195,7 +206,7 @@ def test_sigkill_after_durable_approval_request_preserves_resolution(
         recovered = asyncio.run(harness.load_session_state(session_id))
         assert recovered.session is not None
         assert recovered.session.status == SessionStatus.COMPLETED
-        assert recovered.checkpoint == {}
+        _assert_only_model_step_publication(recovered.checkpoint)
         assert len(harness.read_marker()) == (1 if decision == "approve" else 0)
 
         event_types = [event.type for event in recovered.events]
@@ -440,7 +451,7 @@ def test_sigkill_preserves_attached_task_ownership_and_recovers_linked_session(
         }
         assert recovered_session.session is not None
         assert recovered_session.session.status == SessionStatus.COMPLETED
-        assert recovered_session.checkpoint == {}
+        _assert_only_model_step_publication(recovered_session.checkpoint)
         assert len(harness.read_marker()) == 1
         assert asyncio.run(harness.list_causal_sessions(task_id)) == [recovered_session.session]
 

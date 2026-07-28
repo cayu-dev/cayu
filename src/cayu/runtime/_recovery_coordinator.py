@@ -19,7 +19,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from cayu._exception_groups import (
@@ -27,18 +27,24 @@ from cayu._exception_groups import (
     iter_exception_tree,
     set_exception_cause,
 )
-from cayu._task_wait import await_shielded_task_outcome
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    unexpected_child_cancellation_error,
+)
 from cayu._validation import copy_json_value, require_clean_nonblank
-from cayu.core.events import Event, EventType
-from cayu.core.messages import Message
+from cayu.core.events import Event, EventType, copy_event
+from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPart
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._diagnostics import (
@@ -58,12 +64,14 @@ from cayu.runtime._interruption_coordinator import (
     _is_background_subagent_session,
 )
 from cayu.runtime._run_limits import RunLimitController, SessionUsageTracker
-from cayu.runtime._session_control import ActiveSessionRun, SessionControl
+from cayu.runtime._session_control import (
+    ActiveSessionRun,
+    SessionControl,
+)
 from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
-    ordered_tool_result_messages,
     policy_denial_payload_fields,
 )
 from cayu.runtime.approvals import (
@@ -82,13 +90,18 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary
-from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 from cayu.runtime.hooks import RuntimeHookPhase
 from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     CheckpointTransform,
+    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
@@ -97,15 +110,18 @@ from cayu.runtime.sessions import (
     SessionOrder,
     SessionQuery,
     SessionRunFenced,
+    SessionRuntimePublicationConflict,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
+    TranscriptQuery,
     _activate_session_run_fence,
     _deactivate_session_run_fence,
     _incomplete_recovery_claim_from_checkpoint,
 )
 from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
 from cayu.runtime.structured_output import (
+    STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     copy_structured_output_spec,
     require_secret_free_structured_output_spec,
@@ -408,6 +424,30 @@ class _IncompleteRecoveryClaimLost(RuntimeError):
     """The durable incomplete-session recovery lease is no longer owned."""
 
 
+class ModelCompletionManualRecoveryRequired(RuntimeError):
+    """A model dispatch cannot be reconstructed safely without operator input."""
+
+
+@dataclass(frozen=True)
+class ModelCompletionBoundaryReconciliation:
+    """Verified state at the durable model-completion publication boundary."""
+
+    state: Literal["none", "promoted", "already_promoted"]
+    session: Session
+    pointer: model_completion_publication.ModelStepPublicationCheckpoint | None = None
+    completion_event: Event | None = None
+    pending_tool_round: tool_round_recovery.PendingToolRound | None = None
+    transcript_cursor: int = 0
+
+    @property
+    def blocks_provider_dispatch(self) -> bool:
+        return (
+            self.pointer is not None
+            and self.pending_tool_round is None
+            and self.transcript_cursor == self.pointer.transcript_end_cursor
+        )
+
+
 class _ManualRecoveryInterrupted(RuntimeError):
     """A durable interruption won before manual recovery could claim the session."""
 
@@ -508,6 +548,292 @@ class RecoveryCoordinator:
         self._interrupt_session_for_recovery = interrupt_session_for_recovery
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
         self._abandoned_turn_completed = abandoned_turn_completed
+
+    async def preflight_model_completion_boundary(self, session: Session) -> None:
+        """Reject a non-terminal provider dispatch before mutating session state."""
+
+        active = await self._session_store.load_active_model_completion_stage(session.id)
+        if active is None:
+            return
+        stage = active.stage
+        self._validate_active_model_completion_stage(session, stage)
+        if stage.state == "in_flight":
+            raise ModelCompletionManualRecoveryRequired(
+                "The active model-completion dispatch has no durable terminal response. "
+                "Its provider outcome and linked budget reservations require manual "
+                f"reconciliation before retrying: {stage.stage_id}"
+            )
+
+    async def reconcile_model_completion_boundary(
+        self,
+        session: Session,
+    ) -> ModelCompletionBoundaryReconciliation:
+        """Promote terminal model evidence or verify an already-published boundary."""
+
+        active = await self._session_store.load_active_model_completion_stage(session.id)
+        state: Literal["none", "promoted", "already_promoted"] = "none"
+        if active is not None:
+            stage = active.stage
+            self._validate_active_model_completion_stage(session, stage)
+            if stage.state == "in_flight":
+                raise ModelCompletionManualRecoveryRequired(
+                    "The active model-completion dispatch has no durable terminal response. "
+                    "Its provider outcome and linked budget reservations require manual "
+                    f"reconciliation before retrying: {stage.stage_id}"
+                )
+            if session.status not in {
+                stage.source_status,
+                SessionStatus.INTERRUPTING,
+            }:
+                raise ModelCompletionManualRecoveryRequired(
+                    "The completed model stage cannot be promoted from the current session "
+                    f"status ({session.status.value}); expected {stage.source_status.value}."
+                )
+            session = await self._promote_completed_model_stage(
+                session=session,
+                stage_id=stage.stage_id,
+            )
+            state = "promoted"
+
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        pointer = model_completion_publication.model_step_publication_from_checkpoint(checkpoint)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        if pending_approval is not None and pending_user_input is not None:
+            raise RuntimeError(
+                "The checkpoint contains conflicting pending approval and user-input pauses."
+            )
+        if pending_round is not None and (
+            pending_approval is not None or pending_user_input is not None
+        ):
+            raise RuntimeError(
+                "The checkpoint contains conflicting pending tool-round and pause markers."
+            )
+        if pointer is None:
+            if active is not None:
+                raise RuntimeError(
+                    "Promoted model completion did not publish its durable model-step pointer."
+                )
+            if pending_round is not None and pending_round.source_model_step_id is not None:
+                raise RuntimeError(
+                    "A pending tool round exists without a durable source model-step pointer."
+                )
+            return ModelCompletionBoundaryReconciliation(
+                state=state,
+                session=session,
+            )
+
+        receipt = await self._session_store.load_runtime_publication_receipt(
+            session.id,
+            pointer.logical_step_id,
+        )
+        if receipt is None:
+            raise RuntimeError("The durable model-step pointer has no publication receipt.")
+        if (
+            receipt.kind != "model-step"
+            or receipt.transcript_start_cursor != pointer.source_transcript_cursor
+            or receipt.transcript_end_cursor != pointer.transcript_end_cursor
+            or receipt.appended_event_ids != (pointer.completion_event_id,)
+            or receipt.referenced_events
+        ):
+            raise RuntimeError(
+                "The durable model-step pointer conflicts with its publication receipt."
+            )
+
+        event_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_id=pointer.completion_event_id,
+                limit=1,
+            )
+        )
+        if len(event_records) != 1:
+            raise RuntimeError("The durable model-step pointer has no exact completion event.")
+        completion_event = event_records[0].event
+        if (
+            completion_event.type != EventType.MODEL_COMPLETED
+            or completion_event.payload.get("step_classification") != pointer.classification
+            or completion_event.payload.get("transcript_cursor") != pointer.transcript_end_cursor
+        ):
+            raise RuntimeError(
+                "The durable model-step pointer conflicts with its completion event."
+            )
+
+        transcript_page = await self._session_store.query_transcript(
+            TranscriptQuery(
+                session_id=session.id,
+                offset=max(0, pointer.transcript_end_cursor - 1),
+                limit=2,
+            )
+        )
+        if transcript_page.total_records < pointer.transcript_end_cursor:
+            raise RuntimeError("The durable model-step pointer extends beyond the transcript.")
+        if pointer.assistant_message_published and (
+            not transcript_page.records
+            or transcript_page.records[0].index != pointer.transcript_end_cursor - 1
+            or transcript_page.records[0].message.role != MessageRole.ASSISTANT
+        ):
+            raise RuntimeError(
+                "The durable model-step pointer does not identify its assistant message."
+            )
+
+        if pending_round is not None:
+            if (
+                pointer.tool_round_id != pending_round.tool_round_id
+                or pending_round.source_model_step_id != pointer.logical_step_id
+                or pending_round.source_transcript_cursor != pointer.source_transcript_cursor
+            ):
+                raise RuntimeError(
+                    "The pending tool round conflicts with its durable source model step."
+                )
+        elif pointer.tool_round_id is not None:
+            pending_pause = pending_approval if pending_approval is not None else pending_user_input
+            assistant_message = transcript_page.records[0].message
+            assistant_calls = tuple(
+                (part.tool_call_id, part.tool_name, part.arguments)
+                for part in assistant_message.content
+                if type(part) is ToolCallPart
+            )
+            if transcript_page.total_records == pointer.transcript_end_cursor:
+                if pending_pause is None:
+                    raise RuntimeError(
+                        "The latest model completion requires a pending tool round, but its "
+                        "durable marker is missing."
+                    )
+                if (
+                    pending_pause.agent_name != session.agent_name
+                    or pending_pause.environment_name != session.environment_name
+                ):
+                    raise RuntimeError(
+                        "The pending tool pause conflicts with its durable source model step."
+                    )
+                pending_calls = tuple(
+                    (call.tool_call_id, call.tool_name, call.arguments)
+                    for call in pending_pause.tool_calls
+                )
+                pending_target = (
+                    pending_pause.tool_call_id,
+                    pending_pause.tool_name,
+                    pending_pause.arguments,
+                )
+                if (
+                    not pointer.assistant_message_published
+                    or not assistant_calls
+                    or assistant_calls != pending_calls
+                    or pending_calls.count(pending_target) != 1
+                ):
+                    raise RuntimeError(
+                        "The pending tool pause conflicts with its durable source model step."
+                    )
+            else:
+                if pending_pause is not None:
+                    raise RuntimeError(
+                        "A pending tool pause remains after its source model step advanced."
+                    )
+                next_record = (
+                    transcript_page.records[1] if len(transcript_page.records) > 1 else None
+                )
+                tool_results = (
+                    tuple(
+                        (part.tool_call_id, part.tool_name)
+                        for part in next_record.message.content
+                        if type(part) is ToolResultPart
+                    )
+                    if next_record is not None
+                    and next_record.index == pointer.transcript_end_cursor
+                    and next_record.message.role == MessageRole.TOOL
+                    else ()
+                )
+                expected_results = tuple(
+                    (tool_call_id, tool_name)
+                    for tool_call_id, tool_name, _arguments in assistant_calls
+                )
+                if (
+                    not pointer.assistant_message_published
+                    or not expected_results
+                    or next_record is None
+                    or len(tool_results) != len(next_record.message.content)
+                    or tool_results != expected_results
+                ):
+                    raise RuntimeError(
+                        "The transcript after the durable model step does not exactly close "
+                        "its assistant tool calls."
+                    )
+
+        await self._event_writer.fan_out_persisted([completion_event])
+        return ModelCompletionBoundaryReconciliation(
+            state=("already_promoted" if state == "none" else state),
+            session=session,
+            pointer=pointer,
+            completion_event=copy_event(completion_event),
+            pending_tool_round=pending_round,
+            transcript_cursor=transcript_page.total_records,
+        )
+
+    @staticmethod
+    def _validate_active_model_completion_stage(session: Session, stage) -> None:
+        if stage.session_id != session.id:
+            raise RuntimeError("The active model-completion stage belongs to another session.")
+        if stage.source_run_epoch > session.run_epoch:
+            raise RuntimeError(
+                "The active model-completion stage was prepared by a future run epoch."
+            )
+
+    async def _promote_completed_model_stage(
+        self,
+        *,
+        session: Session,
+        stage_id: str,
+    ) -> Session:
+        async def commit_once():
+            return await self._session_store.promote_model_completion_stage(
+                session.id,
+                stage_id=stage_id,
+                expected_run_epoch=session.run_epoch,
+            )
+
+        async def commit():
+            try:
+                return await commit_once()
+            except Exception as first_error:
+                try:
+                    return await commit_once()
+                except Exception as replay_error:
+                    replay_error.add_note(
+                        "Exact recovered model-completion promotion also failed after "
+                        f"{type(first_error).__name__}: {first_error}"
+                    )
+                    raise replay_error from first_error
+
+        task = asyncio.create_task(commit())
+        outcome = await await_shielded_task_outcome(task)
+        cancellation = outcome.cancellation
+        error = outcome.error
+        if isinstance(error, asyncio.CancelledError) and cancellation is None:
+            error = unexpected_child_cancellation_error(
+                error,
+                operation="Recovered model-completion promotion",
+            )
+        if error is not None:
+            if cancellation is not None:
+                cancellation.add_note(
+                    "Recovered model-completion promotion also failed: "
+                    f"{type(error).__name__}: {error}"
+                )
+                raise cancellation from error
+            raise error
+        if outcome.result is None:
+            result_error = RuntimeError(
+                "Recovered model-completion promotion returned no acknowledgement."
+            )
+            if cancellation is not None:
+                cancellation.add_note(str(result_error))
+                raise cancellation from result_error
+            raise result_error
+        if cancellation is not None:
+            raise cancellation
+        return outcome.result.session
 
     async def _cleanup_recovery_handoff(
         self,
@@ -3824,20 +4150,53 @@ class RecoveryCoordinator:
         request: InterruptedToolRoundRequest,
     ) -> AsyncGenerator[Event, None]:
         """Close an interrupted round without replaying unfinished tools."""
-        if await transcript_helpers.tool_round_has_result_messages(
-            self._session_store,
-            request.session.id,
-            request.tool_calls,
-            tool_round_identity=request.tool_round_identity,
+        tool_round_identity = copy_tool_round_identity(request.tool_round_identity)
+        publication_id = f"tool-round:{tool_round_identity.tool_round_id}"
+        if (
+            await self._session_store.load_runtime_publication_receipt(
+                request.session.id,
+                publication_id,
+            )
+            is not None
         ):
             return
-        terminal_event_exists = (
-            await self._session_control.latest_interrupted_event(request.session.id) is not None
+        source_checkpoint = await self._session_store.load_checkpoint(request.session.id)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(source_checkpoint)
+        if (
+            pending_round is None
+            or tool_round_recovery.pending_tool_round_identity(pending_round) != tool_round_identity
+        ):
+            raise RuntimeError("Interrupted tool round lost its durable pending marker.")
+        pending_tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        if [(tool_call.id, tool_call.name) for tool_call in request.tool_calls] != [
+            (tool_call.id, tool_call.name) for tool_call in pending_tool_calls
+        ]:
+            raise RuntimeError("Interrupted tool calls conflict with the durable pending round.")
+        if any(call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls):
+            async for event in self._recover_structured_output_tool_round(
+                session=request.session,
+                registered_agent=request.registered_agent,
+                registered_environment=request.registered_environment,
+                messages=request.messages,
+                insert_at=len(request.messages),
+                pending_round=pending_round,
+                source_checkpoint=source_checkpoint,
+                retry_allowed=False,
+            ):
+                yield event
+            return
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=request.session.id,
+            pending_round=pending_round,
+        )
+        recorded_outcomes, _started_ids = tool_round_recovery.recorded_tool_outcomes(
+            events=lifecycle_events,
+            pending_round=pending_round,
         )
         interrupted_results = _interrupted_tool_round_results(
-            tool_calls=request.tool_calls,
-            completed_outcomes=request.tool_outcomes,
-            tool_round_identity=request.tool_round_identity,
+            tool_calls=pending_tool_calls,
+            completed_outcomes=list(recorded_outcomes.values()),
+            tool_round_identity=tool_round_identity,
             cancellation_artifacts=request.cancellation_artifacts,
             cancellation_artifacts_by_id=request.cancellation_artifacts_by_id,
         )
@@ -3845,10 +4204,6 @@ class RecoveryCoordinator:
             session_id=request.session.id,
             tool_round_id=request.tool_round_identity.tool_round_id,
             outcomes=interrupted_results,
-        )
-        tool_outcomes = tool_results.redact_tool_call_outcomes(
-            request.tool_outcomes,
-            self._secret_redactor,
         )
         cancellation_redactors = request.cancellation_redactors_by_id or {}
         interrupted_results = [
@@ -3858,34 +4213,288 @@ class RecoveryCoordinator:
             )[0]
             for outcome in interrupted_results
         ]
-        if not interrupted_results and not tool_outcomes:
-            return
-        if not terminal_event_exists:
-            for interrupted_result in interrupted_results:
-                yield await self._event_writer.emit(
-                    _interrupted_tool_call_event(
-                        session=request.session,
-                        registered_agent=request.registered_agent,
-                        registered_environment=request.registered_environment,
-                        tool_call_outcome=interrupted_result,
-                        tool_round_identity=request.tool_round_identity,
-                    )
+        planned_terminal_events = [
+            _interrupted_tool_call_event(
+                session=request.session,
+                registered_agent=request.registered_agent,
+                registered_environment=request.registered_environment,
+                tool_call_outcome=interrupted_result,
+                tool_round_identity=tool_round_identity,
+            )
+            for interrupted_result in interrupted_results
+        ]
+        tool_round_publication.collect_tool_round_publication_evidence(
+            session_id=request.session.id,
+            pending_round=pending_round,
+            durable_events=[*lifecycle_events, *planned_terminal_events],
+        )
+
+        emitted_events: list[Event] = []
+        for interrupted_result, terminal_event in zip(
+            interrupted_results,
+            planned_terminal_events,
+            strict=True,
+        ):
+            async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
+                event=terminal_event,
+                session=request.session,
+                registered_agent=request.registered_agent,
+                registered_environment=request.registered_environment,
+                tool_call=interrupted_result.call,
+                result=interrupted_result.result,
+                task_id=pending_round.task_id,
+            ):
+                emitted_events.append(event)
+                if outcome is not None and outcome != interrupted_result:
+                    raise RuntimeError("Interrupted tool-round hooks changed terminal evidence.")
+
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=request.session.id,
+            pending_round=pending_round,
+        )
+        prepared = tool_round_publication.prepare_tool_round_publication(
+            session_id=request.session.id,
+            pending_round=pending_round,
+            source_checkpoint=source_checkpoint,
+            durable_events=lifecycle_events,
+            expected_statuses={
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+                SessionStatus.INTERRUPTED,
+            },
+            expected_run_epoch=request.session.run_epoch,
+            expected_transcript_cursor=len(request.messages),
+        )
+        cancellation = await self._publish_tool_round_with_exact_replay(prepared)
+        request.messages.extend(prepared.request.transcript_messages)
+        for event in emitted_events:
+            yield event
+        if cancellation is not None:
+            raise cancellation
+
+    async def _load_tool_round_lifecycle_events(
+        self,
+        *,
+        session_id: str,
+        pending_round: tool_round_recovery.PendingToolRound,
+    ) -> list[Event]:
+        """Load bounded lifecycle evidence and scope reused call IDs by round."""
+        candidates = await self._session_store.load_tool_round_lifecycle_events_for_round(
+            session_id,
+            [call.tool_call_id for call in pending_round.tool_calls],
+            tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
+        )
+        lifecycle_events: list[Event] = []
+        for event in candidates:
+            event_round_id = event.payload.get("tool_round_id")
+            if event_round_id == pending_round.tool_round_id:
+                lifecycle_events.append(event)
+                continue
+            if (
+                type(event_round_id) is not str
+                or not event_round_id.strip()
+                or event_round_id.strip() != event_round_id
+            ):
+                raise RuntimeError(
+                    "Indexed tool-round lifecycle evidence has no valid round identity."
                 )
-        tool_outcomes.extend(interrupted_results)
-        interrupted_messages = ordered_tool_result_messages(
-            request.tool_calls,
-            tool_outcomes,
-            parallel=True,
-            tool_round_identity=request.tool_round_identity,
+            raise RuntimeError(
+                "Round-scoped lifecycle lookup returned evidence for a different tool round."
+            )
+        return lifecycle_events
+
+    async def _recover_structured_output_tool_round(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        messages: list[Message],
+        insert_at: int,
+        pending_round: tool_round_recovery.PendingToolRound,
+        source_checkpoint: dict[str, Any] | None,
+        retry_allowed: bool,
+    ) -> AsyncGenerator[Event, None]:
+        """Rebuild one reserved finalizer round from its durable model output."""
+
+        spec = pending_round.structured_output
+        step = pending_round.model_step
+        attempt = pending_round.structured_output_attempt
+        if spec is None or step is None or attempt is None:
+            raise RuntimeError(
+                "Structured-output recovery requires durable config, step, and attempt."
+            )
+        if attempt > spec.max_retries + 1:
+            raise RuntimeError(
+                "Structured-output recovery attempt exceeds the durable retry policy."
+            )
+        tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        validation = pending_round.structured_output_validation
+        if validation is None:
+            raise RuntimeError(
+                "Structured-output recovery requires authoritative durable validation."
+            )
+        validation = validation.model_copy(deep=True)
+        expected_outcomes = structured_output_tool_round._structured_output_tool_round_outcomes(
+            tool_calls=tool_calls,
+            spec=spec,
+            validation=validation,
         )
-        request.messages.extend(interrupted_messages)
-        cleared_checkpoint = await self._tool_round_executor.checkpoint_without_pending_tool_round(
-            request.session.id
+        expected_outcomes = tool_results.redact_tool_call_outcomes(
+            expected_outcomes,
+            self._secret_redactor,
         )
-        await self._session_store.append_transcript_messages_and_transform_checkpoint(
-            request.session.id,
-            interrupted_messages,
-            self._checkpoint_transform(cleared_checkpoint),
+        environment_name = _environment_name(registered_environment)
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=session.id,
+            pending_round=pending_round,
+        )
+        recorded_outcomes, _started_ids = tool_round_recovery.recorded_tool_outcomes(
+            events=lifecycle_events,
+            pending_round=pending_round,
+        )
+        terminal_events_by_call = {
+            event.payload["tool_call_id"]: event
+            for event in lifecycle_events
+            if event.type
+            in {
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+            }
+        }
+        planned_terminal_events: list[Event] = []
+        for expected_outcome in expected_outcomes:
+            expected_event = structured_output_tool_round._structured_output_tool_terminal_event(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
+                outcome=expected_outcome,
+            )
+            recorded_outcome = recorded_outcomes.get(expected_outcome.call.id)
+            if recorded_outcome is None:
+                planned_terminal_events.append(expected_event)
+                continue
+            recorded_event = terminal_events_by_call.get(expected_outcome.call.id)
+            if (
+                recorded_outcome != expected_outcome
+                or recorded_event is None
+                or recorded_event.id != expected_event.id
+                or recorded_event.type != expected_event.type
+                or recorded_event.session_id != expected_event.session_id
+                or recorded_event.agent_name != expected_event.agent_name
+                or recorded_event.environment_name != expected_event.environment_name
+                or recorded_event.tool_name != expected_event.tool_name
+                or recorded_event.payload != expected_event.payload
+            ):
+                raise RuntimeError(
+                    "Durable structured-output terminal evidence conflicts with "
+                    f"the pending call: {expected_outcome.call.id}"
+                )
+
+        tool_round_publication.collect_tool_round_publication_evidence(
+            session_id=session.id,
+            pending_round=pending_round,
+            durable_events=[*lifecycle_events, *planned_terminal_events],
+        )
+        emitted_terminal_events: list[Event] = []
+        for terminal_event in planned_terminal_events:
+            emitted_terminal_events.append(await self._event_writer.emit(terminal_event))
+
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=session.id,
+            pending_round=pending_round,
+        )
+        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        retry_scheduled = not validation.valid and retry_allowed and attempt <= spec.max_retries
+        validating_event = structured_output_tool_round._structured_output_validating_event(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            spec=spec,
+            step=step,
+            attempt=attempt,
+            tool_round_identity=tool_round_identity,
+        )
+        outcome_event = structured_output_tool_round._structured_output_event(
+            event_type=(
+                EventType.STRUCTURED_OUTPUT_VALIDATED
+                if validation.valid
+                else EventType.STRUCTURED_OUTPUT_FAILED
+            ),
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            spec=spec,
+            validation=validation,
+            step=step,
+            attempt=attempt,
+            redactor=self._secret_redactor,
+            tool_round_identity=tool_round_identity,
+        )
+        auxiliary_events = [validating_event, outcome_event]
+        if retry_scheduled:
+            auxiliary_events.append(
+                structured_output_tool_round._structured_output_event(
+                    event_type=EventType.STRUCTURED_OUTPUT_RETRY,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    spec=spec,
+                    validation=validation,
+                    step=step,
+                    attempt=attempt,
+                    redactor=self._secret_redactor,
+                    tool_round_identity=tool_round_identity,
+                )
+            )
+        auxiliary_events = self._event_writer.prepare_many(auxiliary_events)
+        extension = structured_output_tool_round._StructuredOutputToolRoundPublicationExtension(
+            intent={
+                "schema_version": 1,
+                "kind": "structured-output-validation",
+                "step": step,
+                "attempt": attempt,
+                "valid": validation.valid,
+                "retry_scheduled": retry_scheduled,
+                "event_ids": [event.id for event in auxiliary_events],
+            },
+            events=tuple(auxiliary_events),
+        )
+        prepared = tool_round_publication.prepare_tool_round_publication(
+            session_id=session.id,
+            pending_round=pending_round,
+            source_checkpoint=source_checkpoint,
+            durable_events=lifecycle_events,
+            expected_statuses={
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+                SessionStatus.INTERRUPTED,
+            },
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=insert_at,
+            extension=extension,
+        )
+        cancellation = await self._publish_tool_round_with_exact_replay(prepared)
+        messages[insert_at:insert_at] = list(prepared.request.transcript_messages)
+        for event in emitted_terminal_events:
+            yield event
+        for event in auxiliary_events:
+            yield copy_event(event)
+        if cancellation is not None:
+            raise cancellation
+
+    async def _publish_tool_round_with_exact_replay(
+        self,
+        prepared: tool_round_publication.PreparedToolRoundPublication,
+    ) -> asyncio.CancelledError | None:
+        """Reconcile an ambiguous publication by replaying its retained request."""
+        return await tool_round_publication.publish_tool_round_with_exact_replay(
+            prepared,
+            session_store=self._session_store,
+            event_writer=self._event_writer,
         )
 
     async def reattach_subagent_children_in_outcomes(
@@ -3949,7 +4558,6 @@ class RecoveryCoordinator:
                 "Pending tool round belongs to a different environment: "
                 f"{pending_round.environment_name}."
             )
-
         pending_tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
         tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         if await transcript_helpers.tool_round_has_result_messages(
@@ -3958,25 +4566,32 @@ class RecoveryCoordinator:
             pending_tool_calls,
             tool_round_identity=tool_round_identity,
         ):
-            await self._clear_pending_tool_round_if_matches(session.id, pending_round)
-            yield await self._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_CHECKPOINTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
-                        **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
-                        "cleared": True,
-                    },
-                )
+            raise SessionRuntimePublicationConflict(
+                "The durable transcript already closes the pending tool round without "
+                "its atomic checkpoint publication."
             )
+        insert_at = len(messages) - tail_message_count
+        if insert_at < 0:
+            raise RuntimeError("Pending tool round recovery received an invalid tail size.")
+        if any(call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for call in pending_round.tool_calls):
+            async for event in self._recover_structured_output_tool_round(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                messages=messages,
+                insert_at=insert_at,
+                pending_round=pending_round,
+                source_checkpoint=checkpoint,
+                retry_allowed=session.status == SessionStatus.RUNNING,
+            ):
+                yield event
             return
-
-        events = await self._session_store.load_events(session.id)
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=session.id,
+            pending_round=pending_round,
+        )
         recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
-            events=events,
+            events=lifecycle_events,
             pending_round=pending_round,
         )
         subagent_children: dict[str, Session] = {}
@@ -3984,11 +4599,10 @@ class RecoveryCoordinator:
             recorded_outcomes.get(call.tool_call_id) is None for call in pending_round.tool_calls
         ):
             subagent_children = await self._subagent_children_by_idempotency_key(session.id)
-        tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        synthesized_outcomes: list[runtime_records.ToolCallOutcome] = []
         for pending_tool_call in pending_round.tool_calls:
             recorded_outcome = recorded_outcomes.get(pending_tool_call.tool_call_id)
             if recorded_outcome is not None:
-                tool_outcomes.append(recorded_outcome)
                 continue
 
             tool_call = runtime_records.ToolCallRequest(
@@ -4014,65 +4628,92 @@ class RecoveryCoordinator:
                     pending_round=pending_round,
                     started=pending_tool_call.tool_call_id in started_ids,
                 )
-            event_type = (
-                EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
+            synthesized_outcomes.append(
+                runtime_records.ToolCallOutcome(call=tool_call, result=result)
             )
-            async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
-                event=Event(
+
+        synthesized_outcomes = tool_results.redact_tool_call_outcomes(
+            synthesized_outcomes,
+            self._secret_redactor,
+        )
+        planned_terminal_events: list[Event] = []
+        for outcome in synthesized_outcomes:
+            event_type = (
+                EventType.TOOL_CALL_FAILED
+                if outcome.result.is_error
+                else EventType.TOOL_CALL_COMPLETED
+            )
+            planned_terminal_events.append(
+                Event(
                     type=event_type,
                     session_id=session.id,
                     agent_name=registered_agent.spec.name,
                     environment_name=environment_name,
-                    tool_name=tool_call.name,
+                    tool_name=outcome.call.name,
                     payload={
                         **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
-                        "tool_call_id": tool_call.id,
-                        "idempotency_key": expected_idempotency_key,
+                        "tool_call_id": outcome.call.id,
+                        "idempotency_key": tool_execution.tool_idempotency_key(
+                            session_id=session.id,
+                            tool_round_id=pending_round.tool_round_id,
+                            tool_call_id=outcome.call.id,
+                        ),
                         "recovered": True,
-                        "result": result.model_dump(),
+                        "result": outcome.result.model_dump(),
                     },
-                ),
+                )
+            )
+        tool_round_publication.collect_tool_round_publication_evidence(
+            session_id=session.id,
+            pending_round=pending_round,
+            durable_events=[*lifecycle_events, *planned_terminal_events],
+        )
+
+        emitted_events: list[Event] = []
+        for expected_outcome, terminal_event in zip(
+            synthesized_outcomes,
+            planned_terminal_events,
+            strict=True,
+        ):
+            async for (
+                event,
+                emitted_outcome,
+            ) in self._tool_round_executor.emit_tool_call_result_with_hooks(
+                event=terminal_event,
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                tool_call=tool_call,
-                result=result,
+                tool_call=expected_outcome.call,
+                result=expected_outcome.result,
                 task_id=pending_round.task_id,
             ):
-                yield event
-                if outcome is not None:
-                    tool_outcomes.append(outcome)
+                emitted_events.append(event)
+                if emitted_outcome is not None and emitted_outcome != expected_outcome:
+                    raise RuntimeError("Recovered tool-round hooks changed terminal evidence.")
 
-        tool_result_messages = transcript_helpers.tool_result_messages(
-            tool_outcomes,
-            tool_round_identity=tool_round_identity,
+        lifecycle_events = await self._load_tool_round_lifecycle_events(
+            session_id=session.id,
+            pending_round=pending_round,
         )
-        insert_at = len(messages) - tail_message_count
-        if insert_at < 0:
-            raise RuntimeError("Pending tool round recovery received an invalid tail size.")
-        messages[insert_at:insert_at] = tool_result_messages
-        cleared_checkpoint = await self._tool_round_executor.checkpoint_without_pending_tool_round(
-            session.id
+        prepared = tool_round_publication.prepare_tool_round_publication(
+            session_id=session.id,
+            pending_round=pending_round,
+            source_checkpoint=checkpoint,
+            durable_events=lifecycle_events,
+            expected_statuses={
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+                SessionStatus.INTERRUPTED,
+            },
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=insert_at,
         )
-        await self._session_store.append_transcript_messages_and_transform_checkpoint(
-            session.id,
-            tool_result_messages,
-            self._checkpoint_transform(cleared_checkpoint),
-        )
-        yield await self._event_writer.emit(
-            Event(
-                type=EventType.SESSION_CHECKPOINTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    "checkpoint": tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY,
-                    **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
-                    "cleared": True,
-                    "recovered_tool_calls": len(tool_outcomes),
-                },
-            )
-        )
+        cancellation = await self._publish_tool_round_with_exact_replay(prepared)
+        messages[insert_at:insert_at] = list(prepared.request.transcript_messages)
+        for event in emitted_events:
+            yield event
+        if cancellation is not None:
+            raise cancellation
 
     async def finalize_abandoned_session_run(
         self,
@@ -5030,6 +5671,15 @@ class RecoveryCoordinator:
                 )
             )
 
+        model_boundary = await self.reconcile_model_completion_boundary(session)
+        session = model_boundary.session
+        if model_boundary.state == "promoted" and model_boundary.completion_event is not None:
+            events.append(copy_event(model_boundary.completion_event))
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
+        pending_user_input = pending_user_input_from_checkpoint(checkpoint)
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+
         if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
             if pending_approval is not None:
                 interrupt_payload = {
@@ -5215,28 +5865,6 @@ class RecoveryCoordinator:
         if loaded is None:
             raise KeyError(f"Session not found: {session_id}") from None
         return loaded
-
-    async def _clear_pending_tool_round_if_matches(
-        self,
-        session_id: str,
-        pending_round: tool_round_recovery.PendingToolRound,
-    ) -> None:
-        checkpoint = await self._session_store.load_checkpoint(session_id)
-        if checkpoint is None:
-            return
-        copied_checkpoint = copy_json_value(checkpoint, "checkpoint")
-        current = tool_round_recovery.pending_tool_round_from_checkpoint(
-            copied_checkpoint,
-            redactor=self._secret_redactor,
-            consume_on_rejection=True,
-        )
-        if current is None or current.tool_round_id != pending_round.tool_round_id:
-            return
-        copied_checkpoint.pop(tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY, None)
-        await self._session_store.transform_checkpoint(
-            session_id,
-            self._checkpoint_transform(copied_checkpoint),
-        )
 
     async def _subagent_children_by_idempotency_key(
         self,

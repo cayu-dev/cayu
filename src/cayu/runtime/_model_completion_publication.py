@@ -25,6 +25,7 @@ LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY = "last_model_step_publication"
 MODEL_STEP_PUBLICATION_CHECKPOINT_RECORD_TYPE = "cayu.model-step-publication"
 MODEL_STEP_PUBLICATION_CHECKPOINT_SCHEMA_VERSION = 1
 _NON_TURN_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
+_MESSAGELESS_CLASSIFICATIONS = _NON_TURN_CLASSIFICATIONS | {"continue"}
 _CLASSIFICATIONS = frozenset(
     {
         "continue",
@@ -95,11 +96,11 @@ class ModelStepPublicationCheckpoint(BaseModel):
             )
         if (
             not self.assistant_message_published
-            and self.classification.get("type") not in _NON_TURN_CLASSIFICATIONS
+            and self.classification.get("type") not in _MESSAGELESS_CLASSIFICATIONS
         ):
             raise ValueError(
                 "A model-step pointer without an assistant message requires a "
-                "non-turn classification."
+                "non-turn or continue classification."
             )
         if self.tool_round_id is not None and not self.assistant_message_published:
             raise ValueError(

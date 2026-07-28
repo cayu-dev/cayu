@@ -608,6 +608,8 @@ def test_bind_cancellation_releases_unadopted_factory_result_once() -> None:
         _EvidenceRunner,
         list[str],
         dict[str, Any],
+        str,
+        list[Event],
     ]:
         provider = _RecordingProvider()
         lifecycle: list[str] = []
@@ -637,14 +639,21 @@ def test_bind_cancellation_releases_unadopted_factory_result_once() -> None:
             await run_task
         checkpoint = await app.session_store.load_checkpoint("sess_bind_release_cancel")
         assert checkpoint is not None
+        session = await app.session_store.load("sess_bind_release_cancel")
+        assert session is not None
+        events = await app.session_store.load_events("sess_bind_release_cancel")
         assert provider.requests == []
-        return factory, runner, lifecycle, checkpoint
+        return factory, runner, lifecycle, checkpoint, session.status.value, events
 
-    factory, runner, lifecycle, checkpoint = asyncio.run(run())
+    factory, runner, lifecycle, checkpoint, status, events = asyncio.run(run())
 
     assert factory.release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
     assert lifecycle == ["factory.release:preserve"]
     assert runner.is_closed is True
+    assert status == "interrupted"
+    interrupted = [event for event in events if event.type is EventType.SESSION_INTERRUPTED]
+    assert len(interrupted) == 1
+    assert interrupted[0].payload["abandoned"] is True
     assert checkpoint["environment_factory_allocation_owner"] == {
         "hosted": "sess_bind_release_cancel"
     }

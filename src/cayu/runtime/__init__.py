@@ -7,6 +7,9 @@ from cayu.core.billing import (
     ResolvedBillingIdentity,
     UnresolvedBillingIdentity,
 )
+from cayu.runtime._recovery_coordinator import (
+    ModelCompletionManualRecoveryRequired,
+)
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
     AggregateAccuracyKind,
@@ -520,6 +523,7 @@ __all__ = [
     "ModelAttemptIdentity",
     "ModelCatalog",
     "ModelCompactor",
+    "ModelCompletionManualRecoveryRequired",
     "ModelCompletionStage",
     "ModelCompletionStageAbandonment",
     "ModelCompletionStageAbandonmentResult",

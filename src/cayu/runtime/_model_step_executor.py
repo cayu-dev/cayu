@@ -117,6 +117,10 @@ from cayu.runtime._session_control import (
     SessionControl,
     SessionInterruptedByRequest,
 )
+from cayu.runtime._structured_output_tool_round import (
+    _redact_structured_output_validation,
+    _validate_structured_output_tool_round,
+)
 from cayu.runtime.budgets import (
     BudgetLimit,
     BudgetPolicy,
@@ -196,6 +200,8 @@ from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
     StructuredOutputStrategy,
+    StructuredOutputValidation,
+    copy_structured_output_spec,
     require_secret_free_json_schema_keys,
     require_secret_free_structured_output_spec,
     structured_output_spec_payload,
@@ -394,6 +400,7 @@ class ModelCompletionPublicationRequest:
     assistant_step_result: AssistantStepResult | None
     completion_event: Event
     authoritative_assistant_message: Message | None
+    structured_output_validation: StructuredOutputValidation | None
 
     def __post_init__(self) -> None:
         if type(self.dispatch) is not ModelCompletionDispatch:
@@ -413,6 +420,16 @@ class ModelCompletionPublicationRequest:
             if self.authoritative_assistant_message is None
             else detach_message(self.authoritative_assistant_message)
         )
+        if (
+            self.structured_output_validation is not None
+            and type(self.structured_output_validation) is not StructuredOutputValidation
+        ):
+            raise TypeError("structured_output_validation must be a StructuredOutputValidation.")
+        structured_output_validation = (
+            None
+            if self.structured_output_validation is None
+            else self.structured_output_validation.model_copy(deep=True)
+        )
         if result is not None and result.session_id != dispatch.stage.session_id:
             raise ValueError("Assistant result session does not match its completion stage.")
         if event.session_id != dispatch.stage.session_id:
@@ -428,10 +445,23 @@ class ModelCompletionPublicationRequest:
                 raise ValueError(
                     "Authoritative assistant message does not match the detached step result."
                 )
+        if structured_output_validation is not None and (
+            result is None
+            or assistant_message is None
+            or not any(call.name == STRUCTURED_OUTPUT_TOOL_NAME for call in result.tool_calls)
+        ):
+            raise ValueError(
+                "Structured-output validation requires a published finalizer tool round."
+            )
         object.__setattr__(self, "dispatch", dispatch)
         object.__setattr__(self, "assistant_step_result", result)
         object.__setattr__(self, "completion_event", event)
         object.__setattr__(self, "authoritative_assistant_message", assistant_message)
+        object.__setattr__(
+            self,
+            "structured_output_validation",
+            structured_output_validation,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -618,6 +648,30 @@ def _validate_model_completion_publication_result(
         raise RuntimeError("Model completion publication changed the authoritative assistant turn.")
     if publication_request.events != (request.completion_event,):
         raise RuntimeError("Model completion publication changed its completion event.")
+    pending_round_operations = [
+        operation
+        for operation in publication_request.mutation.operations
+        if operation.key == "pending_tool_round"
+    ]
+    durable_validation = None
+    if pending_round_operations:
+        if len(pending_round_operations) != 1:
+            raise RuntimeError(
+                "Model completion publication changed its pending tool-round mutation."
+            )
+        pending_round_value = pending_round_operations[0].value
+        if type(pending_round_value) is not dict:
+            raise RuntimeError(
+                "Model completion publication returned a malformed pending tool round."
+            )
+        durable_validation = pending_round_value.get("structured_output_validation")
+    expected_validation = (
+        None
+        if request.structured_output_validation is None
+        else request.structured_output_validation.model_dump(mode="json")
+    )
+    if durable_validation != expected_validation:
+        raise RuntimeError("Model completion publication changed its structured-output validation.")
 
     promoted = detached_result.publication
     receipt = promoted.receipt
@@ -651,6 +705,7 @@ async def _publish_model_completion(
         assistant_step_result=request.assistant_step_result,
         completion_event=request.completion_event,
         authoritative_assistant_message=request.authoritative_assistant_message,
+        structured_output_validation=request.structured_output_validation,
     )
     publication_cancellation = _model_completion_cancellation(terminal_failure)
     if publication_cancellation is not None:
@@ -1256,6 +1311,7 @@ class ModelStepExecutor:
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         record_model_attempt_identity: Callable[[ModelAttemptIdentity], None],
         billing_identity: BillingIdentity | None = None,
+        structured_output: StructuredOutputSpec | None = None,
         prepare_model_completion_dispatch: Callable[
             [ModelRequest],
             Awaitable[ModelCompletionDispatch],
@@ -1264,6 +1320,7 @@ class ModelStepExecutor:
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
+        structured_output = copy_structured_output_spec(structured_output)
         model_step_identity = copy_model_step_identity(model_step_identity)
         next_model_attempt_identity = (
             None
@@ -1382,6 +1439,7 @@ class ModelStepExecutor:
                 record_model_completion=record_model_completion,
                 before_provider_dispatch=before_provider_dispatch,
                 billing_identity=billing_identity,
+                structured_output=structured_output,
                 prepare_model_completion_dispatch=prepare_model_completion_dispatch,
                 model_completion_publisher=model_completion_publisher,
             )
@@ -1669,6 +1727,7 @@ class ModelStepExecutor:
         record_model_completion: Callable[[Event], None],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
+        structured_output: StructuredOutputSpec | None,
         prepare_model_completion_dispatch: Callable[
             [ModelRequest],
             Awaitable[ModelCompletionDispatch],
@@ -2075,12 +2134,32 @@ class ModelStepExecutor:
                     terminal_failure = exc
 
             durable_step_result = None
+            structured_output_validation = None
             if step_result is not None:
                 try:
-                    durable_step_result = _durable_assistant_step_result(
+                    candidate_step_result = _durable_assistant_step_result(
                         step_result,
                         redactor=self._secret_redactor,
                     )
+                    candidate_validation = None
+                    if (
+                        terminal_failure is None
+                        and structured_output is not None
+                        and structured_output.strategy == StructuredOutputStrategy.TOOL
+                        and any(
+                            call.name == STRUCTURED_OUTPUT_TOOL_NAME
+                            for call in step_result.tool_calls
+                        )
+                    ):
+                        candidate_validation = _redact_structured_output_validation(
+                            _validate_structured_output_tool_round(
+                                tool_calls=step_result.tool_calls,
+                                spec=structured_output,
+                            ),
+                            self._secret_redactor,
+                        )
+                    durable_step_result = candidate_step_result
+                    structured_output_validation = candidate_validation
                 except (TypeError, ValueError):
                     if terminal_failure is None:
                         terminal_failure = ModelProviderError(
@@ -2112,6 +2191,7 @@ class ModelStepExecutor:
                 assistant_step_result=durable_step_result,
                 completion_event=publication_event,
                 authoritative_assistant_message=authoritative_assistant_message,
+                structured_output_validation=structured_output_validation,
             )
             await _publish_model_completion(
                 model_completion_publisher,
@@ -3048,6 +3128,7 @@ class ModelStepRun:
                 before_provider_dispatch=before_provider_dispatch,
                 record_model_attempt_identity=record_model_attempt_identity,
                 billing_identity=billing_identity,
+                structured_output=self._structured_output,
                 prepare_model_completion_dispatch=prepare_model_completion_dispatch,
                 model_completion_publisher=model_completion_publisher,
             )

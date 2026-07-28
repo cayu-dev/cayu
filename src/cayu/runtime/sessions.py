@@ -99,7 +99,11 @@ from cayu.runtime.budgets import (
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
-from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.runtime.execution_units import (
+    ModelAttemptIdentity,
+    ToolRoundIdentity,
+    copy_tool_round_identity,
+)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -108,8 +112,8 @@ from cayu.runtime.structured_output import (
     StructuredOutputError,
     StructuredOutputSpec,
     StructuredOutputStrategy,
+    StructuredOutputValidation,
     copy_structured_output_spec,
-    validate_structured_output_tool_arguments,
 )
 from cayu.runtime.usage import UsageMetrics
 
@@ -1505,6 +1509,9 @@ MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE = "cayu.model-completion-stage.ab
 MODEL_COMPLETION_STAGE_SCHEMA_VERSION = 1
 MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY = MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "active"
 _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
+_MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS = _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS | {
+    "continue"
+}
 ModelCompletionPurpose = Literal["assistant-turn", "context-compaction"]
 
 
@@ -8150,6 +8157,29 @@ def _validate_structured_output_auxiliary_integer(
     return value
 
 
+def _validate_durable_structured_output_validation(
+    value: Any,
+    field_name: str,
+) -> StructuredOutputValidation:
+    if (
+        type(value) is not dict
+        or set(value) != {"valid", "output", "errors"}
+        or type(value.get("valid")) is not bool
+        or type(value.get("errors")) is not list
+    ):
+        raise ValueError(f"{field_name} must be a structured-output validation object.")
+    try:
+        validation = StructuredOutputValidation.model_validate(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} is malformed.") from exc
+    if validation.valid:
+        if validation.errors:
+            raise ValueError(f"{field_name} cannot contain errors for a valid output.")
+    elif validation.output is not None or not validation.errors:
+        raise ValueError(f"{field_name} must contain errors and no output for an invalid result.")
+    return validation
+
+
 def _validate_structured_output_tool_round_auxiliary(
     request: RuntimePublicationRequest,
     *,
@@ -8517,6 +8547,10 @@ def _validate_structured_output_tool_round_marker(
             "Structured-output auxiliary evidence requires the reserved tool "
             "in the durable pending marker."
         )
+    if any(type(call.get("arguments")) is not dict for call in structured_calls):
+        raise SessionRuntimePublicationConflict(
+            "The reserved structured-output call arguments are malformed."
+        )
 
     raw_spec = marker.get("structured_output")
     if type(raw_spec) is not dict:
@@ -8541,20 +8575,41 @@ def _validate_structured_output_tool_round_marker(
         raise SessionRuntimePublicationConflict(
             "Structured-output auxiliary retry exceeds the durable retry policy."
         )
-    deterministic_valid = False
-    if len(structured_calls) == 1 and len(raw_calls) == 1:
-        raw_arguments = structured_calls[0].get("arguments")
-        if type(raw_arguments) is not dict:
-            raise SessionRuntimePublicationConflict(
-                "The reserved structured-output call arguments are malformed."
-            )
-        deterministic_valid = validate_structured_output_tool_arguments(
-            raw_arguments,
-            spec,
-        ).valid
-    if auxiliary.valid != deterministic_valid:
+    raw_validation = marker.get("structured_output_validation")
+    try:
+        durable_validation = _validate_durable_structured_output_validation(
+            raw_validation,
+            "pending_tool_round.structured_output_validation",
+        )
+    except (TypeError, ValueError) as exc:
         raise SessionRuntimePublicationConflict(
-            "Structured-output auxiliary validity conflicts with the durable tool calls."
+            "The durable structured-output validation is malformed."
+        ) from exc
+    durable_errors = tuple(error.model_dump(mode="json") for error in durable_validation.errors)
+    if (
+        auxiliary.valid != durable_validation.valid
+        or (
+            durable_validation.valid
+            and (
+                durable_errors
+                or not auxiliary.output_present
+                or not _runtime_publication_json_equal(
+                    auxiliary.output,
+                    durable_validation.output,
+                )
+            )
+        )
+        or (
+            not durable_validation.valid
+            and (
+                durable_validation.output is not None
+                or auxiliary.output_present
+                or auxiliary.errors != durable_errors
+            )
+        )
+    ):
+        raise SessionRuntimePublicationConflict(
+            "Structured-output auxiliary outcome conflicts with its authoritative validation."
         )
     marker_model_step = marker.get("model_step")
     if marker_model_step is not None and (
@@ -8941,12 +8996,12 @@ def _validate_model_completion_stage_publication(
         and not publication.transcript_messages
         and (
             type(classification) is not dict
-            or classification.get("type") not in _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS
+            or classification.get("type") not in _MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS
         )
     ):
         raise ValueError(
             "A model completion publication without an assistant message requires "
-            "a non-turn model.completed step classification."
+            "a non-turn or continue model.completed step classification."
         )
     if (
         stage.purpose == "assistant-turn"
@@ -8989,6 +9044,32 @@ def _validate_assistant_model_completion_publication(
 ) -> None:
     if type(classification) is not dict:
         raise ValueError("An assistant-turn publication requires a model step classification.")
+    raw_model_step_id = stage.intent.get("model_step_id")
+    raw_model_attempt_id = stage.intent.get("model_attempt_id")
+    model_attempt_identity = None
+    if raw_model_step_id is not None or raw_model_attempt_id is not None:
+        if type(raw_model_step_id) is not str or type(raw_model_attempt_id) is not str:
+            raise ValueError(
+                "An assistant-turn completion stage has a malformed model-attempt identity."
+            )
+        try:
+            model_attempt_identity = ModelAttemptIdentity(
+                model_step_id=raw_model_step_id,
+                model_attempt_id=raw_model_attempt_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "An assistant-turn completion stage has a malformed model-attempt identity."
+            ) from exc
+        if (
+            model_attempt_identity.model_step_id != stage.logical_step_id
+            or completed_event.payload.get("model_step_id") != model_attempt_identity.model_step_id
+            or completed_event.payload.get("model_attempt_id")
+            != model_attempt_identity.model_attempt_id
+        ):
+            raise ValueError(
+                "The model.completed identity conflicts with its staged model attempt."
+            )
     assistant_message = (
         publication.transcript_messages[0] if publication.transcript_messages else None
     )
@@ -9002,12 +9083,39 @@ def _validate_assistant_model_completion_publication(
         raise ValueError(
             "An assistant model completion with tool calls must be classified as continue."
         )
-    if not tool_calls and classification_type == "continue":
-        raise ValueError(
-            "An assistant model completion without tool calls cannot be classified as continue."
-        )
 
-    expected_tool_round_id = f"{stage.logical_step_id}:tool-round" if tool_calls else None
+    tool_round_identity = None
+    if tool_calls:
+        if model_attempt_identity is None:
+            raise ValueError("Assistant tool calls require a staged model-attempt identity.")
+        raw_identities = {
+            (call.model_step_id, call.model_attempt_id, call.tool_round_id) for call in tool_calls
+        }
+        if len(raw_identities) != 1:
+            raise ValueError("Assistant tool calls must share one complete tool-round identity.")
+        model_step_id, model_attempt_id, tool_round_id = next(iter(raw_identities))
+        if model_step_id is None or model_attempt_id is None or tool_round_id is None:
+            raise ValueError("Assistant tool calls must carry a complete tool-round identity.")
+        try:
+            tool_round_identity = ToolRoundIdentity(
+                model_step_id=model_step_id,
+                model_attempt_id=model_attempt_id,
+                tool_round_id=tool_round_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Assistant tool calls must carry a valid tool-round identity."
+            ) from exc
+        if (
+            tool_round_identity.model_step_id != model_attempt_identity.model_step_id
+            or tool_round_identity.model_attempt_id != model_attempt_identity.model_attempt_id
+        ):
+            raise ValueError(
+                "Assistant tool-round identity conflicts with its staged model completion."
+            )
+    expected_tool_round_id = (
+        None if tool_round_identity is None else tool_round_identity.tool_round_id
+    )
     expected_operation_keys = {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
     if tool_calls:
         expected_operation_keys.add(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
@@ -9051,7 +9159,9 @@ def _validate_assistant_model_completion_publication(
         raise ValueError("A model-step pending tool-round marker must use an object set operation.")
     marker = pending_operation.value
     expected_marker_keys = {
-        "round_id",
+        "tool_round_id",
+        "model_step_id",
+        "model_attempt_id",
         "agent_name",
         "environment_name",
         "task_id",
@@ -9061,12 +9171,19 @@ def _validate_assistant_model_completion_publication(
         "source_transcript_cursor",
         "model_step",
         "structured_output_attempt",
+        "structured_output_validation",
     }
     if set(marker) != expected_marker_keys:
         raise ValueError("The model-step pending tool-round marker has invalid fields.")
-    if marker.get("round_id") != expected_tool_round_id:
+    if tool_round_identity is None:
+        raise ValueError("The model-step pending tool round lost its identity.")
+    if (
+        marker.get("tool_round_id") != tool_round_identity.tool_round_id
+        or marker.get("model_step_id") != tool_round_identity.model_step_id
+        or marker.get("model_attempt_id") != tool_round_identity.model_attempt_id
+    ):
         raise ValueError("The pending tool-round identity conflicts with its model step.")
-    if marker.get("source_model_step_id") != stage.logical_step_id:
+    if marker.get("source_model_step_id") != tool_round_identity.model_step_id:
         raise ValueError("The pending tool round has a conflicting source model-step identity.")
     if marker.get("source_transcript_cursor") != stage.source_transcript_cursor:
         raise ValueError("The pending tool round has a conflicting source transcript cursor.")
@@ -9129,6 +9246,7 @@ def _validate_assistant_model_completion_publication(
         tool_call.tool_name == STRUCTURED_OUTPUT_TOOL_NAME for tool_call in tool_calls
     )
     structured_output_attempt = marker.get("structured_output_attempt")
+    raw_structured_output_validation = marker.get("structured_output_validation")
     if has_structured_finalizer:
         if structured_output is None or structured_output.strategy != StructuredOutputStrategy.TOOL:
             raise ValueError(
@@ -9139,8 +9257,19 @@ def _validate_assistant_model_completion_publication(
             or not 1 <= structured_output_attempt <= structured_output.max_retries + 1
         ):
             raise ValueError("The pending structured-output round requires a valid attempt number.")
-    elif structured_output_attempt is not None:
-        raise ValueError("An ordinary pending tool round cannot carry a structured-output attempt.")
+        try:
+            _validate_durable_structured_output_validation(
+                raw_structured_output_validation,
+                "pending_tool_round.structured_output_validation",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "The pending structured-output round requires authoritative validation."
+            ) from exc
+    elif structured_output_attempt is not None or raw_structured_output_validation is not None:
+        raise ValueError(
+            "An ordinary pending tool round cannot carry structured-output attempt evidence."
+        )
 
 
 def _model_completion_stage_preparation_record(

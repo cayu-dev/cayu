@@ -2447,6 +2447,8 @@ def test_secret_bearing_provider_call_id_fails_closed_before_tool_execution() ->
     assert all(event.type != EventType.TOOL_CALL_FAILED for event in initial_events)
     assert call_id not in repr([event.model_dump(mode="json") for event in initial_events])
     assert tool.effects == 0
+    completed = next(event for event in initial_events if event.type is EventType.MODEL_COMPLETED)
+    assert completed.payload["step_classification"]["type"] == "failed"
 
     resumed_events = asyncio.run(
         collect_resume_events(
@@ -2458,7 +2460,10 @@ def test_secret_bearing_provider_call_id_fails_closed_before_tool_execution() ->
         )
     )
 
-    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    active_stage = asyncio.run(store.load_active_model_completion_stage(session_id))
+    assert active_stage is None
+    assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+    assert len(provider.requests) == 2
     assert tool.effects == 0
     stored_events = asyncio.run(store.load_events(session_id))
     stored_started = [event for event in stored_events if event.type == EventType.TOOL_CALL_STARTED]

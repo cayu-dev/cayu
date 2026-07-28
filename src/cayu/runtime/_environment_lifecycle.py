@@ -662,7 +662,15 @@ class EnvironmentLifecycle:
                 registered_environment,
                 error=exc,
             )
-            self._active_environment_setups.pop(session.id, None)
+            # Retain a cleanup tombstone until the run finalizer executes. A
+            # caller cancellation is terminalized after this method unwinds,
+            # and that terminal path still holds its pre-bind environment
+            # snapshot. Removing the owner here would make that stale snapshot
+            # look authoritative and release the same factory result twice.
+            setup_owner = self._active_environment_setups.get(session.id)
+            if setup_owner is not None:
+                setup_owner.registered_environment = registered_environment
+                setup_owner.cleanup_started = True
             if ordinary_failure:
                 failure_payload = {
                     **base_payload,

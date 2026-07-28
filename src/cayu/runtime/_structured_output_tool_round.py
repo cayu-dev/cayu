@@ -356,7 +356,7 @@ def _redact_structured_output_validation(
     if type(validation) is not StructuredOutputValidation:
         raise TypeError("Structured output validation must be a StructuredOutputValidation.")
     if redactor is None or not redactor.has_values:
-        return validation
+        return validation.model_copy(deep=True)
     return StructuredOutputValidation(
         valid=validation.valid,
         output=redactor.redact_json(validation.output),

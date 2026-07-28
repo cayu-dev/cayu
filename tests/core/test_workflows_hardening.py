@@ -914,13 +914,20 @@ def test_step_cancellation_finalizes_started_child_before_replay():
         with pytest.raises(asyncio.CancelledError):
             await task
         child = await app.session_store.load(child_session_id)
-        return child_session_id, child
+        active_stage = await app.session_store.load_active_model_completion_stage(child_session_id)
+        events = await app.session_store.load_events(child_session_id)
+        return child_session_id, child, active_stage, events
 
-    child_session_id, child = asyncio.run(cancel_running_step())
+    child_session_id, child, active_stage, events = asyncio.run(cancel_running_step())
 
     assert provider.closed is True
     assert child is not None
-    assert child.status != SessionStatus.RUNNING
+    assert child.status == SessionStatus.INTERRUPTED
+    assert active_stage is not None
+    assert active_stage.stage.state == "in_flight"
+    interrupted = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
+    assert len(interrupted) == 1
+    assert interrupted[0].payload["abandoned"] is True
 
     with pytest.raises(StepError) as replay:
         asyncio.run(
@@ -932,6 +939,7 @@ def test_step_cancellation_finalizes_started_child_before_replay():
             )
         )
     assert replay.value.session_id == child_session_id
+    assert len(provider.requests) == 1
 
 
 def test_step_reuses_resolved_interrupted_child_on_rerun():

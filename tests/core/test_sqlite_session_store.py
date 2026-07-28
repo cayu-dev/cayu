@@ -3222,7 +3222,7 @@ def test_sqlite_maintenance_preserves_pending_tool_round(tmp_path):
             session.id,
             {
                 "pending_tool_round": {
-                    "round_id": round_id,
+                    "tool_round_id": round_id,
                     "agent_name": "assistant",
                     "tool_calls": [
                         {

@@ -5,10 +5,23 @@ from copy import deepcopy
 from typing import Any
 
 import pytest
+from tests.core._workload_secret_support import FakeProvider, collect_events
 
-from cayu.core import Message
-from cayu.environments import WorkspaceInstructions
-from cayu.runtime import InMemorySessionStore, RunRequest, SessionIdentity
+from cayu.core import AgentSpec, EventType, Message
+from cayu.environments import (
+    EnvironmentFactory,
+    EnvironmentFactoryRequest,
+    EnvironmentFactoryResult,
+    EnvironmentSpec,
+    WorkspaceInstructions,
+)
+from cayu.runtime import (
+    CayuApp,
+    InMemorySessionStore,
+    RunRequest,
+    SessionIdentity,
+    SessionStatus,
+)
 from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
@@ -127,6 +140,86 @@ def test_checkpoint_preservation_rejects_deleting_transform() -> None:
             ),
             None,
         )
+
+
+def test_cancellation_during_factory_resolution_finalizes_before_fence_release() -> None:
+    class OrderingStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lifecycle_order: list[str] = []
+
+        async def transition_status(
+            self,
+            session_id: str,
+            *,
+            from_statuses: set[SessionStatus],
+            to_status: SessionStatus,
+        ) -> Session:
+            result = await super().transition_status(
+                session_id,
+                from_statuses=from_statuses,
+                to_status=to_status,
+            )
+            if to_status == SessionStatus.INTERRUPTED:
+                self.lifecycle_order.append("finalized")
+            return result
+
+        async def release_run_fence(self, session_id: str) -> None:
+            self.lifecycle_order.append("released")
+            await super().release_run_fence(session_id)
+
+    class BlockingFactory(EnvironmentFactory):
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def create(
+            self,
+            request: EnvironmentFactoryRequest,
+        ) -> EnvironmentFactoryResult:
+            self.entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("Blocked factory unexpectedly resumed.")
+
+    async def scenario() -> None:
+        session_id = "sess_cancelled_pre_run_factory"
+        store = OrderingStore()
+        factory = BlockingFactory()
+        provider = FakeProvider([])
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await asyncio.wait_for(factory.entered.wait(), timeout=1)
+        run_task.cancel("cancel pre-run factory")
+        with pytest.raises(asyncio.CancelledError, match="cancel pre-run factory"):
+            await run_task
+
+        session = await store.load(session_id)
+        assert session is not None
+        assert session.status == SessionStatus.INTERRUPTED
+        assert store.lifecycle_order == ["finalized", "released"]
+        events = await store.load_events(session_id)
+        interrupted = [event for event in events if event.type == EventType.SESSION_INTERRUPTED]
+        assert len(interrupted) == 1
+        assert interrupted[0].payload["abandoned"] is True
+        assert provider.requests == []
+
+    asyncio.run(scenario())
 
 
 def test_render_initial_system_prompt_keeps_agent_and_workspace_provenance() -> None:

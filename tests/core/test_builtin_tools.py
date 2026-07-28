@@ -49,6 +49,10 @@ from cayu.runtime import (
     RuntimeHook,
     ToolCallHookContext,
 )
+from cayu.runtime._model_completion_publication import (
+    LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    model_step_publication_from_checkpoint,
+)
 from cayu.tools import ExecCommandTool
 from cayu.tools.commands import (
     DEFAULT_OUTPUT_LIMIT_BYTES,
@@ -2223,7 +2227,10 @@ def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
         assert tool_result.content.endswith(_POLICY_DENIAL_TRUNCATION_MARKER)
     else:
         assert expected_reason in tool_result.content
-    assert asyncio.run(app.session_store.load_checkpoint(blocked[0].session_id)) == {}
+    checkpoint = asyncio.run(app.session_store.load_checkpoint(blocked[0].session_id))
+    assert checkpoint is not None
+    assert set(checkpoint) == {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
+    assert model_step_publication_from_checkpoint(checkpoint) is not None
 
 
 def test_command_policy_denial_is_redacted_before_runtime_bounding():

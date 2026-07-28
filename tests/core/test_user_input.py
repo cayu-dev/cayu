@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from copy import deepcopy
 
 import pytest
 
@@ -2305,6 +2306,70 @@ def test_worker_recovery_preserves_pending_user_input() -> None:
     assert interrupted and interrupted[-1].payload["interruption_type"] == "user_input_required"
     assert interrupted[-1].payload["user_input"]["question"] == "which env?"
     assert asyncio.run(store.load("s_crashrec")).status == SessionStatus.INTERRUPTED
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        pytest.param("nested-arguments", id="nested-arguments"),
+        pytest.param("target-arguments", id="top-level-target"),
+    ],
+)
+def test_worker_recovery_rejects_corrupted_pending_user_input(
+    corruption: str,
+) -> None:
+    async def run() -> None:
+        session_id = f"s_corrupt_user_input_{corruption}"
+        provider = _ScriptedProvider(
+            [("call_1", "ask_user", {"question": "which env?", "options": ["dev"]})]
+        )
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool()],
+        )
+        await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+
+        def corrupt_checkpoint(_session, current):
+            updated = deepcopy({} if current is None else current)
+            pending = updated["pending_user_input"]
+            if corruption == "nested-arguments":
+                pending["tool_calls"][0]["arguments"] = {"question": "different question"}
+            elif corruption == "target-arguments":
+                pending["arguments"] = {"question": "different question"}
+            else:  # pragma: no cover - parametrization is exhaustive
+                raise AssertionError(f"Unknown corruption: {corruption}")
+            return updated
+
+        await store.transform_checkpoint(session_id, corrupt_checkpoint)
+        checkpoint_before = await store.load_checkpoint(session_id)
+        transcript_before = await store.load_transcript(session_id)
+        events_before = await store.load_events(session_id)
+        await store.update_status(session_id, SessionStatus.RUNNING)
+
+        with pytest.raises(
+            ValueError,
+            match="Pending user-input checkpoint is invalid and cannot be executed",
+        ):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+
+        assert await store.load_checkpoint(session_id) == checkpoint_before
+        assert await store.load_transcript(session_id) == transcript_before
+        assert await store.load_events(session_id) == events_before
+        assert len(provider.requests) == 1
+
+    asyncio.run(run())
 
 
 def test_recover_after_reused_id_prior_round_is_not_wrongly_rejected() -> None:
