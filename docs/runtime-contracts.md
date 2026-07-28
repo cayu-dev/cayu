@@ -2448,7 +2448,7 @@ required safety prefix, and repository-controlled-filter residual risk are in
 
 The first built-in tools are:
 
-- `read_file`: page through workspace text by byte `offset` without splitting UTF-8 scalars, returning continuation and complete-snapshot revision metadata; capture workspace image/PDF files as artifact snapshots when an artifact store is configured; read text artifacts by `artifact_id`; or return provider-neutral image/PDF attachment references for capable providers
+- `read_file`: page through workspace text by byte `offset` without splitting UTF-8 scalars. Workspace text results begin with a `[read_file metadata]` JSON block so the model sees `next_offset`, truncation state, and the opaque revision/sha256 from a complete offset-zero snapshot; the same fields remain available in structured result metadata for application consumers. The tool can also capture workspace image/PDF files as artifact snapshots when an artifact store is configured, read text artifacts by `artifact_id`, or return provider-neutral image/PDF attachment references for capable providers.
 - `write_file`: create a missing UTF-8 file or conditionally overwrite an existing revision, capped by `max_bytes`
 - `edit_file`: apply one or more exact, non-overlapping replacements against one complete UTF-8 snapshot as a conditional mutation
 - `delete_file`: delete one existing file through an opaque revision precondition

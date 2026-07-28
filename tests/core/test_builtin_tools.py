@@ -464,7 +464,7 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
         "revision": f"sha256:{hashlib.sha256(b'hello').hexdigest()}",
         "sha256": hashlib.sha256(b"hello").hexdigest(),
     }
-    assert read_result.content == "hello"
+    assert read_result.content.endswith("[/read_file metadata]\nhello")
     assert read_result.structured == {
         "source": "workspace",
         "path": "notes/result.txt",
@@ -484,6 +484,27 @@ def test_workspace_tools_read_write_and_list_files(tmp_path):
         "total_files": 1,
         "truncated": False,
     }
+
+
+def test_read_file_exposes_complete_revision_to_the_model(tmp_path):
+    content = b"hello"
+    (tmp_path / "notes.txt").write_bytes(content)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt"}))
+
+    revision = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    assert result.content == (
+        "[read_file metadata]\n"
+        f'{{"path":"notes.txt","bytes":5,"total_bytes":5,"offset":0,'
+        f'"next_offset":null,"revision":"{revision}","sha256":"{hashlib.sha256(content).hexdigest()}",'
+        '"truncated":false}\n'
+        "[/read_file metadata]\n"
+        "hello"
+    )
 
 
 def test_edit_file_applies_multiple_exact_replacements_atomically(tmp_path):
@@ -788,11 +809,13 @@ def test_read_file_pages_text_and_only_complete_snapshot_has_revision(tmp_path):
         )
     )
 
-    assert first.content.startswith("ab")
+    assert '"next_offset":2' in first.content
+    assert '"truncated":true' in first.content
+    assert first.content.endswith("[/read_file metadata]\nab")
     assert first.structured["offset"] == 0
     assert first.structured["next_offset"] == 2
     assert first.structured["revision"] is None
-    assert suffix.content == "cdef"
+    assert suffix.content.endswith("[/read_file metadata]\ncdef")
     assert suffix.structured["offset"] == 2
     assert suffix.structured["next_offset"] is None
     assert suffix.structured["revision"] is None
@@ -822,11 +845,11 @@ def test_read_file_pages_utf8_only_at_complete_scalar_boundaries(tmp_path):
         ReadFileTool().run(ctx, {"path": "notes.txt", "offset": 2, "max_bytes": 3})
     )
 
-    assert first.content.startswith("A")
+    assert first.content.endswith("[/read_file metadata]\nA")
     assert first.structured["next_offset"] == 1
-    assert second.content.startswith("€")
+    assert second.content.endswith("[/read_file metadata]\n€")
     assert second.structured["next_offset"] == 4
-    assert third.content == "B"
+    assert third.content.endswith("[/read_file metadata]\nB")
     assert split_start.is_error is True
     assert split_start.structured == {"error": "invalid_arguments"}
 
@@ -1075,21 +1098,23 @@ def test_read_file_still_reads_text_like_workspace_formats(tmp_path):
     java_result = asyncio.run(ReadFileTool().run(ctx, {"path": "src/Main.java"}))
 
     assert csv_result.is_error is False
-    assert csv_result.content == "name,score\ncayu,10\n"
+    assert csv_result.content.endswith("[/read_file metadata]\nname,score\ncayu,10\n")
     assert csv_result.structured["encoding"] == "utf-8"
     assert "binary" not in csv_result.structured
     assert html_result.is_error is False
-    assert html_result.content == "<h1>Cayu</h1>\n"
+    assert html_result.content.endswith("[/read_file metadata]\n<h1>Cayu</h1>\n")
     assert readme_result.is_error is False
-    assert readme_result.content == "Cayu workspace notes\n"
+    assert readme_result.content.endswith("[/read_file metadata]\nCayu workspace notes\n")
     assert readme_result.structured["encoding"] == "utf-8"
     assert "binary" not in readme_result.structured
     assert typescript_result.is_error is False
-    assert typescript_result.content == "export const name = 'cayu';\n"
+    assert typescript_result.content.endswith(
+        "[/read_file metadata]\nexport const name = 'cayu';\n"
+    )
     assert typescript_result.structured["encoding"] == "utf-8"
     assert "binary" not in typescript_result.structured
     assert java_result.is_error is False
-    assert java_result.content == "class Main {}\n"
+    assert java_result.content.endswith("[/read_file metadata]\nclass Main {}\n")
     assert java_result.structured["encoding"] == "utf-8"
     assert "binary" not in java_result.structured
 
@@ -1628,7 +1653,7 @@ def test_read_file_extends_default_artifact_readers(tmp_path):
     pdf_result = asyncio.run(tool.run(ctx, {"artifact_id": pdf.id}))
     text_result = asyncio.run(tool.run(ctx, {"artifact_id": text.id}))
 
-    assert workspace_result.content == "workspace ok"
+    assert workspace_result.content.endswith("[/read_file metadata]\nworkspace ok")
     assert pdf_result.content == "custom pdf reader: invoice.pdf"
     assert pdf_result.structured["reader"] == "custom"
     assert text_result.content == "text artifact ok"
@@ -1834,7 +1859,9 @@ def test_builtin_tools_truncate_model_facing_large_outputs(tmp_path):
         )
     )
 
-    assert read_result.content == "abc\n\n[file truncated]"
+    assert '"next_offset":3' in read_result.content
+    assert '"truncated":true' in read_result.content
+    assert read_result.content.endswith("[/read_file metadata]\nabc")
     assert read_result.structured["truncated"] is True
     assert read_result.structured["total_bytes"] == 6
     assert list_result.content.endswith("[file list truncated]")

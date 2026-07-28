@@ -1277,7 +1277,8 @@ def test_builtin_file_tools_use_runner_workspace(tmp_path) -> None:
 
     assert write_result.is_error is False
     assert "Wrote 16 bytes" in write_result.content
-    assert read_result.content == "runner workspace"
+    assert read_result.content.endswith("[/read_file metadata]\nrunner workspace")
+    assert '"revision":"sha256:' in read_result.content
     assert list_result.structured == {
         "pattern": "**/*.txt",
         "files": ["notes/result.txt"],

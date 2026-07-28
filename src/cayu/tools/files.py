@@ -4,6 +4,7 @@ import asyncio
 import difflib
 import hashlib
 import io
+import json
 import mimetypes
 import ntpath
 import posixpath
@@ -149,9 +150,12 @@ def _read_file_tool_spec(
         description=(
             "Read a file from the active workspace or read an artifact by id. "
             "Use `path` for workspace files and `artifact_id` for uploaded/generated artifacts. "
-            "Text files return text. Workspace image/PDF files are captured as artifact "
-            "snapshots when an artifact store is configured. Image and PDF artifacts return "
-            "provider-neutral file attachments that capable providers can inspect natively."
+            "Workspace text results begin with model-visible JSON metadata. A complete offset-zero "
+            "read includes the opaque revision required by edit_file, write_file overwrite mode, "
+            "and delete_file; paged reads include next_offset. Workspace image/PDF files are "
+            "captured as artifact snapshots when an artifact store is configured. Image and PDF "
+            "artifacts return provider-neutral file attachments that capable providers can inspect "
+            "natively."
         ),
         input_schema={
             "type": "object",
@@ -365,21 +369,40 @@ async def _read_workspace_file(
     text = page.decode("utf-8")
     truncated = next_offset is not None
     complete = offset == 0 and not truncated
+    structured = {
+        "source": "workspace",
+        "path": path,
+        "bytes": len(page),
+        "total_bytes": result.total_bytes,
+        "offset": offset,
+        "next_offset": next_offset,
+        "revision": result.revision if complete else None,
+        "sha256": result.sha256 if complete else None,
+        "encoding": "utf-8",
+        "truncated": truncated,
+    }
     return ToolResult(
-        content=f"{text}\n\n[file truncated]" if truncated else text,
-        structured={
-            "source": "workspace",
-            "path": path,
-            "bytes": len(page),
-            "total_bytes": result.total_bytes,
-            "offset": offset,
-            "next_offset": next_offset,
-            "revision": result.revision if complete else None,
-            "sha256": result.sha256 if complete else None,
-            "encoding": "utf-8",
-            "truncated": truncated,
-        },
+        content=_model_visible_workspace_text(text, structured),
+        structured=structured,
     )
+
+
+def _model_visible_workspace_text(text: str, structured: dict) -> str:
+    metadata = {
+        key: structured[key]
+        for key in (
+            "path",
+            "bytes",
+            "total_bytes",
+            "offset",
+            "next_offset",
+            "revision",
+            "sha256",
+            "truncated",
+        )
+    }
+    encoded = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+    return f"[read_file metadata]\n{encoded}\n[/read_file metadata]\n{text}"
 
 
 def _utf8_workspace_page(
