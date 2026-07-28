@@ -568,10 +568,11 @@ def _non_turn_model_completion_event(
     event: Event,
     *,
     failure: BaseException,
+    cancellation: asyncio.CancelledError | None,
     transcript_cursor: int,
 ) -> Event:
     payload = copy_durable_json_object(event.payload, "model_completion_payload")
-    if _model_completion_cancellation(failure) is not None:
+    if cancellation is not None:
         reason = "model stream was cancelled before terminal validation completed"
     elif isinstance(failure, SessionInterruptedByRequest):
         reason = "session interruption won before terminal validation completed"
@@ -698,6 +699,7 @@ async def _publish_model_completion(
     request: ModelCompletionPublicationRequest,
     *,
     terminal_failure: BaseException | None,
+    publication_cancellation: asyncio.CancelledError | None,
 ) -> None:
     expected_request = request
     callback_request = ModelCompletionPublicationRequest(
@@ -707,7 +709,6 @@ async def _publish_model_completion(
         authoritative_assistant_message=request.authoritative_assistant_message,
         structured_output_validation=request.structured_output_validation,
     )
-    publication_cancellation = _model_completion_cancellation(terminal_failure)
     if publication_cancellation is not None:
         assert terminal_failure is not None
 
@@ -754,7 +755,20 @@ async def _publish_model_completion(
                         f"{type(validation_error).__name__}: {validation_error}"
                     ),
                 )
-        raise terminal_failure
+        if terminal_failure is publication_cancellation or (
+            isinstance(terminal_failure, BaseExceptionGroup)
+            and any(
+                candidate is publication_cancellation
+                for candidate in iter_exception_tree(terminal_failure)
+            )
+        ):
+            raise terminal_failure
+        add_exception_note_safely(
+            publication_cancellation,
+            "The provider suppressed caller cancellation before raising "
+            f"{type(terminal_failure).__name__}.",
+        )
+        raise publication_cancellation from terminal_failure
 
     try:
         result = await publisher(callback_request)
@@ -768,20 +782,27 @@ async def _publish_model_completion(
         raise
 
 
-def _model_completion_cancellation(
+def _take_model_completion_cancellation(
     failure: BaseException | None,
+    *,
+    cancellation_baseline: int,
 ) -> asyncio.CancelledError | None:
-    if isinstance(failure, asyncio.CancelledError):
-        return failure
-    if not isinstance(failure, BaseExceptionGroup):
+    """Take caller cancellation newer than the provider-boundary baseline."""
+
+    task = asyncio.current_task()
+    if task is None or task.cancelling() <= cancellation_baseline:
         return None
-    return next(
+    cancellation = next(
         (
             candidate
-            for candidate in iter_exception_tree(failure)
+            for candidate in (() if failure is None else iter_exception_tree(failure))
             if isinstance(candidate, asyncio.CancelledError)
         ),
         None,
+    )
+    return consume_pending_task_cancellation(
+        cancellation,
+        preserve_requests=cancellation_baseline,
     )
 
 
@@ -1768,6 +1789,13 @@ class ModelStepExecutor:
             raise RuntimeError(
                 "Model completion staging and publication must be configured together."
             )
+        # Deliver a cancellation already pending before the dispatch boundary.
+        # A request count retained after this checkpoint is historical; only a
+        # later generation can classify provider or cleanup failure as caller
+        # cancellation.
+        await asyncio.sleep(0)
+        current_task = asyncio.current_task()
+        provider_cancellation_baseline = 0 if current_task is None else current_task.cancelling()
         # This is the accounting boundary: after the callback returns, the next
         # expression enters provider-controlled code and billable work may occur.
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
@@ -1995,12 +2023,12 @@ class ModelStepExecutor:
             if model_completion_publisher is None or not model_completed:
                 raise
             post_completion_failure = exc
+        except GeneratorExit as exc:
+            if model_completion_publisher is None or not model_completed:
+                raise
+            post_completion_failure = exc
         except BaseExceptionGroup as exc:
-            if (
-                model_completion_publisher is None
-                or not model_completed
-                or not exception_tree_contains(exc, asyncio.CancelledError)
-            ):
+            if model_completion_publisher is None or not model_completed:
                 raise
             post_completion_failure = exc
         except ModelAttemptFailed as exc:
@@ -2093,23 +2121,16 @@ class ModelStepExecutor:
                     )
             else:  # pragma: no cover - every Exception has a control or durable failure
                 raise RuntimeError("Provider exception handling lost its failure state.") from None
+        except BaseException as exc:
+            if model_completion_publisher is None or not model_completed:
+                raise
+            post_completion_failure = exc
         finally:
             if provider_events is not None and not provider_exhausted:
                 try:
                     await _close_async_iterator(provider_events)
-                except asyncio.CancelledError as exc:
+                except BaseException as exc:
                     if model_completion_publisher is None or not model_completed:
-                        raise
-                    post_completion_failure = _combine_post_completion_failures(
-                        post_completion_failure,
-                        exc,
-                    )
-                except BaseExceptionGroup as exc:
-                    if (
-                        model_completion_publisher is None
-                        or not model_completed
-                        or not exception_tree_contains(exc, asyncio.CancelledError)
-                    ):
                         raise
                     post_completion_failure = _combine_post_completion_failures(
                         post_completion_failure,
@@ -2132,6 +2153,20 @@ class ModelStepExecutor:
                     await self._session_control.raise_if_interrupted(session.id)
                 except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
                     terminal_failure = exc
+            publication_cancellation = _take_model_completion_cancellation(
+                terminal_failure,
+                cancellation_baseline=provider_cancellation_baseline,
+            )
+            if publication_cancellation is not None and terminal_failure is None:
+                terminal_failure = publication_cancellation
+            elif publication_cancellation is None and isinstance(
+                terminal_failure,
+                asyncio.CancelledError,
+            ):
+                terminal_failure = unexpected_child_cancellation_error(
+                    terminal_failure,
+                    operation="Model provider stream",
+                )
 
             durable_step_result = None
             structured_output_validation = None
@@ -2181,6 +2216,7 @@ class ModelStepExecutor:
                 else _non_turn_model_completion_event(
                     completion_event,
                     failure=terminal_failure,
+                    cancellation=publication_cancellation,
                     transcript_cursor=completion_dispatch.stage.source_transcript_cursor,
                 )
             )
@@ -2197,8 +2233,13 @@ class ModelStepExecutor:
                 model_completion_publisher,
                 publication_request,
                 terminal_failure=terminal_failure,
+                publication_cancellation=publication_cancellation,
             )
-            yield copy_event(publication_event), None
+            if terminal_failure is None or not exception_tree_contains(
+                terminal_failure,
+                GeneratorExit,
+            ):
+                yield copy_event(publication_event), None
             if terminal_failure is not None:
                 raise terminal_failure
 
@@ -5877,19 +5918,21 @@ def _payload_model(payload: dict[str, Any], *, fallback: str) -> str:
 
 
 async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
-    close = getattr(iterator, "aclose", None)
-    if close is not None:
-        # Iterator disposal runs while a more authoritative provider, budget,
-        # cancellation, or GeneratorExit outcome is already propagating.
-        try:
+    # Iterator disposal runs while a more authoritative provider, budget,
+    # cancellation, or GeneratorExit outcome is already propagating. Attribute
+    # lookup is provider-controlled too, so it belongs inside the same boundary
+    # as invoking the close hook.
+    try:
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
             await close()
-        except ExceptionGroup:
-            # Ordinary cleanup failures remain secondary to the outcome that
-            # caused iterator disposal.
-            pass
-        except BaseExceptionGroup:
-            # A mixed group also carries a fatal signal such as cancellation.
-            # Preserve the complete group for the caller to classify.
-            raise
-        except Exception:
-            pass
+    except ExceptionGroup:
+        # Ordinary cleanup failures remain secondary to the outcome that
+        # caused iterator disposal.
+        pass
+    except BaseExceptionGroup:
+        # A mixed group also carries a fatal signal such as cancellation.
+        # Preserve the complete group for the caller to classify.
+        raise
+    except Exception:
+        pass

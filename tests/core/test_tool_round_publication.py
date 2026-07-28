@@ -18,6 +18,7 @@ from cayu.runtime._tool_round_publication import (
     collect_tool_round_publication_evidence,
     prepare_tool_round_publication,
     publish_tool_round_publication,
+    publish_tool_round_with_exact_replay,
 )
 from cayu.runtime._tool_round_recovery import (
     PENDING_TOOL_ROUND_CHECKPOINT_KEY,
@@ -1070,6 +1071,90 @@ class _LostPublicationAcknowledgementStore(InMemorySessionStore):
         return result
 
 
+class _ProviderControlledExceptionGroup(BaseExceptionGroup):
+    @property
+    def exceptions(self):
+        raise RuntimeError("workload-secret-from-overridden-accessor")
+
+
+class _CommitThenProviderControlledGroupStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+        self.cancellation = asyncio.CancelledError("publication caller stopped")
+        self.failure = _ProviderControlledExceptionGroup(
+            "provider-controlled publication failure",
+            [
+                self.cancellation,
+                RuntimeError("publication acknowledgement cleanup failed"),
+            ],
+        )
+
+    async def publish_runtime_publication(self, session_id, *, request, **kwargs):
+        self.calls += 1
+        result = await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            **kwargs,
+        )
+        if self.calls == 1:
+            raise self.failure
+        return result
+
+
+def test_exact_replay_safely_traverses_provider_controlled_exception_group() -> None:
+    async def scenario() -> tuple[BaseExceptionGroup, int, bool]:
+        store, session = await _created_store(
+            _CommitThenProviderControlledGroupStore(),
+            session_id="session-hostile-exception-group",
+        )
+        pending_round = _pending_round()
+        source_checkpoint = _source_checkpoint(pending_round)
+        events = _lifecycle_events(
+            pending_round,
+            session_id=session.id,
+        )
+        await store.checkpoint(session.id, source_checkpoint)
+        await store.append_events(session.id, events)
+        prepared = prepare_tool_round_publication(
+            session_id=session.id,
+            pending_round=pending_round,
+            source_checkpoint=source_checkpoint,
+            durable_events=events,
+            expected_statuses={SessionStatus.PENDING},
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=0,
+        )
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+        )
+
+        async def publish() -> None:
+            await publish_tool_round_with_exact_replay(
+                prepared,
+                session_store=store,
+                event_writer=writer,
+            )
+
+        publishing = asyncio.create_task(publish())
+        with pytest.raises(BaseExceptionGroup) as raised:
+            await publishing
+
+        assert raised.value is store.failure
+        assert store.calls == 2
+        assert len(await store.load_transcript(session.id)) == 1
+        assert await store.load_checkpoint(session.id) == {"unrelated": {"keep": True}}
+        return raised.value, publishing.cancelling(), publishing.cancelled()
+
+    failure, cancelling, cancelled = asyncio.run(scenario())
+
+    assert isinstance(failure, _ProviderControlledExceptionGroup)
+    assert cancelling == 0
+    assert cancelled is False
+
+
 def test_ambiguous_acknowledgement_reuses_exact_prepared_request() -> None:
     async def scenario() -> None:
         store, session = await _created_store(
@@ -1182,6 +1267,64 @@ def test_cancellation_waits_for_commit_and_retains_replayable_request() -> None:
         assert len(await store.load_transcript(session.id)) == 1
 
     asyncio.run(scenario())
+
+
+def test_exact_replay_preserves_repeated_real_caller_cancellation() -> None:
+    async def scenario() -> tuple[int, bool]:
+        store, session = await _created_store(
+            _CommitThenBlockStore(),
+            session_id="session-repeated-cancellation",
+        )
+        pending_round = _pending_round()
+        source_checkpoint = _source_checkpoint(pending_round)
+        events = _lifecycle_events(pending_round, session_id=session.id)
+        await store.checkpoint(session.id, source_checkpoint)
+        await store.append_events(session.id, events)
+        prepared = prepare_tool_round_publication(
+            session_id=session.id,
+            pending_round=pending_round,
+            source_checkpoint=source_checkpoint,
+            durable_events=events,
+            expected_statuses={SessionStatus.PENDING},
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=0,
+        )
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+        )
+
+        async def publish() -> None:
+            cancellation = await publish_tool_round_with_exact_replay(
+                prepared,
+                session_store=store,
+                event_writer=writer,
+            )
+            if cancellation is not None:
+                raise cancellation
+
+        publishing = asyncio.create_task(publish())
+        await store.committed.wait()
+        publishing.cancel("first caller cancellation")
+        publishing.cancel("second caller cancellation")
+        store.release_acknowledgement.set()
+
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await publishing
+        assert raised.value.args == ("first caller cancellation",)
+        assert len(await store.load_transcript(session.id)) == 1
+        receipt = await store.load_runtime_publication_receipt(
+            session.id,
+            prepared.request.publication_id,
+        )
+        assert receipt is not None
+        return publishing.cancelling(), publishing.cancelled()
+
+    cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 0
+    assert cancelled is True
 
 
 class _BlockBeforeCommitStore(InMemorySessionStore):

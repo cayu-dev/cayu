@@ -17,6 +17,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from cayu._exception_groups import add_exception_note_safely
 from cayu._task_wait import (
     await_shielded_task_outcome,
     unexpected_child_cancellation_error,
@@ -395,80 +396,79 @@ async def publish_tool_round_with_exact_replay(
         )
         return None
     except (BaseExceptionGroup, Exception, asyncio.CancelledError) as publication_error:
-        abandonment = _publication_abandonment_signal(publication_error)
-        if isinstance(abandonment, GeneratorExit):
-            raise
-        cancellation = abandonment if isinstance(abandonment, asyncio.CancelledError) else None
-        if cancellation is not None:
-            _clear_current_task_cancellation()
-        try:
+        # ``publish_tool_round_publication`` converts child-only scalar
+        # cancellation to an operational error. A scalar cancellation crossing
+        # this runtime-owned boundary is therefore authoritative caller
+        # cancellation; a cancellation nested in a store-controlled group is
+        # not. Preserve fatal child groups after reconciling their possibly
+        # committed publication instead of forging caller cancellation from one
+        # of their leaves.
+        cancellation = (
+            publication_error if isinstance(publication_error, asyncio.CancelledError) else None
+        )
+        fatal_child_group = (
+            publication_error
+            if isinstance(publication_error, BaseExceptionGroup)
+            and not isinstance(publication_error, ExceptionGroup)
+            else None
+        )
+
+        async def reconcile() -> bool:
             receipt = await session_store.load_runtime_publication_receipt(
                 prepared.session_id,
                 prepared.request.publication_id,
             )
-        except BaseException as receipt_error:
-            if cancellation is not None:
-                cancellation.add_note(
-                    "Tool-round receipt reconciliation failed: "
-                    f"{type(receipt_error).__name__}: {receipt_error}"
-                )
-                raise cancellation from receipt_error
-            receipt_error.add_note(
-                "Tool-round receipt reconciliation also failed after "
-                f"{type(publication_error).__name__}."
-            )
-            raise receipt_error from publication_error
-        if receipt is None:
-            if cancellation is not None and publication_error is not cancellation:
-                cancellation.add_note(
-                    "Tool-round publication failed before a durable receipt could be reconstructed."
-                )
-                raise cancellation from publication_error
-            raise
-        try:
+            if receipt is None:
+                return False
             await publish_tool_round_publication(
                 prepared,
                 session_store=session_store,
                 event_writer=event_writer,
             )
-        except BaseException as replay_error:
-            if cancellation is not None:
-                cancellation.add_note(
-                    "Exact tool-round publication replay failed: "
-                    f"{type(replay_error).__name__}: {replay_error}"
+            return True
+
+        reconciliation_task = asyncio.create_task(reconcile())
+        outcome = await await_shielded_task_outcome(
+            reconciliation_task,
+            cancellation=cancellation,
+        )
+        cancellation = outcome.cancellation
+        if outcome.error is not None:
+            reconciliation_error = outcome.error
+            if isinstance(reconciliation_error, asyncio.CancelledError):
+                reconciliation_error = unexpected_child_cancellation_error(
+                    reconciliation_error,
+                    operation="Tool-round publication reconciliation",
                 )
-                raise cancellation from replay_error
-            replay_error.add_note(
-                "Exact tool-round publication replay also failed after "
-                f"{type(publication_error).__name__}."
+            if cancellation is not None:
+                add_exception_note_safely(
+                    cancellation,
+                    "Tool-round publication reconciliation failed: "
+                    f"{type(reconciliation_error).__name__}.",
+                )
+                raise cancellation from reconciliation_error
+            add_exception_note_safely(
+                reconciliation_error,
+                "Tool-round publication reconciliation also failed after "
+                f"{type(publication_error).__name__}.",
             )
-            raise replay_error from publication_error
-        return cancellation
-
-
-def _publication_abandonment_signal(
-    error: BaseException | None,
-) -> GeneratorExit | asyncio.CancelledError | None:
-    if isinstance(error, GeneratorExit | asyncio.CancelledError):
-        return error
-    if isinstance(error, BaseExceptionGroup):
-        generator_exit: GeneratorExit | None = None
-        for child in error.exceptions:
-            abandonment = _publication_abandonment_signal(child)
-            if isinstance(abandonment, asyncio.CancelledError):
-                return abandonment
-            if isinstance(abandonment, GeneratorExit) and generator_exit is None:
-                generator_exit = abandonment
-        return generator_exit
-    return None
-
-
-def _clear_current_task_cancellation() -> None:
-    task = asyncio.current_task()
-    if task is None:
-        return
-    while task.cancelling():
-        task.uncancel()
+            raise reconciliation_error from publication_error
+        if outcome.result is not True:
+            if cancellation is not None:
+                add_exception_note_safely(
+                    cancellation,
+                    (
+                        "Tool-round publication failed before a durable receipt could be "
+                        "reconstructed."
+                    ),
+                )
+                raise cancellation from publication_error
+            raise publication_error
+        if cancellation is not None:
+            return cancellation
+        if fatal_child_group is not None:
+            raise fatal_child_group from None
+        return None
 
 
 def _build_tool_round_publication_request(
