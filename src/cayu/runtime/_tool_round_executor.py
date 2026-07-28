@@ -52,6 +52,7 @@ from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._checkpoint_redaction import (
@@ -105,6 +106,7 @@ from cayu.runtime.sessions import (
     McpManifestHistoryConflict,
     McpManifestPublicationResult,
     Session,
+    SessionStatus,
     SessionStore,
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
@@ -642,6 +644,20 @@ class ToolRoundExecutor:
             structured_output=structured_output,
             tool_round_identity=tool_round_identity,
             redactor=redactor,
+        )
+
+    def redactor_for_tool_calls(
+        self,
+        *,
+        registered_agent: runtime_records.RegisteredAgentState,
+        tool_calls: list[runtime_records.ToolCallRequest],
+    ) -> SecretRedactor:
+        """Compose app and adapter-owned secrets for a tool publication boundary."""
+
+        return _redactor_for_tool_calls(
+            self._secret_redactor,
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
         )
 
     async def checkpoint_without_pending_tool_round(
@@ -2037,6 +2053,7 @@ class ToolRoundRun:
         executor = self._executor
         session = self._session
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
+        durable_lifecycle_events: list[Event] = []
         try:
             await executor._session_control.raise_if_interrupted(session.id)
             policy_plan = await executor.policy_plan(
@@ -2173,7 +2190,6 @@ class ToolRoundRun:
             raise UserInputRequired(pending_input)
 
         segments = self._tool_round_segments(tool_calls)
-        any_parallel = any(run_parallel for run_parallel, _ in segments)
         try:
             for run_parallel, segment_calls in segments:
                 if run_parallel:
@@ -2196,6 +2212,10 @@ class ToolRoundRun:
                     )
                 async for event, outcome in call_stream:
                     yield event
+                    if event.type == EventType.TOOL_CALL_STARTED or (
+                        event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES
+                    ):
+                        durable_lifecycle_events.append(copy_event(event))
                     if outcome is not None:
                         tool_outcomes.append(outcome)
                 if self.stopped_for_limit:
@@ -2213,29 +2233,34 @@ class ToolRoundRun:
                 yield event
             raise
 
-        tool_result_messages = ordered_tool_result_messages(
-            tool_calls,
-            tool_outcomes,
-            parallel=any_parallel,
-            tool_round_identity=tool_round_identity,
+        source_checkpoint = await executor._session_store.load_checkpoint(session.id)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(source_checkpoint)
+        if (
+            pending_round is None
+            or tool_round_recovery.pending_tool_round_identity(pending_round) != tool_round_identity
+        ):
+            raise RuntimeError("The durable pending tool round changed before publication.")
+        prepared_publication = tool_round_publication.prepare_tool_round_publication(
+            session_id=session.id,
+            pending_round=pending_round,
+            source_checkpoint=source_checkpoint,
+            durable_events=durable_lifecycle_events,
+            expected_statuses={
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+            },
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=len(messages),
         )
-        messages.extend(tool_result_messages)
-        cleared_checkpoint = await executor.checkpoint_without_pending_tool_round(session.id)
-        try:
-            await executor._session_store.append_transcript_messages_and_transform_checkpoint(
-                session.id,
-                tool_result_messages,
-                executor._checkpoint_transform(cleared_checkpoint),
-            )
-        except asyncio.CancelledError:
-            if await executor._session_control.interrupt_requested(session.id):
-                clear_current_task_cancellation()
-                await executor._session_store.append_transcript_messages_and_transform_checkpoint(
-                    session.id,
-                    tool_result_messages,
-                    executor._checkpoint_transform(cleared_checkpoint),
-                )
-            raise
+        cancellation = await tool_round_publication.publish_tool_round_with_exact_replay(
+            prepared_publication,
+            session_store=executor._session_store,
+            event_writer=executor._event_writer,
+        )
+        messages.extend(prepared_publication.request.transcript_messages)
+        if cancellation is not None:
+            raise cancellation
+        await executor._session_control.raise_if_interrupted(session.id)
 
     async def _apply_limit_evaluation(
         self,
@@ -2473,7 +2498,7 @@ class ToolRoundRun:
         for index, tool_call in enumerate(tool_calls):
             if all(outcome is None for _, outcome in buffers[index]):
                 buffers[index].append(
-                    self._abnormal_tool_termination_item(
+                    await self._abnormal_tool_termination_item(
                         tool_call=tool_call,
                         tool_round_identity=tool_round_identity,
                     )
@@ -2482,7 +2507,7 @@ class ToolRoundRun:
             for item in buffer:
                 yield item
 
-    def _abnormal_tool_termination_item(
+    async def _abnormal_tool_termination_item(
         self,
         *,
         tool_call: runtime_records.ToolCallRequest,
@@ -2508,7 +2533,7 @@ class ToolRoundRun:
             "result": result.model_dump(),
             **copy_tool_round_identity(tool_round_identity).payload(),
         }
-        return (
+        event = await self._executor._event_writer.emit(
             Event(
                 type=EventType.TOOL_CALL_FAILED,
                 session_id=self._session.id,
@@ -2516,7 +2541,10 @@ class ToolRoundRun:
                 environment_name=self._environment_name,
                 tool_name=tool_call.name,
                 payload=payload,
-            ),
+            )
+        )
+        return (
+            event,
             runtime_records.ToolCallOutcome(call=tool_call, result=result),
         )
 

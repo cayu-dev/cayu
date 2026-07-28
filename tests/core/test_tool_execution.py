@@ -524,6 +524,8 @@ def test_parallel_spontaneous_cancel_does_not_brick_the_round() -> None:
         tool_round_id=abnormal_event.payload["tool_round_id"],
         tool_call_id="call_1",
     )
+    durable_events = asyncio.run(app.session_store.load_events("s_cancel"))
+    assert any(event == abnormal_event for event in durable_events)
 
 
 def test_max_parallel_one_runs_sequentially() -> None:

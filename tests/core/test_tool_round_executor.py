@@ -28,6 +28,7 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
+from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
 from cayu.runtime.execution_units import ToolRoundIdentity
 
 
@@ -203,16 +204,31 @@ def test_tool_round_interrupt_close_persists_missing_results():
     app, store, _ = _app_with_completed_session("sess_guard_interrupt")
 
     async def scenario() -> tuple[list[Event], list[Message]]:
-        session = await store.load("sess_guard_interrupt")
-        assert session is not None
+        session = await store.transition_status(
+            "sess_guard_interrupt",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
         runner = _tool_round_run(app, session, limits=RunLimits())
-        messages: list[Message] = []
+        tool_calls = [_tool_call()]
+        checkpoint, _pending_round = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        messages = await store.load_transcript(session.id)
         events = [
             event
             async for event in runner.close_after_interrupt(
                 SessionInterruptedByRequest(session.id),
                 messages=messages,
-                tool_calls=[_tool_call()],
+                tool_calls=tool_calls,
                 tool_outcomes=[],
                 tool_round_identity=_tool_round_identity(),
             )
@@ -224,7 +240,7 @@ def test_tool_round_interrupt_close_persists_missing_results():
     assert [event.type for event in events] == [EventType.TOOL_CALL_FAILED]
     assert events[0].payload["tool_call_id"] == "call_1"
     assert events[0].payload["tool_round_id"] == f"tround_{'3' * 32}"
-    assert [message.role for message in messages] == ["tool"]
+    assert messages[-1].role == "tool"
     transcript = asyncio.run(store.load_transcript("sess_guard_interrupt"))
     assert [message.role for message in transcript] == ["user", "assistant", "tool"]
 
@@ -233,18 +249,35 @@ def test_tool_round_interrupt_close_handles_requested_cancellation():
     app, store, _ = _app_with_completed_session("sess_guard_cancel_interrupt")
 
     async def scenario() -> tuple[list[Event], list[Message]]:
-        session = await store.update_status(
+        session = await store.transition_status(
             "sess_guard_cancel_interrupt",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+        session = await store.update_status(
+            session.id,
             SessionStatus.INTERRUPTING,
         )
         runner = _tool_round_run(app, session, limits=RunLimits())
-        messages: list[Message] = []
+        tool_calls = [_tool_call()]
+        checkpoint, _pending_round = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        messages = await store.load_transcript(session.id)
         events = [
             event
             async for event in runner.close_after_interrupt(
                 asyncio.CancelledError(),
                 messages=messages,
-                tool_calls=[_tool_call()],
+                tool_calls=tool_calls,
                 tool_outcomes=[],
                 tool_round_identity=_tool_round_identity(),
             )
@@ -255,7 +288,7 @@ def test_tool_round_interrupt_close_handles_requested_cancellation():
 
     assert [event.type for event in events] == [EventType.TOOL_CALL_FAILED]
     assert events[0].payload["tool_call_id"] == "call_1"
-    assert [message.role for message in messages] == ["tool"]
+    assert messages[-1].role == "tool"
 
 
 def test_tool_round_interrupt_close_rejects_unrelated_exceptions():
@@ -282,18 +315,33 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
     app, store, tool = _app_with_completed_session("sess_runner_limit")
 
     async def scenario() -> tuple[list[Event], bool]:
-        session = await store.load("sess_runner_limit")
-        assert session is not None
+        session = await store.transition_status(
+            "sess_runner_limit",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
         runner = _tool_round_run(
             app,
             session,
             limits=RunLimits(max_total_tokens=10),
         )
+        tool_calls = [_tool_call()]
+        checkpoint, _pending_round = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
         events = [
             event
             async for event in runner.run(
-                messages=[],
-                tool_calls=[_tool_call()],
+                messages=await store.load_transcript(session.id),
+                tool_calls=tool_calls,
                 tool_round_identity=_tool_round_identity(),
             )
         ]
@@ -315,22 +363,39 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
     app, store, tool = _app_with_completed_session("sess_runner_execute")
 
     async def scenario() -> tuple[list[Event], list[Message], bool]:
-        session = await store.load("sess_runner_execute")
-        assert session is not None
+        session = await store.transition_status(
+            "sess_runner_execute",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
         runner = _tool_round_run(
             app,
             session,
             limits=RunLimits(max_total_tokens=100),
         )
-        messages: list[Message] = []
+        tool_calls = [_tool_call()]
+        source_checkpoint = await store.load_checkpoint(session.id)
+        checkpoint, _pending_round = checkpoint_with_pending_tool_round(
+            source_checkpoint,
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        messages = await store.load_transcript(session.id)
         events = [
             event
             async for event in runner.run(
                 messages=messages,
-                tool_calls=[_tool_call()],
+                tool_calls=tool_calls,
                 tool_round_identity=_tool_round_identity(),
             )
         ]
+        await store.release_run_fence(session.id)
         return events, messages, runner.stopped_for_limit
 
     events, messages, stopped_for_limit = asyncio.run(scenario())
@@ -341,7 +406,7 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
         EventType.TOOL_CALL_COMPLETED,
     ]
     assert tool.calls == [{}]
-    assert [message.role for message in messages] == ["tool"]
+    assert messages[-1].role == "tool"
     transcript = asyncio.run(store.load_transcript("sess_runner_execute"))
     assert transcript[-1].role == "tool"
 
@@ -366,22 +431,39 @@ def test_tool_round_budget_gate_retains_the_originating_model_attempt() -> None:
     identity = _tool_round_identity()
 
     async def scenario() -> list[Event]:
-        session = await store.load("sess_tool_round_budget_identity")
-        assert session is not None
+        session = await store.transition_status(
+            "sess_tool_round_budget_identity",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
         runner = _tool_round_run(
             app,
             session,
             limits=RunLimits(),
             budget_limits=(budget_limit,),
         )
-        return [
+        tool_calls = [_tool_call()]
+        checkpoint, _pending_round = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=identity,
+        )
+        await store.checkpoint(session.id, checkpoint)
+        events = [
             event
             async for event in runner.run(
-                messages=[],
-                tool_calls=[_tool_call()],
+                messages=await store.load_transcript(session.id),
+                tool_calls=tool_calls,
                 tool_round_identity=identity,
             )
         ]
+        await store.release_run_fence(session.id)
+        return events
 
     events = asyncio.run(scenario())
 
