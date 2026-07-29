@@ -9330,6 +9330,150 @@ def test_session_store_conformance_admits_resume_input_with_start_event(
     asyncio.run(run())
 
 
+def test_session_store_conformance_interaction_transition_is_atomic_and_reconstructable(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_interaction_transition_conformance"
+            interaction_id = "interaction-transition-conformance"
+            started = Event(
+                id="evt_interaction_transition_started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+                interaction_started_event=started,
+                interaction_source_messages=[Message.text("user", "start")],
+            )
+            failed = Event(
+                id="evt_interaction_transition_failed",
+                type=EventType.INTERACTION_FAILED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            published = await store.publish_interaction_transition(
+                session_id,
+                event=failed,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.FAILED,
+            )
+            assert published.status_changed is True
+            assert published.replayed is False
+            assert published.session.status is SessionStatus.FAILED
+            assert published.event == failed
+
+            store = await _reopen_store(session_store_case, store)
+            replayed = await store.publish_interaction_transition(
+                session_id,
+                event=failed,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.FAILED,
+            )
+            assert replayed.status_changed is True
+            assert replayed.replayed is True
+            assert replayed.session.status is SessionStatus.FAILED
+            assert replayed.event == failed
+            records = await store.query_events(
+                EventQuery(session_id=session_id, event_id=failed.id)
+            )
+            assert [record.event for record in records] == [failed]
+
+            with pytest.raises(ValueError, match="different data"):
+                await store.publish_interaction_transition(
+                    session_id,
+                    event=failed.model_copy(update={"payload": {"changed": True}}),
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=SessionStatus.FAILED,
+                )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_interaction_completion_replays_queue_decision(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_interaction_completion_queue_conformance"
+            interaction_id = "interaction-completion-queue-conformance"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="evt_interaction_completion_queue_started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                ),
+                interaction_source_messages=[Message.text("user", "start")],
+            )
+            await store.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=session_id,
+                    idempotency_key="queued-before-interaction-completion",
+                    content="continue",
+                    delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                )
+            )
+            completed = Event(
+                id="evt_interaction_completion_queue_completed",
+                type=EventType.INTERACTION_COMPLETED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            publication = await store.publish_interaction_transition(
+                session_id,
+                event=completed,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+                only_if_no_queued_messages=True,
+            )
+            assert publication.status_changed is False
+            assert publication.session.status is SessionStatus.RUNNING
+
+            await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=False,
+                interaction_id="interaction-after-queued-completion",
+                interaction_started_event=Event(
+                    id="evt_interaction_after_queued_completion_started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id="interaction-after-queued-completion",
+                ),
+            )
+            replayed = await store.publish_interaction_transition(
+                session_id,
+                event=completed,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+                only_if_no_queued_messages=True,
+            )
+            assert replayed.replayed is True
+            assert replayed.status_changed is False
+            assert replayed.session.status is SessionStatus.RUNNING
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_materializes_deferred_interaction_input_fallback(
     session_store_case,
 ) -> None:

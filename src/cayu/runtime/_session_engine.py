@@ -250,6 +250,7 @@ from cayu.runtime.sessions import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryRequest,
+    InteractionTransitionResult,
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
@@ -260,7 +261,6 @@ from cayu.runtime.sessions import (
     SessionOperationPublication,
     SessionOrder,
     SessionQuery,
-    SessionQueuedMessagesPending,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
@@ -2214,7 +2214,7 @@ class SessionEngine:
             status=InteractionStatus.ACTIVE,
         )
 
-    async def _emit_interaction_state(
+    async def _prepare_interaction_state_event(
         self,
         *,
         session: Session,
@@ -2371,20 +2371,163 @@ class SessionEngine:
             models=usage_summary.models,
             pending_action_kind=pending_action_kind,
         )
-        emitted = await self._event_writer.emit(
-            Event(
-                type=event_type,
-                session_id=session.id,
-                interaction_id=interaction_id,
-                timestamp=observed_at,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload=evidence.model_dump(mode="json"),
-            )
+        event = Event(
+            type=event_type,
+            session_id=session.id,
+            interaction_id=interaction_id,
+            timestamp=observed_at,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=evidence.model_dump(mode="json"),
         )
         if event_type == EventType.INTERACTION_RESUMED:
             _clear_session_interaction_recovered_active_through(session.id)
-        return emitted
+        return event
+
+    async def _emit_interaction_state(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        event_type: EventType,
+        status: InteractionStatus,
+        pending_action_kind: str | None = None,
+        recovered_active_through: datetime | None = None,
+    ) -> Event | None:
+        event = await self._prepare_interaction_state_event(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            event_type=event_type,
+            status=status,
+            pending_action_kind=pending_action_kind,
+            recovered_active_through=recovered_active_through,
+        )
+        if event is None:
+            return None
+        return await self._event_writer.emit(event)
+
+    async def _publish_interaction_transition(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        to_status: SessionStatus,
+        only_if_no_queued_messages: bool = False,
+        from_statuses: set[SessionStatus] | None = None,
+    ) -> tuple[Session, Event | None, bool]:
+        interaction_id = _current_session_interaction_id(session.id)
+        if interaction_id is None:
+            transitioned = (
+                await self.session_store.transition_status_if_no_queued_messages(
+                    session.id,
+                    from_statuses={SessionStatus.RUNNING},
+                    to_status=to_status,
+                )
+                if only_if_no_queued_messages
+                else await self.session_store.update_status(session.id, to_status)
+            )
+            return transitioned, None, True
+
+        pending_action_kind: str | None = None
+        if to_status is not SessionStatus.COMPLETED:
+            checkpoint = await self.session_store.load_checkpoint(session.id)
+            if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:
+                pending_action_kind = "tool_approval"
+            elif pending_user_input_from_checkpoint(checkpoint) is not None:
+                pending_action_kind = "user_input"
+            elif tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint) is not None:
+                pending_action_kind = "tool_recovery"
+        if to_status is SessionStatus.COMPLETED:
+            event_type = EventType.INTERACTION_COMPLETED
+            interaction_status = InteractionStatus.COMPLETED
+        elif pending_action_kind is not None:
+            event_type = EventType.INTERACTION_PAUSED
+            interaction_status = InteractionStatus.PAUSED
+        elif to_status is SessionStatus.FAILED:
+            event_type = EventType.INTERACTION_FAILED
+            interaction_status = InteractionStatus.FAILED
+        elif to_status is SessionStatus.INTERRUPTED:
+            event_type = EventType.INTERACTION_INTERRUPTED
+            interaction_status = InteractionStatus.INTERRUPTED
+        else:
+            raise ValueError(f"Unsupported interaction terminal session status: {to_status}")
+
+        event = await self._prepare_interaction_state_event(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            event_type=event_type,
+            status=interaction_status,
+            pending_action_kind=pending_action_kind,
+        )
+        if event is None:
+            loaded = await self.session_store.load(session.id)
+            if loaded is None:
+                raise KeyError(f"Session not found: {session.id}") from None
+            if loaded.status is to_status:
+                return loaded, None, True
+            if (
+                from_statuses is None
+                and to_status is SessionStatus.FAILED
+                and loaded.status in {SessionStatus.COMPLETED, SessionStatus.INTERRUPTED}
+            ):
+                # Environment finalization or a terminal hook can fail after the
+                # response interaction and its original session outcome are
+                # already durable. Keep that interaction terminal evidence
+                # truthful while recording the later session-scoped failure.
+                transitioned = await self.session_store.transition_status(
+                    session.id,
+                    from_statuses={loaded.status},
+                    to_status=SessionStatus.FAILED,
+                )
+                return transitioned, None, True
+            allowed_statuses = (
+                {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+                if from_statuses is None
+                else from_statuses
+            )
+            transitioned = (
+                await self.session_store.transition_status_if_no_queued_messages(
+                    session.id,
+                    from_statuses=allowed_statuses,
+                    to_status=to_status,
+                )
+                if only_if_no_queued_messages
+                else await self.session_store.transition_status(
+                    session.id,
+                    from_statuses=allowed_statuses,
+                    to_status=to_status,
+                )
+            )
+            return transitioned, None, True
+
+        publication_kwargs = {
+            "event": event,
+            "from_statuses": (
+                {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+                if from_statuses is None
+                else from_statuses
+            ),
+            "to_status": to_status,
+            "only_if_no_queued_messages": only_if_no_queued_messages,
+        }
+        try:
+            result: InteractionTransitionResult = (
+                await self.session_store.publish_interaction_transition(
+                    session.id,
+                    **publication_kwargs,
+                )
+            )
+        except Exception:
+            result = await self.session_store.publish_interaction_transition(
+                session.id,
+                **publication_kwargs,
+            )
+        await self._event_writer.fan_out_persisted([result.event])
+        return result.session, result.event, result.status_changed
 
     async def _emit_interaction_completed(
         self,
@@ -2562,16 +2705,18 @@ class SessionEngine:
                 )
                 if task_failure_event is not None:
                     yield task_failure_event
-                interaction_failed_event = await self._emit_interaction_state(
+                (
+                    session,
+                    interaction_failed_event,
+                    _,
+                ) = await self._publish_interaction_transition(
                     session=session,
                     registered_agent=registered_agent,
                     environment_name=_environment_name(registered_environment),
-                    event_type=EventType.INTERACTION_FAILED,
-                    status=InteractionStatus.FAILED,
+                    to_status=SessionStatus.FAILED,
                 )
                 if interaction_failed_event is not None:
                     yield interaction_failed_event
-                session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
                 failure_payload = exception_failure_payload(
                     resolution.error,
                     diagnostic=failure_diagnostic,
@@ -2682,17 +2827,18 @@ class SessionEngine:
             )
             if task_failure_event is not None:
                 yield task_failure_event
-            if interaction_started:
-                interaction_failed_event = await self._emit_interaction_state(
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=_environment_name(registered_environment),
-                    event_type=EventType.INTERACTION_FAILED,
-                    status=InteractionStatus.FAILED,
-                )
-                if interaction_failed_event is not None:
-                    yield interaction_failed_event
-            session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            (
+                session,
+                interaction_failed_event,
+                _,
+            ) = await self._publish_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=_environment_name(registered_environment),
+                to_status=SessionStatus.FAILED,
+            )
+            if interaction_failed_event is not None:
+                yield interaction_failed_event
             failure_payload = exception_failure_payload(
                 exc,
                 diagnostic=failure_diagnostic,
@@ -5420,18 +5566,27 @@ class SessionEngine:
             events.append(copy_event(records[0].event))
         return events
 
-    async def _complete_session_if_no_queued_messages(self, session_id: str) -> Session:
+    async def _complete_session_if_no_queued_messages(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+    ) -> tuple[Session, Event | None, bool]:
         try:
-            return await self.session_store.transition_status_if_no_queued_messages(
-                session_id,
-                from_statuses={SessionStatus.RUNNING},
+            return await self._publish_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
                 to_status=SessionStatus.COMPLETED,
+                only_if_no_queued_messages=True,
+                from_statuses={SessionStatus.RUNNING},
             )
         except SessionStatusConflict:
             # An interrupt can win between the final provider response and the
-            # atomic completion transition. Route that race through the normal
+            # atomic completion publication. Route that race through the normal
             # interrupt finalizer instead of the generic failure handler.
-            await self._session_control.raise_if_interrupted(session_id)
+            await self._session_control.raise_if_interrupted(session.id)
             raise
 
     async def _handle_queued_messages_before_completion(
@@ -6507,7 +6662,16 @@ class SessionEngine:
                 self._session_control.end_interruption_request(loaded_session.id)
             raise
 
-        session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+        (
+            session,
+            _interaction_event,
+            _,
+        ) = await self._publish_interaction_transition(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=_environment_name(registered_environment),
+            to_status=SessionStatus.INTERRUPTED,
+        )
         payload = await self._load_pending_session_interrupt_payload(
             session.id,
             default={
@@ -6773,7 +6937,6 @@ class SessionEngine:
             if interaction_id is None:
                 raise RuntimeError("New interaction admission produced no interaction identity.")
             _activate_session_interaction(session.id, interaction_id)
-        interaction_active = not legacy_pending_round
         try:
             if interaction_started_event is not None:
                 await self._event_writer.fan_out_persisted([interaction_started_event])
@@ -6816,17 +6979,18 @@ class SessionEngine:
             try:
                 if continuing_recovery_boundary and not legacy_pending_round:
                     await self.session_store.materialize_deferred_interaction_input(session.id)
-                if interaction_active:
-                    interaction_failed_event = await self._emit_interaction_state(
-                        session=session,
-                        registered_agent=registered_agent,
-                        environment_name=_environment_name(registered_environment),
-                        event_type=EventType.INTERACTION_FAILED,
-                        status=InteractionStatus.FAILED,
-                    )
-                    if interaction_failed_event is not None:
-                        yield interaction_failed_event
-                await self.session_store.update_status(session.id, SessionStatus.FAILED)
+                (
+                    session,
+                    interaction_failed_event,
+                    _,
+                ) = await self._publish_interaction_transition(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=_environment_name(registered_environment),
+                    to_status=SessionStatus.FAILED,
+                )
+                if interaction_failed_event is not None:
+                    yield interaction_failed_event
                 yield await self._event_writer.emit(
                     Event(
                         type=EventType.SESSION_FAILED,
@@ -7676,9 +7840,18 @@ class SessionEngine:
                 and recovered_structured_outcome.type == EventType.STRUCTURED_OUTPUT_VALIDATED
                 and not messages_to_append
             ):
-                try:
-                    session = await self._complete_session_if_no_queued_messages(session.id)
-                except SessionQueuedMessagesPending:
+                (
+                    session,
+                    interaction_completed_event,
+                    session_completed,
+                ) = await self._complete_session_if_no_queued_messages(
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                )
+                if interaction_completed_event is not None:
+                    yield interaction_completed_event
+                if not session_completed:
                     recovered_step = recovered_structured_outcome.payload.get("step")
                     if type(recovered_step) is not int:
                         raise RuntimeError(
@@ -8145,16 +8318,18 @@ class SessionEngine:
                             session.id,
                             validation.output,
                         )
-                        interaction_completed_event = await self._emit_interaction_completed(
+                        (
+                            session,
+                            interaction_completed_event,
+                            session_completed,
+                        ) = await self._complete_session_if_no_queued_messages(
                             session=session,
                             registered_agent=registered_agent,
                             environment_name=environment_name,
                         )
                         if interaction_completed_event is not None:
                             yield interaction_completed_event
-                        try:
-                            session = await self._complete_session_if_no_queued_messages(session.id)
-                        except SessionQueuedMessagesPending:
+                        if not session_completed:
                             (
                                 should_continue,
                                 queued_events,
@@ -8233,20 +8408,18 @@ class SessionEngine:
                                         redactor=self._secret_redactor,
                                     )
                                 )
-                                interaction_completed_event = (
-                                    await self._emit_interaction_completed(
-                                        session=session,
-                                        registered_agent=registered_agent,
-                                        environment_name=environment_name,
-                                    )
+                                (
+                                    session,
+                                    interaction_completed_event,
+                                    session_completed,
+                                ) = await self._complete_session_if_no_queued_messages(
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    environment_name=environment_name,
                                 )
                                 if interaction_completed_event is not None:
                                     yield interaction_completed_event
-                                try:
-                                    session = await self._complete_session_if_no_queued_messages(
-                                        session.id
-                                    )
-                                except SessionQueuedMessagesPending:
+                                if not session_completed:
                                     (
                                         should_continue,
                                         queued_events,
@@ -8362,10 +8535,18 @@ class SessionEngine:
                             )
                             continue
                         if before_stop_decision.action == BeforeStopAction.INTERRUPT:
-                            session = await self.session_store.update_status(
-                                session.id,
-                                SessionStatus.INTERRUPTED,
+                            (
+                                session,
+                                interaction_interrupted_event,
+                                _,
+                            ) = await self._publish_interaction_transition(
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                to_status=SessionStatus.INTERRUPTED,
                             )
+                            if interaction_interrupted_event is not None:
+                                yield interaction_interrupted_event
                             for event in await self._emit_turn_completed_once(
                                 session=session,
                                 registered_agent=registered_agent,
@@ -8404,16 +8585,18 @@ class SessionEngine:
                             raise RuntimeError(
                                 f"Before-stop policy failed session: {before_stop_decision.reason}"
                             )
-                    interaction_completed_event = await self._emit_interaction_completed(
+                    (
+                        session,
+                        interaction_completed_event,
+                        session_completed,
+                    ) = await self._complete_session_if_no_queued_messages(
                         session=session,
                         registered_agent=registered_agent,
                         environment_name=environment_name,
                     )
                     if interaction_completed_event is not None:
                         yield interaction_completed_event
-                    try:
-                        session = await self._complete_session_if_no_queued_messages(session.id)
-                    except SessionQueuedMessagesPending:
+                    if not session_completed:
                         (
                             should_continue,
                             queued_events,
@@ -8509,7 +8692,18 @@ class SessionEngine:
                 yield event
         except ToolApprovalRequired as exc:
             await materialize_deferred_messages_after_failure()
-            session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            (
+                session,
+                interaction_paused_event,
+                _,
+            ) = await self._publish_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+            )
+            if interaction_paused_event is not None:
+                yield interaction_paused_event
             for event in await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
@@ -8542,7 +8736,18 @@ class SessionEngine:
                 yield event
         except UserInputRequired as exc:
             await materialize_deferred_messages_after_failure()
-            session = await self.session_store.update_status(session.id, SessionStatus.INTERRUPTED)
+            (
+                session,
+                interaction_paused_event,
+                _,
+            ) = await self._publish_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+            )
+            if interaction_paused_event is not None:
+                yield interaction_paused_event
             for event in await self._emit_turn_completed_once(
                 session=session,
                 registered_agent=registered_agent,
@@ -8726,7 +8931,18 @@ class SessionEngine:
                     )
                 except Exception as task_exc:
                     task_failure_error = task_exc
-            session = await self.session_store.update_status(session.id, SessionStatus.FAILED)
+            (
+                session,
+                interaction_failed_event,
+                _,
+            ) = await self._publish_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                to_status=SessionStatus.FAILED,
+            )
+            if interaction_failed_event is not None:
+                yield interaction_failed_event
             payload = exception_failure_payload(
                 exc,
                 diagnostic=failure_diagnostic,
@@ -9238,10 +9454,18 @@ class SessionEngine:
             ):
                 yield event
 
-        interrupted_session = await self.session_store.update_status(
-            session.id,
-            SessionStatus.INTERRUPTED,
+        (
+            interrupted_session,
+            interaction_interrupted_event,
+            _,
+        ) = await self._publish_interaction_transition(
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            to_status=SessionStatus.INTERRUPTED,
         )
+        if interaction_interrupted_event is not None:
+            yield interaction_interrupted_event
         terminal_payload = {
             "interruption_type": _INTERRUPTION_TYPE_LIMIT_REACHED,
             **limit_payload,
@@ -9965,14 +10189,23 @@ class SessionEngine:
             loaded_interrupted = await self.session_store.load(session.id)
             if loaded_interrupted is None:
                 raise KeyError(f"Session not found: {session.id}") from None
+            interaction_event: Event | None = None
             if loaded_interrupted.status != SessionStatus.INTERRUPTED:
-                loaded_interrupted = await self.session_store.update_status(
-                    session.id,
-                    SessionStatus.INTERRUPTED,
+                (
+                    loaded_interrupted,
+                    interaction_event,
+                    _,
+                ) = await self._publish_interaction_transition(
+                    session=loaded_interrupted,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    to_status=SessionStatus.INTERRUPTED,
                 )
             payload = await self._load_pending_session_interrupt_payload(session.id, default={})
-            interaction_event: Event | None = None
-            if _current_session_interaction_id(session.id) is not None:
+            if (
+                interaction_event is None
+                and _current_session_interaction_id(session.id) is not None
+            ):
                 checkpoint = await self.session_store.load_checkpoint(session.id)
                 pending_action_kind: str | None = None
                 if approval_support.pending_approval_from_checkpoint(checkpoint) is not None:

@@ -419,6 +419,23 @@ def test_concurrent_lazy_cleanup_sweeps_cannot_release_pending_sync_owner_early(
                     )
                 )
             ]
+        failed_session = await store.load("sync-concurrent-settlement")
+        assert failed_session is not None
+        assert failed_session.status is SessionStatus.FAILED
+        lifecycle_types = [
+            event.type
+            for event in await store.load_events("sync-concurrent-settlement")
+            if event.type
+            in {
+                EventType.INTERACTION_STARTED,
+                EventType.INTERACTION_COMPLETED,
+                EventType.INTERACTION_FAILED,
+            }
+        ]
+        assert lifecycle_types == [
+            EventType.INTERACTION_STARTED,
+            EventType.INTERACTION_COMPLETED,
+        ]
         assert binding._fixed_target_owners
 
         store.fail_finalize_evidence = False

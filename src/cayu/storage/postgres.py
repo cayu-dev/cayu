@@ -120,6 +120,7 @@ from cayu.runtime.sessions import (
     EventSummary,
     ForkTranscriptValidator,
     InteractionAttribution,
+    InteractionTransitionResult,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -194,6 +195,7 @@ from cayu.runtime.sessions import (
     _model_completion_terminal_advances_last_activity,
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
+    _prepare_interaction_transition,
     _prepare_model_completion_stage_promotion,
     _prepare_session_fork_request,
     _PreparedModelCompletionStage,
@@ -6173,6 +6175,152 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(transitioned)
             return transitioned
+
+    async def publish_interaction_transition(
+        self,
+        session_id: str,
+        *,
+        event: Event,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        only_if_no_queued_messages: bool = False,
+    ) -> InteractionTransitionResult:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        (
+            session_id,
+            copied_event,
+            allowed_statuses,
+            target_status,
+            conditional,
+        ) = _prepare_interaction_transition(
+            session_id,
+            event=event,
+            from_statuses=from_statuses,
+            to_status=to_status,
+            only_if_no_queued_messages=only_if_no_queued_messages,
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    loaded = await self._load_for_update(cur, session_id)
+                    if loaded is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    await cur.execute(
+                        "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                        (session_id, copied_event.id),
+                    )
+                    existing_row = await cur.fetchone()
+                    if existing_row is not None:
+                        existing_event = Event(**_json_obj(existing_row[0]))
+                        if existing_event != copied_event:
+                            raise ValueError(
+                                "Interaction transition event identity was reused "
+                                "with different data."
+                            )
+                        status_changed = loaded.status is target_status
+                        if not status_changed and not conditional:
+                            raise RuntimeError(
+                                "Interaction transition event exists without its session status."
+                            )
+                        await conn.commit()
+                        return InteractionTransitionResult(
+                            session=loaded,
+                            event=existing_event,
+                            status_changed=status_changed,
+                            replayed=True,
+                        )
+
+                    _assert_session_run_epoch(session_id, loaded)
+                    if loaded.status not in allowed_statuses:
+                        raise SessionStatusConflict(
+                            "Session status transition not allowed: "
+                            f"{loaded.status} -> {target_status}"
+                        )
+                    queued = False
+                    if conditional:
+                        await cur.execute(
+                            "SELECT 1 FROM cayu_session_message_queue "
+                            "WHERE session_id = %s AND status = 'queued' LIMIT 1",
+                            (session_id,),
+                        )
+                        queued = await cur.fetchone() is not None
+                    updated_at = datetime.now(UTC)
+                    await cur.execute(
+                        """
+                        UPDATE cayu_sessions
+                        SET status = CASE WHEN %s THEN status ELSE %s END,
+                            updated_at = CASE WHEN %s THEN updated_at ELSE %s END,
+                            last_activity_at = %s,
+                            event_seq = event_seq + 1
+                        WHERE id = %s
+                        RETURNING event_seq
+                        """,
+                        (
+                            queued,
+                            str(target_status),
+                            queued,
+                            updated_at,
+                            updated_at,
+                            session_id,
+                        ),
+                    )
+                    order_row = await cur.fetchone()
+                    if order_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                        copied_event
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, session_order, event_id, interaction_id,
+                            event_type, timestamp, agent_name, environment_name,
+                            workflow_name, tool_name, payload, event,
+                            pending_action_lookup_key, pending_action_projection,
+                            pending_action_projection_bytes
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            session_id,
+                            order_row[0],
+                            copied_event.id,
+                            copied_event.interaction_id,
+                            str(copied_event.type),
+                            pg_support.to_utc(copied_event.timestamp),
+                            copied_event.agent_name,
+                            copied_event.environment_name,
+                            copied_event.workflow_name,
+                            copied_event.tool_name,
+                            _dumps(copied_event.payload),
+                            _dumps(copied_event.model_dump(mode="json")),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        ),
+                    )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        session_id,
+                        [copied_event.id],
+                    )
+                    transitioned = await self._load(cur, session_id)
+                    if transitioned is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return InteractionTransitionResult(
+            session=transitioned,
+            event=copied_event,
+            status_changed=not queued,
+        )
 
     async def fence_stalled_run(
         self,

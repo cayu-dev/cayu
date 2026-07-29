@@ -867,6 +867,27 @@ class SessionMessageDeliveryBatch(BaseModel):
         return require_clean_nonblank(value, "interaction_id")
 
 
+class InteractionTransitionResult(BaseModel):
+    """Exact result of an atomic interaction-lifecycle/session transition."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session: Session
+    event: Event
+    status_changed: StrictBool
+    replayed: StrictBool = False
+
+    @field_validator("session")
+    @classmethod
+    def copy_session(cls, value: Session) -> Session:
+        return copy_session(value)
+
+    @field_validator("event")
+    @classmethod
+    def copy_event(cls, value: Event) -> Event:
+        return copy_event(value)
+
+
 class InterruptSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -4049,6 +4070,24 @@ class SessionStore(ABC):
         """Atomically terminalize only when no durable queued input remains."""
 
     @abstractmethod
+    async def publish_interaction_transition(
+        self,
+        session_id: str,
+        *,
+        event: Event,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        only_if_no_queued_messages: bool = False,
+    ) -> InteractionTransitionResult:
+        """Atomically publish one interaction state and its session transition.
+
+        A completion guarded by ``only_if_no_queued_messages`` always publishes
+        the interaction event, but leaves the session status unchanged when
+        queued input remains. Repeating the exact event identity reconstructs
+        the committed result without re-evaluating that queue boundary.
+        """
+
+    @abstractmethod
     async def fence_stalled_run(
         self,
         session_id: str,
@@ -5924,6 +5963,75 @@ class InMemorySessionStore(SessionStore):
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(result)
             return result
+
+    async def publish_interaction_transition(
+        self,
+        session_id: str,
+        *,
+        event: Event,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        only_if_no_queued_messages: bool = False,
+    ) -> InteractionTransitionResult:
+        (
+            session_id,
+            copied_event,
+            allowed_statuses,
+            target_status,
+            conditional,
+        ) = _prepare_interaction_transition(
+            session_id,
+            event=event,
+            from_statuses=from_statuses,
+            to_status=to_status,
+            only_if_no_queued_messages=only_if_no_queued_messages,
+        )
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            existing = self._event_records_by_id.get((session_id, copied_event.id))
+            if existing is not None:
+                if existing.event != copied_event:
+                    raise ValueError(
+                        "Interaction transition event identity was reused with different data."
+                    )
+                status_changed = session.status is target_status
+                if not status_changed and not conditional:
+                    raise RuntimeError(
+                        "Interaction transition event exists without its session status."
+                    )
+                return InteractionTransitionResult(
+                    session=session,
+                    event=existing.event,
+                    status_changed=status_changed,
+                    replayed=True,
+                )
+            _assert_session_run_epoch(session_id, session)
+            if session.status not in allowed_statuses:
+                raise SessionStatusConflict(
+                    f"Session status transition not allowed: {session.status} -> {target_status}"
+                )
+            queued = conditional and any(
+                (session_id, delivery_mode) in self._pending_session_messages
+                for delivery_mode in SessionMessageDeliveryMode
+            )
+            now = datetime.now(UTC)
+            updated = self._append_events_unlocked(session, [copied_event])
+            if not queued:
+                updated = updated.model_copy(
+                    update={
+                        "status": target_status,
+                        "updated_at": now,
+                        "last_activity_at": now,
+                    }
+                )
+            self._sessions[session_id] = updated
+            return InteractionTransitionResult(
+                session=updated,
+                event=copied_event,
+                status_changed=not queued,
+            )
 
     async def fence_stalled_run(
         self,
@@ -11968,6 +12076,55 @@ def _copy_queued_interaction_started_event(
     if copied.type != EventType.INTERACTION_STARTED:
         raise ValueError("interaction_started_event must be interaction.started.")
     return copied
+
+
+def _prepare_interaction_transition(
+    session_id: str,
+    *,
+    event: Event,
+    from_statuses: set[SessionStatus],
+    to_status: SessionStatus,
+    only_if_no_queued_messages: bool,
+) -> tuple[str, Event, set[SessionStatus], SessionStatus, bool]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    copied_event = copy_event(event)
+    if copied_event.session_id != session_id:
+        raise ValueError("Interaction transition event belongs to a different session.")
+    if copied_event.interaction_id is None:
+        raise ValueError("Interaction transition event must have an interaction_id.")
+    statuses_by_event_type: dict[str, set[SessionStatus]] = {
+        EventType.INTERACTION_PAUSED: {
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
+        },
+        EventType.INTERACTION_COMPLETED: {SessionStatus.COMPLETED},
+        EventType.INTERACTION_FAILED: {SessionStatus.FAILED},
+        EventType.INTERACTION_INTERRUPTED: {SessionStatus.INTERRUPTED},
+    }
+    expected_statuses = statuses_by_event_type.get(copied_event.type)
+    if expected_statuses is None:
+        raise ValueError("event must be a terminal or paused interaction lifecycle event.")
+    if not isinstance(to_status, SessionStatus):
+        raise ValueError("to_status must be a SessionStatus.")
+    if to_status not in expected_statuses:
+        rendered_statuses = ", ".join(sorted(str(status) for status in expected_statuses))
+        raise ValueError(
+            f"{copied_event.type} requires session status in "
+            f"{{{rendered_statuses}}}, not {to_status}."
+        )
+    if type(only_if_no_queued_messages) is not bool:
+        raise TypeError("only_if_no_queued_messages must be a bool.")
+    if only_if_no_queued_messages and copied_event.type is not EventType.INTERACTION_COMPLETED:
+        raise ValueError("only_if_no_queued_messages is valid only for interaction.completed.")
+    return (
+        session_id,
+        copied_event,
+        _validate_status_set(from_statuses, "from_statuses"),
+        to_status,
+        only_if_no_queued_messages,
+    )
 
 
 def _copy_interaction_admission(

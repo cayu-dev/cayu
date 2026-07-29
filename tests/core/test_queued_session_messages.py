@@ -186,19 +186,24 @@ class CompletionFenceStore(InterruptTrackingStore):
         self.completion_started = asyncio.Event()
         self.release_completion = asyncio.Event()
 
-    async def transition_status_if_no_queued_messages(
+    async def publish_interaction_transition(
         self,
         session_id: str,
         *,
+        event: Event,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
+        only_if_no_queued_messages: bool = False,
     ):
-        self.completion_started.set()
-        await self.release_completion.wait()
-        return await super().transition_status_if_no_queued_messages(
+        if only_if_no_queued_messages:
+            self.completion_started.set()
+            await self.release_completion.wait()
+        return await super().publish_interaction_transition(
             session_id,
+            event=event,
             from_statuses=from_statuses,
             to_status=to_status,
+            only_if_no_queued_messages=only_if_no_queued_messages,
         )
 
 

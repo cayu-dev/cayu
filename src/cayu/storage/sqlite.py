@@ -48,6 +48,7 @@ from cayu.runtime.sessions import (
     EventSummary,
     ForkTranscriptValidator,
     InteractionAttribution,
+    InteractionTransitionResult,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -123,6 +124,7 @@ from cayu.runtime.sessions import (
     _model_completion_terminal_advances_last_activity,
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
+    _prepare_interaction_transition,
     _prepare_model_completion_stage_promotion,
     _prepare_session_fork_request,
     _PreparedModelCompletionStage,
@@ -1980,6 +1982,140 @@ class SQLiteSessionStore(SessionStore):
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(transitioned)
             return transitioned
+
+    async def publish_interaction_transition(
+        self,
+        session_id: str,
+        *,
+        event: Event,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        only_if_no_queued_messages: bool = False,
+    ) -> InteractionTransitionResult:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        (
+            session_id,
+            copied_event,
+            allowed_statuses,
+            target_status,
+            conditional,
+        ) = _prepare_interaction_transition(
+            session_id,
+            event=event,
+            from_statuses=from_statuses,
+            to_status=to_status,
+            only_if_no_queued_messages=only_if_no_queued_messages,
+        )
+
+        def statement(connection: sqlite3.Connection) -> InteractionTransitionResult:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                loaded = _load_session(connection, session_id)
+                if loaded is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                existing_row = connection.execute(
+                    f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                    "WHERE session_id = ? AND event_id = ?",
+                    (session_id, copied_event.id),
+                ).fetchone()
+                if existing_row is not None:
+                    existing_event = _event_from_row(existing_row)
+                    if existing_event != copied_event:
+                        raise ValueError(
+                            "Interaction transition event identity was reused with different data."
+                        )
+                    status_changed = loaded.status is target_status
+                    if not status_changed and not conditional:
+                        raise RuntimeError(
+                            "Interaction transition event exists without its session status."
+                        )
+                    connection.commit()
+                    return InteractionTransitionResult(
+                        session=loaded,
+                        event=existing_event,
+                        status_changed=status_changed,
+                        replayed=True,
+                    )
+
+                _assert_session_run_epoch(session_id, loaded)
+                if loaded.status not in allowed_statuses:
+                    raise SessionStatusConflict(
+                        f"Session status transition not allowed: {loaded.status} -> {target_status}"
+                    )
+                queued = False
+                if conditional:
+                    queued = (
+                        connection.execute(
+                            "SELECT 1 FROM cayu_session_message_queue "
+                            "WHERE session_id = ? AND status = 'queued' LIMIT 1",
+                            (session_id,),
+                        ).fetchone()
+                        is not None
+                    )
+                updated_at = datetime.now(UTC)
+                formatted_updated_at = sqlite_support.format_datetime(updated_at)
+                if queued:
+                    _touch_session_activity(connection, session_id, updated_at)
+                else:
+                    connection.execute(
+                        "UPDATE cayu_sessions SET status = ?, updated_at = ?, "
+                        "last_activity_at = ? WHERE id = ?",
+                        (
+                            str(target_status),
+                            formatted_updated_at,
+                            formatted_updated_at,
+                            session_id,
+                        ),
+                    )
+                lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                    copied_event
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cayu_events (
+                        session_id, event_id, interaction_id, event_type, timestamp,
+                        agent_name, environment_name, workflow_name, tool_name,
+                        payload_json, pending_action_lookup_key,
+                        pending_action_projection_json, pending_action_projection_bytes
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        copied_event.id,
+                        copied_event.interaction_id,
+                        str(copied_event.type),
+                        sqlite_support.format_datetime(copied_event.timestamp),
+                        copied_event.agent_name,
+                        copied_event.environment_name,
+                        copied_event.workflow_name,
+                        copied_event.tool_name,
+                        sqlite_support.json_dumps(copied_event.payload),
+                        lookup_key,
+                        projection,
+                        projection_bytes,
+                    ),
+                )
+                _enqueue_persisted_event_side_effects(
+                    connection,
+                    session_id,
+                    [copied_event.id],
+                )
+                transitioned = _load_session(connection, session_id)
+                if transitioned is None:
+                    raise KeyError(f"Session not found: {session_id}")
+                connection.commit()
+                return InteractionTransitionResult(
+                    session=transitioned,
+                    event=copied_event,
+                    status_changed=not queued,
+                )
+            except Exception:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
 
     async def release_run_fence(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
