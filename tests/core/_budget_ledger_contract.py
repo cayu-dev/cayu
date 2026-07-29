@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
@@ -11,14 +12,282 @@ import pytest
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
 from cayu._validation import DurableValueError
-from cayu.runtime import BudgetLedger, BudgetLimit
-from cayu.runtime.budgets import BudgetReservationIdentityConflict
+from cayu.core import AgentSpec, EventType, Message
+from cayu.core.billing import BillingIdentity, PricingContext
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runtime import (
+    BudgetLedger,
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReservation,
+    BudgetSettlementCursor,
+    BudgetSettlementFallback,
+    CayuApp,
+    InMemorySessionStore,
+    ModelPrice,
+    PriceBook,
+    RunRequest,
+)
+from cayu.runtime.budgets import (
+    BudgetReservationIdentityConflict,
+    budget_settlement_id,
+)
+from cayu.runtime.costs import ContextualPricingRequirement
+from cayu.vaults import REDACTED_SECRET
 
 
 class MutableClock(Protocol):
     value: datetime
 
     def __call__(self) -> datetime: ...
+
+
+async def assert_prepriced_reservation_stores_only_durable_billing_identity(
+    ledger: BudgetLedger,
+) -> None:
+    """Accept a prepriced amount while persisting only normalized authority."""
+
+    raw_identity = BillingIdentity(
+        provider_name="fake",
+        resource_id="fake-model",
+        request_evidence={"opaque": "raw-workload-value"},
+        pricing_contexts=(PricingContext(dimensions={"billing_tenant": "raw-workload-value"}),),
+    )
+    durable_identity = raw_identity.model_copy(
+        update={
+            "request_evidence": {"opaque": REDACTED_SECRET},
+            "pricing_contexts": (PricingContext(dimensions={"billing_tenant": REDACTED_SECRET}),),
+        },
+        deep=True,
+    )
+    limit = BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal("1"),
+        pricing=PriceBook(
+            contextual_pricing_requirements=(
+                ContextualPricingRequirement(
+                    provider_name="fake",
+                    dimensions=("billing_tenant",),
+                ),
+            ),
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="fake-model",
+                    match="exact",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("0"),
+                    pricing_context={"billing_tenant": ("raw-workload-value",)},
+                ),
+            ),
+        ),
+        reservation=BudgetReservation(
+            max_input_tokens=1_000_000,
+            max_output_tokens=0,
+        ),
+    )
+    result = await ledger.reserve(
+        limit=limit,
+        session_id="sess_transient_pricing_identity",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+        requested_amount=Decimal("1"),
+        billing_identity=durable_identity,
+    )
+
+    assert result.accepted is True
+    assert result.requested == Decimal("1")
+    assert result.record is not None
+    assert result.record.billing_identity == durable_identity
+    assert "raw-workload-value" not in result.record.model_dump_json()
+
+
+class _CompletedProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.requests = 0
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        self.requests += 1
+        yield ModelStreamEvent.text_delta("done")
+        yield ModelStreamEvent.completed(
+            {"usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}
+        )
+
+
+class _DelegatingBudgetLedger(BudgetLedger):
+    def __init__(self, ledger: BudgetLedger) -> None:
+        self.ledger = ledger
+
+    @property
+    def reservation_ttl_seconds(self) -> int | None:
+        return self.ledger.reservation_ttl_seconds
+
+    async def claim_reservation_identity(self, **kwargs) -> None:
+        await self.ledger.claim_reservation_identity(**kwargs)
+
+    async def reserve(self, **kwargs):
+        return await self.ledger.reserve(**kwargs)
+
+    async def heartbeat(self, **kwargs):
+        return await self.ledger.heartbeat(**kwargs)
+
+    async def mark_dispatched(self, **kwargs):
+        return await self.ledger.mark_dispatched(**kwargs)
+
+    async def reconcile(self, **kwargs):
+        return await self.ledger.reconcile(**kwargs)
+
+    async def release(self, **kwargs):
+        return await self.ledger.release(**kwargs)
+
+    async def load_settlement(self, settlement_id):
+        return await self.ledger.load_settlement(settlement_id)
+
+    async def list_pending_settlements(self, **kwargs):
+        return await self.ledger.list_pending_settlements(**kwargs)
+
+    async def mark_settlement_event_published(self, **kwargs):
+        return await self.ledger.mark_settlement_event_published(**kwargs)
+
+
+class _LoseFirstDispatchAcknowledgement(_DelegatingBudgetLedger):
+    def __init__(self, ledger: BudgetLedger) -> None:
+        super().__init__(ledger)
+        self.mark_dispatched_calls = 0
+        self.dispatched_reservation_ids: tuple[str, ...] = ()
+
+    async def mark_dispatched(self, **kwargs):
+        records = await self.ledger.mark_dispatched(**kwargs)
+        self.mark_dispatched_calls += 1
+        self.dispatched_reservation_ids = tuple(record.reservation_id for record in records)
+        if self.mark_dispatched_calls == 1:
+            raise RuntimeError("dispatch fence acknowledgement lost after commit")
+        return records
+
+
+class _LoseFirstReservationAcknowledgement(_DelegatingBudgetLedger):
+    def __init__(self, ledger: BudgetLedger) -> None:
+        super().__init__(ledger)
+        self.lose_acknowledgement = True
+        self.lost_reservation_id: str | None = None
+
+    async def reserve(self, **kwargs):
+        result = await self.ledger.reserve(**kwargs)
+        if self.lose_acknowledgement:
+            self.lose_acknowledgement = False
+            assert result.record is not None
+            self.lost_reservation_id = result.record.reservation_id
+            raise RuntimeError("reservation acknowledgement lost after commit")
+        return result
+
+
+async def assert_runtime_reconstructs_dispatch_fence_acknowledgement(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+) -> None:
+    """Prove runtime replay against one concrete ledger implementation."""
+
+    wrapped = _LoseFirstDispatchAcknowledgement(ledger)
+    provider = _CompletedProvider()
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        budget_ledger=wrapped,
+        budget_policy=BudgetPolicy(limits=(limit,)),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_dispatch_fence_ack_reconstruction",
+                messages=[Message.text("user", "run exactly once")],
+            )
+        )
+    ]
+
+    assert wrapped.mark_dispatched_calls == 2
+    assert provider.requests == 1
+    assert len(wrapped.dispatched_reservation_ids) == 1
+    settlement = await ledger.load_settlement(
+        budget_settlement_id(wrapped.dispatched_reservation_ids[0])
+    )
+    assert settlement is not None
+    assert settlement.reconciliation.status == "reconciled"
+    assert settlement.event_published is True
+    assert (
+        await store.load_active_model_completion_stage("sess_dispatch_fence_ack_reconstruction")
+        is None
+    )
+    assert sum(event.type == EventType.BUDGET_RECONCILED for event in events) == 1
+
+
+async def assert_runtime_publishes_cross_session_ttl_release(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+    *,
+    clock: MutableClock,
+    ttl_seconds: int,
+) -> None:
+    """Prove that one session can publish another session's reaped release."""
+
+    wrapped = _LoseFirstReservationAcknowledgement(ledger)
+    provider = _CompletedProvider()
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        budget_ledger=wrapped,
+        budget_policy=BudgetPolicy(limits=(limit,)),
+        clock=clock,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    abandoned_session_id = "sess_cross_session_ttl_release_source"
+    async for _event in app.run(
+        RunRequest(
+            agent_name="assistant",
+            session_id=abandoned_session_id,
+            messages=[Message.text("user", "fail after reservation commit")],
+        )
+    ):
+        pass
+    abandoned = await store.load(abandoned_session_id)
+    assert abandoned is not None
+    assert abandoned.status.value == "failed"
+    assert provider.requests == 0
+    assert wrapped.lost_reservation_id is not None
+
+    clock.value += timedelta(seconds=ttl_seconds + 1)
+    async for _event in app.run(
+        RunRequest(
+            agent_name="assistant",
+            session_id="sess_cross_session_ttl_release_trigger",
+            messages=[Message.text("user", "trigger the reap")],
+        )
+    ):
+        pass
+
+    assert provider.requests == 1
+    settlement = await ledger.load_settlement(budget_settlement_id(wrapped.lost_reservation_id))
+    assert settlement is not None
+    assert settlement.reconciliation.status == "released"
+    assert settlement.event_published is True
+    source_events = await store.load_events(abandoned_session_id)
+    assert [
+        event for event in source_events if event.type == EventType.BUDGET_RESERVATION_RELEASED
+    ] == [settlement.event]
+    assert await ledger.list_pending_settlements(session_id=abandoned_session_id) == []
 
 
 async def assert_reservation_identity_collision_is_rejected(
@@ -259,6 +528,12 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     """Exercise the shared dispatch fence and terminal audit-outbox contract."""
 
     completion_identity = model_attempt_identity()
+    completion_fallback = BudgetSettlementFallback(
+        settled_at=clock.value,
+        reconciliation_reason="prevalidated conservative completion",
+        release_reason="prevalidated predispatch release",
+        expiration_reason=f"prevalidated expiry after {ttl_seconds}s",
+    )
     reserved = await ledger.reserve(
         limit=limit,
         session_id="sess_crash_safe_completion",
@@ -268,9 +543,11 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
         provider_name="fake",
         model="fake-model",
         model_attempt_identity=completion_identity,
+        settlement_fallback=completion_fallback,
     )
     assert reserved.accepted is True
     assert reserved.record is not None
+    assert reserved.record.settlement_fallback == completion_fallback
     reserved.record.settlement_event_payload["forged"] = "caller mutation"
     dispatch_id = f"{completion_identity.model_step_id}:dispatch:0"
     dispatched_records = await ledger.mark_dispatched(
@@ -281,6 +558,7 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     assert len(dispatched_records) == 1
     dispatched = dispatched_records[0]
     assert dispatched.dispatch_id == dispatch_id
+    assert dispatched.settlement_fallback == completion_fallback
     assert await ledger.mark_dispatched(
         reservation_ids=(reserved.record.reservation_id,),
         dispatch_id=dispatch_id,
@@ -358,6 +636,12 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     )
     assert await ledger.list_pending_settlements(session_id=reserved.record.session_id) == []
 
+    expiration_fallback = BudgetSettlementFallback(
+        settled_at=clock.value,
+        reconciliation_reason="unused conservative fallback",
+        release_reason="unused predispatch release",
+        expiration_reason=f"prevalidated expiry after {ttl_seconds}s",
+    )
     pending = await ledger.reserve(
         limit=limit,
         session_id="sess_crash_safe_predispatch",
@@ -365,6 +649,7 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
         provider_name="fake",
         model="fake-model",
         model_attempt_identity=model_attempt_identity(),
+        settlement_fallback=expiration_fallback,
     )
     assert pending.accepted is True
     assert pending.record is not None
@@ -382,10 +667,10 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
         session_id=pending.record.session_id,
     )
     assert len(pending_releases) == 1, pending_releases
+    assert await ledger.list_pending_settlements() == pending_releases
     assert pending_releases[0].settlement_kind == "released"
-    assert pending_releases[0].reconciliation.reason == (
-        f"Reservation expired: not reconciled within {ttl_seconds}s."
-    )
+    assert pending_releases[0].reconciliation.reason == expiration_fallback.expiration_reason
+    assert pending_releases[0].reconciliation.settled_at == expiration_fallback.settled_at
 
     audit_limit = limit.model_copy(
         update={"max_estimated_cost": Decimal("2")},
@@ -452,6 +737,21 @@ async def assert_crash_safe_dispatch_and_settlement_outbox(
     assert release_settlement is not None
     assert release_settlement.settlement_kind == "released"
     assert release_settlement.event_published is False
+
+    expected_pending = await ledger.list_pending_settlements()
+    paged_pending = []
+    cursor = None
+    while True:
+        page = await ledger.list_pending_settlements(after=cursor, limit=1)
+        if not page:
+            break
+        assert len(page) == 1
+        paged_pending.extend(page)
+        cursor = BudgetSettlementCursor(
+            settled_at=page[0].reconciliation.settled_at,
+            settlement_id=page[0].settlement_id,
+        )
+    assert paged_pending == expected_pending
 
     atomic_limit = limit.model_copy(
         update={"max_estimated_cost": Decimal("1")},

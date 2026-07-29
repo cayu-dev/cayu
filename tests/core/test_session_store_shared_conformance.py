@@ -458,14 +458,33 @@ def test_session_store_conformance_retains_reservation_identity_after_session_de
                 identity=_identity(),
             )
             reservation_id = "bres_shared_conformance_deleted_session"
+            reserved = Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id=first.id,
+                payload={"reservation_id": reservation_id},
+            )
             await store.append_event(
                 first.id,
-                Event(
-                    type=EventType.BUDGET_RESERVED,
-                    session_id=first.id,
-                    payload={"reservation_id": reservation_id},
-                ),
+                reserved,
             )
+            reserved_claim = await store.claim_persisted_event_side_effect(
+                session_id=first.id,
+                event_id=reserved.id,
+            )
+            assert reserved_claim is not None
+            await store.mark_persisted_event_side_effect_delivered(reserved_claim)
+            released = Event(
+                type=EventType.BUDGET_RESERVATION_RELEASED,
+                session_id=first.id,
+                payload={"reservation_id": reservation_id},
+            )
+            await store.append_event(first.id, released)
+            released_claim = await store.claim_persisted_event_side_effect(
+                session_id=first.id,
+                event_id=released.id,
+            )
+            assert released_claim is not None
+            await store.mark_persisted_event_side_effect_delivered(released_claim)
             await store.delete_session(first.id)
             store = await _reopen_store(session_store_case, store)
 
@@ -8006,6 +8025,71 @@ def test_session_store_conformance_blocks_delete_during_incomplete_recovery_clai
                     }
                 },
             )
+            await store.delete_session(created.id)
+            assert await store.load(created.id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_blocks_delete_until_budget_settlement_is_delivered(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_pending_budget_settlement_delete",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            reservation_id = "bres_" + "1" * 32
+            reserved = Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id=created.id,
+                payload={"reservation_id": reservation_id},
+            )
+            await store.claim_budget_reservation_identity(
+                reservation_id=reservation_id,
+                publication_session_id=created.id,
+                publication_id=reserved.id,
+            )
+            await store.append_event(created.id, reserved)
+            reserved_claim = await store.claim_persisted_event_side_effect(
+                session_id=created.id,
+                event_id=reserved.id,
+            )
+            assert reserved_claim is not None
+            await store.mark_persisted_event_side_effect_delivered(reserved_claim)
+
+            with pytest.raises(
+                ValueError,
+                match="budget settlement audit event is pending",
+            ):
+                await store.delete_session(created.id)
+
+            released = Event(
+                type=EventType.BUDGET_RESERVATION_RELEASED,
+                session_id=created.id,
+                payload={"reservation_id": reservation_id},
+            )
+            await store.append_event(created.id, released)
+            with pytest.raises(
+                ValueError,
+                match="budget settlement audit event is pending",
+            ):
+                await store.delete_session(created.id)
+
+            released_claim = await store.claim_persisted_event_side_effect(
+                session_id=created.id,
+                event_id=released.id,
+            )
+            assert released_claim is not None
+            await store.mark_persisted_event_side_effect_delivered(released_claim)
             await store.delete_session(created.id)
             assert await store.load(created.id) is None
         finally:

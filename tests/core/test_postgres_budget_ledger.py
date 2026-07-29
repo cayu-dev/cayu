@@ -15,7 +15,10 @@ from tests.core._budget_ledger_contract import (
     assert_crash_safe_dispatch_and_settlement_outbox,
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
+    assert_prepriced_reservation_stores_only_durable_billing_identity,
     assert_reservation_identity_collision_is_rejected,
+    assert_runtime_publishes_cross_session_ttl_release,
+    assert_runtime_reconstructs_dispatch_fence_acknowledgement,
 )
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
@@ -207,6 +210,48 @@ def test_postgres_budget_ledger_has_crash_safe_settlement_outbox(postgres_dsn) -
     )
 
 
+def test_postgres_budget_ledger_separates_pricing_and_durable_billing_identity(
+    postgres_dsn,
+) -> None:
+    async def ops(ledger):
+        await assert_prepriced_reservation_stores_only_durable_billing_identity(ledger)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_budget_ledger_reconstructs_dispatch_fence_acknowledgement(
+    postgres_dsn,
+) -> None:
+    async def ops(ledger):
+        await assert_runtime_reconstructs_dispatch_fence_acknowledgement(
+            ledger,
+            _reservation_budget_limit(max_cost="0.25"),
+        )
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_budget_ledger_publishes_cross_session_ttl_release(
+    postgres_dsn,
+) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+
+    async def ops(ledger):
+        await assert_runtime_publishes_cross_session_ttl_release(
+            ledger,
+            _reservation_budget_limit(max_cost="0.25"),
+            clock=clock,
+            ttl_seconds=60,
+        )
+
+    _run(
+        postgres_dsn,
+        ops,
+        clock=clock,
+        reservation_ttl_seconds=60,
+    )
+
+
 def test_postgres_revision_twenty_five_refuses_ambiguous_active_reservations(
     postgres_dsn,
 ) -> None:
@@ -241,6 +286,7 @@ def test_postgres_revision_twenty_five_refuses_ambiguous_active_reservations(
                     "ALTER TABLE cayu_budget_reservations "
                     "DROP COLUMN environment_name, "
                     "DROP COLUMN settlement_event_payload, "
+                    "DROP COLUMN settlement_fallback, "
                     "DROP COLUMN dispatch_id, "
                     "DROP COLUMN dispatched_at"
                 )

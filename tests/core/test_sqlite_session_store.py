@@ -1907,15 +1907,31 @@ def test_sqlite_revision_twenty_three_preserves_existing_reservation_ownership(
                 ),
                 identity=_identity(),
             )
-            await store.append_event(
-                session.id,
-                Event(
-                    id=publication_id,
-                    type=EventType.BUDGET_RESERVED,
-                    session_id=session.id,
-                    payload={"reservation_id": reservation_id},
-                ),
+            reserved = Event(
+                id=publication_id,
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
             )
+            await store.append_event(session.id, reserved)
+            reserved_claim = await store.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=reserved.id,
+            )
+            assert reserved_claim is not None
+            await store.mark_persisted_event_side_effect_delivered(reserved_claim)
+            released = Event(
+                type=EventType.BUDGET_RESERVATION_RELEASED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
+            )
+            await store.append_event(session.id, released)
+            released_claim = await store.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=released.id,
+            )
+            assert released_claim is not None
+            await store.mark_persisted_event_side_effect_delivered(released_claim)
         finally:
             await _close(store)
 
@@ -1995,14 +2011,31 @@ def test_sqlite_recorded_revision_twenty_three_fails_closed_without_registry(
             ),
             identity=_identity(),
         )
-        await store.append_event(
-            session.id,
-            Event(
-                type=EventType.BUDGET_RESERVED,
-                session_id=session.id,
-                payload={"reservation_id": "bres_registry_repair"},
-            ),
+        reservation_id = "bres_registry_repair"
+        reserved = Event(
+            type=EventType.BUDGET_RESERVED,
+            session_id=session.id,
+            payload={"reservation_id": reservation_id},
         )
+        await store.append_event(session.id, reserved)
+        reserved_claim = await store.claim_persisted_event_side_effect(
+            session_id=session.id,
+            event_id=reserved.id,
+        )
+        assert reserved_claim is not None
+        await store.mark_persisted_event_side_effect_delivered(reserved_claim)
+        released = Event(
+            type=EventType.BUDGET_RESERVATION_RELEASED,
+            session_id=session.id,
+            payload={"reservation_id": reservation_id},
+        )
+        await store.append_event(session.id, released)
+        released_claim = await store.claim_persisted_event_side_effect(
+            session_id=session.id,
+            event_id=released.id,
+        )
+        assert released_claim is not None
+        await store.mark_persisted_event_side_effect_delivered(released_claim)
         await store.delete_session(session.id)
         await _close(store)
 

@@ -10,6 +10,7 @@ from cayu.runtime.budgets import (
     BudgetReconciliation,
     budget_check_payload,
     budget_reconciliation_payload,
+    budget_settlement_id,
     project_budget_inspection_event,
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
@@ -67,9 +68,10 @@ def _reconciliation(
     value: int,
     kind: Literal["completed", "conservative"],
 ) -> BudgetReconciliation:
+    reservation_id = f"reservation-state-{value}"
     return BudgetReconciliation(
-        reservation_id=f"reservation-state-{value}",
-        settlement_id=f"settlement-state-{value}",
+        reservation_id=reservation_id,
+        settlement_id=budget_settlement_id(reservation_id),
         settlement_kind=kind,
         budget_limit_id=_budget_limit_id(value),
         **_model_attempt_identity(value),

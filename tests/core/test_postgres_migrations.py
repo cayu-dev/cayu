@@ -253,6 +253,10 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             await cur.execute("SELECT to_regclass('cayu_budget_settlements')")
             assert (await cur.fetchone())[0] == "cayu_budget_settlements"
             await cur.execute(
+                "SELECT to_regclass('idx_cayu_budget_reservation_identities_session')"
+            )
+            assert (await cur.fetchone())[0] == ("idx_cayu_budget_reservation_identities_session")
+            await cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'cayu_budget_reservations' "
@@ -276,7 +280,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "AND table_name = 'cayu_budget_reservations' "
                 "AND column_name IN ("
                 "'environment_name', 'settlement_event_payload', "
-                "'dispatch_id', 'dispatched_at'"
+                "'settlement_fallback', 'dispatch_id', 'dispatched_at'"
                 ") ORDER BY column_name"
             )
             assert await cur.fetchall() == [
@@ -284,6 +288,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 ("dispatched_at",),
                 ("environment_name",),
                 ("settlement_event_payload",),
+                ("settlement_fallback",),
             ]
             await cur.execute(
                 "SELECT EXISTS(SELECT 1 FROM pg_trigger "
@@ -1088,15 +1093,31 @@ def test_revision_twenty_three_preserves_existing_reservation_ownership(
                 ),
                 identity=_identity(),
             )
-            await creator.append_event(
-                session.id,
-                Event(
-                    id=publication_id,
-                    type=EventType.BUDGET_RESERVED,
-                    session_id=session.id,
-                    payload={"reservation_id": reservation_id},
-                ),
+            reserved = Event(
+                id=publication_id,
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
             )
+            await creator.append_event(session.id, reserved)
+            reserved_claim = await creator.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=reserved.id,
+            )
+            assert reserved_claim is not None
+            await creator.mark_persisted_event_side_effect_delivered(reserved_claim)
+            released = Event(
+                type=EventType.BUDGET_RESERVATION_RELEASED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
+            )
+            await creator.append_event(session.id, released)
+            released_claim = await creator.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=released.id,
+            )
+            assert released_claim is not None
+            await creator.mark_persisted_event_side_effect_delivered(released_claim)
         finally:
             await creator.close()
 
@@ -1170,14 +1191,31 @@ def test_recorded_revision_twenty_three_fails_closed_without_reservation_registr
                 ),
                 identity=_identity(),
             )
-            await creator.append_event(
-                session.id,
-                Event(
-                    type=EventType.BUDGET_RESERVED,
-                    session_id=session.id,
-                    payload={"reservation_id": "bres_registry_repair"},
-                ),
+            reservation_id = "bres_registry_repair"
+            reserved = Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
             )
+            await creator.append_event(session.id, reserved)
+            reserved_claim = await creator.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=reserved.id,
+            )
+            assert reserved_claim is not None
+            await creator.mark_persisted_event_side_effect_delivered(reserved_claim)
+            released = Event(
+                type=EventType.BUDGET_RESERVATION_RELEASED,
+                session_id=session.id,
+                payload={"reservation_id": reservation_id},
+            )
+            await creator.append_event(session.id, released)
+            released_claim = await creator.claim_persisted_event_side_effect(
+                session_id=session.id,
+                event_id=released.id,
+            )
+            assert released_claim is not None
+            await creator.mark_persisted_event_side_effect_delivered(released_claim)
             await creator.delete_session(session.id)
         finally:
             await creator.close()

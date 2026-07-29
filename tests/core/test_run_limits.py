@@ -49,6 +49,7 @@ from cayu.runtime.budgets import (
     BudgetPolicy,
     BudgetReservation,
     BudgetReservationResult,
+    BudgetSettlementFallback,
     InMemoryBudgetLedger,
     SessionBudgetStore,
     has_deferred_contextual_price,
@@ -220,6 +221,7 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
     async def reserve(
         self,
         *,
+        reservation_id: str | None = None,
         limit: BudgetLimit,
         session_id: str,
         agent_name: str,
@@ -228,12 +230,14 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
         model_attempt_identity: ModelAttemptIdentity,
         environment_name: str | None = None,
         settlement_event_payload: dict[str, Any] | None = None,
+        settlement_fallback: BudgetSettlementFallback | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         self.reserve_calls += 1
         if self.reserve_calls == 2:
             raise asyncio.CancelledError
         result = await super().reserve(
+            reservation_id=reservation_id,
             limit=limit,
             session_id=session_id,
             agent_name=agent_name,
@@ -242,6 +246,7 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
             model_attempt_identity=model_attempt_identity,
             environment_name=environment_name,
             settlement_event_payload=settlement_event_payload,
+            settlement_fallback=settlement_fallback,
             effective_at=effective_at,
         )
         if result.record is not None:
@@ -254,11 +259,21 @@ class _FailSecondReleaseLedger(InMemoryBudgetLedger):
         super().__init__()
         self.release_calls = 0
 
-    async def release(self, *, reservation_id: str, reason: str):
+    async def release(
+        self,
+        *,
+        reservation_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ):
         self.release_calls += 1
         if self.release_calls == 2:
             raise RuntimeError("simulated second release failure")
-        return await super().release(reservation_id=reservation_id, reason=reason)
+        return await super().release(
+            reservation_id=reservation_id,
+            reason=reason,
+            occurred_at=occurred_at,
+        )
 
 
 class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
@@ -270,6 +285,7 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
     async def reserve(
         self,
         *,
+        reservation_id: str | None = None,
         limit: BudgetLimit,
         session_id: str,
         agent_name: str,
@@ -278,9 +294,11 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
         model_attempt_identity: ModelAttemptIdentity,
         environment_name: str | None = None,
         settlement_event_payload: dict[str, Any] | None = None,
+        settlement_fallback: BudgetSettlementFallback | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         result = await super().reserve(
+            reservation_id=reservation_id,
             limit=limit,
             session_id=session_id,
             agent_name=agent_name,
@@ -289,6 +307,7 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
             model_attempt_identity=model_attempt_identity,
             environment_name=environment_name,
             settlement_event_payload=settlement_event_payload,
+            settlement_fallback=settlement_fallback,
             effective_at=effective_at,
         )
         if result.record is not None:
@@ -298,9 +317,19 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
     async def heartbeat(self, *, reservation_id: str) -> bool:
         raise asyncio.CancelledError
 
-    async def release(self, *, reservation_id: str, reason: str):
+    async def release(
+        self,
+        *,
+        reservation_id: str,
+        reason: str,
+        occurred_at: datetime | None = None,
+    ):
         self.release_calls += 1
-        return await super().release(reservation_id=reservation_id, reason=reason)
+        return await super().release(
+            reservation_id=reservation_id,
+            reason=reason,
+            occurred_at=occurred_at,
+        )
 
 
 class _FailSecondReconcileLedger(InMemoryBudgetLedger):

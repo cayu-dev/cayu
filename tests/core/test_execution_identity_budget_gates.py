@@ -440,8 +440,10 @@ def test_reservation_identity_matching_a_workload_secret_fails_before_dispatch(
     monkeypatch.setattr(budgets_module, "uuid4", lambda: fixed_uuid)
     provider = _UsageProvider()
     store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger()
     app = CayuApp(
         session_store=store,
+        budget_ledger=ledger,
         budget_policy=BudgetPolicy(limits=(_reservation_limit(),)),
         secret_redactor=SecretRedactor(reservation_id),
         enable_logging=False,
@@ -467,6 +469,8 @@ def test_reservation_identity_matching_a_workload_secret_fails_before_dispatch(
         event.payload.get("reservation_id") in {reservation_id, REDACTED_SECRET}
         for event in [*events, *persisted]
     )
+    assert ledger._records == {}
+    assert ledger._settlements == {}
 
 
 def test_context_overflow_terminalizes_the_reserved_attempt_for_inspection() -> None:
@@ -1247,6 +1251,39 @@ def test_runtime_rejects_settlement_identity_rewritten_by_custom_ledger() -> Non
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_rewritten_settlement_identity",
+                messages=[Message.text("user", "answer")],
+            ),
+        )
+    )
+
+    assert provider.calls == 1
+    assert EventType.MODEL_COMPLETED in {event.type for event in events}
+    assert EventType.BUDGET_RECONCILED not in {event.type for event in events}
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].payload["error"] == "Budget ledger settlement changed its requested outcome."
+
+
+def test_runtime_rejects_settlement_id_rewritten_by_custom_ledger() -> None:
+    class RewritingSettlementLedger(InMemoryBudgetLedger):
+        async def reconcile(self, **kwargs):
+            reconciliation = await super().reconcile(**kwargs)
+            return reconciliation.model_copy(update={"settlement_id": "forged-custom-settlement"})
+
+    provider = _UsageProvider()
+    app = CayuApp(
+        budget_policy=BudgetPolicy(limits=(_reservation_limit(),)),
+        budget_ledger=RewritingSettlementLedger(),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="identity-model"))
+
+    events = asyncio.run(
+        _collect_app_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_rewritten_settlement_id",
                 messages=[Message.text("user", "answer")],
             ),
         )

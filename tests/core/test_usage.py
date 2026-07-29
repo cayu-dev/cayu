@@ -10,7 +10,10 @@ from tests.core._budget_ledger_contract import (
     assert_crash_safe_dispatch_and_settlement_outbox,
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
+    assert_prepriced_reservation_stores_only_durable_billing_identity,
     assert_reservation_identity_collision_is_rejected,
+    assert_runtime_publishes_cross_session_ttl_release,
+    assert_runtime_reconstructs_dispatch_fence_acknowledgement,
 )
 from tests.core._execution_unit_fixtures import model_attempt_identity
 
@@ -1230,6 +1233,35 @@ def test_in_memory_budget_ledger_has_crash_safe_settlement_outbox() -> None:
     )
 
 
+def test_in_memory_budget_ledger_separates_pricing_and_durable_billing_identity() -> None:
+    asyncio.run(
+        assert_prepriced_reservation_stores_only_durable_billing_identity(
+            InMemoryBudgetLedger(),
+        )
+    )
+
+
+def test_in_memory_budget_ledger_reconstructs_dispatch_fence_acknowledgement() -> None:
+    asyncio.run(
+        assert_runtime_reconstructs_dispatch_fence_acknowledgement(
+            InMemoryBudgetLedger(),
+            _reservation_budget_limit(max_cost="0.25"),
+        )
+    )
+
+
+def test_in_memory_budget_ledger_publishes_cross_session_ttl_release() -> None:
+    clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+    asyncio.run(
+        assert_runtime_publishes_cross_session_ttl_release(
+            InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60),
+            _reservation_budget_limit(max_cost="0.25"),
+            clock=clock,
+            ttl_seconds=60,
+        )
+    )
+
+
 def test_in_memory_budget_ledger_rejects_reservation_identity_collision() -> None:
     asyncio.run(
         assert_reservation_identity_collision_is_rejected(
@@ -1544,6 +1576,56 @@ def test_sqlite_budget_ledger_has_crash_safe_settlement_outbox(tmp_path) -> None
         )
         try:
             await assert_crash_safe_dispatch_and_settlement_outbox(
+                ledger,
+                _reservation_budget_limit(max_cost="0.25"),
+                clock=clock,
+                ttl_seconds=60,
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_separates_pricing_and_durable_billing_identity(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        ledger = SQLiteBudgetLedger(tmp_path / "budget-pricing-identity.sqlite")
+        try:
+            await assert_prepriced_reservation_stores_only_durable_billing_identity(ledger)
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_reconstructs_dispatch_fence_acknowledgement(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        ledger = SQLiteBudgetLedger(tmp_path / "budget-dispatch-ack.sqlite")
+        try:
+            await assert_runtime_reconstructs_dispatch_fence_acknowledgement(
+                ledger,
+                _reservation_budget_limit(max_cost="0.25"),
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_budget_ledger_publishes_cross_session_ttl_release(tmp_path) -> None:
+    async def run() -> None:
+        clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget-cross-session-reap.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=60,
+        )
+        try:
+            await assert_runtime_publishes_cross_session_ttl_release(
                 ledger,
                 _reservation_budget_limit(max_cost="0.25"),
                 clock=clock,
@@ -2318,7 +2400,7 @@ def test_sqlite_budget_ledger_preserves_bedrock_identity_across_reopen(tmp_path)
     assert reconciled.actual_amount == Decimal("9")
 
 
-def test_sqlite_budget_ledger_revisions_21_through_24_add_settlement_schema(
+def test_sqlite_budget_ledger_revisions_21_through_25_add_settlement_schema(
     tmp_path,
 ) -> None:
     path = tmp_path / "bedrock-budget-migration.sqlite"
@@ -2338,6 +2420,9 @@ def test_sqlite_budget_ledger_revisions_21_through_24_add_settlement_schema(
         connection.execute(
             "ALTER TABLE cayu_budget_reservations DROP COLUMN settlement_event_payload_json"
         )
+        connection.execute(
+            "ALTER TABLE cayu_budget_reservations DROP COLUMN settlement_fallback_json"
+        )
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN environment_name")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN model_attempt_id")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN model_step_id")
@@ -2349,7 +2434,7 @@ def test_sqlite_budget_ledger_revisions_21_through_24_add_settlement_schema(
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 25"):
         SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     async def migrate() -> None:
@@ -2364,8 +2449,12 @@ def test_sqlite_budget_ledger_revisions_21_through_24_add_settlement_schema(
         }
         revisions = connection.execute(
             "SELECT revision, kind, compatible_from FROM cayu_schema_migrations "
-            "WHERE revision BETWEEN 21 AND 23 ORDER BY revision"
+            "WHERE revision BETWEEN 21 AND 25 ORDER BY revision"
         ).fetchall()
+        ownership_index = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_budget_reservation_identities_session'"
+        ).fetchone()
     finally:
         connection.close()
     assert "billing_identity_json" in columns
@@ -2374,13 +2463,16 @@ def test_sqlite_budget_ledger_revisions_21_through_24_add_settlement_schema(
     assert "model_attempt_id" in columns
     assert "environment_name" in columns
     assert "settlement_event_payload_json" in columns
+    assert "settlement_fallback_json" in columns
     assert "dispatch_id" in columns
     assert "dispatched_at" in columns
+    assert ownership_index == ("idx_cayu_budget_reservation_identities_session",)
     assert revisions == [
         (21, "breaking", 21),
         (22, "breaking", 22),
         (23, "breaking", 23),
-        (24, "breaking", 24),
+        (24, "additive", 23),
+        (25, "breaking", 25),
     ]
 
 
@@ -2412,6 +2504,9 @@ def test_sqlite_revision_twenty_five_refuses_ambiguous_active_reservations(
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN dispatch_id")
         connection.execute(
             "ALTER TABLE cayu_budget_reservations DROP COLUMN settlement_event_payload_json"
+        )
+        connection.execute(
+            "ALTER TABLE cayu_budget_reservations DROP COLUMN settlement_fallback_json"
         )
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN environment_name")
         connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 25")
