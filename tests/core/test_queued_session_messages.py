@@ -1282,8 +1282,22 @@ def test_sqlite_queue_delivery_replay_survives_event_retention(tmp_path) -> None
                 interaction_id=interaction_id,
                 interaction_started_event=started,
             )
+            completed = Event(
+                id="evt_queue_delivery_retention_completed",
+                type=EventType.INTERACTION_COMPLETED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            publication = await store.publish_interaction_transition(
+                session_id,
+                event=completed,
+                from_statuses={SessionStatus.RUNNING},
+                to_status=SessionStatus.COMPLETED,
+                only_if_no_queued_messages=True,
+            )
+            assert publication.status_changed is True
 
-            for event in (accepted.event, *batch.events):
+            for event in (accepted.event, *batch.events, completed):
                 claim = await store.claim_persisted_event_side_effect(
                     session_id=session_id,
                     event_id=event.id,
@@ -1295,7 +1309,7 @@ def test_sqlite_queue_delivery_replay_survives_event_retention(tmp_path) -> None
                     before=datetime.now(UTC) + timedelta(days=1),
                     session_id=session_id,
                 )
-                == 3
+                == 4
             )
 
             replayed = await store.deliver_queued_session_messages(

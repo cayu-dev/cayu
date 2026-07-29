@@ -501,8 +501,8 @@ class RecoveryAbandonedTurnRequest:
     session: Session
     registered_agent: runtime_records.RegisteredAgentState
     environment_name: str | None
-    run_started_at: float
-    usage_tracker: SessionUsageTracker
+    run_started_at: float | None
+    usage_tracker: SessionUsageTracker | None
     active_run: ActiveSessionRun[SessionUsageTracker] | None
 
 
@@ -601,7 +601,7 @@ RegisteredProviderResolver = Callable[[str], runtime_records.RegisteredProvider]
 RegisteredEnvironmentResolver = Callable[[str | None], runtime_records.RegisteredEnvironment | None]
 RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterator[Event]]
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
-AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Event]]
+AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
 IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
 MaterializeDeferredInteractionInput = Callable[[str], Awaitable[bool]]
 ResumeInteraction = Callable[
@@ -1519,11 +1519,14 @@ class RecoveryCoordinator:
                 limit=1,
             )
         )
-        interaction_id = (
-            latest_events[0].event.interaction_id
-            if latest_events and latest_events[0].event.type not in INTERACTION_TERMINAL_EVENT_TYPES
-            else None
-        )
+        if not latest_events or latest_events[0].event.type in INTERACTION_TERMINAL_EVENT_TYPES:
+            raise RuntimeError(
+                "Pending recovery state has no open interaction. "
+                "Pre-interaction prerelease recovery state is unsupported."
+            )
+        interaction_id = latest_events[0].event.interaction_id
+        if interaction_id is None:
+            raise RuntimeError("Interaction lifecycle event has no interaction identity.")
         expected_statuses = (
             {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
         )
@@ -1582,9 +1585,8 @@ class RecoveryCoordinator:
         # The transition activated this epoch only in the child task's copied
         # context. The caller owns all subsequent writes and cleanup.
         _activate_session_run_fence(session)
-        resumed_event: Event | None = None
-        if interaction_id is not None:
-            _activate_session_interaction(session.id, interaction_id)
+        _activate_session_interaction(session.id, interaction_id)
+        try:
             registered_agent = self._resolve_registered_agent(session.agent_name)
             registered_environment = self._resolve_registered_environment(session.environment_name)
             resumed_event = await self._resume_interaction(
@@ -1592,6 +1594,25 @@ class RecoveryCoordinator:
                 registered_agent,
                 registered_environment,
             )
+        except BaseException as exc:
+            try:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=exc,
+                    steps=(
+                        (
+                            "abandoned session finalization",
+                            lambda: self.finalize_abandoned_session_by_id(session.id),
+                        ),
+                        (
+                            "run fence release",
+                            lambda: self._session_store.release_run_fence(session.id),
+                        ),
+                    ),
+                )
+            finally:
+                _deactivate_session_run_fence(session.id)
+                _deactivate_session_interaction(session.id)
+            raise
         if cancellation is None:
             return session, resumed_event
 
@@ -1994,19 +2015,26 @@ class RecoveryCoordinator:
                 task_started=False,
                 task_finished=False,
             )
-        interaction_id = await self._activate_latest_open_interaction(loaded_session.id)
-        recovery_stream = self.recover_tool_round(
-            request=request,
-            loaded_session=loaded_session,
-            pending_round=pending_round,
-            pending_tool_call=pending_tool_call,
-            registered_agent=registered_agent,
-            registered_provider=registered_provider,
-            registered_environment=registered_environment,
-            effective_structured_output=effective_structured_output,
-        )
+        interaction_id: str | None = None
+        recovery_stream: AsyncGenerator[Event, None] | None = None
         authoritative_failure: BaseException | None = None
         try:
+            interaction_id = await self._activate_latest_open_interaction(loaded_session.id)
+            if interaction_id is None:
+                raise RuntimeError(
+                    "Pending tool recovery state has no open interaction. "
+                    "Pre-interaction prerelease recovery state is unsupported."
+                )
+            recovery_stream = self.recover_tool_round(
+                request=request,
+                loaded_session=loaded_session,
+                pending_round=pending_round,
+                pending_tool_call=pending_tool_call,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                registered_environment=registered_environment,
+                effective_structured_output=effective_structured_output,
+            )
             async for event in recovery_stream:
                 yield event
         except BaseException as exc:
@@ -5362,29 +5390,34 @@ class RecoveryCoordinator:
     ) -> None:
         """Best-effort finalization for a live session whose event stream closed."""
         try:
-            finalized = await self._session_store.transition_status(
-                request.session.id,
-                from_statuses={
-                    SessionStatus.PENDING,
-                    SessionStatus.RUNNING,
-                    SessionStatus.INTERRUPTING,
-                },
-                to_status=SessionStatus.INTERRUPTED,
-            )
-        except (KeyError, ValueError):
-            return
-        if request.run_started_at is not None and request.turn_usage_tracker is not None:
-            with contextlib.suppress(Exception):
-                await self._abandoned_turn_completed(
-                    RecoveryAbandonedTurnRequest(
-                        session=finalized,
-                        registered_agent=request.registered_agent,
-                        environment_name=request.environment_name,
-                        run_started_at=request.run_started_at,
-                        usage_tracker=request.turn_usage_tracker,
-                        active_run=request.active_run,
-                    )
+            finalized = await self._abandoned_turn_completed(
+                RecoveryAbandonedTurnRequest(
+                    session=request.session,
+                    registered_agent=request.registered_agent,
+                    environment_name=request.environment_name,
+                    run_started_at=request.run_started_at,
+                    usage_tracker=request.turn_usage_tracker,
+                    active_run=request.active_run,
                 )
+            )
+        except BaseException:
+            try:
+                finalized = await self._session_store.transition_status(
+                    request.session.id,
+                    from_statuses={
+                        SessionStatus.PENDING,
+                        SessionStatus.RUNNING,
+                        SessionStatus.INTERRUPTING,
+                    },
+                    to_status=SessionStatus.INTERRUPTED,
+                )
+            except KeyError:
+                return
+            except ValueError:
+                loaded = await self._session_store.load(request.session.id)
+                if loaded is None or loaded.status is not SessionStatus.INTERRUPTED:
+                    return
+                finalized = loaded
         with contextlib.suppress(BaseException):
             async for _ in self._emit_terminal_event_with_hooks(
                 RecoveryTerminalEventRequest(

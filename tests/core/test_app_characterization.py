@@ -61,6 +61,13 @@ from cayu.runtime import (
 )
 from cayu.tools.user_input import UserInputTool
 
+_UNASSOCIATED_INTERACTION_EVENT_TYPES = {
+    EventType.TURN_COMPLETED,
+    EventType.SESSION_COMPLETED,
+    EventType.SESSION_FAILED,
+    EventType.SESSION_INTERRUPTED,
+}
+
 
 class ScriptedProvider(ModelProvider):
     """Deterministic provider that replays one scripted event batch per request.
@@ -248,12 +255,14 @@ def test_interaction_identity_partitions_two_responses() -> None:
         )
 
         first_ids = {
-            event.interaction_id for event in first_events if event.type != EventType.TURN_COMPLETED
+            event.interaction_id
+            for event in first_events
+            if event.type not in _UNASSOCIATED_INTERACTION_EVENT_TYPES
         }
         second_ids = {
             event.interaction_id
             for event in second_events
-            if event.type != EventType.TURN_COMPLETED
+            if event.type not in _UNASSOCIATED_INTERACTION_EVENT_TYPES
         }
         assert len(first_ids) == 1
         assert None not in first_ids
@@ -391,10 +400,14 @@ def test_g2a_user_input_pause_then_resume() -> None:
         EventType.SESSION_COMPLETED,
     ]
     pause_ids = {
-        event.interaction_id for event in pause_events if event.type != EventType.TURN_COMPLETED
+        event.interaction_id
+        for event in pause_events
+        if event.type not in _UNASSOCIATED_INTERACTION_EVENT_TYPES
     }
     resume_ids = {
-        event.interaction_id for event in resume_events if event.type != EventType.TURN_COMPLETED
+        event.interaction_id
+        for event in resume_events
+        if event.type not in _UNASSOCIATED_INTERACTION_EVENT_TYPES
     }
     assert pause_ids == resume_ids == {resume_events[0].interaction_id}
     assert resume_events[0].interaction_id is not None
@@ -499,10 +512,14 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
         EventType.SESSION_COMPLETED,
     ]
     pause_ids = {
-        event.interaction_id for event in pause_events if event.type != EventType.TURN_COMPLETED
+        event.interaction_id
+        for event in pause_events
+        if event.type not in _UNASSOCIATED_INTERACTION_EVENT_TYPES
     }
     resume_ids = {
-        event.interaction_id for event in resume_events if event.type != EventType.TURN_COMPLETED
+        event.interaction_id
+        for event in resume_events
+        if event.type not in _UNASSOCIATED_INTERACTION_EVENT_TYPES
     }
     assert pause_ids == resume_ids == {resume_events[0].interaction_id}
     assert resume_events[0].interaction_id is not None

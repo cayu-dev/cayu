@@ -169,22 +169,11 @@ REVISIONS: tuple[Revision, ...] = (
     # dispatch fence and atomically materialize terminal audit evidence, so a
     # pre-25 worker must not share this ledger.
     Revision(revision=25, kind=RevisionKind.BREAKING, compatible_from=25),
-    # Add nullable interaction attribution beside events and transcript rows.
-    # Existing rows stay explicitly unassociated and revision-25 binaries
-    # ignore the additive columns.
-    Revision(revision=26, kind=RevisionKind.ADDITIVE, compatible_from=25),
-    # Maintain one indexed latest lifecycle pointer per interaction so bounded
-    # interaction listing never groups a session's complete event history.
-    Revision(revision=27, kind=RevisionKind.ADDITIVE, compatible_from=25),
-    # New-session interaction admission may defer transcript visibility until
-    # the environment-derived system prefix is known. The deferred source row
-    # is written atomically with interaction.started and must be understood by
-    # every recovery worker, so mixed-version writers are unsafe.
-    Revision(revision=28, kind=RevisionKind.BREAKING, compatible_from=28),
-    # Queue delivery attempts gain a durable idempotency record. Every runtime
-    # worker must publish and reconstruct those records so a commit whose
-    # acknowledgement is lost cannot strand an admitted interaction.
-    Revision(revision=29, kind=RevisionKind.BREAKING, compatible_from=29),
+    # Add durable interaction attribution, database-owned transcript ordinals,
+    # bounded latest-lifecycle projection, deferred admission, and replay-safe
+    # queue/transition records. This prerelease contract intentionally does not
+    # migrate populated pre-interaction session databases.
+    Revision(revision=26, kind=RevisionKind.BREAKING, compatible_from=26),
 )
 
 #: The revision an empty database is initialized to.

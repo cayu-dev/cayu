@@ -228,23 +228,27 @@ class _BlockingAbandonedFinalizationStore(_RecordingReleaseStore):
         self.finalization_started: asyncio.Event | None = None
         self.finish_finalization: asyncio.Event | None = None
 
-    async def transition_status(
+    async def publish_interaction_transition(
         self,
         session_id: str,
         *,
+        event: Event,
         from_statuses: set[SessionStatus],
         to_status: SessionStatus,
-    ) -> Session:
+        only_if_no_queued_messages: bool = False,
+    ):
         if self.block_next_interrupted_transition and to_status == SessionStatus.INTERRUPTED:
             self.block_next_interrupted_transition = False
             if self.finalization_started is None or self.finish_finalization is None:
                 raise AssertionError("Finalization boundary events were not initialized.")
             self.finalization_started.set()
             await self.finish_finalization.wait()
-        return await super().transition_status(
+        return await super().publish_interaction_transition(
             session_id,
+            event=event,
             from_statuses=from_statuses,
             to_status=to_status,
+            only_if_no_queued_messages=only_if_no_queued_messages,
         )
 
 

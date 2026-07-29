@@ -249,6 +249,30 @@ def _new_publishable_budget_reservation_authority(
     )
 
 
+def _interaction_bound_settlement_event_payload(
+    event_writer: RuntimeEventWriter,
+    *,
+    session_id: str,
+    agent_name: str,
+    environment_name: str | None,
+    payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Bind future ledger-owned settlement evidence to its current interaction."""
+
+    copied = copy_durable_json_object(payload or {}, "settlement_event_payload")
+    attribution_probe = event_writer.prepare(
+        Event(
+            type=EventType.BUDGET_RECONCILED,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            payload={},
+        )
+    )
+    copied["interaction_id"] = attribution_probe.interaction_id
+    return copied
+
+
 def _validate_ledger_reservation_result(
     result: BudgetReservationResult,
     *,
@@ -1401,6 +1425,12 @@ class RunLimitController:
         reservation_failure: BudgetReservationResult | None = None
         release_reason = "reservation setup failed"
         expected_billing_identity = copy_billing_identity(billing_identity)
+        settlement_event_payload = _interaction_bound_settlement_event_payload(
+            self._event_writer,
+            session_id=session.id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+        )
         identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         try:
             for limit in limits:
@@ -1424,7 +1454,7 @@ class RunLimitController:
                     environment_name=environment_name,
                     provider_name=provider_name,
                     model=session.model,
-                    settlement_event_payload={},
+                    settlement_event_payload=settlement_event_payload,
                     billing_identity=expected_billing_identity,
                     reserved_amount=expected_requested_amount,
                     fallback_settled_at=reservation_effective_at,
@@ -1442,6 +1472,10 @@ class RunLimitController:
                             model=session.model,
                             model_attempt_identity=ledger_model_attempt_identity,
                             environment_name=environment_name,
+                            settlement_event_payload=copy_durable_json_object(
+                                settlement_event_payload,
+                                "settlement_event_payload",
+                            ),
                             settlement_fallback=authority.settlement_fallback,
                             effective_at=reservation_effective_at,
                         )
@@ -1455,6 +1489,10 @@ class RunLimitController:
                             model=session.model,
                             model_attempt_identity=ledger_model_attempt_identity,
                             environment_name=environment_name,
+                            settlement_event_payload=copy_durable_json_object(
+                                settlement_event_payload,
+                                "settlement_event_payload",
+                            ),
                             settlement_fallback=authority.settlement_fallback,
                             requested_amount=expected_requested_amount,
                             billing_identity=ledger_billing_identity,
@@ -1475,7 +1513,7 @@ class RunLimitController:
                     provider_name=provider_name,
                     model=session.model,
                     environment_name=environment_name,
-                    settlement_event_payload={},
+                    settlement_event_payload=settlement_event_payload,
                     settlement_fallback=authority.settlement_fallback,
                     billing_identity=authority.billing_identity,
                     expected_requested_amount=expected_requested_amount,
@@ -2902,9 +2940,12 @@ class RunLimitController:
         events: list[Event] = []
         releases: list[BudgetReconciliation] = []
         expected_billing_identity = copy_billing_identity(billing_identity)
-        expected_settlement_event_payload = copy_durable_json_object(
-            settlement_event_payload or {},
-            "settlement_event_payload",
+        expected_settlement_event_payload = _interaction_bound_settlement_event_payload(
+            self._event_writer,
+            session_id=session_id,
+            agent_name=agent_name,
+            environment_name=environment_name,
+            payload=settlement_event_payload,
         )
         identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         if reservation_event_factory is None:

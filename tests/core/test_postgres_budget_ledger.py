@@ -290,7 +290,7 @@ def test_postgres_revision_twenty_five_refuses_ambiguous_active_reservations(
                     "DROP COLUMN dispatch_id, "
                     "DROP COLUMN dispatched_at"
                 )
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 25")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 25")
             await conn.commit()
 
         migrator = PostgresBudgetLedger(

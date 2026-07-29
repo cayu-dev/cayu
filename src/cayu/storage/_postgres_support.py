@@ -40,6 +40,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         last_activity_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
         run_epoch BIGINT NOT NULL DEFAULT 0,
         event_seq BIGINT NOT NULL DEFAULT 0,
+        transcript_seq BIGINT NOT NULL DEFAULT 0,
         metadata JSONB NOT NULL
     )
     """,
@@ -134,6 +135,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         interaction_id TEXT,
+        session_order BIGINT,
         message JSONB NOT NULL
     )
     """,

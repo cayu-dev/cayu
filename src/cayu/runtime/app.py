@@ -1709,16 +1709,24 @@ class CayuApp:
     async def _complete_abandoned_recovery_turn(
         self,
         request: RecoveryAbandonedTurnRequest,
-    ) -> Event:
-        return await self._emit_turn_completed_once(
+    ) -> Session:
+        finalized, _, _ = await self._session_engine._publish_interaction_transition(
             session=request.session,
             registered_agent=request.registered_agent,
             environment_name=request.environment_name,
-            status=SessionStatus.INTERRUPTED,
-            run_started_at=request.run_started_at,
-            usage_tracker=request.usage_tracker,
-            active_run=request.active_run,
+            to_status=SessionStatus.INTERRUPTED,
         )
+        if request.run_started_at is not None and request.usage_tracker is not None:
+            await self._emit_turn_completed_once(
+                session=finalized,
+                registered_agent=request.registered_agent,
+                environment_name=request.environment_name,
+                status=SessionStatus.INTERRUPTED,
+                run_started_at=request.run_started_at,
+                usage_tracker=request.usage_tracker,
+                active_run=request.active_run,
+            )
+        return finalized
 
     async def _resume_recovery_interaction(
         self,

@@ -3642,6 +3642,7 @@ def _budget_settlement_record(
         id=budget_settlement_event_id(reconciliation.settlement_id),
         timestamp=reconciliation.settled_at,
         session_id=reservation.session_id,
+        interaction_id=reservation.settlement_event_payload.get("interaction_id"),
         agent_name=reservation.agent_name,
         environment_name=reservation.environment_name,
         payload=payload,

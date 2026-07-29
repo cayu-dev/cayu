@@ -2384,6 +2384,7 @@ def create_router(
                 Event(
                     type=EventType.SERVER_MUTATION_ACCEPTED,
                     session_id=session_id,
+                    interaction_id=first_event.interaction_id,
                     agent_name=first_event.agent_name,
                     environment_name=first_event.environment_name,
                     workflow_name=first_event.workflow_name,

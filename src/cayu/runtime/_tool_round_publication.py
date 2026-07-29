@@ -542,16 +542,12 @@ def _build_tool_round_publication_request(
     )
     if len(transcript_messages) != 1:
         raise AssertionError("Tool-round transcript construction must return one message.")
-    interaction_ids = {
-        event.interaction_id
-        for event in evidence.lifecycle_events
-        if event.interaction_id is not None
-    }
-    if len(interaction_ids) > 1:
+    interaction_ids = {event.interaction_id for event in evidence.lifecycle_events}
+    if len(interaction_ids) != 1 or None in interaction_ids:
         raise ValueError(
-            "Tool-round publication lifecycle evidence has conflicting interaction identities."
+            "Tool-round publication lifecycle evidence requires one interaction identity."
         )
-    interaction_id = next(iter(interaction_ids), None)
+    interaction_id = next(iter(interaction_ids))
     ordinary_request = RuntimePublicationRequest(
         publication_id=f"tool-round:{copied_pending_round.tool_round_id}",
         kind="tool-round",
@@ -640,6 +636,8 @@ def _validate_extended_request(
         raise ValueError("Tool-round extension cannot replace the publication identity.")
     if extended_request.kind != ordinary_request.kind:
         raise ValueError("Tool-round extension cannot replace the publication kind.")
+    if extended_request.interaction_id != ordinary_request.interaction_id:
+        raise ValueError("Tool-round extension cannot replace the interaction identity.")
     if not _durable_json_equal(
         extended_request.mutation.model_dump(mode="json"),
         ordinary_request.mutation.model_dump(mode="json"),
@@ -716,6 +714,10 @@ def _validate_publication_result(
         raise RuntimeError("Tool-round publication acknowledgement has a conflicting session.")
     if receipt.publication_id != request.publication_id or receipt.kind != request.kind:
         raise RuntimeError("Tool-round publication acknowledgement has a conflicting identity.")
+    if receipt.interaction_id != request.interaction_id:
+        raise RuntimeError(
+            "Tool-round publication acknowledgement has a conflicting interaction identity."
+        )
     if not _durable_json_equal(receipt.intent, request.intent):
         raise RuntimeError("Tool-round publication acknowledgement has conflicting intent.")
     if (

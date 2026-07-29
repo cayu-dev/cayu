@@ -69,6 +69,7 @@ export function assertMutationSseEvent(value: unknown): asserts value is SseEven
     !isMutationSseMarkerComponent(event.session_id) ||
     typeof event.timestamp !== "string" ||
     event.timestamp.length === 0 ||
+    !nullableString(event.interaction_id) ||
     !nullableString(event.agent_name) ||
     !nullableString(event.tool_name) ||
     !optionalNullableString(event.environment_name) ||

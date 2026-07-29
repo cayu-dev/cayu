@@ -32,6 +32,7 @@ function event(id, type = "custom.test", payload = {}) {
     id,
     type,
     session_id: SESSION_ID,
+    interaction_id: null,
     agent_name: "assistant",
     environment_name: null,
     workflow_name: null,
@@ -222,6 +223,14 @@ test("strict stream protocol parsing preserves generated envelopes", () => {
   )
   assert.throws(
     () => parseMutationSseEvent(JSON.stringify({ ...value, agent_name: 42 })),
+    /Malformed SSE event/,
+  )
+  assert.throws(() => {
+    const { interaction_id: _interactionId, ...missingInteractionId } = value
+    parseMutationSseEvent(JSON.stringify(missingInteractionId))
+  }, /Malformed SSE event/)
+  assert.throws(
+    () => parseMutationSseEvent(JSON.stringify({ ...value, interaction_id: 42 })),
     /Malformed SSE event/,
   )
   assert.throws(

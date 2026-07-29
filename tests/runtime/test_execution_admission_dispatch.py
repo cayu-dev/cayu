@@ -898,7 +898,7 @@ def test_factory_candidate_switch_is_refused_and_discarded_before_checkpoint() -
     assert checkpoint is None or "environment_factory_allocation_owner" not in checkpoint
 
 
-def test_failed_pre_checkpoint_factory_setup_recreates_on_resume() -> None:
+def test_failed_pre_checkpoint_factory_setup_requires_a_new_session() -> None:
     async def run() -> tuple[list[Event], list[Event], _RecordingProvider, _RecoveringFactory]:
         provider = _RecordingProvider()
         factory = _RecoveringFactory()
@@ -914,21 +914,23 @@ def test_failed_pre_checkpoint_factory_setup_recreates_on_resume() -> None:
             execution_requirements=_requirements(),
         )
         initial_events = await _run(app, "sess_factory_recreate")
-        resumed_events = [
-            event
-            async for event in app.resume(
-                ResumeRequest(
-                    session_id="sess_factory_recreate",
-                    messages=[Message.text("user", "retry")],
+        with pytest.raises(RuntimeError, match="authoritative initial transcript"):
+            _ = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id="sess_factory_recreate",
+                        messages=[Message.text("user", "retry")],
+                    )
                 )
-            )
-        ]
-        return initial_events, resumed_events, provider, factory
+            ]
+        retried_events = await _run(app, "sess_factory_recreate_retry")
+        return initial_events, retried_events, provider, factory
 
-    initial_events, resumed_events, provider, factory = asyncio.run(run())
+    initial_events, retried_events, provider, factory = asyncio.run(run())
 
     assert EventType.SESSION_FAILED in {event.type for event in initial_events}
-    assert EventType.SESSION_COMPLETED in {event.type for event in resumed_events}
+    assert EventType.SESSION_COMPLETED in {event.type for event in retried_events}
     assert [request.operation for request in factory.requests] == [
         EnvironmentFactoryOperation.CREATE,
         EnvironmentFactoryOperation.CREATE,

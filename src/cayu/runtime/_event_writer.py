@@ -94,6 +94,7 @@ _EVENT_SECRET_FREE_AUTHORITY_FIELDS = frozenset(
         "checkpoint",
         "event_id",
         "input_id",
+        "interaction_id",
         "model_attempt_id",
         "model_step_id",
         "model",
@@ -548,6 +549,8 @@ def prepare_runtime_event(
             ("session_id", event.session_id),
             ("event_id", event.id),
         ]
+        if event.interaction_id is not None:
+            authority_fields.append(("interaction_id", event.interaction_id))
         if not isinstance(event.type, EventType):
             authority_fields.append(("event_type", str(event.type)))
         for field_name, value in authority_fields:

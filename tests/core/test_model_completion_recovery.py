@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,6 +15,8 @@ from cayu.runtime import (
     CayuApp,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
+    InteractionStatus,
+    InteractionSummaryEvidence,
     ModelCompletionManualRecoveryRequired,
     ResumeRequest,
     RunRequest,
@@ -129,6 +132,22 @@ async def _stage_completed_model_boundary(
     tool_call_count: int = 1,
 ) -> _StagedCompletion:
     user_message = Message.text("user", "complete this model step once")
+    interaction_id = f"interaction-{session_id}"
+    started_event_id = f"{session_id}:interaction-started"
+    started_at = datetime.now(UTC)
+    started_event = Event(
+        id=started_event_id,
+        type=EventType.INTERACTION_STARTED,
+        session_id=session_id,
+        interaction_id=interaction_id,
+        timestamp=started_at,
+        agent_name="assistant",
+        payload=InteractionSummaryEvidence(
+            status=InteractionStatus.ACTIVE,
+            start_event_id=started_event_id,
+            started_at=started_at,
+        ).model_dump(mode="json"),
+    )
     created = await store.create(
         RunRequest(
             agent_name="assistant",
@@ -139,13 +158,16 @@ async def _stage_completed_model_boundary(
             provider_name=provider_name,
             model="fake-model",
         ),
+        interaction_started_event=started_event,
+        interaction_source_messages=[user_message],
     )
-    await store.append_transcript_messages(created.id, [user_message])
-    running = await store.transition_status(
+    await store.replace_initial_transcript_messages(
         created.id,
-        from_statuses={SessionStatus.PENDING},
-        to_status=SessionStatus.RUNNING,
+        [user_message],
+        [user_message],
+        interaction_id=interaction_id,
     )
+    running = created
 
     source_cursor = 1
     model_attempt_identity = ModelAttemptIdentity(
@@ -245,6 +267,7 @@ async def _stage_completed_model_boundary(
         id=f"{session_id}:model-completed",
         type=EventType.MODEL_COMPLETED,
         session_id=session_id,
+        interaction_id=interaction_id,
         agent_name="assistant",
         payload={
             **model_attempt_identity.payload(),
@@ -276,6 +299,7 @@ async def _stage_completed_model_boundary(
     publication = RuntimePublicationRequest(
         publication_id=logical_step_id,
         kind="model-step",
+        interaction_id=interaction_id,
         intent=intent,
         mutation=runtime_publication_checkpoint_mutation(None, target_checkpoint),
         transcript_messages=(assistant_message,),
@@ -289,7 +313,7 @@ async def _stage_completed_model_boundary(
     assert completed.stage.state == "completed"
     assert await store.load_active_model_completion_stage(session_id) is not None
     assert await store.load_transcript(session_id) == [user_message]
-    assert await store.load_events(session_id) == []
+    assert await store.load_events(session_id) == [started_event]
     return _StagedCompletion(
         session=running,
         stage=completed.stage,
@@ -471,6 +495,7 @@ async def _receiptless_pause_tail(
         id=f"{session_id}:resumed",
         type=EventType.SESSION_RESUMED,
         session_id=session_id,
+        interaction_id=staged.completion_event.interaction_id,
         agent_name="assistant",
         payload=resume_payload,
     )
@@ -490,6 +515,7 @@ async def _receiptless_pause_tail(
                 id=f"{session_id}:started:{index}",
                 type=EventType.TOOL_CALL_STARTED,
                 session_id=session_id,
+                interaction_id=staged.completion_event.interaction_id,
                 agent_name="assistant",
                 tool_name=call.tool_name,
                 payload={
@@ -507,6 +533,7 @@ async def _receiptless_pause_tail(
                 id=f"{session_id}:completed:{index}",
                 type=EventType.TOOL_CALL_COMPLETED,
                 session_id=session_id,
+                interaction_id=staged.completion_event.interaction_id,
                 agent_name="assistant",
                 tool_name=call.tool_name,
                 payload={
@@ -1156,6 +1183,7 @@ def test_model_boundary_accepts_exact_published_tool_round() -> None:
             Event(
                 type=EventType.TOOL_CALL_STARTED,
                 session_id=staged.session.id,
+                interaction_id=staged.completion_event.interaction_id,
                 agent_name=pending_round.agent_name,
                 tool_name=pending_call.tool_name,
                 payload={
@@ -1168,6 +1196,7 @@ def test_model_boundary_accepts_exact_published_tool_round() -> None:
             Event(
                 type=EventType.TOOL_CALL_COMPLETED,
                 session_id=staged.session.id,
+                interaction_id=staged.completion_event.interaction_id,
                 agent_name=pending_round.agent_name,
                 tool_name=pending_call.tool_name,
                 payload={

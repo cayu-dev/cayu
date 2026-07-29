@@ -153,8 +153,8 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert response.status_code == 200
     body = response.json()
     assert body["api_prefix"] == "/api"
-    assert body["contract_version"] == "4"
-    assert body["versioning"]["contract_version"] == "4"
+    assert body["contract_version"] == "5"
+    assert body["versioning"]["contract_version"] == "5"
     assert body["versioning"]["breaking_change_requires"] == [
         "openapi_snapshot_update",
         "client_regeneration",
@@ -355,7 +355,7 @@ def test_system_diagnostics_reports_bounded_protected_framework_state(tmp_path) 
         "dashboard_enabled": True,
         "docs_enabled": False,
     }
-    assert body["versions"]["server_contract"] == "4"
+    assert body["versions"]["server_contract"] == "5"
     assert body["versions"]["cayu"] == body["capabilities"]["cayu_version"]
     assert body["capabilities"]["actor"] == {
         "subject": "operator-a",

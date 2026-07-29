@@ -20,6 +20,7 @@ from cayu.runtime import (
     SessionIdentity,
     TaskCreate,
 )
+from cayu.storage import SQLiteSessionStore
 from cayu.storage.jsonl_export import (
     ImportedSession,
     export_sessions,
@@ -81,7 +82,7 @@ def test_export_sessions_writes_one_line_per_session_with_nested_state():
             {
                 "session",
                 "events",
-                "transcript",
+                "transcript_records",
                 "checkpoint",
                 "deferred_interaction_input",
             }
@@ -96,13 +97,13 @@ def test_export_sessions_writes_one_line_per_session_with_nested_state():
         assert rich["session"]["agent_name"] == "builder"
         assert len(rich["events"]) == 1
         assert rich["events"][0]["type"] == EventType.SESSION_STARTED.value
-        assert len(rich["transcript"]) == 1  # the one appended assistant message
-        assert rich["transcript"][0]["role"] == "assistant"
+        assert len(rich["transcript_records"]) == 1
+        assert rich["transcript_records"][0]["message"]["role"] == "assistant"
         assert rich["checkpoint"] == {"step": 3}
 
         bare = by_id["sess_bare"]
         assert bare["events"] == []
-        assert bare["transcript"] == []
+        assert bare["transcript_records"] == []
         assert bare["checkpoint"] is None
         assert bare["deferred_interaction_input"] is None
 
@@ -144,7 +145,7 @@ def test_export_sessions_preserves_private_deferred_interaction_input():
             assert await export_sessions(store, stream=stream) == 1
 
             [line] = _lines(stream)
-            assert line["transcript"] == []
+            assert line["transcript_records"] == []
             assert line["deferred_interaction_input"] == {
                 "interaction_id": "interaction-deferred",
                 "source_messages": [source[0].model_dump(mode="json")],
@@ -202,6 +203,37 @@ def test_export_sessions_preserves_materialized_transcript_interaction_attributi
             "interaction-two",
         ]
         assert [record.message for record in imported.transcript_records] == imported.transcript
+
+    asyncio.run(run())
+
+
+def test_export_sessions_round_trips_retained_absolute_transcript_indices(tmp_path):
+    async def run() -> None:
+        store = SQLiteSessionStore(tmp_path / "sessions.sqlite")
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="builder",
+                    session_id="sess_compacted",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await store.append_transcript_messages(
+                "sess_compacted",
+                [Message.text("assistant", f"message {index}") for index in range(5)],
+            )
+            assert await store.compact_transcript("sess_compacted", keep_last=2) == 3
+
+            stream = io.StringIO()
+            assert await export_sessions(store, stream=stream) == 1
+            [line] = _lines(stream)
+            assert [record["index"] for record in line["transcript_records"]] == [3, 4]
+
+            [imported] = list(import_sessions(io.StringIO(stream.getvalue())))
+            assert [record.index for record in imported.transcript_records] == [3, 4]
+        finally:
+            await store.close()
 
     asyncio.run(run())
 
@@ -402,7 +434,8 @@ def test_import_sessions_round_trips_export():
     asyncio.run(run())
 
 
-def test_import_sessions_accepts_legacy_export_without_deferred_input():
+@pytest.mark.parametrize("missing_field", ["transcript_records", "deferred_interaction_input"])
+def test_import_sessions_rejects_incomplete_session_export(missing_field: str):
     session = SessionIdentity(provider_name="fake", model="fake-model")
 
     async def build_line() -> str:
@@ -410,7 +443,7 @@ def test_import_sessions_accepts_legacy_export_without_deferred_input():
         created = await store.create(
             RunRequest(
                 agent_name="builder",
-                session_id="sess_legacy",
+                session_id="sess_incomplete_export",
                 messages=[],
             ),
             identity=session,
@@ -420,14 +453,43 @@ def test_import_sessions_accepts_legacy_export_without_deferred_input():
                 "type": "session",
                 "session": created.model_dump(mode="json"),
                 "events": [],
-                "transcript": [],
+                "transcript_records": [],
                 "checkpoint": None,
+                "deferred_interaction_input": None,
             }
         )
 
-    [imported] = list(import_sessions([asyncio.run(build_line())]))
-    assert imported.deferred_interaction_input is None
-    assert imported.transcript_records == []
+    record = json.loads(asyncio.run(build_line()))
+    record.pop(missing_field)
+    with pytest.raises(ValueError, match=missing_field):
+        list(import_sessions([json.dumps(record)]))
+
+
+def test_import_sessions_rejects_removed_bare_transcript_field():
+    async def build_line() -> str:
+        store = InMemorySessionStore()
+        created = await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_removed_transcript_field",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        return json.dumps(
+            {
+                "type": "session",
+                "session": created.model_dump(mode="json"),
+                "events": [],
+                "transcript": [],
+                "transcript_records": [],
+                "checkpoint": None,
+                "deferred_interaction_input": None,
+            }
+        )
+
+    with pytest.raises(ValueError, match="unsupported fields"):
+        list(import_sessions([asyncio.run(build_line())]))
 
 
 def test_import_tasks_round_trips_export():

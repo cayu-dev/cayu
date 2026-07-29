@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -25,11 +26,13 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import sessions as sessions_module
 from cayu.runtime._run_limits import RunLimitGate
 from cayu.runtime._session_control import SessionInterruptedByRequest
 from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
 
 
 class _FakeProvider(ModelProvider):
@@ -120,13 +123,36 @@ def _limit_gate(
     )
 
 
-def _tool_round_run(
+async def _tool_round_run(
     app: CayuApp,
     session: Session,
     *,
     limits: RunLimits,
     budget_limits: tuple[BudgetLimit, ...] = (),
 ) -> ToolRoundRun:
+    interaction_id = f"interaction-{session.id}"
+    started_at = datetime.now(UTC)
+    start_event_id = f"{session.id}:interaction-started"
+    await app.session_store.append_event(
+        session.id,
+        Event(
+            id=start_event_id,
+            type=EventType.INTERACTION_STARTED,
+            session_id=session.id,
+            interaction_id=interaction_id,
+            timestamp=started_at,
+            agent_name="assistant",
+            payload=InteractionSummaryEvidence(
+                status=InteractionStatus.ACTIVE,
+                start_event_id=start_event_id,
+                started_at=started_at,
+            ).model_dump(mode="json"),
+        ),
+    )
+    sessions_module._activate_session_interaction(
+        session.id,
+        interaction_id,
+    )
     return app._tool_round_executor.create_run(
         session=session,
         registered_agent=app._get_registered_agent("assistant"),
@@ -178,7 +204,7 @@ def test_tool_round_interrupt_close_ignores_unrequested_cancellation():
     async def scenario() -> tuple[list[Event], list[Message]]:
         session = await store.load("sess_guard_cancel")
         assert session is not None
-        runner = _tool_round_run(app, session, limits=RunLimits())
+        runner = await _tool_round_run(app, session, limits=RunLimits())
         messages: list[Message] = []
         events = [
             event
@@ -209,7 +235,7 @@ def test_tool_round_interrupt_close_persists_missing_results():
             from_statuses={SessionStatus.COMPLETED},
             to_status=SessionStatus.RUNNING,
         )
-        runner = _tool_round_run(app, session, limits=RunLimits())
+        runner = await _tool_round_run(app, session, limits=RunLimits())
         tool_calls = [_tool_call()]
         checkpoint, _pending_round = checkpoint_with_pending_tool_round(
             await store.load_checkpoint(session.id),
@@ -258,7 +284,7 @@ def test_tool_round_interrupt_close_handles_requested_cancellation():
             session.id,
             SessionStatus.INTERRUPTING,
         )
-        runner = _tool_round_run(app, session, limits=RunLimits())
+        runner = await _tool_round_run(app, session, limits=RunLimits())
         tool_calls = [_tool_call()]
         checkpoint, _pending_round = checkpoint_with_pending_tool_round(
             await store.load_checkpoint(session.id),
@@ -297,7 +323,7 @@ def test_tool_round_interrupt_close_rejects_unrelated_exceptions():
     async def scenario() -> None:
         session = await store.load("sess_guard_type_error")
         assert session is not None
-        runner = _tool_round_run(app, session, limits=RunLimits())
+        runner = await _tool_round_run(app, session, limits=RunLimits())
         async for _ in runner.close_after_interrupt(
             ValueError("not an interrupt"),
             messages=[],
@@ -320,7 +346,7 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
             from_statuses={SessionStatus.COMPLETED},
             to_status=SessionStatus.RUNNING,
         )
-        runner = _tool_round_run(
+        runner = await _tool_round_run(
             app,
             session,
             limits=RunLimits(max_total_tokens=10),
@@ -353,6 +379,7 @@ def test_tool_round_runner_stops_for_limit_before_tool_side_effects():
     assert [event.type for event in events] == [
         EventType.SESSION_LIMIT_REACHED,
         EventType.TOOL_CALL_FAILED,
+        EventType.INTERACTION_INTERRUPTED,
         EventType.SESSION_INTERRUPTED,
     ]
     assert events[1].payload["reason"] == "limit_reached"
@@ -368,7 +395,7 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
             from_statuses={SessionStatus.COMPLETED},
             to_status=SessionStatus.RUNNING,
         )
-        runner = _tool_round_run(
+        runner = await _tool_round_run(
             app,
             session,
             limits=RunLimits(max_total_tokens=100),
@@ -436,7 +463,7 @@ def test_tool_round_budget_gate_retains_the_originating_model_attempt() -> None:
             from_statuses={SessionStatus.COMPLETED},
             to_status=SessionStatus.RUNNING,
         )
-        runner = _tool_round_run(
+        runner = await _tool_round_run(
             app,
             session,
             limits=RunLimits(),

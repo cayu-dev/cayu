@@ -3075,6 +3075,20 @@ def test_runtime_event_rejects_secret_in_every_payload_authority_field(
         )
 
 
+def test_runtime_event_rejects_secret_interaction_authority() -> None:
+    from cayu.runtime._event_writer import prepare_runtime_event
+
+    secret = "event-interaction-id-secret-canary"
+    event = Event(
+        type=EventType.MODEL_STARTED,
+        session_id="sess-safe",
+        interaction_id=secret,
+    )
+
+    with pytest.raises(ValueError, match=r"event\.interaction_id"):
+        prepare_runtime_event(event, redactor=SecretRedactor(secret))
+
+
 def test_runtime_tool_event_cannot_restore_secret_linkage_control() -> None:
     from cayu.runtime._event_writer import prepare_runtime_event
     from cayu.vaults import SecretRedactor

@@ -9,26 +9,12 @@ These skip automatically when Postgres is unavailable (see ``conftest.py``).
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
 from cayu import PostgresSessionStore, PostgresTaskStore
 from cayu.core import Event, EventType, Message
-from cayu.runtime import (
-    PendingActionQuery,
-    RunRequest,
-    SessionIdentity,
-    SessionStatus,
-)
-from cayu.runtime.pending_actions import (
-    pending_action_event_storage_values,
-    pending_action_lookup_key,
-)
-from cayu.runtime.sessions import (
-    MAX_PENDING_ACTION_RESULT_BYTES,
-    BudgetReservationIdentityConflict,
-)
+from cayu.runtime import RunRequest, SessionIdentity
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
 from cayu.storage.migrations import SchemaMode
@@ -169,6 +155,83 @@ def test_validate_mode_succeeds_after_create(postgres_dsn: str) -> None:
     asyncio.run(runner())
 
 
+def test_revision_twenty_six_rejects_populated_session_database(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            session = await creator.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_transcript_order_migration",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await creator.append_transcript_messages(
+                session.id,
+                [Message.text("user", "first")],
+                interaction_id="interaction-one",
+            )
+            await creator.append_transcript_messages(
+                session.id,
+                [Message.text("user", "other")],
+                interaction_id="interaction-two",
+            )
+            await creator.append_transcript_messages(
+                session.id,
+                [Message.text("assistant", "second")],
+                interaction_id="interaction-one",
+            )
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DROP TRIGGER cayu_assign_transcript_order ON cayu_transcript_messages"
+                )
+                await cur.execute("DROP FUNCTION cayu_assign_transcript_order()")
+                await cur.execute("ALTER TABLE cayu_transcript_messages DROP COLUMN session_order")
+                await cur.execute("ALTER TABLE cayu_sessions DROP COLUMN transcript_seq")
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 26")
+            await conn.commit()
+
+        migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
+        try:
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match="clean prerelease break",
+            ):
+                await migrator.ensure_schema()
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
+                ("sess_transcript_order_migration",),
+            )
+            assert (await cur.fetchone())[0] == 3
+            await cur.execute("SELECT MAX(revision) FROM cayu_schema_migrations")
+            assert (await cur.fetchone())[0] == 25
+            await cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'cayu_transcript_messages' "
+                "AND column_name = 'session_order'"
+            )
+            assert await cur.fetchone() is None
+
+    asyncio.run(runner())
+
+
 def test_latest_migrates_queue_and_event_side_effect_handoff(
     postgres_dsn: str,
 ) -> None:
@@ -193,7 +256,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 29"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -318,7 +381,7 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 29"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -345,7 +408,7 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 29"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -389,7 +452,7 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 29"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -429,450 +492,6 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
     asyncio.run(runner())
 
 
-def test_revision_seventeen_requires_pending_action_index_migration(
-    postgres_dsn: str,
-) -> None:
-    async def runner() -> None:
-        import psycopg
-
-        await _drop_all(postgres_dsn)
-        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
-        try:
-            await creator.ensure_schema()
-            long_id_session = await creator.create(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="revision_17_long_identifier",
-                    messages=[Message.text("user", "hello")],
-                ),
-                identity=_identity(),
-            )
-            await creator.append_event(
-                long_id_session.id,
-                Event(
-                    type=EventType.TOOL_CALL_STARTED,
-                    session_id=long_id_session.id,
-                    payload={
-                        "tool_call_id": "x" * 10_000,
-                        "approval_id": "revision_17_pause",
-                    },
-                ),
-            )
-            await creator.append_event(
-                long_id_session.id,
-                Event(
-                    type=EventType.TOOL_CALL_COMPLETED,
-                    session_id=long_id_session.id,
-                    payload={
-                        "tool_round_id": "revision_17_terminal_round",
-                        "tool_call_id": "revision_17_valid_terminal",
-                        "result": {"content": "done"},
-                    },
-                ),
-            )
-            await creator.append_event(
-                long_id_session.id,
-                Event(
-                    type=EventType.TOOL_CALL_FAILED,
-                    session_id=long_id_session.id,
-                    payload={
-                        "tool_round_id": "revision_17_terminal_round",
-                        "tool_call_id": "revision_17_invalid_terminal",
-                    },
-                ),
-            )
-            await creator.append_event(
-                long_id_session.id,
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=long_id_session.id,
-                    payload={
-                        "approval_id": "revision_17_large_event",
-                        "error": "x"
-                        * (postgres_storage._REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES + 1),
-                    },
-                ),
-            )
-            await creator.append_event(
-                long_id_session.id,
-                Event(
-                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                    session_id=long_id_session.id,
-                    payload={
-                        "approval_id": "\t",
-                        "approval": {
-                            "approval_id": "revision_17_nested_approval",
-                            "tool_name": "deploy",
-                        },
-                    },
-                ),
-            )
-            identity_payload = {
-                "model_step_id": f"mstep_{'1' * 32}",
-                "model_attempt_id": f"matt_{'2' * 32}",
-                "tool_round_id": f"tround_{'3' * 32}",
-            }
-            projected_action_events = [
-                Event(
-                    id="revision_17_projected_approval",
-                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                    session_id=long_id_session.id,
-                    tool_name="deploy",
-                    payload={
-                        **identity_payload,
-                        "approval_id": "revision_17_projected_approval_id",
-                        "tool_call_id": "revision_17_projected_approval_call",
-                        "approval": {
-                            "approval_id": "revision_17_projected_approval_id",
-                            **identity_payload,
-                            "tool_call_id": "revision_17_projected_approval_call",
-                            "reason": "review",
-                            "tool_name": "deploy",
-                        },
-                    },
-                ),
-                Event(
-                    id="revision_17_projected_input",
-                    type=EventType.SESSION_AWAITING_USER_INPUT,
-                    session_id=long_id_session.id,
-                    tool_name="ask_user",
-                    payload={
-                        **identity_payload,
-                        "input_id": "revision_17_projected_input_id",
-                        "tool_call_id": "revision_17_projected_input_call",
-                        "question": "Deploy?",
-                        "options": ["yes", "no"],
-                    },
-                ),
-                Event(
-                    id="revision_17_projected_interruption",
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=long_id_session.id,
-                    tool_name="deploy",
-                    payload={
-                        **identity_payload,
-                        "interruption_type": "runtime_interrupted",
-                        "manual_recovery_required": True,
-                        "approval_id": "revision_17_projected_approval_id",
-                        "tool_call_id": "revision_17_projected_approval_call",
-                        "message": "reconcile",
-                        "tool_name": "deploy",
-                        "tool_evidence_conflict": True,
-                        "approval": {
-                            "approval_id": "revision_17_projected_approval_id",
-                            **identity_payload,
-                            "tool_call_id": "revision_17_projected_approval_call",
-                            "reason": "review",
-                            "tool_name": "deploy",
-                        },
-                        "user_input": {
-                            "input_id": "revision_17_projected_input_id",
-                            "tool_call_id": "revision_17_projected_input_call",
-                            "question": "Deploy?",
-                            "options": ["yes", "no"],
-                        },
-                    },
-                ),
-                Event(
-                    id="revision_17_projected_failure",
-                    type=EventType.SESSION_FAILED,
-                    session_id=long_id_session.id,
-                    payload={"tool_evidence_conflict": True},
-                ),
-                Event(
-                    id="revision_17_projected_resume",
-                    type=EventType.SESSION_RESUMED,
-                    session_id=long_id_session.id,
-                    payload=identity_payload,
-                ),
-                Event(
-                    id="revision_17_projected_oversized_input",
-                    type=EventType.SESSION_AWAITING_USER_INPUT,
-                    session_id=long_id_session.id,
-                    payload={
-                        **identity_payload,
-                        "input_id": "revision_17_projected_oversized_input_id",
-                        "tool_call_id": "revision_17_projected_oversized_input_call",
-                        "question": "x" * MAX_PENDING_ACTION_RESULT_BYTES,
-                        "options": [],
-                    },
-                ),
-            ]
-            await creator.append_events(long_id_session.id, projected_action_events)
-            pending_approval_session = await creator.create(
-                RunRequest(
-                    agent_name="assistant",
-                    session_id="revision_17_pending_approval",
-                    messages=[Message.text("user", "hello")],
-                ),
-                identity=_identity(),
-            )
-            await creator.append_event(
-                pending_approval_session.id,
-                Event(
-                    id="revision_17_pending_approval_event",
-                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                    session_id=pending_approval_session.id,
-                    agent_name="assistant",
-                    tool_name="deploy",
-                    payload={
-                        **identity_payload,
-                        "approval_id": "revision_17_pending_approval_id",
-                        "tool_call_id": "revision_17_pending_approval_call",
-                        "approval": {
-                            "approval_id": "revision_17_pending_approval_id",
-                            **identity_payload,
-                            "tool_call_id": "revision_17_pending_approval_call",
-                            "tool_name": "deploy",
-                            "arguments": {},
-                            "agent_name": "assistant",
-                            "tool_calls": [
-                                {
-                                    "tool_call_id": "revision_17_pending_approval_call",
-                                    "tool_name": "deploy",
-                                    "arguments": {},
-                                    "policy_decision": None,
-                                    "reason": None,
-                                    "metadata": {},
-                                    "active_taint_labels": [],
-                                }
-                            ],
-                        },
-                    },
-                ),
-            )
-            await creator.checkpoint(
-                pending_approval_session.id,
-                {
-                    "pending_tool_approval": {
-                        **identity_payload,
-                        "approval_id": "revision_17_pending_approval_id",
-                        "tool_call_id": "revision_17_pending_approval_call",
-                        "tool_name": "deploy",
-                        "arguments": {},
-                        "agent_name": "assistant",
-                        "tool_calls": [
-                            {
-                                "tool_call_id": "revision_17_pending_approval_call",
-                                "tool_name": "deploy",
-                                "arguments": {},
-                                "policy_decision": None,
-                                "reason": None,
-                                "metadata": {},
-                                "active_taint_labels": [],
-                            }
-                        ],
-                    }
-                },
-            )
-            await creator.update_status(
-                pending_approval_session.id,
-                SessionStatus.INTERRUPTED,
-            )
-            await creator.checkpoint(
-                long_id_session.id,
-                {
-                    "pending_tool_round": {
-                        "round_id": "revision_17_round",
-                        "agent_name": "assistant",
-                        "tool_calls": [{"tool_call_id": "revision_17_call"}],
-                    }
-                },
-            )
-        finally:
-            await creator.close()
-
-        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 17")
-                await cur.execute("DROP INDEX idx_cayu_checkpoints_pending_control_action")
-                await cur.execute("DROP INDEX idx_cayu_events_pending_action_barrier")
-                await cur.execute("DROP INDEX idx_cayu_events_pending_action_lookup")
-                await cur.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
-                await cur.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
-                await cur.execute(
-                    "ALTER TABLE cayu_events DROP COLUMN pending_action_lookup_key, "
-                    "DROP COLUMN pending_action_projection, "
-                    "DROP COLUMN pending_action_projection_bytes"
-                )
-                await cur.execute(
-                    "ALTER TABLE cayu_checkpoints DROP COLUMN pending_action_source_bytes, "
-                    "DROP COLUMN pending_action_tool_call_count, "
-                    "DROP COLUMN pending_action_flags, "
-                    "DROP COLUMN pending_action_metrics_ready"
-                )
-            await conn.commit()
-
-        validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
-        try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 29"):
-                await validator.ensure_schema()
-        finally:
-            await validator.close()
-
-        first_migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
-        second_migrator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
-        try:
-            await asyncio.gather(
-                first_migrator.ensure_schema(),
-                second_migrator.ensure_schema(),
-            )
-        finally:
-            await first_migrator.close()
-            await second_migrator.close()
-
-        async with (
-            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
-            conn.cursor() as cur,
-        ):
-            await cur.execute(
-                "SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema() "
-                "AND indexname = 'idx_cayu_checkpoints_pending_control_action'"
-            )
-            row = await cur.fetchone()
-            assert row is not None
-            assert "pending_action_flags" in row[0]
-            await cur.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = current_schema()
-                  AND table_name = 'cayu_checkpoints'
-                  AND column_name IN (
-                      'pending_action_source_bytes',
-                      'pending_action_tool_call_count',
-                      'pending_action_flags',
-                      'pending_action_metrics_ready'
-                  )
-                """
-            )
-            assert {row[0] for row in await cur.fetchall()} == {
-                "pending_action_source_bytes",
-                "pending_action_tool_call_count",
-                "pending_action_flags",
-                "pending_action_metrics_ready",
-            }
-            await cur.execute(
-                "SELECT pending_action_source_bytes, pending_action_tool_call_count, "
-                "pending_action_flags, pending_action_metrics_ready FROM cayu_checkpoints "
-                "WHERE session_id = 'revision_17_long_identifier'"
-            )
-            metric_row = await cur.fetchone()
-            assert metric_row is not None
-            assert metric_row[0] > 0
-            assert metric_row[1:] == (1, 4, True)
-            await cur.execute(
-                "SELECT pending_action_source_bytes, pending_action_tool_call_count, "
-                "pending_action_flags, pending_action_metrics_ready FROM cayu_checkpoints "
-                "WHERE session_id = 'revision_17_pending_approval'"
-            )
-            approval_metric_row = await cur.fetchone()
-            assert approval_metric_row is not None
-            assert approval_metric_row[0] > 0
-            assert approval_metric_row[1:] == (1, 1, True)
-            await cur.execute(
-                """
-                SELECT index_definition.indisvalid
-                FROM pg_catalog.pg_class AS index_class
-                JOIN pg_catalog.pg_namespace AS namespace
-                  ON namespace.oid = index_class.relnamespace
-                JOIN pg_catalog.pg_index AS index_definition
-                  ON index_definition.indexrelid = index_class.oid
-                WHERE namespace.nspname = current_schema()
-                  AND index_class.relname = 'idx_cayu_events_pending_action_barrier'
-                """
-            )
-            assert await cur.fetchone() == (True,)
-            await cur.execute(
-                """
-                SELECT index_definition.indisvalid, pg_get_indexdef(index_class.oid)
-                FROM pg_catalog.pg_class AS index_class
-                JOIN pg_catalog.pg_namespace AS namespace
-                  ON namespace.oid = index_class.relnamespace
-                JOIN pg_catalog.pg_index AS index_definition
-                  ON index_definition.indexrelid = index_class.oid
-                WHERE namespace.nspname = current_schema()
-                  AND index_class.relname = 'idx_cayu_events_pending_action_lookup'
-                """
-            )
-            lookup_row = await cur.fetchone()
-            assert lookup_row is not None
-            assert lookup_row[0] is True
-            assert "pending_action_lookup_key" in lookup_row[1]
-            assert "event_type" in lookup_row[1]
-            assert "IS NOT NULL" in lookup_row[1]
-            await cur.execute(
-                "SELECT pending_action_lookup_key, pending_action_projection, "
-                "pending_action_projection_bytes FROM cayu_events "
-                "WHERE session_id = 'revision_17_long_identifier' "
-                "AND event_type = 'tool.call.started'"
-            )
-            event_metric_row = await cur.fetchone()
-            assert event_metric_row is not None
-            assert event_metric_row[0] == pending_action_lookup_key("x" * 10_000)
-            assert event_metric_row[1]["payload"] == {"tool_call_id": "x" * 10_000}
-            assert event_metric_row[2] > 10_000
-            await cur.execute(
-                "SELECT pending_action_lookup_key FROM cayu_events "
-                "WHERE session_id = 'revision_17_long_identifier' "
-                "AND event_type = 'tool.call.approval_requested'"
-            )
-            assert await cur.fetchone() == (
-                pending_action_lookup_key("revision_17_nested_approval"),
-            )
-            await cur.execute(
-                "SELECT pending_action_lookup_key, pending_action_projection_bytes "
-                "FROM cayu_events WHERE session_id = 'revision_17_long_identifier' "
-                "AND event_type = 'session.interrupted'"
-            )
-            large_event_row = await cur.fetchone()
-            assert large_event_row is not None
-            assert large_event_row[0] == pending_action_lookup_key("revision_17_large_event")
-            assert (
-                large_event_row[1] > postgres_storage._REVISION_17_EVENT_BACKFILL_SMALL_EVENT_BYTES
-            )
-            await cur.execute(
-                "SELECT event_type, pending_action_projection -> 'payload' "
-                "->> '__cayu_terminal_result_valid__' "
-                "FROM cayu_events WHERE session_id = 'revision_17_long_identifier' "
-                "AND event_type IN ('tool.call.completed', 'tool.call.failed') "
-                "ORDER BY event_type"
-            )
-            assert await cur.fetchall() == [
-                ("tool.call.completed", "true"),
-                ("tool.call.failed", "false"),
-            ]
-            await cur.execute(
-                "SELECT event_id, pending_action_projection FROM cayu_events "
-                "WHERE event_id = ANY(%s)",
-                ([event.id for event in projected_action_events],),
-            )
-            migrated_projections = {
-                str(event_id): projection for event_id, projection in await cur.fetchall()
-            }
-            expected_projections = {}
-            for event in projected_action_events:
-                _lookup_key, projection_json, _projection_bytes = (
-                    pending_action_event_storage_values(event)
-                )
-                assert projection_json is not None
-                expected_projections[event.id] = json.loads(projection_json)
-            assert migrated_projections == expected_projections
-
-        reader = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
-        try:
-            pending_actions = await reader.query_pending_actions(
-                PendingActionQuery(session_id="revision_17_pending_approval")
-            )
-        finally:
-            await reader.close()
-        assert len(pending_actions.actions) == 1
-        assert pending_actions.actions[0].approval_id == "revision_17_pending_approval_id"
-        assert pending_actions.issues == []
-
-    asyncio.run(runner())
-
-
 def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: str) -> None:
     async def runner() -> None:
         import psycopg
@@ -892,7 +511,7 @@ def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: s
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 29"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -1070,106 +689,6 @@ def test_recorded_revision_twenty_three_requires_the_unique_reservation_index(
                 "'idx_cayu_events_budget_reservation_identity'"
             )
             assert await cur.fetchone() == (True,)
-
-    asyncio.run(runner())
-
-
-def test_revision_twenty_three_preserves_existing_reservation_ownership(
-    postgres_dsn: str,
-) -> None:
-    async def runner() -> None:
-        import psycopg
-
-        await _drop_all(postgres_dsn)
-        reservation_id = "bres_revision_23_existing"
-        publication_id = "evt_revision_23_existing"
-        creator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
-        try:
-            session = await creator.create(
-                RunRequest(
-                    session_id="sess_revision_23_existing",
-                    agent_name="assistant",
-                    messages=[Message.text("user", "seed")],
-                ),
-                identity=_identity(),
-            )
-            reserved = Event(
-                id=publication_id,
-                type=EventType.BUDGET_RESERVED,
-                session_id=session.id,
-                payload={"reservation_id": reservation_id},
-            )
-            await creator.append_event(session.id, reserved)
-            reserved_claim = await creator.claim_persisted_event_side_effect(
-                session_id=session.id,
-                event_id=reserved.id,
-            )
-            assert reserved_claim is not None
-            await creator.mark_persisted_event_side_effect_delivered(reserved_claim)
-            released = Event(
-                type=EventType.BUDGET_RESERVATION_RELEASED,
-                session_id=session.id,
-                payload={"reservation_id": reservation_id},
-            )
-            await creator.append_event(session.id, released)
-            released_claim = await creator.claim_persisted_event_side_effect(
-                session_id=session.id,
-                event_id=released.id,
-            )
-            assert released_claim is not None
-            await creator.mark_persisted_event_side_effect_delivered(released_claim)
-        finally:
-            await creator.close()
-
-        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 23")
-                await cur.execute("DROP INDEX idx_cayu_events_budget_reservation_identity")
-                await cur.execute("DROP INDEX idx_cayu_events_pending_action_round_scope")
-                await cur.execute("DROP INDEX idx_cayu_events_pending_action_attempt_scope")
-                await cur.execute("DROP TABLE cayu_budget_reservation_identities")
-            await conn.commit()
-
-        store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.MIGRATE)
-        try:
-            await store.ensure_schema()
-            async with (
-                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
-                conn.cursor() as cur,
-            ):
-                await cur.execute(
-                    "SELECT publication_session_id, publication_id, published "
-                    "FROM cayu_budget_reservation_identities "
-                    "WHERE reservation_id = %s",
-                    (reservation_id,),
-                )
-                assert await cur.fetchone() == (
-                    "sess_revision_23_existing",
-                    publication_id,
-                    True,
-                )
-
-            await store.delete_session("sess_revision_23_existing")
-            replacement = await store.create(
-                RunRequest(
-                    session_id="sess_revision_23_replacement",
-                    agent_name="assistant",
-                    messages=[Message.text("user", "reuse")],
-                ),
-                identity=_identity(),
-            )
-            with pytest.raises(BudgetReservationIdentityConflict):
-                await store.append_event(
-                    replacement.id,
-                    Event(
-                        id="evt_revision_23_reuse",
-                        type=EventType.BUDGET_RESERVED,
-                        session_id=replacement.id,
-                        payload={"reservation_id": reservation_id},
-                    ),
-                )
-        finally:
-            await store.close()
 
     asyncio.run(runner())
 

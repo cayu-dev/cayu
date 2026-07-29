@@ -106,7 +106,7 @@ from cayu.runtime.sessions import (
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
     _build_runtime_publication_receipt,
-    _copy_interaction_admission,
+    _checkpoint_after_initial_transcript_publication,
     _copy_mcp_manifest_publication,
     _copy_optional_interaction_admission,
     _copy_queued_interaction_started_event,
@@ -115,6 +115,9 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+    _initial_transcript_pending_checkpoint,
+    _interaction_transition_receipt_record,
+    _interaction_transition_storage_key,
     _model_completion_stage_abandonment_record,
     _model_completion_stage_preparation_record,
     _model_completion_stage_storage_identity,
@@ -135,6 +138,7 @@ from cayu.runtime.sessions import (
     _queued_session_message_event_payload,
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
+    _reconstruct_interaction_transition_receipt,
     _reconstruct_model_completion_stage,
     _reconstruct_model_completion_stage_abandonment,
     _reconstruct_runtime_publication_receipt,
@@ -151,6 +155,7 @@ from cayu.runtime.sessions import (
     _validate_interaction_page,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
+    _validate_message_delivery_eligible_through,
     _validate_model_completion_active_marker_for_preparation,
     _validate_model_completion_active_marker_for_promotion,
     _validate_model_completion_preparation_replay_state,
@@ -226,7 +231,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 29
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 26
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -303,6 +308,18 @@ def _session_exists(connection: sqlite3.Connection, session_id: str) -> bool:
         (session_id,),
     ).fetchone()
     return row is not None
+
+
+def _transcript_cursor(connection: sqlite3.Connection, session_id: str) -> int:
+    """Return the permanent next transcript position, independent of retention."""
+
+    row = connection.execute(
+        "SELECT transcript_seq FROM cayu_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"Session not found: {session_id}")
+    return int(row["transcript_seq"])
 
 
 def _claim_budget_reservation_identity(
@@ -1037,6 +1054,22 @@ class SQLiteSessionStore(SessionStore):
                                 ),
                             ),
                         )
+                        self._connection.execute(
+                            """
+                            INSERT INTO cayu_checkpoints (
+                                session_id, state_json, updated_at,
+                                pending_action_source_bytes,
+                                pending_action_tool_call_count,
+                                pending_action_flags,
+                                pending_action_metrics_ready
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            sqlite_support.checkpoint_row_values(
+                                session.id,
+                                _initial_transcript_pending_checkpoint(interaction_id),
+                                session.updated_at,
+                            ),
+                        )
             except sqlite3.IntegrityError as exc:
                 if self._session_exists_unlocked(session.id):
                     raise ValueError(f"Session already exists: {session.id}") from exc
@@ -1135,41 +1168,33 @@ class SQLiteSessionStore(SessionStore):
                         "Cannot fork a session while a model-completion stage is active: "
                         f"{source_session_id}"
                     )
-                transcript_rows = self._connection.execute(
+                source_transcript_cursor = _transcript_cursor(
+                    self._connection,
+                    source_session_id,
+                )
+                if transcript_cursor is not None and transcript_cursor > source_transcript_cursor:
+                    raise ValueError("transcript_cursor is greater than source transcript length.")
+                selected_transcript_rows = self._connection.execute(
                     """
                     SELECT message_json, interaction_id
                     FROM cayu_transcript_messages
                     WHERE session_id = ?
-                    ORDER BY sequence ASC
+                      AND session_order <= ?
+                    ORDER BY session_order ASC
                     """,
-                    (source_session_id,),
+                    (
+                        source_session_id,
+                        (
+                            source_transcript_cursor
+                            if transcript_cursor is None
+                            else transcript_cursor
+                        ),
+                    ),
                 ).fetchall()
-                transcript_row_count = len(transcript_rows)
-                if transcript_cursor is None:
-                    selected_transcript_rows = transcript_rows
-                    transcript_rows = []
-                    copied_messages = [
-                        Message(**json.loads(row["message_json"]))
-                        for row in selected_transcript_rows
-                    ]
-                    copied_interaction_ids = [
-                        row["interaction_id"] for row in selected_transcript_rows
-                    ]
-                else:
-                    if transcript_cursor > transcript_row_count:
-                        transcript_rows.clear()
-                        raise ValueError(
-                            "transcript_cursor is greater than source transcript length."
-                        )
-                    selected_transcript_rows = transcript_rows[:transcript_cursor]
-                    transcript_rows.clear()
-                    copied_messages = [
-                        Message(**json.loads(row["message_json"]))
-                        for row in selected_transcript_rows
-                    ]
-                    copied_interaction_ids = [
-                        row["interaction_id"] for row in selected_transcript_rows
-                    ]
+                copied_messages = [
+                    Message(**json.loads(row["message_json"])) for row in selected_transcript_rows
+                ]
+                copied_interaction_ids = [row["interaction_id"] for row in selected_transcript_rows]
                 selected_transcript_rows.clear()
                 if not fork_transcript_is_accepted(copied_messages, transcript_validator):
                     copied_messages.clear()
@@ -1807,6 +1832,22 @@ class SQLiteSessionStore(SessionStore):
                         "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
                     }
                 )
+            except sqlite3.IntegrityError as exc:
+                self._connection.rollback()
+                existing_event_id = (
+                    None
+                    if admission is None or admission[0] is None
+                    else _first_existing_event_id(
+                        self._connection,
+                        session_id,
+                        [admission[0].id],
+                    )
+                )
+                if existing_event_id is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing_event_id}"
+                    ) from exc
+                raise
             except Exception:
                 self._connection.rollback()
                 raise
@@ -2007,6 +2048,7 @@ class SQLiteSessionStore(SessionStore):
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
         )
+        receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
 
         def statement(connection: sqlite3.Connection) -> InteractionTransitionResult:
             try:
@@ -2014,31 +2056,43 @@ class SQLiteSessionStore(SessionStore):
                 loaded = _load_session(connection, session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, loaded)
+                receipt_row = connection.execute(
+                    "SELECT record_json FROM cayu_session_operations "
+                    "WHERE session_id = ? AND idempotency_key = ?",
+                    (session_id, receipt_storage_key),
+                ).fetchone()
                 existing_row = connection.execute(
                     f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
                     "WHERE session_id = ? AND event_id = ?",
                     (session_id, copied_event.id),
                 ).fetchone()
-                if existing_row is not None:
-                    existing_event = _event_from_row(existing_row)
-                    if existing_event != copied_event:
-                        raise ValueError(
-                            "Interaction transition event identity was reused with different data."
-                        )
-                    status_changed = loaded.status is target_status
-                    if not status_changed and not conditional:
+                if receipt_row is not None:
+                    receipt = _reconstruct_interaction_transition_receipt(
+                        copy_durable_json_object(
+                            json.loads(receipt_row["record_json"]),
+                            "interaction transition receipt",
+                        ),
+                        event=copied_event,
+                        from_statuses=allowed_statuses,
+                        to_status=target_status,
+                        only_if_no_queued_messages=conditional,
+                    )
+                    if existing_row is not None and _event_from_row(existing_row) != receipt.event:
                         raise RuntimeError(
-                            "Interaction transition event exists without its session status."
+                            "Interaction transition receipt conflicts with retained event history."
                         )
                     connection.commit()
                     return InteractionTransitionResult(
-                        session=loaded,
-                        event=existing_event,
-                        status_changed=status_changed,
+                        session=receipt.session,
+                        event=receipt.event,
+                        status_changed=receipt.status_changed,
                         replayed=True,
                     )
-
-                _assert_session_run_epoch(session_id, loaded)
+                if existing_row is not None:
+                    raise RuntimeError(
+                        "Interaction transition event exists without its immutable receipt."
+                    )
                 if loaded.status not in allowed_statuses:
                     raise SessionStatusConflict(
                         f"Session status transition not allowed: {loaded.status} -> {target_status}"
@@ -2105,6 +2159,25 @@ class SQLiteSessionStore(SessionStore):
                 transitioned = _load_session(connection, session_id)
                 if transitioned is None:
                     raise KeyError(f"Session not found: {session_id}")
+                receipt_record = _interaction_transition_receipt_record(
+                    session=transitioned,
+                    event=copied_event,
+                    from_statuses=allowed_statuses,
+                    to_status=target_status,
+                    only_if_no_queued_messages=conditional,
+                    status_changed=not queued,
+                )
+                connection.execute(
+                    "INSERT INTO cayu_session_operations "
+                    "(session_id, idempotency_key, record_json, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        session_id,
+                        receipt_storage_key,
+                        sqlite_support.json_dumps(receipt_record),
+                        formatted_updated_at,
+                    ),
+                )
                 connection.commit()
                 return InteractionTransitionResult(
                     session=transitioned,
@@ -2430,115 +2503,6 @@ class SQLiteSessionStore(SessionStore):
 
         return await self._run_write(statement)
 
-    async def admit_interaction(
-        self,
-        session_id: str,
-        *,
-        started_event: Event,
-        source_messages: list[Message],
-        defer_transcript: bool = False,
-    ) -> None:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
-
-        copied_event, copied_messages = _copy_interaction_admission(
-            session_id,
-            started_event,
-            source_messages,
-            defer_transcript=defer_transcript,
-        )
-        interaction_id = copied_event.interaction_id
-        if interaction_id is None:  # validated by _copy_interaction_admission
-            raise AssertionError("Interaction admission lost its identity.")
-        serialized_messages = sqlite_support.json_dumps(
-            [message.model_dump(mode="json") for message in copied_messages]
-        )
-
-        def statement(connection: sqlite3.Connection) -> None:
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                session = self._load_unlocked(session_id)
-                if session is None:
-                    raise KeyError(f"Session not found: {session_id}")
-                _assert_session_run_epoch(session_id, session)
-                pending = connection.execute(
-                    "SELECT 1 FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                if pending is not None:
-                    raise RuntimeError("Session already has deferred interaction input.")
-                lookup_key, projection, projection_bytes = pending_action_event_storage_values(
-                    copied_event
-                )
-                connection.execute(
-                    """
-                    INSERT INTO cayu_events (
-                        session_id, event_id, interaction_id, event_type, timestamp,
-                        agent_name, environment_name, workflow_name, tool_name,
-                        payload_json, pending_action_lookup_key,
-                        pending_action_projection_json, pending_action_projection_bytes
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        session_id,
-                        copied_event.id,
-                        interaction_id,
-                        str(copied_event.type),
-                        sqlite_support.format_datetime(copied_event.timestamp),
-                        copied_event.agent_name,
-                        copied_event.environment_name,
-                        copied_event.workflow_name,
-                        copied_event.tool_name,
-                        sqlite_support.json_dumps(copied_event.payload),
-                        lookup_key,
-                        projection,
-                        projection_bytes,
-                    ),
-                )
-                _enqueue_persisted_event_side_effects(
-                    connection,
-                    session_id,
-                    [copied_event.id],
-                )
-                if defer_transcript:
-                    connection.execute(
-                        "INSERT INTO cayu_deferred_interaction_inputs "
-                        "(session_id, interaction_id, source_messages_json) VALUES (?, ?, ?)",
-                        (session_id, interaction_id, serialized_messages),
-                    )
-                else:
-                    connection.executemany(
-                        "INSERT INTO cayu_transcript_messages "
-                        "(session_id, role, interaction_id, message_json) VALUES (?, ?, ?, ?)",
-                        [
-                            (
-                                session_id,
-                                str(message.role),
-                                interaction_id,
-                                sqlite_support.json_dumps(message.model_dump(mode="json")),
-                            )
-                            for message in copied_messages
-                        ],
-                    )
-                _touch_session_activity(connection, session_id, datetime.now(UTC))
-                connection.commit()
-            except sqlite3.IntegrityError as exc:
-                connection.rollback()
-                existing_event_id = _first_existing_event_id(
-                    connection,
-                    session_id,
-                    [copied_event.id],
-                )
-                if existing_event_id is not None:
-                    raise ValueError(
-                        f"Event already exists for session {session_id}: {existing_event_id}"
-                    ) from exc
-                raise
-            except Exception:
-                connection.rollback()
-                raise
-
-        await self._run_write(statement)
-
     async def claim_persisted_event_side_effect(
         self,
         *,
@@ -2839,11 +2803,7 @@ class SQLiteSessionStore(SessionStore):
                     raise SessionStatusConflict(
                         "Session messages may be enqueued only while a session is pending or running."
                     )
-                cursor_row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
-                    (request.session_id,),
-                ).fetchone()
-                transcript_cursor = cursor_row["count"]
+                transcript_cursor = _transcript_cursor(connection, request.session_id)
                 accepted_at = datetime.now(UTC)
                 queue_id = str(uuid4())
                 accepted_event_id = str(uuid4())
@@ -2973,8 +2933,7 @@ class SQLiteSessionStore(SessionStore):
         )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
-        if eligible_through is not None and eligible_through < 0:
-            raise ValueError("eligible_through must be greater than or equal to zero.")
+        eligible_through = _validate_message_delivery_eligible_through(eligible_through)
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
 
@@ -2986,6 +2945,7 @@ class SQLiteSessionStore(SessionStore):
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
+                _assert_session_run_epoch(session_id, loaded)
                 delivery_row = connection.execute(
                     "SELECT * FROM cayu_session_message_deliveries WHERE delivery_id = ?",
                     (delivery_id,),
@@ -3033,7 +2993,6 @@ class SQLiteSessionStore(SessionStore):
                         has_more=bool(delivery_row["has_more"]),
                         replayed=True,
                     )
-                _assert_session_run_epoch(session_id, loaded)
                 if loaded.status != SessionStatus.RUNNING:
                     raise SessionStatusConflict(
                         "Queued session messages may be delivered only while running."
@@ -3097,14 +3056,11 @@ class SQLiteSessionStore(SessionStore):
                     connection.commit()
                     return SessionMessageDeliveryBatch(
                         delivery_id=delivery_id,
+                        interaction_id=interaction_id,
                         eligible_through=boundary,
                         has_more=False,
                     )
-                transcript_row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                transcript_cursor = transcript_row["count"]
+                transcript_cursor = _transcript_cursor(connection, session_id)
                 delivered_at = datetime.now(UTC)
                 updated_messages: list[SessionQueuedMessage] = []
                 delivery_events: list[Event] = []
@@ -3362,17 +3318,18 @@ class SQLiteSessionStore(SessionStore):
         receipt: RuntimePublicationReceipt,
     ) -> None:
         try:
-            transcript_count = receipt.transcript_end_cursor - receipt.transcript_start_cursor
             transcript_rows = connection.execute(
-                "SELECT message_json FROM cayu_transcript_messages "
-                "WHERE session_id = ? ORDER BY sequence ASC LIMIT ? OFFSET ?",
+                "SELECT interaction_id, message_json FROM cayu_transcript_messages "
+                "WHERE session_id = ? AND session_order > ? AND session_order <= ? "
+                "ORDER BY session_order ASC",
                 (
                     receipt.session_id,
-                    transcript_count,
                     receipt.transcript_start_cursor,
+                    receipt.transcript_end_cursor,
                 ),
             ).fetchall()
             transcript = [Message(**json.loads(row["message_json"])) for row in transcript_rows]
+            transcript_interaction_ids = [row["interaction_id"] for row in transcript_rows]
 
             referenced_event_ids = _runtime_publication_referenced_event_ids(
                 receipt.referenced_events
@@ -3392,6 +3349,7 @@ class SQLiteSessionStore(SessionStore):
             _validate_runtime_publication_durable_material(
                 receipt,
                 transcript_messages=transcript,
+                transcript_interaction_ids=transcript_interaction_ids,
                 appended_events=(
                     events_by_id[event_id]
                     for event_id in receipt.appended_event_ids
@@ -3609,11 +3567,7 @@ class SQLiteSessionStore(SessionStore):
                         "Session source run epoch is stale: expected "
                         f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
                     )
-                cursor_row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                current_cursor = cursor_row["count"]
+                current_cursor = _transcript_cursor(connection, session_id)
                 if current_cursor != prepared.expected_transcript_cursor:
                     raise ValueError(
                         "Session source transcript cursor is stale: expected "
@@ -4190,11 +4144,7 @@ class SQLiteSessionStore(SessionStore):
                         "Session source run epoch is stale: expected "
                         f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
                     )
-                cursor_row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                transcript_start_cursor = cursor_row["count"]
+                transcript_start_cursor = _transcript_cursor(connection, session_id)
                 if (
                     prepared.expected_transcript_cursor is not None
                     and transcript_start_cursor != prepared.expected_transcript_cursor
@@ -4225,6 +4175,7 @@ class SQLiteSessionStore(SessionStore):
                 _validate_runtime_publication_event_references(
                     request.referenced_events,
                     durable_referenced_events,
+                    interaction_id=request.interaction_id,
                 )
                 current_checkpoint = self._load_checkpoint_unlocked(session_id)
                 _validate_tool_round_checkpoint_mutation(
@@ -4592,11 +4543,7 @@ class SQLiteSessionStore(SessionStore):
                         f"Session source run epoch is stale: expected {expected_run_epoch}, "
                         f"current {loaded.run_epoch}."
                     )
-                cursor_row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM cayu_transcript_messages WHERE session_id = ?",
-                    (session_id,),
-                ).fetchone()
-                current_cursor = cursor_row["count"]
+                current_cursor = _transcript_cursor(connection, session_id)
                 if (
                     expected_transcript_cursor is not None
                     and current_cursor != expected_transcript_cursor
@@ -5110,9 +5057,11 @@ class SQLiteSessionStore(SessionStore):
         ``before`` is compared against each event's timestamp (events strictly
         older are removed). When ``session_id`` is given the prune is scoped to
         that session (which must exist); otherwise every session is pruned.
-        Sessions with an active model-completion stage, pending tool round, or
-        immutable runtime-publication receipt are retained because deleting
-        their evidence would make exact recovery or receipt replay impossible.
+        The latest active or paused interaction lifecycle event is retained
+        until a terminal event replaces it. Sessions with an active
+        model-completion stage, pending tool round, or immutable
+        runtime-publication receipt are retained because deleting their
+        evidence would make exact recovery or receipt replay impossible.
         Returns the number of events deleted.
         """
         if not isinstance(before, datetime):
@@ -5159,6 +5108,19 @@ class SQLiteSessionStore(SessionStore):
                                     '$.pending_tool_round'
                                 ) IS NOT NULL
                           )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_interaction_latest_events AS latest
+                              JOIN cayu_events AS latest_event
+                                ON latest_event.sequence = latest.latest_event_sequence
+                              WHERE latest.session_id = cayu_events.session_id
+                                AND latest.latest_event_sequence = cayu_events.sequence
+                                AND latest_event.event_type IN (
+                                    'interaction.started',
+                                    'interaction.resumed',
+                                    'interaction.paused'
+                                )
+                          )
                         """,
                         (
                             cutoff,
@@ -5198,6 +5160,19 @@ class SQLiteSessionStore(SessionStore):
                                     checkpoint.state_json,
                                     '$.pending_tool_round'
                                 ) IS NOT NULL
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM cayu_interaction_latest_events AS latest
+                              JOIN cayu_events AS latest_event
+                                ON latest_event.sequence = latest.latest_event_sequence
+                              WHERE latest.session_id = cayu_events.session_id
+                                AND latest.latest_event_sequence = cayu_events.sequence
+                                AND latest_event.event_type IN (
+                                    'interaction.started',
+                                    'interaction.resumed',
+                                    'interaction.paused'
+                                )
                           )
                         """,
                         (
@@ -5269,7 +5244,8 @@ class SQLiteSessionStore(SessionStore):
                     """,
                     (session_id, session_id, keep_last),
                 )
-            return cursor.rowcount
+                deleted = cursor.rowcount
+            return deleted
 
         return await self._run_write(statement)
 
@@ -6472,6 +6448,8 @@ class SQLiteSessionStore(SessionStore):
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        if interaction_id is None:
+            raise ValueError("Initial transcript publication requires an interaction identity.")
         expected = copy_transcript_messages(expected_messages)
         replacement = copy_transcript_messages(replacement_messages)
         updated_at = datetime.now(UTC)
@@ -6506,6 +6484,10 @@ class SQLiteSessionStore(SessionStore):
                         "Initial transcript must preserve the admitted source suffix."
                     )
                 prefix_count = len(replacement) - len(expected)
+                checkpoint = _checkpoint_after_initial_transcript_publication(
+                    self._load_checkpoint_unlocked(session_id),
+                    interaction_id=interaction_id,
+                )
                 connection.executemany(
                     "INSERT INTO cayu_transcript_messages "
                     "(session_id, role, interaction_id, message_json) VALUES (?, ?, ?, ?)",
@@ -6523,6 +6505,38 @@ class SQLiteSessionStore(SessionStore):
                     "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = ?",
                     (session_id,),
                 )
+                if checkpoint is None:
+                    connection.execute(
+                        "DELETE FROM cayu_checkpoints WHERE session_id = ?",
+                        (session_id,),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        INSERT INTO cayu_checkpoints (
+                            session_id, state_json, updated_at,
+                            pending_action_source_bytes,
+                            pending_action_tool_call_count,
+                            pending_action_flags,
+                            pending_action_metrics_ready
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(session_id) DO UPDATE SET
+                            state_json = excluded.state_json,
+                            updated_at = excluded.updated_at,
+                            pending_action_source_bytes =
+                                excluded.pending_action_source_bytes,
+                            pending_action_tool_call_count =
+                                excluded.pending_action_tool_call_count,
+                            pending_action_flags = excluded.pending_action_flags,
+                            pending_action_metrics_ready =
+                                excluded.pending_action_metrics_ready
+                        """,
+                        sqlite_support.checkpoint_row_values(
+                            session_id,
+                            checkpoint,
+                            updated_at,
+                        ),
+                    )
                 _touch_session_activity(connection, session_id, updated_at)
                 connection.commit()
             except Exception:
@@ -6722,28 +6736,20 @@ class SQLiteSessionStore(SessionStore):
         if query.interaction_id is not None:
             filters.append("interaction_id = ?")
             filter_params.append(query.interaction_id)
-        filter_clause = "WHERE " + " AND ".join(filters) if filters else ""
+        filter_clause = " AND " + " AND ".join(filters) if filters else ""
 
         async with self._lock:
             if not self._session_exists_unlocked(query.session_id):
                 raise KeyError(f"Session not found: {query.session_id}")
 
-            count_params: list[object] = [query.session_id, *filter_params]
             total_row = self._connection.execute(
                 f"""
-                WITH ordered AS (
-                    SELECT
-                        role,
-                        interaction_id,
-                        ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
-                    FROM cayu_transcript_messages
-                    WHERE session_id = ?
-                )
                 SELECT COUNT(*) AS total_records
-                FROM ordered
+                FROM cayu_transcript_messages
+                WHERE session_id = ?
                 {filter_clause}
                 """,
-                count_params,
+                [query.session_id, *filter_params],
             ).fetchone()
             total_records = int(total_row["total_records"])
 
@@ -6755,19 +6761,11 @@ class SQLiteSessionStore(SessionStore):
             ]
             rows = self._connection.execute(
                 f"""
-                WITH ordered AS (
-                    SELECT
-                        role,
-                        interaction_id,
-                        message_json,
-                        ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
-                    FROM cayu_transcript_messages
-                    WHERE session_id = ?
-                )
-                SELECT transcript_index, interaction_id, message_json
-                FROM ordered
+                SELECT session_order - 1 AS transcript_index, interaction_id, message_json
+                FROM cayu_transcript_messages
+                WHERE session_id = ?
                 {filter_clause}
-                ORDER BY transcript_index ASC
+                ORDER BY session_order ASC
                 LIMIT ? OFFSET ?
                 """,
                 page_params,

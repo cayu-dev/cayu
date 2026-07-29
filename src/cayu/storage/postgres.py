@@ -177,7 +177,7 @@ from cayu.runtime.sessions import (
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
     _build_runtime_publication_receipt,
-    _copy_interaction_admission,
+    _checkpoint_after_initial_transcript_publication,
     _copy_mcp_manifest_publication,
     _copy_optional_interaction_admission,
     _copy_queued_interaction_started_event,
@@ -186,6 +186,9 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+    _initial_transcript_pending_checkpoint,
+    _interaction_transition_receipt_record,
+    _interaction_transition_storage_key,
     _model_completion_stage_abandonment_record,
     _model_completion_stage_preparation_record,
     _model_completion_stage_storage_identity,
@@ -206,6 +209,7 @@ from cayu.runtime.sessions import (
     _queued_session_message_event_payload,
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
+    _reconstruct_interaction_transition_receipt,
     _reconstruct_model_completion_stage,
     _reconstruct_model_completion_stage_abandonment,
     _reconstruct_runtime_publication_receipt,
@@ -222,6 +226,7 @@ from cayu.runtime.sessions import (
     _validate_interaction_page,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
+    _validate_message_delivery_eligible_through,
     _validate_model_completion_active_marker_for_preparation,
     _validate_model_completion_active_marker_for_promotion,
     _validate_model_completion_preparation_replay_state,
@@ -334,7 +339,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 29
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 26
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -801,8 +806,39 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
     26: (
         "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS interaction_id TEXT",
         "ALTER TABLE cayu_transcript_messages ADD COLUMN IF NOT EXISTS interaction_id TEXT",
-    ),
-    27: (
+        "ALTER TABLE cayu_sessions ADD COLUMN IF NOT EXISTS "
+        "transcript_seq BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE cayu_transcript_messages ADD COLUMN IF NOT EXISTS session_order BIGINT",
+        "ALTER TABLE cayu_transcript_messages ALTER COLUMN session_order SET NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_transcript_session_order "
+        "ON cayu_transcript_messages(session_id, session_order)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_transcript_interaction_order "
+        "ON cayu_transcript_messages(session_id, interaction_id, session_order)",
+        """
+        CREATE OR REPLACE FUNCTION cayu_assign_transcript_order()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.session_order IS NOT NULL THEN
+                RAISE EXCEPTION
+                    'cayu_transcript_messages.session_order is runtime-owned';
+            END IF;
+            UPDATE cayu_sessions
+            SET transcript_seq = transcript_seq + 1
+            WHERE id = NEW.session_id
+            RETURNING transcript_seq INTO NEW.session_order;
+            IF NEW.session_order IS NULL THEN
+                RAISE EXCEPTION 'transcript session does not exist: %', NEW.session_id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+        "DROP TRIGGER IF EXISTS cayu_assign_transcript_order ON cayu_transcript_messages",
+        """
+        CREATE TRIGGER cayu_assign_transcript_order
+        BEFORE INSERT ON cayu_transcript_messages
+        FOR EACH ROW EXECUTE FUNCTION cayu_assign_transcript_order()
+        """,
         """
         CREATE TABLE IF NOT EXISTS cayu_interaction_latest_events (
             session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
@@ -841,33 +877,12 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         FOR EACH ROW EXECUTE FUNCTION cayu_track_interaction_latest_event()
         """,
         """
-        INSERT INTO cayu_interaction_latest_events (
-            session_id, interaction_id, latest_event_sequence
-        )
-        SELECT session_id, interaction_id, MAX(sequence)
-        FROM cayu_events
-        WHERE interaction_id IS NOT NULL
-          AND event_type = ANY(ARRAY[
-              'interaction.started', 'interaction.resumed', 'interaction.paused',
-              'interaction.completed', 'interaction.failed', 'interaction.interrupted'
-          ])
-        GROUP BY session_id, interaction_id
-        ON CONFLICT (session_id, interaction_id) DO UPDATE SET
-            latest_event_sequence = EXCLUDED.latest_event_sequence
-        WHERE EXCLUDED.latest_event_sequence
-            > cayu_interaction_latest_events.latest_event_sequence
-        """,
-    ),
-    28: (
-        """
         CREATE TABLE IF NOT EXISTS cayu_deferred_interaction_inputs (
             session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
             interaction_id TEXT NOT NULL,
             source_messages JSONB NOT NULL
         )
         """,
-    ),
-    29: (
         """
         CREATE TABLE IF NOT EXISTS cayu_session_message_deliveries (
             delivery_id TEXT PRIMARY KEY,
@@ -1707,6 +1722,30 @@ async def read_schema_state(cur: Any) -> schema.SchemaState:
     return schema.SchemaState(revision=latest[0], compatible_from=latest[1])
 
 
+async def _reject_populated_pre_interaction_database(cur: Any) -> None:
+    await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions)")
+    row = await cur.fetchone()
+    if row is not None and row[0] is True:
+        raise schema.SchemaTooOld(
+            "Storage revision 26 is a clean prerelease break and cannot migrate a "
+            "populated Cayu session database. Recreate the Cayu database before "
+            "starting this build."
+        )
+
+
+async def _transcript_cursor(cur: Any, session_id: str) -> int:
+    """Return the permanent next transcript position, independent of retention."""
+
+    await cur.execute(
+        "SELECT transcript_seq FROM cayu_sessions WHERE id = %s",
+        (session_id,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        raise KeyError(f"Session not found: {session_id}")
+    return int(row[0])
+
+
 async def _disable_prepared_statements(conn: Any) -> None:
     """Pool ``configure`` hook: disable psycopg3 server-side prepared statements.
 
@@ -1893,6 +1932,14 @@ class _PostgresStoreBase:
                     await cur.execute(pg_support.MIGRATIONS_TABLE_DDL)
                     state = await self._read_schema_state(cur)
                     current = state.revision
+                    if (
+                        current != schema.UNINITIALIZED
+                        and current < 26
+                        and any(revision.revision == 26 for revision in schema.pending(current))
+                    ):
+                        # Reject before applying any earlier pending revision so
+                        # the clean break cannot leave a database half-migrated.
+                        await _reject_populated_pre_interaction_database(cur)
                     if current == schema.UNINITIALIZED:
                         await self._apply_baseline(cur)
                         current = schema.BASELINE_REVISION
@@ -2150,6 +2197,12 @@ class _PostgresStoreBase:
 
     async def _apply_pending(self, cur: Any, state: schema.SchemaState) -> None:
         current = state.revision
+        if (
+            current != schema.UNINITIALIZED
+            and current < 26
+            and any(revision.revision == 26 for revision in schema.pending(current))
+        ):
+            await _reject_populated_pre_interaction_database(cur)
         if current == schema.UNINITIALIZED:
             await self._apply_baseline(cur)
             current = schema.BASELINE_REVISION
@@ -5402,6 +5455,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 ),
                             ),
                         )
+                        await self._upsert_checkpoint(
+                            cur,
+                            session.id,
+                            _initial_transcript_pending_checkpoint(interaction_id),
+                            session.updated_at,
+                        )
                 await conn.commit()
             except UniqueViolation as exc:
                 await conn.rollback()
@@ -5503,36 +5562,36 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             f"{source_session_id}"
                         )
 
+                    source_transcript_cursor = await _transcript_cursor(cur, source_session_id)
+                    if (
+                        transcript_cursor is not None
+                        and transcript_cursor > source_transcript_cursor
+                    ):
+                        raise ValueError(
+                            "transcript_cursor is greater than source transcript length."
+                        )
                     await cur.execute(
                         """
                         SELECT message, interaction_id
                         FROM cayu_transcript_messages
                         WHERE session_id = %s
-                        ORDER BY sequence ASC
+                          AND session_order <= %s
+                        ORDER BY session_order ASC
                         """,
-                        (source_session_id,),
+                        (
+                            source_session_id,
+                            (
+                                source_transcript_cursor
+                                if transcript_cursor is None
+                                else transcript_cursor
+                            ),
+                        ),
                     )
-                    transcript_rows = await cur.fetchall()
-                    transcript_row_count = len(transcript_rows)
-                    if transcript_cursor is None:
-                        selected_transcript_rows = transcript_rows
-                        transcript_rows = []
-                        copied_messages = [
-                            Message(**_json_obj(row[0])) for row in selected_transcript_rows
-                        ]
-                        copied_interaction_ids = [row[1] for row in selected_transcript_rows]
-                    else:
-                        if transcript_cursor > transcript_row_count:
-                            transcript_rows.clear()
-                            raise ValueError(
-                                "transcript_cursor is greater than source transcript length."
-                            )
-                        selected_transcript_rows = transcript_rows[:transcript_cursor]
-                        transcript_rows.clear()
-                        copied_messages = [
-                            Message(**_json_obj(row[0])) for row in selected_transcript_rows
-                        ]
-                        copied_interaction_ids = [row[1] for row in selected_transcript_rows]
+                    selected_transcript_rows = await cur.fetchall()
+                    copied_messages = [
+                        Message(**_json_obj(row[0])) for row in selected_transcript_rows
+                    ]
+                    copied_interaction_ids = [row[1] for row in selected_transcript_rows]
                     selected_transcript_rows.clear()
                     if not fork_transcript_is_accepted(copied_messages, transcript_validator):
                         copied_messages.clear()
@@ -6121,6 +6180,21 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 ],
                             )
                 await conn.commit()
+            except UniqueViolation as exc:
+                await conn.rollback()
+                existing_event_id = (
+                    None
+                    if admission is None or admission[0] is None
+                    else await self._first_existing_event_id(
+                        session_id,
+                        [admission[0].id],
+                    )
+                )
+                if existing_event_id is not None:
+                    raise ValueError(
+                        f"Event already exists for session {session_id}: {existing_event_id}"
+                    ) from exc
+                raise
             except Exception:
                 await conn.rollback()
                 raise
@@ -6220,6 +6294,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
         )
+        receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
@@ -6227,32 +6302,44 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, loaded)
+                    await cur.execute(
+                        "SELECT record FROM cayu_session_operations "
+                        "WHERE session_id = %s AND idempotency_key = %s",
+                        (session_id, receipt_storage_key),
+                    )
+                    receipt_row = await cur.fetchone()
                     await cur.execute(
                         "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
                         (session_id, copied_event.id),
                     )
                     existing_row = await cur.fetchone()
-                    if existing_row is not None:
-                        existing_event = Event(**_json_obj(existing_row[0]))
-                        if existing_event != copied_event:
-                            raise ValueError(
-                                "Interaction transition event identity was reused "
-                                "with different data."
-                            )
-                        status_changed = loaded.status is target_status
-                        if not status_changed and not conditional:
+                    if receipt_row is not None:
+                        receipt = _reconstruct_interaction_transition_receipt(
+                            _json_obj(receipt_row[0]),
+                            event=copied_event,
+                            from_statuses=allowed_statuses,
+                            to_status=target_status,
+                            only_if_no_queued_messages=conditional,
+                        )
+                        if (
+                            existing_row is not None
+                            and Event(**_json_obj(existing_row[0])) != receipt.event
+                        ):
                             raise RuntimeError(
-                                "Interaction transition event exists without its session status."
+                                "Interaction transition receipt conflicts with retained event history."
                             )
                         await conn.commit()
                         return InteractionTransitionResult(
-                            session=loaded,
-                            event=existing_event,
-                            status_changed=status_changed,
+                            session=receipt.session,
+                            event=receipt.event,
+                            status_changed=receipt.status_changed,
                             replayed=True,
                         )
-
-                    _assert_session_run_epoch(session_id, loaded)
+                    if existing_row is not None:
+                        raise RuntimeError(
+                            "Interaction transition event exists without its immutable receipt."
+                        )
                     if loaded.status not in allowed_statuses:
                         raise SessionStatusConflict(
                             "Session status transition not allowed: "
@@ -6332,6 +6419,25 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     transitioned = await self._load(cur, session_id)
                     if transitioned is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    receipt_record = _interaction_transition_receipt_record(
+                        session=transitioned,
+                        event=copied_event,
+                        from_statuses=allowed_statuses,
+                        to_status=target_status,
+                        only_if_no_queued_messages=conditional,
+                        status_changed=not queued,
+                    )
+                    await cur.execute(
+                        "INSERT INTO cayu_session_operations "
+                        "(session_id, idempotency_key, record, updated_at) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (
+                            session_id,
+                            receipt_storage_key,
+                            _dumps(receipt_record),
+                            updated_at,
+                        ),
+                    )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
@@ -6915,137 +7021,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await conn.rollback()
                 raise
 
-    async def admit_interaction(
-        self,
-        session_id: str,
-        *,
-        started_event: Event,
-        source_messages: list[Message],
-        defer_transcript: bool = False,
-    ) -> None:
-        from cayu.runtime.pending_actions import pending_action_event_storage_values
-
-        copied_event, copied_messages = _copy_interaction_admission(
-            session_id,
-            started_event,
-            source_messages,
-            defer_transcript=defer_transcript,
-        )
-        interaction_id = copied_event.interaction_id
-        if interaction_id is None:  # validated by _copy_interaction_admission
-            raise AssertionError("Interaction admission lost its identity.")
-        lookup_key, projection, projection_bytes = pending_action_event_storage_values(copied_event)
-        expected_run_epoch = _current_session_run_epoch(session_id)
-        await self._ensure_ready()
-        async with self._connection() as conn:
-            try:
-                async with conn.cursor() as cur:
-                    if expected_run_epoch is None:
-                        await cur.execute(
-                            "UPDATE cayu_sessions SET event_seq = event_seq + 1, "
-                            "last_activity_at = %s WHERE id = %s RETURNING event_seq",
-                            (datetime.now(UTC), session_id),
-                        )
-                    else:
-                        await cur.execute(
-                            "UPDATE cayu_sessions SET event_seq = event_seq + 1, "
-                            "last_activity_at = %s WHERE id = %s AND run_epoch = %s "
-                            "RETURNING event_seq",
-                            (datetime.now(UTC), session_id, expected_run_epoch),
-                        )
-                    order_row = await cur.fetchone()
-                    if order_row is None:
-                        if expected_run_epoch is not None:
-                            await _raise_session_write_conflict(
-                                cur,
-                                session_id,
-                                expected_run_epoch,
-                            )
-                        raise KeyError(f"Session not found: {session_id}")
-                    await cur.execute(
-                        "SELECT 1 FROM cayu_deferred_interaction_inputs WHERE session_id = %s",
-                        (session_id,),
-                    )
-                    if await cur.fetchone() is not None:
-                        raise RuntimeError("Session already has deferred interaction input.")
-                    await cur.execute(
-                        """
-                        INSERT INTO cayu_events (
-                            session_id, session_order, event_id, interaction_id,
-                            event_type, timestamp, agent_name, environment_name,
-                            workflow_name, tool_name, payload, event,
-                            pending_action_lookup_key, pending_action_projection,
-                            pending_action_projection_bytes
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s
-                        )
-                        """,
-                        (
-                            session_id,
-                            order_row[0],
-                            copied_event.id,
-                            interaction_id,
-                            str(copied_event.type),
-                            pg_support.to_utc(copied_event.timestamp),
-                            copied_event.agent_name,
-                            copied_event.environment_name,
-                            copied_event.workflow_name,
-                            copied_event.tool_name,
-                            _dumps(copied_event.payload),
-                            _dumps(copied_event.model_dump(mode="json")),
-                            lookup_key,
-                            projection,
-                            projection_bytes,
-                        ),
-                    )
-                    await self._enqueue_persisted_event_side_effects(
-                        cur,
-                        session_id,
-                        [copied_event.id],
-                    )
-                    if defer_transcript:
-                        await cur.execute(
-                            "INSERT INTO cayu_deferred_interaction_inputs "
-                            "(session_id, interaction_id, source_messages) "
-                            "VALUES (%s, %s, %s)",
-                            (
-                                session_id,
-                                interaction_id,
-                                _dumps(
-                                    [message.model_dump(mode="json") for message in copied_messages]
-                                ),
-                            ),
-                        )
-                    else:
-                        await cur.executemany(
-                            "INSERT INTO cayu_transcript_messages "
-                            "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
-                            [
-                                (
-                                    session_id,
-                                    interaction_id,
-                                    _dumps(message.model_dump(mode="json")),
-                                )
-                                for message in copied_messages
-                            ],
-                        )
-                await conn.commit()
-            except UniqueViolation as exc:
-                await conn.rollback()
-                existing = await self._first_existing_event_id(
-                    session_id,
-                    [copied_event.id],
-                )
-                if existing is not None:
-                    raise ValueError(
-                        f"Event already exists for session {session_id}: {existing}"
-                    ) from exc
-                raise
-            except Exception:
-                await conn.rollback()
-                raise
-
     @staticmethod
     async def _enqueue_persisted_event_side_effects(
         cur: Any,
@@ -7384,12 +7359,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionStatusConflict(
                             "Session messages may be enqueued only while a session is pending or running."
                         )
-                    await cur.execute(
-                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
-                        (request.session_id,),
-                    )
-                    cursor_row = await cur.fetchone()
-                    transcript_cursor = cursor_row[0] if cursor_row is not None else 0
+                    transcript_cursor = await _transcript_cursor(cur, request.session_id)
                     accepted_at = datetime.now(UTC)
                     queue_id = str(uuid4())
                     accepted_event_id = str(uuid4())
@@ -7531,8 +7501,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
-        if eligible_through is not None and eligible_through < 0:
-            raise ValueError("eligible_through must be greater than or equal to zero.")
+        eligible_through = _validate_message_delivery_eligible_through(eligible_through)
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
         await self._ensure_ready()
@@ -7542,6 +7511,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    _assert_session_run_epoch(session_id, loaded)
                     await cur.execute(
                         """
                         SELECT session_id, interaction_id, include_on_idle,
@@ -7600,7 +7570,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             has_more=delivery_row[6],
                             replayed=True,
                         )
-                    _assert_session_run_epoch(session_id, loaded)
                     if loaded.status != SessionStatus.RUNNING:
                         raise SessionStatusConflict(
                             "Queued session messages may be delivered only while running."
@@ -7668,15 +7637,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await conn.commit()
                         return SessionMessageDeliveryBatch(
                             delivery_id=delivery_id,
+                            interaction_id=interaction_id,
                             eligible_through=boundary,
                             has_more=False,
                         )
-                    await cur.execute(
-                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
-                        (session_id,),
-                    )
-                    cursor_row = await cur.fetchone()
-                    transcript_cursor = cursor_row[0] if cursor_row is not None else 0
+                    transcript_cursor = await _transcript_cursor(cur, session_id)
                     delivered_at = datetime.now(UTC)
                     updated_messages: list[SessionQueuedMessage] = []
                     delivery_events: list[Event] = []
@@ -7944,17 +7909,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         receipt: RuntimePublicationReceipt,
     ) -> None:
         try:
-            transcript_count = receipt.transcript_end_cursor - receipt.transcript_start_cursor
             await cur.execute(
-                "SELECT message FROM cayu_transcript_messages "
-                "WHERE session_id = %s ORDER BY sequence ASC LIMIT %s OFFSET %s",
+                "SELECT interaction_id, message FROM cayu_transcript_messages "
+                "WHERE session_id = %s AND session_order > %s AND session_order <= %s "
+                "ORDER BY session_order ASC",
                 (
                     receipt.session_id,
-                    transcript_count,
                     receipt.transcript_start_cursor,
+                    receipt.transcript_end_cursor,
                 ),
             )
-            transcript = [Message(**_json_obj(row[0])) for row in await cur.fetchall()]
+            transcript_rows = await cur.fetchall()
+            transcript = [Message(**_json_obj(row[1])) for row in transcript_rows]
+            transcript_interaction_ids = [row[0] for row in transcript_rows]
 
             referenced_event_ids = _runtime_publication_referenced_event_ids(
                 receipt.referenced_events
@@ -7973,6 +7940,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             _validate_runtime_publication_durable_material(
                 receipt,
                 transcript_messages=transcript,
+                transcript_interaction_ids=transcript_interaction_ids,
                 appended_events=(
                     events_by_id[event_id]
                     for event_id in receipt.appended_event_ids
@@ -8189,12 +8157,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "Session source run epoch is stale: expected "
                             f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
                         )
-                    await cur.execute(
-                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
-                        (session_id,),
-                    )
-                    cursor_row = await cur.fetchone()
-                    current_cursor = cursor_row[0] if cursor_row is not None else 0
+                    current_cursor = await _transcript_cursor(cur, session_id)
                     if current_cursor != prepared.expected_transcript_cursor:
                         raise ValueError(
                             "Session source transcript cursor is stale: expected "
@@ -8796,12 +8759,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "Session source run epoch is stale: expected "
                             f"{prepared.expected_run_epoch}, current {loaded.run_epoch}."
                         )
-                    await cur.execute(
-                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
-                        (session_id,),
-                    )
-                    cursor_row = await cur.fetchone()
-                    transcript_start_cursor = cursor_row[0] if cursor_row is not None else 0
+                    transcript_start_cursor = await _transcript_cursor(cur, session_id)
                     if (
                         prepared.expected_transcript_cursor is not None
                         and transcript_start_cursor != prepared.expected_transcript_cursor
@@ -8833,6 +8791,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     _validate_runtime_publication_event_references(
                         request.referenced_events,
                         durable_references,
+                        interaction_id=request.interaction_id,
                     )
                     current_checkpoint = await self._load_checkpoint(cur, session_id)
                     _validate_tool_round_checkpoint_mutation(
@@ -9215,12 +9174,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             f"Session source run epoch is stale: expected {expected_run_epoch}, "
                             f"current {loaded.run_epoch}."
                         )
-                    await cur.execute(
-                        "SELECT COUNT(*) FROM cayu_transcript_messages WHERE session_id = %s",
-                        (session_id,),
-                    )
-                    cursor_row = await cur.fetchone()
-                    current_cursor = cursor_row[0] if cursor_row is not None else 0
+                    current_cursor = await _transcript_cursor(cur, session_id)
                     if (
                         expected_transcript_cursor is not None
                         and current_cursor != expected_transcript_cursor
@@ -10854,6 +10808,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        if interaction_id is None:
+            raise ValueError("Initial transcript publication requires an interaction identity.")
         expected = copy_transcript_messages(expected_messages)
         replacement = copy_transcript_messages(replacement_messages)
         updated_at = datetime.now(UTC)
@@ -10894,6 +10850,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "Initial transcript must preserve the admitted source suffix."
                         )
                     prefix_count = len(replacement) - len(expected)
+                    checkpoint = _checkpoint_after_initial_transcript_publication(
+                        await self._load_checkpoint(cur, session_id),
+                        interaction_id=interaction_id,
+                    )
                     await cur.executemany(
                         "INSERT INTO cayu_transcript_messages "
                         "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
@@ -10910,6 +10870,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         "DELETE FROM cayu_deferred_interaction_inputs WHERE session_id = %s",
                         (session_id,),
                     )
+                    if checkpoint is None:
+                        await cur.execute(
+                            "DELETE FROM cayu_checkpoints WHERE session_id = %s",
+                            (session_id,),
+                        )
+                    else:
+                        await self._upsert_checkpoint(cur, session_id, checkpoint, updated_at)
                     await _touch_session_activity(cur, session_id, updated_at)
                 await conn.commit()
             except Exception:
@@ -11065,19 +11032,15 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         query = copy_transcript_query(query)
-        # The transcript role lives inside the stored ``message`` JSONB, so it is read
-        # with ``message ->> 'role'`` rather than a dedicated column. This keeps the
-        # existing transcript schema unchanged (no destructive NOT NULL migration) while
-        # matching the SQLite store's role-filtering and stable, gap-free index semantics.
         filters: list[str] = []
         filter_params: list[object] = []
         if query.role is not None:
-            filters.append("role = %s")
+            filters.append("message ->> 'role' = %s")
             filter_params.append(str(query.role))
         if query.interaction_id is not None:
             filters.append("interaction_id = %s")
             filter_params.append(query.interaction_id)
-        filter_clause = "WHERE " + " AND ".join(filters) if filters else ""
+        filter_clause = " AND " + " AND ".join(filters) if filters else ""
 
         await self._ensure_ready()
         async with self._connection() as conn, conn.cursor() as cur:
@@ -11087,16 +11050,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
             await cur.execute(
                 f"""
-                WITH ordered AS (
-                    SELECT
-                        message ->> 'role' AS role,
-                        interaction_id,
-                        ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
-                    FROM cayu_transcript_messages
-                    WHERE session_id = %s
-                )
                 SELECT COUNT(*)
-                FROM ordered
+                FROM cayu_transcript_messages
+                WHERE session_id = %s
                 {filter_clause}
                 """,
                 [query.session_id, *filter_params],
@@ -11106,19 +11062,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
             await cur.execute(
                 f"""
-                WITH ordered AS (
-                    SELECT
-                        message ->> 'role' AS role,
-                        interaction_id,
-                        message,
-                        ROW_NUMBER() OVER (ORDER BY sequence ASC) - 1 AS transcript_index
-                    FROM cayu_transcript_messages
-                    WHERE session_id = %s
-                )
-                SELECT transcript_index, interaction_id, message
-                FROM ordered
+                SELECT session_order - 1 AS transcript_index, interaction_id, message
+                FROM cayu_transcript_messages
+                WHERE session_id = %s
                 {filter_clause}
-                ORDER BY transcript_index ASC
+                ORDER BY session_order ASC
                 LIMIT %s OFFSET %s
                 """,
                 [query.session_id, *filter_params, query.limit, query.offset],

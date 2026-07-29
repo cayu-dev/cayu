@@ -43,6 +43,29 @@ guard.
 
 ## v0.1.0 (unreleased)
 
+### Interaction durability advances the server and storage contracts
+
+First-interaction admission, queued delivery, and lifecycle closure now retain
+stable interaction identity across acknowledgement loss and recovery. Session,
+event, transcript, and checkpoint transitions that decide an interaction
+outcome use store-atomic, idempotent publication. Setup failures retain a
+durable incomplete-authority marker: source input remains inspectable, but the
+session cannot be resumed, forked, or compacted without an authoritative system
+prefix. Interaction-transition receipts content-bind their historical result
+snapshots so acknowledgement-loss replay cannot be changed by later session state.
+
+Storage revision 26 adds interaction attribution and a database-maintained,
+gap-free per-session transcript ordinal. This prerelease contract is a clean
+break: migration rejects a populated pre-26 Cayu session database instead of
+rewriting its events or transcript. Recreate the Cayu database before starting
+the new workers. Empty schemas migrate normally.
+
+The server contract advances from version 4 to version 5. Mutation SSE
+envelopes, API event records, and transcript records now require
+`interaction_id`, and interaction-scoped endpoints are part of the published
+OpenAPI surface. Regenerate clients and deploy independently hosted dashboards
+with the matching server version.
+
 ### Session topology reads are bounded and indexed
 
 The protected server now exposes a session-focused topology read for control
@@ -347,8 +370,8 @@ Session stores now expose `publish_runtime_publication(...)` for crash-sensitive
 model-step and tool-round commits. One call atomically publishes the detached
 transcript batch, replacement checkpoint, new events and their side-effect
 handoffs, session timestamps, and an insert-only, store-owned receipt. The
-receipt binds the logical publication identity, intent, source fences, transcript
-cursors, and ordered referenced events. References are typed ID-and-canonical-
+receipt binds the logical publication identity, interaction identity, intent,
+source fences, transcript cursors, and ordered referenced events. References are typed ID-and-canonical-
 content-digest pairs derived from an exact `Event`; missing or changed referenced
 content fails before mutation and on every receipt load or replay.
 

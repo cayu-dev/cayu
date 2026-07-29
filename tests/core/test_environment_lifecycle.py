@@ -229,17 +229,21 @@ def test_cancellation_during_factory_resolution_finalizes_before_fence_release()
             super().__init__()
             self.lifecycle_order: list[str] = []
 
-        async def transition_status(
+        async def publish_interaction_transition(
             self,
             session_id: str,
             *,
+            event: Event,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
-        ) -> Session:
-            result = await super().transition_status(
+            only_if_no_queued_messages: bool = False,
+        ):
+            result = await super().publish_interaction_transition(
                 session_id,
+                event=event,
                 from_statuses=from_statuses,
                 to_status=to_status,
+                only_if_no_queued_messages=only_if_no_queued_messages,
             )
             if to_status == SessionStatus.INTERRUPTED:
                 self.lifecycle_order.append("finalized")
@@ -1012,15 +1016,24 @@ def test_deferred_factory_failure_retains_capacity_until_cleanup_settles() -> No
 
         factory.release.set()
         assert await app.drain_environment_cleanups(timeout_s=0.2) is True
-        continuation = [
-            event
-            async for event in app.resume(
-                ResumeRequest(
-                    session_id="deferred-owner",
-                    messages=[Message.text("user", "continue after cleanup")],
+        with pytest.raises(RuntimeError, match="authoritative initial transcript"):
+            _ = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id="deferred-owner",
+                        messages=[Message.text("user", "continue after cleanup")],
+                    )
                 )
-            )
-        ]
+            ]
+        continuation = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="deferred-owner-retry",
+                messages=[Message.text("user", "retry after cleanup")],
+            ),
+        )
         return first, second, continuation, factory, app
 
     first, second, continuation, factory, app = asyncio.run(run())
@@ -1114,15 +1127,24 @@ def test_explicit_drain_retries_same_failed_factory_cleanup_owner() -> None:
         )
         factory.allow_cleanup = True
         assert await app.drain_environment_cleanups(timeout_s=0.2) is True
-        continuation = [
-            event
-            async for event in app.resume(
-                ResumeRequest(
-                    session_id="recoverable-cleanup-owner",
-                    messages=[Message.text("user", "continue after recovery")],
+        with pytest.raises(RuntimeError, match="authoritative initial transcript"):
+            _ = [
+                event
+                async for event in app.resume(
+                    ResumeRequest(
+                        session_id="recoverable-cleanup-owner",
+                        messages=[Message.text("user", "continue after recovery")],
+                    )
                 )
-            )
-        ]
+            ]
+        continuation = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="recoverable-cleanup-owner-retry",
+                messages=[Message.text("user", "retry after recovery")],
+            ),
+        )
         return first, contender, continuation, factory, app
 
     first, contender, continuation, factory, app = asyncio.run(run())

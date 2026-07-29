@@ -28,6 +28,7 @@ function event(id = "event-2", type = "session.resumed", payload = {}) {
     id,
     type,
     session_id: SESSION_ID,
+    interaction_id: null,
     agent_name: "assistant",
     environment_name: null,
     workflow_name: null,

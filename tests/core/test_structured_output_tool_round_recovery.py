@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
@@ -15,6 +16,8 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
+    InteractionStatus,
+    InteractionSummaryEvidence,
     ResumeRequest,
     RunLimits,
     RunRequest,
@@ -171,7 +174,23 @@ async def _publish_structured_model_step(
     redactor: SecretRedactor | None = None,
 ) -> _PublishedStructuredStep:
     user_message = Message.text("user", "produce the final structured answer")
-    await store.create(
+    interaction_id = f"interaction-{session_id}"
+    started_event_id = f"{session_id}:interaction-started"
+    started_at = datetime.now(UTC)
+    started_event = Event(
+        id=started_event_id,
+        type=EventType.INTERACTION_STARTED,
+        session_id=session_id,
+        interaction_id=interaction_id,
+        timestamp=started_at,
+        agent_name="assistant",
+        payload=InteractionSummaryEvidence(
+            status=InteractionStatus.ACTIVE,
+            start_event_id=started_event_id,
+            started_at=started_at,
+        ).model_dump(mode="json"),
+    )
+    running = await store.create(
         RunRequest(
             agent_name="assistant",
             session_id=session_id,
@@ -182,12 +201,14 @@ async def _publish_structured_model_step(
             provider_name=provider_name,
             model="fake-model",
         ),
+        interaction_started_event=started_event,
+        interaction_source_messages=[user_message],
     )
-    await store.append_transcript_messages(session_id, [user_message])
-    running = await store.transition_status(
+    await store.replace_initial_transcript_messages(
         session_id,
-        from_statuses={SessionStatus.PENDING},
-        to_status=SessionStatus.RUNNING,
+        [user_message],
+        [user_message],
+        interaction_id=interaction_id,
     )
 
     source_transcript_cursor = 1
@@ -277,6 +298,7 @@ async def _publish_structured_model_step(
         id=f"{session_id}:model-completed",
         type=EventType.MODEL_COMPLETED,
         session_id=session_id,
+        interaction_id=interaction_id,
         agent_name="assistant",
         payload={
             **tool_round_identity.payload(),
@@ -310,6 +332,7 @@ async def _publish_structured_model_step(
     publication = RuntimePublicationRequest(
         publication_id=logical_step_id,
         kind="model-step",
+        interaction_id=interaction_id,
         intent=intent,
         mutation=runtime_publication_checkpoint_mutation(None, target_checkpoint),
         transcript_messages=(assistant_message,),

@@ -346,20 +346,24 @@ def test_repeated_cancellation_during_run_initialization_waits_for_finalization(
             self.allow_finalization = asyncio.Event()
             self.lifecycle_order: list[str] = []
 
-        async def transition_status(
+        async def publish_interaction_transition(
             self,
             session_id: str,
             *,
+            event: Event,
             from_statuses: set[SessionStatus],
             to_status: SessionStatus,
+            only_if_no_queued_messages: bool = False,
         ):
             if to_status == SessionStatus.INTERRUPTED:
                 self.finalization_started.set()
                 await self.allow_finalization.wait()
-            result = await super().transition_status(
+            result = await super().publish_interaction_transition(
                 session_id,
+                event=event,
                 from_statuses=from_statuses,
                 to_status=to_status,
+                only_if_no_queued_messages=only_if_no_queued_messages,
             )
             if to_status == SessionStatus.INTERRUPTED:
                 self.lifecycle_order.append("finalized")

@@ -46,6 +46,8 @@ from cayu.runtime.structured_output import (
     StructuredOutputValidation,
 )
 
+_INTERACTION_ID = "interaction-tool-round-publication"
+
 
 def _pending_round(*, structured: bool = False) -> PendingToolRound:
     first_tool_name = STRUCTURED_OUTPUT_TOOL_NAME if structured else "lookup"
@@ -102,6 +104,7 @@ def _lifecycle_events(
         id="started-a",
         type=EventType.TOOL_CALL_STARTED,
         session_id=session_id,
+        interaction_id=_INTERACTION_ID,
         agent_name=pending_round.agent_name,
         environment_name=pending_round.environment_name,
         tool_name=first_call.tool_name,
@@ -116,6 +119,7 @@ def _lifecycle_events(
         id="terminal-a",
         type=EventType.TOOL_CALL_COMPLETED,
         session_id=session_id,
+        interaction_id=_INTERACTION_ID,
         agent_name=pending_round.agent_name,
         environment_name=pending_round.environment_name,
         tool_name=first_call.tool_name,
@@ -133,6 +137,7 @@ def _lifecycle_events(
         id="terminal-b",
         type=EventType.TOOL_CALL_FAILED,
         session_id=session_id,
+        interaction_id=_INTERACTION_ID,
         agent_name=pending_round.agent_name,
         environment_name=pending_round.environment_name,
         tool_name=second_call.tool_name,
@@ -237,6 +242,7 @@ def _structured_lifecycle_events(
             id="structured-terminal",
             type=(EventType.TOOL_CALL_COMPLETED if valid else EventType.TOOL_CALL_FAILED),
             session_id=session_id,
+            interaction_id=_INTERACTION_ID,
             agent_name=pending_round.agent_name,
             environment_name=pending_round.environment_name,
             tool_name=pending_call.tool_name,
@@ -277,6 +283,7 @@ def _structured_auxiliary_events(
             id="structured-validating",
             type=EventType.STRUCTURED_OUTPUT_VALIDATING,
             session_id=session_id,
+            interaction_id=_INTERACTION_ID,
             agent_name=pending_round.agent_name,
             environment_name=pending_round.environment_name,
             payload={
@@ -292,6 +299,7 @@ def _structured_auxiliary_events(
                 else EventType.STRUCTURED_OUTPUT_FAILED
             ),
             session_id=session_id,
+            interaction_id=_INTERACTION_ID,
             agent_name=pending_round.agent_name,
             environment_name=pending_round.environment_name,
             payload={
@@ -318,6 +326,7 @@ def _structured_auxiliary_events(
                 id="structured-retry",
                 type=EventType.STRUCTURED_OUTPUT_RETRY,
                 session_id=session_id,
+                interaction_id=_INTERACTION_ID,
                 agent_name=pending_round.agent_name,
                 environment_name=pending_round.environment_name,
                 payload={
@@ -357,6 +366,7 @@ class _StructuredOutputPublicationExtension:
         return RuntimePublicationRequest(
             publication_id=ordinary_request.publication_id,
             kind=ordinary_request.kind,
+            interaction_id=ordinary_request.interaction_id,
             intent={
                 **ordinary_request.intent,
                 "auxiliary": {
@@ -564,6 +574,7 @@ def test_structured_output_requires_explicit_nonweakening_extension() -> None:
             return RuntimePublicationRequest(
                 publication_id=ordinary_request.publication_id,
                 kind=ordinary_request.kind,
+                interaction_id=ordinary_request.interaction_id,
                 intent=ordinary_request.intent,
                 mutation=ordinary_request.mutation,
                 transcript_messages=(),
@@ -711,6 +722,7 @@ def test_store_scopes_reused_tool_call_ids_to_the_exact_round() -> None:
                 id=f"old-{event.id}",
                 type=event.type,
                 session_id=event.session_id,
+                interaction_id=event.interaction_id,
                 agent_name=event.agent_name,
                 environment_name=event.environment_name,
                 tool_name=event.tool_name,
@@ -763,6 +775,7 @@ def test_store_rejects_ambiguous_roundless_lifecycle_evidence() -> None:
             id="roundless-started",
             type=EventType.TOOL_CALL_STARTED,
             session_id=session.id,
+            interaction_id=_INTERACTION_ID,
             agent_name=pending_round.agent_name,
             tool_name=pending_round.tool_calls[0].tool_name,
             payload={
@@ -1028,6 +1041,7 @@ def test_store_rejects_malformed_structured_output_auxiliary_publications(
         malformed_request = RuntimePublicationRequest(
             publication_id=request.publication_id,
             kind=request.kind,
+            interaction_id=request.interaction_id,
             intent=intent,
             mutation=request.mutation,
             transcript_messages=request.transcript_messages,
@@ -1417,6 +1431,7 @@ class _AuxiliaryPublicationStore(InMemorySessionStore):
             session_id=session_id,
             publication_id=request.publication_id,
             kind=request.kind,
+            interaction_id=request.interaction_id,
             intent=request.intent,
             request_digest="1" * 64,
             publication_digest="2" * 64,

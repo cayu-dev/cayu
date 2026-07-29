@@ -10,7 +10,7 @@ import time
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -234,7 +234,14 @@ class _InheritInteractionAttribution:
 
 INHERIT_INTERACTION = _InheritInteractionAttribution()
 InteractionAttribution = str | None | _InheritInteractionAttribution
-UNASSOCIATED_RUNTIME_EVENT_TYPES: frozenset[EventType] = frozenset({EventType.TURN_COMPLETED})
+UNASSOCIATED_RUNTIME_EVENT_TYPES: frozenset[EventType] = frozenset(
+    {
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_COMPLETED,
+        EventType.SESSION_FAILED,
+        EventType.SESSION_INTERRUPTED,
+    }
+)
 
 
 def _current_session_interaction_id(session_id: str) -> str | None:
@@ -330,19 +337,24 @@ def _activate_session_interaction(session_id: str, interaction_id: str) -> None:
         _SESSION_INVOCATION_INTERACTION_IDS.set(invocation_interactions)
 
 
-def _deactivate_session_interaction(session_id: str) -> None:
+def _close_session_interaction(session_id: str) -> None:
+    """Clear active attribution while retaining invocation-level history."""
+
     interactions = _SESSION_INTERACTION_IDS.get()
-    if interactions is None or session_id not in interactions:
-        return
-    remaining = dict(interactions)
-    remaining.pop(session_id)
-    _SESSION_INTERACTION_IDS.set(remaining or None)
+    if interactions is not None and session_id in interactions:
+        remaining = dict(interactions)
+        remaining.pop(session_id)
+        _SESSION_INTERACTION_IDS.set(remaining or None)
     started = _SESSION_INTERACTION_STARTED_AT.get()
     if started is not None and session_id in started:
         remaining_started = dict(started)
         remaining_started.pop(session_id)
         _SESSION_INTERACTION_STARTED_AT.set(remaining_started or None)
     _clear_session_interaction_recovered_active_through(session_id)
+
+
+def _deactivate_session_interaction(session_id: str) -> None:
+    _close_session_interaction(session_id)
     invocation_interactions = _SESSION_INVOCATION_INTERACTION_IDS.get()
     if invocation_interactions is not None and session_id in invocation_interactions:
         remaining_invocations = dict(invocation_interactions)
@@ -351,11 +363,25 @@ def _deactivate_session_interaction(session_id: str) -> None:
 
 
 class _SessionRunFenceContext:
-    """Carry one stream's task-local run fences across task boundaries."""
+    """Carry one stream's task-local runtime ownership across task boundaries."""
 
     def __init__(self) -> None:
         fences = _SESSION_RUN_FENCES.get()
         self._fences = None if fences is None else dict(fences)
+        interaction_ids = _SESSION_INTERACTION_IDS.get()
+        self._interaction_ids = None if interaction_ids is None else dict(interaction_ids)
+        interaction_started_at = _SESSION_INTERACTION_STARTED_AT.get()
+        self._interaction_started_at = (
+            None if interaction_started_at is None else dict(interaction_started_at)
+        )
+        recovered_active_through = _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.get()
+        self._recovered_active_through = (
+            None if recovered_active_through is None else dict(recovered_active_through)
+        )
+        invocation_interaction_ids = _SESSION_INVOCATION_INTERACTION_IDS.get()
+        self._invocation_interaction_ids = (
+            None if invocation_interaction_ids is None else dict(invocation_interaction_ids)
+        )
 
     @classmethod
     def current_or_new(cls) -> _SessionRunFenceContext:
@@ -376,13 +402,59 @@ class _SessionRunFenceContext:
             return
         fences = None if self._fences is None else dict(self._fences)
         fence_token = _SESSION_RUN_FENCES.set(fences)
+        interaction_ids = None if self._interaction_ids is None else dict(self._interaction_ids)
+        interaction_id_token = _SESSION_INTERACTION_IDS.set(interaction_ids)
+        interaction_started_at = (
+            None if self._interaction_started_at is None else dict(self._interaction_started_at)
+        )
+        interaction_started_at_token = _SESSION_INTERACTION_STARTED_AT.set(interaction_started_at)
+        recovered_active_through = (
+            None if self._recovered_active_through is None else dict(self._recovered_active_through)
+        )
+        recovered_active_through_token = _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.set(
+            recovered_active_through
+        )
+        invocation_interaction_ids = (
+            None
+            if self._invocation_interaction_ids is None
+            else dict(self._invocation_interaction_ids)
+        )
+        invocation_interaction_ids_token = _SESSION_INVOCATION_INTERACTION_IDS.set(
+            invocation_interaction_ids
+        )
         context_token = _ACTIVE_SESSION_RUN_FENCE_CONTEXT.set((self, ref(task)))
         try:
             yield
         finally:
             current = _SESSION_RUN_FENCES.get()
             self._fences = None if current is None else dict(current)
+            current_interaction_ids = _SESSION_INTERACTION_IDS.get()
+            self._interaction_ids = (
+                None if current_interaction_ids is None else dict(current_interaction_ids)
+            )
+            current_interaction_started_at = _SESSION_INTERACTION_STARTED_AT.get()
+            self._interaction_started_at = (
+                None
+                if current_interaction_started_at is None
+                else dict(current_interaction_started_at)
+            )
+            current_recovered_active_through = _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.get()
+            self._recovered_active_through = (
+                None
+                if current_recovered_active_through is None
+                else dict(current_recovered_active_through)
+            )
+            current_invocation_interaction_ids = _SESSION_INVOCATION_INTERACTION_IDS.get()
+            self._invocation_interaction_ids = (
+                None
+                if current_invocation_interaction_ids is None
+                else dict(current_invocation_interaction_ids)
+            )
             _ACTIVE_SESSION_RUN_FENCE_CONTEXT.reset(context_token)
+            _SESSION_INVOCATION_INTERACTION_IDS.reset(invocation_interaction_ids_token)
+            _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.reset(recovered_active_through_token)
+            _SESSION_INTERACTION_STARTED_AT.reset(interaction_started_at_token)
+            _SESSION_INTERACTION_IDS.reset(interaction_id_token)
             _SESSION_RUN_FENCES.reset(fence_token)
 
 
@@ -892,6 +964,55 @@ class InteractionTransitionResult(BaseModel):
         return copy_event(value)
 
 
+class _InteractionTransitionReceipt(BaseModel):
+    """Immutable store-owned evidence for exact lifecycle-transition replay."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    record_type: Literal["cayu.interaction-transition"] = "cayu.interaction-transition"
+    schema_version: Literal[1] = 1
+    session: Session
+    event: Event
+    from_statuses: tuple[SessionStatus, ...]
+    to_status: SessionStatus
+    only_if_no_queued_messages: StrictBool
+    status_changed: StrictBool
+    record_digest: str
+
+    @field_validator("session")
+    @classmethod
+    def copy_session(cls, value: Session) -> Session:
+        return copy_session(value)
+
+    @field_validator("event")
+    @classmethod
+    def copy_event(cls, value: Event) -> Event:
+        return copy_event(value)
+
+    @field_validator("record_digest")
+    @classmethod
+    def validate_record_digest(cls, value: str) -> str:
+        _require_raw_sha256_digest(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_source_statuses(self) -> _InteractionTransitionReceipt:
+        if not self.from_statuses:
+            raise ValueError("Interaction-transition receipt requires source statuses.")
+        if len(set(self.from_statuses)) != len(self.from_statuses):
+            raise ValueError("Interaction-transition receipt source statuses must be unique.")
+        if self.session.id != self.event.session_id:
+            raise ValueError("Interaction-transition receipt session and event disagree.")
+        if self.status_changed:
+            if self.session.status is not self.to_status:
+                raise ValueError(
+                    "Interaction-transition receipt changed status does not match its session."
+                )
+        elif not self.only_if_no_queued_messages or self.session.status not in self.from_statuses:
+            raise ValueError("Interaction-transition receipt unchanged status is inconsistent.")
+        return self
+
+
 class InterruptSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1249,8 +1370,9 @@ def transform_fork_checkpoint(
 
 
 RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX = "__cayu_runtime_publication_v1__:"
+INTERACTION_TRANSITION_OPERATION_KEY_PREFIX = "__cayu_interaction_transition_v1__:"
 RUNTIME_PUBLICATION_RECORD_TYPE = "cayu.runtime-publication"
-RUNTIME_PUBLICATION_SCHEMA_VERSION = 1
+RUNTIME_PUBLICATION_SCHEMA_VERSION = 2
 RUNTIME_PUBLICATION_MAX_CHECKPOINT_OPERATIONS = 128
 RUNTIME_PUBLICATION_MAX_TRANSCRIPT_MESSAGES = 512
 RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS = 512
@@ -1556,10 +1678,11 @@ class RuntimePublicationReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     record_type: Literal["cayu.runtime-publication"] = RUNTIME_PUBLICATION_RECORD_TYPE
-    schema_version: Literal[1] = RUNTIME_PUBLICATION_SCHEMA_VERSION
+    schema_version: Literal[2] = RUNTIME_PUBLICATION_SCHEMA_VERSION
     session_id: str
     publication_id: str = Field(max_length=256)
     kind: RuntimePublicationKind
+    interaction_id: str | None = Field(default=None, max_length=256)
     intent: dict[str, Any]
     request_digest: str
     publication_digest: str
@@ -1578,6 +1701,11 @@ class RuntimePublicationReceipt(BaseModel):
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("interaction_id")
+    @classmethod
+    def validate_optional_interaction_id(cls, value: str | None) -> str | None:
+        return None if value is None else require_clean_nonblank(value, "interaction_id")
 
     @field_validator("intent", mode="before")
     @classmethod
@@ -2091,17 +2219,7 @@ class SessionOperationPublication(BaseModel):
     ) -> dict[str, dict[str, Any]]:
         copied = copy_durable_json_object(value, "operation_records")
         for key, record in copied.items():
-            require_clean_nonblank(key, "operation_records key")
-            if key.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
-                raise ValueError(
-                    "Session operation record keys cannot use the reserved runtime "
-                    "publication namespace."
-                )
-            if key.startswith(MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX):
-                raise ValueError(
-                    "Session operation record keys cannot use the reserved model-completion "
-                    "stage namespace."
-                )
+            _reject_reserved_runtime_publication_key(key, "operation_records key")
             if type(record) is not dict:
                 raise ValueError("Session operation records must be objects.")
         return copied
@@ -4186,25 +4304,6 @@ class SessionStore(ABC):
         )
 
     @abstractmethod
-    async def admit_interaction(
-        self,
-        session_id: str,
-        *,
-        started_event: Event,
-        source_messages: list[Message],
-        defer_transcript: bool = False,
-    ) -> None:
-        """Atomically persist an interaction start and its exact source input.
-
-        ``defer_transcript`` is reserved for a new session whose bootstrap/system
-        prefix is not known until environment setup completes.  Stores must keep
-        that source input durable but invisible to transcript reads until
-        :meth:`replace_initial_transcript_messages` materializes the final ordered
-        transcript.  Non-deferred admissions append the source messages directly,
-        attributed to ``started_event.interaction_id``.
-        """
-
-    @abstractmethod
     async def claim_persisted_event_side_effect(
         self,
         *,
@@ -5153,6 +5252,10 @@ class InMemorySessionStore(SessionStore):
         # queries — including the per-step budget read path — stop scanning the global
         # event list. Keyed by session id and by ``str(event.type)`` respectively.
         self._session_event_records: dict[str, list[EventRecord]] = {}
+        self._interaction_event_records: dict[
+            str,
+            dict[str, list[EventRecord]],
+        ] = {}
         self._latest_interaction_event_records: dict[str, dict[str, EventRecord]] = {}
         self._latest_interaction_event_records_by_sequence: dict[
             str,
@@ -5191,6 +5294,7 @@ class InMemorySessionStore(SessionStore):
         self._next_event_sequence = 1
         self._transcripts: dict[str, list[Message]] = {}
         self._transcript_interaction_ids: dict[str, list[str | None]] = {}
+        self._transcript_indices_by_interaction: dict[str, dict[str | None, list[int]]] = {}
         self._deferred_interaction_inputs: dict[str, tuple[str, list[Message]]] = {}
         self._checkpoints: dict[str, dict[str, Any]] = {}
         self._session_operation_records: dict[str, dict[str, dict[str, Any]]] = {}
@@ -5377,6 +5481,37 @@ class InMemorySessionStore(SessionStore):
         prepared = self._prepare_checkpoint_store_unlocked(session_id, checkpoint)
         self._apply_checkpoint_store_unlocked(session_id, prepared)
 
+    def _extend_transcript_attribution_unlocked(
+        self,
+        session_id: str,
+        interaction_ids: list[str | None],
+    ) -> None:
+        """Append attribution and maintain a lazily built absolute-index projection."""
+
+        stored = self._transcript_interaction_ids[session_id]
+        start = len(stored)
+        stored.extend(interaction_ids)
+        projection = self._transcript_indices_by_interaction.get(session_id)
+        if projection is None:
+            return
+        for offset, interaction_id in enumerate(interaction_ids):
+            projection.setdefault(interaction_id, []).append(start + offset)
+
+    def _transcript_interaction_projection_unlocked(
+        self,
+        session_id: str,
+    ) -> dict[str | None, list[int]]:
+        projection = self._transcript_indices_by_interaction.get(session_id)
+        if projection is not None:
+            return projection
+        projection = {}
+        for index, interaction_id in enumerate(
+            self._transcript_interaction_ids.get(session_id, ())
+        ):
+            projection.setdefault(interaction_id, []).append(index)
+        self._transcript_indices_by_interaction[session_id] = projection
+        return projection
+
     async def create(
         self,
         request: RunRequest,
@@ -5431,6 +5566,7 @@ class InMemorySessionStore(SessionStore):
             self._events[session.id] = []
             self._event_ids[session.id] = set()
             self._session_event_records[session.id] = []
+            self._interaction_event_records[session.id] = {}
             self._latest_interaction_event_records[session.id] = {}
             self._latest_interaction_event_records_by_sequence[session.id] = []
             self._pending_action_event_records[session.id] = {}
@@ -5449,6 +5585,10 @@ class InMemorySessionStore(SessionStore):
                 self._deferred_interaction_inputs[session.id] = (
                     interaction_id,
                     source_messages,
+                )
+                self._store_checkpoint_unlocked(
+                    session.id,
+                    _initial_transcript_pending_checkpoint(interaction_id),
                 )
                 session = self._sessions[session.id]
                 _activate_session_run_fence(session)
@@ -5577,6 +5717,7 @@ class InMemorySessionStore(SessionStore):
             self._events[fork.id] = []
             self._event_ids[fork.id] = set()
             self._session_event_records[fork.id] = []
+            self._interaction_event_records[fork.id] = {}
             self._latest_interaction_event_records[fork.id] = {}
             self._latest_interaction_event_records_by_sequence[fork.id] = []
             self._pending_action_event_records[fork.id] = {}
@@ -5752,6 +5893,7 @@ class InMemorySessionStore(SessionStore):
                 if key[0] != session_id
             }
             self._session_event_records.pop(session_id, None)
+            self._interaction_event_records.pop(session_id, None)
             self._latest_interaction_event_records.pop(session_id, None)
             self._latest_interaction_event_records_by_sequence.pop(session_id, None)
             self._pending_action_event_records.pop(session_id, None)
@@ -5759,6 +5901,7 @@ class InMemorySessionStore(SessionStore):
             self._pending_action_latest_barrier_records.pop(session_id, None)
             self._transcripts.pop(session_id, None)
             self._transcript_interaction_ids.pop(session_id, None)
+            self._transcript_indices_by_interaction.pop(session_id, None)
             self._deferred_interaction_inputs.pop(session_id, None)
             self._checkpoints.pop(session_id, None)
             self._session_operation_records.pop(session_id, None)
@@ -5923,15 +6066,35 @@ class InMemorySessionStore(SessionStore):
                     "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
                 }
             )
+            prepared_events: _PreparedInMemoryEventAppend | None = None
+            if admission is not None and admission[0] is not None:
+                prepared_events = self._prepare_event_append_unlocked(
+                    updated,
+                    [admission[0]],
+                )
+            prepared_checkpoint = (
+                None
+                if transformed_checkpoint is None
+                else self._prepare_checkpoint_store_unlocked(
+                    session_id,
+                    transformed_checkpoint,
+                    additional_event_records=(
+                        ()
+                        if prepared_events is None
+                        else tuple(event.record for event in prepared_events.events)
+                    ),
+                )
+            )
+
             self._sessions[session_id] = updated
-            if transformed_checkpoint is not None:
-                self._store_checkpoint_unlocked(session_id, transformed_checkpoint)
+            if prepared_checkpoint is not None:
+                self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
             if admission is not None:
-                started_event, interaction_id, source_messages, defer_source = admission
-                if started_event is not None:
-                    self._sessions[session_id] = self._append_events_unlocked(
+                _, interaction_id, source_messages, defer_source = admission
+                if prepared_events is not None:
+                    self._sessions[session_id] = self._apply_event_append_unlocked(
                         updated,
-                        [started_event],
+                        prepared_events,
                     )
                 if defer_source:
                     self._deferred_interaction_inputs[session_id] = (
@@ -5940,8 +6103,8 @@ class InMemorySessionStore(SessionStore):
                     )
                 else:
                     self._transcripts[session_id].extend(source_messages)
-                    self._transcript_interaction_ids[session_id].extend(
-                        [interaction_id] * len(source_messages)
+                    self._extend_transcript_attribution_unlocked(
+                        session_id, [interaction_id] * len(source_messages)
                     )
                 updated = self._sessions[session_id]
             result = updated.model_copy(deep=True)
@@ -6013,28 +6176,37 @@ class InMemorySessionStore(SessionStore):
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
         )
+        receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            operation_records = self._session_operation_records.setdefault(session_id, {})
+            receipt_record = operation_records.get(receipt_storage_key)
             existing = self._event_records_by_id.get((session_id, copied_event.id))
-            if existing is not None:
-                if existing.event != copied_event:
-                    raise ValueError(
-                        "Interaction transition event identity was reused with different data."
-                    )
-                status_changed = session.status is target_status
-                if not status_changed and not conditional:
+            if receipt_record is not None:
+                receipt = _reconstruct_interaction_transition_receipt(
+                    receipt_record,
+                    event=copied_event,
+                    from_statuses=allowed_statuses,
+                    to_status=target_status,
+                    only_if_no_queued_messages=conditional,
+                )
+                if existing is not None and existing.event != receipt.event:
                     raise RuntimeError(
-                        "Interaction transition event exists without its session status."
+                        "Interaction transition receipt conflicts with retained event history."
                     )
                 return InteractionTransitionResult(
-                    session=session,
-                    event=existing.event,
-                    status_changed=status_changed,
+                    session=receipt.session,
+                    event=receipt.event,
+                    status_changed=receipt.status_changed,
                     replayed=True,
                 )
-            _assert_session_run_epoch(session_id, session)
+            if existing is not None:
+                raise RuntimeError(
+                    "Interaction transition event exists without its immutable receipt."
+                )
             if session.status not in allowed_statuses:
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {target_status}"
@@ -6054,6 +6226,14 @@ class InMemorySessionStore(SessionStore):
                     }
                 )
             self._sessions[session_id] = updated
+            operation_records[receipt_storage_key] = _interaction_transition_receipt_record(
+                session=updated,
+                event=copied_event,
+                from_statuses=allowed_statuses,
+                to_status=target_status,
+                only_if_no_queued_messages=conditional,
+                status_changed=not queued,
+            )
             return InteractionTransitionResult(
                 session=updated,
                 event=copied_event,
@@ -6334,6 +6514,11 @@ class InMemorySessionStore(SessionStore):
             self._event_records_by_id[(session_id, stored_event.id)] = record
             session_records.append(record)
             interaction_id = stored_event.interaction_id
+            if interaction_id is not None:
+                self._interaction_event_records.setdefault(session_id, {}).setdefault(
+                    interaction_id,
+                    [],
+                ).append(record)
             if interaction_id is not None and event_type in lifecycle_types:
                 latest_by_id = self._latest_interaction_event_records.setdefault(session_id, {})
                 latest_by_sequence = self._latest_interaction_event_records_by_sequence.setdefault(
@@ -6478,45 +6663,6 @@ class InMemorySessionStore(SessionStore):
                     for key in expected
                     if key in self._mcp_manifest_baselines
                 },
-            )
-
-    async def admit_interaction(
-        self,
-        session_id: str,
-        *,
-        started_event: Event,
-        source_messages: list[Message],
-        defer_transcript: bool = False,
-    ) -> None:
-        copied_event, copied_messages = _copy_interaction_admission(
-            session_id,
-            started_event,
-            source_messages,
-            defer_transcript=defer_transcript,
-        )
-        interaction_id = copied_event.interaction_id
-        if interaction_id is None:  # validated by _copy_interaction_admission
-            raise AssertionError("Interaction admission lost its identity.")
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            _assert_session_run_epoch(session_id, session)
-            if session_id in self._deferred_interaction_inputs:
-                raise RuntimeError("Session already has deferred interaction input.")
-            updated = self._append_events_unlocked(session, [copied_event])
-            if defer_transcript:
-                self._deferred_interaction_inputs[session_id] = (
-                    interaction_id,
-                    copied_messages,
-                )
-            else:
-                self._transcripts[session_id].extend(copied_messages)
-                self._transcript_interaction_ids[session_id].extend(
-                    [interaction_id] * len(copied_messages)
-                )
-            self._sessions[session_id] = updated.model_copy(
-                update={"last_activity_at": datetime.now(UTC)}
             )
 
     async def claim_persisted_event_side_effect(
@@ -6848,11 +6994,14 @@ class InMemorySessionStore(SessionStore):
             interaction_id,
             interaction_started_event,
         )
-        if eligible_through is not None and eligible_through < 0:
-            raise ValueError("eligible_through must be greater than or equal to zero.")
+        eligible_through = _validate_message_delivery_eligible_through(eligible_through)
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
         async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
             existing_delivery = self._session_message_delivery_records.get(delivery_id)
             if existing_delivery is not None:
                 _validate_equivalent_message_delivery(
@@ -6868,10 +7017,6 @@ class InMemorySessionStore(SessionStore):
                     update={"replayed": True},
                     deep=True,
                 )
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            _assert_session_run_epoch(session_id, session)
             if session.status != SessionStatus.RUNNING:
                 raise SessionStatusConflict(
                     "Queued session messages may be delivered only while running."
@@ -6903,6 +7048,7 @@ class InMemorySessionStore(SessionStore):
             if not selected:
                 batch = SessionMessageDeliveryBatch(
                     delivery_id=delivery_id,
+                    interaction_id=interaction_id,
                     eligible_through=boundary,
                     has_more=False,
                 )
@@ -6971,8 +7117,9 @@ class InMemorySessionStore(SessionStore):
             ]
             updated_session = self._append_events_unlocked(session, persisted_events)
             self._transcripts.setdefault(session_id, []).extend(transcript_messages)
-            self._transcript_interaction_ids.setdefault(session_id, []).extend(
-                [interaction_id] * len(transcript_messages)
+            self._transcript_interaction_ids.setdefault(session_id, [])
+            self._extend_transcript_attribution_unlocked(
+                session_id, [interaction_id] * len(transcript_messages)
             )
             selected_queue = self._pending_session_messages[selected_key]
             for _ in selected:
@@ -7110,6 +7257,10 @@ class InMemorySessionStore(SessionStore):
         transcript_segment = transcript[
             receipt.transcript_start_cursor : receipt.transcript_end_cursor
         ]
+        transcript_interaction_ids = self._transcript_interaction_ids.get(
+            receipt.session_id,
+            [],
+        )[receipt.transcript_start_cursor : receipt.transcript_end_cursor]
         referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
         requested_event_ids = set((*receipt.appended_event_ids, *referenced_event_ids))
         events_by_id = {}
@@ -7120,6 +7271,7 @@ class InMemorySessionStore(SessionStore):
         _validate_runtime_publication_durable_material(
             receipt,
             transcript_messages=transcript_segment,
+            transcript_interaction_ids=transcript_interaction_ids,
             appended_events=(
                 events_by_id[event_id]
                 for event_id in receipt.appended_event_ids
@@ -7714,6 +7866,7 @@ class InMemorySessionStore(SessionStore):
         _validate_runtime_publication_event_references(
             request.referenced_events,
             durable_events_by_id,
+            interaction_id=request.interaction_id,
         )
         current_checkpoint = self._checkpoints.get(session_id)
         _validate_tool_round_checkpoint_mutation(request, current_checkpoint)
@@ -7800,8 +7953,8 @@ class InMemorySessionStore(SessionStore):
             }
         )
         self._transcripts[session_id].extend(request.transcript_messages)
-        self._transcript_interaction_ids[session_id].extend(
-            [request.interaction_id] * len(request.transcript_messages)
+        self._extend_transcript_attribution_unlocked(
+            session_id, [request.interaction_id] * len(request.transcript_messages)
         )
         if prepared_checkpoint is not None:
             self._apply_checkpoint_store_unlocked(session_id, prepared_checkpoint)
@@ -7995,11 +8148,24 @@ class InMemorySessionStore(SessionStore):
             record = self._event_records_by_id.get((query.session_id, query.event_id))
             return [] if record is None else [record]
         if query.session_id is not None:
+            if query.interaction_id is not None:
+                return self._interaction_event_records.get(query.session_id, {}).get(
+                    query.interaction_id,
+                    [],
+                )
             return self._session_event_records.get(query.session_id, [])
         if query.session_ids:
             merged: list[EventRecord] = []
             for session_id in query.session_ids:
-                merged.extend(self._session_event_records.get(session_id, []))
+                if query.interaction_id is None:
+                    merged.extend(self._session_event_records.get(session_id, []))
+                else:
+                    merged.extend(
+                        self._interaction_event_records.get(session_id, {}).get(
+                            query.interaction_id,
+                            [],
+                        )
+                    )
             merged.sort(key=lambda record: record.sequence)
             return merged
         if event_types:
@@ -8434,8 +8600,8 @@ class InMemorySessionStore(SessionStore):
             if not copied_messages:
                 return
             self._transcripts[session_id].extend(copied_messages)
-            self._transcript_interaction_ids[session_id].extend(
-                [interaction_id] * len(copied_messages)
+            self._extend_transcript_attribution_unlocked(
+                session_id, [interaction_id] * len(copied_messages)
             )
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
@@ -8451,6 +8617,8 @@ class InMemorySessionStore(SessionStore):
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         interaction_id = resolve_interaction_attribution(session_id, interaction_id)
+        if interaction_id is None:
+            raise ValueError("Initial transcript publication requires an interaction identity.")
         expected = _detach_transcript_messages(expected_messages)
         replacement = _detach_transcript_messages(replacement_messages)
         async with self._lock:
@@ -8468,11 +8636,20 @@ class InMemorySessionStore(SessionStore):
             ):
                 raise RuntimeError("Initial transcript must preserve the admitted source suffix.")
             prefix_count = len(replacement) - len(expected)
+            checkpoint = _checkpoint_after_initial_transcript_publication(
+                self._checkpoints.get(session_id),
+                interaction_id=interaction_id,
+            )
             self._transcripts[session_id] = replacement
             self._transcript_interaction_ids[session_id] = [None] * prefix_count + [
                 interaction_id
             ] * len(expected)
+            self._transcript_indices_by_interaction.pop(session_id, None)
             self._deferred_interaction_inputs.pop(session_id, None)
+            if checkpoint is None:
+                self._checkpoints.pop(session_id, None)
+            else:
+                self._store_checkpoint_unlocked(session_id, checkpoint)
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
             )
@@ -8497,7 +8674,10 @@ class InMemorySessionStore(SessionStore):
             if deferred_interaction_id != interaction_id:
                 raise RuntimeError("Deferred interaction input belongs to another interaction.")
             self._transcripts[session_id].extend(messages)
-            self._transcript_interaction_ids[session_id].extend([interaction_id] * len(messages))
+            self._extend_transcript_attribution_unlocked(
+                session_id,
+                [interaction_id] * len(messages),
+            )
             self._deferred_interaction_inputs.pop(session_id, None)
             self._sessions[session_id] = session.model_copy(
                 update={"last_activity_at": datetime.now(UTC)}
@@ -8549,8 +8729,8 @@ class InMemorySessionStore(SessionStore):
             copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
             if copied_messages:
                 self._transcripts[session_id].extend(copied_messages)
-                self._transcript_interaction_ids[session_id].extend(
-                    [interaction_id] * len(copied_messages)
+                self._extend_transcript_attribution_unlocked(
+                    session_id, [interaction_id] * len(copied_messages)
                 )
             self._store_checkpoint_unlocked(session_id, copied_checkpoint)
             self._sessions[session_id] = session.model_copy(
@@ -8570,38 +8750,37 @@ class InMemorySessionStore(SessionStore):
             if query.session_id not in self._sessions:
                 raise KeyError(f"Session not found: {query.session_id}")
 
+            messages = self._transcripts.get(query.session_id, [])
             interaction_ids = self._transcript_interaction_ids.get(query.session_id, [])
-            indexed_messages = [
-                (index, message, interaction_ids[index])
-                for index, message in enumerate(self._transcripts.get(query.session_id, []))
-            ]
+            if query.interaction_id is None:
+                candidate_indices: Sequence[int] = range(len(messages))
+            else:
+                candidate_indices = self._transcript_interaction_projection_unlocked(
+                    query.session_id
+                ).get(query.interaction_id, ())
             if query.role is not None:
-                indexed_messages = [
-                    (index, message, interaction_id)
-                    for index, message, interaction_id in indexed_messages
-                    if message.role == query.role
+                candidate_indices = [
+                    index for index in candidate_indices if messages[index].role == query.role
                 ]
-            if query.interaction_id is not None:
-                indexed_messages = [
-                    (index, message, interaction_id)
-                    for index, message, interaction_id in indexed_messages
-                    if interaction_id == query.interaction_id
-                ]
-
-            page = indexed_messages[query.offset : query.offset + query.limit]
+            total_records = len(candidate_indices)
+            page_indices = candidate_indices[query.offset : query.offset + query.limit]
             # Per filter_transcript_records' contract, the include_thinking=False
             # path already isolates — detach only pass-through records.
             records = [
                 TranscriptRecord(
                     index=index,
-                    interaction_id=interaction_id,
-                    message=detach_message(message) if query.include_thinking else message,
+                    interaction_id=interaction_ids[index],
+                    message=(
+                        detach_message(messages[index])
+                        if query.include_thinking
+                        else messages[index]
+                    ),
                 )
-                for index, message, interaction_id in page
+                for index in page_indices
             ]
             return TranscriptPage(
                 records=filter_transcript_records(records, include_thinking=query.include_thinking),
-                total_records=len(indexed_messages),
+                total_records=total_records,
             )
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
@@ -9160,9 +9339,78 @@ def _reject_reserved_runtime_publication_key(value: str, field_name: str) -> str
     value = require_clean_nonblank(value, field_name)
     if value.startswith(RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX):
         raise ValueError(f"{field_name} cannot use the reserved runtime publication namespace.")
+    if value.startswith(INTERACTION_TRANSITION_OPERATION_KEY_PREFIX):
+        raise ValueError(f"{field_name} cannot use the reserved interaction-transition namespace.")
     if value.startswith(MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX):
         raise ValueError(f"{field_name} cannot use the reserved model-completion stage namespace.")
     return value
+
+
+def _interaction_transition_storage_key(event_id: str) -> str:
+    event_id = require_clean_nonblank(event_id, "event.id")
+    return (
+        INTERACTION_TRANSITION_OPERATION_KEY_PREFIX + sha256(event_id.encode("utf-8")).hexdigest()
+    )
+
+
+def _interaction_transition_receipt_record(
+    *,
+    session: Session,
+    event: Event,
+    from_statuses: set[SessionStatus],
+    to_status: SessionStatus,
+    only_if_no_queued_messages: bool,
+    status_changed: bool,
+) -> dict[str, Any]:
+    ordered_from_statuses = tuple(sorted(from_statuses, key=str))
+    payload = {
+        "record_type": "cayu.interaction-transition",
+        "schema_version": 1,
+        "session": session.model_dump(mode="json"),
+        "event": event.model_dump(mode="json"),
+        "from_statuses": [str(status) for status in ordered_from_statuses],
+        "to_status": str(to_status),
+        "only_if_no_queued_messages": only_if_no_queued_messages,
+        "status_changed": status_changed,
+    }
+    receipt = _InteractionTransitionReceipt(
+        session=session,
+        event=event,
+        from_statuses=ordered_from_statuses,
+        to_status=to_status,
+        only_if_no_queued_messages=only_if_no_queued_messages,
+        status_changed=status_changed,
+        record_digest=_canonical_runtime_publication_digest(payload),
+    )
+    return receipt.model_dump(mode="json")
+
+
+def _reconstruct_interaction_transition_receipt(
+    record: object,
+    *,
+    event: Event,
+    from_statuses: set[SessionStatus],
+    to_status: SessionStatus,
+    only_if_no_queued_messages: bool,
+) -> _InteractionTransitionReceipt:
+    try:
+        receipt = _InteractionTransitionReceipt.model_validate(record)
+        digest_payload = receipt.model_dump(mode="json", exclude={"record_digest"})
+        if _canonical_runtime_publication_digest(digest_payload) != receipt.record_digest:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Stored interaction-transition receipt is invalid.") from exc
+    if (
+        receipt.event != event
+        or set(receipt.from_statuses) != from_statuses
+        or receipt.to_status is not to_status
+        or receipt.only_if_no_queued_messages is not only_if_no_queued_messages
+    ):
+        raise ValueError(
+            "Interaction transition event identity was reused with different data "
+            "for the transition."
+        )
+    return receipt
 
 
 def _validate_session_operation_record_keys(records: Mapping[str, Any]) -> None:
@@ -9339,6 +9587,8 @@ def _runtime_publication_referenced_event_ids(
 def _validate_runtime_publication_event_references(
     references: Iterable[RuntimePublicationEventReference],
     durable_events_by_id: Mapping[str, Event],
+    *,
+    interaction_id: str | None,
 ) -> None:
     for reference in references:
         durable_event = durable_events_by_id.get(reference.event_id)
@@ -9350,6 +9600,11 @@ def _validate_runtime_publication_event_references(
         if _runtime_publication_event_digest(durable_event) != reference.event_digest:
             raise ValueError(
                 "Runtime publication event reference does not match durable event content "
+                f"for the session: {reference.event_id}"
+            )
+        if durable_event.interaction_id != interaction_id:
+            raise ValueError(
+                "Runtime publication event reference belongs to a different interaction "
                 f"for the session: {reference.event_id}"
             )
 
@@ -11636,6 +11891,11 @@ def _prepare_runtime_publication(
     for event in copied_request.events:
         if event.session_id != session_id:
             raise ValueError("Runtime publication event session_id does not match target session.")
+        if event.interaction_id != copied_request.interaction_id:
+            raise ValueError(
+                "Runtime publication event interaction_id does not match its transcript "
+                "attribution."
+            )
 
     allowed_statuses = (
         None
@@ -11661,6 +11921,7 @@ def _prepare_runtime_publication(
             "session_id": session_id,
             "publication_id": copied_request.publication_id,
             "kind": copied_request.kind,
+            "interaction_id": copied_request.interaction_id,
             "intent": copied_request.intent,
             "mutation": copied_request.mutation.model_dump(mode="json"),
             "transcript_messages": list(transcript_payloads),
@@ -11708,6 +11969,7 @@ def _build_runtime_publication_receipt(
         "session_id": prepared.session_id,
         "publication_id": request.publication_id,
         "kind": request.kind,
+        "interaction_id": request.interaction_id,
         "intent": request.intent,
         "request_digest": prepared.request_digest,
         "checkpoint_digest": _canonical_runtime_publication_digest(checkpoint),
@@ -11771,6 +12033,8 @@ def _reconstruct_runtime_publication_receipt(
             raise TypeError
         if type(record["intent"]) is not dict:
             raise TypeError
+        if record["interaction_id"] is not None and type(record["interaction_id"]) is not str:
+            raise TypeError
         for field in (
             "source_run_epoch",
             "transcript_start_cursor",
@@ -11812,6 +12076,7 @@ def _validate_runtime_publication_replay_receipt(
     request = prepared.request
     if (
         receipt.kind != request.kind
+        or receipt.interaction_id != request.interaction_id
         or not _runtime_publication_json_equal(receipt.intent, request.intent)
         or receipt.transcript_digest != prepared.transcript_digest
         or receipt.events_digest != prepared.events_digest
@@ -11829,6 +12094,7 @@ def _validate_runtime_publication_durable_material(
     receipt: RuntimePublicationReceipt,
     *,
     transcript_messages: Iterable[Message],
+    transcript_interaction_ids: Iterable[str | None],
     appended_events: Iterable[Event],
     durable_referenced_events: Iterable[Event],
 ) -> None:
@@ -11842,6 +12108,7 @@ def _validate_runtime_publication_durable_material(
 
     try:
         transcript = tuple(detach_message(message) for message in transcript_messages)
+        interaction_ids = tuple(transcript_interaction_ids)
         events = tuple(copy_event(event) for event in appended_events)
         durable_references = tuple(copy_event(event) for event in durable_referenced_events)
     except (AttributeError, KeyError, TypeError, UnicodeError, ValueError) as exc:
@@ -11852,6 +12119,12 @@ def _validate_runtime_publication_durable_material(
     if len(transcript) != expected_transcript_count:
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication transcript segment is missing or truncated."
+        )
+    if len(interaction_ids) != expected_transcript_count or any(
+        interaction_id != receipt.interaction_id for interaction_id in interaction_ids
+    ):
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication transcript attribution conflicts with its receipt."
         )
     transcript_digest = _canonical_runtime_publication_digest(
         [message.model_dump(mode="json") for message in transcript]
@@ -11872,6 +12145,10 @@ def _validate_runtime_publication_durable_material(
         raise SessionRuntimePublicationConflict(
             "The durable runtime publication event batch conflicts with its receipt."
         )
+    if any(event.interaction_id != receipt.interaction_id for event in events):
+        raise SessionRuntimePublicationConflict(
+            "The durable runtime publication event attribution conflicts with its receipt."
+        )
 
     referenced_event_ids = _runtime_publication_referenced_event_ids(receipt.referenced_events)
     if tuple(event.id for event in durable_references) != referenced_event_ids:
@@ -11887,6 +12164,11 @@ def _validate_runtime_publication_durable_material(
             raise SessionRuntimePublicationConflict(
                 "The durable runtime publication referenced event content conflicts with "
                 "its receipt."
+            )
+        if durable_event.interaction_id != receipt.interaction_id:
+            raise SessionRuntimePublicationConflict(
+                "The durable runtime publication referenced event attribution conflicts "
+                "with its receipt."
             )
 
 
@@ -12152,6 +12434,16 @@ def _validate_equivalent_message_delivery(
         raise ValueError("delivery_id was already used for a different queue delivery.")
 
 
+def _validate_message_delivery_eligible_through(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or not 0 <= value <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError(
+            f"eligible_through must be an integer between 0 and {MAX_DURABLE_JSON_INTEGER}."
+        )
+    return value
+
+
 def _copy_queued_interaction_started_event(
     session_id: str,
     interaction_id: str | None,
@@ -12209,7 +12501,7 @@ def _prepare_interaction_transition(
         )
     if type(only_if_no_queued_messages) is not bool:
         raise TypeError("only_if_no_queued_messages must be a bool.")
-    if only_if_no_queued_messages and copied_event.type is not EventType.INTERACTION_COMPLETED:
+    if only_if_no_queued_messages and copied_event.type != EventType.INTERACTION_COMPLETED:
         raise ValueError("only_if_no_queued_messages is valid only for interaction.completed.")
     return (
         session_id,
@@ -12235,7 +12527,7 @@ def _copy_interaction_admission(
     copied_event = copy_event(started_event)
     if copied_event.session_id != session_id:
         raise ValueError("started_event belongs to a different session.")
-    if copied_event.type is not EventType.INTERACTION_STARTED:
+    if copied_event.type != EventType.INTERACTION_STARTED:
         raise ValueError("started_event must be interaction.started.")
     if copied_event.interaction_id is None:
         raise ValueError("started_event must have an interaction_id.")
@@ -12907,6 +13199,50 @@ def _sort_sessions(sessions: list[Session], order_by: SessionOrder) -> list[Sess
 # Sessions that must be interrupted before they can be deleted (in-flight work).
 DELETE_BLOCKED_SESSION_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
 _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY = "incomplete_session_recovery_claim"
+INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY = "initial_transcript_pending"
+
+
+def _initial_transcript_pending_checkpoint(interaction_id: str) -> dict[str, Any]:
+    """Create the authority marker held until initial transcript publication."""
+
+    return {
+        INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY: {
+            "version": 1,
+            "interaction_id": require_clean_nonblank(interaction_id, "interaction_id"),
+        }
+    }
+
+
+def _initial_transcript_pending_interaction_id(
+    checkpoint: dict[str, Any] | None,
+) -> str | None:
+    if checkpoint is None or INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY not in checkpoint:
+        return None
+    marker = checkpoint[INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY]
+    if type(marker) is not dict or marker.get("version") != 1:
+        raise ValueError("Initial transcript authority marker is invalid.")
+    interaction_id = marker.get("interaction_id")
+    if type(interaction_id) is not str:
+        raise ValueError("Initial transcript authority marker is invalid.")
+    return require_clean_nonblank(interaction_id, "interaction_id")
+
+
+def _checkpoint_after_initial_transcript_publication(
+    checkpoint: dict[str, Any] | None,
+    *,
+    interaction_id: str,
+) -> dict[str, Any] | None:
+    pending_interaction_id = _initial_transcript_pending_interaction_id(checkpoint)
+    if pending_interaction_id is None:
+        # Deferred admission is also used after session creation, when there is
+        # no environment-derived bootstrap authority to protect.
+        return checkpoint
+    if pending_interaction_id != interaction_id:
+        raise RuntimeError("Initial transcript authority changed before finalization.")
+    assert checkpoint is not None
+    updated = copy_durable_json_object(checkpoint, "checkpoint")
+    updated.pop(INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY)
+    return updated or None
 
 
 def _incomplete_recovery_claim_from_checkpoint(

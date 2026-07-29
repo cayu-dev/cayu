@@ -1999,9 +1999,9 @@ def test_format_exception_records_type_and_traceback():
     assert "boom" in detached
 
 
-def test_run_case_records_exception_type_when_loading_session_fails():
+def test_run_case_records_exception_type_when_loading_session_fails(monkeypatch):
     # A failure loading session records surfaces the exception TYPE, not a bare message.
-    from cayu.evals.runner import _run_case_once
+    import cayu.evals.runner as eval_runner
 
     app = CayuApp(enable_logging=False)
     app.register_provider(
@@ -2015,17 +2015,17 @@ def test_run_case_records_exception_type_when_loading_session_fails():
     )
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    async def _boom(session_id):
+    async def _boom(*_args, **_kwargs):
         raise RuntimeError("store offline")
 
-    app.session_store.load = _boom  # type: ignore[assignment]
+    monkeypatch.setattr(eval_runner, "_load_session_records", _boom)
 
     case = EvalCase(
         id="load-fails",
         request=RunRequest(agent_name="assistant", messages=[Message.text("user", "hi")]),
         assertions=[SessionCompleted()],
     )
-    result = asyncio.run(_run_case_once(app, case, suite_id="s"))
+    result = asyncio.run(eval_runner._run_case_once(app, case, suite_id="s"))
     assert result.status == EvalStatus.ERROR
     assert result.error is not None
     assert "Failed to load eval session state" in result.error

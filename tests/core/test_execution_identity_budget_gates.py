@@ -514,6 +514,12 @@ def test_context_overflow_terminalizes_the_reserved_attempt_for_inspection() -> 
     assert _model_attempt_payload(reconciliations[0]) == _model_attempt_payload(model_errors[0])
     assert _model_attempt_payload(reservations[1]) == _model_attempt_payload(completions[0])
     assert _model_attempt_payload(reconciliations[1]) == _model_attempt_payload(completions[0])
+    interaction_ids = {
+        event.interaction_id
+        for event in [*reservations, *reconciliations, *model_errors, *completions]
+    }
+    assert None not in interaction_ids
+    assert len(interaction_ids) == 1
     assert inspection.budget.cost_state == "unpriced"
     assert inspection.budget.amount is None
     assert inspection.budget.currency is None

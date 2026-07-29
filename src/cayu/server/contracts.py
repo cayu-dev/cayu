@@ -61,7 +61,7 @@ from cayu.server.sse import (
 )
 
 SERVER_API_PREFIX = "/api"
-SERVER_CONTRACT_VERSION = "4"
+SERVER_CONTRACT_VERSION = "5"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:event_id"
 MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
@@ -603,9 +603,9 @@ class OptionalSurfaceCapability(ApiBaseModel):
 
 class ControlPlaneSurfaceCapabilities(ApiBaseModel):
     dashboard: OptionalSurfaceCapability
-    # Added within control-plane contract v4. Keep the field optional so a v4
-    # dashboard can fail closed against an earlier v4 server response instead
-    # of dereferencing a capability that did not exist yet.
+    # Added within control-plane contract v4. Keep the field optional so a
+    # dashboard can fail closed against an incomplete capability response
+    # instead of dereferencing a capability that did not exist yet.
     workflow: OptionalSurfaceCapability | None = None
     tasks: OptionalSurfaceCapability
     reviewed_knowledge: OptionalSurfaceCapability

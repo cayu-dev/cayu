@@ -1269,7 +1269,7 @@ def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
         event.interaction_id
         for events in event_batches
         for event in events
-        if event.type is not EventType.TURN_COMPLETED
+        if event.type not in sessions_module.UNASSOCIATED_RUNTIME_EVENT_TYPES
     }
     assert len(interaction_ids) == 1
     interaction_id = next(iter(interaction_ids))
@@ -1293,6 +1293,31 @@ def _tool_round_identity() -> ToolRoundIdentity:
         model_step_id=f"mstep_{'1' * 32}",
         model_attempt_id=f"matt_{'2' * 32}",
         tool_round_id=f"tround_{'3' * 32}",
+    )
+
+
+def _interaction_started_event(
+    session_id: str,
+    *,
+    interaction_id: str,
+    agent_name: str,
+) -> Event:
+    from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+
+    event_id = f"{session_id}:interaction-started"
+    started_at = datetime.now(UTC)
+    return Event(
+        id=event_id,
+        type=EventType.INTERACTION_STARTED,
+        session_id=session_id,
+        interaction_id=interaction_id,
+        timestamp=started_at,
+        agent_name=agent_name,
+        payload=InteractionSummaryEvidence(
+            status=InteractionStatus.ACTIVE,
+            start_event_id=event_id,
+            started_at=started_at,
+        ).model_dump(mode="json"),
     )
 
 
@@ -1529,6 +1554,9 @@ def test_cayu_app_turn_completed_on_resume_excludes_prior_turn_usage() -> None:
     assert resumed_turn.payload["token_usage"]["input_tokens"] == 12
     assert resumed_turn.payload["token_usage"]["output_tokens"] == 3
     assert resumed_turn.payload["token_usage"]["total_tokens"] == 15
+    assert len(first_turn.payload["interaction_ids"]) == 1
+    assert len(resumed_turn.payload["interaction_ids"]) == 1
+    assert first_turn.payload["interaction_ids"] != resumed_turn.payload["interaction_ids"]
 
 
 def test_context_pressure_estimate_reconciles_against_actual_input_usage() -> None:
@@ -22195,13 +22223,27 @@ async def _seed_crashed_spawn_parent(
     from cayu.runtime import _tool_round_recovery as tool_round_recovery
 
     identity = SessionIdentity(provider_name="fake", model="fake-model")
+    parent_interaction_id = "interaction-parent-crashed-spawn"
+    parent_messages = [Message.text("user", "spawn a reviewer")]
     await store.create(
         RunRequest(
             agent_name="parent",
             session_id="parent",
-            messages=[Message.text("user", "spawn a reviewer")],
+            messages=parent_messages,
         ),
         identity=identity,
+        interaction_started_event=_interaction_started_event(
+            "parent",
+            interaction_id=parent_interaction_id,
+            agent_name="parent",
+        ),
+        interaction_source_messages=parent_messages,
+    )
+    await store.replace_initial_transcript_messages(
+        "parent",
+        parent_messages,
+        parent_messages,
+        interaction_id=parent_interaction_id,
     )
     # Build the pending round first so the child can stamp the round-scoped idempotency_key.
     checkpoint, pending_round = tool_round_recovery.checkpoint_with_pending_tool_round(
@@ -22255,6 +22297,7 @@ async def _seed_crashed_spawn_parent(
             Event(
                 type=EventType.TOOL_CALL_STARTED,
                 session_id="parent",
+                interaction_id=parent_interaction_id,
                 agent_name="parent",
                 tool_name="subagent",
                 payload={
@@ -22272,7 +22315,6 @@ async def _seed_crashed_spawn_parent(
             )
         ],
     )
-    await store.update_status("parent", SessionStatus.RUNNING)
     return pending_round
 
 
@@ -22468,9 +22510,23 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
     app.register_provider(FakeProvider([]), default=True)
     app.register_agent(AgentSpec(name="parent", model="fake-model"))
     identity = SessionIdentity(provider_name="fake", model="fake-model")
+    interaction_id = "interaction-parent-interrupted-spawn"
+    parent_messages = [Message.text("user", "go")]
     await store.create(
-        RunRequest(agent_name="parent", session_id="parent", messages=[Message.text("user", "go")]),
+        RunRequest(agent_name="parent", session_id="parent", messages=parent_messages),
         identity=identity,
+        interaction_started_event=_interaction_started_event(
+            "parent",
+            interaction_id=interaction_id,
+            agent_name="parent",
+        ),
+        interaction_source_messages=parent_messages,
+    )
+    await store.replace_initial_transcript_messages(
+        "parent",
+        parent_messages,
+        parent_messages,
+        interaction_id=interaction_id,
     )
     round_identity = _tool_round_identity()
     tool_call = runtime_records.ToolCallRequest(
@@ -22489,7 +22545,6 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
         tool_round_identity=round_identity,
     )
     await store.checkpoint("parent", checkpoint)
-    await store.update_status("parent", SessionStatus.RUNNING)
     key = tool_execution.tool_idempotency_key(
         session_id="parent",
         tool_round_id=pending_round.tool_round_id,
@@ -22517,13 +22572,14 @@ async def _close_interrupted_spawn_and_collect_events(child_status):
     )
     await store.update_status("child", child_status)
     parent = await store.load("parent")
+    sessions_module._activate_session_interaction("parent", interaction_id)
     events = []
     async for event in app._recovery_coordinator.close_interrupted_tool_round(
         InterruptedToolRoundRequest(
             session=parent,
             registered_agent=app._get_registered_agent("parent"),
             registered_environment=None,
-            messages=[],
+            messages=list(parent_messages),
             tool_calls=[tool_call],
             tool_outcomes=[],
             tool_round_identity=round_identity,
@@ -25196,6 +25252,12 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
         now = datetime.now(UTC)
         stale_owner_ready = asyncio.Event()
         release_stale_owner = asyncio.Event()
+        interaction_id = next(
+            event.interaction_id
+            for event in await store.load_events(session_id)
+            if event.type == EventType.INTERACTION_STARTED
+        )
+        assert interaction_id is not None
 
         def install_expired_claim(
             _session: Session,
@@ -25237,6 +25299,7 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
                 Event(
                     type=EventType.TOOL_CALL_COMPLETED,
                     session_id=session_id,
+                    interaction_id=interaction_id,
                     agent_name="assistant",
                     tool_name="side_effect",
                     payload={
@@ -26757,7 +26820,16 @@ def test_cayu_app_batch_recovery_attributes_repairs_before_terminal_reconciliati
     assert results[0].actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
     recovery_events = [event for event in events if event.id != "interaction-batch-recovery-start"]
     assert recovery_events
-    assert all(event.interaction_id == interaction_id for event in recovery_events)
+    assert all(
+        event.interaction_id == interaction_id
+        for event in recovery_events
+        if event.type not in sessions_module.UNASSOCIATED_RUNTIME_EVENT_TYPES
+    )
+    assert all(
+        event.interaction_id is None
+        for event in recovery_events
+        if event.type in sessions_module.UNASSOCIATED_RUNTIME_EVENT_TYPES
+    )
     assert [event.type for event in events].count(EventType.INTERACTION_INTERRUPTED) == 1
 
 
@@ -28016,6 +28088,7 @@ def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
             Event(
                 type=EventType.TOOL_CALL_APPROVED,
                 session_id="sess_expiry_retry",
+                interaction_id=approval_event.interaction_id,
                 agent_name="assistant",
                 tool_name="side_effect",
                 payload={
@@ -44191,7 +44264,7 @@ def test_workspace_instruction_failure_terminalizes_admitted_interaction(tmp_pat
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
     async def run() -> list[Event]:
-        return [
+        events = [
             event
             async for event in app.run(
                 RunRequest(
@@ -44201,6 +44274,28 @@ def test_workspace_instruction_failure_terminalizes_admitted_interaction(tmp_pat
                 )
             )
         ]
+        with pytest.raises(
+            RuntimeError,
+            match="authoritative initial transcript.*resume fails closed",
+        ):
+            await collect_resume_events(
+                app,
+                ResumeRequest(
+                    session_id="sess_oversized_workspace_instructions",
+                    messages=[Message.text("user", "continue")],
+                ),
+            )
+        with pytest.raises(
+            RuntimeError,
+            match="authoritative initial transcript.*fork fails closed",
+        ):
+            await collect_fork_events(
+                app,
+                ForkSessionRequest(
+                    source_session_id="sess_oversized_workspace_instructions",
+                ),
+            )
+        return events
 
     events = asyncio.run(run())
 

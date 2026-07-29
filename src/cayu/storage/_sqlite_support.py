@@ -150,6 +150,7 @@ _BASELINE_DDL = """
         updated_at TEXT NOT NULL,
         last_activity_at TEXT NOT NULL,
         run_epoch INTEGER NOT NULL DEFAULT 0,
+        transcript_seq INTEGER NOT NULL DEFAULT 0,
         metadata_json TEXT NOT NULL
     );
 
@@ -260,6 +261,7 @@ _BASELINE_DDL = """
         session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         role TEXT NOT NULL,
         interaction_id TEXT,
+        session_order INTEGER,
         message_json TEXT NOT NULL
     );
 
@@ -921,8 +923,35 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_events(session_id, interaction_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_interaction_sequence
             ON cayu_transcript_messages(session_id, interaction_id, sequence);
-    """,
-    27: """
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cayu_transcript_session_order
+            ON cayu_transcript_messages(session_id, session_order);
+        CREATE INDEX IF NOT EXISTS idx_cayu_transcript_interaction_order
+            ON cayu_transcript_messages(session_id, interaction_id, session_order);
+
+        CREATE TRIGGER IF NOT EXISTS cayu_reject_explicit_transcript_order
+        BEFORE INSERT ON cayu_transcript_messages
+        FOR EACH ROW
+        WHEN NEW.session_order IS NOT NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'cayu_transcript_messages.session_order is runtime-owned');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_assign_transcript_order
+        AFTER INSERT ON cayu_transcript_messages
+        FOR EACH ROW
+        WHEN NEW.session_order IS NULL
+        BEGIN
+            UPDATE cayu_sessions
+            SET transcript_seq = transcript_seq + 1
+            WHERE id = NEW.session_id;
+            UPDATE cayu_transcript_messages
+            SET session_order = (
+                SELECT transcript_seq FROM cayu_sessions WHERE id = NEW.session_id
+            )
+            WHERE sequence = NEW.sequence;
+        END;
+
         CREATE TABLE IF NOT EXISTS cayu_interaction_latest_events (
             session_id TEXT NOT NULL,
             interaction_id TEXT NOT NULL,
@@ -934,20 +963,6 @@ _MIGRATION_STEPS: dict[int, str] = {
         );
         CREATE INDEX IF NOT EXISTS idx_cayu_interaction_latest_events_page
             ON cayu_interaction_latest_events(session_id, latest_event_sequence DESC);
-        INSERT INTO cayu_interaction_latest_events (
-            session_id, interaction_id, latest_event_sequence
-        )
-        SELECT session_id, interaction_id, MAX(sequence)
-        FROM cayu_events
-        WHERE interaction_id IS NOT NULL
-          AND event_type IN (
-              'interaction.started', 'interaction.resumed', 'interaction.paused',
-              'interaction.completed', 'interaction.failed', 'interaction.interrupted'
-          )
-        GROUP BY session_id, interaction_id
-        ON CONFLICT(session_id, interaction_id) DO UPDATE SET
-            latest_event_sequence = excluded.latest_event_sequence
-        WHERE excluded.latest_event_sequence > latest_event_sequence;
         CREATE TRIGGER IF NOT EXISTS cayu_track_interaction_latest_event
         AFTER INSERT ON cayu_events
         FOR EACH ROW
@@ -964,16 +979,14 @@ _MIGRATION_STEPS: dict[int, str] = {
                 latest_event_sequence = excluded.latest_event_sequence
             WHERE excluded.latest_event_sequence > latest_event_sequence;
         END;
-    """,
-    28: """
+
         CREATE TABLE IF NOT EXISTS cayu_deferred_interaction_inputs (
             session_id TEXT PRIMARY KEY
                 REFERENCES cayu_sessions(id) ON DELETE CASCADE,
             interaction_id TEXT NOT NULL,
             source_messages_json TEXT NOT NULL
         );
-    """,
-    29: """
+
         CREATE TABLE IF NOT EXISTS cayu_session_message_deliveries (
             delivery_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
@@ -1036,6 +1049,8 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
     26: (
         ("cayu_events", "interaction_id", "TEXT"),
         ("cayu_transcript_messages", "interaction_id", "TEXT"),
+        ("cayu_sessions", "transcript_seq", "INTEGER NOT NULL DEFAULT 0"),
+        ("cayu_transcript_messages", "session_order", "INTEGER"),
     ),
 }
 
@@ -1079,6 +1094,15 @@ def _migrate_legacy_budget_reservations(connection: sqlite3.Connection) -> None:
         """
     )
     connection.execute("DROP TABLE budget_reservations")
+
+
+def _reject_populated_pre_interaction_database(connection: sqlite3.Connection) -> None:
+    if connection.execute("SELECT EXISTS(SELECT 1 FROM cayu_sessions)").fetchone()[0]:
+        raise schema.SchemaTooOld(
+            "Storage revision 26 is a clean prerelease break and cannot migrate a "
+            "populated Cayu session database. Recreate the Cayu database before "
+            "starting this build."
+        )
 
 
 def _backfill_session_activity(connection: sqlite3.Connection) -> None:
@@ -1739,6 +1763,15 @@ def _apply_baseline(connection: sqlite3.Connection) -> None:
 
 def _apply_pending(connection: sqlite3.Connection, state: schema.SchemaState) -> None:
     current = state.revision
+    if (
+        current != schema.UNINITIALIZED
+        and current < 26
+        and any(revision.revision == 26 for revision in schema.pending(current))
+    ):
+        # Refuse the clean break before applying any earlier pending revision.
+        # A failed migration must not leave an old populated database advanced
+        # partway to revision 25.
+        _reject_populated_pre_interaction_database(connection)
     if current == schema.UNINITIALIZED:
         _apply_baseline(connection)
         current = schema.BASELINE_REVISION
