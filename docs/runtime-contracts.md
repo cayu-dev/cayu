@@ -684,7 +684,11 @@ Session stores expose two read surfaces:
 - `query_events(EventQuery(...))` returns `EventRecord` values with durable sequence numbers for filtered timeline/dashboard reads. `EventQuery` filters by a single `event_type` or by several at once via `event_types` (mutually exclusive).
 - `inspect_summary(session_id)` returns a content-free `SessionInspectionSummary`
   with identity, serialized transcript/event sizes, usage, pending/queued/operation
-  state, terminal failure state, and explicit budget availability. Its default
+  state, terminal failure state, and explicit budget availability. Budget
+  inspection separately counts reservations that are still pre-completion
+  pending, have durable model completion evidence but no published settlement,
+  are exactly reconciled, are conservatively reconciled after uncertain
+  dispatch, or are released before dispatch. Its default
   implementation composes public paginated store queries with a 100,000-record
   safety ceiling; custom stores may provide an equivalent native aggregate.
 
@@ -2099,11 +2103,15 @@ cache-write input; each category is then charged at its corresponding rate. Maxi
 output is charged at that tier's output rate but does not select the input-context tier.
 Accepted reservations
 emit `budget.reserved`; failed reservations emit `budget.reservation_failed`,
-then `budget.limit_reached`, and stop before the provider request. After
-`model.completed`, Cayu reconciles the reservation to actual normalized usage
-and emits `budget.reconciled`. A failure proven to occur before Cayu enters
-provider-controlled stream execution releases the reservation and emits
-`budget.reservation_released`. Once provider dispatch may have occurred, a
+then `budget.limit_reached`, and stop before the provider request. Immediately
+before Cayu enters provider-controlled code, it atomically marks every
+reservation with the attempt's stable dispatch identity. After
+`model.completed`, Cayu writes the exact proposed settlement for every
+reservation into that same durable completion publication, reconciles each
+original reservation to actual normalized usage, and emits
+`budget.reconciled`. A failure proven to occur before the dispatch fence commits
+releases the reservation and emits `budget.reservation_released`. Once the
+dispatch fence commits and provider dispatch may have occurred, a
 failure without usable completed usage instead reconciles the full reserved
 amount and emits `budget.reconciled` with the constrained reason
 `provider usage unknown after dispatch; charged reserved amount`. This budget
@@ -2115,11 +2123,12 @@ attempt must acquire its own atomic reservation before dispatch and reconciles
 that reservation to its exact durable completion cost or, when that attempt's
 usage is unknown, to the full reserved amount. A denied retry reservation stops
 before another provider call.
-With rolling or calendar budget windows, unresolved active reservations continue
-to consume capacity until they are reconciled or released; reconciled spend ages
+With rolling or calendar budget windows, unresolved dispatched reservations
+continue to consume capacity until they are reconciled; they do not become
+reusable merely because their lease timestamp ages out. Reconciled spend ages
 out by the reconciliation/model-completion timestamp.
 
-Built-in ledgers treat an active reservation as a renewable lease. The default
+Built-in ledgers treat a pre-dispatch active reservation as a renewable lease. The default
 lease duration is one hour, and Cayu heartbeats every one-third of that duration
 while the provider step is live, including silent streams and retries. A live
 reservation is counted even when its creation or latest heartbeat falls outside
@@ -2129,18 +2138,97 @@ is paused cannot later start an unprotected model call. If the runtime cannot
 renew a live lease, it fails the step closed and reconciles known actual usage,
 or the full reserved amount when the provider outcome is uncertain. Set
 `reservation_ttl_seconds=None` only when reservations should never expire
-automatically; a crashed worker can then hold capacity until an operator or
-recovery path releases it. All workers sharing a durable ledger must use the same
-TTL and reasonably synchronized clocks. Custom expiring `BudgetLedger`
+automatically. TTL cleanup only releases reservations whose dispatch fence was
+never committed. A dispatched reservation remains capacity-bearing until exact
+completion recovery or conservative post-dispatch settlement resolves it; this
+prevents completed but temporarily unsettled work from making its capacity
+available to another session. All workers sharing a durable ledger must use the
+same TTL and reasonably synchronized clocks. Custom expiring `BudgetLedger`
 implementations must advertise their TTL and implement `heartbeat`; the base
 custom-ledger contract is non-expiring.
 
-Terminal ledger operations are idempotent by reservation id and outcome. An
-identical reconciliation or release retry returns the first stored result without
+The complete dispatch-fence batch is retried with the same dispatch identity
+and timestamp when its acknowledgement is ambiguous. An exact replay permits
+the provider call to proceed once. If that replay cannot reconstruct the
+committed fence, Cayu retains the prepared model stage for explicit recovery
+instead of misclassifying it as safely undispatched and abandoning its only
+reservation provenance.
+
+Terminal ledger operations are idempotent by stable settlement identity and
+reservation outcome. Reconciliation or release atomically commits both the
+accounting transition and an immutable audit-event outbox record. Publishing
+that exact `budget.reconciled` or `budget.reservation_released` event is a
+separate idempotent step: acknowledgement loss verifies the preassigned event
+identity. Ledger-returned settlement records, pages, and acknowledgements are
+exact-type checked, defensively reconstructed, and revalidated against their
+accounting payload before any event append. Exact replay is also preflighted
+through the active workload-secret policy; publication never appends a redacted
+variant and only then discovers that it differs from the ledger record.
+Completion-time billing and pricing evidence is evaluated first and then
+normalized through that publication policy before it becomes immutable ledger
+or model-completion settlement authority. The ledger therefore commits the same
+redacted descriptive evidence that the exact audit event publishes, without
+changing the amount calculated from the original validated usage and price.
+Reservation admission follows the same split: the runtime calculates
+`requested_amount` from the transient original identity, while
+`billing_identity` is the normalized authority passed to and retained by the
+ledger and its terminal outbox. The original request identity never crosses
+the ledger boundary.
+Before accepting a reservation, the runtime also constructs and publication-
+preflights its complete conservative reconciliation, ordinary pre-dispatch
+release, and TTL-release authority. The resulting
+`BudgetSettlementFallback` is stored with the reservation by every ledger
+backend. If an immutable typed field required by those outcomes—such as the
+reserved decimal amount—collides with the workload-secret policy and cannot
+remain valid after redaction, admission fails before the ledger mutates or
+provider code runs. Descriptive reasons may instead be stored in their
+normalized, redacted form. Runtime-owned settlement instants use signed Unix
+microseconds in event payloads. This exact numeric representation preserves the
+accounting clock across completion and recovery without treating an ISO
+timestamp that happens to match a workload-secret value as provider text.
+
+When completed provider usage produces exact settlement evidence for one
+reservation whose typed accounting value cannot be published under the active
+secret policy, Cayu does not erase the completed usage or leave that dispatched
+reservation active. The same `model.completed` publication records its
+prevalidated conservative fallback at the completion accounting time, and the
+ledger charges its full reserved amount with
+`settlement_kind="conservative"`. Exact priced settlement remains the normal
+path for every unaffected reservation; this fallback is reserved for the
+individual evidence that cannot cross the durable publication boundary as
+valid accounting data.
+
+Pending settlement discovery is ledger-wide and uses the immutable
+`(settled_at, settlement_id)` keyset cursor. Model-boundary recovery first
+drains the current session strictly. Reservation attempts also scan bounded
+global pages after TTL cleanup may have released capacity owned by another
+session. A worker publishes only rows whose owning session is present in its
+session-store publication domain; foreign or unavailable rows remain pending
+and the cursor advances past them, so they neither become falsely acknowledged
+nor block unrelated admissions. The matching session-store worker publishes
+them on its next scan. Global scans retain a process-local continuation and
+visit at most 1,000 rows per admission, bounding work while eventually
+traversing larger outboxes. Session deletion is rejected while any accepted
+reservation lacks a fully delivered terminal settlement event, closing the
+delete-versus-outbox orphan window. A terminal session therefore does not need
+to run again for its release event to become durable. A crash
+after durable `model.completed` but
+before ledger reconciliation replays the completion's exact settlement evidence
+against the original reservation and never calls the provider again. A crash
+after the ledger commit but before session-event publication reconstructs the
+same event id, timestamp, amount, settlement kind, and status rather than
+creating a second audit event.
+
+An identical reconciliation or release retry returns the first stored result without
 changing its accounting timestamp. A retry that changes the terminal action,
 charged amount, or reason is rejected rather than rewriting financial history.
 Reservation ids are ledger-wide reconciliation keys, not session-local ids.
-Every accepted reservation must therefore return a previously unused id.
+The runtime allocates each id and rejects it against the workload-secret policy
+before calling `reserve()`, so a built-in ledger cannot commit an authority that
+its exact audit event is forbidden to publish. Direct ledger callers may omit
+the id and let the ledger allocate one. Every accepted reservation must return
+the requested, previously unused id and retain the exact supplied
+`settlement_fallback`.
 Before provider dispatch, the runtime claims each id in both the publication
 session store and the budget ledger's identity domain. Session stores enforce
 the same uniqueness when publishing `budget.reserved`;
@@ -2154,14 +2242,18 @@ if its permanent ownership registry is missing or malformed. A custom ledger
 that reuses an id fails closed even when the colliding reservations belong to
 different sessions or workers.
 
-Schema revision 23 is a breaking deployment boundary. Stop every revision-22
-and older session or budget worker, run `cayu storage migrate` against every
-SQLite or PostgreSQL session-store and budget-ledger database, and only then
-deploy revision-23 workers. Mixed-version rolling deployment is rejected because
-older workers do not claim the permanent cross-session reservation identity.
-App-only rollback is also unsupported after migration; restoring an older
-application requires restoring or exporting to a compatible pre-revision-23
-database state first.
+Schema revision 25 is a breaking deployment boundary. It adds the dispatch
+fence, prevalidated settlement fallback, and settlement outbox required by this
+protocol. Quiesce revision-24 and older workers, allow or explicitly settle
+every active budget reservation, then stop all old workers. Run
+`cayu storage migrate` against every SQLite or PostgreSQL session-store and
+budget-ledger database, and only then deploy revision-25 workers. The migration
+refuses active pre-25 reservations because their provider-dispatch state was
+not durably recorded and cannot be inferred safely.
+Mixed-version rolling deployment is rejected because older workers may release
+dispatched reservations or omit terminal outbox records. App-only rollback is
+also unsupported after migration; restoring an older application requires
+restoring or exporting to a compatible pre-revision-25 database state first.
 
 The built-in SQLite and PostgreSQL ledgers persist the same claim in the ledger
 database, so workers with distinct session stores still share one authoritative
@@ -2169,7 +2261,20 @@ identity registry. The in-memory ledger and the base custom-ledger implementatio
 enforce claims across all apps sharing that exact ledger instance. A custom
 ledger used by separate worker processes must override
 `claim_reservation_identity()` and implement the idempotent permanent claim in
-its shared backend.
+its shared backend. A custom ledger must durably retain the supplied
+`BudgetSettlementFallback` unchanged, including through dispatch transitions
+and restarts. It must also implement
+`mark_dispatched(...)` as one atomic batch transition and retain immutable
+`BudgetSettlementRecord` values for `load_settlement(...)`,
+`list_pending_settlements(...)`, and
+`mark_settlement_event_published(...)`. Per-reservation dispatch writes or
+reconstructed audit payloads do not satisfy the crash-safety contract. Runtime
+validation also requires the canonical settlement identity and the exact
+requested completed, conservative, or released classification; custom ledgers
+cannot substitute one terminal accounting meaning for another. Custom pending
+settlement queries must honor `BudgetSettlementCursor` as a strict,
+deterministically ordered keyset boundary and return no more than the requested
+page size.
 
 `InMemoryBudgetLedger` is the default and is only strict inside one process.
 Multi-worker apps that need hard shared caps should pass `SQLiteBudgetLedger`
