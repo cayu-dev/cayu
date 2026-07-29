@@ -4878,7 +4878,7 @@ class SessionEngine:
             )
         events = [
             event
-            async for event in self._stop_session_for_queued_input_step_limit(
+            async for event in self._stop_session_for_model_step_limit(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
@@ -7691,7 +7691,20 @@ class SessionEngine:
                     return
             else:
                 if not skip_model_steps:
-                    raise RuntimeError(f"Maximum model steps exceeded: {max_steps}")
+                    async for event in self._stop_session_for_model_step_limit(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        messages=messages,
+                        step=step,
+                        max_steps=max_steps,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                    ):
+                        yield event
+                    return
 
             if task_id is not None:
                 await self._session_control.raise_if_interrupted(session.id)
@@ -8457,7 +8470,7 @@ class SessionEngine:
         ):
             yield event
 
-    async def _stop_session_for_queued_input_step_limit(
+    async def _stop_session_for_model_step_limit(
         self,
         *,
         session: Session,
@@ -8480,8 +8493,8 @@ class SessionEngine:
             maximum=max_steps,
             actual=step,
             message=(
-                "Run limit reached: durable queued input arrived after the final "
-                f"model step ({step} >= {max_steps})."
+                "Run limit reached: the configured model-step allowance was "
+                f"exhausted ({step} >= {max_steps})."
             ),
         )
         async for event in self._stop_session_for_limit_reached(

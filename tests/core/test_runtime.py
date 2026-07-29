@@ -1270,6 +1270,29 @@ async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Ev
     return [event async for event in app.resume(request)]
 
 
+def assert_model_step_limit_interruption(
+    events: list[Event],
+    *,
+    maximum: int,
+    actual: int,
+    cumulative_model_steps: int,
+) -> None:
+    limit_event = events[-3]
+    interrupted_event = events[-1]
+
+    assert limit_event.type == EventType.SESSION_LIMIT_REACHED
+    assert limit_event.payload["reason"] == "limit_reached"
+    assert limit_event.payload["limit"] == "model_steps"
+    assert limit_event.payload["maximum"] == maximum
+    assert limit_event.payload["actual"] == actual
+    assert limit_event.payload["usage_summary"]["model_steps"] == cumulative_model_steps
+    assert interrupted_event.type == EventType.SESSION_INTERRUPTED
+    assert interrupted_event.payload["interruption_type"] == "limit_reached"
+    assert interrupted_event.payload["limit"] == "model_steps"
+    assert interrupted_event.payload["maximum"] == maximum
+    assert interrupted_event.payload["actual"] == actual
+
+
 def assert_only_model_step_publication_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> None:
@@ -44392,7 +44415,7 @@ def test_cayu_app_groups_multiple_tool_calls_and_results_in_history():
     assert [part.content for part in tool_result_message.content] == ["one", "TWO"]
 
 
-def test_cayu_app_fails_session_when_max_steps_exceeded():
+def test_cayu_app_interrupts_session_when_max_steps_exhausted_by_tool_work():
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
@@ -44432,12 +44455,19 @@ def test_cayu_app_fails_session_when_max_steps_exceeded():
         EventType.MODEL_COMPLETED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
         EventType.TURN_COMPLETED,
-        EventType.SESSION_FAILED,
+        EventType.SESSION_INTERRUPTED,
     ]
-    assert events[-1].payload["error"] == "Maximum model steps exceeded: 1"
+    assert_model_step_limit_interruption(
+        events,
+        maximum=1,
+        actual=1,
+        cumulative_model_steps=1,
+    )
+    assert events[-2].payload["status"] == "interrupted"
     assert session is not None
-    assert session.status == SessionStatus.FAILED
+    assert session.status == SessionStatus.INTERRUPTED
 
 
 def test_cayu_app_bounds_repeated_end_turn_false_by_max_steps():
@@ -44468,10 +44498,81 @@ def test_cayu_app_bounds_repeated_end_turn_false_by_max_steps():
     session = asyncio.run(store.load("sess_end_turn_false_max_steps"))
 
     assert len(provider.requests) == 1
-    assert events[-1].type == EventType.SESSION_FAILED
-    assert events[-1].payload["error"] == "Maximum model steps exceeded: 1"
+    assert [event.type for event in events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert_model_step_limit_interruption(
+        events,
+        maximum=1,
+        actual=1,
+        cumulative_model_steps=1,
+    )
+    assert events[-2].payload["status"] == "interrupted"
     assert session is not None
-    assert session.status == SessionStatus.FAILED
+    assert session.status == SessionStatus.INTERRUPTED
+
+
+def test_cayu_app_can_resume_after_max_steps_limit():
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="echo",
+                    arguments={"text": "again"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("Finished."),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    initial_events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_resume_max_steps",
+                messages=[Message.text("user", "loop")],
+                max_steps=1,
+            ),
+        )
+    )
+    assert initial_events[-1].type == EventType.SESSION_INTERRUPTED
+
+    resumed_events = asyncio.run(
+        collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_resume_max_steps",
+                messages=[Message.text("user", "continue")],
+                max_steps=1,
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 2
+    assert resumed_events[0].type == EventType.SESSION_RESUMED
+    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    session = asyncio.run(store.load("sess_resume_max_steps"))
+    assert session is not None
+    assert session.status == SessionStatus.COMPLETED
 
 
 def test_cayu_app_records_failed_session_for_invalid_tool_call_payload():
@@ -47014,12 +47115,10 @@ def test_cayu_app_rejects_unknown_environment_for_run():
 def test_cayu_app_includes_environment_on_failed_session_event():
     provider = FakeProvider(
         [
-            ModelStreamEvent.tool_call(
-                id="call_1",
-                name="echo",
-                arguments={"text": "hello"},
+            ModelStreamEvent(
+                type=ModelStreamEventType.TOOL_CALL,
+                payload={"name": "echo", "arguments": "not-an-object"},
             ),
-            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
     app = CayuApp()
@@ -47035,7 +47134,6 @@ def test_cayu_app_includes_environment_on_failed_session_event():
             app,
             RunRequest(
                 agent_name="assistant",
-                max_steps=1,
                 messages=[Message.text("user", "hi")],
             ),
         )
@@ -47043,7 +47141,7 @@ def test_cayu_app_includes_environment_on_failed_session_event():
 
     assert events[-1].type == EventType.SESSION_FAILED
     assert events[-1].environment_name == "local"
-    assert events[-1].payload["error_type"] == "RuntimeError"
+    assert events[-1].payload["error_type"] == "ValueError"
 
 
 def test_cayu_app_tags_all_runtime_events_with_environment():
