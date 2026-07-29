@@ -16,6 +16,7 @@ from cayu.egress._remote_adapter import (
 )
 from cayu.egress.adapter import (
     EgressBinding,
+    RunnerFinalizationResult,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
     _virtual_egress_execution_capability_evidence,
@@ -344,14 +345,22 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
             metadata["session_id"] = session_id
         return metadata
 
-    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
         if not isinstance(runner, LambdaMicroVMRunner):
             raise TypeError("Lambda MicroVM adapter received a different runner type.")
         if outcome == "interrupted":
             await runner.suspend()
+            await runner.wait_until_suspended()
         else:
             await runner.terminate()
+            await runner.wait_until_terminated()
         await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
 
 async def _install_ca(

@@ -10,6 +10,7 @@ from cayu.credentials import CredentialMode
 from cayu.egress.adapter import (
     EgressAdapterRegistry,
     EgressBinding,
+    RunnerFinalizationResult,
     SandboxEgressAdapter,
     UnsupportedEgressAdapter,
     VirtualEgressRunnerRequest,
@@ -79,6 +80,7 @@ __all__ = [
     "HttpEgressPolicy",
     "HttpxUpstream",
     "InvalidEgressReconnectMetadataError",
+    "RunnerFinalizationResult",
     "SandboxEgressAdapter",
     "TransparentEgressBroker",
     "UnsupportedEgressAdapter",

@@ -342,11 +342,35 @@ runner. That capability exposes only native filesystem operations and stable
 sandbox identity; it has no `close()` method and cannot bypass environment
 finalization. Runner-backed workspaces retain the managed runner privately and
 prove their binding by identity without publishing a runner accessor. Finalization
-revokes grants first, finalizes the workspace binding while enforcement is
-still present, then closes the provider runner, proxy/network, and session CA.
-Applications must finalize the environment binding (the normal `CayuApp`
-lifecycle) or close the managed runner; they must not retain or close a raw
-provider runner.
+first fences new managed command dispatch, revokes grants, and drains commands
+that were admitted before the fence. The exact binding owner then finalizes the
+workspace while its runner-backed target remains readable, after which Cayu
+closes the provider runner, proxy/network, and session CA. A failed sync retains
+that readable target, its baseline, and its exact owner so a retry can converge
+partial copies or deletions before teardown. A managed runner accepts only one
+active stateful workspace binding; a second or overlapping admission fails
+before the inner binding can mutate a target.
+For a copy binding that retains target ownership, adapter finalization must
+return positive evidence that provider-side workspace mutations are quiescent.
+A detached but still-running sandbox does not satisfy that contract; Cayu
+escalates it to a stop/removal before releasing the copy binding's exact owner.
+Managed commands already dispatched through the lifecycle runner are included
+because the authoritative sync waits for them to return and, when a provider
+reports deferred command cleanup, for the runner's positive settlement proof.
+Missing or uncertain proof retains the exact owner and requires explicit
+operator verification before execution is reopened. Cancellation during that
+drain is republished only after the admitted work settles. Control-plane
+commands used by synchronization bypass the workload fence but remain under
+the same settlement accounting. If command cleanup already terminated the
+sandbox and made the target unreadable, Cayu retires the unusable generation
+after provider quiescence while preserving the sync failure. Independently
+detached guest processes are outside dispatch accounting; applications must
+not start such processes when their later filesystem effects must be durable.
+Before workspace binding, applications may close the managed runner directly.
+Once a stateful copy binding is active, they must finalize the environment
+binding (the normal `CayuApp` lifecycle); direct runner close waits only for
+that binding-owned synchronization and cannot replace it. Applications must
+not retain or close a raw provider runner.
 
 ### Microsandbox
 
@@ -487,10 +511,13 @@ request through the new broker. A second concurrent owner receives
 `EgressReconnectConflictError` before a proxy is opened or the sandbox is
 mutated.
 
-An interrupted Microsandbox session detaches rather than removes its sandbox so
-the checkpoint can be resumed. Completed, failed, cancelled, or explicitly
-closed sessions remove it. Reconnected teardown keeps the normal ordering:
-revoke and drain grants, release the runner, then close the proxy boundary.
+An interrupted Microsandbox session without a copied workspace detaches rather
+than removes its sandbox. When a copied workspace requires a positive mutation
+boundary, Cayu stops the sandbox instead: the durable identity and attestation
+remain resumable, and reconnect restarts that same stopped incarnation.
+Completed, failed, cancelled, or explicitly closed sessions remove it.
+Reconnected teardown keeps the normal ordering: revoke and drain grants,
+release the runner, then close the proxy boundary.
 
 The envelope never contains real or virtual credential values, proxy bearer
 authority, or CA private material. The factory validates version, runner kind,

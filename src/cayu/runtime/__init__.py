@@ -7,6 +7,7 @@ from cayu.core.billing import (
     ResolvedBillingIdentity,
     UnresolvedBillingIdentity,
 )
+from cayu.runtime._environment_lifecycle import EnvironmentCapacityError
 from cayu.runtime._recovery_coordinator import (
     ModelCompletionManualRecoveryRequired,
 )
@@ -479,6 +480,7 @@ __all__ = [
     "Dispatcher",
     "EnqueueSessionMessageRequest",
     "EnqueueSessionMessageResult",
+    "EnvironmentCapacityError",
     "EnvironmentManifest",
     "EventOrder",
     "EventQuery",

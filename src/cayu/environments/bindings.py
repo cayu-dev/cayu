@@ -7,15 +7,16 @@ import inspect
 import io
 import shutil
 import tarfile
-import time
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+from cayu._task_wait import unexpected_child_cancellation_error
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces import (
@@ -69,16 +70,14 @@ class SyncBindingContext:
 
 @dataclass(frozen=True)
 class _SyncBindingState:
-    session_id: str
-    created_at: float
     source_paths: tuple[str, ...]
     target_baseline_paths: tuple[str, ...]
-    # Id of the fixed target workspace this bind reserved (None for factory targets), so the
-    # reservation that guards against concurrent binds is released when this state is dropped.
-    target_id: str | None = None
+    target_id: str
+    target_resource_key: tuple[object, ...]
+    phase: Literal["active", "finalizing"] = "active"
+    defer_finalize_release: bool = False
 
 
-DEFAULT_SYNC_STATE_TTL_S = 24 * 60 * 60.0
 DEFAULT_SYNC_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 DEFAULT_SYNC_MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 
@@ -104,6 +103,48 @@ SyncBackPolicy = Literal["always", "on_success", "never"]
 GIT_REPOSITORY_METADATA_KEY = "git_repository"
 
 SYNC_DISTINCT_WORKSPACES_ERROR = "SyncBinding source and target workspaces must be different."
+
+_MutationResultT = TypeVar("_MutationResultT")
+
+_SYNC_TARGET_OWNERS_LOCK = threading.Lock()
+_SYNC_TARGET_OWNERS: dict[tuple[object, ...], str] = {}
+
+
+def _reserve_sync_target(
+    target: Workspace,
+    *,
+    resource_key: tuple[object, ...],
+    generation: str,
+) -> None:
+    """Atomically reserve one process-local target resource for an exact generation."""
+
+    with _SYNC_TARGET_OWNERS_LOCK:
+        if resource_key in _SYNC_TARGET_OWNERS:
+            raise ValueError(
+                f"SyncBinding target workspace {target.id!r} is already bound by an active session."
+            )
+        _SYNC_TARGET_OWNERS[resource_key] = generation
+
+
+def _release_sync_target(
+    resource_key: tuple[object, ...],
+    *,
+    generation: str,
+) -> None:
+    """Release only the exact generation that currently owns a target."""
+
+    with _SYNC_TARGET_OWNERS_LOCK:
+        if _SYNC_TARGET_OWNERS.get(resource_key) == generation:
+            del _SYNC_TARGET_OWNERS[resource_key]
+
+
+def _sync_target_is_owned_by(
+    resource_key: tuple[object, ...],
+    *,
+    generation: str,
+) -> bool:
+    with _SYNC_TARGET_OWNERS_LOCK:
+        return _SYNC_TARGET_OWNERS.get(resource_key) == generation
 
 
 @dataclass(frozen=True)
@@ -223,6 +264,37 @@ class WorkspaceBinding(ABC):
         metadata: dict[str, Any] | None = None,
     ) -> WorkspaceSnapshot | None:
         """Clean up or persist the binding after the session ends."""
+
+    def abandon(self, bound: BoundWorkspace) -> bool:
+        """Release process-local retry state when finalization will not run again.
+
+        Most bindings do not retain retry state, so the compatibility default is
+        a validated no-op. Stateful bindings should override this method and
+        release only state owned by ``bound``. Return ``False`` only when the
+        binding must retain its lifecycle owner for a later cleanup attempt.
+        """
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("WorkspaceBinding abandon requires a BoundWorkspace.")
+        return True
+
+    def _defer_finalize_release(self, bound: BoundWorkspace) -> None:
+        """Keep retry ownership after successful finalization until abandonment.
+
+        Composite lifecycle owners use this before finalization when another
+        resource must become quiescent before the binding can be released.
+        Stateless bindings inherit the validated no-op.
+        """
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("WorkspaceBinding deferred release requires a BoundWorkspace.")
+
+    def _requires_mutation_quiescence(self, bound: BoundWorkspace) -> bool:
+        """Whether releasing ``bound`` requires positive external mutation quiescence."""
+
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("WorkspaceBinding quiescence query requires a BoundWorkspace.")
+        return False
 
 
 class NativeBinding(WorkspaceBinding):
@@ -544,11 +616,11 @@ class SyncBinding(WorkspaceBinding):
     or ``target_workspace_factory`` identifies the workspace visible to tools
     during the run, typically a sandbox filesystem wrapper. The target workspace
     should be dedicated to this binding because the default clean policy deletes
-    files in the target before copying source files in. A fixed ``target_workspace``
-    is therefore single-session: a concurrent ``bind`` against a target already held
-    by an active bind of this instance is rejected (use ``target_workspace_factory``
-    for concurrent sessions). The guard is per binding instance, so sharing one fixed
-    target across separate ``SyncBinding`` instances stays out of contract.
+    files in the target before copying source files in. Every resolved target,
+    whether fixed or factory-created, is process-locally single-owner by its
+    authoritative ``Workspace.resource_key``. Concurrent binds through the same
+    or different ``SyncBinding`` instances are rejected when they resolve to the
+    same resource.
 
     File copies use one bulk tar transfer per direction when either workspace
     implements the explicit ``BoundedTarReader`` or ``TarWriter`` capability
@@ -556,9 +628,11 @@ class SyncBinding(WorkspaceBinding):
     before destination writes. ``max_total_bytes`` bounds logical file bytes,
     while ``max_archive_bytes`` independently bounds raw tar bytes; pass
     ``None`` for a limit to opt out of that bound.
-    Per-bind state is keyed by session: rebinding a session replaces its leaked
-    state, ``abandon`` drops state for a bind whose finalize will never run, and
-    states older than ``state_ttl_s`` are pruned on the next bind.
+    Per-bind state is keyed by an opaque owner generation. A target remains
+    reserved until that exact generation finalizes successfully or is explicitly
+    abandoned; elapsed time is not evidence that a live binding released it.
+    Direct callers whose lifecycle will not invoke ``finalize`` must call
+    ``abandon`` with the matching bound workspace.
     """
 
     def __init__(
@@ -575,7 +649,6 @@ class SyncBinding(WorkspaceBinding):
         clean_target: SyncTargetCleanPolicy = "always",
         sync_back: SyncBackPolicy = "always",
         delete_missing: bool = True,
-        state_ttl_s: float | None = DEFAULT_SYNC_STATE_TTL_S,
     ) -> None:
         if target_workspace is not None and not isinstance(target_workspace, Workspace):
             raise TypeError("SyncBinding target_workspace must be a Workspace or None.")
@@ -606,12 +679,11 @@ class SyncBinding(WorkspaceBinding):
         if type(delete_missing) is not bool:
             raise TypeError("SyncBinding delete_missing must be a bool.")
         self.delete_missing = delete_missing
-        self.state_ttl_s = _validate_optional_positive_number(state_ttl_s, "state_ttl_s")
+        self._state_lock = threading.Lock()
         self._states: dict[str, _SyncBindingState] = {}
-        # Ids of fixed target workspaces with an active (un-finalized) bind. A fixed target is a
-        # single shared filesystem, so overlapping binds would clear/copy over each other; reject
-        # the second instead of corrupting silently. Factory targets are per-bind and never tracked.
-        self._active_fixed_target_ids: set[str] = set()
+        # Retained as a compatibility diagnostic for existing callers. The authoritative
+        # exclusion registry is process-wide and keyed by Workspace.resource_key.
+        self._fixed_target_owners: dict[str, str] = {}
 
     async def bind(
         self,
@@ -635,7 +707,6 @@ class SyncBinding(WorkspaceBinding):
             raise ValueError("SyncBinding requires a source workspace.")
         if "sync_binding" in request_metadata:
             raise ValueError("SyncBinding metadata key 'sync_binding' is reserved.")
-        self._prune_sync_states(session_id=session_id)
         context = SyncBindingContext(
             source_workspace=workspace,
             runner=runner,
@@ -645,13 +716,19 @@ class SyncBinding(WorkspaceBinding):
             metadata=request_metadata,
         )
         target = await self._target_workspace(context)
-        _reject_same_or_indeterminate_target(workspace, target)
-        # Reserve a fixed target before any mutating await so a concurrent bind against the same
-        # shared target is rejected rather than interleaving clear/copy over it. The check-and-add is
-        # synchronous, so two coroutines cannot both pass it. Released when this bind's state is
-        # dropped (finalize/abandon/prune), so sequential reuse and same-session rebind still work.
-        reserved_target_id = self._reserve_fixed_target(target)
+        target_resource_key = _reject_same_or_indeterminate_target(workspace, target)
+        state_key = uuid4().hex
+        # Reserve every resolved target before any mutating await. The module-level registry
+        # composes fixed targets, factory targets, and separate SyncBinding instances into one
+        # exact-generation exclusion decision.
+        _reserve_sync_target(
+            target,
+            resource_key=target_resource_key,
+            generation=state_key,
+        )
         try:
+            with self._state_lock:
+                self._fixed_target_owners[target.id] = state_key
             source_paths = await _list_workspace_paths(
                 workspace,
                 self.pattern,
@@ -711,22 +788,25 @@ class SyncBinding(WorkspaceBinding):
                         "copied_bytes": copied_bytes,
                     },
                 ),
-                state_key=uuid4().hex,
+                state_key=state_key,
             )
-            if bound.state_key is None:
-                raise RuntimeError("SyncBinding bound workspace missing state key.")
-            self._states[bound.state_key] = _SyncBindingState(
-                session_id=session_id,
-                created_at=time.monotonic(),
-                source_paths=source_paths,
-                target_baseline_paths=target_baseline_paths,
-                target_id=reserved_target_id,
+            self._record_sync_state(
+                state_key,
+                _SyncBindingState(
+                    source_paths=source_paths,
+                    target_baseline_paths=target_baseline_paths,
+                    target_id=target.id,
+                    target_resource_key=target_resource_key,
+                ),
             )
             return bound
         except BaseException:
             # A failed bind must not leak its reservation (the state that would release it was never
             # stored). Success keeps the reservation until the bind's state is dropped.
-            self._release_fixed_target(reserved_target_id)
+            with self._state_lock:
+                if self._fixed_target_owners.get(target.id) == state_key:
+                    del self._fixed_target_owners[target.id]
+            _release_sync_target(target_resource_key, generation=state_key)
             raise
 
     async def finalize(
@@ -744,51 +824,72 @@ class SyncBinding(WorkspaceBinding):
         _reject_reserved_sync_finalize_metadata(finalize_metadata)
         _validate_sync_binding_metadata(bound)
         if not _should_sync_back(self.sync_back, outcome):
-            self._discard_sync_state(bound)
+            state_key, state = self._begin_sync_finalize(bound)
+            self._complete_sync_finalize(
+                state_key,
+                source_paths=state.source_paths,
+                target_baseline_paths=state.target_baseline_paths,
+            )
             return None
         if bound.source_workspace is None:
             raise ValueError("SyncBinding finalize requires a source workspace.")
         if bound.workspace is None:
             raise ValueError("SyncBinding finalize requires a bound workspace.")
-        state = self._get_sync_state(bound)
-        target_paths = await _list_workspace_paths(
-            bound.workspace,
-            self.pattern,
-            limit=self.max_files,
-            role="target",
+        source_workspace = bound.source_workspace
+        state_key, state = self._begin_sync_finalize(bound)
+        try:
+            target_paths = await _list_workspace_paths(
+                bound.workspace,
+                self.pattern,
+                limit=self.max_files,
+                role="target",
+            )
+            copy_back_paths = _sync_back_paths(
+                source_paths=state.source_paths,
+                target_baseline_paths=state.target_baseline_paths,
+                target_paths=target_paths,
+            )
+            copied_bytes = await _copy_paths(
+                source=bound.workspace,
+                target=source_workspace,
+                paths=copy_back_paths,
+                max_file_bytes=self.max_file_bytes,
+                max_total_bytes=self.max_total_bytes,
+                max_archive_bytes=self.max_archive_bytes,
+            )
+            deleted_paths: tuple[str, ...] = ()
+            if self.delete_missing:
+                deleted_paths = tuple(sorted(set(state.source_paths) - set(target_paths)))
+                for path in deleted_paths:
+                    await _await_sync_mutation(
+                        lambda path=path: source_workspace.delete(path),
+                        operation=f"SyncBinding source delete for {path!r}",
+                    )
+            synced_source_paths = tuple(
+                sorted((set(state.source_paths) - set(deleted_paths)).union(copy_back_paths))
+            )
+            final_snapshot = WorkspaceSnapshot(
+                snapshot_id=_final_sync_snapshot_id(bound, outcome),
+                workspace_id=bound.source_workspace.id,
+                source="sync",
+                metadata={
+                    **finalize_metadata,
+                    "target_workspace_id": bound.workspace.id,
+                    "outcome": outcome,
+                    "copied_files": len(copy_back_paths),
+                    "copied_bytes": copied_bytes,
+                    "deleted_files": len(deleted_paths),
+                },
+            )
+        except BaseException:
+            self._restore_sync_state(state_key)
+            raise
+        self._complete_sync_finalize(
+            state_key,
+            source_paths=synced_source_paths,
+            target_baseline_paths=target_paths,
         )
-        copy_back_paths = _sync_back_paths(
-            source_paths=state.source_paths,
-            target_baseline_paths=state.target_baseline_paths,
-            target_paths=target_paths,
-        )
-        copied_bytes = await _copy_paths(
-            source=bound.workspace,
-            target=bound.source_workspace,
-            paths=copy_back_paths,
-            max_file_bytes=self.max_file_bytes,
-            max_total_bytes=self.max_total_bytes,
-            max_archive_bytes=self.max_archive_bytes,
-        )
-        deleted_paths: tuple[str, ...] = ()
-        if self.delete_missing:
-            deleted_paths = tuple(sorted(set(state.source_paths) - set(target_paths)))
-            for path in deleted_paths:
-                await bound.source_workspace.delete(path)
-        self._discard_sync_state(bound)
-        return WorkspaceSnapshot(
-            snapshot_id=_final_sync_snapshot_id(bound, outcome),
-            workspace_id=bound.source_workspace.id,
-            source="sync",
-            metadata={
-                **finalize_metadata,
-                "target_workspace_id": bound.workspace.id,
-                "outcome": outcome,
-                "copied_files": len(copy_back_paths),
-                "copied_bytes": copied_bytes,
-                "deleted_files": len(deleted_paths),
-            },
-        )
+        return final_snapshot
 
     async def _target_workspace(
         self,
@@ -805,71 +906,121 @@ class SyncBinding(WorkspaceBinding):
             raise TypeError("SyncBinding target workspace factory must return a Workspace.")
         return result
 
-    def abandon(self, bound: BoundWorkspace) -> None:
+    def abandon(self, bound: BoundWorkspace) -> bool:
         """Drop in-process bind state for a bind whose finalize will never run.
 
         Lifecycle owners that skip ``finalize`` (crash recovery, cancelled
-        sessions) should call this so per-bind state does not leak until the
-        TTL prune catches it.
+        sessions) should call this so per-bind state and fixed-target ownership
+        do not leak.
         """
 
         if type(bound) is not BoundWorkspace:
             raise TypeError("SyncBinding abandon requires a BoundWorkspace.")
         self._discard_sync_state(bound)
+        return True
 
-    def _reserve_fixed_target(self, target: Workspace) -> str | None:
-        """Reserve a fixed target for the duration of a bind, or raise if one is already active.
+    def _defer_finalize_release(self, bound: BoundWorkspace) -> None:
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("SyncBinding deferred release requires a BoundWorkspace.")
+        state_key = bound.state_key
+        if state_key is None:
+            raise ValueError("SyncBinding deferred release requires in-process bind state.")
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None:
+                raise ValueError("SyncBinding deferred release requires in-process bind state.")
+            if state.phase != "active":
+                raise RuntimeError("SyncBinding release cannot be deferred during finalization.")
+            self._states[state_key] = replace(state, defer_finalize_release=True)
 
-        Returns the reserved id (to store on the bind state) or ``None`` for factory targets, which
-        are per-bind and cannot collide.
-        """
+    def _requires_mutation_quiescence(self, bound: BoundWorkspace) -> bool:
+        if type(bound) is not BoundWorkspace:
+            raise TypeError("SyncBinding quiescence query requires a BoundWorkspace.")
+        state_key = bound.state_key
+        if state_key is None:
+            return False
+        with self._state_lock:
+            return state_key in self._states
 
-        if self.target_workspace is None:
-            return None
-        target_id = target.id
-        if target_id in self._active_fixed_target_ids:
-            raise ValueError(
-                f"SyncBinding target_workspace {target_id!r} is already bound by an active "
-                "session; use target_workspace_factory for concurrent sessions."
-            )
-        self._active_fixed_target_ids.add(target_id)
-        return target_id
+    def _record_sync_state(self, state_key: str, state: _SyncBindingState) -> None:
+        with self._state_lock:
+            if state_key in self._states:
+                raise RuntimeError("SyncBinding generated a duplicate state key.")
+            if not _sync_target_is_owned_by(
+                state.target_resource_key,
+                generation=state_key,
+            ):
+                raise RuntimeError("SyncBinding lost fixed-target ownership during bind.")
+            self._states[state_key] = state
+            self._fixed_target_owners[state.target_id] = state_key
 
-    def _release_fixed_target(self, target_id: str | None) -> None:
-        if target_id is not None:
-            self._active_fixed_target_ids.discard(target_id)
-
-    def _remove_state(self, state_key: str) -> None:
-        """The single place that drops a `_states` entry: pop it and release the fixed-target
+    def _remove_state_locked(self, state_key: str) -> None:
+        """The single place that drops a `_states` entry: pop it and release the target
         reservation it held, so a reservation can never outlive its state."""
         state = self._states.pop(state_key, None)
         if state is not None:
-            self._release_fixed_target(state.target_id)
+            if self._fixed_target_owners.get(state.target_id) == state_key:
+                del self._fixed_target_owners[state.target_id]
+            _release_sync_target(state.target_resource_key, generation=state_key)
 
-    def _prune_sync_states(self, *, session_id: str) -> None:
-        now = time.monotonic()
-        stale_keys = [
-            key
-            for key, state in self._states.items()
-            if state.session_id == session_id
-            or (self.state_ttl_s is not None and now - state.created_at > self.state_ttl_s)
-        ]
-        for key in stale_keys:
-            self._remove_state(key)
-
-    def _get_sync_state(self, bound: BoundWorkspace) -> _SyncBindingState:
-        if bound.state_key is not None:
-            state = self._states.get(bound.state_key)
-            if state is not None:
-                return state
+    def _begin_sync_finalize(self, bound: BoundWorkspace) -> tuple[str, _SyncBindingState]:
+        state_key = bound.state_key
+        if state_key is not None:
+            with self._state_lock:
+                state = self._states.get(state_key)
+                if state is not None:
+                    if state.phase == "finalizing":
+                        raise RuntimeError("SyncBinding state is already being finalized.")
+                    finalizing = replace(state, phase="finalizing")
+                    self._states[state_key] = finalizing
+                    return state_key, finalizing
         raise ValueError(
             "SyncBinding finalize requires in-process bind state. "
             "Use a custom WorkspaceBinding when sync finalization must survive process restart."
         )
 
+    def _restore_sync_state(self, state_key: str) -> None:
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is not None and state.phase == "finalizing":
+                self._states[state_key] = replace(state, phase="active")
+
+    def _complete_sync_finalize(
+        self,
+        state_key: str,
+        *,
+        source_paths: tuple[str, ...],
+        target_baseline_paths: tuple[str, ...],
+    ) -> None:
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None or state.phase != "finalizing":
+                raise RuntimeError("SyncBinding finalization lost its ownership state.")
+            if state.defer_finalize_release:
+                # A composite binding keeps ownership until its remaining
+                # cleanup succeeds. Advance both path baselines only after this
+                # pass completed so a retry can reverse files created or
+                # deleted before the next readable snapshot.
+                self._states[state_key] = replace(
+                    state,
+                    source_paths=source_paths,
+                    target_baseline_paths=target_baseline_paths,
+                    phase="active",
+                )
+            else:
+                self._remove_state_locked(state_key)
+
     def _discard_sync_state(self, bound: BoundWorkspace) -> None:
-        if bound.state_key is not None:
-            self._remove_state(bound.state_key)
+        state_key = bound.state_key
+        if state_key is None:
+            return
+        with self._state_lock:
+            state = self._states.get(state_key)
+            if state is None:
+                return
+            if state.phase == "finalizing":
+                raise RuntimeError("SyncBinding state cannot be abandoned during finalization.")
+            self._remove_state_locked(state_key)
 
 
 def copy_bound_workspace(bound: BoundWorkspace) -> BoundWorkspace:
@@ -946,7 +1097,10 @@ def _validate_finalize_request(
     return copy_json_value(metadata, "metadata")
 
 
-def _reject_same_or_indeterminate_target(source: Workspace, target: Workspace) -> None:
+def _reject_same_or_indeterminate_target(
+    source: Workspace,
+    target: Workspace,
+) -> tuple[object, ...]:
     """Refuse a SyncBinding whose target is, or might be, the same resource as the source.
 
     Fails closed: when either workspace cannot report a stable ``resource_key`` the identity is
@@ -954,16 +1108,29 @@ def _reject_same_or_indeterminate_target(source: Workspace, target: Workspace) -
     """
     if source is target or source.id == target.id:
         raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
-    source_key, target_key = source.resource_key, target.resource_key
-    if source_key is None or target_key is None:
-        unknown = type(source if source_key is None else target).__name__
-        raise ValueError(
-            "SyncBinding cannot confirm the source and target are different workspaces: "
-            f"{unknown} does not define resource_key. Override Workspace.resource_key on {unknown} "
-            "to return a stable identity token, or use target_workspace_factory for per-bind targets."
-        )
+    source_key = _validated_workspace_resource_key(source)
+    target_key = _validated_workspace_resource_key(target)
     if source_key == target_key:
         raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
+    return target_key
+
+
+def _validated_workspace_resource_key(workspace: Workspace) -> tuple[object, ...]:
+    resource_key = workspace.resource_key
+    if resource_key is None:
+        workspace_type = type(workspace).__name__
+        raise ValueError(
+            "SyncBinding cannot confirm the source and target are different workspaces: "
+            f"{workspace_type} does not define resource_key. Override Workspace.resource_key on "
+            f"{workspace_type} to return a stable identity token."
+        )
+    if type(resource_key) is not tuple or not resource_key:
+        raise TypeError("Workspace resource_key must be a non-empty tuple or None.")
+    try:
+        hash(resource_key)
+    except TypeError as exc:
+        raise TypeError("Workspace resource_key must be hashable.") from exc
+    return resource_key
 
 
 def _validate_positive_int(value: int, field_name: str, *, owner: str = "SyncBinding") -> int:
@@ -978,16 +1145,6 @@ def _validate_optional_positive_int(value: int | None, field_name: str) -> int |
     if value is None:
         return None
     return _validate_positive_int(value, field_name)
-
-
-def _validate_optional_positive_number(value: float | None, field_name: str) -> float | None:
-    if value is None:
-        return None
-    if type(value) not in {int, float}:
-        raise TypeError(f"SyncBinding {field_name} must be a number or None.")
-    if value <= 0:
-        raise ValueError(f"SyncBinding {field_name} must be greater than zero.")
-    return float(value)
 
 
 def _validate_optional_timeout(value: int | None, field_name: str) -> int | None:
@@ -1031,7 +1188,10 @@ async def _list_workspace_paths(
 async def _clear_workspace(workspace: Workspace, *, max_files: int) -> tuple[str, ...]:
     paths = await _list_workspace_paths(workspace, "**/*", limit=max_files, role="target")
     for path in paths:
-        await workspace.delete(path)
+        await _await_sync_mutation(
+            lambda path=path: workspace.delete(path),
+            operation=f"SyncBinding target delete for {path!r}",
+        )
     return paths
 
 
@@ -1090,7 +1250,10 @@ async def _copy_paths(
         max_archive_bytes=max_archive_bytes,
     )
     if target_supports_bulk:
-        await target.write_tar_bytes(tar_data)
+        await _await_sync_mutation(
+            lambda: target.write_tar_bytes(tar_data),
+            operation="SyncBinding target tar write",
+        )
     else:
         await _extract_tar_to_workspace(target, tar_data)
     return copied_bytes
@@ -1113,7 +1276,10 @@ async def _copy_paths_per_file(
             max_total_bytes=max_total_bytes,
             copied_bytes=copied_bytes,
         )
-        await target.write_bytes(path, content)
+        await _await_sync_mutation(
+            lambda path=path, content=content: target.write_bytes(path, content),
+            operation=f"SyncBinding target write for {path!r}",
+        )
         copied_bytes += len(content)
     return copied_bytes
 
@@ -1162,7 +1328,88 @@ async def _extract_tar_to_workspace(target: Workspace, tar_data: bytes) -> None:
             extracted = archive.extractfile(member)
             if extracted is None:
                 raise RuntimeError(f"SyncBinding tar member could not be read: {member.name}")
-            await target.write_bytes(member.name, extracted.read())
+            content = extracted.read()
+            await _await_sync_mutation(
+                lambda name=member.name, content=content: target.write_bytes(name, content),
+                operation=f"SyncBinding target write for {member.name!r}",
+            )
+
+
+async def _await_sync_mutation(
+    operation_factory: Callable[[], Awaitable[_MutationResultT]],
+    *,
+    operation: str,
+) -> _MutationResultT:
+    """Keep a dispatched workspace mutation fenced until it is quiescent.
+
+    Workspace implementations can delegate filesystem or SDK work to a thread.
+    Cancelling the await does not prove that work stopped. Run each mutation in
+    a shielded child task and defer propagation of caller cancellation or fatal
+    signals until the child has a terminal outcome, so SyncBinding cannot
+    release or restore ownership while an old mutation can still affect a new
+    owner.
+    """
+
+    # Deliver a cancellation already pending at entry before dispatching work.
+    # A historical, already-handled cancellation request does not raise here.
+    await asyncio.sleep(0)
+    current_task = asyncio.current_task()
+    observed_cancellation_requests = 0 if current_task is None else current_task.cancelling()
+
+    async def run_operation() -> _MutationResultT:
+        return await operation_factory()
+
+    mutation_task = asyncio.create_task(run_operation())
+    caller_signal: BaseException | None = None
+
+    while not mutation_task.done():
+        try:
+            await asyncio.shield(mutation_task)
+        except asyncio.CancelledError as cancellation:
+            cancellation_requests = 0 if current_task is None else current_task.cancelling()
+            if cancellation_requests > observed_cancellation_requests:
+                observed_cancellation_requests = cancellation_requests
+                if caller_signal is None:
+                    caller_signal = cancellation
+                else:
+                    caller_signal.add_note(
+                        f"Additional caller cancellation arrived while draining {operation}."
+                    )
+                continue
+            if mutation_task.done():
+                break
+            raise
+        except BaseException as signal:
+            if mutation_task.done():
+                break
+            if caller_signal is None:
+                caller_signal = signal
+            else:
+                caller_signal = BaseExceptionGroup(
+                    f"{operation} received multiple caller control signals.",
+                    [caller_signal, signal],
+                )
+
+    try:
+        result = mutation_task.result()
+    except asyncio.CancelledError as child_cancellation:
+        mutation_error: BaseException = unexpected_child_cancellation_error(
+            child_cancellation,
+            operation=operation,
+        )
+    except BaseException as child_error:
+        mutation_error = child_error
+    else:
+        if caller_signal is not None:
+            raise caller_signal
+        return result
+
+    if caller_signal is not None:
+        raise BaseExceptionGroup(
+            f"{operation} failed after a caller control signal.",
+            [caller_signal, mutation_error],
+        ) from mutation_error
+    raise mutation_error
 
 
 def _validate_sync_tar(

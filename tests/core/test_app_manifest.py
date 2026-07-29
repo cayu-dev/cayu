@@ -151,7 +151,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "5"
+    assert manifest.schema_version == "6"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -160,6 +160,21 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     assert manifest.model_dump(mode="json") == reversed_manifest.model_dump(mode="json")
     assert manifest.fingerprint == reversed_manifest.fingerprint
     assert len(manifest.fingerprint) == 64
+
+
+def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:
+    first = CayuApp(
+        enable_logging=False,
+        max_environment_lifecycle_owners=1,
+    ).describe()
+    second = CayuApp(
+        enable_logging=False,
+        max_environment_lifecycle_owners=2,
+    ).describe()
+
+    assert first.runtime.max_environment_lifecycle_owners == 1
+    assert second.runtime.max_environment_lifecycle_owners == 2
+    assert first.fingerprint != second.fingerprint
 
 
 def test_agent_authoring_state_is_typed_copied_and_fingerprinted() -> None:
@@ -348,7 +363,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "5"
+    assert schema["properties"]["schema_version"]["const"] == "6"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -457,7 +472,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "5",
+                "schema_version": "6",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {
@@ -524,6 +539,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
                     "max_file_attachments_per_request": 1,
                     "tool_timeout_seconds": None,
                     "max_parallel_tool_calls": 1,
+                    "max_environment_lifecycle_owners": 256,
                 },
                 "capabilities": [],
             }

@@ -5836,6 +5836,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
     server = FastAPI()
     cayu_app = CayuApp()
     drain_timeouts = []
+    environment_drain_timeouts = []
     resume_calls = []
 
     async def resume_pending_interruption_cascades(*, interrupting_inactive_before):
@@ -5846,7 +5847,12 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         drain_timeouts.append(timeout_s)
         return True
 
+    async def drain_environment_cleanups(*, timeout_s):
+        environment_drain_timeouts.append(timeout_s)
+        return True
+
     cayu_app.drain_background_interruptions = drain_background_interruptions
+    cayu_app.drain_environment_cleanups = drain_environment_cleanups
     cayu_app.resume_pending_interruption_cascades = resume_pending_interruption_cascades
     mount_cayu(
         server,
@@ -5861,6 +5867,7 @@ def test_mount_cayu_composes_background_interruption_drain() -> None:
         pass
 
     assert drain_timeouts == [2.5]
+    assert environment_drain_timeouts == [2.5]
     assert len(resume_calls) == 1
     assert resume_calls[0] < datetime.now(UTC)
 

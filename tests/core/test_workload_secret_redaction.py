@@ -621,6 +621,249 @@ def test_os_timeout_after_real_cancellation_does_not_retain_secret_slots() -> No
     _assert_cayu_traceback_does_not_retain_text(failure, secret)
 
 
+def test_environment_operation_preserves_factory_cleanup_owner_after_cancellation() -> None:
+    from cayu.environments.factory import (
+        attach_environment_factory_cleanup_settlement_task,
+        environment_factory_cleanup_settlement_task,
+    )
+    from cayu.runtime._environment_operation_boundary import (
+        await_environment_operation as _await_environment_operation,
+    )
+
+    started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+
+    async def extension_operation() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+
+            async def settle() -> None:
+                await allow_cleanup.wait()
+
+            settlement_task = asyncio.create_task(settle())
+            error = RuntimeError("factory cleanup is still running")
+            attach_environment_factory_cleanup_settlement_task(
+                error,
+                settlement_task,
+            )
+            raise error from None
+
+    async def scenario() -> tuple[BaseExceptionGroup, asyncio.Task[None]]:
+        task = asyncio.create_task(
+            _await_environment_operation(
+                extension_operation,
+                operation_name="Environment factory creation",
+                redactor=SecretRedactor(),
+            )
+        )
+        await started.wait()
+        task.cancel("caller stopped waiting")
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await task
+        settlement_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert not settlement_task.done()
+        allow_cleanup.set()
+        await settlement_task
+        return exc_info.value, settlement_task
+
+    failure, settlement_task = asyncio.run(scenario())
+
+    assert isinstance(failure.exceptions[0], RuntimeError)
+    assert isinstance(failure.exceptions[1], asyncio.CancelledError)
+    assert settlement_task.done()
+    assert not settlement_task.cancelled()
+
+
+def test_environment_operation_combines_group_leaf_cleanup_owners() -> None:
+    from cayu.environments.factory import (
+        attach_environment_factory_cleanup_settlement_task,
+        environment_factory_cleanup_settlement_task,
+    )
+    from cayu.runtime._environment_operation_boundary import (
+        await_environment_operation as _await_environment_operation,
+    )
+
+    started = asyncio.Event()
+    allow_first_cleanup = asyncio.Event()
+    allow_second_cleanup = asyncio.Event()
+    first_cleanup_finished = asyncio.Event()
+    second_cleanup_finished = asyncio.Event()
+
+    async def extension_operation() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+
+            async def settle_first() -> None:
+                await allow_first_cleanup.wait()
+                first_cleanup_finished.set()
+
+            async def settle_second() -> None:
+                await allow_second_cleanup.wait()
+                second_cleanup_finished.set()
+
+            first_error = RuntimeError("first factory cleanup is still running")
+            attach_environment_factory_cleanup_settlement_task(
+                first_error,
+                asyncio.create_task(settle_first()),
+            )
+            second_error = RuntimeError("second factory cleanup is still running")
+            attach_environment_factory_cleanup_settlement_task(
+                second_error,
+                asyncio.create_task(settle_second()),
+            )
+            raise BaseExceptionGroup(
+                "factory cleanup leaves",
+                [
+                    first_error,
+                    BaseExceptionGroup(
+                        "nested factory cleanup leaf",
+                        [second_error, cancellation],
+                    ),
+                ],
+            ) from None
+
+    async def scenario() -> BaseExceptionGroup:
+        task = asyncio.create_task(
+            _await_environment_operation(
+                extension_operation,
+                operation_name="Environment factory creation",
+                redactor=SecretRedactor(),
+            )
+        )
+        await started.wait()
+        task.cancel("caller stopped grouped factory creation")
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await task
+        assert task.cancelling() == 1
+        assert not task.cancelled()
+        settlement_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert not settlement_task.done()
+
+        allow_first_cleanup.set()
+        await first_cleanup_finished.wait()
+        await asyncio.sleep(0)
+        assert not settlement_task.done()
+
+        allow_second_cleanup.set()
+        await settlement_task
+        assert second_cleanup_finished.is_set()
+        return exc_info.value
+
+    failure = asyncio.run(scenario())
+    assert environment_factory_cleanup_settlement_task(failure) is not None
+
+
+def test_environment_operation_preserves_grouped_cleanup_retry_owners() -> None:
+    from cayu.environments import factory as factory_module
+    from cayu.environments.factory import (
+        attach_environment_factory_cleanup_settlement_task,
+        environment_factory_cleanup_settlement_task,
+        register_environment_factory_cleanup_retry,
+        retry_environment_factory_cleanup_settlement_task,
+    )
+    from cayu.runtime._environment_operation_boundary import (
+        await_environment_operation as _await_environment_operation,
+    )
+
+    secret = "grouped-cleanup-retry-secret-canary"
+    allow_cleanup = False
+    cleanup_calls = [0, 0]
+    cleanup_tasks: list[asyncio.Task[None]] = []
+
+    def cleanup_attempt(index: int) -> asyncio.Task[None]:
+        async def cleanup() -> None:
+            cleanup_calls[index] += 1
+            if not allow_cleanup:
+                raise PermissionError(f"{secret}: cleanup {index} denied")
+
+        task = asyncio.create_task(cleanup())
+        cleanup_tasks.append(task)
+        return task
+
+    async def extension_operation() -> None:
+        failures: list[BaseException] = []
+        for index in range(2):
+            task = cleanup_attempt(index)
+            register_environment_factory_cleanup_retry(
+                task,
+                lambda index=index: cleanup_attempt(index),
+            )
+            error = RuntimeError(f"{secret}: cleanup {index} retained")
+            attach_environment_factory_cleanup_settlement_task(error, task)
+            failures.append(error)
+        raise BaseExceptionGroup(
+            f"{secret}: grouped cleanup failure",
+            [*failures, asyncio.CancelledError("extension child cancelled")],
+        )
+
+    async def scenario() -> None:
+        nonlocal allow_cleanup
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await _await_environment_operation(
+                extension_operation,
+                operation_name="Environment factory creation",
+                redactor=SecretRedactor([secret]),
+            )
+        assert secret not in repr(exc_info.value)
+        settlement_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        with pytest.raises(BaseExceptionGroup):
+            await settlement_task
+
+        allow_cleanup = True
+        retry_task = retry_environment_factory_cleanup_settlement_task(settlement_task)
+        assert retry_task is not settlement_task
+        await retry_task
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+    assert cleanup_calls == [2, 2]
+    assert all(
+        task not in factory_module._ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK
+        for task in cleanup_tasks
+    )
+
+
+def test_factory_cleanup_settlement_handoff_ignores_exception_descriptors_and_forgery() -> None:
+    from cayu.environments.factory import (
+        attach_environment_factory_cleanup_settlement_task,
+        environment_factory_cleanup_settlement_task,
+    )
+
+    attribute_name = "_cayu_environment_factory_cleanup_settlement_task"
+
+    class DescriptorControlledError(RuntimeError):
+        descriptor_reads = 0
+
+        @property
+        def _cayu_environment_factory_cleanup_settlement_task(self) -> object:
+            type(self).descriptor_reads += 1
+            raise RuntimeError("workload-secret-from-factory-descriptor")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(asyncio.sleep(0))
+        unattached = DescriptorControlledError("unattached provider failure")
+        assert environment_factory_cleanup_settlement_task(unattached) is None
+
+        forged = DescriptorControlledError("forged provider failure")
+        forged.__dict__[attribute_name] = task
+        assert environment_factory_cleanup_settlement_task(forged) is None
+
+        attached = DescriptorControlledError("attached provider failure")
+        attach_environment_factory_cleanup_settlement_task(attached, task)
+        assert environment_factory_cleanup_settlement_task(attached) is task
+        await task
+
+    asyncio.run(scenario())
+    assert DescriptorControlledError.descriptor_reads == 0
+
+
 def test_suppressed_cancellation_result_is_not_retained_by_safe_cancellation() -> None:
     from cayu.runtime._environment_operation_boundary import (
         await_environment_operation as _await_environment_operation,

@@ -6,8 +6,9 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from cayu.environments import (
 )
 from cayu.environments.bindings import (
     _list_workspace_paths,
+    _release_sync_target,
     _reset_workspace_after_failed_clone,
     _validate_sync_tar,
 )
@@ -103,6 +105,71 @@ class StubRunner(Runner):
         output_limit_bytes: int | None = None,
     ) -> ExecResult:
         return ExecResult(stdout="ok")
+
+
+class BlockingListWorkspace(LocalWorkspace):
+    """Local workspace with a deterministic list barrier for ownership-race tests."""
+
+    def __init__(self, root: Path, *, workspace_id: str) -> None:
+        super().__init__(root, workspace_id=workspace_id)
+        self.block_list = False
+        self.list_started = asyncio.Event()
+        self.release_list = asyncio.Event()
+
+    async def list(
+        self,
+        pattern: str = "**/*",
+        *,
+        limit: int | None = None,
+    ) -> WorkspaceListResult:
+        if self.block_list:
+            self.list_started.set()
+            await self.release_list.wait()
+        return await super().list(pattern, limit=limit)
+
+
+class BlockingMutationWorkspace(LocalWorkspace):
+    """Local workspace whose real worker-thread mutations can be paused."""
+
+    def __init__(self, root: Path, *, workspace_id: str) -> None:
+        super().__init__(root, workspace_id=workspace_id)
+        self.block_delete = False
+        self.block_write = False
+        self.delete_started = threading.Event()
+        self.write_started = threading.Event()
+        self.release_delete = threading.Event()
+        self.release_write = threading.Event()
+        self.write_error: BaseException | None = None
+
+    async def write_bytes(self, path: str, content: bytes) -> None:
+        if not self.block_write:
+            await super().write_bytes(path, content)
+            return
+        target = self.resolve_no_symlinks(path)
+
+        def write_after_release() -> None:
+            self.write_started.set()
+            self.release_write.wait()
+            if self.write_error is not None:
+                raise self.write_error
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+
+        await asyncio.to_thread(write_after_release)
+
+    async def delete(self, path: str) -> None:
+        if not self.block_delete:
+            await super().delete(path)
+            return
+        target = self.resolve_no_symlinks(path)
+
+        def delete_after_release() -> None:
+            self.delete_started.set()
+            self.release_delete.wait()
+            if target.exists():
+                target.unlink()
+
+        await asyncio.to_thread(delete_after_release)
 
 
 class TruncatedListWorkspace(StubWorkspace):
@@ -610,6 +677,8 @@ def test_bind_request_rejects_invalid_values() -> None:
 
 def test_binding_finalize_methods_are_noops() -> None:
     bound = BoundWorkspace()
+    NativeBinding().abandon(bound)
+    NoWorkspaceBinding().abandon(bound)
 
     async def run() -> tuple[WorkspaceSnapshot | None, WorkspaceSnapshot | None]:
         return (
@@ -622,6 +691,8 @@ def test_binding_finalize_methods_are_noops() -> None:
         )
 
     assert asyncio.run(run()) == (None, None)
+    with pytest.raises(TypeError, match="BoundWorkspace"):
+        NativeBinding().abandon(object())  # type: ignore[arg-type]
 
 
 def test_sync_binding_copies_source_to_target_and_syncs_back(tmp_path) -> None:
@@ -1034,17 +1105,115 @@ def test_sync_binding_rejects_concurrent_bind_on_fixed_target(tmp_path) -> None:
     target = LocalWorkspace(target_root, workspace_id="target")
     binding = SyncBinding(target_workspace=target)
 
-    async def run() -> None:
-        await binding.bind(source, None, session_id="sess_a")
+    async def run() -> BoundWorkspace:
+        bound = await binding.bind(source, None, session_id="sess_a")
         # sess_a still holds the shared fixed target; a concurrent second bind must be rejected
         # instead of interleaving clear/copy over it.
         with pytest.raises(ValueError, match="already bound by an active session"):
             await binding.bind(source, None, session_id="sess_b")
+        return bound
 
-    asyncio.run(run())
+    bound = asyncio.run(run())
     # The reservation was taken before any mutating await, so the rejected bind never touched the
     # target, and sess_a's reservation is still held.
-    assert binding._active_fixed_target_ids == {"target"}
+    assert binding._fixed_target_owners == {"target": bound.state_key}
+
+
+def test_sync_binding_reserves_fixed_target_before_mutating_await(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    (target_root / "operator.txt").write_text("untouched", encoding="utf-8")
+    source = BlockingListWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> BoundWorkspace:
+        source.block_list = True
+        first_task = asyncio.create_task(binding.bind(source, None, session_id="sess_first"))
+        await source.list_started.wait()
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_second")
+        assert (target_root / "operator.txt").read_text(encoding="utf-8") == "untouched"
+        source.release_list.set()
+        return await first_task
+
+    bound = asyncio.run(run())
+    assert binding._fixed_target_owners == {"target": bound.state_key}
+
+
+def test_sync_binding_cancellation_releases_only_inflight_owner(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    source = BlockingListWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> BoundWorkspace:
+        source.block_list = True
+        cancelled_task = asyncio.create_task(
+            binding.bind(source, None, session_id="sess_cancelled")
+        )
+        await source.list_started.wait()
+        cancelled_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_task
+        assert cancelled_task.cancelling() == 1
+        assert cancelled_task.cancelled()
+        assert binding._states == {}
+        assert binding._fixed_target_owners == {}
+
+        source.block_list = False
+        return await binding.bind(source, None, session_id="sess_retry")
+
+    rebound = asyncio.run(run())
+    assert binding._fixed_target_owners == {"target": rebound.state_key}
+
+
+def test_sync_binding_bind_cancellation_waits_for_dispatched_delete(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("source", encoding="utf-8")
+    (target_root / "stale.txt").write_text("stale", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = BlockingMutationWorkspace(target_root, workspace_id="target")
+    target.block_delete = True
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> BoundWorkspace:
+        cancelled_task = asyncio.create_task(
+            binding.bind(source, None, session_id="sess_cancelled")
+        )
+        assert await asyncio.to_thread(target.delete_started.wait, 5)
+        cancelled_task.cancel("stop old bind")
+        await asyncio.sleep(0)
+        assert not cancelled_task.done()
+        assert binding._fixed_target_owners
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_competing")
+
+        target.release_delete.set()
+        with pytest.raises(asyncio.CancelledError, match="stop old bind"):
+            await cancelled_task
+        assert cancelled_task.cancelling() == 1
+        assert cancelled_task.cancelled()
+        assert binding._states == {}
+        assert binding._fixed_target_owners == {}
+
+        target.block_delete = False
+        rebound = await binding.bind(source, None, session_id="sess_retry")
+        assert (target_root / "a.txt").read_text(encoding="utf-8") == "source"
+        return rebound
+
+    rebound = asyncio.run(run())
+    assert binding._fixed_target_owners == {"target": rebound.state_key}
 
 
 def test_sync_binding_allows_sequential_reuse_of_fixed_target(tmp_path) -> None:
@@ -1057,14 +1226,14 @@ def test_sync_binding_allows_sequential_reuse_of_fixed_target(tmp_path) -> None:
     target = LocalWorkspace(target_root, workspace_id="target")
     binding = SyncBinding(target_workspace=target)
 
-    async def run() -> None:
+    async def run() -> BoundWorkspace:
         bound = await binding.bind(source, None, session_id="sess_a")
         await binding.finalize(bound, outcome="completed")
         # finalize released the reservation, so a later session reuses the same target cleanly.
-        await binding.bind(source, None, session_id="sess_b")
+        return await binding.bind(source, None, session_id="sess_b")
 
-    asyncio.run(run())
-    assert binding._active_fixed_target_ids == {"target"}
+    rebound = asyncio.run(run())
+    assert binding._fixed_target_owners == {"target": rebound.state_key}
 
 
 def test_sync_binding_abandon_releases_fixed_target(tmp_path) -> None:
@@ -1077,18 +1246,17 @@ def test_sync_binding_abandon_releases_fixed_target(tmp_path) -> None:
     target = LocalWorkspace(target_root, workspace_id="target")
     binding = SyncBinding(target_workspace=target)
 
-    async def run() -> None:
+    async def run() -> BoundWorkspace:
         bound = await binding.bind(source, None, session_id="sess_a")
         binding.abandon(bound)
         # abandon released the reservation, so a re-bind of the same target succeeds.
-        await binding.bind(source, None, session_id="sess_b")
+        return await binding.bind(source, None, session_id="sess_b")
 
-    asyncio.run(run())
-    assert binding._active_fixed_target_ids == {"target"}
+    rebound = asyncio.run(run())
+    assert binding._fixed_target_owners == {"target": rebound.state_key}
 
 
-def test_sync_binding_factory_targets_are_not_reservation_gated(tmp_path) -> None:
-    # The concurrency guard applies only to a shared fixed target; factory targets are per-bind.
+def test_sync_binding_factory_allows_distinct_target_resources(tmp_path) -> None:
     source_root = tmp_path / "source"
     source_root.mkdir()
     (source_root / "a.txt").write_text("x", encoding="utf-8")
@@ -1105,12 +1273,106 @@ def test_sync_binding_factory_targets_are_not_reservation_gated(tmp_path) -> Non
     binding = SyncBinding(target_workspace_factory=factory)
 
     async def run() -> None:
-        await binding.bind(source, None, session_id="sess_a")
-        await binding.bind(source, None, session_id="sess_b")
+        first = await binding.bind(source, None, session_id="sess_a")
+        second = await binding.bind(source, None, session_id="sess_b")
+        binding.abandon(first)
+        binding.abandon(second)
 
     asyncio.run(run())
     assert len(made) == 2
-    assert binding._active_fixed_target_ids == set()
+    assert binding._fixed_target_owners == {}
+
+
+def test_sync_binding_factory_rejects_same_resolved_target(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+
+    async def factory(_context: SyncBindingContext) -> Workspace:
+        return target
+
+    binding = SyncBinding(target_workspace_factory=factory)
+
+    async def run() -> None:
+        owner = await binding.bind(source, None, session_id="sess_a")
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_b")
+        binding.abandon(owner)
+
+    asyncio.run(run())
+
+
+def test_sync_binding_concurrent_factory_same_target_has_one_winner(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    both_resolving = asyncio.Event()
+    release_factory = asyncio.Event()
+    factory_calls = 0
+
+    async def factory(_context: SyncBindingContext) -> Workspace:
+        nonlocal factory_calls
+        factory_calls += 1
+        if factory_calls == 2:
+            both_resolving.set()
+        await release_factory.wait()
+        return target
+
+    binding = SyncBinding(target_workspace_factory=factory)
+
+    async def run() -> None:
+        first_task = asyncio.create_task(binding.bind(source, None, session_id="sess_a"))
+        second_task = asyncio.create_task(binding.bind(source, None, session_id="sess_b"))
+        await both_resolving.wait()
+        release_factory.set()
+        results = await asyncio.gather(first_task, second_task, return_exceptions=True)
+        winners = [result for result in results if isinstance(result, BoundWorkspace)]
+        losers = [result for result in results if isinstance(result, ValueError)]
+        assert len(winners) == 1
+        assert len(losers) == 1
+        assert "already bound by an active session" in str(losers[0])
+        binding.abandon(winners[0])
+
+    asyncio.run(run())
+
+
+def test_sync_binding_separate_instances_share_target_registry(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("x", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    first_binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="first-view")
+    )
+    second_binding = SyncBinding(
+        target_workspace=LocalWorkspace(target_root, workspace_id="second-view")
+    )
+
+    async def run() -> None:
+        first = await first_binding.bind(source, None, session_id="sess_a")
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await second_binding.bind(source, None, session_id="sess_b")
+
+        first_binding.abandon(first)
+        second = await second_binding.bind(source, None, session_id="sess_b")
+
+        # Delayed cleanup from the old generation cannot release the newer owner.
+        first_binding.abandon(first)
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await first_binding.bind(source, None, session_id="sess_c")
+        second_binding.abandon(second)
+
+    asyncio.run(run())
 
 
 def test_sync_binding_releases_fixed_target_when_bind_fails(tmp_path) -> None:
@@ -1139,10 +1401,10 @@ def test_sync_binding_releases_fixed_target_when_bind_fails(tmp_path) -> None:
         with pytest.raises(RuntimeError, match="clear failed"):
             await binding.bind(source, None, session_id="sess_fail")
         # The failed bind released its reservation, so a retry can bind the same target.
-        assert binding._active_fixed_target_ids == set()
+        assert binding._fixed_target_owners == {}
         target.fail_clear = False
-        await binding.bind(source, None, session_id="sess_retry")
-        assert binding._active_fixed_target_ids == {"target"}
+        rebound = await binding.bind(source, None, session_id="sess_retry")
+        assert binding._fixed_target_owners == {"target": rebound.state_key}
 
     asyncio.run(run())
 
@@ -1172,6 +1434,8 @@ def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
         with pytest.raises(RuntimeError, match="delete failed"):
             await binding.finalize(bound, outcome="completed")
         assert len(binding._states) == 1
+        assert binding._states[bound.state_key].phase == "active"
+        assert binding._fixed_target_owners == {"target": bound.state_key}
         source.fail_delete = False
         await binding.finalize(bound, outcome="completed")
 
@@ -1179,6 +1443,223 @@ def test_sync_binding_keeps_state_when_finalize_fails(tmp_path) -> None:
 
     assert binding._states == {}
     assert not (source_root / "removed.txt").exists()
+
+
+def test_sync_binding_deferred_finalize_advances_path_baselines(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "recreated.txt").write_text("original", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target, delete_missing=True)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_deferred")
+        binding._defer_finalize_release(bound)
+
+        await target.delete("recreated.txt")
+        await target.write_bytes("transient.txt", b"first-pass")
+        await binding.finalize(bound, outcome="completed")
+
+        assert not (source_root / "recreated.txt").exists()
+        assert (source_root / "transient.txt").read_bytes() == b"first-pass"
+        state = binding._states[bound.state_key]
+        assert state.source_paths == ("transient.txt",)
+        assert state.target_baseline_paths == ("transient.txt",)
+
+        # The next pass must delete a path introduced by the first pass and
+        # recognize an original path recreated after its first-pass deletion.
+        await target.delete("transient.txt")
+        await target.write_bytes("recreated.txt", b"second-pass")
+        await binding.finalize(bound, outcome="completed")
+
+        assert not (source_root / "transient.txt").exists()
+        assert (source_root / "recreated.txt").read_bytes() == b"second-pass"
+        binding.abandon(bound)
+
+    asyncio.run(run())
+    assert binding._states == {}
+    assert binding._fixed_target_owners == {}
+
+
+def test_sync_binding_finalization_excludes_other_lifecycle_operations(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = BlockingListWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> BoundWorkspace:
+        bound = await binding.bind(source, None, session_id="sess_owner")
+        target.block_list = True
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="completed"))
+        await target.list_started.wait()
+        assert binding._states[bound.state_key].phase == "finalizing"
+
+        with pytest.raises(RuntimeError, match="already being finalized"):
+            await binding.finalize(bound, outcome="completed")
+        with pytest.raises(RuntimeError, match="cannot be abandoned"):
+            binding.abandon(bound)
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_waiting")
+
+        target.block_list = False
+        target.release_list.set()
+        await finalize_task
+        return await binding.bind(source, None, session_id="sess_waiting")
+
+    rebound = asyncio.run(run())
+    assert binding._fixed_target_owners == {"target": rebound.state_key}
+
+
+def test_sync_binding_finalization_cancellation_restores_owner_for_retry(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = BlockingListWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_owner")
+        target.block_list = True
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="completed"))
+        await target.list_started.wait()
+        finalize_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await finalize_task
+        assert finalize_task.cancelling() == 1
+        assert finalize_task.cancelled()
+        assert binding._states[bound.state_key].phase == "active"
+        assert binding._fixed_target_owners == {"target": bound.state_key}
+
+        target.block_list = False
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+    assert binding._states == {}
+    assert binding._fixed_target_owners == {}
+
+
+def test_sync_binding_finalize_cancellation_waits_for_dispatched_write(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = BlockingMutationWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_owner")
+        await target.write_bytes("a.txt", b"old-owner-write")
+        source.block_write = True
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="completed"))
+        assert await asyncio.to_thread(source.write_started.wait, 5)
+        finalize_task.cancel("stop old finalize")
+        await asyncio.sleep(0)
+        assert not finalize_task.done()
+        assert binding._states[bound.state_key].phase == "finalizing"
+        with pytest.raises(RuntimeError, match="already being finalized"):
+            await binding.finalize(bound, outcome="completed")
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_competing")
+
+        # A retry will observe this newer target state only after the old write
+        # is known to be quiescent and the cancellation restores active state.
+        await target.write_bytes("a.txt", b"retry-write")
+        source.release_write.set()
+        with pytest.raises(asyncio.CancelledError, match="stop old finalize"):
+            await finalize_task
+        assert finalize_task.cancelling() == 1
+        assert finalize_task.cancelled()
+        assert binding._states[bound.state_key].phase == "active"
+        assert binding._fixed_target_owners == {"target": bound.state_key}
+
+        source.block_write = False
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+    assert binding._states == {}
+    assert binding._fixed_target_owners == {}
+    assert (source_root / "a.txt").read_text(encoding="utf-8") == "retry-write"
+
+
+def test_sync_binding_preserves_cancellation_and_late_mutation_failure(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = BlockingMutationWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+    mutation_error = OSError("late write failed")
+
+    async def run() -> BaseExceptionGroup:
+        bound = await binding.bind(source, None, session_id="sess_owner")
+        await target.write_bytes("a.txt", b"changed")
+        source.block_write = True
+        source.write_error = mutation_error
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="completed"))
+        assert await asyncio.to_thread(source.write_started.wait, 5)
+        finalize_task.cancel("cancel while writing")
+        source.release_write.set()
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await finalize_task
+        assert binding._states[bound.state_key].phase == "active"
+        assert binding._fixed_target_owners == {"target": bound.state_key}
+        binding.abandon(bound)
+        return exc_info.value
+
+    failure = asyncio.run(run())
+    assert len(failure.exceptions) == 2
+    assert isinstance(failure.exceptions[0], asyncio.CancelledError)
+    assert str(failure.exceptions[0]) == "cancel while writing"
+    assert failure.exceptions[1] is mutation_error
+    assert binding._states == {}
+    assert binding._fixed_target_owners == {}
+
+
+def test_sync_binding_stale_cleanup_cannot_release_new_owner(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        first = await binding.bind(source, None, session_id="sess_first")
+        assert first.state_key is not None
+        binding.abandon(first)
+        second = await binding.bind(source, None, session_id="sess_second")
+
+        # Exercise both public stale-cleanup paths and the generation fence used by an internally
+        # delayed release. None may clear the second generation's ownership.
+        binding.abandon(first)
+        with pytest.raises(ValueError, match="in-process bind state"):
+            await binding.finalize(first, outcome="completed")
+        assert target.resource_key is not None
+        _release_sync_target(target.resource_key, generation=first.state_key)
+        assert binding._fixed_target_owners == {"target": second.state_key}
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_third")
+        binding.abandon(second)
+
+    asyncio.run(run())
+    assert binding._states == {}
+    assert binding._fixed_target_owners == {}
 
 
 def test_sync_binding_respects_sync_back_and_delete_options(tmp_path) -> None:
@@ -1681,9 +2162,9 @@ def test_sync_binding_abandon_releases_state_without_syncing(tmp_path) -> None:
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "before"
 
 
-def test_sync_binding_rebind_replaces_leaked_state_for_same_session(tmp_path) -> None:
-    # Concurrent sessions must use a factory (a shared fixed target rejects overlapping binds), so
-    # the leaked-state scenario is exercised through per-session factory targets.
+def test_sync_binding_factory_rebind_keeps_each_same_session_state(tmp_path) -> None:
+    # A factory returns a distinct target for each bind. Rebinding the same session must not silently
+    # invalidate the earlier target's exact-owner finalization state.
     source_root = tmp_path / "source"
     source_root.mkdir()
     (source_root / "a.txt").write_text("before", encoding="utf-8")
@@ -1701,20 +2182,21 @@ def test_sync_binding_rebind_replaces_leaked_state_for_same_session(tmp_path) ->
 
     async def run() -> None:
         first = await binding.bind(source, None, session_id="sess_leak")
-        await binding.bind(source, None, session_id="sess_other")
+        other = await binding.bind(source, None, session_id="sess_other")
         rebound = await binding.bind(source, None, session_id="sess_leak")
-        assert len(binding._states) == 2
-        assert first.state_key not in binding._states
+        assert len(binding._states) == 3
+        assert first.state_key in binding._states
+        assert other.state_key in binding._states
         assert rebound.state_key in binding._states
-        with pytest.raises(ValueError, match="in-process bind state"):
-            await binding.finalize(first, outcome="completed")
+        binding.abandon(first)
+        binding.abandon(other)
+        binding.abandon(rebound)
 
     asyncio.run(run())
+    assert binding._states == {}
 
 
-def test_sync_binding_same_session_rebind_reuses_fixed_target(tmp_path) -> None:
-    # A same-session rebind of a fixed target is not a concurrent bind: the prior state is pruned
-    # (releasing its reservation) before the new bind re-reserves the target.
+def test_sync_binding_same_session_rebind_cannot_displace_fixed_target(tmp_path) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
     source_root.mkdir()
@@ -1724,18 +2206,22 @@ def test_sync_binding_same_session_rebind_reuses_fixed_target(tmp_path) -> None:
     target = LocalWorkspace(target_root, workspace_id="target")
     binding = SyncBinding(target_workspace=target)
 
-    async def run() -> None:
+    async def run() -> BoundWorkspace:
         first = await binding.bind(source, None, session_id="sess_x")
-        rebound = await binding.bind(source, None, session_id="sess_x")
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_x")
         assert len(binding._states) == 1
-        assert first.state_key not in binding._states
-        assert rebound.state_key in binding._states
+        assert first.state_key in binding._states
+        return first
 
-    asyncio.run(run())
-    assert binding._active_fixed_target_ids == {"target"}
+    first = asyncio.run(run())
+    assert binding._fixed_target_owners == {"target": first.state_key}
 
 
-def test_sync_binding_prunes_expired_states_on_bind(tmp_path) -> None:
+def test_sync_binding_retains_fixed_target_beyond_historical_ttl_until_exact_owner_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
     source_root.mkdir()
@@ -1743,19 +2229,21 @@ def test_sync_binding_prunes_expired_states_on_bind(tmp_path) -> None:
     (source_root / "a.txt").write_text("before", encoding="utf-8")
     source = LocalWorkspace(source_root, workspace_id="source")
     target = LocalWorkspace(target_root, workspace_id="target")
-    binding = SyncBinding(target_workspace=target, state_ttl_s=60)
+    binding = SyncBinding(target_workspace=target)
+    now = time.monotonic()
+    monkeypatch.setattr(time, "monotonic", lambda: now)
 
     async def run() -> None:
-        stale = await binding.bind(source, None, session_id="sess_stale")
-        assert stale.state_key is not None
-        binding._states[stale.state_key] = replace(
-            binding._states[stale.state_key],
-            created_at=time.monotonic() - 120.0,
-        )
-        fresh = await binding.bind(source, None, session_id="sess_fresh")
-        assert fresh.state_key is not None
-        assert set(binding._states) == {fresh.state_key}
-        assert binding._states[fresh.state_key].session_id == "sess_fresh"
+        owner = await binding.bind(source, None, session_id="sess_owner")
+        # Advance beyond the removed 24-hour default without sleeping. Elapsed
+        # time is not positive proof that this still-live owner became stale.
+        nonlocal now
+        now += 48 * 60 * 60
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="sess_waiting")
+        binding.abandon(owner)
+        rebound = await binding.bind(source, None, session_id="sess_waiting")
+        assert binding._fixed_target_owners == {"target": rebound.state_key}
 
     asyncio.run(run())
 
@@ -1963,10 +2451,6 @@ def test_binding_constructors_validate_values() -> None:
         SyncBinding(sync_back=invalid_sync_back)
     with pytest.raises(TypeError, match="delete_missing"):
         SyncBinding(delete_missing=invalid_delete_missing)
-    with pytest.raises(ValueError, match="state_ttl_s"):
-        SyncBinding(state_ttl_s=0)
-    with pytest.raises(TypeError, match="state_ttl_s"):
-        SyncBinding(state_ttl_s=invalid_delete_missing)
 
 
 def test_copy_bound_workspace_defensively_copies_metadata_and_snapshot() -> None:

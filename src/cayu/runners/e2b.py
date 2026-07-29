@@ -611,7 +611,8 @@ class E2BRunner(Runner):
         self._late_start_cleanup_timeout_s = self.cancel_timeout_s * (
             E2B_LATE_START_CLEANUP_TIMEOUT_MULTIPLIER
         )
-        self._late_start_cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._late_start_cleanup_tasks: set[asyncio.Task[bool]] = set()
+        self._command_settlement_uncertain = False
         self._hardened_guest_user: str | None = None
 
     @classmethod
@@ -1007,6 +1008,29 @@ class E2BRunner(Runner):
             return
         raise AssertionError(f"Unsupported E2B close action: {self.close_action}")
 
+    async def await_pending_command_settlement(self) -> bool:
+        """Wait for every deferred late-start cleanup known to this runner."""
+
+        tasks = tuple(self._late_start_cleanup_tasks)
+        if tasks:
+            results = await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
+            if any(result is not True for result in results):
+                self._command_settlement_uncertain = True
+        return not self._command_settlement_uncertain
+
+    def reopen_exec(self) -> None:
+        """Accept an operator's positive proof that no deferred command remains."""
+
+        if self._late_start_cleanup_tasks:
+            raise RuntimeError(
+                "E2BRunner command settlement is still active and cannot be reopened."
+            )
+        super().reopen_exec()
+        self._command_settlement_uncertain = False
+
     def filesystem(self) -> Any:
         """Return the native E2B filesystem API for workspace adapters."""
 
@@ -1171,6 +1195,12 @@ class E2BRunner(Runner):
         if cleanup.close_runner:
             self._close_exec("runner cleanup closed the exec path")
         if (
+            cleanup.artifact.get("action") == "kill_command"
+            and cleanup.artifact.get("status") != "completed"
+        ):
+            self._command_settlement_uncertain = True
+            self._close_exec("E2B command cleanup did not prove remote command mutation quiescence")
+        if (
             cleanup.artifact.get("action") == "kill_sandbox"
             and cleanup.artifact.get("status") == "completed"
         ):
@@ -1257,31 +1287,51 @@ class E2BRunner(Runner):
             self._cleanup_late_started_command(start_task, cleanup_policy=cleanup_policy)
         )
         self._late_start_cleanup_tasks.add(cleanup_task)
-        cleanup_task.add_done_callback(self._late_start_cleanup_tasks.discard)
+        cleanup_task.add_done_callback(self._record_late_start_cleanup)
+
+    def _record_late_start_cleanup(self, task: asyncio.Task[bool]) -> None:
+        self._late_start_cleanup_tasks.discard(task)
+        try:
+            settled = task.result()
+        except BaseException:
+            settled = False
+        if not settled:
+            self._command_settlement_uncertain = True
+        if self._command_settlement_uncertain:
+            if not self._exec_closed:
+                self._close_exec(
+                    "E2B command cleanup did not prove remote command mutation quiescence"
+                )
+            return
+        if not self._late_start_cleanup_tasks and not self._closed:
+            # A deferred cleanup may reopen execution only after the complete
+            # process-local cleanup set has settled positively. One successful
+            # sibling must never clear another sibling's uncertainty latch.
+            self._open_exec()
 
     async def _cleanup_late_started_command(
         self,
         start_task: asyncio.Task[Any],
         *,
         cleanup_policy: RunnerCleanupPolicy,
-    ) -> None:
+    ) -> bool:
         try:
             handle = await asyncio.wait_for(
                 asyncio.shield(start_task),
                 timeout=self._late_start_cleanup_timeout_s,
             )
         except asyncio.CancelledError:
-            self._open_exec()
-            return
+            self._close_exec("E2B command start ended without positive remote abort evidence")
+            return False
         except TimeoutError:
             self._close_exec(
                 "E2B command start did not resolve after interruption or timeout; "
                 "command state is unknown"
             )
-            return
+            return False
         except Exception:
-            self._open_exec()
-            return
+            self._close_exec("E2B command start failed without positive remote abort evidence")
+            return False
         cleanup = await cleanup_runner_command_with_diagnostic(
             self._sandbox,
             handle=handle,
@@ -1294,9 +1344,9 @@ class E2BRunner(Runner):
             cleanup.artifact.get("action") == "kill_command"
             and cleanup.artifact.get("status") == "completed"
         ):
-            self._open_exec()
-            return
+            return True
         self._close_exec("late-started E2B command cleanup did not complete")
+        return False
 
     async def _wait_for_late_start_cleanup_tasks(self) -> None:
         if not self._late_start_cleanup_tasks:

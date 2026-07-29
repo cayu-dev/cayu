@@ -4,13 +4,16 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from cayu import (
     AgentSpec,
-    BoundWorkspace,
     CayuApp,
     Environment,
     EnvironmentSpec,
+    Event,
     EventType,
+    InMemorySessionStore,
     Message,
     ModelStreamEvent,
     RunRequest,
@@ -20,12 +23,10 @@ from cayu import (
     ToolContext,
     ToolResult,
     ToolSpec,
-    WorkspaceSnapshot,
 )
-from cayu.runners import Runner
-from cayu.runtime import SessionStatus
+from cayu.runtime import InMemoryEventSink, SessionStatus
 from cayu.storage import SQLiteSessionStore
-from cayu.workspaces import LocalWorkspace, Workspace
+from cayu.workspaces import LocalWorkspace
 
 
 class FailOnceWriteWorkspace(LocalWorkspace):
@@ -42,31 +43,79 @@ class FailOnceWriteWorkspace(LocalWorkspace):
         await super().write_bytes(path, content)
 
 
-class CapturingSyncBinding(SyncBinding):
-    def __init__(self, *, target_workspace: Workspace) -> None:
-        super().__init__(target_workspace=target_workspace)
-        self.last_bound: BoundWorkspace | None = None
+class FailingFinalizeEvidenceStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_finalize_evidence = True
+        self.commit_finalize_evidence_before_failure = False
+        self.block_finalize_evidence = False
+        self.finalize_evidence_attempt_ids: list[str] = []
+        self.finalize_evidence_append_started = asyncio.Event()
+        self.allow_finalize_evidence_append = asyncio.Event()
 
-    async def bind(
-        self,
-        workspace: Workspace | None,
-        runner: Runner | None,
-        *,
-        session_id: str,
-        agent_name: str | None = None,
-        environment_name: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> BoundWorkspace:
-        bound = await super().bind(
-            workspace,
-            runner,
-            session_id=session_id,
-            agent_name=agent_name,
-            environment_name=environment_name,
-            metadata=metadata,
+    async def append_event(self, session_id: str, event: Event) -> None:
+        if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED:
+            self.finalize_evidence_attempt_ids.append(event.id)
+            if self.block_finalize_evidence:
+                self.finalize_evidence_append_started.set()
+                await self.allow_finalize_evidence_append.wait()
+            if self.fail_finalize_evidence:
+                if self.commit_finalize_evidence_before_failure:
+                    await super().append_event(session_id, event)
+                raise RuntimeError("forced finalize evidence failure")
+        await super().append_event(session_id, event)
+
+
+def _sync_durability_test_app(
+    tmp_path: Path,
+    store: InMemorySessionStore,
+    *,
+    event_sink: InMemoryEventSink | None = None,
+) -> tuple[CayuApp, SyncBinding, FailOnceWriteWorkspace, LocalWorkspace, Path]:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a-updated.txt").write_text("original-a", encoding="utf-8")
+    (source_root / "b-fail.txt").write_text("original-b", encoding="utf-8")
+    source = FailOnceWriteWorkspace(
+        source_root,
+        workspace_id="durability-source",
+        fail_path="b-fail.txt",
+    )
+    target = LocalWorkspace(target_root, workspace_id="fixed-target")
+    binding = SyncBinding(target_workspace=target)
+    app = CayuApp(
+        session_store=store,
+        event_sinks=[] if event_sink is None else [event_sink],
+        enable_logging=False,
+    )
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+                [ModelStreamEvent.completed({"finish_reason": "stop"})],
+            ],
+            name="durability-provider",
+        ),
+        default=True,
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="sync-durability"),
+            workspace=source,
+            binding=binding,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(
+            name="sync-durability-agent",
+            model="scripted-model",
+            provider_name="durability-provider",
         )
-        self.last_bound = bound
-        return bound
+    )
+    return app, binding, source, target, target_root
 
 
 class MutateBoundWorkspaceTool(Tool):
@@ -86,7 +135,7 @@ class MutateBoundWorkspaceTool(Tool):
         return ToolResult(content="workspace mutated")
 
 
-def test_sync_binding_partial_finalize_failure_is_durable_and_retry_converges(
+def test_sync_binding_partial_finalize_failure_is_durable_and_runtime_abandons(
     tmp_path: Path,
 ) -> None:
     source_root = tmp_path / "source"
@@ -106,7 +155,7 @@ def test_sync_binding_partial_finalize_failure_is_durable_and_retry_converges(
         fail_path="b-fail.txt",
     )
     target = LocalWorkspace(target_root, workspace_id="ephemeral-target")
-    binding = CapturingSyncBinding(target_workspace=target)
+    binding = SyncBinding(target_workspace=target)
     store_path = tmp_path / "sessions.sqlite"
     store = SQLiteSessionStore(store_path)
     provider = ScriptedModelProvider(
@@ -170,22 +219,19 @@ def test_sync_binding_partial_finalize_failure_is_durable_and_retry_converges(
         finally:
             await reopened.close()
 
-        assert binding.last_bound is not None
-        retry_snapshot = await binding.finalize(
-            binding.last_bound,
-            outcome="completed",
-            metadata={
-                "event_type": "session.completed",
-                "session_id": "workspace-sync-failure",
-            },
-        )
+        # The failure is already durable and the terminal runtime has no public
+        # BoundWorkspace handle through which a caller could retry. Its final
+        # abort therefore abandons this exact generation instead of leaking the
+        # fixed target for the lifetime of the app.
+        assert binding._states == {}
+        assert binding._fixed_target_owners == {}
         rebound = await binding.bind(source, None, session_id="workspace-sync-rebind")
         binding.abandon(rebound)
-        return events, partial_source, durable_session, durable_events, retry_snapshot
+        assert binding._states == {}
+        assert binding._fixed_target_owners == {}
+        return events, partial_source, durable_session, durable_events
 
-    events, partial_source, session, durable_events, retry_snapshot = asyncio.run(
-        exercise_contract()
-    )
+    events, partial_source, session, durable_events = asyncio.run(exercise_contract())
 
     assert source.failed_writes == 1
     assert partial_source == {
@@ -222,11 +268,240 @@ def test_sync_binding_partial_finalize_failure_is_durable_and_retry_converges(
         ],
     }
 
-    assert type(retry_snapshot) is WorkspaceSnapshot
-    assert retry_snapshot.metadata["copied_files"] == 3
-    assert retry_snapshot.metadata["deleted_files"] == 1
-    assert {path.name: path.read_text(encoding="utf-8") for path in source_root.iterdir()} == {
-        "a-updated.txt": "updated-a",
-        "b-fail.txt": "updated-b",
-        "created.txt": "created",
-    }
+
+def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
+    tmp_path: Path,
+) -> None:
+    store = FailingFinalizeEvidenceStore()
+    sink = InMemoryEventSink()
+    app, binding, source, _target, target_root = _sync_durability_test_app(
+        tmp_path,
+        store,
+        event_sink=sink,
+    )
+
+    async def exercise_contract() -> None:
+        run_error: BaseException | None = None
+        try:
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="sync-durability-agent",
+                        session_id="sync-durability-session",
+                        messages=[Message.text("user", "Finish.")],
+                    )
+                )
+            ]
+        except BaseException as exc:
+            run_error = exc
+
+        assert run_error is not None
+        # The terminalizer performs one append/reconciliation attempt. Its
+        # outer abort defers a retry so the authoritative exception shape is
+        # not replaced during the same unwind.
+        assert len(store.finalize_evidence_attempt_ids) == 1
+        assert len(set(store.finalize_evidence_attempt_ids)) == 1
+        assert binding._fixed_target_owners
+        assert binding._states
+        assert "sync-durability-session" in app._environment_lifecycle._active_environment_setups
+
+        target_before_rebind = {
+            path.name: path.read_text(encoding="utf-8") for path in target_root.iterdir()
+        }
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await binding.bind(source, None, session_id="blocked-rebind")
+        assert {
+            path.name: path.read_text(encoding="utf-8") for path in target_root.iterdir()
+        } == target_before_rebind
+
+        # A normal later run—not a private lifecycle call—delivers the bounded
+        # cleanup retry. It reuses the stable pending event identity before the
+        # new bind is admitted.
+        store.fail_finalize_evidence = False
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="sync-durability-agent",
+                    session_id="sync-durability-recovery-trigger",
+                    messages=[Message.text("user", "Continue.")],
+                )
+            )
+        ]
+        assert events[-1].type == EventType.SESSION_COMPLETED
+        assert len(store.finalize_evidence_attempt_ids) == 2
+        assert len(set(store.finalize_evidence_attempt_ids)) == 1
+        assert binding._fixed_target_owners == {}
+        assert binding._states == {}
+        assert (
+            "sync-durability-session" not in app._environment_lifecycle._active_environment_setups
+        )
+
+        durable_events = await store.load_events("sync-durability-session")
+        finalize_failures = [
+            event
+            for event in durable_events
+            if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED
+        ]
+        assert len(finalize_failures) == 1
+        assert finalize_failures[0].id == store.finalize_evidence_attempt_ids[0]
+        sink_failures = [
+            event
+            for event in sink.events
+            if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED
+        ]
+        assert [event.id for event in sink_failures] == [finalize_failures[0].id]
+
+        rebound = await binding.bind(source, None, session_id="successful-rebind")
+        binding.abandon(rebound)
+
+    asyncio.run(exercise_contract())
+
+
+def test_sync_binding_releases_owner_after_finalize_failure_commit_is_reconciled(
+    tmp_path: Path,
+) -> None:
+    store = FailingFinalizeEvidenceStore()
+    store.commit_finalize_evidence_before_failure = True
+    app, binding, source, _target, _target_root = _sync_durability_test_app(tmp_path, store)
+
+    async def exercise_contract() -> None:
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="sync-durability-agent",
+                    session_id="sync-durability-reconciled",
+                    messages=[Message.text("user", "Finish.")],
+                )
+            )
+        ]
+        assert source.failed_writes == 1
+        assert store.finalize_evidence_attempt_ids
+        assert len(set(store.finalize_evidence_attempt_ids)) == 1
+        assert binding._fixed_target_owners == {}
+        assert binding._states == {}
+        assert (
+            "sync-durability-reconciled"
+            not in app._environment_lifecycle._active_environment_setups
+        )
+        assert (
+            sum(
+                event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED
+                for event in await store.load_events("sync-durability-reconciled")
+            )
+            == 1
+        )
+        assert events[-1].type == EventType.SESSION_COMPLETED
+
+        rebound = await binding.bind(source, None, session_id="reconciled-rebind")
+        binding.abandon(rebound)
+
+    asyncio.run(exercise_contract())
+
+
+def test_concurrent_lazy_cleanup_sweeps_cannot_release_pending_sync_owner_early(
+    tmp_path: Path,
+) -> None:
+    store = FailingFinalizeEvidenceStore()
+    app, binding, _source, _target, _target_root = _sync_durability_test_app(tmp_path, store)
+
+    async def exercise_contract() -> None:
+        with pytest.raises(OSError, match="forced sync write failure"):
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="sync-durability-agent",
+                        session_id="sync-concurrent-settlement",
+                        messages=[Message.text("user", "Finish.")],
+                    )
+                )
+            ]
+        assert binding._fixed_target_owners
+
+        store.fail_finalize_evidence = False
+        store.block_finalize_evidence = True
+        first_sweep = asyncio.create_task(
+            app._environment_lifecycle._settle_retained_environment_cleanups()
+        )
+        await store.finalize_evidence_append_started.wait()
+        await app._environment_lifecycle._settle_retained_environment_cleanups()
+        assert binding._fixed_target_owners
+        assert binding._states
+        retained = app._environment_lifecycle._active_environment_setups[
+            "sync-concurrent-settlement"
+        ]
+        settlement_task = retained.cleanup_settlement_task
+        assert settlement_task is not None
+        assert not settlement_task.done()
+
+        store.allow_finalize_evidence_append.set()
+        await first_sweep
+        await settlement_task
+        assert binding._fixed_target_owners == {}
+        assert binding._states == {}
+        assert len(store.finalize_evidence_attempt_ids) == 2
+        assert len(set(store.finalize_evidence_attempt_ids)) == 1
+
+    asyncio.run(exercise_contract())
+
+
+def test_lazy_cleanup_sweep_keeps_owned_settlement_alive_after_trigger_cancellation(
+    tmp_path: Path,
+) -> None:
+    store = FailingFinalizeEvidenceStore()
+    app, binding, _source, _target, _target_root = _sync_durability_test_app(tmp_path, store)
+
+    async def exercise_contract() -> None:
+        with pytest.raises(OSError, match="forced sync write failure"):
+            _ = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="sync-durability-agent",
+                        session_id="sync-cancelled-settlement",
+                        messages=[Message.text("user", "Finish.")],
+                    )
+                )
+            ]
+        assert binding._fixed_target_owners
+
+        store.fail_finalize_evidence = False
+        store.block_finalize_evidence = True
+
+        async def trigger_normal_runtime_activity() -> list[Event]:
+            return [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="sync-durability-agent",
+                        session_id="sync-cancelled-settlement-trigger",
+                        messages=[Message.text("user", "Continue.")],
+                    )
+                )
+            ]
+
+        trigger_task = asyncio.create_task(trigger_normal_runtime_activity())
+        await store.finalize_evidence_append_started.wait()
+        trigger_task.cancel("stop cleanup trigger")
+        with pytest.raises(asyncio.CancelledError, match="stop cleanup trigger"):
+            await asyncio.wait_for(trigger_task, timeout=1)
+        assert trigger_task.cancelled()
+        assert binding._fixed_target_owners
+        retained = app._environment_lifecycle._active_environment_setups[
+            "sync-cancelled-settlement"
+        ]
+        settlement_task = retained.cleanup_settlement_task
+        assert settlement_task is not None
+        assert not settlement_task.done()
+
+        store.allow_finalize_evidence_append.set()
+        await settlement_task
+        assert binding._fixed_target_owners == {}
+        assert binding._states == {}
+        assert len(store.finalize_evidence_attempt_ids) == 2
+        assert len(set(store.finalize_evidence_attempt_ids)) == 1
+
+    asyncio.run(exercise_contract())

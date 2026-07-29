@@ -28,9 +28,21 @@ from cayu.egress import (
 )
 from cayu.egress.microsandbox_adapter import MicrosandboxEgressAdapter
 from cayu.egress.proxy_exposure import MICROSANDBOX_HOST, ExposedProxy
-from cayu.environments import ExecutionRequirements, evaluate_execution_admission
+from cayu.environments import (
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryRequest,
+    ExecutionRequirements,
+    SyncBinding,
+    evaluate_execution_admission,
+)
+from cayu.environments.factory import (
+    environment_factory_cleanup_settlement_task,
+    retry_environment_factory_cleanup_settlement_task,
+)
 from cayu.runners import MicrosandboxRunner
+from cayu.runtime import VirtualCredentialSpec, VirtualEgressEnvironmentFactory
 from cayu.vaults import SecretRef, StaticVault
+from cayu.workspaces import LocalWorkspace
 
 
 class _FakeAuthority:
@@ -164,6 +176,7 @@ class _FakeSandbox:
         self.stopped = False
         self.detached = False
         self.fail_stop = False
+        self.stop_error: Exception | None = None
         self.sentinel: bytes | None = None
 
     async def exec(self, cmd: str, args: list[str], **kwargs: Any) -> _FakeExecOutput:
@@ -181,7 +194,7 @@ class _FakeSandbox:
 
     async def stop_and_wait(self) -> None:
         if self.fail_stop:
-            raise RuntimeError("stop failed")
+            raise self.stop_error or RuntimeError("stop failed")
         self.stopped = True
 
     async def detach(self) -> None:
@@ -192,9 +205,13 @@ class _FakeSandboxHandle:
     def __init__(self, sandbox: _FakeSandbox) -> None:
         self.sandbox = sandbox
         self.created_at = sandbox.created_at
+        self.status = "stopped" if sandbox.stopped else "running"
 
     async def connect(self) -> _FakeSandbox:
         return self.sandbox
+
+    async def stop_and_wait(self) -> None:
+        await self.sandbox.stop_and_wait()
 
 
 class _FakeSandboxNotFoundError(RuntimeError):
@@ -207,6 +224,7 @@ class _FakeSandboxApi:
     sandbox: _FakeSandbox | None = None
     sandboxes: dict[str, _FakeSandbox] = {}
     next_created_at = 1_000.0
+    started: list[dict[str, Any]] = []
 
     @classmethod
     async def create(cls, name: str, **kwargs: Any) -> _FakeSandbox:
@@ -223,6 +241,13 @@ class _FakeSandboxApi:
         except KeyError as exc:
             raise _FakeSandboxNotFoundError(name) from exc
         return _FakeSandboxHandle(sandbox)
+
+    @classmethod
+    async def start(cls, name: str, **kwargs: Any) -> _FakeSandbox:
+        sandbox = cls.sandboxes[name]
+        sandbox.stopped = False
+        cls.started.append({"name": name, **kwargs})
+        return sandbox
 
     @classmethod
     async def remove(cls, name: str) -> None:
@@ -323,6 +348,7 @@ def _reset_fakes() -> None:
     _FakeSandboxApi.sandbox = None
     _FakeSandboxApi.sandboxes = {}
     _FakeSandboxApi.next_created_at = 1_000.0
+    _FakeSandboxApi.started = []
     _FakeUpstream.requests = []
 
 
@@ -659,12 +685,954 @@ def test_microsandbox_terminal_retry_escalates_detach_after_claim_release(
         )
         identity = adapter.reconnect_metadata(runner)
 
-        await adapter.finalize_runner(runner, outcome="interrupted")
+        detached = await adapter.finalize_runner(runner, outcome="interrupted")
+        assert detached.workspace_mutations_quiescent is False
         await binding.close()
         assert identity["sandbox_name"] in _FakeSandboxApi.sandboxes
 
-        await adapter.finalize_runner(runner, outcome="failed")
+        removed = await adapter.finalize_runner(runner, outcome="failed")
+        assert removed.workspace_mutations_quiescent is True
         assert identity["sandbox_name"] not in _FakeSandboxApi.sandboxes
+        assert list((tmp_path / "claims").glob("*.json")) == []
+
+    asyncio.run(run())
+
+
+def test_microsandbox_binding_quiescence_stops_and_preserves_reconnect_identity(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        runner = await adapter.create_runner(
+            _request(binding=binding, grant=grant, ca_path=tmp_path / "ca.pem")
+        )
+        identity = adapter.reconnect_metadata(runner)
+
+        result = await adapter.finalize_runner_for_binding(
+            runner,
+            outcome="interrupted",
+        )
+        await binding.close()
+
+        assert result.workspace_mutations_quiescent is True
+        assert result.allocation_preserved is True
+        assert _FakeSandboxApi.sandboxes[identity["sandbox_name"]].stopped is True
+        assert _FakeSandboxApi.removed == []
+        assert list((tmp_path / "claims").glob("*.json"))
+
+        terminal = await adapter.finalize_runner(runner, outcome="failed")
+        assert terminal.workspace_mutations_quiescent is True
+        assert _FakeSandboxApi.started == []
+        assert _FakeSandboxApi.removed == [identity["sandbox_name"]]
+        assert list((tmp_path / "claims").glob("*.json")) == []
+
+    asyncio.run(run())
+
+
+def test_microsandbox_binding_quiescence_reattaches_after_prior_detach(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        runner = await adapter.create_runner(
+            _request(binding=binding, grant=grant, ca_path=tmp_path / "ca.pem")
+        )
+        identity = adapter.reconnect_metadata(runner)
+        sandbox = _FakeSandboxApi.sandboxes[identity["sandbox_name"]]
+
+        detached = await adapter.finalize_runner(runner, outcome="interrupted")
+        assert detached.workspace_mutations_quiescent is False
+        assert runner.closed is True
+        assert sandbox.detached is True
+        assert sandbox.stopped is False
+
+        quiesced = await adapter.finalize_runner_for_binding(
+            runner,
+            outcome="interrupted",
+        )
+
+        assert quiesced.workspace_mutations_quiescent is True
+        assert quiesced.allocation_preserved is True
+        assert sandbox.stopped is True
+        assert _FakeSandboxApi.started == []
+
+        await binding.close()
+
+    asyncio.run(run())
+
+
+def test_microsandbox_reacquired_quiescence_claim_releases_after_retry(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        runner = await adapter.create_runner(
+            _request(binding=binding, grant=grant, ca_path=tmp_path / "ca.pem")
+        )
+        identity = adapter.reconnect_metadata(runner)
+        sandbox = _FakeSandboxApi.sandboxes[identity["sandbox_name"]]
+
+        await adapter.finalize_runner(runner, outcome="interrupted")
+        await binding.close()
+        sandbox.fail_stop = True
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await adapter.finalize_runner_for_binding(
+                runner,
+                outcome="interrupted",
+            )
+
+        sandbox.fail_stop = False
+        quiesced = await adapter.finalize_runner_for_binding(
+            runner,
+            outcome="interrupted",
+        )
+        assert quiesced.workspace_mutations_quiescent is True
+
+        contender = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        contender_binding = await contender.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        await contender_binding.close()
+
+    asyncio.run(run())
+
+
+def test_microsandbox_failed_reconnect_restops_allocation_started_for_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_preflight(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("reconnect preflight failed")
+
+    async def run() -> None:
+        _reset_fakes()
+        first_broker, first_grant = _broker_and_grant()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first_binding = await first_adapter.prepare(
+            session_id="session-1",
+            grants=[first_grant],
+            broker=first_broker,
+        )
+        first_runner = await first_adapter.create_runner(
+            _request(
+                binding=first_binding,
+                grant=first_grant,
+                ca_path=tmp_path / "first-ca.pem",
+            )
+        )
+        identity = first_adapter.reconnect_metadata(first_runner)
+        await first_adapter.finalize_runner_for_binding(
+            first_runner,
+            outcome="interrupted",
+        )
+        await first_binding.close()
+
+        second_broker, second_grant = _broker_and_grant()
+        second_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        second_binding = await second_adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[second_grant],
+            broker=second_broker,
+            reconnect_metadata=identity,
+        )
+        monkeypatch.setattr(adapter_module, "run_enforcement_preflight", fail_preflight)
+
+        with pytest.raises(RuntimeError, match="reconnect preflight failed"):
+            await second_adapter.create_runner(
+                _request(
+                    binding=second_binding,
+                    grant=second_grant,
+                    ca_path=tmp_path / "second-ca.pem",
+                    reconnect_metadata=identity,
+                )
+            )
+
+        sandbox_name = identity["sandbox_name"]
+        assert _FakeSandboxApi.started == [{"name": sandbox_name, "detached": True}]
+        assert _FakeSandboxApi.sandboxes[sandbox_name].stopped is True
+        assert _FakeSandboxApi.removed == []
+        await second_binding.close()
+
+    asyncio.run(run())
+
+
+def test_microsandbox_timed_out_restart_has_explicit_restoration_recovery(
+    tmp_path: Path,
+) -> None:
+    start_accepted = asyncio.Event()
+    allow_start_return = asyncio.Event()
+
+    class BlockingStartSandboxApi(_FakeSandboxApi):
+        @classmethod
+        async def start(cls, name: str, **kwargs: Any) -> _FakeSandbox:
+            sandbox = cls.sandboxes[name]
+            sandbox.stopped = False
+            cls.started.append({"name": name, **kwargs})
+            start_accepted.set()
+            await allow_start_return.wait()
+            return sandbox
+
+    class BlockingStartModule(_FakeMicrosandboxModule):
+        Sandbox = BlockingStartSandboxApi
+
+    async def run() -> None:
+        _reset_fakes()
+        first_broker, first_grant = _broker_and_grant()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first_binding = await first_adapter.prepare(
+            session_id="session-1",
+            grants=[first_grant],
+            broker=first_broker,
+        )
+        first_runner = await first_adapter.create_runner(
+            _request(
+                binding=first_binding,
+                grant=first_grant,
+                ca_path=tmp_path / "first-ca.pem",
+            )
+        )
+        identity = first_adapter.reconnect_metadata(first_runner)
+        await first_adapter.finalize_runner_for_binding(
+            first_runner,
+            outcome="interrupted",
+        )
+        await first_binding.close()
+        sandbox = _FakeSandboxApi.sandboxes[identity["sandbox_name"]]
+        sandbox.fail_stop = True
+        sandbox.stop_error = PermissionError("provider stop permission denied")
+
+        second_broker, second_grant = _broker_and_grant()
+        second_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=BlockingStartModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+            reconnect_timeout_s=0.01,
+        )
+        second_binding = await second_adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[second_grant],
+            broker=second_broker,
+            reconnect_metadata=identity,
+        )
+        with pytest.raises(EgressReconnectError, match="timed out") as exc_info:
+            async with asyncio.timeout(0.2):
+                await second_adapter.create_runner(
+                    _request(
+                        binding=second_binding,
+                        grant=second_grant,
+                        ca_path=tmp_path / "second-ca.pem",
+                        reconnect_metadata=identity,
+                    )
+                )
+        assert start_accepted.is_set()
+        failed_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert failed_task is not None
+        await second_binding.close()
+
+        contender = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        with pytest.raises(EgressReconnectConflictError, match="active reconnect owner"):
+            await contender.prepare_reconnect(
+                session_id="session-1",
+                environment_name="egress-env",
+                grants=[second_grant],
+                broker=second_broker,
+                reconnect_metadata=identity,
+            )
+
+        allow_start_return.set()
+        with pytest.raises(PermissionError, match="permission denied"):
+            await failed_task
+        claim = second_adapter._claims_by_name[identity["sandbox_name"]]
+        assert claim.settlement_task is failed_task
+        assert claim.settlement_error is not None
+
+        sandbox.fail_stop = False
+        recovery_task = retry_environment_factory_cleanup_settlement_task(failed_task)
+        assert recovery_task is not failed_task
+        assert claim.settlement_task is recovery_task
+        await recovery_task
+        await asyncio.sleep(0)
+        assert sandbox.stopped
+        assert claim.closed
+
+        recovered_binding = await contender.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[second_grant],
+            broker=second_broker,
+            reconnect_metadata=identity,
+        )
+        await recovered_binding.close()
+
+    asyncio.run(run())
+
+
+def test_timed_out_restart_restoration_retains_claim_until_stop_settles(
+    tmp_path: Path,
+) -> None:
+    stop_started = asyncio.Event()
+    allow_stop = asyncio.Event()
+
+    class FailingSecondGetSandboxApi(_FakeSandboxApi):
+        get_calls = 0
+
+        @classmethod
+        async def get(cls, name: str) -> _FakeSandboxHandle:
+            cls.get_calls += 1
+            if cls.get_calls == 2:
+                raise RuntimeError("restarted identity lookup failed")
+            return await super().get(name)
+
+    class FailingSecondGetModule(_FakeMicrosandboxModule):
+        Sandbox = FailingSecondGetSandboxApi
+
+    async def run() -> None:
+        _reset_fakes()
+        FailingSecondGetSandboxApi.get_calls = 0
+        broker, grant = _broker_and_grant()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first_binding = await first_adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        first_runner = await first_adapter.create_runner(
+            _request(binding=first_binding, grant=grant, ca_path=tmp_path / "first-ca.pem")
+        )
+        identity = first_adapter.reconnect_metadata(first_runner)
+        await first_adapter.finalize_runner_for_binding(
+            first_runner,
+            outcome="interrupted",
+        )
+        await first_binding.close()
+
+        sandbox = _FakeSandboxApi.sandboxes[identity["sandbox_name"]]
+
+        async def blocking_stop() -> None:
+            stop_started.set()
+            await allow_stop.wait()
+            sandbox.stopped = True
+
+        sandbox.stop_and_wait = blocking_stop  # type: ignore[method-assign]
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=FailingSecondGetModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+            reconnect_timeout_s=0.01,
+        )
+        failing_binding = await adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        with pytest.raises(BaseExceptionGroup, match="restoring"):
+            async with asyncio.timeout(0.2):
+                await adapter.create_runner(
+                    _request(
+                        binding=failing_binding,
+                        grant=grant,
+                        ca_path=tmp_path / "failing-ca.pem",
+                        reconnect_metadata=identity,
+                    )
+                )
+        await failing_binding.close()
+        claim = adapter._claims_by_name[identity["sandbox_name"]]
+        assert claim.settlement_task is not None
+        assert stop_started.is_set()
+        assert not claim.settlement_task.done()
+
+        contender = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        with pytest.raises(EgressReconnectConflictError, match="active reconnect owner"):
+            await contender.prepare_reconnect(
+                session_id="session-1",
+                environment_name="egress-env",
+                grants=[grant],
+                broker=broker,
+                reconnect_metadata=identity,
+            )
+
+        allow_stop.set()
+        async with asyncio.timeout(0.2):
+            await asyncio.shield(claim.settlement_task)
+        await asyncio.sleep(0)
+        recovered_binding = await contender.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        await recovered_binding.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("sandbox_removed_before_recovery", [False, True])
+def test_failed_restart_restoration_has_same_identity_explicit_recovery(
+    tmp_path: Path,
+    sandbox_removed_before_recovery: bool,
+) -> None:
+    class FailingSecondGetSandboxApi(_FakeSandboxApi):
+        get_calls = 0
+
+        @classmethod
+        async def get(cls, name: str) -> _FakeSandboxHandle:
+            cls.get_calls += 1
+            if cls.get_calls == 2:
+                raise RuntimeError("restarted identity lookup failed")
+            return await super().get(name)
+
+    class FailingSecondGetModule(_FakeMicrosandboxModule):
+        Sandbox = FailingSecondGetSandboxApi
+
+    async def run() -> None:
+        _reset_fakes()
+        FailingSecondGetSandboxApi.get_calls = 0
+        broker, grant = _broker_and_grant()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first_binding = await first_adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        first_runner = await first_adapter.create_runner(
+            _request(binding=first_binding, grant=grant, ca_path=tmp_path / "first-ca.pem")
+        )
+        identity = first_adapter.reconnect_metadata(first_runner)
+        await first_adapter.finalize_runner_for_binding(
+            first_runner,
+            outcome="interrupted",
+        )
+        await first_binding.close()
+
+        sandbox = _FakeSandboxApi.sandboxes[identity["sandbox_name"]]
+        sandbox.fail_stop = True
+        sandbox.stop_error = PermissionError("provider stop permission denied")
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=FailingSecondGetModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        failing_binding = await adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        with pytest.raises(BaseExceptionGroup, match="restoring") as exc_info:
+            await adapter.create_runner(
+                _request(
+                    binding=failing_binding,
+                    grant=grant,
+                    ca_path=tmp_path / "failing-ca.pem",
+                    reconnect_metadata=identity,
+                )
+            )
+        failed_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert failed_task is not None
+        with pytest.raises(PermissionError, match="permission denied"):
+            await failed_task
+        await failing_binding.close()
+
+        claim = adapter._claims_by_name[identity["sandbox_name"]]
+        assert claim.settlement_task is failed_task
+        assert claim.settlement_error is not None
+        if sandbox_removed_before_recovery:
+            _FakeSandboxApi.sandboxes.pop(identity["sandbox_name"])
+        else:
+            sandbox.fail_stop = False
+        recovery_task = retry_environment_factory_cleanup_settlement_task(failed_task)
+        assert recovery_task is not failed_task
+        assert claim.settlement_task is recovery_task
+        await recovery_task
+        await asyncio.sleep(0)
+        if not sandbox_removed_before_recovery:
+            assert sandbox.stopped
+        assert claim.closed
+        assert identity["sandbox_name"] not in adapter._claims_by_name
+
+        recovery_binding = await adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        await recovery_binding.close()
+
+    asyncio.run(run())
+
+
+def test_failed_restart_settlement_retries_while_claim_stays_fenced(
+    tmp_path: Path,
+) -> None:
+    start_accepted = asyncio.Event()
+    allow_start_return = asyncio.Event()
+
+    class BlockingStartSandboxApi(_FakeSandboxApi):
+        @classmethod
+        async def start(cls, name: str, **kwargs: Any) -> _FakeSandbox:
+            sandbox = cls.sandboxes[name]
+            sandbox.stopped = False
+            cls.started.append({"name": name, **kwargs})
+            start_accepted.set()
+            await allow_start_return.wait()
+            return sandbox
+
+    class BlockingStartModule(_FakeMicrosandboxModule):
+        Sandbox = BlockingStartSandboxApi
+
+    async def run() -> None:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first_binding = await first_adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        first_runner = await first_adapter.create_runner(
+            _request(binding=first_binding, grant=grant, ca_path=tmp_path / "first-ca.pem")
+        )
+        identity = first_adapter.reconnect_metadata(first_runner)
+        await first_adapter.finalize_runner_for_binding(
+            first_runner,
+            outcome="interrupted",
+        )
+        await first_binding.close()
+
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=BlockingStartModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+            reconnect_timeout_s=0.01,
+        )
+        timed_out_binding = await adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        sandbox = _FakeSandboxApi.sandboxes[identity["sandbox_name"]]
+        sandbox.fail_stop = True
+        sandbox.stop_error = ConnectionError("temporary stop transport failure")
+        with pytest.raises(EgressReconnectError, match="timed out"):
+            await adapter.create_runner(
+                _request(
+                    binding=timed_out_binding,
+                    grant=grant,
+                    ca_path=tmp_path / "timed-out-ca.pem",
+                    reconnect_metadata=identity,
+                )
+            )
+        await timed_out_binding.close()
+        allow_start_return.set()
+        claim = adapter._claims_by_name[identity["sandbox_name"]]
+        assert claim.settlement_task is not None
+        assert not claim.settlement_task.done()
+
+        contender = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        with pytest.raises(EgressReconnectConflictError, match="active reconnect owner"):
+            await contender.prepare_reconnect(
+                session_id="session-1",
+                environment_name="egress-env",
+                grants=[grant],
+                broker=broker,
+                reconnect_metadata=identity,
+            )
+
+        sandbox.fail_stop = False
+        async with asyncio.timeout(1.5):
+            await asyncio.shield(claim.settlement_task)
+        await asyncio.sleep(0)
+        assert claim.settlement_error is None
+        assert claim.closed
+
+        recovery_binding = await contender.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        await recovery_binding.close()
+
+    asyncio.run(run())
+
+
+def test_failed_post_attach_restoration_stays_fenced_until_explicit_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first_binding = await first_adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        first_runner = await first_adapter.create_runner(
+            _request(binding=first_binding, grant=grant, ca_path=tmp_path / "first-ca.pem")
+        )
+        identity = first_adapter.reconnect_metadata(first_runner)
+        await first_adapter.finalize_runner_for_binding(
+            first_runner,
+            outcome="interrupted",
+        )
+        await first_binding.close()
+
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        failing_binding = await adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        original_preflight = adapter_module.run_enforcement_preflight
+
+        async def fail_preflight(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("post-attach preflight failed")
+
+        monkeypatch.setattr(adapter_module, "run_enforcement_preflight", fail_preflight)
+        sandbox = _FakeSandboxApi.sandboxes[identity["sandbox_name"]]
+        sandbox.fail_stop = True
+        sandbox.stop_error = PermissionError("provider stop permission denied")
+        with pytest.raises(RuntimeError, match="post-attach preflight failed") as exc_info:
+            await adapter.create_runner(
+                _request(
+                    binding=failing_binding,
+                    grant=grant,
+                    ca_path=tmp_path / "failing-ca.pem",
+                    reconnect_metadata=identity,
+                )
+            )
+        failed_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert failed_task is not None
+        with pytest.raises(PermissionError, match="permission denied"):
+            await failed_task
+        await failing_binding.close()
+
+        claim = adapter._claims_by_name[identity["sandbox_name"]]
+        assert claim.settlement_task is failed_task
+        assert claim.settlement_error is not None
+        contender = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        with pytest.raises(EgressReconnectConflictError, match="active reconnect owner"):
+            await contender.prepare_reconnect(
+                session_id="session-1",
+                environment_name="egress-env",
+                grants=[grant],
+                broker=broker,
+                reconnect_metadata=identity,
+            )
+
+        monkeypatch.setattr(
+            adapter_module,
+            "run_enforcement_preflight",
+            original_preflight,
+        )
+        sandbox.fail_stop = False
+        recovery_task = retry_environment_factory_cleanup_settlement_task(failed_task)
+        assert recovery_task is not failed_task
+        assert claim.settlement_task is recovery_task
+        async with asyncio.timeout(1.5):
+            await asyncio.shield(recovery_task)
+        await asyncio.sleep(0)
+        assert claim.settlement_error is None
+        assert claim.closed
+        recovery_binding = await adapter.prepare_reconnect(
+            session_id="session-1",
+            environment_name="egress-env",
+            grants=[grant],
+            broker=broker,
+            reconnect_metadata=identity,
+        )
+        recovered_runner = await adapter.create_runner(
+            _request(
+                binding=recovery_binding,
+                grant=grant,
+                ca_path=tmp_path / "recovery-ca.pem",
+                reconnect_metadata=identity,
+            )
+        )
+        removed = await adapter.finalize_runner(recovered_runner, outcome="failed")
+        assert removed.workspace_mutations_quiescent is True
+        await recovery_binding.close()
+
+    asyncio.run(run())
+
+
+def test_microsandbox_post_handoff_failure_restops_resumed_allocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="handoff-source")
+    target = LocalWorkspace(target_root, workspace_id="handoff-target")
+    policy = HttpEgressPolicy(
+        name="stripe",
+        allowed_hosts=["api.stripe.com"],
+        allowed_endpoints=[("GET", "/")],
+    )
+    credential = VirtualCredentialSpec(
+        env_name="STRIPE_SECRET_KEY",
+        secret=SecretRef(name="stripe"),
+        destination="api.stripe.com",
+        policy_name="stripe",
+    )
+
+    def factory(adapter: MicrosandboxEgressAdapter) -> VirtualEgressEnvironmentFactory:
+        return VirtualEgressEnvironmentFactory(
+            policies={"stripe": policy},
+            credentials=[credential],
+            resolver=StaticVault({"stripe": "sk_test_real"}),
+            adapter=adapter,
+            inner_binding=SyncBinding(target_workspace=target),
+        )
+
+    async def run() -> None:
+        _reset_fakes()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first = await factory(first_adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="handoff-resume",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        first_binding = first.environment.binding
+        first_runner = first.environment.runner
+        assert first_binding is not None and first_runner is not None
+        first_bound = await first_binding.bind(
+            source,
+            first_runner,
+            session_id="handoff-resume",
+        )
+        await first_binding.finalize(first_bound, outcome="interrupted")
+        sandbox_name = first.reconnect_metadata["identity"]["sandbox_name"]
+        assert _FakeSandboxApi.sandboxes[sandbox_name].stopped is True
+
+        second_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        second_factory = factory(second_adapter)
+
+        async def fail_workspace_handoff(_runner: Any) -> Any:
+            raise RuntimeError("workspace handoff failed")
+
+        monkeypatch.setattr(second_factory, "_create_workspace", fail_workspace_handoff)
+        with pytest.raises(RuntimeError, match="workspace handoff failed"):
+            await second_factory.create(
+                EnvironmentFactoryRequest(
+                    session_id="handoff-resume",
+                    agent_name="agent",
+                    environment_name="egress-env",
+                    operation=EnvironmentFactoryOperation.RECONNECT,
+                    reconnect_metadata=first.reconnect_metadata,
+                )
+            )
+
+        assert _FakeSandboxApi.started == [{"name": sandbox_name, "detached": True}]
+        assert _FakeSandboxApi.sandboxes[sandbox_name].stopped is True
+        assert _FakeSandboxApi.removed == []
+
+    asyncio.run(run())
+
+
+def test_microsandbox_sync_binding_interruption_reconnects_stopped_allocation(
+    tmp_path: Path,
+) -> None:
+    policy = HttpEgressPolicy(
+        name="stripe",
+        allowed_hosts=["api.stripe.com"],
+        allowed_endpoints=[("GET", "/")],
+    )
+    credential = VirtualCredentialSpec(
+        env_name="STRIPE_SECRET_KEY",
+        secret=SecretRef(name="stripe"),
+        destination="api.stripe.com",
+        policy_name="stripe",
+    )
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="durable-source")
+    target = LocalWorkspace(target_root, workspace_id="sandbox-copy")
+
+    def factory(adapter: MicrosandboxEgressAdapter) -> VirtualEgressEnvironmentFactory:
+        return VirtualEgressEnvironmentFactory(
+            policies={"stripe": policy},
+            credentials=[credential],
+            resolver=StaticVault({"stripe": "sk_test_real"}),
+            adapter=adapter,
+            inner_binding=SyncBinding(target_workspace=target),
+        )
+
+    async def run() -> None:
+        _reset_fakes()
+        first_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        first = await factory(first_adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sync-resume",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        first_binding = first.environment.binding
+        first_runner = first.environment.runner
+        assert first_binding is not None and first_runner is not None
+        first_bound = await first_binding.bind(
+            source,
+            first_runner,
+            session_id="sync-resume",
+        )
+        await target.write_bytes("state.txt", b"interrupted-state")
+        await first_binding.finalize(first_bound, outcome="interrupted")
+
+        identity = first.reconnect_metadata["identity"]
+        sandbox_name = identity["sandbox_name"]
+        assert _FakeSandboxApi.sandboxes[sandbox_name].stopped is True
+        assert _FakeSandboxApi.removed == []
+        assert (source_root / "state.txt").read_bytes() == b"interrupted-state"
+
+        second_adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        second = await factory(second_adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sync-resume",
+                agent_name="agent",
+                environment_name="egress-env",
+                operation=EnvironmentFactoryOperation.RECONNECT,
+                reconnect_metadata=first.reconnect_metadata,
+            )
+        )
+        second_binding = second.environment.binding
+        second_runner = second.environment.runner
+        assert second_binding is not None and second_runner is not None
+        second_bound = await second_binding.bind(
+            source,
+            second_runner,
+            session_id="sync-resume",
+        )
+        await second_binding.finalize(second_bound, outcome="completed")
+
+        assert _FakeSandboxApi.started == [{"name": sandbox_name, "detached": True}]
+        assert _FakeSandboxApi.removed == [sandbox_name]
         assert list((tmp_path / "claims").glob("*.json")) == []
 
     asyncio.run(run())
@@ -1318,6 +2286,222 @@ def test_microsandbox_fresh_runner_rollback_removes_attestation(
     assert _FakeSandboxApi.sandbox is not None
     assert _FakeSandboxApi.sandbox.shell_calls == []
     assert list((tmp_path / "claims").glob("*.json")) == []
+
+
+def test_microsandbox_fresh_runner_timeout_retains_removal_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    remove_started = asyncio.Event()
+    allow_remove = asyncio.Event()
+
+    class BlockingRemoveSandboxApi(_FakeSandboxApi):
+        @classmethod
+        async def remove(cls, name: str) -> None:
+            remove_started.set()
+            await allow_remove.wait()
+            await super().remove(name)
+
+    class BlockingRemoveModule(_FakeMicrosandboxModule):
+        Sandbox = BlockingRemoveSandboxApi
+
+    async def fail_preflight(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("fresh preflight failed")
+
+    monkeypatch.setattr(adapter_module, "run_enforcement_preflight", fail_preflight)
+    monkeypatch.setattr(
+        adapter_module,
+        "DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def run() -> asyncio.Task[None]:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=BlockingRemoveModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=tmp_path / "claims",
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        with pytest.raises(RuntimeError, match="fresh preflight failed") as exc_info:
+            await adapter.create_runner(
+                _request(
+                    binding=binding,
+                    grant=grant,
+                    ca_path=tmp_path / "ca.pem",
+                )
+            )
+        settlement_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert remove_started.is_set()
+        assert not settlement_task.done()
+        await binding.close()
+        assert list((tmp_path / "claims").glob("*.json")) != []
+
+        allow_remove.set()
+        async with asyncio.timeout(0.2):
+            await asyncio.shield(settlement_task)
+        await asyncio.sleep(0)
+        return settlement_task
+
+    settlement_task = asyncio.run(run())
+
+    assert settlement_task.done()
+    assert not settlement_task.cancelled()
+    assert _FakeSandboxApi.removed == ["sandbox-generated-name"]
+    assert list((tmp_path / "claims").glob("*.json")) == []
+
+
+def test_microsandbox_fresh_runner_failed_rollback_retries_owned_removal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    stop_attempts = 0
+
+    async def fail_stop_twice_then_succeed(sandbox: _FakeSandbox) -> None:
+        nonlocal stop_attempts
+        stop_attempts += 1
+        if stop_attempts <= 2:
+            raise ConnectionError("temporary stop transport failure")
+        sandbox.stopped = True
+
+    async def fail_preflight(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("fresh preflight failed")
+
+    monkeypatch.setattr(_FakeSandbox, "stop_and_wait", fail_stop_twice_then_succeed)
+    monkeypatch.setattr(adapter_module, "run_enforcement_preflight", fail_preflight)
+
+    async def run() -> tuple[asyncio.Task[None], Path]:
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        claims_path = tmp_path / "claims"
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=claims_path,
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        with pytest.raises(RuntimeError, match="fresh preflight failed") as exc_info:
+            await adapter.create_runner(
+                _request(
+                    binding=binding,
+                    grant=grant,
+                    ca_path=tmp_path / "ca.pem",
+                )
+            )
+        settlement_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert not settlement_task.done()
+        await binding.close()
+        claim_files = list(claims_path.glob("*.json"))
+        assert len(claim_files) == 1
+
+        contender = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=claims_path,
+        )
+        with pytest.raises(EgressReconnectConflictError, match="active reconnect owner"):
+            contender._acquire_claim("sandbox-generated-name")
+
+        async with asyncio.timeout(1):
+            await asyncio.shield(settlement_task)
+        await asyncio.sleep(0)
+        return settlement_task, claims_path
+
+    settlement_task, claims_path = asyncio.run(run())
+
+    assert settlement_task.done()
+    assert not settlement_task.cancelled()
+    assert stop_attempts == 3
+    assert _FakeSandboxApi.removed == ["sandbox-generated-name"]
+    assert list(claims_path.glob("*.json")) == []
+
+
+def test_microsandbox_fresh_permanent_rollback_keeps_same_recovery_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    allow_stop = False
+    stop_attempts = 0
+
+    async def permission_gated_stop(sandbox: _FakeSandbox) -> None:
+        nonlocal stop_attempts
+        stop_attempts += 1
+        if not allow_stop:
+            raise PermissionError("provider cleanup permission denied")
+        sandbox.stopped = True
+
+    async def fail_preflight(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("fresh preflight failed")
+
+    monkeypatch.setattr(_FakeSandbox, "stop_and_wait", permission_gated_stop)
+    monkeypatch.setattr(adapter_module, "run_enforcement_preflight", fail_preflight)
+
+    async def run() -> tuple[asyncio.Task[None], asyncio.Task[None], Path]:
+        nonlocal allow_stop
+        _reset_fakes()
+        broker, grant = _broker_and_grant()
+        claims_path = tmp_path / "claims"
+        adapter = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=claims_path,
+        )
+        binding = await adapter.prepare(
+            session_id="session-1",
+            grants=[grant],
+            broker=broker,
+        )
+        with pytest.raises(RuntimeError, match="fresh preflight failed") as exc_info:
+            await adapter.create_runner(
+                _request(
+                    binding=binding,
+                    grant=grant,
+                    ca_path=tmp_path / "ca.pem",
+                )
+            )
+        failed_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert failed_task is not None
+        with pytest.raises(PermissionError, match="permission denied"):
+            await failed_task
+        await binding.close()
+        assert len(list(claims_path.glob("*.json"))) == 1
+
+        contender = MicrosandboxEgressAdapter(
+            microsandbox_module=_FakeMicrosandboxModule,
+            proxy_server_factory=_FakeProxyServer,
+            reconnect_state_dir=claims_path,
+        )
+        with pytest.raises(EgressReconnectConflictError, match="active reconnect owner"):
+            contender._acquire_claim("sandbox-generated-name")
+
+        allow_stop = True
+        recovery_task = retry_environment_factory_cleanup_settlement_task(failed_task)
+        assert recovery_task is not failed_task
+        await recovery_task
+        await asyncio.sleep(0)
+        return failed_task, recovery_task, claims_path
+
+    failed_task, recovery_task, claims_path = asyncio.run(run())
+
+    assert failed_task.done()
+    assert recovery_task.done()
+    assert stop_attempts == 2
+    assert _FakeSandboxApi.removed == ["sandbox-generated-name"]
+    assert list(claims_path.glob("*.json")) == []
 
 
 def test_microsandbox_partial_attestation_write_is_removed_after_runner_rollback(

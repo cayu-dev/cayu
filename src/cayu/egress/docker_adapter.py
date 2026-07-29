@@ -16,6 +16,7 @@ from cayu.credentials import CredentialMode
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
+    RunnerFinalizationResult,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
     _await_bounded_cleanup_task,
@@ -464,6 +465,18 @@ class DockerEgressAdapter(SandboxEgressAdapter):
             setup_commands=request.setup_commands,
             docker_cli_env_allowlist=self._docker_cli_env_allowlist,
         )
+
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        del outcome
+        if not isinstance(runner, DockerRunner):
+            raise TypeError("Docker adapter received a different runner type.")
+        await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
     async def _run(self, argv: Sequence[str]) -> None:
         exit_code, _stderr = await self._docker_exec(argv)

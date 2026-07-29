@@ -4,14 +4,17 @@ import asyncio
 import contextlib
 import importlib
 import posixpath
+import random
 from abc import abstractmethod
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from math import isfinite
 from types import ModuleType
 from typing import Any, Literal, cast
 
 from cayu._exception_groups import exception_group_children
+from cayu._exception_state import exception_state, set_exception_state
+from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -47,18 +50,47 @@ DEFAULT_MICROSANDBOX_RECONNECT_TIMEOUT_SECONDS = 15.0
 MICROSANDBOX_NAME_MAX_BYTES = 128
 _MICROSANDBOX_REMOVE_INITIAL_BACKOFF_SECONDS = 0.05
 _MICROSANDBOX_REMOVE_MAX_BACKOFF_SECONDS = 0.5
+_MICROSANDBOX_SETTLEMENT_MAX_BACKOFF_SECONDS = 30.0
+_MICROSANDBOX_SETTLEMENT_JITTER_RATIO = 0.2
 _MICROSANDBOX_CLEANUP_DIAGNOSTIC_TYPE = "cayu.microsandbox_cleanup.v1"
 MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS = 1.0
 _MICROSANDBOX_NO_EXIT_EVENT_ERROR = "runtime error: exec session ended without exit event"
 _MICROSANDBOX_UNAVAILABLE_REMEDIATION = (
     "Reconnect to or replace the Microsandbox before executing more commands."
 )
+_MICROSANDBOX_RECONNECT_SETTLEMENT_TASK_ATTRIBUTE = "_cayu_microsandbox_reconnect_settlement_task"
+_MICROSANDBOX_RECONNECT_SETTLEMENT_TASK_TOKEN = object()
+_MICROSANDBOX_RECONNECT_SETTLEMENT_TASKS: set[asyncio.Task[None]] = set()
 
 MicrosandboxCloseAction = Literal["remove", "stop", "detach", "none"]
 
 
 class MicrosandboxReconnectIdentityError(ValueError):
     """The provider handle does not match durable reconnect identity."""
+
+
+@dataclass(frozen=True, slots=True)
+class _MicrosandboxReconnectSettlementTaskHandoff:
+    task: asyncio.Task[None]
+    token: object
+
+
+def microsandbox_reconnect_settlement_task(
+    error: BaseException,
+) -> asyncio.Task[None] | None:
+    """Return deferred restart settlement owned by a reconnect failure."""
+
+    handoff = exception_state(
+        error,
+        _MICROSANDBOX_RECONNECT_SETTLEMENT_TASK_ATTRIBUTE,
+    )
+    if (
+        type(handoff) is not _MicrosandboxReconnectSettlementTaskHandoff
+        or handoff.token is not _MICROSANDBOX_RECONNECT_SETTLEMENT_TASK_TOKEN
+        or not isinstance(handoff.task, asyncio.Task)
+    ):
+        return None
+    return handoff.task
 
 
 class MicrosandboxWorkspaceCapability(RunnerWorkspaceCapability):
@@ -196,9 +228,12 @@ class MicrosandboxRunner(Runner):
         remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
         env_overlay: Mapping[str, str] | None = None,
         sandbox_module: ModuleType | Any | None = None,
+        _restarted_from_stopped: bool = False,
     ) -> None:
         if sandbox is None:
             raise TypeError("MicrosandboxRunner sandbox cannot be None.")
+        if type(_restarted_from_stopped) is not bool:
+            raise TypeError("MicrosandboxRunner restart evidence must be a bool.")
         self.name = _validate_sandbox_name(name)
         self.default_cwd = _validate_guest_root(default_cwd)
         self.close_action = _validate_close_action(close_action)
@@ -212,6 +247,7 @@ class MicrosandboxRunner(Runner):
         self.env_overlay = dict(env_overlay) if env_overlay else {}
         self._sandbox = sandbox
         self._sandbox_module = sandbox_module
+        self._restarted_from_stopped = _restarted_from_stopped
         self._sftp_client: Any = None
         self._sftp: Any = None
         self._sftp_lock = asyncio.Lock()
@@ -340,6 +376,61 @@ class MicrosandboxRunner(Runner):
         does not inspect, replace, or strengthen that network policy.
         """
 
+        return await cls._from_existing(
+            name,
+            default_cwd=default_cwd,
+            close_action=close_action,
+            cancel_timeout_s=cancel_timeout_s,
+            liveness_timeout_s=liveness_timeout_s,
+            cancellation_cleanup=cancellation_cleanup,
+            timeout_cleanup=timeout_cleanup,
+            remove_timeout_s=remove_timeout_s,
+            env_overlay=env_overlay,
+            sandbox_module=sandbox_module,
+            reconnect_timeout_s=reconnect_timeout_s,
+            expected_created_at=expected_created_at,
+            lifecycle_only=False,
+        )
+
+    @classmethod
+    async def _from_existing_for_lifecycle(
+        cls,
+        name: str,
+        *,
+        close_action: Literal["stop", "remove"],
+        sandbox_module: ModuleType | Any | None,
+        reconnect_timeout_s: float,
+        expected_created_at: float,
+    ) -> MicrosandboxRunner:
+        """Attach only to apply a non-executable lifecycle transition."""
+
+        return await cls._from_existing(
+            name,
+            close_action=close_action,
+            sandbox_module=sandbox_module,
+            reconnect_timeout_s=reconnect_timeout_s,
+            expected_created_at=expected_created_at,
+            lifecycle_only=True,
+        )
+
+    @classmethod
+    async def _from_existing(
+        cls,
+        name: str,
+        *,
+        default_cwd: str = DEFAULT_MICROSANDBOX_CWD,
+        close_action: MicrosandboxCloseAction = "none",
+        cancel_timeout_s: float | None = DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
+        liveness_timeout_s: float = MICROSANDBOX_LIVENESS_TIMEOUT_SECONDS,
+        cancellation_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
+        timeout_cleanup: RunnerCleanupPolicy = DEFAULT_RUNNER_TIMEOUT_CLEANUP_POLICY,
+        remove_timeout_s: float = DEFAULT_MICROSANDBOX_REMOVE_TIMEOUT_SECONDS,
+        env_overlay: Mapping[str, str] | None = None,
+        sandbox_module: ModuleType | Any | None = None,
+        reconnect_timeout_s: float = DEFAULT_MICROSANDBOX_RECONNECT_TIMEOUT_SECONDS,
+        expected_created_at: float | None = None,
+        lifecycle_only: bool,
+    ) -> MicrosandboxRunner:
         module = _microsandbox_module(sandbox_module)
         sandbox_name = _validate_sandbox_name(name)
         _validate_guest_root(default_cwd)
@@ -351,22 +442,124 @@ class MicrosandboxRunner(Runner):
         liveness_timeout = _validate_liveness_timeout(liveness_timeout_s)
         removal_timeout = _validate_remove_timeout(remove_timeout_s)
         reconnect_timeout = _validate_reconnect_timeout(reconnect_timeout_s)
+        if type(lifecycle_only) is not bool:
+            raise TypeError("lifecycle_only must be a bool.")
+        restarted_from_stopped = False
+        loop = asyncio.get_running_loop()
+        reconnect_deadline = loop.time() + reconnect_timeout
         try:
-            async with asyncio.timeout(reconnect_timeout):
+            async with asyncio.timeout_at(reconnect_deadline):
                 handle = await module.Sandbox.get(sandbox_name)
-                if expected_created_at is not None:
-                    actual_created_at = _validate_provider_created_at(
-                        getattr(handle, "created_at", None)
+            if expected_created_at is not None:
+                actual_created_at = _validate_provider_created_at(
+                    getattr(handle, "created_at", None)
+                )
+                if actual_created_at != expected_created_at:
+                    raise MicrosandboxReconnectIdentityError(
+                        "Microsandbox reconnect provider incarnation does not match."
                     )
-                    if actual_created_at != expected_created_at:
-                        raise MicrosandboxReconnectIdentityError(
-                            "Microsandbox reconnect provider incarnation does not match."
+            status = _sandbox_status_value(handle)
+            if status is not None and status.lower() == "stopped":
+                if lifecycle_only:
+                    # Lifecycle-only cleanup must never make guest code
+                    # executable merely to obtain a connected runner.
+                    sandbox = handle
+                else:
+                    start = getattr(module.Sandbox, "start", None)
+                    if start is None:
+                        raise RuntimeError("Microsandbox SDK cannot restart a stopped sandbox.")
+                    restarted_sandbox: Any = None
+                    start_task = asyncio.create_task(
+                        start(sandbox_name, detached=True),
+                        name=f"cayu-microsandbox-reconnect-start-{sandbox_name}",
+                    )
+                    try:
+                        start_outcome = await await_shielded_task_outcome(
+                            start_task,
+                            timeout_s=max(reconnect_deadline - loop.time(), 0.0),
                         )
-                sandbox = await handle.connect()
+                        if start_outcome.timed_out:
+                            settlement_task = _defer_reconnect_start_restoration(
+                                module,
+                                handle,
+                                sandbox_name,
+                                start_task,
+                            )
+                            signal: BaseException
+                            if start_outcome.cancellation is not None:
+                                signal = start_outcome.cancellation
+                            else:
+                                signal = TimeoutError(
+                                    "Microsandbox stopped-sandbox restart exceeded its "
+                                    "reconnect deadline."
+                                )
+                            _attach_reconnect_settlement_task(signal, settlement_task)
+                            raise signal
+                        restarted_sandbox = start_outcome.result
+                        if (
+                            start_outcome.error is not None
+                            and start_outcome.cancellation is not None
+                        ):
+                            restart_error = BaseExceptionGroup(
+                                "Microsandbox stopped-sandbox restart failed after "
+                                "caller cancellation.",
+                                [start_outcome.cancellation, start_outcome.error],
+                            )
+                            raise restart_error from start_outcome.cancellation
+                        if start_outcome.error is not None:
+                            raise start_outcome.error
+                        if start_outcome.cancellation is not None:
+                            raise start_outcome.cancellation
+                        restarted_from_stopped = True
+                        try:
+                            async with asyncio.timeout_at(reconnect_deadline):
+                                handle = await module.Sandbox.get(sandbox_name)
+                                if expected_created_at is not None:
+                                    restarted_created_at = _validate_provider_created_at(
+                                        getattr(handle, "created_at", None)
+                                    )
+                                    if restarted_created_at != expected_created_at:
+                                        raise MicrosandboxReconnectIdentityError(
+                                            "Microsandbox restarted provider incarnation does "
+                                            "not match."
+                                        )
+                                sandbox = (
+                                    restarted_sandbox
+                                    if restarted_sandbox is not None
+                                    else await handle.connect()
+                                )
+                        except TimeoutError as reconnect_error:
+                            settlement_task = _defer_reconnect_restoration(
+                                module,
+                                restarted_sandbox if restarted_sandbox is not None else handle,
+                                sandbox_name,
+                            )
+                            _attach_reconnect_settlement_task(
+                                reconnect_error,
+                                settlement_task,
+                            )
+                            raise
+                    except BaseException as reconnect_error:
+                        if microsandbox_reconnect_settlement_task(reconnect_error) is None:
+                            await _stop_restarted_sandbox_after_failed_reconnect(
+                                module,
+                                restarted_sandbox if restarted_sandbox is not None else handle,
+                                sandbox_name,
+                                reconnect_error,
+                                deadline=reconnect_deadline,
+                            )
+                        raise
+            else:
+                async with asyncio.timeout_at(reconnect_deadline):
+                    sandbox = await handle.connect()
         except TimeoutError as exc:
-            raise TimeoutError(
+            error = TimeoutError(
                 f"Microsandbox reconnect did not attach within {reconnect_timeout:g} seconds."
-            ) from exc
+            )
+            settlement_task = microsandbox_reconnect_settlement_task(exc)
+            if settlement_task is not None:
+                _attach_reconnect_settlement_task(error, settlement_task)
+            raise error from exc
         return cls(
             sandbox,
             name=sandbox_name,
@@ -379,6 +572,7 @@ class MicrosandboxRunner(Runner):
             remove_timeout_s=removal_timeout,
             env_overlay=env_overlay,
             sandbox_module=module,
+            _restarted_from_stopped=restarted_from_stopped,
         )
 
     @property
@@ -390,6 +584,49 @@ class MicrosandboxRunner(Runner):
         """Whether this runner instance has completed its lifecycle action."""
 
         return self._closed
+
+    @property
+    def restarted_from_stopped(self) -> bool:
+        """Whether this attachment made a stopped allocation executable."""
+
+        return self._restarted_from_stopped
+
+    def _defer_stopped_boundary_restoration(
+        self,
+        initial_task: asyncio.Task[Any],
+    ) -> asyncio.Task[None]:
+        """Retain retry ownership after a restarted allocation fails to stop."""
+
+        if not self._restarted_from_stopped:
+            raise RuntimeError(
+                "Stopped-boundary restoration requires a runner restarted from stopped."
+            )
+        if not isinstance(initial_task, asyncio.Task):
+            raise TypeError("Stopped-boundary restoration requires an asyncio Task.")
+        return _defer_reconnect_restoration(
+            _microsandbox_module(self._sandbox_module),
+            self._sandbox,
+            self.name,
+            initial_task=initial_task,
+        )
+
+    def _defer_terminal_removal(
+        self,
+        initial_task: asyncio.Task[Any] | None = None,
+    ) -> asyncio.Task[None]:
+        """Retain retry ownership until a fresh allocation is removed."""
+
+        if self.close_action != "remove":
+            raise RuntimeError("Terminal removal settlement requires close_action='remove'.")
+        if initial_task is not None and not isinstance(initial_task, asyncio.Task):
+            raise TypeError("Terminal removal settlement requires an asyncio Task.")
+        return _defer_microsandbox_settlement(
+            _microsandbox_module(self._sandbox_module),
+            self.close,
+            self.name,
+            operation="terminal-removal",
+            initial_task=initial_task,
+        )
 
     def workspace_capability(
         self,
@@ -1387,8 +1624,11 @@ def _sandbox_status_value(value: Any) -> str | None:
     status = getattr(value, "status", None)
     if callable(status):
         status = status()
-    if type(status) is str and status:
-        return status
+    # The supported SDK exposes SandboxStatus as a str-backed enum. Accept
+    # that authoritative representation without broad coercion of arbitrary
+    # status objects.
+    if isinstance(status, str) and status:
+        return str(status)
     return None
 
 
@@ -1457,3 +1697,258 @@ async def _cleanup_created_sandbox_after_failure(
         ) from cleanup_group
     except (BaseExceptionGroup, Exception, asyncio.CancelledError) as cleanup_error:
         raise BaseExceptionGroup(message, [original_error, cleanup_error]) from cleanup_error
+
+
+def _attach_reconnect_settlement_task(
+    error: BaseException,
+    task: asyncio.Task[None],
+) -> None:
+    handoff = _MicrosandboxReconnectSettlementTaskHandoff(
+        task=task,
+        token=_MICROSANDBOX_RECONNECT_SETTLEMENT_TASK_TOKEN,
+    )
+    if not set_exception_state(
+        error,
+        _MICROSANDBOX_RECONNECT_SETTLEMENT_TASK_ATTRIBUTE,
+        handoff,
+    ):
+        raise RuntimeError("Could not attach Microsandbox reconnect settlement ownership.")
+
+
+def _retain_reconnect_settlement_task(task: asyncio.Task[None]) -> None:
+    """Keep deferred provider settlement alive and consume its terminal error."""
+
+    _MICROSANDBOX_RECONNECT_SETTLEMENT_TASKS.add(task)
+
+    def settled(completed: asyncio.Task[None]) -> None:
+        _MICROSANDBOX_RECONNECT_SETTLEMENT_TASKS.discard(completed)
+        if completed.cancelled():
+            # Cancelled tasks do not emit unhandled-exception warnings. Reading
+            # result() here would consume the cancellation message before the
+            # lifecycle owner observes the original signal.
+            return
+        with contextlib.suppress(BaseException):
+            completed.result()
+
+    task.add_done_callback(settled)
+
+
+def _defer_reconnect_start_restoration(
+    module: ModuleType | Any,
+    handle: Any,
+    name: str,
+    start_task: asyncio.Task[Any],
+) -> asyncio.Task[None]:
+    """Own an accepted restart until it settles and the guest is stopped."""
+
+    async def settle() -> None:
+        start_outcome = await await_shielded_task_outcome(start_task)
+        sandbox = start_outcome.result if start_outcome.result is not None else handle
+        await _retry_reconnect_restoration(
+            module,
+            sandbox,
+        )
+
+    task = asyncio.create_task(
+        settle(),
+        name=f"cayu-microsandbox-reconnect-settlement-{name}",
+    )
+    _retain_reconnect_settlement_task(task)
+    return task
+
+
+def _defer_reconnect_restoration(
+    module: ModuleType | Any,
+    sandbox: Any,
+    name: str,
+    *,
+    initial_task: asyncio.Task[Any] | None = None,
+) -> asyncio.Task[None]:
+    """Retain one retrying owner until a restarted guest is stopped."""
+
+    return _defer_microsandbox_settlement(
+        module,
+        lambda: _stop_sandbox(
+            module,
+            sandbox,
+            not_found_is_removed=True,
+        ),
+        name,
+        operation="reconnect-restoration",
+        initial_task=initial_task,
+    )
+
+
+async def _retry_reconnect_restoration(
+    module: ModuleType | Any,
+    sandbox: Any,
+) -> None:
+    """Retry transient provider failures while the exact reconnect owner is retained."""
+
+    await _retry_microsandbox_settlement(
+        module,
+        lambda: _stop_sandbox(
+            module,
+            sandbox,
+            not_found_is_removed=True,
+        ),
+    )
+
+
+def _defer_microsandbox_settlement(
+    module: ModuleType | Any,
+    operation_call: Callable[[], Awaitable[Any]],
+    name: str,
+    *,
+    operation: str,
+    initial_task: asyncio.Task[Any] | None = None,
+) -> asyncio.Task[None]:
+    """Retain one owner while a positively transient cleanup is retried."""
+
+    async def settle() -> None:
+        if initial_task is not None:
+            try:
+                await asyncio.shield(initial_task)
+                return
+            except BaseException as error:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                if not _is_retryable_microsandbox_settlement_failure(module, error):
+                    raise
+            await _sleep_before_microsandbox_settlement_retry(
+                _MICROSANDBOX_REMOVE_INITIAL_BACKOFF_SECONDS
+            )
+        await _retry_microsandbox_settlement(module, operation_call)
+
+    if initial_task is not None and not initial_task.done():
+        _retain_reconnect_settlement_task(initial_task)
+    task = asyncio.create_task(
+        settle(),
+        name=f"cayu-microsandbox-{operation}-settlement-{name}",
+    )
+    _retain_reconnect_settlement_task(task)
+    return task
+
+
+async def _retry_microsandbox_settlement(
+    module: ModuleType | Any,
+    operation_call: Callable[[], Awaitable[Any]],
+) -> None:
+    """Retry only failures carrying positive transient provider evidence."""
+
+    backoff_s = _MICROSANDBOX_REMOVE_INITIAL_BACKOFF_SECONDS
+    while True:
+        try:
+            await operation_call()
+            return
+        except BaseException as error:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            if not _is_retryable_microsandbox_settlement_failure(module, error):
+                raise
+        await _sleep_before_microsandbox_settlement_retry(backoff_s)
+        backoff_s = min(
+            backoff_s * 2,
+            _MICROSANDBOX_SETTLEMENT_MAX_BACKOFF_SECONDS,
+        )
+
+
+async def _sleep_before_microsandbox_settlement_retry(delay_s: float) -> None:
+    jitter_s = delay_s * _MICROSANDBOX_SETTLEMENT_JITTER_RATIO
+    await _sleep_before_microsandbox_retry(random.uniform(delay_s - jitter_s, delay_s + jitter_s))
+
+
+def _is_retryable_microsandbox_settlement_failure(
+    module: ModuleType | Any,
+    error: BaseException,
+) -> bool:
+    """Return whether every failure leaf positively permits an automatic retry."""
+
+    pending = [error]
+    while pending:
+        candidate = pending.pop()
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if not children:
+                return False
+            pending.extend(children)
+            continue
+        if isinstance(candidate, asyncio.CancelledError):
+            continue
+        if not isinstance(candidate, Exception):
+            # Fatal signals and unknown BaseException leaves remain authoritative.
+            return False
+        if isinstance(candidate, PermissionError):
+            return False
+        if isinstance(candidate, (MicrosandboxCleanupError, TimeoutError, ConnectionError)):
+            continue
+        if _is_microsandbox_error(module, candidate, "SandboxStillRunningError"):
+            continue
+        # Unknown, configuration, authentication, and unsupported-operation
+        # failures require an explicit later recovery attempt. Automatically
+        # retrying them would turn retained ownership into an unbounded provider
+        # request loop.
+        return False
+    return True
+
+
+async def _stop_restarted_sandbox_after_failed_reconnect(
+    module: ModuleType | Any,
+    sandbox: Any,
+    name: str,
+    original_error: BaseException,
+    *,
+    deadline: float,
+) -> None:
+    """Restore the stopped boundary before a failed reconnect releases ownership."""
+
+    async def restore_stopped_boundary() -> None:
+        await _stop_sandbox(
+            module,
+            sandbox,
+            not_found_is_removed=True,
+        )
+
+    stop_task = asyncio.create_task(
+        restore_stopped_boundary(),
+        name=f"cayu-microsandbox-reconnect-stop-{name}",
+    )
+    outcome = await await_shielded_task_outcome(
+        stop_task,
+        cancellation=(
+            original_error if isinstance(original_error, asyncio.CancelledError) else None
+        ),
+        timeout_s=max(deadline - asyncio.get_running_loop().time(), 0.0),
+    )
+    failures: list[BaseException] = [original_error]
+    if outcome.error is not None and outcome.error is not original_error:
+        failures.append(outcome.error)
+    if (
+        outcome.cancellation is not None
+        and outcome.cancellation is not original_error
+        and outcome.cancellation is not outcome.error
+    ):
+        failures.append(outcome.cancellation)
+    if outcome.timed_out:
+        failures.append(
+            TimeoutError(
+                "Microsandbox stopped-sandbox restoration exceeded its reconnect deadline."
+            )
+        )
+    if len(failures) > 1:
+        restoration_error = BaseExceptionGroup(
+            "Microsandbox reconnect failed and restoring the stopped allocation also failed.",
+            failures,
+        )
+        settlement_task = _defer_reconnect_restoration(
+            module,
+            sandbox,
+            name,
+            initial_task=stop_task,
+        )
+        # The live retry task is the concrete ownership evidence downstream
+        # uses to keep the reconnect claim fenced until restoration succeeds.
+        _attach_reconnect_settlement_task(restoration_error, settlement_task)
+        raise restoration_error from failures[-1]

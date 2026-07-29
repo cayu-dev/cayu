@@ -1533,6 +1533,10 @@ def test_e2b_runner_reports_timeout_cleanup_failure() -> None:
         }
     ]
     sandbox.commands.next_handle = FakeHandle()
+    with pytest.raises(RuntimeError, match="mutation quiescence"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd")))
+    assert asyncio.run(runner.await_pending_command_settlement()) is False
+    runner.reopen_exec()
     after = asyncio.run(runner.exec(ExecCommand.process("pwd")))
     assert after.exit_code == 0
 
@@ -1669,22 +1673,27 @@ def test_e2b_runner_waits_for_start_handle_on_cancellation() -> None:
     ]
 
 
-def test_e2b_runner_stays_reusable_when_cancelled_before_handle_is_returned() -> None:
-    async def run() -> tuple[FakeSandbox, int]:
+def test_e2b_runner_fences_handleless_cancelled_start_until_operator_verification() -> None:
+    async def run() -> tuple[FakeSandbox, BaseException, bool, int]:
         sandbox = FakeSandbox()
         sandbox.commands.cancel_next_background = True
         runner = E2BRunner(sandbox, close_action="kill", e2b_module=FakeE2BModule)
 
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await runner.exec(ExecCommand.process("sleep", "30"))
+        with pytest.raises(RuntimeError, match="remote command mutation quiescence"):
+            await runner.exec(ExecCommand.process("pwd"))
+        settlement = await runner.await_pending_command_settlement()
+        runner.reopen_exec()
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
         await runner.close()
-        return sandbox, exc_info.value, after.exit_code
+        return sandbox, exc_info.value, settlement, after.exit_code
 
-    sandbox, exc, after = asyncio.run(run())
+    sandbox, exc, settlement, after = asyncio.run(run())
 
     assert sandbox.kill_calls == 1
+    assert settlement is False
     assert after == 0
     assert exc.artifacts == [
         {
@@ -1698,8 +1707,8 @@ def test_e2b_runner_stays_reusable_when_cancelled_before_handle_is_returned() ->
     ]
 
 
-def test_e2b_runner_cancels_delayed_start_task_when_handle_wait_times_out() -> None:
-    async def run() -> tuple[FakeSandbox, int]:
+def test_e2b_runner_fences_cancelled_start_without_remote_abort_evidence() -> None:
+    async def run() -> tuple[FakeSandbox, BaseException, bool, int]:
         sandbox = FakeSandbox()
         sandbox.commands.background_delay_s = 1
         runner = E2BRunner(
@@ -1713,14 +1722,19 @@ def test_e2b_runner_cancels_delayed_start_task_when_handle_wait_times_out() -> N
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
         await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="remote command mutation quiescence"):
+            await runner.exec(ExecCommand.process("pwd"))
+        settlement = await runner.await_pending_command_settlement()
+        runner.reopen_exec()
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
-        return sandbox, exc_info.value, after.exit_code
+        return sandbox, exc_info.value, settlement, after.exit_code
 
-    sandbox, exc, after = asyncio.run(run())
+    sandbox, exc, settlement, after = asyncio.run(run())
 
     assert sandbox.commands.start_cancelled is True
     assert sandbox.kill_calls == 0
+    assert settlement is False
     assert after == 0
     assert exc.artifacts == [
         {
@@ -1734,8 +1748,138 @@ def test_e2b_runner_cancels_delayed_start_task_when_handle_wait_times_out() -> N
     ]
 
 
+@pytest.mark.parametrize("start_outcome", ["cancelled", "failed"])
+def test_e2b_runner_does_not_settle_lost_start_acknowledgement(
+    start_outcome: str,
+) -> None:
+    async def run() -> tuple[bool, bool, bool]:
+        remote_effect_allowed = asyncio.Event()
+        remote_effect_completed = asyncio.Event()
+
+        class LostAcknowledgementCommands(FakeCommands):
+            def __init__(self) -> None:
+                super().__init__()
+                self.remote_effect_task: asyncio.Task[None] | None = None
+
+            async def run(self, cmd: str, **kwargs: Any) -> Any:
+                if not kwargs.get("background"):
+                    return await super().run(cmd, **kwargs)
+                self.calls.append({"cmd": cmd, **kwargs})
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.start_cancelled = True
+
+                    async def apply_remote_effect() -> None:
+                        await remote_effect_allowed.wait()
+                        remote_effect_completed.set()
+
+                    self.remote_effect_task = asyncio.create_task(apply_remote_effect())
+                    # Outlive both bounded handle waits so cleanup owns the
+                    # eventual handle-less outcome rather than the caller.
+                    await asyncio.sleep(0.02)
+                    if start_outcome == "failed":
+                        raise RuntimeError("E2B start acknowledgement was lost") from None
+                    raise
+
+        sandbox = FakeSandbox()
+        commands = LostAcknowledgementCommands()
+        sandbox.commands = commands
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+        command_task = asyncio.create_task(runner.exec(ExecCommand.process("mutate-workspace")))
+        await asyncio.sleep(0)
+        command_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command_task
+        assert command_task.cancelled()
+        assert command_task.cancelling() == 1
+
+        settled = await runner.await_pending_command_settlement()
+        effect_before_release = remote_effect_completed.is_set()
+        with pytest.raises(RuntimeError, match="positive remote abort evidence"):
+            await runner.exec(ExecCommand.process("new-owner-work"))
+
+        remote_effect_allowed.set()
+        assert commands.remote_effect_task is not None
+        await commands.remote_effect_task
+        return settled, effect_before_release, remote_effect_completed.is_set()
+
+    settled, effect_before_release, effect_after_release = asyncio.run(run())
+
+    assert settled is False
+    assert effect_before_release is False
+    assert effect_after_release is True
+
+
+def test_e2b_runner_keeps_uncertainty_latched_across_concurrent_cleanups() -> None:
+    async def run() -> tuple[bool, bool, bool, bool]:
+        successful_handle = FakeHandle()
+
+        class ConcurrentLostAcknowledgementCommands(FakeCommands):
+            def __init__(self) -> None:
+                super().__init__()
+                self.background_calls = 0
+
+            async def run(self, cmd: str, **kwargs: Any) -> Any:
+                if not kwargs.get("background"):
+                    return await super().run(cmd, **kwargs)
+                self.calls.append({"cmd": cmd, **kwargs})
+                self.background_calls += 1
+                call = self.background_calls
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.015 if call == 1 else 0.025)
+                    if call == 1:
+                        raise RuntimeError("first E2B start acknowledgement was lost") from None
+                    return successful_handle
+
+        sandbox = FakeSandbox()
+        sandbox.commands = ConcurrentLostAcknowledgementCommands()
+        runner = E2BRunner(
+            sandbox,
+            cancel_timeout_s=0.01,
+            e2b_module=FakeE2BModule,
+        )
+        commands = (
+            asyncio.create_task(runner.exec(ExecCommand.process("first-mutation"))),
+            asyncio.create_task(runner.exec(ExecCommand.process("second-mutation"))),
+        )
+        await asyncio.sleep(0)
+        for command in commands:
+            command.cancel()
+        for command in commands:
+            with pytest.raises(asyncio.CancelledError):
+                await command
+
+        settled = await runner.await_pending_command_settlement()
+        exec_closed_before_verification = runner._exec_closed
+        sandbox.commands = FakeCommands()
+        with pytest.raises(RuntimeError, match="positive remote abort evidence"):
+            await runner.exec(ExecCommand.process("new-owner-work"))
+        runner.reopen_exec()
+        after = await runner.exec(ExecCommand.process("verified-work"))
+        return (
+            settled,
+            exec_closed_before_verification,
+            successful_handle.killed,
+            after.exit_code == 0,
+        )
+
+    settled, exec_closed, successful_cleanup, reopened = asyncio.run(run())
+
+    assert settled is False
+    assert exec_closed is True
+    assert successful_cleanup is True
+    assert reopened is True
+
+
 def test_e2b_runner_bounds_delayed_start_task_drain_when_sdk_ignores_cancellation() -> None:
-    async def run() -> tuple[FakeSandbox, bool, int]:
+    async def run() -> tuple[FakeSandbox, BaseException, bool, int, bool, bool]:
         sandbox = FakeSandbox()
         sandbox.commands.background_delay_s = 1
         sandbox.commands.hang_after_start_cancel = True
@@ -1752,14 +1896,34 @@ def test_e2b_runner_bounds_delayed_start_task_drain_when_sdk_ignores_cancellatio
         await asyncio.sleep(0.05)
         with pytest.raises(RuntimeError, match="command state is unknown"):
             await runner.exec(ExecCommand.process("pwd"))
-        return sandbox, exc_info.value, runner._exec_closed, len(runner._late_start_cleanup_tasks)
+        exec_closed = runner._exec_closed
+        settlement = await runner.await_pending_command_settlement()
+        runner.reopen_exec()
+        reopened_settlement = await runner.await_pending_command_settlement()
+        return (
+            sandbox,
+            exc_info.value,
+            exec_closed,
+            len(runner._late_start_cleanup_tasks),
+            settlement,
+            reopened_settlement,
+        )
 
-    sandbox, exc, exec_closed, late_cleanup_tasks = asyncio.run(run())
+    (
+        sandbox,
+        exc,
+        exec_closed,
+        late_cleanup_tasks,
+        settlement,
+        reopened_settlement,
+    ) = asyncio.run(run())
 
     assert sandbox.commands.start_cancelled is True
     assert sandbox.kill_calls == 0
     assert exec_closed is True
     assert late_cleanup_tasks == 0
+    assert settlement is False
+    assert reopened_settlement is True
     assert exc.artifacts == [
         {
             "type": "cayu.runner_cleanup.v1",
@@ -1794,10 +1958,10 @@ def test_e2b_runner_kills_late_handle_after_start_cancellation_timeout() -> None
         with pytest.raises(RuntimeError, match="cleanup is pending"):
             await runner.exec(ExecCommand.process("pwd"))
 
-        for _ in range(20):
-            if late_handle.killed:
-                break
-            await asyncio.sleep(0.01)
+        settlement = asyncio.create_task(runner.await_pending_command_settlement())
+        await asyncio.sleep(0)
+        assert not settlement.done()
+        assert await settlement is True
 
         sandbox.commands.next_handle = FakeHandle()
         after = await runner.exec(ExecCommand.process("pwd"))
@@ -1910,7 +2074,7 @@ def test_e2b_runner_late_start_skip_cleanup_keeps_exec_closed() -> None:
     ]
 
 
-def test_e2b_runner_stays_reusable_when_timeout_happens_before_handle_is_returned() -> None:
+def test_e2b_runner_fences_timeout_before_handle_until_operator_verification() -> None:
     sandbox = FakeSandbox()
     sandbox.commands.timeout_next_background = True
     runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
@@ -1931,12 +2095,16 @@ def test_e2b_runner_stays_reusable_when_timeout_happens_before_handle_is_returne
         }
     ]
     sandbox.commands.next_handle = FakeHandle()
+    with pytest.raises(RuntimeError, match="mutation quiescence"):
+        asyncio.run(runner.exec(ExecCommand.process("pwd")))
+    assert asyncio.run(runner.await_pending_command_settlement()) is False
+    runner.reopen_exec()
     after = asyncio.run(runner.exec(ExecCommand.process("pwd")))
     assert after.exit_code == 0
 
 
 def test_e2b_runner_times_out_delayed_start_without_hanging() -> None:
-    async def run() -> tuple[FakeSandbox, ExecResult, int]:
+    async def run() -> tuple[FakeSandbox, ExecResult, bool, int]:
         sandbox = FakeSandbox()
         sandbox.commands.background_delay_s = 30
         runner = E2BRunner(
@@ -1951,15 +2119,20 @@ def test_e2b_runner_times_out_delayed_start_without_hanging() -> None:
         )
         sandbox.commands.background_delay_s = 0
         sandbox.commands.next_handle = FakeHandle()
+        with pytest.raises(RuntimeError, match="mutation quiescence"):
+            await runner.exec(ExecCommand.process("pwd"))
+        settlement = await runner.await_pending_command_settlement()
+        runner.reopen_exec()
         after = await runner.exec(ExecCommand.process("pwd"))
-        return sandbox, result, after.exit_code
+        return sandbox, result, settlement, after.exit_code
 
-    sandbox, result, after = asyncio.run(run())
+    sandbox, result, settlement, after = asyncio.run(run())
 
     assert sandbox.commands.start_cancelled is True
     assert result.timed_out is True
     assert result.exit_code == -9
     assert sandbox.kill_calls == 0
+    assert settlement is False
     assert after == 0
     assert result.artifacts == [
         {
@@ -2015,7 +2188,7 @@ def test_e2b_runner_closes_exec_when_delayed_start_timeout_cannot_be_resolved() 
 
 
 def test_e2b_runner_bounds_hanging_command_kill_on_cancellation() -> None:
-    async def run() -> tuple[FakeHandle, int]:
+    async def run() -> tuple[FakeHandle, BaseException, bool, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         sandbox.commands.next_handle = handle
@@ -2031,12 +2204,17 @@ def test_e2b_runner_bounds_hanging_command_kill_on_cancellation() -> None:
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await asyncio.wait_for(task, timeout=1)
         sandbox.commands.next_handle = FakeHandle()
+        with pytest.raises(RuntimeError, match="mutation quiescence"):
+            await runner.exec(ExecCommand.process("pwd"))
+        settlement = await runner.await_pending_command_settlement()
+        runner.reopen_exec()
         after = await runner.exec(ExecCommand.process("pwd"))
-        return handle, exc_info.value, after.exit_code
+        return handle, exc_info.value, settlement, after.exit_code
 
-    handle, exc, after = asyncio.run(run())
+    handle, exc, settlement, after = asyncio.run(run())
 
     assert handle.killed is False
+    assert settlement is False
     assert after == 0
     assert exc.artifacts == [
         {
@@ -2049,8 +2227,8 @@ def test_e2b_runner_bounds_hanging_command_kill_on_cancellation() -> None:
     ]
 
 
-def test_e2b_runner_stays_reusable_when_command_kill_fails() -> None:
-    async def run() -> tuple[FakeHandle, int]:
+def test_e2b_runner_fences_failed_command_kill_until_operator_verification() -> None:
+    async def run() -> tuple[FakeHandle, BaseException, bool, int]:
         sandbox = FakeSandbox()
         handle = BlockingHandle()
         handle.fail_kill = True
@@ -2065,12 +2243,17 @@ def test_e2b_runner_stays_reusable_when_command_kill_fails() -> None:
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
         sandbox.commands.next_handle = FakeHandle()
+        with pytest.raises(RuntimeError, match="mutation quiescence"):
+            await runner.exec(ExecCommand.process("pwd"))
+        settlement = await runner.await_pending_command_settlement()
+        runner.reopen_exec()
         after = await runner.exec(ExecCommand.process("pwd"))
-        return handle, exc_info.value, after.exit_code
+        return handle, exc_info.value, settlement, after.exit_code
 
-    handle, exc, after = asyncio.run(run())
+    handle, exc, settlement, after = asyncio.run(run())
 
     assert handle.killed is False
+    assert settlement is False
     assert after == 0
     assert exc.artifacts == [
         {

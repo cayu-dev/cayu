@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "5"
+APP_MANIFEST_SCHEMA_VERSION = "6"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -229,10 +229,11 @@ class RuntimeManifest(_ManifestModel):
     max_file_attachments_per_request: int
     tool_timeout_seconds: float | None
     max_parallel_tool_calls: int
+    max_environment_lifecycle_owners: int
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["5"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["6"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -301,6 +302,7 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         max_file_attachments_per_request=app._max_file_attachments_per_request,
         tool_timeout_seconds=app._tool_timeout_seconds,
         max_parallel_tool_calls=app._max_parallel_tool_calls,
+        max_environment_lifecycle_owners=app._max_environment_lifecycle_owners,
     )
     capabilities = _capabilities(
         agents=agents,

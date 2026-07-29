@@ -81,6 +81,59 @@ semantics without unsafe hostname inference.
 bills it once as output. Ordinary OpenAI-compatible endpoints remain on
 `UsageDialect.OPENAI`, where unexplained token-total mismatches fail closed.
 
+### SyncBinding retains live target ownership until exact-owner cleanup
+
+`SyncBinding` reservations no longer expire solely because a bind is old. Each
+bind now owns every resolved target—fixed or factory-created—through an opaque
+process-local generation keyed by the workspace's stable resource identity
+until that exact generation finalizes successfully or is explicitly abandoned.
+The registry is shared across `SyncBinding` instances in the process, so two
+bindings that resolve to the same filesystem cannot both clear or copy it.
+For direct binding callers, failed or cancelled finalization remains retryable,
+and stale cleanup cannot release a newer owner. Cancellation received after a
+workspace mutation is dispatched is propagated only after that mutation becomes
+quiescent, preventing an old worker from changing files owned by a retry.
+
+The prerelease `state_ttl_s` constructor option has been removed because elapsed
+time cannot prove that a process-local binding stopped using its workspace.
+Direct `SyncBinding` callers whose lifecycle will not invoke `finalize()` must
+call `abandon()` with the matching `BoundWorkspace`; runtime-managed sessions
+perform binding finalization through the environment lifecycle. If terminal
+runtime finalization fails, Cayu first persists the failure evidence and then
+abandons the exact process-local generation because no public retry handle
+survives the terminal run. If that evidence cannot be confirmed durable, the
+lifecycle retains the generation and its stable pending failure event; a later
+ordinary environment setup drives a bounded cleanup settlement and must settle
+that event before the target can be reused. A managed-egress wrapper explicitly
+refuses abandonment until its adapter positively proves workspace mutations are
+quiescent. Detachment alone is not proof: the wrapper escalates to a terminal
+stop, suspension, or removal boundary when necessary before releasing
+ownership. Managed-egress finalization fences new command dispatch, drains
+already-admitted commands—including provider cleanup explicitly reported as
+deferred—and then syncs while the runner-backed workspace remains readable.
+Uncertain settlement remains fenced until explicit operator verification, and a
+managed runner rejects overlapping stateful bindings before target mutation.
+Synchronization commands remain settlement-accounted, while a target already
+terminated by command cleanup is retired only after provider quiescence and
+continues reporting its sync failure. An ordinary partial copy or deletion
+failure retains that exact readable generation for retry instead of closing it
+and falsely reporting a later success.
+Independently detached guest processes remain outside managed dispatch
+accounting. Interrupted Microsandbox
+allocations stop without deleting their reconnect identity and restart that
+same incarnation on continuation. Retained cleanup uses one owned task per
+exact owner, caps concurrent settlements at 16, and bounds cleanup polling
+during unrelated environment admission. Total active, in-flight, and retained
+environment owners are capped per process by
+`CayuApp(max_environment_lifecycle_owners=...)` (default 256); the explicit
+cleanup drain and server shutdown path retain rather than cancel work that
+outlives their bounded wait.
+
+The public application manifest advances from schema version 5 to version 6 and
+includes `runtime.max_environment_lifecycle_owners`, so deployment fingerprints
+reflect this admission policy. Generator plans use the same version marker and
+therefore also advance to version 6.
+
 ### Aggregate usage remains exact across every public summary
 
 Session, causal-budget, multi-session, and usage-breakdown summaries now use the

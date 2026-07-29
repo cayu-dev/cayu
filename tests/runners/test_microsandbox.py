@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 from math import inf, nan
 from typing import Any
 
@@ -15,6 +16,10 @@ from cayu.runners import (
     MicrosandboxCleanupError,
     MicrosandboxRunner,
     MicrosandboxUnavailableError,
+)
+from cayu.runners.microsandbox import (
+    _defer_reconnect_restoration,
+    microsandbox_reconnect_settlement_task,
 )
 from cayu.testing import verify_provider_credential_isolation
 
@@ -224,6 +229,9 @@ class FakeHandleRecord:
     async def connect(self) -> FakeSandbox:
         return self.sandbox
 
+    async def stop_and_wait(self) -> None:
+        await self.sandbox.stop_and_wait()
+
     async def refresh(self) -> FakeHandleRecord:
         self.refresh_calls += 1
         if self.hang_refresh:
@@ -260,6 +268,7 @@ class FakeSandboxApi:
     created_stop_failure: Exception | None = None
     registry_status = "running"
     get_error: Exception | None = None
+    start_calls: list[dict[str, Any]] = []
 
     @classmethod
     async def create(cls, name: str, **kwargs: Any) -> FakeSandbox:
@@ -281,6 +290,14 @@ class FakeSandboxApi:
         cls.existing = sandbox
         status = cls.statuses.pop(0) if cls.statuses else cls.registry_status
         return FakeHandleRecord(sandbox, status=status, hang_refresh=cls.hang_refresh)
+
+    @classmethod
+    async def start(cls, name: str, **kwargs: Any) -> FakeSandbox:
+        cls.start_calls.append({"name": name, **kwargs})
+        cls.registry_status = "running"
+        if cls.existing is None:
+            cls.existing = FakeSandbox(name)
+        return cls.existing
 
     @classmethod
     async def remove(cls, name: str) -> None:
@@ -364,6 +381,7 @@ def reset_fake_module() -> None:
     FakeSandboxApi.created_stop_failure = None
     FakeSandboxApi.registry_status = "running"
     FakeSandboxApi.get_error = None
+    FakeSandboxApi.start_calls = []
 
 
 def cleanup_diagnostic(error: BaseException) -> dict[str, Any]:
@@ -1770,6 +1788,498 @@ def test_microsandbox_runner_from_existing_does_not_own_lifecycle_by_default() -
     assert sandbox.stop_calls == 0
     assert sandbox.stop_and_wait_calls == 0
     assert FakeSandboxApi.removed == []
+
+
+def test_microsandbox_runner_restarts_stopped_sandbox_before_reconnect() -> None:
+    class SandboxStatus(StrEnum):
+        STOPPED = "stopped"
+
+    async def run() -> MicrosandboxRunner:
+        reset_fake_module()
+        FakeSandboxApi.existing = FakeSandbox("stopped-existing")
+        FakeSandboxApi.registry_status = SandboxStatus.STOPPED
+        return await MicrosandboxRunner.from_existing(
+            "stopped-existing",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+
+    runner = asyncio.run(run())
+
+    assert runner.name == "stopped-existing"
+    assert FakeSandboxApi.start_calls == [{"name": "stopped-existing", "detached": True}]
+    assert runner.restarted_from_stopped is True
+
+
+def test_microsandbox_runner_removal_attachment_remains_executable() -> None:
+    async def run() -> int:
+        reset_fake_module()
+        sandbox = FakeSandbox("stopped-removal")
+        FakeSandboxApi.existing = sandbox
+        FakeSandboxApi.registry_status = "stopped"
+        runner = await MicrosandboxRunner.from_existing(
+            "stopped-removal",
+            close_action="remove",
+            sandbox_module=FakeMicrosandboxModule,
+        )
+        result = await runner.exec(ExecCommand.process("true"))
+        await runner.close()
+        return result.exit_code
+
+    exit_code = asyncio.run(run())
+
+    assert exit_code == 7
+    assert FakeSandboxApi.start_calls == [{"name": "stopped-removal", "detached": True}]
+    assert FakeSandboxApi.remove_calls == ["stopped-removal"]
+
+
+def test_microsandbox_runner_restops_allocation_when_restart_reattest_fails() -> None:
+    class FailingSecondGetSandboxApi(FakeSandboxApi):
+        get_calls = 0
+
+        @classmethod
+        async def get(cls, name: str) -> FakeHandleRecord:
+            cls.get_calls += 1
+            if cls.get_calls == 2:
+                raise RuntimeError("restarted identity lookup failed")
+            return await super().get(name)
+
+    class FailingSecondGetModule(FakeMicrosandboxModule):
+        Sandbox = FailingSecondGetSandboxApi
+
+    async def run() -> FakeSandbox:
+        reset_fake_module()
+        FailingSecondGetSandboxApi.get_calls = 0
+        sandbox = FakeSandbox("failed-restart")
+        FakeSandboxApi.existing = sandbox
+        FakeSandboxApi.registry_status = "stopped"
+        with pytest.raises(RuntimeError, match="identity lookup failed"):
+            await MicrosandboxRunner.from_existing(
+                "failed-restart",
+                sandbox_module=FailingSecondGetModule,
+            )
+        return sandbox
+
+    sandbox = asyncio.run(run())
+
+    assert FakeSandboxApi.start_calls == [{"name": "failed-restart", "detached": True}]
+    assert sandbox.stop_and_wait_calls == 1
+
+
+@pytest.mark.parametrize(
+    "first_restoration_outcome",
+    ["failed", "child_cancelled", "grouped_failure"],
+)
+def test_microsandbox_runner_retries_failed_restart_restoration_owner(
+    first_restoration_outcome: str,
+) -> None:
+    retry_started = asyncio.Event()
+    allow_retry = asyncio.Event()
+
+    class RecoverableStopSandbox(FakeSandbox):
+        async def stop_and_wait(self) -> None:
+            self.stop_and_wait_calls += 1
+            if self.stop_and_wait_calls == 1:
+                if first_restoration_outcome == "child_cancelled":
+                    raise asyncio.CancelledError("provider stop cancelled itself")
+                if first_restoration_outcome == "grouped_failure":
+                    raise BaseExceptionGroup(
+                        "provider stop failed as a group",
+                        [
+                            asyncio.CancelledError("provider child cancelled itself"),
+                            ConnectionError("transient grouped stop failure"),
+                        ],
+                    )
+                raise ConnectionError("restoration stop failed")
+            retry_started.set()
+            await allow_retry.wait()
+
+    class FailingSecondGetSandboxApi(FakeSandboxApi):
+        get_calls = 0
+
+        @classmethod
+        async def get(cls, name: str) -> FakeHandleRecord:
+            cls.get_calls += 1
+            if cls.get_calls == 2:
+                raise RuntimeError("restarted identity lookup failed")
+            return await super().get(name)
+
+    class FailingSecondGetModule(FakeMicrosandboxModule):
+        Sandbox = FailingSecondGetSandboxApi
+
+    async def run() -> tuple[FakeSandbox, BaseException, asyncio.Task[None]]:
+        reset_fake_module()
+        FailingSecondGetSandboxApi.get_calls = 0
+        sandbox = RecoverableStopSandbox("failed-restart-restoration")
+        FakeSandboxApi.existing = sandbox
+        FakeSandboxApi.registry_status = "stopped"
+        with pytest.raises(BaseExceptionGroup, match="restoring") as exc_info:
+            await MicrosandboxRunner.from_existing(
+                "failed-restart-restoration",
+                sandbox_module=FailingSecondGetModule,
+            )
+        settlement_task = microsandbox_reconnect_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert not settlement_task.done()
+        await retry_started.wait()
+        assert not settlement_task.done()
+        allow_retry.set()
+        async with asyncio.timeout(0.2):
+            await asyncio.shield(settlement_task)
+        return sandbox, exc_info.value, settlement_task
+
+    sandbox, error, settlement_task = asyncio.run(run())
+
+    assert settlement_task.done()
+    assert not settlement_task.cancelled()
+    if first_restoration_outcome == "child_cancelled":
+        assert any(isinstance(child, asyncio.CancelledError) for child in error.exceptions)
+    elif first_restoration_outcome == "grouped_failure":
+        restoration_group = next(
+            child for child in error.exceptions if isinstance(child, BaseExceptionGroup)
+        )
+        assert any(
+            isinstance(child, asyncio.CancelledError) for child in restoration_group.exceptions
+        )
+        assert any(
+            isinstance(child, ConnectionError) and str(child) == "transient grouped stop failure"
+            for child in restoration_group.exceptions
+        )
+    else:
+        assert any(
+            isinstance(child, ConnectionError) and str(child) == "restoration stop failed"
+            for child in error.exceptions
+        )
+    assert sandbox.stop_and_wait_calls == 2
+
+
+def test_microsandbox_restoration_does_not_loop_on_permanent_failure() -> None:
+    async def run() -> tuple[int, int]:
+        class PermissionDeniedStopSandbox:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+                self.allow_stop = False
+
+            async def stop_and_wait(self) -> None:
+                self.stop_calls += 1
+                if not self.allow_stop:
+                    raise PermissionError("provider credentials rejected")
+
+        sandbox = PermissionDeniedStopSandbox()
+        failed_settlement = _defer_reconnect_restoration(
+            FakeMicrosandboxModule,
+            sandbox,
+            "permanent-restoration-failure",
+        )
+        with pytest.raises(PermissionError, match="credentials rejected"):
+            await failed_settlement
+        calls_after_failure = sandbox.stop_calls
+        await asyncio.sleep(0.12)
+        assert sandbox.stop_calls == calls_after_failure
+
+        sandbox.allow_stop = True
+        recovered_settlement = _defer_reconnect_restoration(
+            FakeMicrosandboxModule,
+            sandbox,
+            "explicit-restoration-recovery",
+        )
+        await recovered_settlement
+        return calls_after_failure, sandbox.stop_calls
+
+    calls_after_failure, calls_after_recovery = asyncio.run(run())
+
+    assert calls_after_failure == 1
+    assert calls_after_recovery == 2
+
+
+@pytest.mark.parametrize("failure_kind", ["forged_retryable", "ambiguous_io"])
+def test_microsandbox_restoration_rejects_ambiguous_retry_evidence(
+    failure_kind: str,
+) -> None:
+    class FakeIoError(RuntimeError):
+        pass
+
+    class ModuleWithIoError(FakeMicrosandboxModule):
+        IoError = FakeIoError
+
+    async def run() -> int:
+        class AmbiguousStopSandbox:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+
+            async def stop_and_wait(self) -> None:
+                self.stop_calls += 1
+                if failure_kind == "ambiguous_io":
+                    raise FakeIoError("provider reported generic I/O failure")
+                error = RuntimeError("extension supplied retryable attribute")
+                error.retryable = True
+                raise error
+
+        sandbox = AmbiguousStopSandbox()
+        settlement = _defer_reconnect_restoration(
+            ModuleWithIoError,
+            sandbox,
+            f"ambiguous-{failure_kind}",
+        )
+        expected = FakeIoError if failure_kind == "ambiguous_io" else RuntimeError
+        with pytest.raises(expected):
+            await settlement
+        await asyncio.sleep(0.12)
+        return sandbox.stop_calls
+
+    assert asyncio.run(run()) == 1
+
+
+def test_microsandbox_restoration_owner_cancellation_stops_retries() -> None:
+    async def run() -> tuple[asyncio.Task[None], int]:
+        retry_started = asyncio.Event()
+
+        class BlockingStopSandbox:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+
+            async def stop_and_wait(self) -> None:
+                self.stop_calls += 1
+                retry_started.set()
+                await asyncio.Event().wait()
+
+        sandbox = BlockingStopSandbox()
+        settlement_task = _defer_reconnect_restoration(
+            FakeMicrosandboxModule,
+            sandbox,
+            "cancelled-restoration-owner",
+        )
+        await retry_started.wait()
+        settlement_task.cancel("operator stopped restoration")
+        with pytest.raises(asyncio.CancelledError, match="operator stopped restoration"):
+            await settlement_task
+        await asyncio.sleep(0.1)
+        return settlement_task, sandbox.stop_calls
+
+    settlement_task, stop_calls = asyncio.run(run())
+
+    assert settlement_task.cancelled()
+    assert settlement_task.cancelling() == 1
+    assert stop_calls == 1
+
+
+def test_microsandbox_reconnect_settlement_handoff_ignores_exception_descriptors_and_forgery() -> (
+    None
+):
+    attribute_name = "_cayu_microsandbox_reconnect_settlement_task"
+
+    class DescriptorControlledError(RuntimeError):
+        descriptor_reads = 0
+
+        @property
+        def _cayu_microsandbox_reconnect_settlement_task(self) -> object:
+            type(self).descriptor_reads += 1
+            raise RuntimeError("workload-secret-from-reconnect-descriptor")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(asyncio.sleep(0))
+        unattached = DescriptorControlledError("unattached provider failure")
+        assert microsandbox_reconnect_settlement_task(unattached) is None
+
+        forged = DescriptorControlledError("forged provider failure")
+        forged.__dict__[attribute_name] = task
+        assert microsandbox_reconnect_settlement_task(forged) is None
+        await task
+
+    asyncio.run(scenario())
+    assert DescriptorControlledError.descriptor_reads == 0
+
+
+def test_microsandbox_runner_bounds_failed_restart_restoration() -> None:
+    stop_started = asyncio.Event()
+    allow_stop = asyncio.Event()
+
+    class HangingStopSandbox(FakeSandbox):
+        async def stop_and_wait(self) -> None:
+            self.stop_and_wait_calls += 1
+            stop_started.set()
+            await allow_stop.wait()
+
+    class FailingSecondGetSandboxApi(FakeSandboxApi):
+        get_calls = 0
+
+        @classmethod
+        async def get(cls, name: str) -> FakeHandleRecord:
+            cls.get_calls += 1
+            if cls.get_calls == 2:
+                raise RuntimeError("restarted identity lookup failed")
+            return await super().get(name)
+
+    class FailingSecondGetModule(FakeMicrosandboxModule):
+        Sandbox = FailingSecondGetSandboxApi
+
+    async def run() -> tuple[BaseException, asyncio.Task[None]]:
+        reset_fake_module()
+        FailingSecondGetSandboxApi.get_calls = 0
+        sandbox = HangingStopSandbox("hanging-restart-restoration")
+        FakeSandboxApi.existing = sandbox
+        FakeSandboxApi.registry_status = "stopped"
+        with pytest.raises(BaseExceptionGroup, match="restoring") as exc_info:
+            async with asyncio.timeout(0.2):
+                await MicrosandboxRunner.from_existing(
+                    "hanging-restart-restoration",
+                    reconnect_timeout_s=0.01,
+                    sandbox_module=FailingSecondGetModule,
+                )
+        settlement_task = microsandbox_reconnect_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert stop_started.is_set()
+        assert not settlement_task.done()
+        allow_stop.set()
+        async with asyncio.timeout(0.2):
+            await asyncio.shield(settlement_task)
+        return exc_info.value, settlement_task
+
+    error, settlement_task = asyncio.run(run())
+
+    assert any(isinstance(child, TimeoutError) for child in getattr(error, "exceptions", ()))
+    assert settlement_task.done()
+    assert not settlement_task.cancelled()
+
+
+def test_microsandbox_runner_cancelled_restart_waits_for_start_then_restops() -> None:
+    start_accepted = asyncio.Event()
+    allow_start_return = asyncio.Event()
+
+    class BlockingStartSandboxApi(FakeSandboxApi):
+        @classmethod
+        async def start(cls, name: str, **kwargs: Any) -> FakeSandbox:
+            cls.start_calls.append({"name": name, **kwargs})
+            cls.registry_status = "running"
+            if cls.existing is None:
+                cls.existing = FakeSandbox(name)
+            start_accepted.set()
+            await allow_start_return.wait()
+            return cls.existing
+
+    class BlockingStartModule(FakeMicrosandboxModule):
+        Sandbox = BlockingStartSandboxApi
+
+    async def run() -> tuple[FakeSandbox, asyncio.Task[MicrosandboxRunner]]:
+        reset_fake_module()
+        sandbox = FakeSandbox("cancelled-restart")
+        FakeSandboxApi.existing = sandbox
+        FakeSandboxApi.registry_status = "stopped"
+        task = asyncio.create_task(
+            MicrosandboxRunner.from_existing(
+                "cancelled-restart",
+                sandbox_module=BlockingStartModule,
+            )
+        )
+        await start_accepted.wait()
+        task.cancel("caller stopped waiting")
+        await asyncio.sleep(0)
+        assert not task.done()
+        allow_start_return.set()
+        with pytest.raises(asyncio.CancelledError, match="caller stopped waiting"):
+            await task
+        return sandbox, task
+
+    sandbox, task = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert task.cancelled()
+    assert task.cancelling() == 0
+
+
+def test_microsandbox_runner_preserves_restart_failure_after_cancellation() -> None:
+    start_accepted = asyncio.Event()
+    allow_start_failure = asyncio.Event()
+
+    class FailingCancelledStartSandboxApi(FakeSandboxApi):
+        @classmethod
+        async def start(cls, name: str, **kwargs: Any) -> FakeSandbox:
+            cls.start_calls.append({"name": name, **kwargs})
+            cls.registry_status = "running"
+            if cls.existing is None:
+                cls.existing = FakeSandbox(name)
+            start_accepted.set()
+            await allow_start_failure.wait()
+            raise RuntimeError("provider restart failed")
+
+    class FailingCancelledStartModule(FakeMicrosandboxModule):
+        Sandbox = FailingCancelledStartSandboxApi
+
+    async def run() -> tuple[BaseExceptionGroup, asyncio.Task[MicrosandboxRunner]]:
+        reset_fake_module()
+        sandbox = FakeSandbox("cancelled-failed-restart")
+        FakeSandboxApi.existing = sandbox
+        FakeSandboxApi.registry_status = "stopped"
+        task = asyncio.create_task(
+            MicrosandboxRunner.from_existing(
+                "cancelled-failed-restart",
+                sandbox_module=FailingCancelledStartModule,
+            )
+        )
+        await start_accepted.wait()
+        task.cancel("caller stopped waiting")
+        await asyncio.sleep(0)
+        allow_start_failure.set()
+        with pytest.raises(BaseExceptionGroup, match="restart failed") as exc_info:
+            await task
+        assert sandbox.stop_and_wait_calls == 1
+        return exc_info.value, task
+
+    error, task = asyncio.run(run())
+
+    assert isinstance(error.exceptions[0], asyncio.CancelledError)
+    assert isinstance(error.exceptions[1], RuntimeError)
+    assert str(error.exceptions[1]) == "provider restart failed"
+    assert not task.cancelled()
+    assert task.cancelling() == 0
+
+
+def test_microsandbox_runner_restart_timeout_returns_while_retaining_stop_owner() -> None:
+    start_accepted = asyncio.Event()
+    allow_start_return = asyncio.Event()
+
+    class BlockingStartSandboxApi(FakeSandboxApi):
+        @classmethod
+        async def start(cls, name: str, **kwargs: Any) -> FakeSandbox:
+            cls.start_calls.append({"name": name, **kwargs})
+            cls.registry_status = "running"
+            if cls.existing is None:
+                cls.existing = FakeSandbox(name)
+            start_accepted.set()
+            await allow_start_return.wait()
+            return cls.existing
+
+    class BlockingStartModule(FakeMicrosandboxModule):
+        Sandbox = BlockingStartSandboxApi
+
+    async def run() -> FakeSandbox:
+        reset_fake_module()
+        sandbox = FakeSandbox("timed-out-restart")
+        FakeSandboxApi.existing = sandbox
+        FakeSandboxApi.registry_status = "stopped"
+
+        with pytest.raises(TimeoutError, match="did not attach") as exc_info:
+            async with asyncio.timeout(0.2):
+                await MicrosandboxRunner.from_existing(
+                    "timed-out-restart",
+                    reconnect_timeout_s=0.01,
+                    sandbox_module=BlockingStartModule,
+                )
+
+        settlement_task = microsandbox_reconnect_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert start_accepted.is_set()
+        assert not settlement_task.done()
+        assert sandbox.stop_and_wait_calls == 0
+
+        allow_start_return.set()
+        async with asyncio.timeout(0.2):
+            await asyncio.shield(settlement_task)
+        return sandbox
+
+    sandbox = asyncio.run(run())
+
+    assert sandbox.stop_and_wait_calls == 1
+    assert FakeSandboxApi.start_calls == [{"name": "timed-out-restart", "detached": True}]
 
 
 def test_microsandbox_runner_from_existing_can_remove_with_bounded_retry() -> None:

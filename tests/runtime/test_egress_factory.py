@@ -25,6 +25,7 @@ from cayu.egress import (
     EgressCapabilityEvidence,
     HttpEgressPolicy,
     InvalidEgressReconnectMetadataError,
+    RunnerFinalizationResult,
     SandboxEgressAdapter,
     TransparentEgressBroker,
     UnsupportedEgressAdapter,
@@ -34,6 +35,7 @@ from cayu.egress import (
 )
 from cayu.environments import (
     EFSAccessPointBinding,
+    Environment,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
@@ -43,8 +45,13 @@ from cayu.environments import (
     ExecutionCapabilityEvidence,
     ExecutionEvidenceOverride,
     ExecutionRequirements,
+    SyncBinding,
 )
 from cayu.environments.bindings import BoundWorkspace, WorkspaceBinding
+from cayu.environments.factory import (
+    attach_environment_factory_cleanup_settlement_task,
+    environment_factory_cleanup_settlement_task,
+)
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runners import LambdaMicroVMRunner, LocalRunner
 from cayu.runners.base import ExecCommand, ExecResult, Runner
@@ -55,6 +62,13 @@ from cayu.runtime._environment_lifecycle import (
 )
 from cayu.runtime.event_sinks import EventSink
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
+from cayu.workspaces import (
+    LocalWorkspace,
+    RunnerBoundWorkspace,
+    WorkspaceListResult,
+    WorkspaceMutationResult,
+    WorkspaceReadResult,
+)
 
 pytest.importorskip("cryptography")
 
@@ -75,11 +89,139 @@ from cayu.runtime.egress import (
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
     _await_cleanup_task,
+    _workspace_dispatch_settlement_kind,
 )
 from cayu.testing import verify_provider_credential_isolation
 
 REAL_SECRET = "sk_test_51FactoryRealSecret"
 POLICY_NAME = "provider-example"
+
+
+class _ClosedRejectingRunnerWorkspace(RunnerBoundWorkspace):
+    def __init__(
+        self,
+        runner: Runner,
+        delegate: LocalWorkspace,
+        *,
+        workspace_id: str,
+    ) -> None:
+        self.id = workspace_id
+        self._runner = runner
+        self._delegate = delegate
+        self.operations_after_close = 0
+        self.next_list_error: BaseException | None = None
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("test-runner-workspace", self.id)
+
+    @property
+    def bound_runner_resource_key(self) -> tuple[object, ...]:
+        return ("test-runner", id(self._runner))
+
+    @property
+    def runner_cwd(self) -> str:
+        return self._runner.default_cwd
+
+    def is_bound_to_runner(self, runner: Runner) -> bool:
+        return self._runner is runner
+
+    def _control_plane_runner(self) -> Runner:
+        return self._runner
+
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        return self._delegate.bounded_read_limit(max_bytes)
+
+    def _require_open(self) -> None:
+        if self._runner.is_closed:
+            self.operations_after_close += 1
+            raise RuntimeError("runner-backed target is closed")
+
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReadResult:
+        self._require_open()
+        return await self._delegate.read_bytes(
+            path,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
+
+    async def write_bytes(self, path: str, content: bytes) -> None:
+        self._require_open()
+        await self._delegate.write_bytes(path, content)
+
+    async def delete(self, path: str) -> None:
+        self._require_open()
+        await self._delegate.delete(path)
+
+    async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
+        self._require_open()
+        return await self._delegate.create_bytes(path, content)
+
+    async def replace_bytes(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        self._require_open()
+        return await self._delegate.replace_bytes(
+            path,
+            content,
+            expected_revision=expected_revision,
+        )
+
+    async def delete_if_revision(
+        self,
+        path: str,
+        *,
+        expected_revision: str,
+    ) -> WorkspaceMutationResult:
+        self._require_open()
+        return await self._delegate.delete_if_revision(
+            path,
+            expected_revision=expected_revision,
+        )
+
+    async def list(
+        self,
+        pattern: str = "**/*",
+        *,
+        limit: int | None = None,
+    ) -> WorkspaceListResult:
+        self._require_open()
+        if self.next_list_error is not None:
+            error = self.next_list_error
+            self.next_list_error = None
+            raise error
+        return await self._delegate.list(pattern, limit=limit)
+
+
+class _FailingLocalWorkspace(LocalWorkspace):
+    def __init__(self, root: Path, *, workspace_id: str) -> None:
+        super().__init__(root, workspace_id=workspace_id)
+        self.fail_write_call: int | None = None
+        self.fail_delete_call: int | None = None
+        self.write_calls = 0
+        self.delete_calls = 0
+
+    async def write_bytes(self, path: str, content: bytes) -> None:
+        self.write_calls += 1
+        if self.write_calls == self.fail_write_call:
+            raise OSError(f"injected durable write failure for {path}")
+        await super().write_bytes(path, content)
+
+    async def delete(self, path: str) -> None:
+        self.delete_calls += 1
+        if self.delete_calls == self.fail_delete_call:
+            raise OSError(f"injected durable delete failure for {path}")
+        await super().delete(path)
 
 
 @pytest.mark.parametrize("bounded", [False, True])
@@ -613,6 +755,16 @@ class _RecordingAdapter(SandboxEgressAdapter):
         self.captured["inner_runner"] = runner
         return runner
 
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        del outcome
+        await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
 
 class _LifecycleRecordingAdapter(_RecordingAdapter):
     supports_reconnect = True
@@ -660,9 +812,15 @@ class _LifecycleRecordingAdapter(_RecordingAdapter):
         self.captured["reconnect_environment_name"] = environment_name
         return await self.prepare(session_id=session_id, grants=grants, broker=broker)
 
-    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
         self.finalize_calls.append(outcome)
         await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
 
 class _CapabilityRecordingAdapter(_RecordingAdapter):
@@ -780,19 +938,31 @@ class _RetryingLifecycleAdapter(_RecordingAdapter):
         self.finalize_calls = 0
         self.first_error = first_error or RuntimeError("suspend failed")
 
-    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
         self.finalize_calls += 1
         if self.finalize_calls == 1:
             raise self.first_error
         await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
 
 class _RetryingReconnectAdapter(_LifecycleRecordingAdapter):
-    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
         self.finalize_calls.append(outcome)
         if len(self.finalize_calls) == 1:
             raise RuntimeError("suspend failed")
         await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
 
 class _VirtualCredentialEchoingAdapter(_RecordingAdapter):
@@ -1917,6 +2087,1360 @@ def test_bind_failure_cleans_up_egress_resources() -> None:
     assert adapter.torn_down == 1
 
 
+def test_egress_teardown_binding_delegates_abandon_to_inner_binding() -> None:
+    adapter = _RecordingAdapter()
+    abandoned: list[BoundWorkspace] = []
+
+    class _TrackingBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            return BoundWorkspace(runner=runner)
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+        def abandon(self, bound: BoundWorkspace) -> bool:
+            abandoned.append(bound)
+            return True
+
+    async def run() -> BoundWorkspace:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=_TrackingBinding(),
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_abandon",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(None, runner, session_id="sess_abandon")
+        # An open managed runner may still mutate the workspace, so an abort
+        # cannot release its inner owner merely because a lifecycle returned.
+        assert binding.abandon(bound) is False
+        assert abandoned == []
+        await runner.close()
+        assert binding.abandon(bound) is True
+        assert result.release is not None
+        await result.release(EnvironmentFactoryReleaseAction.DISCARD)
+        return bound
+
+    bound = asyncio.run(run())
+    assert abandoned == [bound]
+    assert adapter.torn_down == 1
+
+
+def test_egress_teardown_retains_sync_owner_until_runner_is_quiescent(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    (source_root / "recreated.txt").write_text("original", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="fixed-target")
+    inner = SyncBinding(target_workspace=target)
+    adapter = _RetryingLifecycleAdapter(first_error=RuntimeError("runner still live"))
+
+    async def workspace_factory(_runner):  # type: ignore[no-untyped-def]
+        return source
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            workspace_factory=workspace_factory,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_sync_teardown_fence",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id="sess_sync_teardown_fence")
+        await target.write_bytes("state.txt", b"first-sync")
+        await target.delete("recreated.txt")
+        await target.write_bytes("transient.txt", b"first-sync")
+
+        with pytest.raises(RuntimeError, match="runner still live"):
+            await binding.finalize(bound, outcome="completed")
+        assert not (source_root / "recreated.txt").exists()
+        assert (source_root / "transient.txt").read_bytes() == b"first-sync"
+        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await inner.bind(source, None, session_id="competing-session")
+
+        # The still-live old guest can change its target after the first sync.
+        # A teardown retry must sync that later state before releasing ownership.
+        await target.write_bytes("state.txt", b"retry-sync")
+        await target.delete("transient.txt")
+        await target.write_bytes("recreated.txt", b"retry-sync")
+        await binding.finalize(bound, outcome="completed")
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+        assert (source_root / "state.txt").read_bytes() == b"retry-sync"
+        assert not (source_root / "transient.txt").exists()
+        assert (source_root / "recreated.txt").read_bytes() == b"retry-sync"
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_does_not_read_runner_bound_target_after_quiescence(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="shared-target-storage")
+    quiesce_started = asyncio.Event()
+    allow_quiescence = asyncio.Event()
+
+    target_holder: list[_ClosedRejectingRunnerWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="shared-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    class _QuiescingAdapter(_RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__("lambda-microvm")
+            self.finalize_calls: list[str | None] = []
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            raise AssertionError(f"ordinary finalization was not expected: {outcome}")
+
+        async def finalize_runner_for_binding(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            quiesce_started.set()
+            await allow_quiescence.wait()
+            await runner.close()
+            return RunnerFinalizationResult(
+                workspace_mutations_quiescent=True,
+                allocation_preserved=True,
+            )
+
+    adapter = _QuiescingAdapter()
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_detach_sync_fence",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id="sess_detach_sync_fence")
+        target = target_holder[0]
+        await target.write_bytes("state.txt", b"final-snapshot")
+
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="interrupted"))
+        await quiesce_started.wait()
+        assert (source_root / "state.txt").read_bytes() == b"final-snapshot"
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=target).bind(
+                source,
+                None,
+                session_id="competing-session",
+            )
+
+        allow_quiescence.set()
+        await finalize_task
+        assert runner.is_closed
+        assert target.operations_after_close == 0
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+    assert adapter.finalize_calls == ["interrupted"]
+
+
+def test_egress_teardown_drains_dispatched_write_before_authoritative_sync(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="late-write-storage")
+    mutation_started = asyncio.Event()
+    allow_mutation = asyncio.Event()
+
+    class _DelayedMutationRunner(_FakeDockerRunner):
+        async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            mutation_started.set()
+            await allow_mutation.wait()
+            await local_target.write_bytes("state.txt", b"late-dispatched-write")
+            return ExecResult()
+
+    async def runner_factory(request: Any) -> Runner:
+        return _DelayedMutationRunner(request.name)
+
+    target_holder: list[_ClosedRejectingRunnerWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="late-write-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(runner_factory=runner_factory),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_late_dispatched_write",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="sess_late_dispatched_write",
+        )
+        target = target_holder[0]
+
+        mutation_task = asyncio.create_task(runner.exec(ExecCommand.process("write-late-state")))
+        await mutation_started.wait()
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="completed"))
+        while runner._workspace_dispatch_gate_owner is None:  # type: ignore[attr-defined]
+            await asyncio.sleep(0)
+
+        with pytest.raises(RuntimeError, match="dispatch is closed"):
+            await runner.exec(ExecCommand.process("new-work-after-finalization"))
+        assert not finalize_task.done()
+        assert (source_root / "state.txt").read_bytes() == b"initial"
+
+        allow_mutation.set()
+        await mutation_task
+        snapshot = await finalize_task
+        assert snapshot is not None
+        assert runner.is_closed
+        assert target.operations_after_close == 0
+        assert (source_root / "state.txt").read_bytes() == b"late-dispatched-write"
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_waits_for_deferred_command_settlement_before_sync(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="deferred-command-storage")
+    command_started = asyncio.Event()
+    allow_settlement = asyncio.Event()
+
+    class _DeferredMutationRunner(_FakeDockerRunner):
+        def __init__(self, name: str) -> None:
+            super().__init__(name)
+            self.settlement_task: asyncio.Task[None] | None = None
+
+        async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            command_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+
+                async def settle() -> None:
+                    await allow_settlement.wait()
+                    await local_target.write_bytes(
+                        "late.txt",
+                        b"written-by-deferred-command",
+                    )
+
+                self.settlement_task = asyncio.create_task(settle())
+                cancellation.artifacts = [  # type: ignore[attr-defined]
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ]
+                raise
+
+        async def await_pending_command_settlement(self) -> bool:
+            assert self.settlement_task is not None
+            await asyncio.shield(self.settlement_task)
+            return True
+
+    async def runner_factory(request: Any) -> Runner:
+        return _DeferredMutationRunner(request.name)
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        return _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="deferred-command-target",
+        )
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(runner_factory=runner_factory),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_deferred_command_settlement",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="sess_deferred_command_settlement",
+        )
+
+        command_task = asyncio.create_task(runner.exec(ExecCommand.process("late-command")))
+        await command_started.wait()
+        command_task.cancel("interrupt deferred command")
+        with pytest.raises(asyncio.CancelledError, match="interrupt deferred command"):
+            await command_task
+
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="interrupted"))
+        while runner._workspace_dispatch_gate_owner is None:  # type: ignore[attr-defined]
+            await asyncio.sleep(0)
+        assert not finalize_task.done()
+        assert not (source_root / "late.txt").exists()
+
+        allow_settlement.set()
+        snapshot = await finalize_task
+        assert snapshot is not None
+        assert (source_root / "late.txt").read_bytes() == b"written-by-deferred-command"
+        assert runner.is_closed
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_retries_only_after_deferred_sync_command_settles(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="sync-command-storage")
+    command_started = asyncio.Event()
+    allow_settlement = asyncio.Event()
+
+    class _DeferredSyncCommandRunner(_FakeDockerRunner):
+        settlement_task: asyncio.Task[None] | None = None
+
+        async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            command_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+
+                async def settle() -> None:
+                    await allow_settlement.wait()
+
+                self.settlement_task = asyncio.create_task(settle())
+                cancellation.artifacts = [  # type: ignore[attr-defined]
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ]
+                raise
+
+        async def await_pending_command_settlement(self) -> bool:
+            assert self.settlement_task is not None
+            await asyncio.shield(self.settlement_task)
+            return True
+
+    class _InterruptingSyncWorkspace(_ClosedRejectingRunnerWorkspace):
+        interrupt_next_list = False
+
+        async def list(
+            self,
+            pattern: str = "**/*",
+            *,
+            limit: int | None = None,
+        ) -> WorkspaceListResult:
+            if self.interrupt_next_list:
+                self.interrupt_next_list = False
+                command_task = asyncio.create_task(
+                    self._runner.exec(ExecCommand.process("sync-command"))
+                )
+                await command_started.wait()
+                command_task.cancel("interrupt sync command")
+                with pytest.raises(asyncio.CancelledError, match="interrupt sync command"):
+                    await command_task
+                raise RuntimeError("sync command was interrupted")
+            return await super().list(pattern, limit=limit)
+
+    async def runner_factory(request: Any) -> Runner:
+        return _DeferredSyncCommandRunner(request.name)
+
+    target_holder: list[_InterruptingSyncWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _InterruptingSyncWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="sync-command-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(runner_factory=runner_factory),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_deferred_sync_command",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="sess_deferred_sync_command",
+        )
+        target_holder[0].interrupt_next_list = True
+
+        with pytest.raises(RuntimeError, match="sync command was interrupted"):
+            await binding.finalize(bound, outcome="interrupted")
+        assert not runner.is_closed
+        assert inner._fixed_target_owners == {"sync-command-target": bound.state_key}
+
+        retry = asyncio.create_task(binding.finalize(bound, outcome="interrupted"))
+        await asyncio.sleep(0)
+        assert not retry.done()
+        allow_settlement.set()
+        assert await retry is not None
+        assert runner.is_closed
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_retires_target_killed_by_command_cleanup(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="killed-command-storage")
+    sync_error = RuntimeError("sandbox cleanup removed the sync target")
+
+    class _SandboxCleanupRunner(_FakeDockerRunner):
+        async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            self._closed = True
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_sandbox",
+                        "status": "completed",
+                    }
+                ],
+            )
+
+        async def close(self) -> None:
+            self.closed = True
+            self._closed = True
+
+    async def runner_factory(request: Any) -> Runner:
+        return _SandboxCleanupRunner(request.name)
+
+    target_holder: list[_ClosedRejectingRunnerWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="killed-command-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+    adapter = _RecordingAdapter(runner_factory=runner_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_killed_command_target",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="sess_killed_command_target",
+        )
+        command_result = await runner.exec(ExecCommand.process("times-out"))
+        assert command_result.timed_out
+        target_holder[0].next_list_error = sync_error
+
+        with pytest.raises(RuntimeError) as first_failure:
+            await binding.finalize(bound, outcome="interrupted")
+        assert first_failure.value is sync_error
+        assert runner.is_closed
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+        assert adapter.torn_down == 1
+
+        with pytest.raises(RuntimeError) as retry_failure:
+            await binding.finalize(bound, outcome="interrupted")
+        assert retry_failure.value is sync_error
+        assert adapter.torn_down == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("settlement_mode", "error_pattern"),
+    [
+        ("default", "did not prove workspace mutation quiescence"),
+        ("child_cancel", "was cancelled without caller cancellation"),
+    ],
+)
+def test_egress_teardown_retains_owner_when_command_settlement_is_uncertain(
+    tmp_path: Path,
+    settlement_mode: str,
+    error_pattern: str,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="uncertain-command-storage")
+
+    class _UncertainMutationRunner(_FakeDockerRunner):
+        async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            return ExecResult(
+                timed_out=True,
+                artifacts=[
+                    {
+                        "type": "cayu.runner_cleanup.v1",
+                        "adapter": "test",
+                        "action": "kill_command",
+                        "status": "deferred",
+                    }
+                ],
+            )
+
+        async def await_pending_command_settlement(self) -> bool:
+            if settlement_mode == "child_cancel":
+                raise asyncio.CancelledError("provider settlement cancelled itself")
+            return await super().await_pending_command_settlement()
+
+    async def runner_factory(request: Any) -> Runner:
+        return _UncertainMutationRunner(request.name)
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        return _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="uncertain-command-target",
+        )
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(runner_factory=runner_factory),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_uncertain_command_settlement",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="sess_uncertain_command_settlement",
+        )
+        command_result = await runner.exec(ExecCommand.process("uncertain-command"))
+        assert command_result.timed_out
+
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        with pytest.raises(RuntimeError, match=error_pattern):
+            await binding.finalize(bound, outcome="interrupted")
+        assert current_task.cancelling() == 0
+        assert not runner.is_closed
+        assert inner._fixed_target_owners == {"uncertain-command-target": bound.state_key}
+
+        # This explicit operator assertion is the only recovery path when a
+        # runner reports deferred cleanup but supplies no settlement contract.
+        runner.reopen_exec()
+        snapshot = await binding.finalize(bound, outcome="interrupted")
+        assert snapshot is not None
+        assert runner.is_closed
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "invalid_artifact",
+    [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "action": "kill_command",
+            "status": True,
+        },
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "action": "future_cleanup_action",
+            "status": "completed",
+        },
+    ],
+)
+def test_workspace_dispatch_settlement_rejects_ambiguous_cleanup_evidence(
+    invalid_artifact: dict[str, Any],
+) -> None:
+    result = ExecResult(
+        timed_out=True,
+        artifacts=[
+            {
+                "type": "cayu.runner_cleanup.v1",
+                "action": "kill_command",
+                "status": "completed",
+            },
+            invalid_artifact,
+        ],
+    )
+
+    assert _workspace_dispatch_settlement_kind(result=result, error=None) == "uncertain"
+
+
+def test_cancelled_egress_teardown_retains_gate_until_dispatched_write_syncs(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="cancelled-drain-storage")
+    mutation_started = asyncio.Event()
+    allow_mutation = asyncio.Event()
+
+    class _DelayedMutationRunner(_FakeDockerRunner):
+        async def exec(self, command: Any, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            mutation_started.set()
+            await allow_mutation.wait()
+            await local_target.write_bytes("state.txt", b"settled-after-cancellation")
+            return ExecResult()
+
+    async def runner_factory(request: Any) -> Runner:
+        return _DelayedMutationRunner(request.name)
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        return _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="cancelled-drain-target",
+        )
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(runner_factory=runner_factory),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_cancelled_dispatch_drain",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="sess_cancelled_dispatch_drain",
+        )
+        # Put finalization past authority revocation so cancellation is
+        # delivered specifically while the pre-fence command drain is waiting.
+        assert await runner.revoke_authority() is False  # type: ignore[attr-defined]
+        mutation_task = asyncio.create_task(runner.exec(ExecCommand.process("write-after-cancel")))
+        await mutation_started.wait()
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="interrupted"))
+        while runner._workspace_dispatch_gate_owner is None:  # type: ignore[attr-defined]
+            await asyncio.sleep(0)
+        finalize_task.cancel("caller abandoned finalization")
+        await asyncio.sleep(0)
+        # Owned cleanup temporarily consumes the request while the already
+        # dispatched mutation drains, then republishes cancellation only after
+        # the authoritative synchronization and provider close.
+        assert finalize_task.cancelling() == 0
+        assert not finalize_task.done()
+        with pytest.raises(RuntimeError, match="dispatch is closed"):
+            await runner.exec(ExecCommand.process("competing-work"))
+
+        allow_mutation.set()
+        await mutation_task
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="caller abandoned finalization",
+        ):
+            await finalize_task
+        assert finalize_task.cancelled()
+        assert runner.is_closed
+        assert (source_root / "state.txt").read_bytes() == b"settled-after-cancellation"
+        assert inner._fixed_target_owners == {"cancelled-drain-target": bound.state_key}
+
+        snapshot = await binding.finalize(bound, outcome="interrupted")
+        assert snapshot is not None
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_retains_sync_owner_until_post_cleanup_diagnostics_finish(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="fixed-target-storage")
+    target_holder: list[_ClosedRejectingRunnerWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="fixed-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+    cancel_revocation_once = True
+
+    async def workspace_factory(_runner):  # type: ignore[no-untyped-def]
+        return source
+
+    async def emit(event: Event) -> Event:
+        nonlocal cancel_revocation_once
+        if event.type == EventType.EGRESS_GRANT_REVOKED and cancel_revocation_once:
+            cancel_revocation_once = False
+            raise asyncio.CancelledError("revocation diagnostic interrupted")
+        return event
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            workspace_factory=workspace_factory,
+            inner_binding=inner,
+            event_emitter=emit,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_sync_diagnostic_fence",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id="sess_sync_diagnostic_fence")
+        target = target_holder[0]
+
+        with pytest.raises(asyncio.CancelledError, match="revocation diagnostic interrupted"):
+            await binding.finalize(bound, outcome="completed")
+        assert runner.is_closed
+        assert target.operations_after_close == 0
+        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert bound.state_key in inner._states
+
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        assert target.operations_after_close == 0
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_retries_partial_runner_bound_copy_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("old-a", encoding="utf-8")
+    (source_root / "b.txt").write_text("old-b", encoding="utf-8")
+    source = _FailingLocalWorkspace(source_root, workspace_id="durable-source")
+    local_target = LocalWorkspace(target_root, workspace_id="partial-copy-storage")
+    target_holder: list[_ClosedRejectingRunnerWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="partial-copy-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_partial_copy_retry",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id="sess_partial_copy_retry")
+        target = target_holder[0]
+        await target.write_bytes("a.txt", b"new-a")
+        await target.write_bytes("b.txt", b"new-b")
+        source.fail_write_call = 2
+
+        with pytest.raises(OSError, match="injected durable write failure"):
+            await binding.finalize(bound, outcome="completed")
+        assert not runner.is_closed
+        assert (source_root / "a.txt").read_bytes() == b"new-a"
+        assert (source_root / "b.txt").read_bytes() == b"old-b"
+        assert inner._fixed_target_owners == {"partial-copy-target": bound.state_key}
+        assert bound.state_key in inner._states
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=target).bind(
+                source,
+                None,
+                session_id="partial-copy-contender",
+            )
+
+        source.fail_write_call = None
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        assert runner.is_closed
+        assert target.operations_after_close == 0
+        assert (source_root / "a.txt").read_bytes() == b"new-a"
+        assert (source_root / "b.txt").read_bytes() == b"new-b"
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_retries_partial_runner_bound_delete_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("delete-a", encoding="utf-8")
+    (source_root / "b.txt").write_text("delete-b", encoding="utf-8")
+    source = _FailingLocalWorkspace(source_root, workspace_id="durable-source")
+    local_target = LocalWorkspace(target_root, workspace_id="partial-delete-storage")
+    target_holder: list[_ClosedRejectingRunnerWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="partial-delete-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_partial_delete_retry",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id="sess_partial_delete_retry")
+        target = target_holder[0]
+        await target.delete("a.txt")
+        await target.delete("b.txt")
+        source.fail_delete_call = 2
+
+        with pytest.raises(OSError, match="injected durable delete failure"):
+            await binding.finalize(bound, outcome="completed")
+        assert not runner.is_closed
+        assert not (source_root / "a.txt").exists()
+        assert (source_root / "b.txt").exists()
+        assert inner._fixed_target_owners == {"partial-delete-target": bound.state_key}
+        assert bound.state_key in inner._states
+
+        source.fail_delete_call = None
+        snapshot = await binding.finalize(bound, outcome="completed")
+        assert snapshot is not None
+        assert runner.is_closed
+        assert target.operations_after_close == 0
+        assert not (source_root / "a.txt").exists()
+        assert not (source_root / "b.txt").exists()
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_retains_readable_target_after_sync_failure(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    local_target = LocalWorkspace(target_root, workspace_id="failed-target-storage")
+    target_holder: list[_ClosedRejectingRunnerWorkspace] = []
+
+    def target_factory(context):  # type: ignore[no-untyped-def]
+        assert context.runner is not None
+        target = _ClosedRejectingRunnerWorkspace(
+            context.runner,
+            local_target,
+            workspace_id="failed-target",
+        )
+        target_holder.append(target)
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+    sync_error = RuntimeError("target listing failed before teardown")
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_failed_sync_unreadable_target",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="sess_failed_sync_unreadable_target",
+        )
+        target = target_holder[0]
+        target.next_list_error = sync_error
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await binding.finalize(bound, outcome="completed")
+        assert exc_info.value is sync_error
+        assert not runner.is_closed
+        assert target.operations_after_close == 0
+        assert inner._fixed_target_owners == {"failed-target": bound.state_key}
+        assert bound.state_key in inner._states
+
+        assert await binding.finalize(bound, outcome="completed") is not None
+        assert runner.is_closed
+        assert target.operations_after_close == 0
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_egress_teardown_retains_sync_owner_after_revocation_cancellation(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="fixed-target")
+    inner = SyncBinding(target_workspace=target)
+    revocation_started = asyncio.Event()
+    allow_revocation = asyncio.Event()
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_sync_revocation_cancel",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id="sess_sync_revocation_cancel")
+
+        revoker = runner._authority_revoker  # type: ignore[attr-defined]
+        original_revoke = revoker._broker.revoke_authority_and_wait
+
+        async def block_revocation(presented_values: Sequence[str]) -> int:
+            revocation_started.set()
+            await allow_revocation.wait()
+            return await original_revoke(presented_values)
+
+        revoker._broker.revoke_authority_and_wait = block_revocation
+        finalize_task = asyncio.create_task(binding.finalize(bound, outcome="completed"))
+        await revocation_started.wait()
+        finalize_task.cancel("cancel during authority revocation")
+        allow_revocation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await finalize_task
+        assert finalize_task.cancelling() == 0
+        assert finalize_task.cancelled()
+        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert bound.state_key in inner._states
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await inner.bind(source, None, session_id="competing-session")
+
+        await binding.finalize(bound, outcome="completed")
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_nested_egress_teardown_retains_sync_owner_until_outer_runner_is_quiescent(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="fixed-target")
+    sync_binding = SyncBinding(target_workspace=target)
+    outer_cleanup_started = asyncio.Event()
+    allow_outer_cleanup = asyncio.Event()
+
+    async def run() -> None:
+        inner_result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            inner_binding=sync_binding,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_nested_inner",
+                agent_name="agent",
+                environment_name="inner-egress",
+            )
+        )
+        inner_binding = inner_result.environment.binding
+        inner_runner = inner_result.environment.runner
+        assert inner_binding is not None and inner_runner is not None
+
+        outer_result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            inner_binding=inner_binding,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_nested_outer",
+                agent_name="agent",
+                environment_name="outer-egress",
+            )
+        )
+        outer_binding = outer_result.environment.binding
+        outer_runner = outer_result.environment.runner
+        assert outer_binding is not None and outer_runner is not None
+        bound = await outer_binding.bind(source, outer_runner, session_id="sess_nested_outer")
+
+        original_outer_finalize = outer_runner.finalize_for_binding
+
+        async def block_outer_finalize(
+            *,
+            outcome: str | None,
+            require_workspace_mutations_quiescent: bool,
+            workspace_owner_key: str | None = None,
+        ) -> None:
+            outer_cleanup_started.set()
+            await allow_outer_cleanup.wait()
+            await original_outer_finalize(
+                outcome=outcome,
+                require_workspace_mutations_quiescent=(require_workspace_mutations_quiescent),
+                workspace_owner_key=workspace_owner_key,
+            )
+
+        outer_runner.finalize_for_binding = block_outer_finalize  # type: ignore[method-assign]
+        finalize_task = asyncio.create_task(outer_binding.finalize(bound, outcome="completed"))
+        await outer_cleanup_started.wait()
+        assert inner_runner.is_closed
+        assert not outer_runner.is_closed
+        assert sync_binding._fixed_target_owners == {"fixed-target": bound.state_key}
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await sync_binding.bind(source, None, session_id="competing-session")
+
+        allow_outer_cleanup.set()
+        await finalize_task
+        assert outer_runner.is_closed
+        assert sync_binding._fixed_target_owners == {}
+        assert sync_binding._states == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("sync_back", "outcome"),
+    [
+        ("never", "completed"),
+        ("on_success", "failed"),
+    ],
+)
+def test_egress_teardown_defers_no_sync_back_release_until_runner_is_quiescent(
+    tmp_path: Path,
+    sync_back: str,
+    outcome: str,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="fixed-target")
+    inner = SyncBinding(target_workspace=target, sync_back=sync_back)  # type: ignore[arg-type]
+    adapter = _RetryingLifecycleAdapter(first_error=RuntimeError("runner still live"))
+
+    async def workspace_factory(_runner):  # type: ignore[no-untyped-def]
+        return source
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            workspace_factory=workspace_factory,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_no_sync_teardown_fence",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(source, runner, session_id="sess_no_sync_teardown_fence")
+
+        with pytest.raises(RuntimeError, match="runner still live"):
+            await binding.finalize(bound, outcome=outcome)
+        assert inner._fixed_target_owners == {"fixed-target": bound.state_key}
+        assert inner._states[bound.state_key].defer_finalize_release
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await inner.bind(source, None, session_id="competing-session")
+
+        await binding.finalize(bound, outcome=outcome)
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+
+    asyncio.run(run())
+
+
+def test_app_lazily_retries_retained_egress_cleanup_before_new_environment_work(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    (source_root / "state.txt").write_text("initial", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="fixed-target")
+    inner = SyncBinding(target_workspace=target)
+    adapter = _RetryingLifecycleAdapter(first_error=RuntimeError("runner still live"))
+
+    async def workspace_factory(_runner):  # type: ignore[no-untyped-def]
+        return source
+
+    class _CompletingProvider(ModelProvider):
+        name = "fake"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            workspace_factory=workspace_factory,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_retained_egress_cleanup",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        app = CayuApp(enable_logging=False)
+        app.register_provider(_CompletingProvider(), default=True)
+        app.register_environment(result.environment, default=True)
+        app.register_environment(
+            Environment(EnvironmentSpec(name="cleanup-trigger")),
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_retained_egress_cleanup",
+                    messages=[Message.text("user", "finish")],
+                )
+            )
+        ]
+        assert inner._fixed_target_owners
+        assert (
+            "sess_retained_egress_cleanup" in app._environment_lifecycle._active_environment_setups
+        )
+
+        # A normal later run drives the bounded cleanup sweep. It retries the
+        # retained egress finalizer before admitting unrelated environment work.
+        _ = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_cleanup_trigger",
+                    environment_name="cleanup-trigger",
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        ]
+        assert inner._fixed_target_owners == {}
+        assert inner._states == {}
+        assert (
+            "sess_retained_egress_cleanup"
+            not in app._environment_lifecycle._active_environment_setups
+        )
+        assert adapter.finalize_calls == 2
+
+    asyncio.run(run())
+
+
 def test_bind_failure_detaches_a_reconnected_environment() -> None:
     adapter = _LifecycleRecordingAdapter()
 
@@ -2079,6 +3603,358 @@ def test_app_retries_factory_release_after_bind_failure() -> None:
     assert provider.requests == []
 
 
+def test_app_retains_failed_unadopted_cleanup_until_later_retry_succeeds() -> None:
+    class _FailingTwiceReconnectAdapter(_LifecycleRecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.third_finalize_started = asyncio.Event()
+            self.allow_third_finalize = asyncio.Event()
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            if len(self.finalize_calls) <= 2:
+                raise RuntimeError(f"suspend attempt {len(self.finalize_calls)} failed")
+            self.third_finalize_started.set()
+            await self.allow_third_finalize.wait()
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    class _FailingBindBinding(WorkspaceBinding):
+        async def bind(self, workspace, runner, **kwargs):  # type: ignore[no-untyped-def]
+            raise RuntimeError("bind failed")
+
+        async def finalize(self, bound, *, outcome=None, metadata=None):  # type: ignore[no-untyped-def]
+            raise AssertionError("finalize should not run")
+
+    class _UnreachedProvider(ModelProvider):
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    async def run() -> tuple[
+        list[Event],
+        list[Event],
+        _FailingTwiceReconnectAdapter,
+        _UnreachedProvider,
+        CayuApp,
+        list[Event],
+    ]:
+        adapter = _FailingTwiceReconnectAdapter()
+        egress_events: list[Event] = []
+        store = InMemorySessionStore()
+        provider = _UnreachedProvider()
+
+        async def emit(event: Event) -> Event:
+            egress_events.append(event)
+            return event
+
+        app = CayuApp(
+            session_store=store,
+            enable_logging=False,
+            max_environment_lifecycle_owners=1,
+        )
+        app.register_provider(provider, default=True)
+        app.register_environment_factory(
+            EnvironmentSpec(name="egress-env"),
+            _virtual_factory(
+                adapter=adapter,
+                inner_binding=_FailingBindBinding(),
+                event_emitter=emit,
+            ),
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        first = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_retained_unadopted_cleanup",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+        async with asyncio.timeout(0.2):
+            await adapter.third_finalize_started.wait()
+        assert "sess_retained_unadopted_cleanup" in (
+            app._environment_lifecycle._deferred_factory_cleanup_tasks
+        )
+        assert "sess_retained_unadopted_cleanup" in (
+            app._environment_lifecycle._pending_environment_owner_admissions
+        )
+
+        contender = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_retained_unadopted_contender",
+                    messages=[Message.text("user", "run")],
+                )
+            )
+        ]
+        assert len(adapter.prepare_calls) == 1
+
+        adapter.allow_third_finalize.set()
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        return first, contender, adapter, provider, app, egress_events
+
+    first, contender, adapter, provider, app, egress_events = asyncio.run(run())
+
+    assert first[-1].type is EventType.SESSION_FAILED
+    assert first[-1].payload["error"] == "bind failed"
+    assert first[-1].payload["environment_factory_release"]["completed"] is False
+    assert contender[-1].type is EventType.SESSION_FAILED
+    assert "EnvironmentCapacityError" in str(contender[-1].payload)
+    assert adapter.finalize_calls == ["interrupted", "interrupted", "interrupted"]
+    assert adapter.torn_down == 1
+    assert provider.requests == []
+    assert sum(event.type is EventType.EGRESS_GRANT_REVOKED for event in egress_events) == 1
+    assert app._environment_lifecycle._deferred_factory_cleanup_tasks == {}
+    assert app._environment_lifecycle._pending_environment_owner_admissions == set()
+
+
+def test_unbound_release_waits_for_adapter_cleanup_owner_before_retry() -> None:
+    class _SettlementOwningAdapter(_LifecycleRecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.allow_owned_cleanup = asyncio.Event()
+            self.owned_cleanup_started = asyncio.Event()
+            self.retry_started = asyncio.Event()
+            self.owned_cleanup_task: asyncio.Task[None] | None = None
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            if len(self.finalize_calls) == 1:
+                raise RuntimeError("first cleanup attempt failed")
+            if len(self.finalize_calls) == 2:
+
+                async def settle_owned_cleanup() -> None:
+                    self.owned_cleanup_started.set()
+                    await self.allow_owned_cleanup.wait()
+
+                self.owned_cleanup_task = asyncio.create_task(
+                    settle_owned_cleanup(),
+                    name="adapter-owned-cleanup",
+                )
+                error = RuntimeError("second cleanup attempt handed off")
+                attach_environment_factory_cleanup_settlement_task(
+                    error,
+                    self.owned_cleanup_task,
+                )
+                raise error
+            self.retry_started.set()
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def run() -> tuple[
+        _SettlementOwningAdapter,
+        asyncio.Task[None],
+    ]:
+        adapter = _SettlementOwningAdapter()
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_adapter_cleanup_owner",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        release = result.release
+        managed = result.environment.runner
+        assert release is not None
+        assert managed is not None
+        managed._teardown_timeout_s = 0.01
+        with pytest.raises(BaseExceptionGroup) as release_error:
+            await release(EnvironmentFactoryReleaseAction.DISCARD)
+        settlement_task = environment_factory_cleanup_settlement_task(release_error.value)
+        assert settlement_task is not None
+        await adapter.owned_cleanup_started.wait()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(adapter.retry_started.wait(), timeout=0.02)
+
+        adapter.allow_owned_cleanup.set()
+        async with asyncio.timeout(0.2):
+            await settlement_task
+        return adapter, settlement_task
+
+    adapter, settlement_task = asyncio.run(run())
+
+    assert adapter.owned_cleanup_task is not None
+    assert adapter.owned_cleanup_task.done()
+    assert settlement_task.done()
+    assert adapter.finalize_calls == [None, None, None]
+    assert adapter.torn_down == 1
+
+
+def test_unbound_release_retains_first_cleanup_handoff_before_retry() -> None:
+    class _FirstAttemptSettlementAdapter(_LifecycleRecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.allow_owned_cleanup = asyncio.Event()
+            self.owned_cleanup_started = asyncio.Event()
+            self.retry_started = asyncio.Event()
+            self.owned_cleanup_task: asyncio.Task[None] | None = None
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            if len(self.finalize_calls) == 1:
+
+                async def settle_owned_cleanup() -> None:
+                    self.owned_cleanup_started.set()
+                    await self.allow_owned_cleanup.wait()
+
+                self.owned_cleanup_task = asyncio.create_task(
+                    settle_owned_cleanup(),
+                    name="first-adapter-owned-cleanup",
+                )
+                error = RuntimeError("first cleanup attempt handed off")
+                attach_environment_factory_cleanup_settlement_task(
+                    error,
+                    self.owned_cleanup_task,
+                )
+                raise error
+            self.retry_started.set()
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def run() -> tuple[
+        _FirstAttemptSettlementAdapter,
+        asyncio.Task[None],
+    ]:
+        adapter = _FirstAttemptSettlementAdapter()
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_first_adapter_cleanup_owner",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        release = result.release
+        managed = result.environment.runner
+        assert release is not None
+        assert managed is not None
+        managed._teardown_timeout_s = 0.01
+        with pytest.raises(BaseExceptionGroup) as release_error:
+            await release(EnvironmentFactoryReleaseAction.DISCARD)
+        settlement_task = environment_factory_cleanup_settlement_task(release_error.value)
+        assert settlement_task is not None
+        await adapter.owned_cleanup_started.wait()
+        repeated_release = asyncio.create_task(
+            release(EnvironmentFactoryReleaseAction.DISCARD),
+            name="repeated-unbound-release",
+        )
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(adapter.retry_started.wait(), timeout=0.02)
+        async with asyncio.timeout(0.1):
+            with pytest.raises(BaseExceptionGroup) as repeated_error:
+                await repeated_release
+        assert environment_factory_cleanup_settlement_task(repeated_error.value) is settlement_task
+
+        adapter.allow_owned_cleanup.set()
+        async with asyncio.timeout(0.2):
+            await settlement_task
+        return adapter, settlement_task
+
+    adapter, settlement_task = asyncio.run(run())
+
+    assert adapter.owned_cleanup_task is not None
+    assert adapter.owned_cleanup_task.done()
+    assert settlement_task.done()
+    assert adapter.finalize_calls == [None, None]
+    assert adapter.torn_down == 1
+
+
+def test_unbound_release_reused_error_does_not_cycle_settlement_owner() -> None:
+    class _ReusedErrorAdapter(_LifecycleRecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.allow_owned_cleanup = asyncio.Event()
+            self.owned_cleanup_started = asyncio.Event()
+            self.owned_cleanup_task: asyncio.Task[None] | None = None
+            self.reused_error = RuntimeError("provider reused cleanup failure")
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            if len(self.finalize_calls) == 1:
+
+                async def settle_owned_cleanup() -> None:
+                    self.owned_cleanup_started.set()
+                    await self.allow_owned_cleanup.wait()
+
+                self.owned_cleanup_task = asyncio.create_task(
+                    settle_owned_cleanup(),
+                    name="reused-error-owned-cleanup",
+                )
+                attach_environment_factory_cleanup_settlement_task(
+                    self.reused_error,
+                    self.owned_cleanup_task,
+                )
+                raise self.reused_error
+            if len(self.finalize_calls) == 2:
+                raise self.reused_error
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def run() -> tuple[_ReusedErrorAdapter, asyncio.Task[None]]:
+        adapter = _ReusedErrorAdapter()
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_reused_cleanup_error",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        release = result.release
+        assert release is not None
+        with pytest.raises(BaseExceptionGroup) as release_error:
+            await release(EnvironmentFactoryReleaseAction.DISCARD)
+        settlement_task = environment_factory_cleanup_settlement_task(release_error.value)
+        assert settlement_task is not None
+        assert (
+            environment_factory_cleanup_settlement_task(adapter.reused_error)
+            is adapter.owned_cleanup_task
+        )
+        await adapter.owned_cleanup_started.wait()
+        adapter.allow_owned_cleanup.set()
+        async with asyncio.timeout(0.3):
+            await settlement_task
+        return adapter, settlement_task
+
+    adapter, settlement_task = asyncio.run(run())
+
+    assert adapter.owned_cleanup_task is not None
+    assert adapter.owned_cleanup_task.done()
+    assert settlement_task.done()
+    assert adapter.finalize_calls == [None, None, None]
+    assert adapter.torn_down == 1
+
+
 def test_app_retries_factory_release_during_bind_cancellation() -> None:
     adapter = _RetryingReconnectAdapter()
     bind_started = asyncio.Event()
@@ -2215,6 +4091,360 @@ def test_factory_rollback_preserves_cancellation_after_ordinary_creation_failure
     assert isinstance(failure.exceptions[1], asyncio.CancelledError)
 
 
+def test_factory_rollback_retains_timed_out_managed_cleanup_owner() -> None:
+    close_started = asyncio.Event()
+    allow_close = asyncio.Event()
+    creation_error = RuntimeError("workspace creation failed")
+
+    class _BlockingRollbackAdapter(_RecordingAdapter):
+        async def prepare(self, **kwargs: Any) -> EgressBinding:
+            binding = await super().prepare(**kwargs)
+            binding.teardown_timeout_s = 0.01
+            return binding
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            del outcome
+            close_started.set()
+            await allow_close.wait()
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def fail_workspace_creation(_runner: Runner) -> LocalWorkspace:
+        raise creation_error
+
+    async def run() -> tuple[BaseException, asyncio.Task[None]]:
+        adapter = _BlockingRollbackAdapter()
+        factory = _virtual_factory(adapter=adapter)
+        factory._workspace_factory = fail_workspace_creation
+        with pytest.raises(RuntimeError, match="workspace creation failed") as exc_info:
+            await factory.create(
+                EnvironmentFactoryRequest(
+                    session_id="sess_timed_out_managed_rollback",
+                    agent_name="assistant",
+                    environment_name="egress-env",
+                )
+            )
+        settlement_task = environment_factory_cleanup_settlement_task(exc_info.value)
+        assert settlement_task is not None
+        assert close_started.is_set()
+        assert not settlement_task.done()
+        allow_close.set()
+        async with asyncio.timeout(0.2):
+            await asyncio.shield(settlement_task)
+        return exc_info.value, settlement_task
+
+    failure, settlement_task = asyncio.run(run())
+
+    assert failure is creation_error
+    assert settlement_task.done()
+    assert not settlement_task.cancelled()
+
+
+@pytest.mark.parametrize("error_type", [TimeoutError, RuntimeError])
+def test_managed_factory_settlement_backs_off_immediate_failures(
+    error_type: type[Exception],
+) -> None:
+    async def run() -> int:
+        result = await _virtual_factory(adapter=_RecordingAdapter()).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_immediate_cleanup_timeout",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        managed._teardown_timeout_s = 0.01
+        attempts = 0
+
+        async def immediate_failure(*, outcome: str | None) -> None:
+            nonlocal attempts
+            del outcome
+            attempts += 1
+            raise error_type("provider cleanup immediately failed")
+
+        managed.finalize = immediate_failure  # type: ignore[method-assign]
+        settlement_task = managed.defer_finalization_settlement(outcome=None)
+        await asyncio.sleep(0.025)
+        settlement_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await settlement_task
+        return attempts
+
+    attempts = asyncio.run(run())
+
+    assert 1 <= attempts <= 3
+
+
+def test_managed_factory_settlement_preserves_cancellation_during_attempt() -> None:
+    async def run() -> tuple[asyncio.Task[None], asyncio.Task[None]]:
+        result = await _virtual_factory(adapter=_RecordingAdapter()).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_cleanup_settlement_cancelled",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        attempt_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+        allow_owned_cleanup = asyncio.Event()
+        retry_started = asyncio.Event()
+        attempts = 0
+
+        async def fail_after_cancellation(*, deadline: float) -> None:
+            nonlocal attempts
+            del deadline
+            attempts += 1
+            if attempts == 1:
+                attempt_started.set()
+                await allow_failure.wait()
+
+                async def settle_owned_cleanup() -> None:
+                    await allow_owned_cleanup.wait()
+
+                owned_cleanup = asyncio.create_task(
+                    settle_owned_cleanup(),
+                    name="cancelled-attempt-owned-cleanup",
+                )
+                error = RuntimeError("cleanup failed after settlement cancellation")
+                attach_environment_factory_cleanup_settlement_task(
+                    error,
+                    owned_cleanup,
+                )
+                raise ExceptionGroup("cleanup handed off during cancellation", [error])
+            retry_started.set()
+            managed._closed = True
+            managed._completed_runner_action = managed._requested_runner_action
+
+        managed._finalize_serialized = fail_after_cancellation  # type: ignore[method-assign]
+        settlement_task = managed.defer_finalization_settlement(outcome=None)
+        await attempt_started.wait()
+        settlement_task.cancel("stop retained cleanup")
+        allow_failure.set()
+        with pytest.raises(asyncio.CancelledError, match="stop retained cleanup"):
+            await settlement_task
+        retry_task = managed.defer_finalization_settlement(outcome=None)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(retry_started.wait(), timeout=0.02)
+        allow_owned_cleanup.set()
+        async with asyncio.timeout(0.2):
+            await retry_task
+        return settlement_task, retry_task
+
+    settlement_task, retry_task = asyncio.run(run())
+
+    assert settlement_task.cancelled()
+    assert retry_task.done()
+
+
+def test_managed_factory_settlement_preserves_concurrent_fatal_signal() -> None:
+    async def run() -> tuple[BaseExceptionGroup, asyncio.Task[None], GeneratorExit]:
+        result = await _virtual_factory(adapter=_RecordingAdapter()).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_cleanup_settlement_cancelled_with_fatal",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        attempt_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+        fatal_signal = GeneratorExit("provider cleanup interrupted")
+
+        async def fail_after_cancellation(*, deadline: float) -> None:
+            del deadline
+            attempt_started.set()
+            await allow_failure.wait()
+            raise fatal_signal
+
+        managed._finalize_serialized = fail_after_cancellation  # type: ignore[method-assign]
+        settlement_task = managed.defer_finalization_settlement(outcome=None)
+        await attempt_started.wait()
+        settlement_task.cancel("stop retained cleanup")
+        assert settlement_task.cancelling() == 1
+        await asyncio.sleep(0)
+        assert not settlement_task.done()
+        allow_failure.set()
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await settlement_task
+        return exc_info.value, settlement_task, fatal_signal
+
+    failure, settlement_task, fatal_signal = asyncio.run(run())
+
+    assert isinstance(failure.exceptions[0], asyncio.CancelledError)
+    assert failure.exceptions[1] is fatal_signal
+    propagated_fatal = binding_finalize_fatal_signal(failure)
+    assert isinstance(propagated_fatal, BaseExceptionGroup)
+    assert propagated_fatal.exceptions == (fatal_signal,)
+    assert settlement_task.cancelled() is False
+
+
+def test_managed_factory_prerequisite_preserves_concurrent_fatal_signal() -> None:
+    async def run() -> tuple[
+        BaseExceptionGroup,
+        asyncio.Task[None],
+        BaseExceptionGroup,
+        GeneratorExit,
+    ]:
+        result = await _virtual_factory(adapter=_RecordingAdapter()).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_cleanup_prerequisite_cancelled_with_fatal",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        prerequisite_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+        fatal_signal = GeneratorExit("predecessor cleanup interrupted")
+        fatal_failure = BaseExceptionGroup(
+            "predecessor cleanup carried a fatal signal",
+            [fatal_signal],
+        )
+
+        async def fail_prerequisite() -> None:
+            prerequisite_started.set()
+            await allow_failure.wait()
+            raise fatal_failure
+
+        prerequisite_task = asyncio.create_task(
+            fail_prerequisite(),
+            name="fatal-cleanup-prerequisite",
+        )
+        managed._factory_cleanup_prerequisite_tasks.add(prerequisite_task)
+        drain_task = asyncio.create_task(
+            managed._drain_factory_cleanup_prerequisites(
+                deadline=asyncio.get_running_loop().time() + 1,
+            ),
+            name="cancelled-cleanup-prerequisite-drain",
+        )
+        await prerequisite_started.wait()
+        await asyncio.sleep(0)
+        drain_task.cancel("stop predecessor cleanup wait")
+        assert drain_task.cancelling() == 1
+        await asyncio.sleep(0)
+        assert not drain_task.done()
+        allow_failure.set()
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await drain_task
+        return exc_info.value, drain_task, fatal_failure, fatal_signal
+
+    failure, drain_task, fatal_failure, fatal_signal = asyncio.run(run())
+
+    assert isinstance(failure.exceptions[0], asyncio.CancelledError)
+    assert failure.exceptions[1] is fatal_failure
+    propagated_fatal = binding_finalize_fatal_signal(failure)
+    assert isinstance(propagated_fatal, BaseExceptionGroup)
+    assert propagated_fatal.exceptions == (fatal_signal,)
+    assert drain_task.cancelled() is False
+
+
+def test_managed_factory_settlement_follows_grouped_prerequisite_handoff() -> None:
+    async def run() -> tuple[asyncio.Task[None], asyncio.Task[None]]:
+        result = await _virtual_factory(adapter=_RecordingAdapter()).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_grouped_cleanup_prerequisite",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        allow_successor = asyncio.Event()
+        retry_started = asyncio.Event()
+
+        async def successor() -> None:
+            await allow_successor.wait()
+
+        successor_task = asyncio.create_task(
+            successor(),
+            name="grouped-cleanup-successor",
+        )
+
+        async def prerequisite() -> None:
+            error = RuntimeError("prerequisite handed off cleanup")
+            attach_environment_factory_cleanup_settlement_task(
+                error,
+                successor_task,
+            )
+            raise ExceptionGroup("grouped prerequisite failure", [error])
+
+        prerequisite_task = asyncio.create_task(
+            prerequisite(),
+            name="grouped-cleanup-prerequisite",
+        )
+
+        async def complete_retry(*, deadline: float) -> None:
+            del deadline
+            retry_started.set()
+            managed._closed = True
+            managed._completed_runner_action = managed._requested_runner_action
+
+        managed._finalize_serialized = complete_retry  # type: ignore[method-assign]
+        settlement_task = managed.defer_finalization_settlement(
+            outcome=None,
+            prerequisite_task=prerequisite_task,
+        )
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(retry_started.wait(), timeout=0.02)
+        allow_successor.set()
+        async with asyncio.timeout(0.2):
+            await settlement_task
+        return successor_task, settlement_task
+
+    successor_task, settlement_task = asyncio.run(run())
+
+    assert successor_task.done()
+    assert settlement_task.done()
+
+
+def test_managed_factory_settlement_retries_child_only_cancellation() -> None:
+    class _ChildCancellingAdapter(_RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            del outcome
+            self.attempts += 1
+            if self.attempts <= 2:
+                raise asyncio.CancelledError("provider cleanup self-cancelled")
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def run() -> int:
+        adapter = _ChildCancellingAdapter()
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_cleanup_settlement_child_cancelled",
+                agent_name="assistant",
+                environment_name="egress-env",
+            )
+        )
+        managed = result.environment.runner
+        assert managed is not None
+        settlement_task = managed.defer_finalization_settlement(outcome=None)
+        async with asyncio.timeout(0.3):
+            await settlement_task
+        return adapter.attempts
+
+    assert asyncio.run(run()) == 3
+
+
 @pytest.mark.parametrize(
     ("action", "expected_outcome"),
     [
@@ -2281,6 +4511,153 @@ def test_concurrent_factory_release_escalates_preserve_to_discard_once() -> None
     assert len(adapter.finalize_calls) <= 2
     assert adapter.torn_down == 1
     assert sum(event.type is EventType.EGRESS_GRANT_REVOKED for event in events) == 1
+
+
+def test_later_release_escalation_refreshes_completed_settlement_owner() -> None:
+    class _TwiceFailingEscalationAdapter(_LifecycleRecordingAdapter):
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            if len(self.finalize_calls) in {1, 2, 4, 5}:
+                raise RuntimeError(f"cleanup attempt {len(self.finalize_calls)} failed")
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def run() -> tuple[
+        asyncio.Task[None],
+        asyncio.Task[None],
+        _TwiceFailingEscalationAdapter,
+        Runner,
+    ]:
+        adapter = _TwiceFailingEscalationAdapter()
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_release_escalation_settlement",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        release = result.release
+        runner = result.environment.runner
+        assert release is not None and runner is not None
+
+        with pytest.raises(BaseExceptionGroup) as preserve_error:
+            await release(EnvironmentFactoryReleaseAction.PRESERVE)
+        preserve_settlement = environment_factory_cleanup_settlement_task(preserve_error.value)
+        assert preserve_settlement is not None
+        async with asyncio.timeout(0.2):
+            await preserve_settlement
+
+        with pytest.raises(BaseExceptionGroup) as discard_error:
+            await release(EnvironmentFactoryReleaseAction.DISCARD)
+        discard_settlement = environment_factory_cleanup_settlement_task(discard_error.value)
+        assert discard_settlement is not None
+        assert discard_settlement is not preserve_settlement
+        assert not discard_settlement.done()
+        async with asyncio.timeout(0.2):
+            await discard_settlement
+        return preserve_settlement, discard_settlement, adapter, runner
+
+    preserve_settlement, discard_settlement, adapter, runner = asyncio.run(run())
+
+    assert preserve_settlement.done()
+    assert discard_settlement.done()
+    assert adapter.finalize_calls == [
+        "interrupted",
+        "interrupted",
+        "interrupted",
+        None,
+        None,
+        None,
+    ]
+    assert adapter.torn_down == 1
+    assert runner.closed is True
+
+
+def test_pending_preserve_settlement_absorbs_later_discard_escalation() -> None:
+    class _BlockedPreserveAdapter(_LifecycleRecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.binding_close_started = asyncio.Event()
+            self.allow_binding_close = asyncio.Event()
+
+        async def prepare(self, **kwargs: Any) -> EgressBinding:
+            binding = await super().prepare(**kwargs)
+            binding.teardown_timeout_s = 0.01
+            original_teardown = binding.teardown
+            assert original_teardown is not None
+
+            async def blocked_teardown() -> None:
+                self.binding_close_started.set()
+                await self.allow_binding_close.wait()
+                await original_teardown()
+
+            binding.teardown = blocked_teardown
+            return binding
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            if len(self.finalize_calls) <= 2:
+                raise RuntimeError(f"detach attempt {len(self.finalize_calls)} failed")
+            if outcome is not None:
+                return RunnerFinalizationResult(
+                    workspace_mutations_quiescent=True,
+                    allocation_preserved=True,
+                )
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def run() -> tuple[_BlockedPreserveAdapter, Runner, asyncio.Task[None]]:
+        adapter = _BlockedPreserveAdapter()
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_pending_preserve_escalation",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        release = result.release
+        runner = result.environment.runner
+        assert release is not None and runner is not None
+
+        with pytest.raises(BaseExceptionGroup) as preserve_error:
+            await release(EnvironmentFactoryReleaseAction.PRESERVE)
+        preserve_settlement = environment_factory_cleanup_settlement_task(preserve_error.value)
+        assert preserve_settlement is not None
+        async with asyncio.timeout(0.2):
+            await adapter.binding_close_started.wait()
+        assert not preserve_settlement.done()
+
+        with pytest.raises(BaseExceptionGroup) as discard_error:
+            await release(EnvironmentFactoryReleaseAction.DISCARD)
+        discard_settlement = environment_factory_cleanup_settlement_task(discard_error.value)
+        assert discard_settlement is preserve_settlement
+
+        adapter.allow_binding_close.set()
+        async with asyncio.timeout(0.2):
+            await discard_settlement
+        return adapter, runner, discard_settlement
+
+    adapter, runner, discard_settlement = asyncio.run(run())
+
+    assert discard_settlement.done()
+    assert adapter.finalize_calls == [
+        "interrupted",
+        "interrupted",
+        "interrupted",
+        None,
+    ]
+    assert adapter.torn_down == 1
+    assert runner.closed is True
 
 
 def test_runner_close_before_bind_cleans_up_egress_resources() -> None:
@@ -2943,6 +5320,324 @@ def test_concurrent_terminal_escalation_keeps_claim_until_remove_completes() -> 
 
     asyncio.run(run())
     assert adapter.finalize_calls == ["interrupted", None]
+    assert adapter.torn_down == 1
+
+
+def test_concurrent_terminal_escalation_follows_preserving_quiescence() -> None:
+    quiesce_started = asyncio.Event()
+    allow_quiesce = asyncio.Event()
+    remove_started = asyncio.Event()
+    allow_remove = asyncio.Event()
+
+    class _CoordinatedAdapter(_LifecycleRecordingAdapter):
+        async def finalize_runner_for_binding(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            assert outcome == "interrupted"
+            self.finalize_calls.append("quiesce")
+            quiesce_started.set()
+            await allow_quiesce.wait()
+            return RunnerFinalizationResult(
+                workspace_mutations_quiescent=True,
+                allocation_preserved=True,
+            )
+
+        async def finalize_runner(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            self.finalize_calls.append(outcome)
+            remove_started.set()
+            await allow_remove.wait()
+            await runner.close()
+            return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    adapter = _CoordinatedAdapter()
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_concurrent_quiescence_escalation",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        runner.arm_workspace_mutation_quiescence()
+
+        interrupted = asyncio.create_task(runner.finalize(outcome="interrupted"))
+        await quiesce_started.wait()
+        terminal = asyncio.create_task(runner.close())
+        await asyncio.sleep(0)
+        allow_quiesce.set()
+        await remove_started.wait()
+        assert adapter.torn_down == 0
+        allow_remove.set()
+        await asyncio.gather(interrupted, terminal)
+
+    asyncio.run(run())
+
+    assert adapter.finalize_calls == ["quiesce", None]
+    assert adapter.torn_down == 1
+
+
+def test_binding_quiescence_is_armed_before_late_finalizer_claim_release(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="late-finalizer-target")
+    inner = SyncBinding(target_workspace=target)
+    claim_release_started = asyncio.Event()
+    allow_claim_release = asyncio.Event()
+
+    class _QuiescenceRecordingAdapter(_RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__("lambda-microvm")
+            self.binding_finalize_calls = 0
+
+        async def finalize_runner_for_binding(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            assert outcome == "interrupted"
+            self.binding_finalize_calls += 1
+            await runner.close()
+            return RunnerFinalizationResult(
+                workspace_mutations_quiescent=True,
+                allocation_preserved=True,
+            )
+
+    adapter = _QuiescenceRecordingAdapter()
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="late-binding-finalizer",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            source,
+            runner,
+            session_id="late-binding-finalizer",
+        )
+        egress_binding: EgressBinding = adapter.captured["binding"]
+        original_teardown = egress_binding.teardown
+        assert original_teardown is not None
+
+        async def blocked_teardown() -> None:
+            claim_release_started.set()
+            await allow_claim_release.wait()
+            await original_teardown()
+
+        egress_binding.teardown = blocked_teardown
+        ordinary_finalize = asyncio.create_task(runner.finalize(outcome="interrupted"))
+        while runner._workspace_dispatch_gate_owner is None:  # type: ignore[attr-defined]
+            await asyncio.sleep(0)
+        assert not claim_release_started.is_set()
+        binding_finalize = asyncio.create_task(binding.finalize(bound, outcome="interrupted"))
+        await claim_release_started.wait()
+
+        with pytest.raises(ValueError, match="already bound by an active session"):
+            await SyncBinding(target_workspace=target).bind(
+                source,
+                None,
+                session_id="competing-session",
+            )
+
+        allow_claim_release.set()
+        await asyncio.gather(ordinary_finalize, binding_finalize)
+        replacement = SyncBinding(target_workspace=target)
+        replacement_bound = await replacement.bind(
+            source,
+            None,
+            session_id="replacement-session",
+        )
+        replacement.abandon(replacement_bound)
+
+    asyncio.run(run())
+
+    assert adapter.binding_finalize_calls == 1
+    assert adapter.torn_down == 1
+
+
+def test_managed_runner_rejects_second_stateful_binding_before_inner_mutation(
+    tmp_path: Path,
+) -> None:
+    first_source_root = tmp_path / "first-source"
+    second_source_root = tmp_path / "second-source"
+    target_root = tmp_path / "target"
+    first_source_root.mkdir()
+    second_source_root.mkdir()
+    target_root.mkdir()
+    first_source = LocalWorkspace(first_source_root, workspace_id="first-source")
+    second_source = LocalWorkspace(second_source_root, workspace_id="second-source")
+    target = LocalWorkspace(target_root, workspace_id="single-owner-target")
+    target_factory_calls = 0
+
+    def target_factory(_context):  # type: ignore[no-untyped-def]
+        nonlocal target_factory_calls
+        target_factory_calls += 1
+        return target
+
+    inner = SyncBinding(target_workspace_factory=target_factory)
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=_RecordingAdapter(),
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="single-managed-binding",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+        bound = await binding.bind(
+            first_source,
+            runner,
+            session_id="first-managed-binding",
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="already has an active stateful workspace binding",
+        ):
+            await binding.bind(
+                second_source,
+                runner,
+                session_id="second-managed-binding",
+            )
+        assert target_factory_calls == 1
+        assert inner._fixed_target_owners == {"single-owner-target": bound.state_key}
+
+        await binding.finalize(bound, outcome="completed")
+        assert inner._fixed_target_owners == {}
+
+    asyncio.run(run())
+
+
+def test_inflight_binding_admission_blocks_runner_release_until_quiescence_is_armed(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="inflight-bind-target")
+    inner_bound = asyncio.Event()
+    allow_bind_return = asyncio.Event()
+
+    class _BlockingSyncBinding(SyncBinding):
+        async def bind(self, *args: Any, **kwargs: Any) -> BoundWorkspace:
+            bound = await super().bind(*args, **kwargs)
+            inner_bound.set()
+            await allow_bind_return.wait()
+            return bound
+
+    inner = _BlockingSyncBinding(target_workspace=target)
+
+    class _QuiescenceRecordingAdapter(_RecordingAdapter):
+        def __init__(self) -> None:
+            super().__init__("lambda-microvm")
+            self.binding_finalize_calls = 0
+
+        async def prepare(self, **kwargs: Any) -> EgressBinding:
+            binding = await super().prepare(**kwargs)
+            binding.teardown_timeout_s = 0.01
+            return binding
+
+        async def finalize_runner_for_binding(
+            self,
+            runner: Runner,
+            *,
+            outcome: str | None,
+        ) -> RunnerFinalizationResult:
+            assert outcome == "interrupted"
+            self.binding_finalize_calls += 1
+            await runner.close()
+            return RunnerFinalizationResult(
+                workspace_mutations_quiescent=True,
+                allocation_preserved=True,
+            )
+
+    adapter = _QuiescenceRecordingAdapter()
+
+    async def run() -> None:
+        result = await _virtual_factory(
+            adapter=adapter,
+            inner_binding=inner,
+        ).create(
+            EnvironmentFactoryRequest(
+                session_id="inflight-binding-finalizer",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        binding = result.environment.binding
+        runner = result.environment.runner
+        assert binding is not None and runner is not None
+
+        bind_task = asyncio.create_task(
+            binding.bind(
+                source,
+                runner,
+                session_id="inflight-binding-finalizer",
+            )
+        )
+        await inner_bound.wait()
+        with pytest.raises(
+            RuntimeError,
+            match="workspace binding admission in progress",
+        ):
+            await binding.bind(
+                source,
+                runner,
+                session_id="competing-inflight-binding",
+            )
+        finalizer = asyncio.create_task(runner.finalize(outcome="interrupted"))
+        await asyncio.sleep(0)
+
+        assert not finalizer.done()
+        assert adapter.binding_finalize_calls == 0
+        assert adapter.torn_down == 0
+        with pytest.raises(TimeoutError, match="binding lifecycle boundary"):
+            async with asyncio.timeout(0.2):
+                await finalizer
+        assert inner._fixed_target_owners
+        assert adapter.binding_finalize_calls == 0
+
+        allow_bind_return.set()
+        bound = await bind_task
+        await binding.finalize(bound, outcome="interrupted")
+        assert adapter.binding_finalize_calls == 1
+        assert inner._fixed_target_owners == {}
+
+    asyncio.run(run())
+
     assert adapter.torn_down == 1
 
 

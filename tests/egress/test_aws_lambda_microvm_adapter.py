@@ -198,6 +198,12 @@ class _FakeLambdaRunner(Runner):
     async def terminate(self) -> None:
         self.terminated = True
 
+    async def wait_until_suspended(self) -> None:
+        assert self.suspended
+
+    async def wait_until_terminated(self) -> None:
+        assert self.terminated
+
     async def close(self) -> None:
         self.closed = True
 
@@ -766,7 +772,7 @@ def test_lambda_microvm_adapter_reattaches_and_maps_lifecycle(
         runner_options={"poll_interval_s": 0},
     )
 
-    async def run() -> tuple[_FakeLambdaRunner, dict[str, Any], str]:
+    async def run() -> tuple[_FakeLambdaRunner, dict[str, Any], str, bool]:
         binding = await adapter.prepare(session_id="session-1", grants=[grant], broker=broker)
         ca_path = tmp_path / "ca.pem"
         ca_path.write_bytes(binding.ca_cert_pem or b"")
@@ -802,11 +808,16 @@ def test_lambda_microvm_adapter_reattaches_and_maps_lifecycle(
         )
         metadata = adapter.reconnect_metadata(runner)
         metadata_isolation = adapter.capability_evidence(runner).state_for("metadata_isolation")
-        await adapter.finalize_runner(runner, outcome="interrupted")
+        finalization = await adapter.finalize_runner(runner, outcome="interrupted")
         await binding.close()
-        return runner, metadata, metadata_isolation  # type: ignore[return-value]
+        return (
+            runner,
+            metadata,
+            metadata_isolation,
+            finalization.workspace_mutations_quiescent,
+        )  # type: ignore[return-value]
 
-    runner, metadata, metadata_isolation = asyncio.run(run())
+    runner, metadata, metadata_isolation, mutations_quiescent = asyncio.run(run())
 
     assert _FakeLambdaRunner.created == []
     assert len(_FakeLambdaRunner.attached) == 1
@@ -815,6 +826,7 @@ def test_lambda_microvm_adapter_reattaches_and_maps_lifecycle(
     assert attached["region_name"] == "us-east-1"
     assert attached["client"] is adapter.client
     assert attached["close_action"] == "none"
+    assert mutations_quiescent is True
     assert attached["env_overlay"]["HTTPS_PROXY"] == "http://10.0.1.20:9443"
     assert attached["poll_interval_s"] == 0
     assert metadata == {

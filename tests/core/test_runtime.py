@@ -4623,14 +4623,14 @@ def test_cayu_app_environment_factory_result_name_must_match_registration(tmp_pa
 def test_environment_factory_result_release_is_bounded(tmp_path):
     async def run():
         store = InMemorySessionStore()
-        release_cancelled = asyncio.Event()
+        release_started = asyncio.Event()
+        finish_release = asyncio.Event()
+        release_completed = asyncio.Event()
 
         async def release(_action: EnvironmentFactoryReleaseAction) -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                release_cancelled.set()
-                raise
+            release_started.set()
+            await finish_release.wait()
+            release_completed.set()
 
         workspace_root = tmp_path / "factory-release-timeout"
         workspace_root.mkdir()
@@ -4659,7 +4659,17 @@ def test_environment_factory_result_release_is_bounded(tmp_path):
                 messages=[Message.text("user", "run")],
             ),
         )
-        await asyncio.wait_for(release_cancelled.wait(), timeout=1)
+        assert release_started.is_set()
+        assert not release_completed.is_set()
+        assert "sess_factory_release_timeout" in (
+            app._environment_lifecycle._deferred_factory_cleanup_tasks
+        )
+        assert "sess_factory_release_timeout" in (
+            app._environment_lifecycle._pending_environment_owner_admissions
+        )
+        finish_release.set()
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert release_completed.is_set()
         return events
 
     events = asyncio.run(run())
@@ -4735,14 +4745,14 @@ def test_cancellation_waits_for_factory_result_release_then_propagates(tmp_path)
 def test_environment_factory_fallback_release_is_bounded(tmp_path):
     class HangingRunner(ProvisionedTestRunner):
         def __init__(self) -> None:
-            self.cancelled = asyncio.Event()
+            self.close_started = asyncio.Event()
+            self.finish_close = asyncio.Event()
+            self.close_completed = asyncio.Event()
 
         async def close(self) -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                self.cancelled.set()
-                raise
+            self.close_started.set()
+            await self.finish_close.wait()
+            self.close_completed.set()
 
     async def run():
         store = InMemorySessionStore()
@@ -4774,7 +4784,17 @@ def test_environment_factory_fallback_release_is_bounded(tmp_path):
                 messages=[Message.text("user", "run")],
             ),
         )
-        await asyncio.wait_for(runner.cancelled.wait(), timeout=1)
+        assert runner.close_started.is_set()
+        assert not runner.close_completed.is_set()
+        assert "sess_factory_fallback_timeout" in (
+            app._environment_lifecycle._deferred_factory_cleanup_tasks
+        )
+        assert "sess_factory_fallback_timeout" in (
+            app._environment_lifecycle._pending_environment_owner_admissions
+        )
+        runner.finish_close.set()
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        assert runner.close_completed.is_set()
         return events
 
     events = asyncio.run(run())
@@ -6141,6 +6161,92 @@ def test_cayu_app_binding_failure_fails_session_before_start_event():
     assert len(binding.bind_calls) == 1
     assert binding.finalize_calls == []
     assert provider.requests == []
+
+
+def test_binding_failure_retains_timed_out_factory_release_owner(tmp_path):
+    async def run():
+        release_started = asyncio.Event()
+        finish_release = asyncio.Event()
+        release_completed = asyncio.Event()
+        release_actions: list[EnvironmentFactoryReleaseAction] = []
+
+        async def release(action: EnvironmentFactoryReleaseAction) -> None:
+            release_actions.append(action)
+            release_started.set()
+            await finish_release.wait()
+            release_completed.set()
+
+        workspace_root = tmp_path / "binding-release-timeout"
+        workspace_root.mkdir()
+        binding = RecordingWorkspaceBinding(fail_bind=True)
+        factory = RecordingEnvironmentFactory(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                workspace=LocalWorkspace(workspace_root),
+                binding=binding,
+            ),
+            release=release,
+            release_timeout_s=0.01,
+        )
+        app = CayuApp(
+            enable_logging=False,
+            max_environment_lifecycle_owners=1,
+        )
+        app.register_provider(
+            FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]),
+            default=True,
+        )
+        app.register_environment_factory(
+            EnvironmentSpec(name="dynamic"),
+            factory,
+            default=True,
+        )
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        first = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="binding-release-owner",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        assert release_started.is_set()
+        assert not release_completed.is_set()
+        assert "binding-release-owner" in (
+            app._environment_lifecycle._deferred_factory_cleanup_tasks
+        )
+        assert "binding-release-owner" in (
+            app._environment_lifecycle._pending_environment_owner_admissions
+        )
+        assert "binding-release-owner" not in (
+            app._environment_lifecycle._active_environment_setups
+        )
+
+        contender = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="binding-release-contender",
+                messages=[Message.text("user", "run")],
+            ),
+        )
+        assert len(factory.requests) == 1
+
+        finish_release.set()
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
+        return first, contender, release_actions, release_completed.is_set(), app
+
+    first, contender, release_actions, release_completed, app = asyncio.run(run())
+
+    assert first[-1].type is EventType.SESSION_FAILED
+    assert first[-1].payload["error"] == "bind failed"
+    assert contender[-1].type is EventType.SESSION_FAILED
+    assert "EnvironmentCapacityError" in str(contender[-1].payload)
+    assert release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
+    assert release_completed is True
+    assert app._environment_lifecycle._deferred_factory_cleanup_tasks == {}
+    assert app._environment_lifecycle._pending_environment_owner_admissions == set()
 
 
 @pytest.mark.parametrize("retry_fails", [False, True])

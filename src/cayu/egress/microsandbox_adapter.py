@@ -30,6 +30,7 @@ from cayu.egress._remote_adapter import (
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
+    RunnerFinalizationResult,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
     _await_bounded_cleanup_task,
@@ -54,11 +55,17 @@ from cayu.egress.proxy_exposure import (
 )
 from cayu.egress.proxy_server import DualStackLoopbackEgressProxyServer
 from cayu.environments.admission import ExecutionCapabilityEvidence
+from cayu.environments.factory import (
+    attach_environment_factory_cleanup_settlement_task,
+    environment_factory_cleanup_settlement_task,
+    register_environment_factory_cleanup_retry,
+)
 from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.microsandbox import (
     DEFAULT_MICROSANDBOX_RECONNECT_TIMEOUT_SECONDS,
     MicrosandboxReconnectIdentityError,
     MicrosandboxRunner,
+    microsandbox_reconnect_settlement_task,
 )
 
 
@@ -79,6 +86,9 @@ class _ReconnectClaim:
     handle: BinaryIO
     remove_on_close: bool = False
     closed: bool = False
+    binding_active: bool = False
+    settlement_task: asyncio.Task[None] | None = None
+    settlement_error: BaseException | None = None
 
     def read_identity(self) -> dict[str, Any]:
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -221,6 +231,9 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
         self._runner_claims: weakref.WeakKeyDictionary[Runner, _ReconnectClaim] = (
             weakref.WeakKeyDictionary()
         )
+        self._runner_reacquired_claims: weakref.WeakKeyDictionary[Runner, _ReconnectClaim] = (
+            weakref.WeakKeyDictionary()
+        )
         self._runner_identities: weakref.WeakKeyDictionary[Runner, _ReconnectIdentity] = (
             weakref.WeakKeyDictionary()
         )
@@ -265,7 +278,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             raise InvalidEgressReconnectMetadataError(
                 "Microsandbox reconnect identity belongs to a different environment."
             )
-        claim = self._acquire_claim(identity["sandbox_name"])
+        claim = self._claim_for_reconnect(identity["sandbox_name"])
         try:
             attested = self.validate_reconnect_metadata(claim.read_identity())
             if attested != identity:
@@ -284,7 +297,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                 proxy_server_factory=self._proxy_server_factory,
             )
         except OSError as exc:
-            claim.close()
+            self._release_failed_reconnect_prepare(identity["sandbox_name"], claim)
             if exc.errno == errno.EADDRINUSE:
                 raise EgressReconnectConflictError(
                     "Microsandbox virtual-egress reconnect could not reclaim its original "
@@ -296,7 +309,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                 f"proxy on port {identity['proxy_listener_port']}."
             ) from exc
         except BaseException:
-            claim.close()
+            self._release_failed_reconnect_prepare(identity["sandbox_name"], claim)
             raise
         self._hold_claim(
             sandbox_name=identity["sandbox_name"],
@@ -415,10 +428,30 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                             f"{reconnect['sandbox_name']}."
                         ) from exc
                     if isinstance(exc, TimeoutError):
-                        raise EgressReconnectError(
+                        settlement_task = microsandbox_reconnect_settlement_task(exc)
+                        if settlement_task is not None:
+                            claim = self._claims_by_name.get(reconnect["sandbox_name"])
+                            if claim is not None and not claim.closed:
+                                self._observe_claim_settlement(
+                                    reconnect["sandbox_name"],
+                                    claim,
+                                    settlement_task,
+                                )
+                                self._register_reconnect_restoration_retry(
+                                    settlement_task,
+                                    identity=reconnect,
+                                    claim=claim,
+                                )
+                        reconnect_error = EgressReconnectError(
                             "Microsandbox reconnect timed out while attaching to sandbox "
                             f"{reconnect['sandbox_name']!r}."
-                        ) from exc
+                        )
+                        if settlement_task is not None:
+                            attach_environment_factory_cleanup_settlement_task(
+                                reconnect_error,
+                                settlement_task,
+                            )
+                        raise reconnect_error from exc
                     if isinstance(exc, MicrosandboxReconnectIdentityError):
                         raise InvalidEgressReconnectMetadataError(
                             "Microsandbox reconnect sandbox incarnation no longer matches "
@@ -438,6 +471,8 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                 )
             self._runner_claims[runner] = claim
             self._runner_identities[runner] = identity
+            claim.settlement_task = None
+            claim.settlement_error = None
             preflight_observed_at = await run_enforcement_preflight(
                 runner,
                 request,
@@ -453,12 +488,36 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             self._runner_preflight_observations[runner] = preflight_observed_at
             return runner
         except BaseException as original:
+            factory_settlement_task = environment_factory_cleanup_settlement_task(original)
+            settlement_task = microsandbox_reconnect_settlement_task(original)
+            if settlement_task is not None and reconnect is not None:
+                claim = self._claims_by_name.get(reconnect["sandbox_name"])
+                if claim is not None and not claim.closed:
+                    self._observe_claim_settlement(
+                        reconnect["sandbox_name"],
+                        claim,
+                        settlement_task,
+                    )
+                    self._register_reconnect_restoration_retry(
+                        settlement_task,
+                        identity=reconnect,
+                        claim=claim,
+                    )
+                factory_settlement_task = settlement_task
+                attach_environment_factory_cleanup_settlement_task(
+                    original,
+                    settlement_task,
+                )
             rollback_complete = False
             rollback_cancelled = False
             rollback_failure: BaseException | None = None
             if runner is not None:
                 _consume_accounted_task_cancellation(original)
-                runner.close_action = "remove" if created_new else "detach"
+                runner.close_action = (
+                    "remove"
+                    if created_new
+                    else ("stop" if runner.restarted_from_stopped else "detach")
+                )
                 cleanup_task = asyncio.create_task(runner.close())
                 try:
                     rollback_cancelled = await _await_bounded_cleanup_task(
@@ -468,6 +527,55 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                     )
                     rollback_complete = True
                 except BaseException as cleanup_error:
+                    claim_name = runner.name if created_new else reconnect["sandbox_name"]
+                    claim = self._claims_by_name.get(claim_name)
+                    factory_settlement_task = (
+                        runner._defer_terminal_removal(cleanup_task)
+                        if created_new
+                        else (
+                            runner._defer_stopped_boundary_restoration(cleanup_task)
+                            if runner.restarted_from_stopped
+                            else cleanup_task
+                        )
+                    )
+                    if created_new:
+
+                        def retry_terminal_removal() -> asyncio.Task[None]:
+                            retry_task = runner._defer_terminal_removal()
+                            if claim is not None and not claim.closed:
+                                self._observe_claim_settlement(
+                                    claim_name,
+                                    claim,
+                                    retry_task,
+                                )
+                            return retry_task
+
+                        register_environment_factory_cleanup_retry(
+                            factory_settlement_task,
+                            retry_terminal_removal,
+                        )
+                    elif runner.restarted_from_stopped and claim is not None:
+                        self._register_reconnect_restoration_retry(
+                            factory_settlement_task,
+                            identity=reconnect,
+                            claim=claim,
+                        )
+                    attach_environment_factory_cleanup_settlement_task(
+                        original,
+                        factory_settlement_task,
+                    )
+                    if claim is not None and not claim.closed:
+                        # A failed or still-running close has not proved that
+                        # this runner stopped mutating its sandbox. Keep the
+                        # exact ownership claim attached to the concrete task
+                        # for both new allocations and reconnects.
+                        self._observe_claim_settlement(
+                            claim_name,
+                            claim,
+                            factory_settlement_task,
+                        )
+                        if created_new:
+                            claim.remove_on_close = True
                     add_exception_note_safely(
                         original,
                         "Microsandbox egress runner rollback incomplete: "
@@ -492,13 +600,24 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             if unbound_claim is not None:
                 unbound_claim.close()
             if rollback_failure is not None:
+                if factory_settlement_task is not None:
+                    attach_environment_factory_cleanup_settlement_task(
+                        rollback_failure,
+                        factory_settlement_task,
+                    )
                 raise rollback_failure from exception_cause(rollback_failure)
             if rollback_cancelled:
                 cancellation = asyncio.CancelledError()
-                raise BaseExceptionGroup(
+                rollback_error = BaseExceptionGroup(
                     "Microsandbox egress runner rollback completed after cancellation.",
                     [original, cancellation],
-                ) from cancellation
+                )
+                if factory_settlement_task is not None:
+                    attach_environment_factory_cleanup_settlement_task(
+                        rollback_error,
+                        factory_settlement_task,
+                    )
+                raise rollback_error from cancellation
             raise
 
     def reconnect_metadata(self, runner: Runner) -> dict[str, Any]:
@@ -517,13 +636,21 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
     ) -> dict[str, Any]:
         return dict(_reconnect_identity(reconnect_metadata))
 
-    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
         if not isinstance(runner, MicrosandboxRunner):
             raise TypeError("Microsandbox adapter received a different runner type.")
         if outcome == "interrupted":
-            runner.close_action = "detach"
+            runner.close_action = "stop" if runner.restarted_from_stopped else "detach"
             await runner.close()
-            return
+            return RunnerFinalizationResult(
+                workspace_mutations_quiescent=runner.restarted_from_stopped,
+                allocation_preserved=True,
+            )
 
         claim = self._runner_claims.get(runner)
         removal_runner = runner
@@ -547,7 +674,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                 self._claims_by_name[identity["sandbox_name"]] = claim
                 self._runner_claims[runner] = claim
             try:
-                removal_runner = await MicrosandboxRunner.from_existing(
+                removal_runner = await MicrosandboxRunner._from_existing_for_lifecycle(
                     identity["sandbox_name"],
                     close_action="remove",
                     sandbox_module=self._microsandbox_module(),
@@ -560,7 +687,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
                     claim.close()
                     self._claims_by_name.pop(identity["sandbox_name"], None)
                     self._runner_claims.pop(runner, None)
-                    return
+                    return RunnerFinalizationResult(workspace_mutations_quiescent=True)
                 raise
         else:
             removal_runner.close_action = "remove"
@@ -573,6 +700,68 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             if identity is not None:
                 self._claims_by_name.pop(identity["sandbox_name"], None)
             self._runner_claims.pop(runner, None)
+            self._runner_reacquired_claims.pop(runner, None)
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
+
+    async def finalize_runner_for_binding(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        if not isinstance(runner, MicrosandboxRunner):
+            raise TypeError("Microsandbox adapter received a different runner type.")
+        if outcome != "interrupted":
+            return await self.finalize_runner(runner, outcome=outcome)
+
+        # A copied workspace needs positive mutation quiescence before its
+        # process-local owner can be transferred, but an interrupted session
+        # must retain the same allocation for durable reconnect. Stopping is
+        # the provider lifecycle boundary that supplies both properties.
+        quiescence_runner = runner
+        reacquired_claim = self._runner_reacquired_claims.get(runner)
+        if runner.closed:
+            identity = self._runner_identities.get(runner)
+            if identity is None:
+                raise InvalidEgressReconnectMetadataError(
+                    "Microsandbox runner is missing identity for quiescence escalation."
+                )
+            claim = self._runner_claims.get(runner)
+            if claim is None or claim.closed:
+                claim = self._claim_for_reconnect(identity["sandbox_name"])
+                reacquired_claim = claim
+                try:
+                    attested = self.validate_reconnect_metadata(claim.read_identity())
+                    if attested != identity:
+                        raise InvalidEgressReconnectMetadataError(
+                            "Microsandbox quiescence identity does not match attestation."
+                        )
+                except BaseException:
+                    self._release_failed_reconnect_prepare(identity["sandbox_name"], claim)
+                    raise
+                self._claims_by_name[identity["sandbox_name"]] = claim
+                self._runner_claims[runner] = claim
+                self._runner_reacquired_claims[runner] = claim
+            quiescence_runner = await MicrosandboxRunner._from_existing_for_lifecycle(
+                identity["sandbox_name"],
+                close_action="stop",
+                sandbox_module=self._microsandbox_module(),
+                reconnect_timeout_s=self._reconnect_timeout_s,
+                expected_created_at=identity["sandbox_created_at"],
+            )
+        else:
+            quiescence_runner.close_action = "stop"
+        await quiescence_runner.close()
+        if reacquired_claim is not None:
+            reacquired_claim.binding_active = False
+            reacquired_claim.close()
+            if self._claims_by_name.get(identity["sandbox_name"]) is reacquired_claim:
+                self._claims_by_name.pop(identity["sandbox_name"], None)
+            self._runner_reacquired_claims.pop(runner, None)
+        return RunnerFinalizationResult(
+            workspace_mutations_quiescent=True,
+            allocation_preserved=True,
+        )
 
     async def _sandbox_created_at(self, module: Any, sandbox_name: str) -> float:
         try:
@@ -655,6 +844,46 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
             handle=handle,
         )
 
+    def _claim_for_reconnect(self, sandbox_name: str) -> _ReconnectClaim:
+        retained = self._claims_by_name.get(sandbox_name)
+        if retained is not None and not retained.closed:
+            settlement_task = retained.settlement_task
+            if retained.binding_active or (
+                settlement_task is not None and not settlement_task.done()
+            ):
+                raise EgressReconnectConflictError(
+                    f"Microsandbox sandbox {sandbox_name!r} already has an active reconnect owner."
+                )
+            if settlement_task is not None:
+                try:
+                    settlement_task.result()
+                except BaseException as error:
+                    retained.settlement_error = error
+                else:
+                    retained.settlement_error = None
+                # Invalidate the teardown callback before transferring this
+                # exact claim to the retry. A callback queued for the completed
+                # task must not close the claim underneath the new binding.
+                retained.settlement_task = None
+            retained.binding_active = True
+            return retained
+        claim = self._acquire_claim(sandbox_name)
+        claim.binding_active = True
+        return claim
+
+    def _release_failed_reconnect_prepare(
+        self,
+        sandbox_name: str,
+        claim: _ReconnectClaim,
+    ) -> None:
+        claim.binding_active = False
+        if claim.settlement_error is not None:
+            self._claims_by_name[sandbox_name] = claim
+            return
+        claim.close()
+        if self._claims_by_name.get(sandbox_name) is claim:
+            self._claims_by_name.pop(sandbox_name, None)
+
     def _hold_claim(
         self,
         *,
@@ -667,12 +896,119 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
         async def teardown() -> None:
             if original_teardown is not None:
                 await original_teardown()
+            claim.binding_active = False
+            settlement_task = claim.settlement_task
+            if settlement_task is not None:
+                if settlement_task.done():
+                    self._settle_claim_task(sandbox_name, claim, settlement_task)
+                return
+            if claim.settlement_error is not None:
+                # A failed settlement has not proved the sandbox stopped.
+                # Keep this exact lock available for a later reconnect owner
+                # to adopt and recover instead of releasing it on an unbound
+                # prepare/cancellation path.
+                self._claims_by_name[sandbox_name] = claim
+                return
             claim.close()
             if self._claims_by_name.get(sandbox_name) is claim:
                 self._claims_by_name.pop(sandbox_name, None)
 
         binding.teardown = teardown
+        claim.binding_active = True
         self._claims_by_name[sandbox_name] = claim
+
+    def _observe_claim_settlement(
+        self,
+        sandbox_name: str,
+        claim: _ReconnectClaim,
+        task: asyncio.Task[None],
+    ) -> None:
+        """Fence one claim until its exact current cleanup task succeeds."""
+
+        claim.settlement_task = task
+        claim.settlement_error = None
+        task.add_done_callback(
+            lambda completed: self._settle_claim_task(
+                sandbox_name,
+                claim,
+                completed,
+            )
+        )
+
+    def _register_reconnect_restoration_retry(
+        self,
+        task: asyncio.Task[None],
+        *,
+        identity: _ReconnectIdentity,
+        claim: _ReconnectClaim,
+    ) -> None:
+        """Retain an explicit same-incarnation retry for a failed stop boundary."""
+
+        sandbox_name = identity["sandbox_name"]
+        expected_created_at = identity["sandbox_created_at"]
+
+        def retry_stopped_boundary_restoration() -> asyncio.Task[None]:
+            async def restore() -> None:
+                if claim.closed or self._claims_by_name.get(sandbox_name) is not claim:
+                    raise EgressReconnectConflictError(
+                        "Microsandbox reconnect restoration lost its exact ownership claim."
+                    )
+                try:
+                    restoration_runner = await MicrosandboxRunner._from_existing_for_lifecycle(
+                        sandbox_name,
+                        close_action="stop",
+                        sandbox_module=self._microsandbox_module(),
+                        reconnect_timeout_s=self._reconnect_timeout_s,
+                        expected_created_at=expected_created_at,
+                    )
+                except BaseException as error:
+                    if _is_sandbox_not_found(self._microsandbox_module(), error):
+                        # Provider-confirmed absence is authoritative mutation
+                        # quiescence for the exact attested incarnation.
+                        return
+                    raise
+                await restoration_runner.close()
+
+            retry_task = asyncio.create_task(
+                restore(),
+                name=f"cayu-microsandbox-reconnect-recovery-{sandbox_name}",
+            )
+            self._observe_claim_settlement(
+                sandbox_name,
+                claim,
+                retry_task,
+            )
+            return retry_task
+
+        register_environment_factory_cleanup_retry(
+            task,
+            retry_stopped_boundary_restoration,
+        )
+
+    def _settle_claim_task(
+        self,
+        sandbox_name: str,
+        claim: _ReconnectClaim,
+        completed: asyncio.Task[None],
+    ) -> None:
+        if claim.settlement_task is not completed:
+            # A retry already adopted this exact claim. Observe the old task
+            # without applying its stale release action.
+            with contextlib.suppress(BaseException):
+                completed.result()
+            return
+        try:
+            completed.result()
+        except BaseException as error:
+            claim.settlement_error = error
+            return
+        claim.settlement_task = None
+        claim.settlement_error = None
+        if claim.binding_active:
+            return
+        claim.close()
+        if self._claims_by_name.get(sandbox_name) is claim:
+            self._claims_by_name.pop(sandbox_name, None)
 
     def _microsandbox_module(self) -> ModuleType | Any:
         if self._module is not None:

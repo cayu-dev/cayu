@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from math import isfinite
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from cayu._exception_groups import iter_exception_tree
 from cayu._task_wait import await_shielded_task_outcome, consume_pending_task_cancellation
@@ -23,12 +23,29 @@ from cayu.environments.admission import (
 from cayu.runners.base import Runner
 
 DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS = 15.0
+_CleanupResultT = TypeVar("_CleanupResultT")
 _ExecutionCapabilityPosture = Literal[
     "available",
     "live_verified",
     "unverified",
     "unsupported",
 ]
+
+
+@dataclass(frozen=True)
+class RunnerFinalizationResult:
+    """Positive lifecycle evidence after runner finalization."""
+
+    workspace_mutations_quiescent: bool
+    allocation_preserved: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.workspace_mutations_quiescent) is not bool:
+            raise TypeError(
+                "RunnerFinalizationResult workspace_mutations_quiescent must be a bool."
+            )
+        if type(self.allocation_preserved) is not bool:
+            raise TypeError("RunnerFinalizationResult allocation_preserved must be a bool.")
 
 
 def _virtual_egress_execution_capability_evidence(
@@ -209,7 +226,7 @@ def _declared_or_available(
 
 
 async def _await_bounded_cleanup_task(
-    task: asyncio.Task[None],
+    task: asyncio.Task[_CleanupResultT],
     *,
     timeout_s: float,
     timeout_message: str,
@@ -481,9 +498,33 @@ class SandboxEgressAdapter(ABC):
             "The application must explicitly rebuild the environment."
         )
 
-    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
-        """Map a session outcome to the runner's lifecycle action."""
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        """Map an outcome to lifecycle cleanup without inferring remote quiescence."""
         await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=False)
+
+    async def finalize_runner_for_binding(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        """Finalize a runner while positively quiescing workspace mutation.
+
+        Reconnectable adapters should override this when they can stop or
+        suspend an allocation without destroying its durable identity. The
+        default fails closed by using terminal cleanup.
+        """
+
+        return await self.finalize_runner(
+            runner,
+            outcome=None if outcome == "interrupted" else outcome,
+        )
 
 
 class UnsupportedEgressAdapter(SandboxEgressAdapter):

@@ -8,13 +8,14 @@ status decisions belong to the session engine behind :class:`CayuApp`.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from math import isfinite
 from typing import Any
 
 from cayu._exception_groups import (
+    exception_group_children,
     exception_tree_contains,
     iter_exception_tree,
 )
@@ -37,6 +38,13 @@ from cayu.environments import (
     copy_workspace_snapshot,
     evaluate_execution_admission,
     load_workspace_instructions,
+)
+from cayu.environments.factory import (
+    attach_environment_factory_cleanup_settlement_task,
+    combine_environment_factory_cleanup_settlement_tasks,
+    environment_factory_cleanup_settlement_task,
+    environment_factory_cleanup_settlement_tasks,
+    retry_environment_factory_cleanup_settlement_task,
 )
 from cayu.runners import Runner
 from cayu.runtime import _environment_operation_boundary as environment_operation_boundary
@@ -72,8 +80,15 @@ _ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE = (
     "_cayu_environment_factory_checkpoint_may_be_committed"
 )
 _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_release"
+_MAX_LAZY_ENVIRONMENT_CLEANUP_SETTLEMENTS = 16
+_LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
+DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS = 256
 
 CheckpointTransformFactory = Callable[[dict[str, Any]], CheckpointTransform]
+
+
+class EnvironmentCapacityError(RuntimeError):
+    """Raised before provisioning when process-local lifecycle capacity is full."""
 
 
 @dataclass(frozen=True)
@@ -96,11 +111,27 @@ class EnvironmentBindingFinalizeResult:
     events: list[Event]
 
 
+@dataclass(frozen=True)
+class _EnvironmentCleanupSettlementOutcome:
+    error: BaseException | None = None
+    task_cancelled: bool = False
+
+
 @dataclass
 class _ActiveEnvironmentSetup:
     registered_environment: runtime_records.RegisteredEnvironment
     cleanup_started: bool = False
+    cleanup_finished: bool = False
+    prebind_release_tombstone: bool = False
     cleanup_error: BaseException | None = None
+    cleanup_release_safe: bool = False
+    pending_finalize_failure_event: Event | None = None
+    cleanup_settlement_started: bool = False
+    cleanup_settlement_deferred: bool = False
+    cleanup_requires_finalize_retry: bool = False
+    cleanup_retry_outcome: str | None = None
+    cleanup_retry_metadata: dict[str, Any] | None = None
+    cleanup_settlement_task: asyncio.Task[_EnvironmentCleanupSettlementOutcome] | None = None
 
 
 class EnvironmentLifecycle:
@@ -113,17 +144,61 @@ class EnvironmentLifecycle:
         event_writer: RuntimeEventWriter,
         checkpoint_transform: CheckpointTransformFactory,
         secret_redactor: SecretRedactor | None = None,
+        max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
     ) -> None:
         self._session_store = session_store
         self._event_writer = event_writer
         self._checkpoint_transform = checkpoint_transform
         self._secret_redactor = secret_redactor or SecretRedactor()
+        if (
+            type(max_environment_lifecycle_owners) is not int
+            or max_environment_lifecycle_owners <= 0
+        ):
+            raise ValueError("max_environment_lifecycle_owners must be a positive integer.")
+        self._max_environment_lifecycle_owners = max_environment_lifecycle_owners
         # Factory results and bound workspaces contain process-local handles
         # that cannot be reconstructed from durable session state. Retain the
         # authoritative owner across async-generator yield boundaries until the
         # setup is adopted or finalized. The run fence permits one owner per
         # session.
         self._active_environment_setups: dict[str, _ActiveEnvironmentSetup] = {}
+        self._pending_environment_owner_admissions: set[str] = set()
+        self._deferred_factory_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
+
+    def _reserve_environment_owner_admission(self, session_id: str) -> None:
+        if (
+            session_id in self._pending_environment_owner_admissions
+            or session_id in self._active_environment_setups
+        ):
+            return
+        owner_count = len(
+            self._active_environment_setups.keys() | self._pending_environment_owner_admissions
+        )
+        if owner_count >= self._max_environment_lifecycle_owners:
+            raise EnvironmentCapacityError(
+                "Environment lifecycle owner capacity is exhausted "
+                f"({owner_count}/{self._max_environment_lifecycle_owners}); "
+                "retry after retained cleanup settles or increase "
+                "max_environment_lifecycle_owners."
+            )
+        self._pending_environment_owner_admissions.add(session_id)
+
+    def _release_pending_environment_owner_admission(self, session_id: str) -> None:
+        self._pending_environment_owner_admissions.discard(session_id)
+
+    def _promote_environment_owner_admission(
+        self,
+        session_id: str,
+        setup_owner: _ActiveEnvironmentSetup,
+    ) -> None:
+        """Replace one pending capacity owner with its active setup."""
+
+        if session_id in self._active_environment_setups:
+            raise RuntimeError(f"Session {session_id!r} already owns an active environment setup.")
+        self._active_environment_setups[session_id] = setup_owner
+        # Promotion is synchronous: pending and active are mutually exclusive
+        # representations of one lifecycle-capacity owner.
+        self._release_pending_environment_owner_admission(session_id)
 
     async def load_workspace_instructions(
         self,
@@ -133,6 +208,243 @@ class EnvironmentLifecycle:
             return None
         return await load_workspace_instructions(registered_environment.environment)
 
+    async def _settle_retained_environment_cleanups(self) -> None:
+        """Start and poll a bounded batch of process-local cleanup owners.
+
+        Normal runtime activity is the delivery mechanism for cleanup retained
+        after an ambiguous durable write or incomplete managed teardown. A
+        cleanup task remains owned by its exact setup until it reaches a
+        terminal outcome; admission never cancels or waits indefinitely for
+        dispatched mutation-capable work.
+        """
+
+        self._harvest_deferred_factory_cleanups()
+        eligible = tuple(
+            (session_id, setup_owner)
+            for session_id, setup_owner in self._active_environment_setups.items()
+            if setup_owner.cleanup_started and setup_owner.cleanup_finished
+        )
+
+        async def settle_one(
+            session_id: str,
+            expected_owner: _ActiveEnvironmentSetup,
+        ) -> _EnvironmentCleanupSettlementOutcome:
+            if self._active_environment_setups.get(session_id) is not expected_owner:
+                return _EnvironmentCleanupSettlementOutcome()
+            try:
+                await self.abort_environment_setup(
+                    session_id=session_id,
+                    original_error=None,
+                    allow_deferred_settlement=True,
+                )
+            except asyncio.CancelledError as error:
+                task = asyncio.current_task()
+                return _EnvironmentCleanupSettlementOutcome(
+                    error=error,
+                    task_cancelled=task is not None and task.cancelling() > 0,
+                )
+            except BaseException as error:
+                return _EnvironmentCleanupSettlementOutcome(error=error)
+            return _EnvironmentCleanupSettlementOutcome()
+
+        def harvest_completed(
+            setup_owner: _ActiveEnvironmentSetup,
+            *,
+            propagate_control_signal: bool,
+        ) -> None:
+            task = setup_owner.cleanup_settlement_task
+            if task is None or not task.done():
+                return
+            try:
+                outcome = task.result()
+            except asyncio.CancelledError as error:
+                # Cancellation before the coroutine first ran has no structured
+                # outcome. It still belongs to the internal settlement task,
+                # not to a later environment admission.
+                outcome = _EnvironmentCleanupSettlementOutcome(
+                    error=error,
+                    task_cancelled=True,
+                )
+            if setup_owner.cleanup_settlement_task is task:
+                setup_owner.cleanup_settlement_task = None
+            cleanup_error = outcome.error
+            if cleanup_error is None or outcome.task_cancelled:
+                return
+            fatal_signal = binding_finalize_fatal_signal(cleanup_error)
+            if (
+                fatal_signal is None
+                and binding_finalize_explicit_cancellation(cleanup_error) is not None
+            ):
+                # The cancellation completed inside this retained owner's
+                # private settlement task. It is retry state for that owner,
+                # not a request to cancel whichever unrelated admission
+                # happened to poll it. Direct cancellation of this admission
+                # still propagates from the asyncio.wait above.
+                return
+            if not propagate_control_signal:
+                # A control signal completed outside this admission's polling
+                # window. Retain the exact owner and retry it; do not replay a
+                # historical signal into an unrelated caller.
+                return
+            if fatal_signal is not None:
+                raise cleanup_error
+
+        # Harvest results from an earlier admission before allocating slots.
+        # In particular, asyncio.run() loop shutdown may have cancelled the
+        # private task after the prior admission returned.
+        for _session_id, setup_owner in eligible:
+            harvest_completed(
+                setup_owner,
+                propagate_control_signal=False,
+            )
+
+        pending_count = sum(
+            setup_owner.cleanup_settlement_task is not None
+            and not setup_owner.cleanup_settlement_task.done()
+            for setup_owner in self._active_environment_setups.values()
+        )
+        available_slots = max(
+            0,
+            _MAX_LAZY_ENVIRONMENT_CLEANUP_SETTLEMENTS - pending_count,
+        )
+        polled: list[tuple[str, _ActiveEnvironmentSetup]] = []
+        for session_id, setup_owner in eligible:
+            task = setup_owner.cleanup_settlement_task
+            if task is not None:
+                polled.append((session_id, setup_owner))
+                continue
+            if available_slots == 0:
+                continue
+            setup_owner.cleanup_settlement_task = asyncio.create_task(
+                settle_one(session_id, setup_owner),
+                name=f"cayu-environment-cleanup-{session_id}",
+            )
+            available_slots -= 1
+            polled.append((session_id, setup_owner))
+
+        # Poll the owned tasks as a group for one small admission budget. The
+        # timeout never cancels them: a quick settlement preserves the previous
+        # eager cleanup behavior, while one permanently unresolved provider or
+        # store call adds only bounded latency to unrelated environment setup.
+        tasks = tuple(
+            setup_owner.cleanup_settlement_task
+            for _session_id, setup_owner in polled
+            if setup_owner.cleanup_settlement_task is not None
+            and not setup_owner.cleanup_settlement_task.done()
+        )
+        tasks = (
+            *tasks,
+            *(task for task in self._deferred_factory_cleanup_tasks.values() if not task.done()),
+        )
+        if tasks:
+            await asyncio.wait(
+                tasks,
+                timeout=_LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS,
+            )
+        self._harvest_deferred_factory_cleanups()
+
+        for session_id, setup_owner in polled:
+            current_owner = self._active_environment_setups.get(session_id)
+            if current_owner is not setup_owner:
+                continue
+            harvest_completed(
+                setup_owner,
+                propagate_control_signal=True,
+            )
+            # A pending or failing prefix must not starve later owners. Move
+            # only the exact owner observed by this sweep; concurrent
+            # replacement or successful retirement wins.
+            if self._active_environment_setups.get(session_id) is setup_owner:
+                del self._active_environment_setups[session_id]
+                self._active_environment_setups[session_id] = setup_owner
+
+    def _require_no_retained_cleanup_for_session(self, session_id: str) -> None:
+        setup_owner = self._active_environment_setups.get(session_id)
+        if setup_owner is not None and setup_owner.cleanup_started:
+            raise RuntimeError(f"Session {session_id!r} still owns incomplete environment cleanup.")
+        task = self._deferred_factory_cleanup_tasks.get(session_id)
+        if task is not None:
+            raise RuntimeError(
+                f"Session {session_id!r} still owns incomplete environment factory cleanup."
+            )
+
+    def _harvest_deferred_factory_cleanups(self) -> None:
+        """Release capacity only after an exact factory cleanup task succeeds."""
+
+        for session_id, task in tuple(self._deferred_factory_cleanup_tasks.items()):
+            if not task.done():
+                continue
+            try:
+                task.result()
+            except BaseException:
+                # A failed settlement has not proved the external mutation or
+                # ownership claim quiescent. Retain this admission and reject
+                # retries in this process rather than allowing a new owner to
+                # obscure an unrecovered resource.
+                continue
+            if self._deferred_factory_cleanup_tasks.get(session_id) is task:
+                del self._deferred_factory_cleanup_tasks[session_id]
+                self._release_pending_environment_owner_admission(session_id)
+
+    def _retry_failed_deferred_factory_cleanups(
+        self,
+        *,
+        attempted_sessions: set[str],
+    ) -> None:
+        """Dispatch at most one explicit recovery attempt per retained owner."""
+
+        for session_id, task in tuple(self._deferred_factory_cleanup_tasks.items()):
+            if session_id in attempted_sessions or not task.done():
+                continue
+            try:
+                task.result()
+            except BaseException:
+                replacement = retry_environment_factory_cleanup_settlement_task(task)
+                if replacement is not task:
+                    self._deferred_factory_cleanup_tasks[session_id] = replacement
+                    attempted_sessions.add(session_id)
+
+    def _transfer_deferred_factory_cleanup(
+        self,
+        *,
+        session_id: str,
+        error: BaseException,
+    ) -> None:
+        """Transfer a timed-out factory release out of an active setup owner."""
+
+        task = self._adopt_deferred_factory_cleanup(
+            session_id=session_id,
+            error=error,
+        )
+        if task is None:
+            return
+        # This is an ownership transfer, not a new admission: replace the
+        # process-local setup owner with a pending admission so the same unit
+        # of capacity remains consumed until the exact task succeeds.
+        self._pending_environment_owner_admissions.add(session_id)
+        self._active_environment_setups.pop(session_id, None)
+
+    def _adopt_deferred_factory_cleanup(
+        self,
+        *,
+        session_id: str,
+        error: BaseException,
+    ) -> asyncio.Task[None] | None:
+        """Retain every authenticated cleanup owner carried by one failure tree."""
+
+        current = self._deferred_factory_cleanup_tasks.get(session_id)
+        task = combine_environment_factory_cleanup_settlement_tasks(
+            (
+                *((current,) if current is not None else ()),
+                *environment_factory_cleanup_settlement_tasks(error),
+            ),
+            task_name=f"cayu-environment-factory-cleanup-{session_id}",
+            failure_message="Environment factory cleanup settlement tasks failed.",
+        )
+        if task is not None:
+            self._deferred_factory_cleanup_tasks[session_id] = task
+        return task
+
     async def emit_factory_started(
         self,
         *,
@@ -141,21 +453,29 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> Event | None:
         """Persist the factory acceptance boundary before provisioning begins."""
+
+        await self._settle_retained_environment_cleanups()
+        self._require_no_retained_cleanup_for_session(session.id)
         if registered_environment is None or registered_environment.factory is None:
             return None
+        self._reserve_environment_owner_admission(session.id)
         environment_name = registered_environment.spec.name
-        return await self._event_writer.emit(
-            Event(
-                type=EventType.ENVIRONMENT_FACTORY_STARTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload=_environment_factory_base_payload(
-                    session=session,
-                    registered_environment=registered_environment,
-                ),
+        try:
+            return await self._event_writer.emit(
+                Event(
+                    type=EventType.ENVIRONMENT_FACTORY_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=_environment_factory_base_payload(
+                        session=session,
+                        registered_environment=registered_environment,
+                    ),
+                )
             )
-        )
+        except BaseException:
+            self._release_pending_environment_owner_admission(session.id)
+            raise
 
     async def resolve_factory(
         self,
@@ -304,10 +624,6 @@ class EnvironmentLifecycle:
                     )
                 )
             )
-            if session.id in self._active_environment_setups:
-                raise RuntimeError(
-                    f"Session {session.id!r} already owns an active environment setup."
-                )
             if result is None:
                 raise RuntimeError("Environment factory did not return an owned result.")
             if environment is None:
@@ -320,23 +636,34 @@ class EnvironmentLifecycle:
                 ),
                 unclaimed_factory_result=result,
             )
-            self._active_environment_setups[session.id] = _ActiveEnvironmentSetup(
-                registered_environment=resolved_environment
+            self._promote_environment_owner_admission(
+                session.id,
+                _ActiveEnvironmentSetup(registered_environment=resolved_environment),
             )
         except BaseException as exc:
+            self._adopt_deferred_factory_cleanup(
+                session_id=session.id,
+                error=exc,
+            )
             if result is not None:
-                release_payload = await _release_unclaimed_factory_result(
-                    result,
-                    action=(
-                        EnvironmentFactoryReleaseAction.PRESERVE
-                        if allocation_checkpointed
-                        or allocation_checkpoint_may_be_committed
-                        or effective_operation is EnvironmentFactoryOperation.RECONNECT
-                        else EnvironmentFactoryReleaseAction.DISCARD
-                    ),
-                    original_error=exc,
-                    redactor=self._secret_redactor,
-                )
+                try:
+                    release_payload = await _release_unclaimed_factory_result(
+                        result,
+                        action=(
+                            EnvironmentFactoryReleaseAction.PRESERVE
+                            if allocation_checkpointed
+                            or allocation_checkpoint_may_be_committed
+                            or effective_operation is EnvironmentFactoryOperation.RECONNECT
+                            else EnvironmentFactoryReleaseAction.DISCARD
+                        ),
+                        original_error=exc,
+                        redactor=self._secret_redactor,
+                    )
+                finally:
+                    self._adopt_deferred_factory_cleanup(
+                        session_id=session.id,
+                        error=exc,
+                    )
                 _attach_environment_factory_release_payload(exc, release_payload)
             ordinary_failure = isinstance(exc, Exception) or exception_tree_contains(exc, Exception)
             fatal_signal = binding_finalize_fatal_signal(exc)
@@ -373,6 +700,10 @@ class EnvironmentLifecycle:
                 events=events,
                 error=exc,
             )
+        finally:
+            self._harvest_deferred_factory_cleanups()
+            if session.id not in self._deferred_factory_cleanup_tasks:
+                self._release_pending_environment_owner_admission(session.id)
 
         return EnvironmentFactoryResolutionResult(
             registered_environment=resolved_environment,
@@ -429,22 +760,30 @@ class EnvironmentLifecycle:
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> Event | None:
         """Persist the binding acceptance boundary before workspace setup begins."""
+
+        await self._settle_retained_environment_cleanups()
+        self._require_no_retained_cleanup_for_session(session.id)
         if (
             registered_environment is None
             or registered_environment.bound_workspace is not None
             or registered_environment.environment.binding is None
         ):
             return None
+        self._reserve_environment_owner_admission(session.id)
         environment_name = _environment_name(registered_environment)
-        return await self._event_writer.emit(
-            Event(
-                type=EventType.ENVIRONMENT_BINDING_STARTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload=_binding_base_payload(registered_environment),
+        try:
+            return await self._event_writer.emit(
+                Event(
+                    type=EventType.ENVIRONMENT_BINDING_STARTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=_binding_base_payload(registered_environment),
+                )
             )
-        )
+        except BaseException:
+            self._release_pending_environment_owner_admission(session.id)
+            raise
 
     def _require_runner_admitted(
         self,
@@ -577,13 +916,19 @@ class EnvironmentLifecycle:
                     registered_environment=registered_environment,
                 )
             except Exception as exc:
-                (
-                    registered_environment,
-                    _release_payload,
-                ) = await self._release_unexposed_factory_environment(
-                    registered_environment,
-                    error=exc,
-                )
+                try:
+                    (
+                        registered_environment,
+                        _release_payload,
+                    ) = await self._release_unexposed_factory_environment(
+                        registered_environment,
+                        error=exc,
+                    )
+                finally:
+                    self._transfer_deferred_factory_cleanup(
+                        session_id=session.id,
+                        error=exc,
+                    )
                 self._active_environment_setups.pop(session.id, None)
                 return EnvironmentBindingResult(
                     registered_environment=registered_environment,
@@ -605,6 +950,11 @@ class EnvironmentLifecycle:
         environment_name = _environment_name(registered_environment)
         events: list[Event] = []
         base_payload = _binding_base_payload(registered_environment)
+        setup_owner = self._active_environment_setups.get(session.id)
+        if setup_owner is None:
+            setup_owner = _ActiveEnvironmentSetup(registered_environment=registered_environment)
+            self._active_environment_setups[session.id] = setup_owner
+        self._release_pending_environment_owner_admission(session.id)
         try:
             bound = await environment_operation_boundary.await_environment_operation(
                 lambda: binding.bind(
@@ -655,13 +1005,31 @@ class EnvironmentLifecycle:
                 )
                 if cleanup_status is not None:
                     attach_binding_cleanup_status(propagated_error, cleanup_status)
-            (
-                registered_environment,
-                _release_payload,
-            ) = await self._release_unexposed_factory_environment(
-                registered_environment,
-                error=exc,
-            )
+            try:
+                (
+                    registered_environment,
+                    _release_payload,
+                ) = await self._release_unexposed_factory_environment(
+                    registered_environment,
+                    error=exc,
+                )
+            finally:
+                self._transfer_deferred_factory_cleanup(
+                    session_id=session.id,
+                    error=exc,
+                )
+                if session.id in self._deferred_factory_cleanup_tasks and setup_owner is not None:
+                    # Main retains this tombstone so terminalization cannot
+                    # reuse its stale pre-bind factory result. The deferred
+                    # task remains the mutation owner, while both records share
+                    # one session identity for admission accounting.
+                    setup_owner.registered_environment = replace(
+                        registered_environment,
+                        unclaimed_factory_result=None,
+                    )
+                    setup_owner.cleanup_started = True
+                    setup_owner.prebind_release_tombstone = True
+                    self._active_environment_setups[session.id] = setup_owner
             # Retain a cleanup tombstone until the run finalizer executes. A
             # caller cancellation is terminalized after this method unwinds,
             # and that terminal path still holds its pre-bind environment
@@ -671,6 +1039,7 @@ class EnvironmentLifecycle:
             if setup_owner is not None:
                 setup_owner.registered_environment = registered_environment
                 setup_owner.cleanup_started = True
+                setup_owner.prebind_release_tombstone = True
             if ordinary_failure:
                 failure_payload = {
                     **base_payload,
@@ -732,14 +1101,7 @@ class EnvironmentLifecycle:
         # Binding owns the live handles from this point. Record that transfer
         # before publishing it so cancellation or an event-store failure cannot
         # leave cleanup using the stale pre-bound value.
-        setup_owner = self._active_environment_setups.get(session.id)
-        if setup_owner is None:
-            setup_owner = _ActiveEnvironmentSetup(
-                registered_environment=bound_registered_environment
-            )
-            self._active_environment_setups[session.id] = setup_owner
-        else:
-            setup_owner.registered_environment = bound_registered_environment
+        setup_owner.registered_environment = bound_registered_environment
         events.append(
             await self._event_writer.emit(
                 Event(
@@ -775,6 +1137,67 @@ class EnvironmentLifecycle:
             events=events,
         )
 
+    async def drain_retained_cleanups(self, *, timeout_s: float = 10.0) -> bool:
+        """Settle retained cleanup owners without cancelling dispatched work."""
+
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, (int, float))
+            or not isfinite(timeout_s)
+            or timeout_s <= 0
+        ):
+            raise ValueError("timeout_s must be a finite positive number.")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + float(timeout_s)
+        # An explicit drain is the operator recovery boundary for a cleanup
+        # that stopped automatic retries after a permanent or ambiguous
+        # provider failure. Retry each authenticated owner once; a later drain
+        # call may request another attempt without creating a busy loop.
+        attempted_factory_recoveries: set[str] = set()
+        while True:
+            self._harvest_deferred_factory_cleanups()
+            self._retry_failed_deferred_factory_cleanups(
+                attempted_sessions=attempted_factory_recoveries,
+            )
+            retained = tuple(
+                owner
+                for owner in self._active_environment_setups.values()
+                if owner.cleanup_started and owner.cleanup_finished
+            )
+            if not retained and not self._deferred_factory_cleanup_tasks:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                async with asyncio.timeout(remaining):
+                    await self._settle_retained_environment_cleanups()
+            except TimeoutError:
+                return False
+            if (
+                not any(
+                    owner.cleanup_started and owner.cleanup_finished
+                    for owner in self._active_environment_setups.values()
+                )
+                and not self._deferred_factory_cleanup_tasks
+            ):
+                return True
+            if (
+                not any(
+                    owner.cleanup_started and owner.cleanup_finished
+                    for owner in self._active_environment_setups.values()
+                )
+                and self._deferred_factory_cleanup_tasks
+                and all(task.done() for task in self._deferred_factory_cleanup_tasks.values())
+            ):
+                # Every explicit recovery attempt in this drain call reached a
+                # terminal failure. Retain ownership and return control so an
+                # operator can correct provider state before retrying.
+                return False
+            # Retry unavailable cleanup without turning the explicit drain path
+            # into a busy loop. In-flight mutation tasks remain singly owned.
+            await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
+
     async def finalize_terminal_event(
         self,
         *,
@@ -782,6 +1205,9 @@ class EnvironmentLifecycle:
         session: Session,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> EnvironmentBindingFinalizeResult:
+        setup_owner = self._active_environment_setups.get(session.id)
+        owns_cleanup = setup_owner is not None and not setup_owner.cleanup_started
+        owns_prebind_tombstone = setup_owner is not None and setup_owner.prebind_release_tombstone
         try:
             return await self._finalize_terminal_event_once(
                 event=event,
@@ -789,10 +1215,32 @@ class EnvironmentLifecycle:
                 registered_environment=registered_environment,
             )
         except BaseException as exc:
-            setup_owner = self._active_environment_setups.get(session.id)
-            if setup_owner is not None and setup_owner.cleanup_started:
+            if owns_cleanup and setup_owner is not None and setup_owner.cleanup_started:
                 setup_owner.cleanup_error = exc
+                if (
+                    not setup_owner.cleanup_release_safe
+                    and setup_owner.pending_finalize_failure_event is None
+                    and setup_owner.cleanup_retry_outcome is not None
+                ):
+                    # Bare fatal control-flow signals bypass ordinary failure
+                    # publication. Keep the exact handle and let a later
+                    # bounded sweep retry finalization to a positive terminal
+                    # boundary instead of retaining it forever.
+                    setup_owner.cleanup_requires_finalize_retry = True
             raise
+        finally:
+            # `cleanup_started` is a claim, not proof of quiescence. Only the
+            # call that observed and claimed the unstarted owner may publish
+            # completion; a concurrent duplicate terminalizer must not make an
+            # abort release binding ownership while the first call is awaiting.
+            if owns_cleanup and setup_owner is not None:
+                setup_owner.cleanup_finished = True
+            if (
+                owns_prebind_tombstone
+                and setup_owner is not None
+                and self._active_environment_setups.get(session.id) is setup_owner
+            ):
+                del self._active_environment_setups[session.id]
 
     async def _finalize_terminal_event_once(
         self,
@@ -816,13 +1264,19 @@ class EnvironmentLifecycle:
             setup_error = RuntimeError(
                 "Environment setup ended before the factory result was adopted."
             )
-            (
-                registered_environment,
-                release_payload,
-            ) = await self._release_unexposed_factory_environment(
-                registered_environment,
-                error=setup_error,
-            )
+            try:
+                (
+                    registered_environment,
+                    release_payload,
+                ) = await self._release_unexposed_factory_environment(
+                    registered_environment,
+                    error=setup_error,
+                )
+            finally:
+                self._transfer_deferred_factory_cleanup(
+                    session_id=session.id,
+                    error=setup_error,
+                )
             if release_payload is not None:
                 terminal_payload = copy_json_value(event.payload, "payload")
                 terminal_payload["environment_factory_release"] = release_payload
@@ -838,6 +1292,16 @@ class EnvironmentLifecycle:
         preserve_factory_allocation = registered_environment.preserve_factory_allocation
         outcome = "interrupted" if preserve_factory_allocation else terminal_outcome
         environment_name = _environment_name(registered_environment)
+        finalize_metadata = {
+            "event_type": str(event.type),
+            "session_id": session.id,
+        }
+        if setup_owner is not None:
+            setup_owner.cleanup_retry_outcome = outcome
+            setup_owner.cleanup_retry_metadata = copy_json_value(
+                finalize_metadata,
+                "binding finalize metadata",
+            )
         base_payload = {
             **_binding_base_payload(registered_environment),
             **_bound_workspace_payload(bound_workspace),
@@ -868,14 +1332,16 @@ class EnvironmentLifecycle:
                 lambda: binding.finalize(
                     bound_workspace,
                     outcome=outcome,
-                    metadata={
-                        "event_type": str(event.type),
-                        "session_id": session.id,
-                    },
+                    metadata=finalize_metadata,
                 ),
                 operation_name="Environment binding finalization",
                 redactor=self._secret_redactor,
             )
+            if setup_owner is not None:
+                # The binding reached its own terminal boundary. Any retained
+                # exact-owner retry state is now safe to discard even if
+                # validating or publishing the resulting snapshot later fails.
+                setup_owner.cleanup_release_safe = True
             final_snapshot = copy_workspace_snapshot(final_snapshot)
         except (BaseExceptionGroup, Exception, asyncio.CancelledError) as exc:
             if start_publication_error is not None:
@@ -883,6 +1349,8 @@ class EnvironmentLifecycle:
                     "Binding finalization and start-event publication failed.",
                     [start_publication_error, exc],
                 )
+            if setup_owner is not None:
+                setup_owner.cleanup_error = exc
             finalize_error_payload = _binding_finalize_error_payload(
                 exc,
                 outcome=outcome,
@@ -892,16 +1360,23 @@ class EnvironmentLifecycle:
                 **base_payload,
                 **finalize_error_payload,
             }
+            pending_failure_event = Event(
+                type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
+                session_id=session.id,
+                agent_name=event.agent_name,
+                environment_name=environment_name,
+                payload=error_payload,
+            )
+            if setup_owner is not None:
+                # Retain the stable event identity until persistence or
+                # reconciliation positively proves the failure durable. A
+                # retry must not create a second diagnostic for the same
+                # failed finalization attempt.
+                setup_owner.pending_finalize_failure_event = pending_failure_event
             try:
                 failure_event, persist_cancellation = await _persist_binding_finalize_failure_event(
                     self._event_writer,
-                    Event(
-                        type=EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED,
-                        session_id=session.id,
-                        agent_name=event.agent_name,
-                        environment_name=environment_name,
-                        payload=error_payload,
-                    ),
+                    pending_failure_event,
                 )
             except BaseException as diagnostic_error:
                 attach_binding_finalize_safe_payload(exc, finalize_error_payload)
@@ -934,6 +1409,9 @@ class EnvironmentLifecycle:
                     )
                     raise aggregate from diagnostic_error
                 raise exc from diagnostic_error
+            if setup_owner is not None:
+                setup_owner.cleanup_release_safe = True
+                setup_owner.pending_finalize_failure_event = None
             if persist_cancellation is not None:
                 raise append_binding_finalize_cancellation(
                     exc, persist_cancellation
@@ -1036,22 +1514,207 @@ class EnvironmentLifecycle:
         *,
         session_id: str,
         original_error: BaseException | None,
+        allow_deferred_settlement: bool = False,
     ) -> None:
         """Release a live setup when no terminal event can own its cleanup."""
 
-        setup_owner = self._active_environment_setups.pop(session_id, None)
-        if setup_owner is None or setup_owner.cleanup_started:
+        setup_owner = self._active_environment_setups.get(session_id)
+        if setup_owner is None:
+            # A stream may be abandoned after the durable started event but
+            # before factory creation or binding mutation begins.
+            if session_id not in self._deferred_factory_cleanup_tasks:
+                self._release_pending_environment_owner_admission(session_id)
+            return
+        if setup_owner.cleanup_started and not setup_owner.cleanup_finished:
+            return
+        if setup_owner.cleanup_settlement_started:
+            return
+        if self._active_environment_setups.get(session_id) is not setup_owner:
+            return
+        setup_owner.cleanup_settlement_started = True
+        registered_environment = setup_owner.registered_environment
+        binding = registered_environment.environment.binding
+        bound_workspace = registered_environment.bound_workspace
+        if setup_owner.cleanup_started:
+            if binding is None or bound_workspace is None:
+                self._active_environment_setups.pop(session_id, None)
+                return
+            if (
+                setup_owner.cleanup_error is not None
+                and not setup_owner.cleanup_settlement_deferred
+            ):
+                if setup_owner.cleanup_release_safe:
+                    try:
+                        released = binding.abandon(bound_workspace)
+                    except BaseException as abandon_error:
+                        setup_owner.cleanup_settlement_started = False
+                        if original_error is None or abandon_error is original_error:
+                            raise
+                        raise BaseExceptionGroup(
+                            "Environment binding abandonment failed after terminal cleanup.",
+                            [original_error, abandon_error],
+                        ) from abandon_error
+                    if released is not False:
+                        if self._active_environment_setups.get(session_id) is setup_owner:
+                            del self._active_environment_setups[session_id]
+                        return
+                    setup_owner.cleanup_requires_finalize_retry = True
+                # Preserve the authoritative terminal exception during its
+                # unwind. The next ordinary lifecycle entry delivers one
+                # bounded retry through `_settle_retained_environment_cleanups`.
+                setup_owner.cleanup_settlement_deferred = True
+                setup_owner.cleanup_settlement_started = False
+                return
+            if setup_owner.cleanup_settlement_deferred and not allow_deferred_settlement:
+                setup_owner.cleanup_settlement_started = False
+                return
+            settlement_error: BaseException | None = None
+
+            async def retry_binding_finalize() -> BaseException | None:
+                try:
+                    await environment_operation_boundary.await_environment_operation(
+                        lambda: binding.finalize(
+                            bound_workspace,
+                            outcome=setup_owner.cleanup_retry_outcome,
+                            metadata=setup_owner.cleanup_retry_metadata,
+                        ),
+                        operation_name="Environment binding cleanup retry",
+                        redactor=self._secret_redactor,
+                    )
+                except BaseException as retry_error:
+                    setup_owner.cleanup_error = retry_error
+                    return retry_error
+                setup_owner.cleanup_requires_finalize_retry = False
+                return None
+
+            pending_failure_event = setup_owner.pending_finalize_failure_event
+            retry_error: BaseException | None = None
+            if (
+                not setup_owner.cleanup_release_safe
+                and pending_failure_event is None
+                and setup_owner.cleanup_requires_finalize_retry
+            ):
+                retry_error = await retry_binding_finalize()
+                if retry_error is None:
+                    setup_owner.cleanup_release_safe = True
+                else:
+                    setup_owner.cleanup_settlement_started = False
+                    if original_error is None or retry_error is original_error:
+                        raise retry_error
+                    raise BaseExceptionGroup(
+                        "Environment binding fatal cleanup retry failed.",
+                        [original_error, retry_error],
+                    ) from retry_error
+            if not setup_owner.cleanup_release_safe and pending_failure_event is not None:
+                try:
+                    (
+                        failure_event,
+                        persist_cancellation,
+                    ) = await _persist_binding_finalize_failure_event(
+                        self._event_writer,
+                        pending_failure_event,
+                    )
+                    setup_owner.cleanup_release_safe = True
+                    setup_owner.pending_finalize_failure_event = None
+                    fanout_outcome = await await_shielded_task_outcome(
+                        asyncio.create_task(self._event_writer.fan_out_persisted([failure_event])),
+                        cancellation=persist_cancellation,
+                    )
+                    settlement_error = _environment_cleanup_settlement_error(
+                        fanout_error=fanout_outcome.error,
+                        cancellation=fanout_outcome.cancellation,
+                    )
+                except BaseException as exc:
+                    settlement_error = exc
+            if not setup_owner.cleanup_release_safe:
+                setup_owner.cleanup_settlement_started = False
+                if settlement_error is None:
+                    # No positive terminal or durable-failure evidence exists
+                    # from which this lifecycle owner can safely retire.
+                    return
+                if original_error is None or settlement_error is original_error:
+                    raise settlement_error
+                raise BaseExceptionGroup(
+                    "Environment binding failure evidence remains non-durable.",
+                    [original_error, settlement_error],
+                ) from settlement_error
+
+            if setup_owner.cleanup_requires_finalize_retry:
+                retry_error = await retry_binding_finalize()
+            if retry_error is None:
+                try:
+                    # `False` is an explicit refusal: a composite binding still
+                    # owns an executable resource and must retain this handle.
+                    released = binding.abandon(bound_workspace)
+                except BaseException as abandon_error:
+                    setup_owner.cleanup_settlement_started = False
+                    if original_error is None or abandon_error is original_error:
+                        raise
+                    raise BaseExceptionGroup(
+                        "Environment binding abandonment failed after terminal cleanup.",
+                        [original_error, abandon_error],
+                    ) from abandon_error
+                if released is False:
+                    setup_owner.cleanup_requires_finalize_retry = True
+                    retry_error = await retry_binding_finalize()
+                    if retry_error is None:
+                        try:
+                            released = binding.abandon(bound_workspace)
+                        except BaseException as abandon_error:
+                            setup_owner.cleanup_settlement_started = False
+                            if original_error is None or abandon_error is original_error:
+                                raise
+                            raise BaseExceptionGroup(
+                                "Environment binding abandonment failed after cleanup retry.",
+                                [original_error, abandon_error],
+                            ) from abandon_error
+                        if released is False:
+                            retry_error = RuntimeError(
+                                "Environment binding refused abandonment after successful "
+                                "cleanup retry."
+                            )
+                            setup_owner.cleanup_requires_finalize_retry = True
+                            setup_owner.cleanup_error = retry_error
+
+            if retry_error is not None:
+                setup_owner.cleanup_settlement_started = False
+                if settlement_error is not None and settlement_error is not retry_error:
+                    retry_error = BaseExceptionGroup(
+                        "Environment binding durability settlement and cleanup retry failed.",
+                        [settlement_error, retry_error],
+                    )
+                if original_error is None or retry_error is original_error:
+                    raise retry_error
+                raise BaseExceptionGroup(
+                    "Environment binding cleanup remains incomplete.",
+                    [original_error, retry_error],
+                ) from retry_error
+            if self._active_environment_setups.get(session_id) is setup_owner:
+                del self._active_environment_setups[session_id]
+            if settlement_error is not None:
+                if original_error is None or settlement_error is original_error:
+                    raise settlement_error
+                raise BaseExceptionGroup(
+                    "Environment binding failure evidence committed after a control signal.",
+                    [original_error, settlement_error],
+                ) from settlement_error
             return
         setup_owner.cleanup_started = True
-        registered_environment = setup_owner.registered_environment
+        setup_owner.cleanup_finished = False
         if original_error is None:
             original_error = RuntimeError("Environment setup ended without terminal cleanup.")
         if registered_environment.unclaimed_factory_result is not None:
             try:
-                await self._release_unexposed_factory_environment(
-                    registered_environment,
-                    error=original_error,
-                )
+                try:
+                    await self._release_unexposed_factory_environment(
+                        registered_environment,
+                        error=original_error,
+                    )
+                finally:
+                    self._transfer_deferred_factory_cleanup(
+                        session_id=session_id,
+                        error=original_error,
+                    )
             except BaseException as cleanup_error:
                 if cleanup_error is original_error:
                     raise
@@ -1059,25 +1722,32 @@ class EnvironmentLifecycle:
                     "Environment factory cleanup failed while aborting setup.",
                     [original_error, cleanup_error],
                 ) from cleanup_error
+            finally:
+                if self._active_environment_setups.get(session_id) is setup_owner:
+                    del self._active_environment_setups[session_id]
             return
-        binding = registered_environment.environment.binding
-        if binding is None or registered_environment.bound_workspace is None:
+        if binding is None or bound_workspace is None:
+            self._active_environment_setups.pop(session_id, None)
             return
-        bound_workspace = registered_environment.bound_workspace
+        setup_owner.cleanup_retry_outcome = "interrupted"
+        setup_owner.cleanup_retry_metadata = {
+            "event_type": "environment_setup_aborted",
+            "session_id": session_id,
+        }
+        cleanup_error: BaseException | None = None
         try:
             await environment_operation_boundary.await_environment_operation(
                 lambda: binding.finalize(
                     bound_workspace,
                     outcome="interrupted",
-                    metadata={
-                        "event_type": "environment_setup_aborted",
-                        "session_id": session_id,
-                    },
+                    metadata=setup_owner.cleanup_retry_metadata,
                 ),
                 operation_name="Environment binding cleanup finalization",
                 redactor=self._secret_redactor,
             )
-        except BaseException as cleanup_error:
+        except BaseException as exc:
+            cleanup_error = exc
+            setup_owner.cleanup_error = exc
             diagnostic = exception_diagnostic(
                 cleanup_error,
                 empty_message="environment binding cleanup failed",
@@ -1091,12 +1761,66 @@ class EnvironmentLifecycle:
                 "Environment binding cleanup failed while aborting setup: "
                 f"{diagnostic.error_type}: {diagnostic.message}.",
             )
-            if cleanup_error is original_error:
-                raise
-            raise BaseExceptionGroup(
-                "Environment binding cleanup failed while aborting setup.",
-                [original_error, cleanup_error],
-            ) from cleanup_error
+        # This non-terminal abort has no surviving public retry handle. Once
+        # the finalize attempt is quiescent, exact-owner abandonment is the
+        # authoritative retirement path even when that attempt failed.
+        setup_owner.cleanup_release_safe = True
+        setup_owner.cleanup_finished = True
+        abandon_error: BaseException | None = None
+        released = True
+        try:
+            # No lifecycle owner survives this abort path. Finalize success
+            # makes this a no-op; failure leaves retry state that must now be
+            # released by the exact bound generation.
+            released = binding.abandon(bound_workspace) is not False
+        except BaseException as exc:
+            abandon_error = exc
+            diagnostic = exception_diagnostic(
+                abandon_error,
+                empty_message="environment binding abandonment failed",
+                nonportable_message=(
+                    "Environment binding abandonment failed with a non-portable diagnostic."
+                ),
+            )
+            _add_exception_note_safely(
+                original_error,
+                "Environment binding abandonment failed while aborting setup: "
+                f"{diagnostic.error_type}: {diagnostic.message}.",
+            )
+        if (
+            abandon_error is None
+            and released
+            and self._active_environment_setups.get(session_id) is setup_owner
+        ):
+            del self._active_environment_setups[session_id]
+        elif abandon_error is not None or not released:
+            setup_owner.cleanup_settlement_started = False
+            setup_owner.cleanup_finished = True
+            # This abort already performed the first cleanup and abandonment
+            # attempt. The next ordinary lifecycle entry should execute the
+            # retained retry, not spend one request merely arming it.
+            setup_owner.cleanup_settlement_deferred = True
+            setup_owner.cleanup_requires_finalize_retry = not released
+            if cleanup_error is None and not released:
+                cleanup_error = RuntimeError(
+                    "Environment binding retained ownership after aborted setup cleanup."
+                )
+                setup_owner.cleanup_error = cleanup_error
+        failures = [
+            error for error in (original_error, cleanup_error, abandon_error) if error is not None
+        ]
+        unique_failures: list[BaseException] = []
+        for error in failures:
+            if all(error is not existing for existing in unique_failures):
+                unique_failures.append(error)
+        if cleanup_error is None and abandon_error is None:
+            return
+        if len(unique_failures) == 1:
+            raise unique_failures[0]
+        raise BaseExceptionGroup(
+            "Environment binding cleanup failed while aborting setup.",
+            unique_failures,
+        ) from (abandon_error or cleanup_error)
 
     async def _load_factory_reconnect_state(
         self,
@@ -1456,6 +2180,23 @@ async def _persist_binding_finalize_failure_event(
     raise persistence_error
 
 
+def _environment_cleanup_settlement_error(
+    *,
+    fanout_error: BaseException | None,
+    cancellation: asyncio.CancelledError | None,
+) -> BaseException | None:
+    """Preserve every signal observed while delivering settled failure evidence."""
+
+    if fanout_error is None:
+        return cancellation
+    if cancellation is None:
+        return fanout_error
+    return BaseExceptionGroup(
+        "Environment binding failure evidence fan-out failed after caller cancellation.",
+        [fanout_error, cancellation],
+    )
+
+
 def _binding_finalize_error_payload(
     error: BaseException,
     *,
@@ -1614,6 +2355,13 @@ async def _release_unclaimed_factory_result(
                 timeout_s=result.release_timeout_s,
             )
         except BaseException as cleanup_error:
+            if (
+                settlement_task := environment_factory_cleanup_settlement_task(cleanup_error)
+            ) is not None:
+                attach_environment_factory_cleanup_settlement_task(
+                    original_error,
+                    settlement_task,
+                )
             diagnostic = exception_diagnostic(
                 cleanup_error,
                 empty_message="environment factory release failed",
@@ -1711,6 +2459,13 @@ async def _release_unclaimed_factory_result(
             timeout_s=result.release_timeout_s,
         )
     except BaseException as cleanup_error:
+        if (
+            settlement_task := environment_factory_cleanup_settlement_task(cleanup_error)
+        ) is not None:
+            attach_environment_factory_cleanup_settlement_task(
+                original_error,
+                settlement_task,
+            )
         diagnostic = exception_diagnostic(
             cleanup_error,
             empty_message="environment factory fallback release failed",
@@ -1779,11 +2534,14 @@ async def _await_bounded_environment_factory_release(
     while not task.done():
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            task.cancel()
-            task.add_done_callback(_consume_background_task_result)
-            raise TimeoutError(
+            error = TimeoutError(
                 f"Environment factory result release did not complete within {timeout_s:g} seconds."
             )
+            attach_environment_factory_cleanup_settlement_task(
+                error,
+                _defer_timed_out_environment_factory_release(task),
+            )
+            raise error
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
         except asyncio.CancelledError:
@@ -1794,15 +2552,86 @@ async def _await_bounded_environment_factory_release(
             if task.done():
                 task.result()
                 break
-            task.cancel()
-            task.add_done_callback(_consume_background_task_result)
-            raise TimeoutError(
+            error = TimeoutError(
                 f"Environment factory result release did not complete within {timeout_s:g} seconds."
-            ) from exc
+            )
+            attach_environment_factory_cleanup_settlement_task(
+                error,
+                _defer_timed_out_environment_factory_release(task),
+            )
+            raise error from exc
     task.result()
     return cancelled
 
 
-def _consume_background_task_result(task: asyncio.Task[Any]) -> None:
-    with contextlib.suppress(BaseException):
-        task.result()
+def _environment_factory_cleanup_handoffs(
+    error: BaseException,
+) -> tuple[tuple[asyncio.Task[None], ...], tuple[BaseException, ...]]:
+    """Split grouped cleanup failures into owned successors and unresolved leaves."""
+
+    pending = [error]
+    tasks: list[asyncio.Task[None]] = []
+    failures: list[BaseException] = []
+    while pending:
+        candidate = pending.pop()
+        task = environment_factory_cleanup_settlement_task(candidate)
+        if task is not None:
+            tasks.append(task)
+            continue
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is not None:
+                pending.extend(reversed(children))
+                continue
+        failures.append(candidate)
+    return tuple(dict.fromkeys(tasks)), tuple(failures)
+
+
+def _defer_timed_out_environment_factory_release(
+    release_task: asyncio.Task[None],
+) -> asyncio.Task[None]:
+    """Follow a timed-out release through any later cleanup-owner handoff."""
+
+    async def settle() -> None:
+        pending = [release_task]
+        seen: set[asyncio.Task[None]] = set()
+        failures: list[BaseException] = []
+        cancellation: asyncio.CancelledError | None = None
+        while pending:
+            task = pending.pop()
+            if task in seen:
+                continue
+            seen.add(task)
+            outcome = await await_shielded_task_outcome(task)
+            error = outcome.error
+            cancellation = cancellation or outcome.cancellation
+            if error is None:
+                continue
+            nested, unresolved = _environment_factory_cleanup_handoffs(error)
+            unseen = tuple(task for task in nested if task not in seen)
+            if len(unseen) != len(nested):
+                # A terminal task that delegates back to itself or an earlier
+                # owner supplies no new proof of quiescence. Preserve its
+                # original failure so lifecycle capacity remains fenced.
+                failures.append(error)
+            pending.extend(unseen)
+            failures.extend(unresolved)
+        if failures:
+            failure: BaseException = (
+                failures[0]
+                if len(failures) == 1
+                else BaseExceptionGroup(
+                    "Environment factory cleanup settlement chain failed.",
+                    failures,
+                )
+            )
+            if cancellation is not None:
+                raise cancellation from failure
+            raise failure
+        if cancellation is not None:
+            raise cancellation
+
+    return asyncio.create_task(
+        settle(),
+        name="cayu-timed-out-environment-factory-release-settlement",
+    )

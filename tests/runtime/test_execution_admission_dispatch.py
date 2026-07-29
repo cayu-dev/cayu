@@ -303,7 +303,10 @@ def _requirements() -> ExecutionRequirements:
     )
 
 
-def _bound_factory_app() -> tuple[
+def _bound_factory_app(
+    *,
+    max_environment_lifecycle_owners: int | None = None,
+) -> tuple[
     CayuApp,
     _ReleasableHostedFactory,
     _SwitchingBinding,
@@ -321,7 +324,14 @@ def _bound_factory_app() -> tuple[
         binding=binding,
         lifecycle=lifecycle,
     )
-    app = CayuApp(enable_logging=False)
+    app = (
+        CayuApp(enable_logging=False)
+        if max_environment_lifecycle_owners is None
+        else CayuApp(
+            enable_logging=False,
+            max_environment_lifecycle_owners=max_environment_lifecycle_owners,
+        )
+    )
     app.register_provider(_RecordingProvider(), default=True)
     app.register_environment_factory(
         EnvironmentSpec(name="hosted"),
@@ -665,9 +675,12 @@ def test_abandoned_factory_result_is_released_before_binding() -> None:
         _EvidenceRunner,
         list[str],
         str,
+        str,
     ]:
-        app, factory, _binding, runner, _bound_runner, lifecycle = _bound_factory_app()
-        stream = app.run(
+        app, factory, _binding, runner, _bound_runner, lifecycle = _bound_factory_app(
+            max_environment_lifecycle_owners=1,
+        )
+        stream: Any = app.run(
             RunRequest(
                 agent_name="assistant",
                 session_id="sess_factory_abandoned_before_bind",
@@ -677,17 +690,84 @@ def test_abandoned_factory_result_is_released_before_binding() -> None:
         async for event in stream:
             if event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED:
                 break
+        environment_lifecycle = app._environment_lifecycle
+        assert set(environment_lifecycle._active_environment_setups) == {
+            "sess_factory_abandoned_before_bind"
+        }
+        assert environment_lifecycle._pending_environment_owner_admissions == set()
         await stream.aclose()
+        assert environment_lifecycle._active_environment_setups == {}
+        assert environment_lifecycle._pending_environment_owner_admissions == set()
         session = await app.session_store.load("sess_factory_abandoned_before_bind")
         assert session is not None
-        return factory, runner, lifecycle, session.status.value
+        abandonment_lifecycle = list(lifecycle)
+        second = await _run(app, "sess_factory_after_abandoned_before_bind")
+        return (
+            factory,
+            runner,
+            abandonment_lifecycle,
+            session.status.value,
+            second[-1].type,
+        )
 
-    factory, runner, lifecycle, status = asyncio.run(run())
+    factory, runner, lifecycle, status, second_terminal = asyncio.run(run())
 
     assert factory.release_actions == [EnvironmentFactoryReleaseAction.PRESERVE]
     assert lifecycle == ["factory.release:preserve"]
     assert runner.is_closed is True
     assert status == "interrupted"
+    assert second_terminal is EventType.SESSION_COMPLETED
+
+
+def test_active_factory_setups_consume_one_capacity_slot_each() -> None:
+    async def advance_to_factory_completion(stream: AsyncIterator[Event]) -> None:
+        async for event in stream:
+            if event.type is EventType.ENVIRONMENT_FACTORY_COMPLETED:
+                return
+        raise AssertionError("Environment factory did not complete.")
+
+    async def run() -> tuple[int, dict[str, Any], set[str]]:
+        app, factory, _binding, _runner, _bound_runner, _lifecycle = _bound_factory_app(
+            max_environment_lifecycle_owners=2,
+        )
+        first: Any = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_capacity_first",
+                messages=[Message.text("user", "run")],
+            )
+        )
+        second: Any = app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_factory_capacity_second",
+                messages=[Message.text("user", "run")],
+            )
+        )
+        await advance_to_factory_completion(first)
+        environment_lifecycle = app._environment_lifecycle
+        assert set(environment_lifecycle._active_environment_setups) == {
+            "sess_factory_capacity_first"
+        }
+        assert environment_lifecycle._pending_environment_owner_admissions == set()
+
+        await advance_to_factory_completion(second)
+        active_at_capacity = dict(environment_lifecycle._active_environment_setups)
+        pending_at_capacity = set(environment_lifecycle._pending_environment_owner_admissions)
+        await second.aclose()
+        await first.aclose()
+        assert environment_lifecycle._active_environment_setups == {}
+        assert environment_lifecycle._pending_environment_owner_admissions == set()
+        return len(factory.requests), active_at_capacity, pending_at_capacity
+
+    factory_calls, active_at_capacity, pending_at_capacity = asyncio.run(run())
+
+    assert factory_calls == 2
+    assert set(active_at_capacity) == {
+        "sess_factory_capacity_first",
+        "sess_factory_capacity_second",
+    }
+    assert pending_at_capacity == set()
 
 
 def test_binding_completion_publication_failure_finalizes_adopted_binding(

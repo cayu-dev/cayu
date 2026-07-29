@@ -62,6 +62,7 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._environment_lifecycle import (
+    DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
     EnvironmentLifecycle,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -412,6 +413,7 @@ class CayuApp:
         max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
         tool_timeout_seconds: float | None = None,
         max_parallel_tool_calls: int = DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+        max_environment_lifecycle_owners: int = DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         if session_store is not None and not isinstance(session_store, SessionStore):
@@ -480,6 +482,10 @@ class CayuApp:
             max_parallel_tool_calls,
             "max_parallel_tool_calls",
         )
+        self._max_environment_lifecycle_owners = _validate_positive_int(
+            max_environment_lifecycle_owners,
+            "max_environment_lifecycle_owners",
+        )
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
         self.task_store = task_store
         self.knowledge_store = knowledge_store
@@ -521,6 +527,7 @@ class CayuApp:
             event_writer=self._event_writer,
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             secret_redactor=self._secret_redactor,
+            max_environment_lifecycle_owners=self._max_environment_lifecycle_owners,
         )
         self._run_limit_controller = RunLimitController(
             session_store=self.session_store,
@@ -696,6 +703,11 @@ class CayuApp:
 
     async def drain_background_interruptions(self, *, timeout_s: float = 10.0) -> bool:
         return await self._session_engine.drain_background_interruptions(timeout_s=timeout_s)
+
+    async def drain_environment_cleanups(self, *, timeout_s: float = 10.0) -> bool:
+        """Settle retained environment cleanup without cancelling live mutations."""
+
+        return await self._environment_lifecycle.drain_retained_cleanups(timeout_s=timeout_s)
 
     async def resume_pending_interruption_cascades(
         self,

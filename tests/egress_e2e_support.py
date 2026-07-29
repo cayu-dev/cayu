@@ -13,6 +13,7 @@ from cayu.egress import (
     CapturedResponse,
     EgressBinding,
     HttpEgressPolicy,
+    RunnerFinalizationResult,
     SandboxEgressAdapter,
     TransparentEgressBroker,
     VirtualCredentialError,
@@ -112,8 +113,13 @@ class CapturingEgressAdapter(SandboxEgressAdapter):
     ) -> dict[str, Any]:
         return self._inner.validate_reconnect_metadata(reconnect_metadata)
 
-    async def finalize_runner(self, runner: Runner, *, outcome: str | None) -> None:
-        await self._inner.finalize_runner(runner, outcome=outcome)
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        return await self._inner.finalize_runner(runner, outcome=outcome)
 
     def captured_single_grant(
         self,

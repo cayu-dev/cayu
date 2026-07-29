@@ -199,6 +199,10 @@ def create_server(
                     app,
                     timeout_s=lifecycle.interruption_shutdown_grace_seconds,
                 )
+                await _drain_environment_cleanups(
+                    app,
+                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+                )
             return
         async with user_lifespan(server) as state:
             try:
@@ -208,6 +212,10 @@ def create_server(
             finally:
                 await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(
+                    app,
+                    timeout_s=lifecycle.interruption_shutdown_grace_seconds,
+                )
+                await _drain_environment_cleanups(
                     app,
                     timeout_s=lifecycle.interruption_shutdown_grace_seconds,
                 )
@@ -592,6 +600,19 @@ async def _drain_background_interruptions(app: CayuApp, *, timeout_s: float) -> 
         )
 
 
+async def _drain_environment_cleanups(app: CayuApp, *, timeout_s: float) -> None:
+    try:
+        drained = await app.drain_environment_cleanups(timeout_s=timeout_s)
+    except Exception:
+        logger.exception("Failed to drain retained environment cleanups during shutdown.")
+        return
+    if not drained:
+        logger.warning(
+            "Retained environment cleanups exceeded the %.3fs shutdown grace period.",
+            timeout_s,
+        )
+
+
 async def _recover_persisted_event_side_effects_until_idle(app: CayuApp) -> None:
     while True:
         recovered = await app.recover_persisted_event_side_effects(
@@ -685,6 +706,7 @@ def _compose_interruption_drain_lifespan(
             finally:
                 await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(app, timeout_s=timeout_s)
+                await _drain_environment_cleanups(app, timeout_s=timeout_s)
 
     server.router.lifespan_context = lifespan
 

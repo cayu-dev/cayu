@@ -625,6 +625,21 @@ class LambdaMicroVMRunner(Runner):
         async with self._lifecycle_lock:
             await self._suspend()
 
+    async def wait_until_suspended(
+        self,
+        timeout_s: float = DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS,
+    ) -> None:
+        """Wait for positive control-plane evidence that guest execution is suspended."""
+
+        async with self._lifecycle_lock:
+            if not self._suspended:
+                raise RuntimeError("Lambda MicroVM suspension has not been requested.")
+            await self._wait_for_lifecycle_state(
+                terminal_state="SUSPENDED",
+                transitional_states={"RUNNING", "SUSPENDING"},
+                timeout_s=timeout_s,
+            )
+
     async def _suspend(self) -> None:
         if self._suspended or self._termination_requested:
             return
@@ -673,6 +688,21 @@ class LambdaMicroVMRunner(Runner):
             self._ensure_lifecycle_open()
             await self._terminate()
 
+    async def wait_until_terminated(
+        self,
+        timeout_s: float = DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS,
+    ) -> None:
+        """Wait for positive control-plane evidence that guest execution terminated."""
+
+        async with self._lifecycle_lock:
+            if not self._termination_requested:
+                raise RuntimeError("Lambda MicroVM termination has not been requested.")
+            await self._wait_for_lifecycle_state(
+                terminal_state="TERMINATED",
+                transitional_states={"RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING"},
+                timeout_s=timeout_s,
+            )
+
     async def close(self) -> None:
         async with self._lifecycle_lock:
             if self._closed:
@@ -702,6 +732,42 @@ class LambdaMicroVMRunner(Runner):
         await asyncio.to_thread(self._client.terminate_microvm, microvmIdentifier=self.microvm_id)
         self._termination_requested = True
         self._close_exec("Lambda MicroVM termination was requested")
+
+    async def _wait_for_lifecycle_state(
+        self,
+        *,
+        terminal_state: str,
+        transitional_states: set[str],
+        timeout_s: float,
+    ) -> None:
+        timeout = _positive_float(timeout_s, "timeout_s")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            response = await asyncio.to_thread(
+                self._client.get_microvm,
+                microvmIdentifier=self.microvm_id,
+            )
+            response_id, endpoint = _microvm_identity(response)
+            if response_id != self.microvm_id or endpoint != self.endpoint:
+                raise LambdaMicroVMProtocolError(
+                    "get_microvm returned different identity while waiting for lifecycle "
+                    "quiescence."
+                )
+            state = _required_response_string(response, "state")
+            if state == terminal_state:
+                return
+            if state not in transitional_states:
+                raise LambdaMicroVMError(
+                    f"Lambda MicroVM entered unexpected state {state} while waiting for "
+                    f"{terminal_state}."
+                )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise LambdaMicroVMError(
+                    f"Lambda MicroVM did not reach {terminal_state} within {timeout:g} seconds."
+                )
+            await asyncio.sleep(min(max(self.poll_interval_s, 0.05), remaining))
 
     async def _close_transports(self) -> None:
         self._auth_token = None

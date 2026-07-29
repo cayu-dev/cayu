@@ -246,6 +246,18 @@ class Runner(ABC):
 
         self._closed = True
 
+    async def await_pending_command_settlement(self) -> bool:
+        """Wait for command cleanup deferred beyond an ``exec`` result.
+
+        Return ``True`` only when every command-cleanup operation dispatched
+        before this call has positively reached its terminal boundary. This hook
+        is consulted only after a runner explicitly reports deferred cleanup.
+        Such runners must override it; the default fails closed so an unknown
+        extension cannot turn absence of evidence into quiescence.
+        """
+
+        return False
+
     def execution_admission_candidate(self) -> ExecutionAdmissionCandidate | None:
         """Return explicit provider-neutral admission evidence, when implemented.
 

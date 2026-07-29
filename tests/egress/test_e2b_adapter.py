@@ -475,7 +475,8 @@ def test_e2b_adapter_allows_only_the_exposed_cayu_proxy(tmp_path: Path) -> None:
     assert network_claim.state == "live_verified"
     assert network_claim.observed_at is not None
 
-    asyncio.run(runner.close())
+    finalization = asyncio.run(adapter.finalize_runner(runner, outcome="interrupted"))
+    assert finalization.workspace_mutations_quiescent is True
     asyncio.run(binding.close())
     assert exposure.closed is True
     assert _FakeProxyServer.instances[0].closed is True

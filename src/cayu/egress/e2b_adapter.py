@@ -22,6 +22,7 @@ from cayu.egress._remote_adapter import (
 from cayu.egress.adapter import (
     DEFAULT_EGRESS_TEARDOWN_TIMEOUT_SECONDS,
     EgressBinding,
+    RunnerFinalizationResult,
     SandboxEgressAdapter,
     VirtualEgressRunnerRequest,
     _virtual_egress_execution_capability_evidence,
@@ -225,6 +226,18 @@ class E2BEgressAdapter(SandboxEgressAdapter):
             if authoritative is None:
                 raise
             raise _copy_public_egress_failure(authoritative) from exc
+
+    async def finalize_runner(
+        self,
+        runner: Runner,
+        *,
+        outcome: str | None,
+    ) -> RunnerFinalizationResult:
+        del outcome
+        if not isinstance(runner, E2BRunner):
+            raise TypeError("E2B adapter received a different runner type.")
+        await runner.close()
+        return RunnerFinalizationResult(workspace_mutations_quiescent=True)
 
     def _e2b_module(self) -> ModuleType | Any:
         if self._module is not None:

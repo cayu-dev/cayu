@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from math import isfinite
 from typing import Any
 
+from cayu._exception_groups import iter_exception_tree
+from cayu._exception_state import exception_state, set_exception_state
+from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
@@ -15,6 +19,249 @@ from cayu.environments.admission import (
 from cayu.environments.base import Environment, copy_environment
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
+_ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_ATTRIBUTE = (
+    "_cayu_environment_factory_cleanup_settlement_task"
+)
+_ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_TOKEN = object()
+
+
+EnvironmentFactoryCleanupRetry = Callable[[], asyncio.Task[None]]
+
+
+@dataclass(slots=True, eq=False)
+class _EnvironmentFactoryCleanupOwner:
+    task: asyncio.Task[None]
+    retry: EnvironmentFactoryCleanupRetry | None
+    token: object
+
+    def retry_failed_task(self) -> asyncio.Task[None]:
+        current = self.task
+        if not current.done():
+            return current
+        try:
+            current.result()
+        except BaseException:
+            pass
+        else:
+            return current
+        if self.retry is None:
+            return current
+        replacement = self.retry()
+        if not isinstance(replacement, asyncio.Task):
+            raise TypeError("Factory cleanup retry must return an asyncio Task.")
+        if replacement is current:
+            raise RuntimeError("Factory cleanup retry must return a new task.")
+        self.task = replacement
+        _ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK.pop(current, None)
+        _register_environment_factory_cleanup_owner_task(replacement, self)
+        return replacement
+
+
+_ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK: dict[
+    asyncio.Task[None],
+    _EnvironmentFactoryCleanupOwner,
+] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _EnvironmentFactoryCleanupSettlementTaskHandoff:
+    owner: _EnvironmentFactoryCleanupOwner
+    token: object
+
+
+def register_environment_factory_cleanup_retry(
+    task: asyncio.Task[None],
+    retry: EnvironmentFactoryCleanupRetry,
+) -> None:
+    """Authenticate a callable that retries the exact cleanup owned by ``task``."""
+
+    if not isinstance(task, asyncio.Task):
+        raise TypeError("Factory cleanup settlement requires an asyncio Task.")
+    if not callable(retry):
+        raise TypeError("Factory cleanup retry must be callable.")
+    existing = _environment_factory_cleanup_owner_for_task(task)
+    if existing is not None:
+        if existing.retry is not None and existing.retry is not retry:
+            raise RuntimeError("Factory cleanup task already has a different retry owner.")
+        existing.retry = retry
+        return
+    owner = _EnvironmentFactoryCleanupOwner(
+        task=task,
+        retry=retry,
+        token=_ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_TOKEN,
+    )
+    _register_environment_factory_cleanup_owner_task(task, owner)
+
+
+def attach_environment_factory_cleanup_settlement_task(
+    error: BaseException,
+    task: asyncio.Task[None],
+) -> None:
+    """Carry an in-flight factory cleanup owner across a failed create boundary."""
+
+    if not isinstance(error, BaseException):
+        raise TypeError("Factory cleanup settlement requires an exception.")
+    if not isinstance(task, asyncio.Task):
+        raise TypeError("Factory cleanup settlement requires an asyncio Task.")
+    owner = _environment_factory_cleanup_owner_for_task(task)
+    if owner is None:
+        owner = _EnvironmentFactoryCleanupOwner(
+            task=task,
+            retry=None,
+            token=_ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_TOKEN,
+        )
+        _register_environment_factory_cleanup_owner_task(task, owner)
+    handoff = _EnvironmentFactoryCleanupSettlementTaskHandoff(
+        owner=owner,
+        token=_ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_TOKEN,
+    )
+    if not set_exception_state(
+        error,
+        _ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_ATTRIBUTE,
+        handoff,
+    ):
+        raise RuntimeError("Could not attach factory cleanup settlement ownership.")
+
+
+def environment_factory_cleanup_settlement_task(
+    error: BaseException,
+) -> asyncio.Task[None] | None:
+    """Return the exact deferred cleanup task carried by a factory failure."""
+
+    handoff = exception_state(
+        error,
+        _ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_ATTRIBUTE,
+    )
+    if (
+        type(handoff) is not _EnvironmentFactoryCleanupSettlementTaskHandoff
+        or handoff.token is not _ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_TOKEN
+        or not _is_authenticated_environment_factory_cleanup_owner(handoff.owner)
+    ):
+        return None
+    return handoff.owner.task
+
+
+def retry_environment_factory_cleanup_settlement_task(
+    task: asyncio.Task[None],
+) -> asyncio.Task[None]:
+    """Retry one authenticated failed cleanup task, if it carries a retry owner."""
+
+    if not isinstance(task, asyncio.Task):
+        raise TypeError("Factory cleanup settlement retry requires an asyncio Task.")
+    owner = _environment_factory_cleanup_owner_for_task(task)
+    if owner is None or owner.task is not task:
+        return task
+    return owner.retry_failed_task()
+
+
+def environment_factory_cleanup_settlement_tasks(
+    error: BaseException,
+) -> tuple[asyncio.Task[None], ...]:
+    """Collect every authenticated cleanup owner in one exception tree."""
+
+    if not isinstance(error, BaseException):
+        raise TypeError("Factory cleanup settlement lookup requires an exception.")
+    return tuple(
+        dict.fromkeys(
+            task
+            for candidate in iter_exception_tree(error)
+            if (task := environment_factory_cleanup_settlement_task(candidate)) is not None
+        )
+    )
+
+
+def combine_environment_factory_cleanup_settlement_tasks(
+    tasks: Sequence[asyncio.Task[None]],
+    *,
+    task_name: str,
+    failure_message: str,
+) -> asyncio.Task[None] | None:
+    """Return one owner that settles every distinct authenticated cleanup task."""
+
+    unique_tasks = tuple(dict.fromkeys(tasks))
+    if not unique_tasks:
+        return None
+    if len(unique_tasks) == 1:
+        return unique_tasks[0]
+
+    owners = tuple(_environment_factory_cleanup_owner_for_task(task) for task in unique_tasks)
+
+    def combined_task() -> asyncio.Task[None]:
+        return asyncio.create_task(
+            settle_all(
+                tuple(
+                    owner.task if owner is not None else task
+                    for task, owner in zip(unique_tasks, owners, strict=True)
+                )
+            ),
+            name=task_name,
+        )
+
+    async def settle_all(tasks_to_settle: Sequence[asyncio.Task[None]]) -> None:
+        failures: list[BaseException] = []
+        for task in tasks_to_settle:
+            outcome = await await_shielded_task_outcome(task)
+            if outcome.error is not None:
+                failures.append(outcome.error)
+            if outcome.cancellation is not None and outcome.cancellation is not outcome.error:
+                failures.append(outcome.cancellation)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(failure_message, failures)
+
+    task = combined_task()
+
+    if any(owner is not None and owner.retry is not None for owner in owners):
+
+        def retry_combined() -> asyncio.Task[None]:
+            for owner in owners:
+                if owner is not None:
+                    owner.retry_failed_task()
+            return combined_task()
+
+        register_environment_factory_cleanup_retry(task, retry_combined)
+    return task
+
+
+def _environment_factory_cleanup_owner_for_task(
+    task: asyncio.Task[None],
+) -> _EnvironmentFactoryCleanupOwner | None:
+    try:
+        owner = _ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK.get(task)
+    except BaseException:
+        return None
+    return owner if _is_authenticated_environment_factory_cleanup_owner(owner) else None
+
+
+def _register_environment_factory_cleanup_owner_task(
+    task: asyncio.Task[None],
+    owner: _EnvironmentFactoryCleanupOwner,
+) -> None:
+    _ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK[task] = owner
+
+    def retire_completed(completed: asyncio.Task[None]) -> None:
+        if owner.task is not completed:
+            _ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK.pop(completed, None)
+            return
+        if owner.retry is None:
+            _ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK.pop(completed, None)
+            return
+        if not completed.cancelled() and completed.exception() is None:
+            _ENVIRONMENT_FACTORY_CLEANUP_OWNERS_BY_TASK.pop(completed, None)
+
+    task.add_done_callback(retire_completed)
+
+
+def _is_authenticated_environment_factory_cleanup_owner(
+    owner: object,
+) -> bool:
+    return (
+        type(owner) is _EnvironmentFactoryCleanupOwner
+        and owner.token is _ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_TOKEN
+        and isinstance(owner.task, asyncio.Task)
+        and (owner.retry is None or callable(owner.retry))
+    )
 
 
 class EnvironmentFactoryOperation(StrEnum):

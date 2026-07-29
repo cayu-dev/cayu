@@ -91,6 +91,13 @@ class SuspendingLambdaMicroVMClient(FakeLambdaMicroVMClient):
         return response
 
 
+class TerminatingLambdaMicroVMClient(FakeLambdaMicroVMClient):
+    def get_microvm(self, **kwargs: Any) -> dict[str, Any]:
+        response = super().get_microvm(**kwargs)
+        response["state"] = "TERMINATING" if len(self.get_calls) == 1 else "TERMINATED"
+        return response
+
+
 class FakeEndpointTransport:
     def __init__(self, *, result_overrides: dict[str, Any] | None = None) -> None:
         self.health_calls: list[dict[str, Any]] = []
@@ -749,6 +756,33 @@ async def test_lambda_microvm_runner_lifecycle_methods_are_idempotent() -> None:
     assert client.suspend_calls == [{"microvmIdentifier": "mvm-123"}]
     assert client.resume_calls == [{"microvmIdentifier": "mvm-123"}]
     assert client.terminate_calls == [{"microvmIdentifier": "mvm-123"}]
+
+
+@pytest.mark.anyio
+async def test_lambda_microvm_runner_waits_for_positive_lifecycle_quiescence() -> None:
+    suspended_client = SuspendingLambdaMicroVMClient()
+    suspended_runner = LambdaMicroVMRunner(
+        suspended_client,
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=FakeEndpointTransport(),
+        poll_interval_s=0,
+    )
+    await suspended_runner.suspend()
+    await suspended_runner.wait_until_suspended(timeout_s=1)
+    assert len(suspended_client.get_calls) == 2
+
+    terminated_client = TerminatingLambdaMicroVMClient()
+    terminated_runner = LambdaMicroVMRunner(
+        terminated_client,
+        microvm_id="mvm-123",
+        endpoint="mvm-123.lambda-microvm.us-west-2.on.aws",
+        endpoint_transport=FakeEndpointTransport(),
+        poll_interval_s=0,
+    )
+    await terminated_runner.terminate()
+    await terminated_runner.wait_until_terminated(timeout_s=1)
+    assert len(terminated_client.get_calls) == 2
 
 
 @pytest.mark.anyio

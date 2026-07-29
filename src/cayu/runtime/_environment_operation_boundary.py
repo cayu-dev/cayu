@@ -7,6 +7,12 @@ from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from cayu._exception_groups import exception_tree_contains, rebuild_exception_group
+from cayu.environments.factory import (
+    attach_environment_factory_cleanup_settlement_task,
+    combine_environment_factory_cleanup_settlement_tasks,
+    environment_factory_cleanup_settlement_task,
+    environment_factory_cleanup_settlement_tasks,
+)
 from cayu.runtime._binding_cleanup import (
     BindingCleanupStatus,
     BindingFinalizeFailure,
@@ -147,6 +153,7 @@ def _detached_environment_cancellation(
 ) -> asyncio.CancelledError:
     """Return a secret-safe cancellation without extension-owned attachments."""
 
+    factory_cleanup_task = environment_factory_cleanup_settlement_task(cancellation)
     redactor = _environment_failure_redactor(cancellation, redactor=redactor)
     safe_args: tuple[Any, ...] = ("Environment operation cancelled",)
     try:
@@ -184,10 +191,20 @@ def _detached_environment_cancellation(
                 cancellation,
                 redactor=redactor,
             )
+            if factory_cleanup_task is not None:
+                attach_environment_factory_cleanup_settlement_task(
+                    cancellation,
+                    factory_cleanup_task,
+                )
             return cancellation
     except BaseException:
         safe_args = ("Environment operation cancelled",)
         safe_cancellation = asyncio.CancelledError(*safe_args)
+    if factory_cleanup_task is not None:
+        attach_environment_factory_cleanup_settlement_task(
+            safe_cancellation,
+            factory_cleanup_task,
+        )
     return safe_cancellation
 
 
@@ -207,6 +224,7 @@ def _detach_exact_environment_failure_in_place(
     }:
         return None
     status_carrier = RuntimeError("detached environment failure status")
+    factory_cleanup_task = environment_factory_cleanup_settlement_task(error)
     try:
         _attach_detached_binding_statuses(
             error,
@@ -228,6 +246,11 @@ def _detach_exact_environment_failure_in_place(
             error,
             redactor=redactor,
         )
+        if factory_cleanup_task is not None:
+            attach_environment_factory_cleanup_settlement_task(
+                error,
+                factory_cleanup_task,
+            )
     except BaseException:
         return None
     return error
@@ -243,6 +266,7 @@ def _environment_operation_group(
     """Detach every extension-owned leaf while preserving ordered failure shape."""
 
     redactor = _environment_failure_redactor(error, redactor=redactor)
+    factory_cleanup_tasks = environment_factory_cleanup_settlement_tasks(error)
     group_message = f"{operation} reported multiple failures."
     try:
         raw_args = _BASE_EXCEPTION_ARGS_DESCRIPTOR.__get__(error, BaseException)
@@ -279,6 +303,16 @@ def _environment_operation_group(
         rebuilt,
         redactor=redactor,
     )
+    factory_cleanup_task = combine_environment_factory_cleanup_settlement_tasks(
+        factory_cleanup_tasks,
+        task_name="cayu-environment-operation-cleanup-settlement",
+        failure_message="Environment operation cleanup settlement failed.",
+    )
+    if factory_cleanup_task is not None:
+        attach_environment_factory_cleanup_settlement_task(
+            rebuilt,
+            factory_cleanup_task,
+        )
     return rebuilt
 
 
@@ -374,6 +408,15 @@ async def await_environment_operation(
                 child_cancellation_failure,
                 redactor=redactor,
             )
+            if (
+                factory_cleanup_task := environment_factory_cleanup_settlement_task(
+                    safe_cancellation
+                )
+            ) is not None:
+                attach_environment_factory_cleanup_settlement_task(
+                    child_cancellation_failure,
+                    factory_cleanup_task,
+                )
             sanitized_failure = child_cancellation_failure
     except BaseExceptionGroup as error:
         caller_cancelled = (
@@ -420,6 +463,13 @@ async def await_environment_operation(
             sanitized_failure,
             redactor=redactor,
         )
+        if (
+            factory_cleanup_task := environment_factory_cleanup_settlement_task(source_error)
+        ) is not None:
+            attach_environment_factory_cleanup_settlement_task(
+                sanitized_failure,
+                factory_cleanup_task,
+            )
         source_error = None
     operation = _completed_environment_operation
     if sanitized_failure is not None:
