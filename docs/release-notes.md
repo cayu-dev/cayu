@@ -1,5 +1,46 @@
 # Release notes
 
+## v0.1.0rc4
+
+This release candidate is an upgrade-testing checkpoint for applications and
+coding agents consuming Cayu as a normal Python package. It is not the final
+`v0.1.0` support declaration.
+
+### Upgrade from v0.1.0rc3
+
+Pin the complete application to `cayu==0.1.0rc4` (including whichever extras it
+uses), refresh its lockfile, and run its own tests. Do not upgrade only a
+globally installed `cayu` executable while leaving the application environment
+on rc3. Run every installation and migration command with Python 3.11 or newer;
+an unqualified system `python3` may be older than Cayu supports.
+
+The storage schema advances from revision 21 to revision 23, with breaking
+boundaries at revisions 22 and 23. For every SQLite or PostgreSQL database used
+by a session store or separately configured budget ledger:
+
+1. stop all rc3 and older Cayu workers;
+2. take an application-consistent backup;
+3. use the rc4 executable to run `cayu storage status`, followed by
+   `cayu storage migrate` against the explicit `--sqlite PATH` or
+   `--postgres DSN` target;
+4. confirm `cayu storage status` reports revision 23 with no pending
+   migrations; and
+5. deploy only rc4 workers.
+
+Do not use a mixed rc3/rc4 rolling deployment. After revision 23 is committed,
+an application-only rollback to rc3 is unsupported; restore the application
+and its pre-upgrade database backup together.
+
+The server contract advances from version 2 to version 4. Upgrade independently
+deployed Cayu servers, generated clients, and dashboards together. The rc4
+dashboard intentionally rejects an older server contract instead of guessing.
+
+After deployment, verify `cayu version`, run `cayu check --json`, execute the
+application's test suite, and exercise at least one durable session through
+process restart. Coding agents should treat failed storage status, migration,
+contract, or project tests as a blocked upgrade rather than editing around the
+guard.
+
 ## v0.1.0 (unreleased)
 
 ### Usage and dashboard pricing advertise separate capabilities
