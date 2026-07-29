@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 from tests.core._budget_ledger_contract import (
+    assert_crash_safe_dispatch_and_settlement_outbox,
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
     assert_reservation_identity_collision_is_rejected,
@@ -1217,6 +1218,18 @@ def test_in_memory_budget_ledger_terminal_settlements_are_idempotent() -> None:
     )
 
 
+def test_in_memory_budget_ledger_has_crash_safe_settlement_outbox() -> None:
+    clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+    asyncio.run(
+        assert_crash_safe_dispatch_and_settlement_outbox(
+            InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60),
+            _reservation_budget_limit(max_cost="0.25"),
+            clock=clock,
+            ttl_seconds=60,
+        )
+    )
+
+
 def test_in_memory_budget_ledger_rejects_reservation_identity_collision() -> None:
     asyncio.run(
         assert_reservation_identity_collision_is_rejected(
@@ -1521,6 +1534,27 @@ def test_sqlite_budget_ledger_terminal_settlements_are_idempotent(tmp_path) -> N
     asyncio.run(run())
 
 
+def test_sqlite_budget_ledger_has_crash_safe_settlement_outbox(tmp_path) -> None:
+    async def run() -> None:
+        clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+        ledger = SQLiteBudgetLedger(
+            tmp_path / "budget-crash-safe.sqlite",
+            clock=clock,
+            reservation_ttl_seconds=60,
+        )
+        try:
+            await assert_crash_safe_dispatch_and_settlement_outbox(
+                ledger,
+                _reservation_budget_limit(max_cost="0.25"),
+                clock=clock,
+                ttl_seconds=60,
+            )
+        finally:
+            await ledger.close()
+
+    asyncio.run(run())
+
+
 def test_sqlite_budget_ledger_rejects_reservation_identity_collision(tmp_path) -> None:
     async def run() -> None:
         ledger = SQLiteBudgetLedger(tmp_path / "budget-identity-collision.sqlite")
@@ -1800,7 +1834,7 @@ def test_sqlite_budget_ledger_uses_reconciliation_time_for_calendar_window(tmp_p
     assert active.actual == Decimal("0.44")
 
 
-def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
+def test_in_memory_budget_ledger_does_not_reap_dispatched_reservations() -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = InMemoryBudgetLedger(clock=clock, reservation_ttl_seconds=60)
@@ -1815,7 +1849,23 @@ def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
         )
         assert orphaned.accepted is True
         assert orphaned.record is not None
+        await ledger.mark_dispatched(
+            reservation_ids=(orphaned.record.reservation_id,),
+            dispatch_id="dispatch:in-memory:expired",
+        )
         clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+        blocked = await _reserve(
+            ledger,
+            limit=limit,
+            session_id="sess_blocked",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+        )
+        reconciled = await ledger.reconcile(
+            reservation_id=orphaned.record.reservation_id,
+            actual_amount=Decimal("0.01"),
+        )
         recovered = await _reserve(
             ledger,
             limit=limit,
@@ -1824,18 +1874,13 @@ def test_in_memory_budget_ledger_reaps_expired_active_reservations() -> None:
             provider_name="fake",
             model="fake-model",
         )
-        # V3: reconciling a reservation reaped while still in flight records the actual
-        # spend instead of crashing the billed run (which would also undercount).
-        reconciled = await ledger.reconcile(
-            reservation_id=orphaned.record.reservation_id,
-            actual_amount=Decimal("0.01"),
-        )
-        return recovered, reconciled
+        return blocked, reconciled, recovered
 
-    recovered, reconciled = asyncio.run(run())
+    blocked, reconciled, recovered = asyncio.run(run())
 
+    assert blocked.accepted is False
     assert recovered.accepted is True
-    assert recovered.actual == Decimal("0.22")
+    assert recovered.actual == Decimal("0.23")
     assert reconciled.status == "reconciled"
     assert reconciled.actual_amount == Decimal("0.01")
 
@@ -2020,7 +2065,7 @@ def test_budget_ledgers_reject_invalid_reservation_ttl(tmp_path) -> None:
         SQLiteBudgetLedger(tmp_path / "budget.sqlite", reservation_ttl_seconds=-5)
 
 
-def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> None:
+def test_sqlite_budget_ledger_does_not_reap_dispatched_reservations(tmp_path) -> None:
     async def run():
         clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
         ledger = SQLiteBudgetLedger(
@@ -2040,7 +2085,23 @@ def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> Non
             )
             assert orphaned.accepted is True
             assert orphaned.record is not None
+            await ledger.mark_dispatched(
+                reservation_ids=(orphaned.record.reservation_id,),
+                dispatch_id="dispatch:sqlite:expired",
+            )
             clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
+            blocked = await _reserve(
+                ledger,
+                limit=limit,
+                session_id="sess_blocked",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            )
+            reconciled = await ledger.reconcile(
+                reservation_id=orphaned.record.reservation_id,
+                actual_amount=Decimal("0.01"),
+            )
             recovered = await _reserve(
                 ledger,
                 limit=limit,
@@ -2049,20 +2110,15 @@ def test_sqlite_budget_ledger_reaps_expired_active_reservations(tmp_path) -> Non
                 provider_name="fake",
                 model="fake-model",
             )
-            # V3: reconciling a reservation reaped while still in flight records the
-            # actual spend instead of crashing the billed run (which would undercount).
-            reconciled = await ledger.reconcile(
-                reservation_id=orphaned.record.reservation_id,
-                actual_amount=Decimal("0.01"),
-            )
-            return recovered, reconciled
+            return blocked, reconciled, recovered
         finally:
             await ledger.close()
 
-    recovered, reconciled = asyncio.run(run())
+    blocked, reconciled, recovered = asyncio.run(run())
 
+    assert blocked.accepted is False
     assert recovered.accepted is True
-    assert recovered.actual == Decimal("0.22")
+    assert recovered.actual == Decimal("0.23")
     assert reconciled.status == "reconciled"
     assert reconciled.actual_amount == Decimal("0.01")
 
@@ -2262,7 +2318,7 @@ def test_sqlite_budget_ledger_preserves_bedrock_identity_across_reopen(tmp_path)
     assert reconciled.actual_amount == Decimal("9")
 
 
-def test_sqlite_budget_ledger_revisions_21_through_23_add_identity_columns(
+def test_sqlite_budget_ledger_revisions_21_through_24_add_settlement_schema(
     tmp_path,
 ) -> None:
     path = tmp_path / "bedrock-budget-migration.sqlite"
@@ -2274,8 +2330,15 @@ def test_sqlite_budget_ledger_revisions_21_through_23_add_identity_columns(
     asyncio.run(create_current_schema())
     connection = sqlite3.connect(path)
     try:
+        connection.execute("DROP TABLE IF EXISTS cayu_budget_settlements")
         connection.execute("DROP INDEX IF EXISTS idx_cayu_budget_reservations_model_attempt")
         connection.execute("DROP INDEX IF EXISTS idx_cayu_budget_reservations_limit")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN dispatched_at")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN dispatch_id")
+        connection.execute(
+            "ALTER TABLE cayu_budget_reservations DROP COLUMN settlement_event_payload_json"
+        )
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN environment_name")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN model_attempt_id")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN model_step_id")
         connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN budget_limit_id")
@@ -2286,7 +2349,7 @@ def test_sqlite_budget_ledger_revisions_21_through_23_add_identity_columns(
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 23"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 24"):
         SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     async def migrate() -> None:
@@ -2309,11 +2372,73 @@ def test_sqlite_budget_ledger_revisions_21_through_23_add_identity_columns(
     assert "budget_limit_id" in columns
     assert "model_step_id" in columns
     assert "model_attempt_id" in columns
+    assert "environment_name" in columns
+    assert "settlement_event_payload_json" in columns
+    assert "dispatch_id" in columns
+    assert "dispatched_at" in columns
     assert revisions == [
         (21, "breaking", 21),
         (22, "breaking", 22),
         (23, "breaking", 23),
+        (24, "breaking", 24),
     ]
+
+
+def test_sqlite_revision_twenty_five_refuses_ambiguous_active_reservations(
+    tmp_path,
+) -> None:
+    path = tmp_path / "active-budget-migration.sqlite"
+
+    async def seed_active_reservation() -> None:
+        ledger = SQLiteBudgetLedger(path)
+        try:
+            result = await ledger.reserve(
+                limit=_reservation_budget_limit(max_cost="1"),
+                session_id="sess_active_revision_25",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+                model_attempt_identity=model_attempt_identity(),
+            )
+            assert result.accepted is True
+        finally:
+            await ledger.close()
+
+    asyncio.run(seed_active_reservation())
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE cayu_budget_settlements")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN dispatched_at")
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN dispatch_id")
+        connection.execute(
+            "ALTER TABLE cayu_budget_reservations DROP COLUMN settlement_event_payload_json"
+        )
+        connection.execute("ALTER TABLE cayu_budget_reservations DROP COLUMN environment_name")
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision = 25")
+        connection.execute("PRAGMA user_version = 24")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match="cannot migrate active budget reservations",
+    ):
+        SQLiteBudgetLedger(path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
+
+    connection = sqlite3.connect(path)
+    try:
+        revision = connection.execute(
+            "SELECT revision FROM cayu_schema_migrations WHERE revision = 25"
+        ).fetchone()
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(cayu_budget_reservations)")
+        }
+    finally:
+        connection.close()
+    assert revision is None
+    assert "dispatch_id" not in columns
+    assert "dispatched_at" not in columns
 
 
 def test_sqlite_budget_ledger_fails_closed_on_missing_attempt_identity(
@@ -2376,7 +2501,7 @@ def test_sqlite_budget_ledger_fails_closed_on_missing_attempt_identity(
 
 def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None:
     # Before ADR 0001 revision 8 the ledger created an ad-hoc unprefixed
-    # `budget_reservations` table. Opening such a database must carry active
+    # `budget_reservations` table. Opening such a database must carry terminal
     # reservations into `cayu_budget_reservations` and drop the legacy table.
     path = tmp_path / "budget.sqlite"
     now = datetime.now(UTC).isoformat()
@@ -2405,7 +2530,8 @@ def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None
     legacy.execute(
         "INSERT INTO budget_reservations VALUES "
         "(?, 'app', NULL, 'all_time', 'USD', 'sess_legacy', 'assistant', "
-        "'fake', 'fake-model', '0.22', NULL, 'active', NULL, ?, ?)",
+        "'fake', 'fake-model', '0.22', '0.01', 'reconciled', "
+        "'terminal before schema migration', ?, ?)",
         ("bres_legacy", now, now),
     )
     legacy.commit()
@@ -2448,7 +2574,7 @@ def test_sqlite_budget_ledger_migrates_legacy_unprefixed_table(tmp_path) -> None
         inspector.close()
     assert "cayu_budget_reservations" in tables
     assert "budget_reservations" not in tables
-    assert migrated == ("bres_legacy", None, "active")
+    assert migrated == ("bres_legacy", None, "reconciled")
 
 
 def test_in_memory_budget_store_filters_app_and_agent_events() -> None:

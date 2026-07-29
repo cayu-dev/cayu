@@ -869,6 +869,29 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_sessions_parent_created_id
             ON cayu_sessions(parent_session_id, created_at, id);
     """,
+    25: """
+        CREATE TABLE IF NOT EXISTS cayu_budget_settlements (
+            settlement_id TEXT PRIMARY KEY,
+            reservation_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_budget_reservations(reservation_id),
+            session_id TEXT NOT NULL,
+            settled_at TEXT NOT NULL,
+            settlement_json TEXT NOT NULL,
+            event_published INTEGER NOT NULL CHECK (event_published IN (0, 1))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_budget_settlements_pending
+            ON cayu_budget_settlements(session_id, event_published, settled_at, settlement_id);
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_budget_settlements_pending_global
+            ON cayu_budget_settlements(event_published, settled_at, settlement_id);
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservation_identities_session
+            ON cayu_budget_reservation_identities(
+                publication_session_id,
+                reservation_id
+            );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -1134,6 +1157,69 @@ def _prepare_revision_twenty_three(connection: sqlite3.Connection) -> None:
     )
 
 
+def _prepare_revision_twenty_five(connection: sqlite3.Connection) -> None:
+    """Install crash-safe budget dispatch and audit-outbox columns."""
+
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cayu_budget_reservations'"
+    ).fetchone()
+    if exists is None:
+        return
+    active = connection.execute(
+        "SELECT 1 FROM cayu_budget_reservations WHERE status = 'active' LIMIT 1"
+    ).fetchone()
+    if active is not None:
+        raise RuntimeError(
+            "Schema revision 25 cannot migrate active budget reservations because "
+            "their dispatch state is unknown. Drain or explicitly settle every active "
+            "reservation, then retry the migration."
+        )
+    for column, definition in (
+        ("environment_name", "TEXT"),
+        ("settlement_event_payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("settlement_fallback_json", "TEXT"),
+        ("dispatch_id", "TEXT"),
+        ("dispatched_at", "TEXT"),
+    ):
+        _add_column_if_missing(
+            connection,
+            "cayu_budget_reservations",
+            column,
+            definition,
+        )
+    rows = connection.execute(
+        """
+        SELECT reservation_id, created_at
+        FROM cayu_budget_reservations
+        WHERE settlement_fallback_json IS NULL
+        """
+    ).fetchall()
+    for reservation_id, created_at in rows:
+        connection.execute(
+            """
+            UPDATE cayu_budget_reservations
+            SET settlement_fallback_json = ?
+            WHERE reservation_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "settled_at": created_at,
+                        "reconciliation_reason": (
+                            "model completion settlement evidence was not publishable; "
+                            "charged reserved amount"
+                        ),
+                        "release_reason": "reservation released before provider dispatch",
+                        "expiration_reason": None,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                reservation_id,
+            ),
+        )
+
+
 # Per-revision Python follow-ups that cannot be expressed as unconditional DDL
 # (e.g. conditionally carrying data out of a legacy ad-hoc table). Each hook runs
 # after its revision's DDL and before the revision is recorded.
@@ -1142,6 +1228,7 @@ _MIGRATION_HOOKS: dict[int, Callable[[sqlite3.Connection], None]] = {
     14: _backfill_session_activity,
     21: _add_budget_billing_identity_if_present,
     23: _prepare_revision_twenty_three,
+    25: _prepare_revision_twenty_five,
 }
 
 _REVISION_17_INDEX_NAMES = frozenset(

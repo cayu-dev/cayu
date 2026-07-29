@@ -164,6 +164,11 @@ REVISIONS: tuple[Revision, ...] = (
     # topology reads. The index is purely additive and older revision-23
     # binaries continue to operate against the expanded schema.
     Revision(revision=24, kind=RevisionKind.ADDITIVE, compatible_from=23),
+    # Budget dispatch fencing and the terminal-settlement outbox change when an
+    # expired reservation may release capacity. Every writer must persist the
+    # dispatch fence and atomically materialize terminal audit evidence, so a
+    # pre-25 worker must not share this ledger.
+    Revision(revision=25, kind=RevisionKind.BREAKING, compatible_from=25),
 )
 
 #: The revision an empty database is initialized to.

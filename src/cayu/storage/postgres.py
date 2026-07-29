@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, ClassVar, LiteralString, cast
+from typing import Any, ClassVar, Literal, LiteralString, cast
 from uuid import uuid4
 
 try:
@@ -40,7 +40,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu.core.billing import BillingIdentity
+from cayu.core.billing import BillingIdentity, copy_billing_identity
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
@@ -55,14 +55,19 @@ from cayu.runtime.budgets import (
     BudgetLedger,
     BudgetLimit,
     BudgetReconciliation,
+    BudgetReconciliationPricing,
     BudgetReservationRecord,
     BudgetReservationResult,
+    BudgetSettlementCursor,
+    BudgetSettlementFallback,
+    BudgetSettlementRecord,
     _budget_reservation_amount,
+    _budget_settlement_record,
     _clock_or_utc_now,
+    _copy_budget_settlement_cursor,
     _EffectiveBudgetLimit,
     _ensure_effective_budget_limit,
     _expired_reservation_reason,
-    _is_expired_reservation_reason,
     _reconciled_record,
     _reconciliation_from_record,
     _released_record,
@@ -70,7 +75,11 @@ from cayu.runtime.budgets import (
     _reservation_result,
     _utc_datetime,
     _validate_amount,
+    _validate_reservation_id_batch,
     _validate_reservation_ttl,
+    _validate_settlement_page_limit,
+    copy_budget_settlement_fallback,
+    new_budget_reservation_id,
 )
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
@@ -812,6 +821,67 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
           AND jsonb_typeof(payload -> 'reservation_id') = 'string'
         ON CONFLICT (reservation_id) DO NOTHING
         """,
+    ),
+    25: (
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM cayu_budget_reservations
+                WHERE status = 'active'
+            ) THEN
+                RAISE EXCEPTION USING MESSAGE =
+                    'Schema revision 25 cannot migrate active budget reservations because '
+                    'their dispatch state is unknown. Drain or explicitly settle every active '
+                    'reservation, then retry the migration.';
+            END IF;
+        END
+        $$
+        """,
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS environment_name TEXT",
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS settlement_event_payload JSONB NOT NULL "
+        "DEFAULT '{}'::jsonb",
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS settlement_fallback JSONB",
+        """
+        UPDATE cayu_budget_reservations
+        SET settlement_fallback = jsonb_build_object(
+            'settled_at', to_jsonb(created_at),
+            'reconciliation_reason',
+                'model completion settlement evidence was not publishable; '
+                'charged reserved amount',
+            'release_reason', 'reservation released before provider dispatch',
+            'expiration_reason', NULL
+        )
+        WHERE settlement_fallback IS NULL
+        """,
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ALTER COLUMN settlement_fallback SET NOT NULL",
+        "ALTER TABLE IF EXISTS cayu_budget_reservations ADD COLUMN IF NOT EXISTS dispatch_id TEXT",
+        "ALTER TABLE IF EXISTS cayu_budget_reservations "
+        "ADD COLUMN IF NOT EXISTS dispatched_at TIMESTAMPTZ",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_budget_settlements (
+            settlement_id TEXT PRIMARY KEY,
+            reservation_id TEXT NOT NULL UNIQUE
+                REFERENCES cayu_budget_reservations(reservation_id),
+            session_id TEXT NOT NULL,
+            settled_at TIMESTAMPTZ NOT NULL,
+            settlement_json JSONB NOT NULL,
+            event_published BOOLEAN NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_budget_settlements_pending "
+        "ON cayu_budget_settlements"
+        "(session_id, event_published, settled_at, settlement_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_budget_settlements_pending_global "
+        "ON cayu_budget_settlements"
+        "(event_published, settled_at, settlement_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservation_identities_session "
+        "ON cayu_budget_reservation_identities(publication_session_id, reservation_id)",
     ),
 }
 
@@ -2535,7 +2605,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     machinery (ADR 0001 revision 8).
     """
 
-    _min_required_revision = 23
+    _min_required_revision = 25
 
     def __init__(
         self,
@@ -2623,15 +2693,25 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     async def reserve(
         self,
         *,
+        reservation_id: str | None = None,
         limit: BudgetLimit,
         session_id: str,
         agent_name: str,
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        environment_name: str | None = None,
+        settlement_event_payload: dict[str, Any] | None = None,
+        settlement_fallback: BudgetSettlementFallback | None = None,
+        requested_amount: Decimal | None = None,
         billing_identity: BillingIdentity | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
+        reservation_id = (
+            new_budget_reservation_id()
+            if reservation_id is None
+            else require_clean_nonblank(reservation_id, "reservation_id")
+        )
         limit = _ensure_effective_budget_limit(
             limit,
             identity_namespace="app_policy",
@@ -2641,6 +2721,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        durable_billing_identity = copy_billing_identity(billing_identity)
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -2650,21 +2731,40 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         (_budget_advisory_lock_key(limit),),
                     )
                     now = self._clock()
+                    durable_settlement_fallback = (
+                        BudgetSettlementFallback(
+                            settled_at=now,
+                            expiration_reason=(
+                                None
+                                if self._reservation_ttl_seconds is None
+                                else _expired_reservation_reason(self._reservation_ttl_seconds)
+                            ),
+                        )
+                        if settlement_fallback is None
+                        else copy_budget_settlement_fallback(settlement_fallback)
+                    )
                     pricing_effective_at = (
                         now if effective_at is None else _utc_datetime(effective_at, "effective_at")
                     )
-                    requested = _budget_reservation_amount(
-                        limit=limit,
-                        provider_name=provider_name,
-                        model=model,
-                        effective_at=pricing_effective_at,
-                        billing_identity=billing_identity,
+                    requested = (
+                        _budget_reservation_amount(
+                            limit=limit,
+                            provider_name=provider_name,
+                            model=model,
+                            effective_at=pricing_effective_at,
+                            billing_identity=durable_billing_identity,
+                        )
+                        if requested_amount is None
+                        else _validate_amount(requested_amount, "requested_amount")
                     )
                     await self._reap_expired(cur, now, limit=limit)
                     current = await self._used_amount(cur, limit, now=now)
                     projected = current + requested
                     if projected > limit.max_estimated_cost:
-                        await conn.rollback()
+                        # Reaping is an independent terminal transition with
+                        # its own outbox evidence. Preserve it even when the
+                        # new reservation is rejected.
+                        await conn.commit()
                         return _reservation_result(
                             limit=limit,
                             model_attempt_identity=model_attempt_identity,
@@ -2677,6 +2777,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                             ),
                         )
                     record = BudgetReservationRecord(
+                        reservation_id=reservation_id,
                         budget_limit_id=limit.budget_limit_id,
                         model_step_id=model_attempt_identity.model_step_id,
                         model_attempt_id=model_attempt_identity.model_attempt_id,
@@ -2686,9 +2787,12 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         currency=limit.currency,
                         session_id=session_id,
                         agent_name=agent_name,
+                        environment_name=environment_name,
                         provider_name=provider_name,
                         model=model,
-                        billing_identity=billing_identity,
+                        billing_identity=durable_billing_identity,
+                        settlement_event_payload=settlement_event_payload or {},
+                        settlement_fallback=durable_settlement_fallback,
                         reserved_amount=requested,
                         created_at=now,
                         updated_at=now,
@@ -2718,6 +2822,62 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             record=record,
         )
 
+    async def mark_dispatched(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        dispatched_at: datetime | None = None,
+    ) -> tuple[BudgetReservationRecord, ...]:
+        reservation_ids = _validate_reservation_id_batch(reservation_ids)
+        dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        marked_at = pg_support.to_utc(dispatched_at) if dispatched_at is not None else self._clock()
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    records_by_id = {
+                        reservation_id: await self._load_record_for_update(
+                            cur,
+                            reservation_id,
+                        )
+                        for reservation_id in sorted(reservation_ids)
+                    }
+                    records = tuple(
+                        records_by_id[reservation_id] for reservation_id in reservation_ids
+                    )
+                    for record in records:
+                        if record.dispatch_id is not None and record.dispatch_id != dispatch_id:
+                            raise ValueError(
+                                "Budget reservation has a conflicting dispatch: "
+                                f"{record.reservation_id}"
+                            )
+                        if record.dispatch_id is None and record.status != "active":
+                            raise ValueError(
+                                f"Budget reservation is not active: {record.reservation_id}"
+                            )
+                    dispatched_records = tuple(
+                        (
+                            record
+                            if record.dispatch_id is not None
+                            else record.model_copy(
+                                update={
+                                    "dispatch_id": dispatch_id,
+                                    "dispatched_at": marked_at,
+                                },
+                                deep=True,
+                            )
+                        )
+                        for record in records
+                    )
+                    for record in dispatched_records:
+                        await self._update_record(cur, record)
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+        return dispatched_records
+
     async def heartbeat(self, *, reservation_id: str) -> bool:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         await self._ensure_ready()
@@ -2746,9 +2906,11 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         *,
         reservation_id: str,
         actual_amount: Decimal,
+        settlement_kind: Literal["completed", "conservative"] = "completed",
         reason: str | None = None,
         occurred_at: datetime | None = None,
         billing_identity: BillingIdentity | None = None,
+        pricing: BudgetReconciliationPricing | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
@@ -2765,22 +2927,32 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         updated_at=reconciled_at,
                         billing_identity=billing_identity,
                     )
+                    reconciliation = _reconciliation_from_record(
+                        reconciled,
+                        settlement_kind=settlement_kind,
+                        pricing=pricing,
+                    )
+                    await self._insert_or_validate_settlement(
+                        cur,
+                        _budget_settlement_record(record, reconciliation),
+                    )
                     await self._update_record(cur, reconciled)
                 await conn.commit()
             except Exception:
                 await conn.rollback()
                 raise
-        return _reconciliation_from_record(reconciled)
+        return reconciliation
 
     async def release(
         self,
         *,
         reservation_id: str,
         reason: str,
+        occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         reason = require_clean_nonblank(reason, "reason")
-        released_at = self._clock()
+        released_at = pg_support.to_utc(occurred_at) if occurred_at is not None else self._clock()
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             try:
@@ -2791,12 +2963,128 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                         reason=reason,
                         updated_at=released_at,
                     )
+                    reconciliation = _reconciliation_from_record(
+                        released,
+                        settlement_kind="released",
+                    )
+                    await self._insert_or_validate_settlement(
+                        cur,
+                        _budget_settlement_record(record, reconciliation),
+                    )
                     await self._update_record(cur, released)
                 await conn.commit()
             except Exception:
                 await conn.rollback()
                 raise
-        return _reconciliation_from_record(released)
+        return reconciliation
+
+    async def load_settlement(self, settlement_id: str) -> BudgetSettlementRecord | None:
+        settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT settlement_json, event_published
+                FROM cayu_budget_settlements
+                WHERE settlement_id = %s
+                """,
+                (settlement_id,),
+            )
+            row = await cur.fetchone()
+            return None if row is None else self._settlement_from_row(row)
+
+    async def list_pending_settlements(
+        self,
+        *,
+        session_id: str | None = None,
+        after: BudgetSettlementCursor | None = None,
+        limit: int = 100,
+    ) -> list[BudgetSettlementRecord]:
+        if session_id is not None:
+            session_id = require_clean_nonblank(session_id, "session_id")
+        after = _copy_budget_settlement_cursor(after)
+        limit = _validate_settlement_page_limit(limit)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            filters = ["NOT event_published"]
+            parameters: list[object] = []
+            if session_id is not None:
+                filters.append("session_id = %s")
+                parameters.append(session_id)
+            if after is not None:
+                filters.append("(settled_at > %s OR (settled_at = %s AND settlement_id > %s))")
+                parameters.extend(
+                    [
+                        pg_support.to_utc(after.settled_at),
+                        pg_support.to_utc(after.settled_at),
+                        after.settlement_id,
+                    ]
+                )
+            parameters.append(limit)
+            query = (
+                """
+                SELECT settlement_json, event_published
+                FROM cayu_budget_settlements
+                WHERE """
+                + " AND ".join(filters)
+                + """
+                ORDER BY settled_at, settlement_id
+                LIMIT %s
+                """
+            )
+            await cur.execute(
+                cast("LiteralString", query),
+                parameters,
+            )
+            return [self._settlement_from_row(row) for row in await cur.fetchall()]
+
+    async def mark_settlement_event_published(
+        self,
+        *,
+        settlement_id: str,
+        event_id: str,
+    ) -> BudgetSettlementRecord:
+        settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
+        event_id = require_clean_nonblank(event_id, "event_id")
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT settlement_json, event_published
+                        FROM cayu_budget_settlements
+                        WHERE settlement_id = %s
+                        FOR UPDATE
+                        """,
+                        (settlement_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        raise KeyError(f"Budget settlement not found: {settlement_id}")
+                    settlement = self._settlement_from_row(row)
+                    if settlement.event.id != event_id:
+                        raise ValueError(
+                            "Budget settlement event acknowledgement has conflicting identity."
+                        )
+                    if not settlement.event_published:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_budget_settlements
+                            SET event_published = TRUE
+                            WHERE settlement_id = %s
+                            """,
+                            (settlement_id,),
+                        )
+                        settlement = settlement.model_copy(
+                            update={"event_published": True},
+                            deep=True,
+                        )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return settlement
 
     async def _reap_expired(
         self,
@@ -2808,26 +3096,41 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         if self._reservation_ttl_seconds is None:
             return
         cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
-        # Keep the matching dimensions and inclusive expiry boundary aligned with
-        # _reservation_matches_limit() and _reservation_is_expired(). ``IS NOT
-        # DISTINCT FROM`` keeps the nullable budget key comparison null-safe.
         await cur.execute(
             """
-            UPDATE cayu_budget_reservations
-            SET status = 'released',
-                reason = %s,
-                updated_at = %s
+            SELECT reservation_id
+            FROM cayu_budget_reservations
             WHERE status = 'active'
+              AND dispatch_id IS NULL
               AND updated_at <= %s
               AND budget_limit_id = %s
+            ORDER BY reservation_id
+            FOR UPDATE
             """,
             (
-                _expired_reservation_reason(self._reservation_ttl_seconds),
-                pg_support.to_utc(now),
                 pg_support.to_utc(cutoff),
                 limit.budget_limit_id,
             ),
         )
+        for row in await cur.fetchall():
+            record = await self._load_record_for_update(cur, row[0])
+            released = _released_record(
+                record,
+                reason=(
+                    record.settlement_fallback.expiration_reason
+                    or _expired_reservation_reason(self._reservation_ttl_seconds)
+                ),
+                updated_at=record.settlement_fallback.settled_at,
+            )
+            reconciliation = _reconciliation_from_record(
+                released,
+                settlement_kind="released",
+            )
+            await self._insert_or_validate_settlement(
+                cur,
+                _budget_settlement_record(record, reconciliation),
+            )
+            await self._update_record(cur, released)
 
     async def _used_amount(
         self,
@@ -2918,9 +3221,14 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 currency,
                 session_id,
                 agent_name,
+                environment_name,
                 provider_name,
                 model,
                 billing_identity,
+                settlement_event_payload,
+                settlement_fallback,
+                dispatch_id,
+                dispatched_at,
                 reserved_amount,
                 actual_amount,
                 status,
@@ -2930,7 +3238,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s
             )
             """,
             (
@@ -2944,6 +3253,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                 record.currency,
                 record.session_id,
                 record.agent_name,
+                record.environment_name,
                 record.provider_name,
                 record.model,
                 (
@@ -2951,6 +3261,10 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                     if record.billing_identity is None
                     else _dumps(record.billing_identity.model_dump(mode="json"))
                 ),
+                _dumps(record.settlement_event_payload),
+                _dumps(record.settlement_fallback.model_dump(mode="json")),
+                record.dispatch_id,
+                pg_support.to_utc_optional(record.dispatched_at),
                 record.reserved_amount,
                 record.actual_amount,
                 record.status,
@@ -2966,6 +3280,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             UPDATE cayu_budget_reservations
             SET actual_amount = %s,
                 billing_identity = %s,
+                dispatch_id = %s,
+                dispatched_at = %s,
                 status = %s,
                 reason = %s,
                 updated_at = %s
@@ -2978,6 +3294,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
                     if record.billing_identity is None
                     else _dumps(record.billing_identity.model_dump(mode="json"))
                 ),
+                record.dispatch_id,
+                pg_support.to_utc_optional(record.dispatched_at),
                 record.status,
                 record.reason,
                 pg_support.to_utc(record.updated_at),
@@ -2997,7 +3315,9 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             SELECT reservation_id, budget_limit_id, model_step_id, model_attempt_id,
                    scope, budget_key, budget_window,
                    currency, session_id,
-                   agent_name, provider_name, model, billing_identity,
+                   agent_name, environment_name, provider_name, model,
+                   billing_identity, settlement_event_payload, settlement_fallback,
+                   dispatch_id, dispatched_at,
                    reserved_amount, actual_amount,
                    status, reason, created_at, updated_at
             FROM cayu_budget_reservations
@@ -3030,17 +3350,80 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             currency=row[7],
             session_id=row[8],
             agent_name=row[9],
-            provider_name=row[10],
-            model=row[11],
+            environment_name=row[10],
+            provider_name=row[11],
+            model=row[12],
             billing_identity=(
-                None if row[12] is None else BillingIdentity.model_validate(_json_obj(row[12]))
+                None if row[13] is None else BillingIdentity.model_validate(_json_obj(row[13]))
             ),
-            reserved_amount=row[13],
-            actual_amount=row[14],
-            status=row[15],
-            reason=row[16],
-            created_at=pg_support.to_utc(row[17]),
-            updated_at=pg_support.to_utc(row[18]),
+            settlement_event_payload=_json_obj(row[14]),
+            settlement_fallback=BudgetSettlementFallback.model_validate(_json_obj(row[15])),
+            dispatch_id=row[16],
+            dispatched_at=pg_support.to_utc_optional(row[17]),
+            reserved_amount=row[18],
+            actual_amount=row[19],
+            status=row[20],
+            reason=row[21],
+            created_at=pg_support.to_utc(row[22]),
+            updated_at=pg_support.to_utc(row[23]),
+        )
+
+    async def _insert_or_validate_settlement(
+        self,
+        cur: Any,
+        settlement: BudgetSettlementRecord,
+    ) -> None:
+        stored = settlement.model_copy(update={"event_published": False}, deep=True)
+        await cur.execute(
+            """
+            INSERT INTO cayu_budget_settlements (
+                settlement_id,
+                reservation_id,
+                session_id,
+                settled_at,
+                settlement_json,
+                event_published
+            )
+            VALUES (%s, %s, %s, %s, %s, FALSE)
+            ON CONFLICT (settlement_id) DO NOTHING
+            RETURNING settlement_id
+            """,
+            (
+                stored.settlement_id,
+                stored.reservation_id,
+                stored.session_id,
+                pg_support.to_utc(stored.reconciliation.settled_at),
+                _dumps(stored.model_dump(mode="json")),
+            ),
+        )
+        if await cur.fetchone() is not None:
+            return
+        await cur.execute(
+            """
+            SELECT settlement_json, event_published
+            FROM cayu_budget_settlements
+            WHERE settlement_id = %s
+            """,
+            (stored.settlement_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("Budget settlement disappeared during conflict.")
+        existing = self._settlement_from_row(row).model_copy(
+            update={"event_published": False},
+            deep=True,
+        )
+        if existing != stored:
+            raise ValueError(
+                f"Budget reservation has a conflicting settlement: {stored.reservation_id}"
+            )
+
+    @staticmethod
+    def _settlement_from_row(row: Any) -> BudgetSettlementRecord:
+        settlement = BudgetSettlementRecord.model_validate(_json_obj(row[0]))
+        return settlement.model_copy(
+            update={"event_published": bool(row[1])},
+            deep=True,
         )
 
     async def _active_record_for_update(
@@ -3059,6 +3442,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
         reservation_id: str,
     ) -> BudgetReservationRecord:
         record = await self._load_record_for_update(cur, reservation_id)
+        if record.status == "active" and record.dispatch_id is not None:
+            raise ValueError(f"Dispatched budget reservation cannot be released: {reservation_id}")
         if record.status in {"active", "released"}:
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
@@ -3070,11 +3455,6 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
     ) -> BudgetReservationRecord:
         record = await self._load_record_for_update(cur, reservation_id)
         if record.status in {"active", "reconciled"}:
-            return record
-        if record.status == "released" and _is_expired_reservation_reason(record.reason):
-            # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
-            # Reconcile it anyway so the actual spend is recorded rather than crashing the
-            # billed run and silently undercounting the shared budget window.
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
@@ -5195,6 +5575,36 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise ValueError(
                             "Cannot delete a session while a model-completion stage is active: "
                             f"{session_id}"
+                        )
+                    await cur.execute(
+                        """
+                        SELECT identity.reservation_id
+                        FROM cayu_budget_reservation_identities AS identity
+                        LEFT JOIN cayu_events AS event
+                          ON event.session_id = identity.publication_session_id
+                         AND event.event_type IN (
+                             'budget.reconciled',
+                             'budget.reservation_released'
+                         )
+                         AND event.payload ->> 'reservation_id'
+                             = identity.reservation_id
+                        LEFT JOIN cayu_persisted_event_side_effects AS delivery
+                          ON delivery.session_id = event.session_id
+                         AND delivery.event_id = event.event_id
+                        WHERE identity.publication_session_id = %s
+                        GROUP BY identity.reservation_id
+                        HAVING COUNT(event.event_id) <> 1
+                            OR COUNT(*) FILTER (
+                                WHERE delivery.status = 'delivered'
+                            ) <> 1
+                        LIMIT 1
+                        """,
+                        (session_id,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise ValueError(
+                            "Cannot delete a session while a budget settlement audit "
+                            f"event is pending: {session_id}"
                         )
                     # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
                     # the self-FK is ON DELETE SET NULL so children keep loading.

@@ -1357,6 +1357,36 @@ class SQLiteSessionStore(SessionStore):
                         "Cannot delete a session while a model-completion stage is active: "
                         f"{session_id}"
                     )
+                pending_budget_settlement = self._connection.execute(
+                    """
+                    SELECT identity.reservation_id
+                    FROM cayu_budget_reservation_identities AS identity
+                    LEFT JOIN cayu_events AS event
+                      ON event.session_id = identity.publication_session_id
+                     AND event.event_type IN (
+                         'budget.reconciled',
+                         'budget.reservation_released'
+                     )
+                     AND json_extract(event.payload_json, '$.reservation_id')
+                         = identity.reservation_id
+                    LEFT JOIN cayu_persisted_event_side_effects AS delivery
+                      ON delivery.session_id = event.session_id
+                     AND delivery.event_id = event.event_id
+                    WHERE identity.publication_session_id = ?
+                    GROUP BY identity.reservation_id
+                    HAVING COUNT(event.event_id) <> 1
+                        OR COUNT(
+                            CASE WHEN delivery.status = 'delivered' THEN 1 END
+                        ) <> 1
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if pending_budget_settlement is not None:
+                    raise ValueError(
+                        "Cannot delete a session while a budget settlement audit "
+                        f"event is pending: {session_id}"
+                    )
                 # ON DELETE CASCADE removes events/labels/checkpoint/transcript;
                 # the self-FK is ON DELETE SET NULL so children keep loading.
                 self._connection.execute(

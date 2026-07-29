@@ -172,7 +172,7 @@ async def _stage_completed_model_boundary(
             dispatch_ordinal=0,
             purpose="assistant-turn",
             intent=intent,
-            reservation_ids=("reservation:model-recovery",),
+            reservation_ids=(),
         ),
         expected_statuses={SessionStatus.RUNNING},
         expected_run_epoch=running.run_epoch,

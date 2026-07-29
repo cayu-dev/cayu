@@ -24,7 +24,9 @@ from pydantic import (
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    MIN_DURABLE_JSON_INTEGER,
     canonical_durable_json_bytes,
+    copy_durable_json_object,
     require_execution_unit_id,
 )
 from cayu._validation import (
@@ -38,6 +40,7 @@ from cayu.core.billing import (
     ResolvedBillingIdentity,
     billing_identity_value,
     completed_billing_identity,
+    copy_billing_identity,
 )
 from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.costs import (
@@ -62,8 +65,15 @@ BudgetWindowKind = Literal["all_time", "rolling", "calendar"]
 BudgetCalendarPeriod = Literal["day", "week", "month"]
 BudgetAction = Literal["interrupt", "notify"]
 BudgetReservationStatus = Literal["active", "reconciled", "released"]
+BudgetSettlementKind = Literal["completed", "conservative", "released"]
 _TOKENS_PER_MILLION = Decimal("1000000")
+_MICROSECONDS_PER_SECOND = 1_000_000
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 DEFAULT_RESERVATION_TTL_SECONDS = 3600
+MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY = "budget_settlements"
+PUBLICATION_FALLBACK_BUDGET_REASON = (
+    "model completion settlement evidence was not publishable; charged reserved amount"
+)
 _ALL_TIME_WINDOW = "all_time"
 _ROLLING_PREFIX = "rolling:"
 _ROLLING_SUFFIX = "s"
@@ -99,6 +109,9 @@ _BUDGET_RECONCILIATION_PRICING_KEYS = frozenset(
     }
 )
 _BUDGET_INSPECTION_PRICING_STATE_KEY = "_cayu_pricing_state"
+_BUDGET_INSPECTION_COMPLETED_SETTLEMENT_IDS_KEY = (
+    "_cayu_completed_budget_settlement_reservation_ids"
+)
 
 
 class BudgetReservationIdentityConflict(RuntimeError):
@@ -137,6 +150,17 @@ class SessionBudgetInspection(BaseModel):
     event_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     reservation_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     reconciliation_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    pending_reservation_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    completed_unsettled_reservation_count: StrictInt = Field(
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    reconciled_reservation_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    conservative_reconciliation_count: StrictInt = Field(
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    released_reservation_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     cost_state: Literal["unknown", "unpriced", "partial", "mixed_currency", "priced"]
     amount: str | None = None
     currency: str | None = None
@@ -158,6 +182,7 @@ def session_budget_inspection(
     budget_events = [event for event in events if event.type in _BUDGET_INSPECTION_EVENT_TYPES]
     terminal_step_ids_by_attempt_id: dict[str, list[str]] = {}
     invalid_terminal_attempt_ids: set[str] = set()
+    terminal_events_by_identity: dict[ModelAttemptIdentity, list[Event]] = {}
     if model_attempt_terminal_events is not None:
         for event in model_attempt_terminal_events:
             if event.type not in _MODEL_ATTEMPT_TERMINAL_EVENT_TYPES:
@@ -175,6 +200,7 @@ def session_budget_inspection(
             terminal_step_ids_by_attempt_id.setdefault(model_attempt_id, []).append(
                 identity.model_step_id
             )
+            terminal_events_by_identity.setdefault(identity, []).append(event)
     checks = [
         event
         for event in budget_events
@@ -302,6 +328,8 @@ def session_budget_inspection(
     priced_amount_by_reservation: dict[str, Decimal] = {}
     priced_reservation_ids: set[str] = set()
     reconciled_reservation_ids: set[str] = set()
+    exactly_reconciled_reservation_ids: set[str] = set()
+    conservatively_reconciled_reservation_ids: set[str] = set()
     terminal_count_by_reservation: dict[str, int] = {}
     for event in reconciliations:
         reservation_id = _inspection_reservation_id(event.payload.get("reservation_id"))
@@ -314,6 +342,14 @@ def session_budget_inspection(
             or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
             or attempt_identities_by_reservation.get(reservation_id) != model_attempt_identity
         ):
+            invalid_reservation_evidence = True
+            continue
+        settlement_kind = event.payload.get("settlement_kind")
+        if settlement_kind == "completed":
+            exactly_reconciled_reservation_ids.add(reservation_id)
+        elif settlement_kind == "conservative":
+            conservatively_reconciled_reservation_ids.add(reservation_id)
+        else:
             invalid_reservation_evidence = True
             continue
         reconciled_reservation_ids.add(reservation_id)
@@ -347,6 +383,7 @@ def session_budget_inspection(
             reservation_id is None
             or budget_limit_id is None
             or model_attempt_identity is None
+            or event.payload.get("settlement_kind") != "released"
             or limit_ids_by_reservation.get(reservation_id) != budget_limit_id
             or attempt_identities_by_reservation.get(reservation_id) != model_attempt_identity
         ):
@@ -357,6 +394,24 @@ def session_budget_inspection(
             terminal_count_by_reservation.get(reservation_id, 0) + 1
         )
     settled_reservation_ids = reconciled_reservation_ids | released_reservation_ids
+    completed_reservation_ids: set[str] = set()
+    invalid_completion_settlement_evidence = False
+    for identity, terminal_events in terminal_events_by_identity.items():
+        expected_attempt_reservation_ids = reservation_ids_by_attempt.get(identity, set())
+        for event in terminal_events:
+            raw_ids = event.payload.get(_BUDGET_INSPECTION_COMPLETED_SETTLEMENT_IDS_KEY)
+            if raw_ids is None:
+                continue
+            if (
+                type(raw_ids) is not list
+                or any(type(reservation_id) is not str for reservation_id in raw_ids)
+                or len(set(raw_ids)) != len(raw_ids)
+                or set(raw_ids) != expected_attempt_reservation_ids
+                or bool(completed_reservation_ids & set(raw_ids))
+            ):
+                invalid_completion_settlement_evidence = True
+                continue
+            completed_reservation_ids.update(raw_ids)
     complete_terminal_coverage = (
         bool(reservation_ids)
         and not invalid_reservation_limit_identity
@@ -407,6 +462,7 @@ def session_budget_inspection(
         or invalid_reservation_limit_identity
         or invalid_reservation_evidence
         or invalid_failure_identity
+        or invalid_completion_settlement_evidence
         or contradictory_failure_outcome
         or invalid_model_attempt_terminal_join
         or (
@@ -510,6 +566,15 @@ def session_budget_inspection(
         event_count=len(budget_events),
         reservation_count=len(reservations),
         reconciliation_count=len(reconciliations),
+        pending_reservation_count=len(
+            reservation_ids - settled_reservation_ids - completed_reservation_ids
+        ),
+        completed_unsettled_reservation_count=len(
+            completed_reservation_ids - settled_reservation_ids
+        ),
+        reconciled_reservation_count=len(exactly_reconciled_reservation_ids),
+        conservative_reconciliation_count=len(conservatively_reconciled_reservation_ids),
+        released_reservation_count=len(released_reservation_ids),
         cost_state=cost_state,
         amount=amount,
         currency=currency,
@@ -763,11 +828,39 @@ def project_budget_model_attempt_inspection_event(event: Event) -> Event:
 
     if event.type not in _MODEL_ATTEMPT_TERMINAL_EVENT_TYPES:
         raise ValueError("Budget model-attempt inspection requires a model terminal event.")
-    payload: dict[str, str] = {}
+    payload: dict[str, Any] = {}
     for field_name in ("model_step_id", "model_attempt_id"):
         value = _inspection_execution_unit_id(event.payload.get(field_name), field_name)
         if value is not None:
             payload[field_name] = value
+    if (
+        event.type == EventType.MODEL_COMPLETED
+        and MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY in event.payload
+    ):
+        try:
+            settlements = tuple(
+                budget_reconciliation_from_payload(raw)
+                for raw in event.payload[MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY]
+            )
+            identity = _inspection_model_attempt_identity(payload)
+            if (
+                type(event.payload[MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY]) is not list
+                or identity is None
+                or len({item.reservation_id for item in settlements}) != len(settlements)
+                or any(
+                    item.status != "reconciled"
+                    or item.settlement_kind == "released"
+                    or item.model_step_id != identity.model_step_id
+                    or item.model_attempt_id != identity.model_attempt_id
+                    for item in settlements
+                )
+            ):
+                raise ValueError("Invalid model completion budget settlements.")
+            payload[_BUDGET_INSPECTION_COMPLETED_SETTLEMENT_IDS_KEY] = [
+                item.reservation_id for item in settlements
+            ]
+        except (TypeError, ValueError):
+            payload[_BUDGET_INSPECTION_COMPLETED_SETTLEMENT_IDS_KEY] = False
     return event.model_copy(update={"payload": payload})
 
 
@@ -802,6 +895,7 @@ def project_budget_inspection_event(event: Event) -> Event:
     elif event.type == EventType.BUDGET_RECONCILED:
         retained_keys = (
             "reservation_id",
+            "settlement_kind",
             "budget_limit_id",
             "model_step_id",
             "model_attempt_id",
@@ -810,6 +904,7 @@ def project_budget_inspection_event(event: Event) -> Event:
     elif event.type == EventType.BUDGET_RESERVATION_RELEASED:
         retained_keys = (
             "reservation_id",
+            "settlement_kind",
             "budget_limit_id",
             "model_step_id",
             "model_attempt_id",
@@ -1158,6 +1253,42 @@ class BudgetCheck(BaseModel):
         return value
 
 
+class BudgetSettlementFallback(BaseModel):
+    """Pre-dispatch authority for a publishable conservative terminal outcome."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    settled_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    reconciliation_reason: str = PUBLICATION_FALLBACK_BUDGET_REASON
+    release_reason: str = "reservation released before provider dispatch"
+    expiration_reason: str | None = None
+
+    @field_validator("settled_at")
+    @classmethod
+    def validate_settled_at(cls, value: datetime) -> datetime:
+        return _utc_datetime(value, "settled_at")
+
+    @field_validator("reconciliation_reason", "release_reason")
+    @classmethod
+    def validate_required_reason(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("expiration_reason")
+    @classmethod
+    def validate_expiration_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, "expiration_reason")
+
+
+def copy_budget_settlement_fallback(
+    fallback: BudgetSettlementFallback,
+) -> BudgetSettlementFallback:
+    if type(fallback) is not BudgetSettlementFallback:
+        raise TypeError("settlement_fallback must be a BudgetSettlementFallback.")
+    return BudgetSettlementFallback.model_validate(fallback.model_dump(mode="python"))
+
+
 class BudgetReservationRecord(BaseModel):
     """One reserved budget amount for a model step."""
 
@@ -1173,9 +1304,14 @@ class BudgetReservationRecord(BaseModel):
     currency: str
     session_id: str
     agent_name: str
+    environment_name: str | None = None
     provider_name: str
     model: str
     billing_identity: BillingIdentity | None = None
+    settlement_event_payload: dict[str, Any] = Field(default_factory=dict)
+    settlement_fallback: BudgetSettlementFallback = Field(default_factory=BudgetSettlementFallback)
+    dispatch_id: str | None = None
+    dispatched_at: datetime | None = None
     reserved_amount: Decimal = Field(ge=0)
     actual_amount: Decimal | None = Field(default=None, ge=0)
     status: BudgetReservationStatus = "active"
@@ -1199,12 +1335,27 @@ class BudgetReservationRecord(BaseModel):
             return BudgetLimitIdentity(budget_limit_id=value).budget_limit_id
         return value
 
-    @field_validator("key", "reason")
+    @field_validator("key", "reason", "environment_name", "dispatch_id")
     @classmethod
     def validate_optional_strings(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("settlement_event_payload", mode="before")
+    @classmethod
+    def copy_settlement_event_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_durable_json_object(value, "settlement_event_payload")
+
+    @field_validator("settlement_fallback", mode="before")
+    @classmethod
+    def copy_settlement_fallback(
+        cls,
+        value: BudgetSettlementFallback | Mapping[str, Any],
+    ) -> BudgetSettlementFallback:
+        if type(value) is BudgetSettlementFallback:
+            return copy_budget_settlement_fallback(value)
+        return BudgetSettlementFallback.model_validate(value)
 
     @field_validator("window", mode="before")
     @classmethod
@@ -1225,9 +1376,11 @@ class BudgetReservationRecord(BaseModel):
             raise ValueError(f"{info.field_name} must be finite.")
         return value
 
-    @field_validator("created_at", "updated_at")
+    @field_validator("created_at", "updated_at", "dispatched_at")
     @classmethod
-    def validate_record_timestamp(cls, value: datetime, info) -> datetime:
+    def validate_record_timestamp(cls, value: datetime | None, info) -> datetime | None:
+        if value is None:
+            return None
         return _utc_datetime(value, info.field_name)
 
     @model_validator(mode="after")
@@ -1236,6 +1389,8 @@ class BudgetReservationRecord(BaseModel):
             model_step_id=self.model_step_id,
             model_attempt_id=self.model_attempt_id,
         )
+        if (self.dispatch_id is None) != (self.dispatched_at is None):
+            raise ValueError("dispatch_id and dispatched_at must be set together.")
         return self
 
 
@@ -1306,12 +1461,44 @@ class BudgetReservationResult(BaseModel):
         return self
 
 
+class BudgetReconciliationPricing(BaseModel):
+    """Bounded pricing provenance committed with one budget settlement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    provider_name: str
+    model: str
+    match: Literal["exact", "prefix", "resource_mapping"]
+    provenance: Provenance
+    effective_from: date | None = None
+    effective_through: date | None = None
+    tier_max_input_tokens: StrictInt | None = Field(default=None, gt=0, le=MAX_DURABLE_JSON_INTEGER)
+    billing_identity: BillingIdentity | None = Field(default=None, exclude=True)
+
+    @field_validator("provider_name", "model")
+    @classmethod
+    def validate_strings(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_effective_window(self) -> BudgetReconciliationPricing:
+        if (
+            self.effective_from is not None
+            and self.effective_through is not None
+            and self.effective_from > self.effective_through
+        ):
+            raise ValueError("reconciliation pricing effective window is reversed")
+        return self
+
+
 class BudgetReconciliation(BaseModel):
     """Result of reconciling a reservation after the model step completes."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     reservation_id: str
+    settlement_id: str
+    settlement_kind: BudgetSettlementKind
     budget_limit_id: str
     model_step_id: str
     model_attempt_id: str
@@ -1320,6 +1507,7 @@ class BudgetReconciliation(BaseModel):
     actual_amount: Decimal | None = Field(default=None, ge=0)
     released_amount: Decimal = Field(ge=0)
     reason: str | None = None
+    settled_at: datetime
     billing_identity: BillingIdentity | None = None
     pricing_provider_name: str | None = None
     pricing_model: str | None = None
@@ -1331,7 +1519,7 @@ class BudgetReconciliation(BaseModel):
         default=None, gt=0, le=MAX_DURABLE_JSON_INTEGER
     )
 
-    @field_validator("reservation_id")
+    @field_validator("reservation_id", "settlement_id")
     @classmethod
     def validate_reconciliation_id(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
@@ -1354,6 +1542,29 @@ class BudgetReconciliation(BaseModel):
             model_step_id=self.model_step_id,
             model_attempt_id=self.model_attempt_id,
         )
+        if self.settlement_id != budget_settlement_id(self.reservation_id):
+            raise ValueError("reconciliation settlement identity is not canonical")
+        if self.status == "released":
+            if (
+                self.settlement_kind != "released"
+                or self.actual_amount is not None
+                or self.released_amount != self.reserved_amount
+            ):
+                raise ValueError("released reconciliation has contradictory accounting")
+        elif self.status == "reconciled":
+            expected_released = (
+                Decimal("0")
+                if self.actual_amount is None or self.actual_amount >= self.reserved_amount
+                else self.reserved_amount - self.actual_amount
+            )
+            if (
+                self.settlement_kind == "released"
+                or self.actual_amount is None
+                or self.released_amount != expected_released
+            ):
+                raise ValueError("charged reconciliation has contradictory accounting")
+        else:
+            raise ValueError("budget reconciliation must be terminal")
         identity = (
             self.pricing_provider_name,
             self.pricing_model,
@@ -1378,6 +1589,11 @@ class BudgetReconciliation(BaseModel):
             raise ValueError("reconciliation pricing effective window is reversed")
         return self
 
+    @field_validator("settled_at")
+    @classmethod
+    def validate_settled_at(cls, value: datetime) -> datetime:
+        return _utc_datetime(value, "settled_at")
+
     @field_validator("reserved_amount", "actual_amount", "released_amount")
     @classmethod
     def validate_reconciliation_decimal(cls, value: Decimal | None, info) -> Decimal | None:
@@ -1386,6 +1602,78 @@ class BudgetReconciliation(BaseModel):
         if not value.is_finite():
             raise ValueError(f"{info.field_name} must be finite.")
         return value
+
+
+class BudgetSettlementRecord(BaseModel):
+    """One ledger-committed terminal transition and its durable audit event."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    settlement_id: str
+    reservation_id: str
+    settlement_kind: BudgetSettlementKind
+    session_id: str
+    agent_name: str
+    environment_name: str | None = None
+    reconciliation: BudgetReconciliation
+    event: Event
+    event_published: StrictBool = False
+
+    @field_validator("settlement_id", "reservation_id", "session_id", "agent_name")
+    @classmethod
+    def validate_required_text(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("environment_name")
+    @classmethod
+    def validate_optional_text(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_event_binding(self) -> BudgetSettlementRecord:
+        reconciliation = self.reconciliation
+        expected_type = (
+            EventType.BUDGET_RESERVATION_RELEASED
+            if self.settlement_kind == "released"
+            else EventType.BUDGET_RECONCILED
+        )
+        if (
+            self.settlement_id != reconciliation.settlement_id
+            or self.reservation_id != reconciliation.reservation_id
+            or self.settlement_kind != reconciliation.settlement_kind
+            or self.event.id != budget_settlement_event_id(self.settlement_id)
+            or self.event.type != expected_type
+            or self.event.session_id != self.session_id
+            or self.event.agent_name != self.agent_name
+            or self.event.environment_name != self.environment_name
+            or self.event.timestamp != reconciliation.settled_at
+        ):
+            raise ValueError("Budget settlement audit event has conflicting identity.")
+        expected_payload = budget_reconciliation_payload(reconciliation)
+        if any(self.event.payload.get(key) != value for key, value in expected_payload.items()):
+            raise ValueError("Budget settlement audit event conflicts with committed accounting.")
+        return self
+
+
+class BudgetSettlementCursor(BaseModel):
+    """Stable keyset position in the ledger settlement outbox."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    settled_at: datetime
+    settlement_id: str
+
+    @field_validator("settled_at")
+    @classmethod
+    def validate_settled_at(cls, value: datetime) -> datetime:
+        return _utc_datetime(value, "settled_at")
+
+    @field_validator("settlement_id")
+    @classmethod
+    def validate_settlement_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "settlement_id")
 
 
 class BudgetStore(ABC):
@@ -1465,22 +1753,53 @@ class BudgetLedger(ABC):
         raise NotImplementedError("This budget ledger does not use expiring reservations.")
 
     @abstractmethod
+    async def mark_dispatched(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        dispatched_at: datetime | None = None,
+    ) -> tuple[BudgetReservationRecord, ...]:
+        """Atomically fence one attempt's reservations before provider code.
+
+        An identical retry is idempotent. Once this transition commits, TTL
+        cleanup must retain every reservation because provider dispatch is no
+        longer known not to have occurred. Implementations must update the
+        complete set or none of it.
+        """
+
+    @abstractmethod
     async def reserve(
         self,
         *,
+        reservation_id: str | None = None,
         limit: BudgetLimit,
         session_id: str,
         agent_name: str,
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        environment_name: str | None = None,
+        settlement_event_payload: dict[str, Any] | None = None,
+        settlement_fallback: BudgetSettlementFallback | None = None,
+        requested_amount: Decimal | None = None,
         billing_identity: BillingIdentity | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         """Reserve budget for one provider dispatch if capacity remains.
 
+        ``reservation_id`` lets the runtime validate durable authority before
+        asking the ledger to mutate. Direct ledger callers may omit it and let
+        the ledger allocate one.
         ``effective_at`` fixes the pricing instant selected by the runtime.
         Direct ledger callers may omit it to use the ledger's current clock.
+        ``settlement_fallback`` binds a publication-safe conservative outcome
+        before provider dispatch. Direct callers may omit it when no workload
+        secret publication policy applies.
+        ``requested_amount`` lets the runtime supply the amount priced from
+        transient request evidence before ``billing_identity`` is normalized
+        for durable storage. Direct callers normally omit it and let the ledger
+        price from ``billing_identity``.
         Implementations must reject a generated ``reservation_id`` that is
         already owned by another record before mutating the existing record.
         """
@@ -1491,9 +1810,11 @@ class BudgetLedger(ABC):
         *,
         reservation_id: str,
         actual_amount: Decimal,
+        settlement_kind: Literal["completed", "conservative"] = "completed",
         reason: str | None = None,
         occurred_at: datetime | None = None,
         billing_identity: BillingIdentity | None = None,
+        pricing: BudgetReconciliationPricing | None = None,
     ) -> BudgetReconciliation:
         """Replace a reservation with the charged amount.
 
@@ -1508,12 +1829,43 @@ class BudgetLedger(ABC):
         *,
         reservation_id: str,
         reason: str,
+        occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
         """Release an active reservation without charging it.
 
         Implementations must return the existing result for an identical retry
         and reject a conflicting terminal outcome for the same reservation.
+        A reservation with a committed dispatch fence is not releasable.
         """
+
+    @abstractmethod
+    async def load_settlement(self, settlement_id: str) -> BudgetSettlementRecord | None:
+        """Load one exact durable terminal transition by stable identity."""
+
+    @abstractmethod
+    async def list_pending_settlements(
+        self,
+        *,
+        session_id: str | None = None,
+        after: BudgetSettlementCursor | None = None,
+        limit: int = 100,
+    ) -> list[BudgetSettlementRecord]:
+        """Return a bounded deterministic page of unpublished audit events.
+
+        Omitting ``session_id`` returns a ledger-wide page so a reservation in
+        one session can publish releases created while another session reaps
+        its expired capacity. ``after`` advances through unavailable publication
+        domains without acknowledging or starving their pending records.
+        """
+
+    @abstractmethod
+    async def mark_settlement_event_published(
+        self,
+        *,
+        settlement_id: str,
+        event_id: str,
+    ) -> BudgetSettlementRecord:
+        """Acknowledge that the settlement's exact audit event is durable."""
 
 
 class InMemoryBudgetStore(BudgetStore):
@@ -1629,6 +1981,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         reservation_ttl_seconds: int | None = DEFAULT_RESERVATION_TTL_SECONDS,
     ) -> None:
         self._records: dict[str, BudgetReservationRecord] = {}
+        self._settlements: dict[str, BudgetSettlementRecord] = {}
         self._lock = asyncio.Lock()
         self._clock = _clock_or_utc_now(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
@@ -1640,15 +1993,25 @@ class InMemoryBudgetLedger(BudgetLedger):
     async def reserve(
         self,
         *,
+        reservation_id: str | None = None,
         limit: BudgetLimit,
         session_id: str,
         agent_name: str,
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        environment_name: str | None = None,
+        settlement_event_payload: dict[str, Any] | None = None,
+        settlement_fallback: BudgetSettlementFallback | None = None,
+        requested_amount: Decimal | None = None,
         billing_identity: BillingIdentity | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
+        reservation_id = (
+            new_budget_reservation_id()
+            if reservation_id is None
+            else require_clean_nonblank(reservation_id, "reservation_id")
+        )
         limit = _ensure_effective_budget_limit(
             limit,
             identity_namespace="app_policy",
@@ -1657,18 +2020,41 @@ class InMemoryBudgetLedger(BudgetLedger):
         agent_name = require_clean_nonblank(agent_name, "agent_name")
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
+        if environment_name is not None:
+            environment_name = require_clean_nonblank(environment_name, "environment_name")
+        durable_billing_identity = copy_billing_identity(billing_identity)
+        durable_settlement_payload = copy_durable_json_object(
+            settlement_event_payload or {},
+            "settlement_event_payload",
+        )
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
         async with self._lock:
             now = self._clock()
+            durable_settlement_fallback = (
+                BudgetSettlementFallback(
+                    settled_at=now,
+                    expiration_reason=(
+                        None
+                        if self._reservation_ttl_seconds is None
+                        else _expired_reservation_reason(self._reservation_ttl_seconds)
+                    ),
+                )
+                if settlement_fallback is None
+                else copy_budget_settlement_fallback(settlement_fallback)
+            )
             pricing_effective_at = (
                 now if effective_at is None else _utc_datetime(effective_at, "effective_at")
             )
-            request = _budget_reservation_amount(
-                limit=limit,
-                provider_name=provider_name,
-                model=model,
-                effective_at=pricing_effective_at,
-                billing_identity=billing_identity,
+            request = (
+                _budget_reservation_amount(
+                    limit=limit,
+                    provider_name=provider_name,
+                    model=model,
+                    effective_at=pricing_effective_at,
+                    billing_identity=durable_billing_identity,
+                )
+                if requested_amount is None
+                else _validate_amount(requested_amount, "requested_amount")
             )
             self._reap_expired_unlocked(now, limit=limit)
             current = _ledger_used_amount(
@@ -1690,6 +2076,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                     ),
                 )
             record = BudgetReservationRecord(
+                reservation_id=reservation_id,
                 budget_limit_id=limit.budget_limit_id,
                 model_step_id=model_attempt_identity.model_step_id,
                 model_attempt_id=model_attempt_identity.model_attempt_id,
@@ -1699,9 +2086,12 @@ class InMemoryBudgetLedger(BudgetLedger):
                 currency=limit.currency,
                 session_id=session_id,
                 agent_name=agent_name,
+                environment_name=environment_name,
                 provider_name=provider_name,
                 model=model,
-                billing_identity=billing_identity,
+                billing_identity=durable_billing_identity,
+                settlement_event_payload=durable_settlement_payload,
+                settlement_fallback=durable_settlement_fallback,
                 reserved_amount=request,
                 created_at=now,
                 updated_at=now,
@@ -1710,7 +2100,7 @@ class InMemoryBudgetLedger(BudgetLedger):
                 raise BudgetReservationIdentityConflict(
                     "Budget ledger reused a reservation identity."
                 )
-            self._records[record.reservation_id] = record
+            self._records[record.reservation_id] = record.model_copy(deep=True)
             return _reservation_result(
                 limit=limit,
                 model_attempt_identity=model_attempt_identity,
@@ -1722,6 +2112,48 @@ class InMemoryBudgetLedger(BudgetLedger):
                 ),
                 record=record,
             )
+
+    async def mark_dispatched(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        dispatched_at: datetime | None = None,
+    ) -> tuple[BudgetReservationRecord, ...]:
+        reservation_ids = _validate_reservation_id_batch(reservation_ids)
+        dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        marked_at = (
+            _utc_datetime(dispatched_at, "dispatched_at")
+            if dispatched_at is not None
+            else self._clock()
+        )
+        async with self._lock:
+            records: list[BudgetReservationRecord] = []
+            for reservation_id in reservation_ids:
+                record = self._records.get(reservation_id)
+                if record is None:
+                    raise KeyError(f"Budget reservation not found: {reservation_id}")
+                if record.dispatch_id is not None and record.dispatch_id != dispatch_id:
+                    raise ValueError(
+                        f"Budget reservation has a conflicting dispatch: {reservation_id}"
+                    )
+                if record.dispatch_id is None and record.status != "active":
+                    raise ValueError(f"Budget reservation is not active: {reservation_id}")
+                records.append(record)
+            dispatched_records = tuple(
+                (
+                    record
+                    if record.dispatch_id is not None
+                    else record.model_copy(
+                        update={"dispatch_id": dispatch_id, "dispatched_at": marked_at},
+                        deep=True,
+                    )
+                )
+                for record in records
+            )
+            for record in dispatched_records:
+                self._records[record.reservation_id] = record
+            return tuple(record.model_copy(deep=True) for record in dispatched_records)
 
     async def heartbeat(self, *, reservation_id: str) -> bool:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
@@ -1747,9 +2179,11 @@ class InMemoryBudgetLedger(BudgetLedger):
         *,
         reservation_id: str,
         actual_amount: Decimal,
+        settlement_kind: Literal["completed", "conservative"] = "completed",
         reason: str | None = None,
         occurred_at: datetime | None = None,
         billing_identity: BillingIdentity | None = None,
+        pricing: BudgetReconciliationPricing | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
@@ -1763,18 +2197,28 @@ class InMemoryBudgetLedger(BudgetLedger):
                 updated_at=reconciled_at,
                 billing_identity=billing_identity,
             )
+            reconciliation = _reconciliation_from_record(
+                reconciled,
+                settlement_kind=settlement_kind,
+                pricing=pricing,
+            )
+            settlement = _budget_settlement_record(record, reconciliation)
+            self._store_settlement_unlocked(settlement)
             self._records[reservation_id] = reconciled
-            return _reconciliation_from_record(reconciled)
+            return reconciliation.model_copy(deep=True)
 
     async def release(
         self,
         *,
         reservation_id: str,
         reason: str,
+        occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         reason = require_clean_nonblank(reason, "reason")
-        released_at = self._clock()
+        released_at = (
+            _utc_datetime(occurred_at, "occurred_at") if occurred_at is not None else self._clock()
+        )
         async with self._lock:
             record = self._releasable_record(reservation_id)
             released = _released_record(
@@ -1782,8 +2226,86 @@ class InMemoryBudgetLedger(BudgetLedger):
                 reason=reason,
                 updated_at=released_at,
             )
+            reconciliation = _reconciliation_from_record(
+                released,
+                settlement_kind="released",
+            )
+            settlement = _budget_settlement_record(record, reconciliation)
+            self._store_settlement_unlocked(settlement)
             self._records[reservation_id] = released
-            return _reconciliation_from_record(released)
+            return reconciliation.model_copy(deep=True)
+
+    async def load_settlement(self, settlement_id: str) -> BudgetSettlementRecord | None:
+        settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
+        async with self._lock:
+            settlement = self._settlements.get(settlement_id)
+            return None if settlement is None else settlement.model_copy(deep=True)
+
+    async def list_pending_settlements(
+        self,
+        *,
+        session_id: str | None = None,
+        after: BudgetSettlementCursor | None = None,
+        limit: int = 100,
+    ) -> list[BudgetSettlementRecord]:
+        if session_id is not None:
+            session_id = require_clean_nonblank(session_id, "session_id")
+        after = _copy_budget_settlement_cursor(after)
+        limit = _validate_settlement_page_limit(limit)
+        async with self._lock:
+            settlements = sorted(
+                (
+                    settlement
+                    for settlement in self._settlements.values()
+                    if not settlement.event_published
+                    and (session_id is None or settlement.session_id == session_id)
+                    and (
+                        after is None
+                        or (
+                            settlement.reconciliation.settled_at,
+                            settlement.settlement_id,
+                        )
+                        > (after.settled_at, after.settlement_id)
+                    )
+                ),
+                key=lambda settlement: (
+                    settlement.reconciliation.settled_at,
+                    settlement.settlement_id,
+                ),
+            )
+            return [item.model_copy(deep=True) for item in settlements[:limit]]
+
+    async def mark_settlement_event_published(
+        self,
+        *,
+        settlement_id: str,
+        event_id: str,
+    ) -> BudgetSettlementRecord:
+        settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
+        event_id = require_clean_nonblank(event_id, "event_id")
+        async with self._lock:
+            settlement = self._settlements.get(settlement_id)
+            if settlement is None:
+                raise KeyError(f"Budget settlement not found: {settlement_id}")
+            if settlement.event.id != event_id:
+                raise ValueError(
+                    "Budget settlement event acknowledgement has conflicting identity."
+                )
+            if not settlement.event_published:
+                settlement = settlement.model_copy(update={"event_published": True}, deep=True)
+                self._settlements[settlement_id] = settlement
+            return settlement.model_copy(deep=True)
+
+    def _store_settlement_unlocked(self, settlement: BudgetSettlementRecord) -> None:
+        existing = self._settlements.get(settlement.settlement_id)
+        if existing is None:
+            self._settlements[settlement.settlement_id] = settlement.model_copy(deep=True)
+            return
+        expected = existing.model_copy(update={"event_published": False}, deep=True)
+        if expected != settlement:
+            raise ValueError(
+                f"Budget reservation has a conflicting settlement: {settlement.reservation_id}"
+            )
 
     def _reap_expired_unlocked(
         self,
@@ -1796,6 +2318,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         for reservation_id, record in self._records.items():
             if (
                 record.status != "active"
+                or record.dispatch_id is not None
                 or not _reservation_matches_limit(record, limit)
                 or not _reservation_is_expired(
                     record,
@@ -1804,14 +2327,20 @@ class InMemoryBudgetLedger(BudgetLedger):
                 )
             ):
                 continue
-            self._records[reservation_id] = record.model_copy(
-                update={
-                    "status": "released",
-                    "reason": _expired_reservation_reason(self._reservation_ttl_seconds),
-                    "updated_at": now,
-                },
-                deep=True,
+            released = _released_record(
+                record,
+                reason=(
+                    record.settlement_fallback.expiration_reason
+                    or _expired_reservation_reason(self._reservation_ttl_seconds)
+                ),
+                updated_at=record.settlement_fallback.settled_at,
             )
+            reconciliation = _reconciliation_from_record(
+                released,
+                settlement_kind="released",
+            )
+            self._store_settlement_unlocked(_budget_settlement_record(record, reconciliation))
+            self._records[reservation_id] = released
 
     def _active_record(self, reservation_id: str) -> BudgetReservationRecord:
         record = self._records.get(reservation_id)
@@ -1825,6 +2354,8 @@ class InMemoryBudgetLedger(BudgetLedger):
         record = self._records.get(reservation_id)
         if record is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
+        if record.status == "active" and record.dispatch_id is not None:
+            raise ValueError(f"Dispatched budget reservation cannot be released: {reservation_id}")
         if record.status in {"active", "released"}:
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
@@ -1834,11 +2365,6 @@ class InMemoryBudgetLedger(BudgetLedger):
         if record is None:
             raise KeyError(f"Budget reservation not found: {reservation_id}")
         if record.status in {"active", "reconciled"}:
-            return record
-        if record.status == "released" and _is_expired_reservation_reason(record.reason):
-            # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
-            # Reconcile it anyway so the actual spend is recorded rather than crashing the
-            # billed run and silently undercounting the shared budget window.
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
 
@@ -2467,6 +2993,8 @@ def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[
         }
     return {
         "reservation_id": reconciliation.reservation_id,
+        "settlement_id": reconciliation.settlement_id,
+        "settlement_kind": reconciliation.settlement_kind,
         "budget_limit_id": reconciliation.budget_limit_id,
         "model_step_id": reconciliation.model_step_id,
         "model_attempt_id": reconciliation.model_attempt_id,
@@ -2477,6 +3005,10 @@ def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[
         ),
         "released_amount": str(reconciliation.released_amount),
         "reason": reconciliation.reason,
+        # This is runtime-owned accounting authority, not descriptive provider
+        # text. Keep it numeric so value-based workload redaction cannot turn a
+        # valid completion timestamp into an invalid durable reconciliation.
+        "settled_at_unix_us": _budget_settlement_timestamp(reconciliation.settled_at),
         "pricing": pricing,
         "billing_identity": (
             None
@@ -2484,6 +3016,170 @@ def budget_reconciliation_payload(reconciliation: BudgetReconciliation) -> dict[
             else reconciliation.billing_identity.model_dump(mode="json")
         ),
     }
+
+
+def budget_reconciliation_from_payload(payload: object) -> BudgetReconciliation:
+    """Parse the exact bounded payload emitted for one committed settlement."""
+
+    if type(payload) is not dict:
+        raise ValueError("Budget settlement evidence must be an object.")
+    payload = cast("dict[str, Any]", payload)
+    expected_keys = {
+        "reservation_id",
+        "settlement_id",
+        "settlement_kind",
+        "budget_limit_id",
+        "model_step_id",
+        "model_attempt_id",
+        "status",
+        "reserved_amount",
+        "actual_amount",
+        "released_amount",
+        "reason",
+        "settled_at_unix_us",
+        "pricing",
+        "billing_identity",
+    }
+    if set(payload) != expected_keys:
+        raise ValueError("Budget settlement evidence has unexpected fields.")
+    pricing_value = payload["pricing"]
+    pricing = (
+        None if pricing_value is None else BudgetReconciliationPricing.model_validate(pricing_value)
+    )
+    billing_value = payload["billing_identity"]
+    billing_identity = (
+        None if billing_value is None else BillingIdentity.model_validate(billing_value)
+    )
+    if pricing is not None:
+        pricing = pricing.model_copy(
+            update={"billing_identity": billing_identity},
+            deep=True,
+        )
+    values: dict[str, Any] = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"pricing", "billing_identity", "settled_at_unix_us"}
+    }
+    values["settled_at"] = _budget_settlement_datetime(payload["settled_at_unix_us"])
+    values["billing_identity"] = billing_identity
+    if pricing is not None:
+        values.update(
+            {
+                "pricing_provider_name": pricing.provider_name,
+                "pricing_model": pricing.model,
+                "pricing_match": pricing.match,
+                "pricing_provenance": pricing.provenance,
+                "pricing_effective_from": pricing.effective_from,
+                "pricing_effective_through": pricing.effective_through,
+                "pricing_tier_max_input_tokens": pricing.tier_max_input_tokens,
+            }
+        )
+    return BudgetReconciliation.model_validate(values)
+
+
+def model_completion_budget_settlements(
+    event: Event,
+    *,
+    reservation_ids: Iterable[str],
+) -> tuple[BudgetReconciliation, ...]:
+    """Parse and bind one model completion's exact reservation settlements."""
+
+    if type(event) is not Event or event.type != EventType.MODEL_COMPLETED:
+        raise ValueError("Budget settlement recovery requires one model.completed event.")
+    expected_ids = tuple(
+        require_clean_nonblank(reservation_id, "reservation_id")
+        for reservation_id in reservation_ids
+    )
+    if len(set(expected_ids)) != len(expected_ids):
+        raise ValueError("Model completion stage contains duplicate reservation ids.")
+    raw_settlements = event.payload.get(MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY)
+    if type(raw_settlements) is not list:
+        raise ValueError("Model completion has no durable budget settlement evidence.")
+    if len(raw_settlements) != len(expected_ids):
+        raise ValueError("Model completion budget settlement count conflicts with its stage.")
+    parsed = tuple(budget_reconciliation_from_payload(value) for value in raw_settlements)
+    parsed_ids = tuple(item.reservation_id for item in parsed)
+    if (
+        len(set(parsed_ids)) != len(parsed_ids)
+        or set(parsed_ids) != set(expected_ids)
+        or any(item.status != "reconciled" for item in parsed)
+        or any(item.settlement_kind == "released" for item in parsed)
+        or any(item.actual_amount is None for item in parsed)
+        or any(
+            item.model_step_id != event.payload.get("model_step_id")
+            or item.model_attempt_id != event.payload.get("model_attempt_id")
+            for item in parsed
+        )
+    ):
+        raise ValueError("Model completion budget settlement identity is contradictory.")
+    by_id = {item.reservation_id: item for item in parsed}
+    return tuple(by_id[reservation_id] for reservation_id in expected_ids)
+
+
+def budget_settlement_id(reservation_id: str) -> str:
+    """Return the stable terminal-settlement identity for one reservation."""
+
+    reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
+    digest = sha256(
+        canonical_durable_json_bytes(
+            {
+                "kind": "budget-settlement",
+                "reservation_id": reservation_id,
+                "schema_version": 1,
+            },
+            "budget_settlement_identity",
+        )
+    ).hexdigest()
+    return f"bset_{digest}"
+
+
+def new_budget_reservation_id() -> str:
+    """Allocate one opaque runtime-owned reservation authority."""
+
+    return f"bres_{uuid4().hex}"
+
+
+def budget_settlement_event_id(settlement_id: str) -> str:
+    """Return the stable session-event identity for one settlement outbox row."""
+
+    settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
+    digest = sha256(
+        canonical_durable_json_bytes(
+            {
+                "kind": "budget-settlement-event",
+                "settlement_id": settlement_id,
+                "schema_version": 1,
+            },
+            "budget_settlement_event_identity",
+        )
+    ).hexdigest()
+    return f"budget-settlement:{digest}"
+
+
+def budget_reconciliation_pricing(
+    line_item: CostLineItem,
+) -> BudgetReconciliationPricing:
+    """Project a priced cost line into bounded durable settlement provenance."""
+
+    if type(line_item) is not CostLineItem or not line_item.priced:
+        raise TypeError("line_item must be a priced CostLineItem.")
+    if (
+        line_item.pricing_provider_name is None
+        or line_item.pricing_model is None
+        or line_item.pricing_match is None
+        or line_item.pricing_provenance is None
+    ):
+        raise ValueError("Priced line item has incomplete pricing provenance.")
+    return BudgetReconciliationPricing(
+        provider_name=line_item.pricing_provider_name,
+        model=line_item.pricing_model,
+        match=line_item.pricing_match,
+        provenance=line_item.pricing_provenance,
+        effective_from=line_item.pricing_effective_from,
+        effective_through=line_item.pricing_effective_through,
+        tier_max_input_tokens=line_item.pricing_tier_max_input_tokens,
+        billing_identity=line_item.billing_identity,
+    )
 
 
 class _BudgetActualCost(NamedTuple):
@@ -2517,21 +3213,39 @@ def budget_reconciliation_with_pricing(
         raise TypeError("reconciliation must be a BudgetReconciliation.")
     if type(line_item) is not CostLineItem or not line_item.priced:
         raise TypeError("line_item must be a priced CostLineItem.")
+    pricing = budget_reconciliation_pricing(line_item)
+    return budget_reconciliation_with_pricing_evidence(
+        reconciliation,
+        pricing,
+        billing_identity=line_item.billing_identity,
+    )
+
+
+def budget_reconciliation_with_pricing_evidence(
+    reconciliation: BudgetReconciliation,
+    pricing: BudgetReconciliationPricing,
+    *,
+    billing_identity: BillingIdentity | None = None,
+) -> BudgetReconciliation:
+    """Attach already-validated durable pricing evidence to a settlement."""
+
+    if type(reconciliation) is not BudgetReconciliation:
+        raise TypeError("reconciliation must be a BudgetReconciliation.")
+    if type(pricing) is not BudgetReconciliationPricing:
+        raise TypeError("pricing must be a BudgetReconciliationPricing.")
     return BudgetReconciliation.model_validate(
         {
             **reconciliation.model_dump(mode="python"),
-            "pricing_provider_name": line_item.pricing_provider_name,
-            "pricing_model": line_item.pricing_model,
-            "pricing_match": line_item.pricing_match,
-            "pricing_provenance": (
-                None
-                if line_item.pricing_provenance is None
-                else line_item.pricing_provenance.model_copy(deep=True)
+            "pricing_provider_name": pricing.provider_name,
+            "pricing_model": pricing.model,
+            "pricing_match": pricing.match,
+            "pricing_provenance": pricing.provenance.model_copy(deep=True),
+            "pricing_effective_from": pricing.effective_from,
+            "pricing_effective_through": pricing.effective_through,
+            "pricing_tier_max_input_tokens": pricing.tier_max_input_tokens,
+            "billing_identity": (
+                billing_identity or pricing.billing_identity or reconciliation.billing_identity
             ),
-            "pricing_effective_from": line_item.pricing_effective_from,
-            "pricing_effective_through": line_item.pricing_effective_through,
-            "pricing_tier_max_input_tokens": line_item.pricing_tier_max_input_tokens,
-            "billing_identity": line_item.billing_identity,
         }
     )
 
@@ -2677,6 +3391,31 @@ def _validate_reservation_ttl(value: int | None) -> int | None:
     return value
 
 
+def _validate_reservation_id_batch(values: tuple[str, ...]) -> tuple[str, ...]:
+    if type(values) is not tuple:
+        raise TypeError("reservation_ids must be a tuple.")
+    reservation_ids = tuple(require_clean_nonblank(value, "reservation_id") for value in values)
+    if len(set(reservation_ids)) != len(reservation_ids):
+        raise ValueError("reservation_ids must be distinct.")
+    return reservation_ids
+
+
+def _validate_settlement_page_limit(value: int) -> int:
+    if type(value) is not int or not 1 <= value <= 1000:
+        raise ValueError("limit must be between 1 and 1000.")
+    return value
+
+
+def _copy_budget_settlement_cursor(
+    value: BudgetSettlementCursor | None,
+) -> BudgetSettlementCursor | None:
+    if value is None:
+        return None
+    if type(value) is not BudgetSettlementCursor:
+        raise TypeError("after must be a BudgetSettlementCursor.")
+    return BudgetSettlementCursor.model_validate(value.model_dump(mode="python"))
+
+
 def _reservation_is_expired(
     record: BudgetReservationRecord,
     *,
@@ -2749,9 +3488,7 @@ def _reconciled_record(
         raise ValueError(
             f"Budget reservation has a conflicting reconciliation: {record.reservation_id}"
         )
-    if record.status != "active" and not (
-        record.status == "released" and _is_expired_reservation_reason(record.reason)
-    ):
+    if record.status != "active":
         raise ValueError(f"Budget reservation is not active: {record.reservation_id}")
     reconciled_at = (
         _utc_datetime(updated_at, "updated_at") if updated_at is not None else datetime.now(UTC)
@@ -2793,15 +3530,28 @@ def _released_record(
     )
 
 
-def _reconciliation_from_record(record: BudgetReservationRecord) -> BudgetReconciliation:
+def _reconciliation_from_record(
+    record: BudgetReservationRecord,
+    *,
+    settlement_kind: BudgetSettlementKind,
+    pricing: BudgetReconciliationPricing | None = None,
+) -> BudgetReconciliation:
+    if record.status == "active":
+        raise ValueError("Cannot construct a settlement from an active reservation.")
+    if settlement_kind == "released" and record.status != "released":
+        raise ValueError("Released settlement kind requires a released reservation.")
+    if settlement_kind != "released" and record.status != "reconciled":
+        raise ValueError("Reconciliation settlement kind requires a reconciled reservation.")
     actual_amount = record.actual_amount
     released_amount = Decimal("0")
     if record.status == "released":
         released_amount = record.reserved_amount
     elif actual_amount is not None and record.reserved_amount > actual_amount:
         released_amount = record.reserved_amount - actual_amount
-    return BudgetReconciliation(
+    reconciliation = BudgetReconciliation(
         reservation_id=record.reservation_id,
+        settlement_id=budget_settlement_id(record.reservation_id),
+        settlement_kind=settlement_kind,
         budget_limit_id=record.budget_limit_id,
         model_step_id=record.model_step_id,
         model_attempt_id=record.model_attempt_id,
@@ -2810,7 +3560,102 @@ def _reconciliation_from_record(record: BudgetReservationRecord) -> BudgetReconc
         actual_amount=actual_amount,
         released_amount=released_amount,
         reason=record.reason,
+        settled_at=record.updated_at,
         billing_identity=record.billing_identity,
+    )
+    if pricing is None:
+        return reconciliation
+    return budget_reconciliation_with_pricing_evidence(reconciliation, pricing)
+
+
+def budget_reconciliation_preview(
+    record: BudgetReservationRecord,
+    *,
+    actual_amount: Decimal,
+    settlement_kind: Literal["completed", "conservative"],
+    reason: str | None,
+    occurred_at: datetime,
+    billing_identity: BillingIdentity | None = None,
+    pricing: BudgetReconciliationPricing | None = None,
+) -> BudgetReconciliation:
+    """Construct the exact reconciliation that a ledger commit must persist."""
+
+    if type(record) is not BudgetReservationRecord:
+        raise TypeError("record must be a BudgetReservationRecord.")
+    reconciled = _reconciled_record(
+        record,
+        actual_amount=_validate_amount(actual_amount, "actual_amount"),
+        reason=reason,
+        updated_at=_utc_datetime(occurred_at, "occurred_at"),
+        billing_identity=billing_identity,
+    )
+    return _reconciliation_from_record(
+        reconciled,
+        settlement_kind=settlement_kind,
+        pricing=pricing,
+    )
+
+
+def budget_release_preview(
+    record: BudgetReservationRecord,
+    *,
+    reason: str,
+    occurred_at: datetime,
+) -> BudgetReconciliation:
+    """Construct the exact release that a ledger commit must persist."""
+
+    if type(record) is not BudgetReservationRecord:
+        raise TypeError("record must be a BudgetReservationRecord.")
+    released = _released_record(
+        record,
+        reason=require_clean_nonblank(reason, "reason"),
+        updated_at=_utc_datetime(occurred_at, "occurred_at"),
+    )
+    return _reconciliation_from_record(
+        released,
+        settlement_kind="released",
+    )
+
+
+def _budget_settlement_record(
+    reservation: BudgetReservationRecord,
+    reconciliation: BudgetReconciliation,
+    *,
+    event_published: bool = False,
+) -> BudgetSettlementRecord:
+    if type(reservation) is not BudgetReservationRecord:
+        raise TypeError("reservation must be a BudgetReservationRecord.")
+    if type(reconciliation) is not BudgetReconciliation:
+        raise TypeError("reconciliation must be a BudgetReconciliation.")
+    if reservation.reservation_id != reconciliation.reservation_id:
+        raise ValueError("Budget settlement belongs to a different reservation.")
+    payload = {
+        **reservation.settlement_event_payload,
+        **budget_reconciliation_payload(reconciliation),
+    }
+    event = Event(
+        type=(
+            EventType.BUDGET_RESERVATION_RELEASED
+            if reconciliation.settlement_kind == "released"
+            else EventType.BUDGET_RECONCILED
+        ),
+        id=budget_settlement_event_id(reconciliation.settlement_id),
+        timestamp=reconciliation.settled_at,
+        session_id=reservation.session_id,
+        agent_name=reservation.agent_name,
+        environment_name=reservation.environment_name,
+        payload=payload,
+    )
+    return BudgetSettlementRecord(
+        settlement_id=reconciliation.settlement_id,
+        reservation_id=reservation.reservation_id,
+        settlement_kind=reconciliation.settlement_kind,
+        session_id=reservation.session_id,
+        agent_name=reservation.agent_name,
+        environment_name=reservation.environment_name,
+        reconciliation=reconciliation,
+        event=event,
+        event_published=event_published,
     )
 
 
@@ -2821,6 +3666,30 @@ def _reconciled_billing_identity(
     if completed is None:
         return requested
     return completed_billing_identity(requested, completed)
+
+
+def _budget_settlement_timestamp(value: datetime) -> int:
+    """Encode one UTC accounting instant as exact portable Unix microseconds."""
+
+    normalized = _utc_datetime(value, "settled_at")
+    delta = normalized - _UNIX_EPOCH
+    timestamp = (
+        delta.days * 86_400 + delta.seconds
+    ) * _MICROSECONDS_PER_SECOND + delta.microseconds
+    if not MIN_DURABLE_JSON_INTEGER <= timestamp <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("settled_at exceeds the portable timestamp range.")
+    return timestamp
+
+
+def _budget_settlement_datetime(value: object) -> datetime:
+    """Decode exact portable Unix microseconds without float conversion."""
+
+    if type(value) is not int or not MIN_DURABLE_JSON_INTEGER <= value <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("settled_at_unix_us must be a signed 64-bit integer.")
+    try:
+        return _UNIX_EPOCH + timedelta(microseconds=value)
+    except OverflowError:
+        raise ValueError("settled_at_unix_us is outside the supported datetime range.") from None
 
 
 def _validate_amount(value: Decimal, field_name: str) -> Decimal:

@@ -96,6 +96,7 @@ from cayu.runtime.budgets import (
     SessionBudgetInspection,
     copy_request_budget_limits,
     is_budget_inspection_event,
+    model_completion_budget_settlements,
     project_budget_inspection_event,
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
@@ -4656,8 +4657,9 @@ class SessionStore(ABC):
         """Delete a session and cascade to its events, transcript, and checkpoint.
 
         Raises ``ValueError`` if the session is in-flight (``RUNNING`` or
-        ``INTERRUPTING`` — interrupt it first). Idempotent: deleting a session
-        that does not exist is a no-op.
+        ``INTERRUPTING`` — interrupt it first), or if one of its accepted budget
+        reservations has no fully delivered terminal settlement audit event.
+        Idempotent: deleting a session that does not exist is a no-op.
 
         Default raises ``NotImplementedError`` so out-of-tree stores keep working.
         """
@@ -5319,6 +5321,37 @@ class InMemorySessionStore(SessionStore):
                     "Cannot delete a session while a model-completion stage is active: "
                     f"{session_id}"
                 )
+            owned_reservation_ids = {
+                reservation_id
+                for reservation_id, ownership in self._budget_reservation_identities.items()
+                if ownership[0] == session_id
+            }
+            for reservation_id in owned_reservation_ids:
+                terminal_events = [
+                    event
+                    for event in self._events.get(session_id, [])
+                    if event.type
+                    in {
+                        EventType.BUDGET_RECONCILED,
+                        EventType.BUDGET_RESERVATION_RELEASED,
+                    }
+                    and event.payload.get("reservation_id") == reservation_id
+                ]
+                delivery = (
+                    None
+                    if len(terminal_events) != 1
+                    else self._persisted_event_side_effect_deliveries.get(
+                        (session_id, terminal_events[0].id)
+                    )
+                )
+                if (
+                    delivery is None
+                    or delivery.status is not PersistedEventSideEffectStatus.DELIVERED
+                ):
+                    raise ValueError(
+                        "Cannot delete a session while a budget settlement audit "
+                        f"event is pending: {session_id}"
+                    )
             self._remove_session_parent_index_unlocked(session)
             self._sessions.pop(session_id, None)
             self._events.pop(session_id, None)
@@ -9491,6 +9524,13 @@ def _validate_model_completion_stage_publication(
             "An assistant-turn publication must bind exactly its model.completed event."
         )
     completed_event = completed_events[0]
+    if stage.purpose == "assistant-turn" and (
+        stage.reservation_ids or "budget_settlements" in completed_event.payload
+    ):
+        model_completion_budget_settlements(
+            completed_event,
+            reservation_ids=stage.reservation_ids,
+        )
     classification = completed_event.payload.get("step_classification")
     if (
         stage.purpose == "assistant-turn"

@@ -39861,15 +39861,19 @@ def test_automatic_compaction_cancellation_waits_for_reconciliation_event(
         )
         reconciliation_publish_started = asyncio.Event()
         allow_reconciliation_publish = asyncio.Event()
-        original_emit = app._event_writer.emit
+        original_persist_exact_replay = app._event_writer.persist_exact_replay
 
         async def block_reconciliation_publish(event: Event) -> Event:
             if event.type == EventType.BUDGET_RECONCILED:
                 reconciliation_publish_started.set()
                 await allow_reconciliation_publish.wait()
-            return await original_emit(event)
+            return await original_persist_exact_replay(event)
 
-        monkeypatch.setattr(app._event_writer, "emit", block_reconciliation_publish)
+        monkeypatch.setattr(
+            app._event_writer,
+            "persist_exact_replay",
+            block_reconciliation_publish,
+        )
         task = asyncio.create_task(
             collect_events(
                 app,
@@ -40182,8 +40186,9 @@ def test_automatic_compaction_does_not_retry_after_settlement_failure() -> None:
             actual_amount: Decimal,
             reason: str | None = None,
             occurred_at: datetime | None = None,
+            **kwargs,
         ):
-            del reservation_id, actual_amount, reason, occurred_at
+            del reservation_id, actual_amount, reason, occurred_at, kwargs
             raise RuntimeError("ledger reconciliation failed")
 
     class RetryableFailureProvider(ModelProvider):
@@ -40265,6 +40270,7 @@ def test_prompt_cache_compaction_does_not_fallback_after_settlement_failure() ->
             actual_amount: Decimal,
             reason: str | None = None,
             occurred_at: datetime | None = None,
+            **kwargs,
         ):
             self.reconcile_calls += 1
             if self.reconcile_calls == 2:
@@ -40274,6 +40280,7 @@ def test_prompt_cache_compaction_does_not_fallback_after_settlement_failure() ->
                 actual_amount=actual_amount,
                 reason=reason,
                 occurred_at=occurred_at,
+                **kwargs,
             )
 
     overflow = ModelContextOverflowError(

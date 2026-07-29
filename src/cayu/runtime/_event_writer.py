@@ -187,6 +187,31 @@ class RuntimeEventWriter:
         await self._session_store.append_event(event.session_id, event)
         return event.model_copy(deep=True)
 
+    async def persist_exact_replay(self, event: Event) -> Event:
+        """Persist one stable event or verify its exact acknowledgement-loss replay."""
+
+        prepared = self.prepare(event)
+        try:
+            await self._session_store.append_event(prepared.session_id, prepared)
+        except Exception as append_error:
+            try:
+                records = await self._session_store.query_events(
+                    EventQuery(
+                        session_id=prepared.session_id,
+                        event_id=prepared.id,
+                        limit=1,
+                    )
+                )
+            except Exception as verification_error:
+                append_error.add_note(
+                    "Exact event replay verification also failed: "
+                    f"{type(verification_error).__name__}: {verification_error}"
+                )
+                raise append_error from verification_error
+            if len(records) != 1 or records[0].event != prepared:
+                raise append_error
+        return prepared.model_copy(deep=True)
+
     async def is_persisted(self, event: Event) -> bool:
         """Return whether this exact event reached the durable event handoff."""
 
@@ -460,6 +485,14 @@ class RuntimeEventWriter:
             event,
             redactor=self._secret_redactor,
         )
+
+    def prepare_exact_replay(self, event: Event) -> Event:
+        """Validate that publication policy preserves an immutable replay event."""
+
+        prepared = self.prepare(event)
+        if prepared != event:
+            raise ValueError("Exact replay event requires redaction before publication.")
+        return prepared
 
     def prepare_many(self, events: list[Event]) -> list[Event]:
         """Return publication-safe defensive copies of one event batch."""

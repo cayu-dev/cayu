@@ -565,6 +565,10 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
             nonlocal dispatch_calls
             dispatch_calls += 1
 
+        def record_model_completion(event: Event) -> Event:
+            completed_events.append(event)
+            return event
+
         events: list[Event] = []
         result = None
         async for event, step_result in app._model_step_executor.run_with_retries(
@@ -579,7 +583,7 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
             initial_model_attempt_identity=initial_model_attempt_identity,
             retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
             transcript_cursor_before_request=1,
-            record_model_completion=completed_events.append,
+            record_model_completion=record_model_completion,
             prepare_provider_dispatch=prepare_provider_dispatch,
             before_provider_dispatch=before_provider_dispatch,
             record_model_attempt_identity=observed_model_attempt_ids.append,
@@ -620,6 +624,7 @@ def test_model_step_executor_retries_synchronous_stream_construction_failure() -
     assert EventType.MODEL_RETRY in [event.type for event in events]
     assert EventType.MODEL_ATTEMPT_DISCARDED in [event.type for event in events]
     assert len(completed_events) == 1
+    assert "budget_settlements" not in completed_events[0].payload
     assert len(observed_model_attempt_ids) == 2
     first_attempt, second_attempt = observed_model_attempt_ids
     assert first_attempt.model_step_id == second_attempt.model_step_id

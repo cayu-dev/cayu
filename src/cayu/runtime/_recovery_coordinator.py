@@ -669,6 +669,11 @@ class RecoveryCoordinator:
     ) -> ModelCompletionBoundaryReconciliation:
         """Promote terminal model evidence or verify an already-published boundary."""
 
+        # Fail closed for this session's own accounting before scanning the
+        # shared ledger. The global pass may retain rows owned by another
+        # session-store publication domain without blocking this boundary.
+        await self._run_limit_controller.recover_pending_budget_settlements(session_id=session.id)
+        await self._run_limit_controller.recover_pending_budget_settlements()
         active = await self._session_store.load_active_model_completion_stage(session.id)
         state: Literal["none", "promoted", "already_promoted"] = "none"
         if active is not None:
@@ -757,6 +762,25 @@ class RecoveryCoordinator:
         ):
             raise RuntimeError(
                 "The durable model-step pointer conflicts with its completion event."
+            )
+        completed_stage = await self._session_store.load_model_completion_stage(
+            session.id,
+            pointer.stage_id,
+        )
+        if (
+            completed_stage is None
+            or completed_stage.state != "completed"
+            or completed_stage.logical_step_id != pointer.logical_step_id
+            or completed_stage.publication is None
+            or completed_stage.publication.events != (completion_event,)
+        ):
+            raise RuntimeError(
+                "The durable model-step pointer conflicts with its completion stage."
+            )
+        if completed_stage.reservation_ids:
+            await self._run_limit_controller.reconcile_model_completion_settlements(
+                completion_event,
+                reservation_ids=completed_stage.reservation_ids,
             )
 
         transcript_page = await self._session_store.query_transcript(

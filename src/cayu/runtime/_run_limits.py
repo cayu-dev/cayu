@@ -9,14 +9,21 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Generic, Literal, TypeVar
 
-from cayu._exception_groups import exception_cause
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._exception_groups import add_exception_note_safely, exception_cause
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    unexpected_child_cancellation_error,
+)
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_json_value,
+    require_clean_nonblank,
+)
 from cayu.core.billing import (
     UNRESOLVED_BILLING_IDENTITY,
     BillingIdentity,
     BillingIdentityState,
     ResolvedBillingIdentity,
-    completed_billing_identity,
     copy_billing_identity,
     resolved_billing_identity,
 )
@@ -25,19 +32,26 @@ from cayu.providers import ModelProviderError
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._session_queries import query_all_event_records
 from cayu.runtime.budgets import (
+    MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
     BudgetCheck,
     BudgetLedger,
     BudgetLimit,
     BudgetPolicy,
     BudgetReconciliation,
+    BudgetReconciliationPricing,
     BudgetReservationIdentityConflict,
     BudgetReservationRecord,
     BudgetReservationResult,
+    BudgetSettlementCursor,
+    BudgetSettlementFallback,
+    BudgetSettlementRecord,
     BudgetStore,
     _budget_reservation_amount,
+    _budget_settlement_record,
     _copy_effective_budget_limit,
     _effective_budget_limits,
     _EffectiveBudgetLimit,
+    _expired_reservation_reason,
     _is_expired_reservation_reason,
     _operation_budget_limits_for_session,
     budget_actual_cost_for_event,
@@ -45,11 +59,17 @@ from cayu.runtime.budgets import (
     budget_check_payload,
     budget_limits_for_session,
     budget_price,
+    budget_reconciliation_from_payload,
     budget_reconciliation_payload,
-    budget_reconciliation_with_pricing,
+    budget_reconciliation_preview,
+    budget_reconciliation_pricing,
+    budget_release_preview,
     budget_reservation_payload,
+    budget_settlement_id,
     events_for_budget_window,
     has_deferred_contextual_price,
+    model_completion_budget_settlements,
+    new_budget_reservation_id,
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary, estimate_session_cost
@@ -114,15 +134,134 @@ def _execution_identity_payload(
     raise TypeError("Execution identity must be a ModelStepIdentity or ModelAttemptIdentity.")
 
 
+@dataclass(frozen=True)
+class _PublishableBudgetReservationAuthority:
+    reservation_id: str
+    settlement_fallback: BudgetSettlementFallback
+    billing_identity: BillingIdentity | None
+
+
+def _new_publishable_budget_reservation_authority(
+    event_writer: RuntimeEventWriter,
+    *,
+    limit: _EffectiveBudgetLimit,
+    model_attempt_identity: ModelAttemptIdentity,
+    session_id: str,
+    agent_name: str,
+    environment_name: str | None,
+    provider_name: str,
+    model: str,
+    settlement_event_payload: dict[str, object],
+    billing_identity: BillingIdentity | None,
+    reserved_amount: Decimal,
+    fallback_settled_at: datetime,
+    reservation_ttl_seconds: int | None,
+) -> _PublishableBudgetReservationAuthority:
+    """Allocate authority only after its terminal fallback is publishable."""
+
+    reservation_id = new_budget_reservation_id()
+    raw_expiration_reason = (
+        None
+        if reservation_ttl_seconds is None
+        else _expired_reservation_reason(reservation_ttl_seconds)
+    )
+    raw_fallback = BudgetSettlementFallback(
+        settled_at=fallback_settled_at,
+        expiration_reason=raw_expiration_reason,
+    )
+    record = BudgetReservationRecord(
+        reservation_id=reservation_id,
+        budget_limit_id=limit.budget_limit_id,
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
+        scope=limit.scope,
+        key=limit.key,
+        window=limit.window,
+        currency=limit.currency,
+        session_id=session_id,
+        agent_name=agent_name,
+        environment_name=environment_name,
+        provider_name=provider_name,
+        model=model,
+        billing_identity=copy_billing_identity(billing_identity),
+        settlement_event_payload=copy_durable_json_object(
+            settlement_event_payload,
+            "settlement_event_payload",
+        ),
+        settlement_fallback=raw_fallback,
+        reserved_amount=reserved_amount,
+        created_at=fallback_settled_at,
+        updated_at=fallback_settled_at,
+    )
+    reservation = BudgetStepReservation(
+        limit=limit,
+        record=record,
+        request_billing_identity=copy_billing_identity(billing_identity),
+    )
+    conservative = _publication_safe_reconciliation(
+        event_writer.prepare,
+        reservation=reservation,
+        reconciliation=budget_reconciliation_preview(
+            record,
+            actual_amount=reserved_amount,
+            settlement_kind="conservative",
+            reason=raw_fallback.reconciliation_reason,
+            occurred_at=raw_fallback.settled_at,
+        ),
+    )
+    release = _publication_safe_reconciliation(
+        event_writer.prepare,
+        reservation=reservation,
+        reconciliation=budget_release_preview(
+            record,
+            reason=raw_fallback.release_reason,
+            occurred_at=raw_fallback.settled_at,
+        ),
+    )
+    expiration = (
+        None
+        if raw_expiration_reason is None
+        else _publication_safe_reconciliation(
+            event_writer.prepare,
+            reservation=reservation,
+            reconciliation=budget_release_preview(
+                record,
+                reason=raw_expiration_reason,
+                occurred_at=raw_fallback.settled_at,
+            ),
+        )
+    )
+    if conservative.actual_amount != reserved_amount:
+        raise RuntimeError("Budget publication changed conservative fallback accounting.")
+    if release.billing_identity != conservative.billing_identity or (
+        expiration is not None and expiration.billing_identity != conservative.billing_identity
+    ):
+        raise RuntimeError("Budget publication changed fallback billing authority.")
+    return _PublishableBudgetReservationAuthority(
+        reservation_id=reservation_id,
+        settlement_fallback=BudgetSettlementFallback(
+            settled_at=conservative.settled_at,
+            reconciliation_reason=conservative.reason or raw_fallback.reconciliation_reason,
+            release_reason=release.reason or raw_fallback.release_reason,
+            expiration_reason=(None if expiration is None else expiration.reason),
+        ),
+        billing_identity=copy_billing_identity(conservative.billing_identity),
+    )
+
+
 def _validate_ledger_reservation_result(
     result: BudgetReservationResult,
     *,
+    expected_reservation_id: str,
     limit: _EffectiveBudgetLimit,
     model_attempt_identity: ModelAttemptIdentity,
     session_id: str,
     agent_name: str,
     provider_name: str,
     model: str,
+    environment_name: str | None,
+    settlement_event_payload: dict[str, object],
+    settlement_fallback: BudgetSettlementFallback,
     billing_identity: BillingIdentity | None,
     expected_requested_amount: Decimal,
 ) -> BudgetReservationResult:
@@ -161,6 +300,8 @@ def _validate_ledger_reservation_result(
     record = result.record
     if record is None:
         raise RuntimeError("Accepted budget reservation did not return a record.")
+    if record.reservation_id != expected_reservation_id:
+        raise RuntimeError("Budget ledger reused a reservation identity.")
     if (
         record.budget_limit_id != limit.budget_limit_id
         or record.model_step_id != expected_identity.model_step_id
@@ -171,15 +312,66 @@ def _validate_ledger_reservation_result(
         or record.currency != limit.currency
         or record.session_id != session_id
         or record.agent_name != agent_name
+        or record.environment_name != environment_name
         or record.provider_name != provider_name
         or record.model != model
         or record.billing_identity != billing_identity
+        or record.settlement_event_payload != settlement_event_payload
+        or record.settlement_fallback != settlement_fallback
+        or record.dispatch_id is not None
+        or record.dispatched_at is not None
         or record.reserved_amount != result.requested
         or record.status != "active"
         or record.actual_amount is not None
+        or record.reason is not None
     ):
         raise RuntimeError("Budget ledger reservation record changed its requested identity.")
     return result
+
+
+def _validate_ledger_settlement_record(
+    settlement: BudgetSettlementRecord,
+) -> BudgetSettlementRecord:
+    """Detach and revalidate one untrusted custom-ledger outbox value."""
+
+    if type(settlement) is not BudgetSettlementRecord:
+        raise TypeError("Budget ledger settlements must be BudgetSettlementRecord instances.")
+    if type(settlement.reconciliation) is not BudgetReconciliation:
+        raise TypeError(
+            "Budget ledger settlement reconciliations must be BudgetReconciliation instances."
+        )
+    if type(settlement.event) is not Event:
+        raise TypeError("Budget ledger settlement events must be Event instances.")
+    return BudgetSettlementRecord.model_validate(settlement.model_dump(mode="python"))
+
+
+def _validate_ledger_settlement_page(
+    page: list[BudgetSettlementRecord],
+    *,
+    session_id: str | None,
+    after: BudgetSettlementCursor | None,
+    limit: int,
+) -> list[BudgetSettlementRecord]:
+    """Validate bounded ordering and ownership before traversing an outbox page."""
+
+    if type(page) is not list:
+        raise TypeError("Budget ledger pending settlements must be returned as a list.")
+    if len(page) > limit:
+        raise RuntimeError("Budget ledger returned an oversized settlement page.")
+    validated: list[BudgetSettlementRecord] = []
+    previous_key = None if after is None else (after.settled_at, after.settlement_id)
+    for raw_settlement in page:
+        settlement = _validate_ledger_settlement_record(raw_settlement)
+        key = (settlement.reconciliation.settled_at, settlement.settlement_id)
+        if settlement.event_published:
+            raise RuntimeError("Budget ledger returned a published settlement as pending.")
+        if session_id is not None and settlement.session_id != session_id:
+            raise RuntimeError("Budget ledger returned a settlement for another session.")
+        if previous_key is not None and key <= previous_key:
+            raise RuntimeError("Budget ledger returned a non-monotonic settlement page.")
+        validated.append(settlement)
+        previous_key = key
+    return validated
 
 
 def _validate_ledger_limit_unchanged(
@@ -204,28 +396,25 @@ def _validate_ledger_reconciliation(
     *,
     reservation: BudgetStepReservation,
     expected_status: Literal["reconciled", "released"],
+    expected_settlement_kind: Literal["completed", "conservative", "released"],
     expected_actual_amount: Decimal | None,
     expected_reason: str | None,
     expected_billing_identity: BillingIdentity | None,
+    expected_pricing: BudgetReconciliationPricing | None = None,
 ) -> BudgetReconciliation:
     """Detach and validate one untrusted custom-ledger settlement response."""
 
     if type(reconciliation) is not BudgetReconciliation:
         raise TypeError("Budget ledger settlement must return a BudgetReconciliation.")
-    reconciliation = BudgetReconciliation.model_validate(reconciliation.model_dump(mode="python"))
-    if any(
-        value is not None
-        for value in (
-            reconciliation.pricing_provider_name,
-            reconciliation.pricing_model,
-            reconciliation.pricing_match,
-            reconciliation.pricing_provenance,
-            reconciliation.pricing_effective_from,
-            reconciliation.pricing_effective_through,
-            reconciliation.pricing_tier_max_input_tokens,
+    try:
+        reconciliation = BudgetReconciliation.model_validate(
+            reconciliation.model_dump(mode="python")
         )
-    ):
-        raise RuntimeError("Budget ledger settlement returned runtime-owned pricing evidence.")
+    except Exception:
+        raise RuntimeError("Budget ledger settlement changed its requested outcome.") from None
+    actual_pricing = _reconciliation_pricing_evidence(reconciliation)
+    if actual_pricing != expected_pricing:
+        raise RuntimeError("Budget ledger settlement changed its requested pricing evidence.")
     record = reservation.record
     expected_released_amount = (
         record.reserved_amount
@@ -237,6 +426,8 @@ def _validate_ledger_reconciliation(
     )
     if (
         reconciliation.reservation_id != record.reservation_id
+        or reconciliation.settlement_id != budget_settlement_id(record.reservation_id)
+        or reconciliation.settlement_kind != expected_settlement_kind
         or reconciliation.budget_limit_id != record.budget_limit_id
         or reconciliation.model_step_id != record.model_step_id
         or reconciliation.model_attempt_id != record.model_attempt_id
@@ -251,14 +442,31 @@ def _validate_ledger_reconciliation(
     return reconciliation
 
 
-def _expected_reconciliation_billing_identity(
+def _publication_safe_reconciliation(
+    prepare_event: Callable[[Event], Event],
+    *,
     reservation: BudgetStepReservation,
-    completed_identity: BillingIdentity | None,
-) -> BillingIdentity | None:
-    requested_identity = reservation.record.billing_identity
-    if completed_identity is None:
-        return requested_identity
-    return completed_billing_identity(requested_identity, completed_identity)
+    reconciliation: BudgetReconciliation,
+) -> BudgetReconciliation:
+    """Normalize dynamic settlement evidence before it becomes ledger authority."""
+
+    if type(reconciliation) is not BudgetReconciliation:
+        raise TypeError("reconciliation must be a BudgetReconciliation.")
+    raw_settlement = _budget_settlement_record(
+        reservation.record,
+        reconciliation,
+    )
+    prepared_event = prepare_event(raw_settlement.event)
+    reconciliation_payload = budget_reconciliation_payload(reconciliation)
+    prepared_payload = {key: prepared_event.payload[key] for key in reconciliation_payload}
+    prepared_reconciliation = budget_reconciliation_from_payload(prepared_payload)
+    prepared_settlement = _budget_settlement_record(
+        reservation.record,
+        prepared_reconciliation,
+    )
+    if prepared_settlement.event != prepared_event:
+        raise RuntimeError("Budget settlement publication changed immutable reservation authority.")
+    return prepared_reconciliation
 
 
 class BudgetReservationLeaseLost(RuntimeError):
@@ -329,6 +537,18 @@ async def _next_model_step_item(
 class BudgetStepReservation:
     limit: _EffectiveBudgetLimit
     record: BudgetReservationRecord
+    request_billing_identity: BillingIdentity | None = field(default=None, repr=False)
+
+
+def _accounting_reservation_record(
+    reservation: BudgetStepReservation,
+) -> BudgetReservationRecord:
+    """Restore transient request evidence while calculating an exact settlement."""
+
+    return reservation.record.model_copy(
+        update={"billing_identity": copy_billing_identity(reservation.request_billing_identity)},
+        deep=True,
+    )
 
 
 @dataclass
@@ -400,7 +620,13 @@ class BudgetModelStepLifecycle:
         self.pending_reservations = None
         self.pending_model_attempt_identity = None
 
-    def record_model_completion(self, event: Event) -> None:
+    def record_model_completion(
+        self,
+        event: Event,
+        *,
+        prepare_event: Callable[[Event], Event],
+        settled_at: datetime,
+    ) -> Event:
         if not self.dispatches:
             raise RuntimeError("Model completed before provider dispatch was recorded.")
         if self.dispatches[-1].completion is not None:
@@ -411,7 +637,146 @@ class BudgetModelStepLifecycle:
             or event.payload.get("model_attempt_id") != identity.model_attempt_id
         ):
             raise ValueError("Model completion identity differs from its provider dispatch.")
-        self.dispatches[-1].completion = event
+        completion = _model_completion_with_budget_settlement_evidence(
+            event,
+            self.dispatches[-1].reservations,
+            prepare_event=prepare_event,
+            settled_at=settled_at,
+        )
+        self.dispatches[-1].completion = completion
+        return completion.model_copy(deep=True)
+
+
+def _model_completion_reconciliation(
+    event: Event,
+    reservation: BudgetStepReservation,
+    *,
+    settled_at: datetime,
+) -> BudgetReconciliation:
+    raw_identity = event.payload.get("billing_identity")
+    completed_billing_identity = (
+        BillingIdentity.model_validate(raw_identity) if type(raw_identity) is dict else None
+    )
+    pricing: BudgetReconciliationPricing | None = None
+    try:
+        priced_actual = budget_actual_cost_for_event(
+            limit=reservation.limit,
+            event=event,
+        )
+    except ValueError:
+        actual_amount = reservation.record.reserved_amount
+        settlement_kind: Literal["completed", "conservative"] = "conservative"
+        reason = "model completed without priced usage; charged reserved amount"
+    else:
+        actual_amount = priced_actual.amount
+        settlement_kind = "completed"
+        reason = "model completed"
+        completed_billing_identity = (
+            priced_actual.line_item.billing_identity or completed_billing_identity
+        )
+        pricing = budget_reconciliation_pricing(priced_actual.line_item)
+    return budget_reconciliation_preview(
+        _accounting_reservation_record(reservation),
+        actual_amount=actual_amount,
+        settlement_kind=settlement_kind,
+        reason=reason,
+        occurred_at=settled_at,
+        billing_identity=completed_billing_identity,
+        pricing=pricing,
+    )
+
+
+def _reconciliation_pricing_evidence(
+    reconciliation: BudgetReconciliation,
+) -> BudgetReconciliationPricing | None:
+    if reconciliation.pricing_provider_name is None:
+        return None
+    if (
+        reconciliation.pricing_model is None
+        or reconciliation.pricing_match is None
+        or reconciliation.pricing_provenance is None
+    ):
+        raise ValueError("Budget reconciliation has incomplete pricing evidence.")
+    return BudgetReconciliationPricing(
+        provider_name=reconciliation.pricing_provider_name,
+        model=reconciliation.pricing_model,
+        match=reconciliation.pricing_match,
+        provenance=reconciliation.pricing_provenance,
+        effective_from=reconciliation.pricing_effective_from,
+        effective_through=reconciliation.pricing_effective_through,
+        tier_max_input_tokens=reconciliation.pricing_tier_max_input_tokens,
+        billing_identity=reconciliation.billing_identity,
+    )
+
+
+def _model_completion_with_budget_settlement_evidence(
+    event: Event,
+    reservations: tuple[BudgetStepReservation, ...],
+    *,
+    prepare_event: Callable[[Event], Event],
+    settled_at: datetime,
+) -> Event:
+    if type(event) is not Event or event.type != EventType.MODEL_COMPLETED:
+        raise ValueError("Budget settlement evidence requires one model.completed event.")
+    if MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY in event.payload:
+        raise ValueError("Model completion already contains budget settlement evidence.")
+    prepared_event = prepare_event(event)
+    if type(prepared_event) is not Event:
+        raise TypeError("Model completion preparation must return an Event.")
+    if not reservations:
+        return prepared_event
+
+    reconciliations: list[BudgetReconciliation] = []
+    for reservation in reservations:
+        exact = _model_completion_reconciliation(
+            event,
+            reservation,
+            settled_at=settled_at,
+        )
+        try:
+            reconciliation = _publication_safe_reconciliation(
+                prepare_event,
+                reservation=reservation,
+                reconciliation=exact,
+            )
+        except ValueError as exact_error:
+            fallback = budget_reconciliation_preview(
+                _accounting_reservation_record(reservation),
+                actual_amount=reservation.record.reserved_amount,
+                settlement_kind="conservative",
+                reason=reservation.record.settlement_fallback.reconciliation_reason,
+                occurred_at=settled_at,
+                billing_identity=exact.billing_identity,
+            )
+            try:
+                reconciliation = _publication_safe_reconciliation(
+                    prepare_event,
+                    reservation=reservation,
+                    reconciliation=fallback,
+                )
+            except Exception as fallback_error:
+                add_exception_note_safely(
+                    exact_error,
+                    "The prevalidated conservative model-budget publication fallback "
+                    f"also failed: {type(fallback_error).__name__}.",
+                )
+                raise exact_error from fallback_error
+        reconciliations.append(reconciliation)
+
+    payload = copy_json_value(prepared_event.payload, "model_completion_payload")
+    payload[MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY] = [
+        budget_reconciliation_payload(reconciliation) for reconciliation in reconciliations
+    ]
+    completion = prepare_event(prepared_event.model_copy(update={"payload": payload}, deep=True))
+    if type(completion) is not Event:
+        raise TypeError("Model completion preparation must return an Event.")
+    parsed = model_completion_budget_settlements(
+        completion,
+        reservation_ids=(reservation.record.reservation_id for reservation in reservations),
+    )
+    if parsed != tuple(reconciliations):
+        raise RuntimeError("Model completion publication changed budget settlement evidence.")
+    return completion
 
 
 @dataclass(frozen=True)
@@ -574,6 +939,8 @@ class RunLimitController:
             session_store,
             budget_ledger,
         )
+        self._global_settlement_recovery_lock = asyncio.Lock()
+        self._global_settlement_recovery_after: BudgetSettlementCursor | None = None
 
     def usage_tracker(self, session_id: str) -> SessionUsageTracker:
         return SessionUsageTracker(self._session_store, session_id=session_id)
@@ -586,6 +953,11 @@ class RunLimitController:
     @property
     def reservation_ttl_seconds(self) -> int | None:
         return self._budget_ledger.reservation_ttl_seconds
+
+    def budget_settlement_time(self) -> datetime:
+        """Return the accounting clock used by the configured budget ledger."""
+
+        return self._clock()
 
     async def session_usage_events(self, session_id: str) -> list[Event]:
         records = await query_all_event_records(
@@ -1035,7 +1407,6 @@ class RunLimitController:
                 expected_limit = _copy_effective_budget_limit(limit)
                 ledger_limit = _copy_effective_budget_limit(limit)
                 ledger_model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-                ledger_billing_identity = copy_billing_identity(expected_billing_identity)
                 reservation_effective_at = self._clock()
                 expected_requested_amount = _budget_reservation_amount(
                     limit=expected_limit,
@@ -1044,25 +1415,48 @@ class RunLimitController:
                     effective_at=reservation_effective_at,
                     billing_identity=expected_billing_identity,
                 )
+                authority = _new_publishable_budget_reservation_authority(
+                    self._event_writer,
+                    limit=expected_limit,
+                    model_attempt_identity=model_attempt_identity,
+                    session_id=session.id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    provider_name=provider_name,
+                    model=session.model,
+                    settlement_event_payload={},
+                    billing_identity=expected_billing_identity,
+                    reserved_amount=expected_requested_amount,
+                    fallback_settled_at=reservation_effective_at,
+                    reservation_ttl_seconds=self.reservation_ttl_seconds,
+                )
+                ledger_billing_identity = copy_billing_identity(authority.billing_identity)
                 try:
-                    if ledger_billing_identity is None:
+                    if expected_billing_identity is None and ledger_billing_identity is None:
                         result = await self._budget_ledger.reserve(
+                            reservation_id=authority.reservation_id,
                             limit=ledger_limit,
                             session_id=session.id,
                             agent_name=agent_name,
                             provider_name=provider_name,
                             model=session.model,
                             model_attempt_identity=ledger_model_attempt_identity,
+                            environment_name=environment_name,
+                            settlement_fallback=authority.settlement_fallback,
                             effective_at=reservation_effective_at,
                         )
                     else:
                         result = await self._budget_ledger.reserve(
+                            reservation_id=authority.reservation_id,
                             limit=ledger_limit,
                             session_id=session.id,
                             agent_name=agent_name,
                             provider_name=provider_name,
                             model=session.model,
                             model_attempt_identity=ledger_model_attempt_identity,
+                            environment_name=environment_name,
+                            settlement_fallback=authority.settlement_fallback,
+                            requested_amount=expected_requested_amount,
                             billing_identity=ledger_billing_identity,
                             effective_at=reservation_effective_at,
                         )
@@ -1073,13 +1467,17 @@ class RunLimitController:
                     )
                 result = _validate_ledger_reservation_result(
                     result,
+                    expected_reservation_id=authority.reservation_id,
                     limit=expected_limit,
                     model_attempt_identity=model_attempt_identity,
                     session_id=session.id,
                     agent_name=agent_name,
                     provider_name=provider_name,
                     model=session.model,
-                    billing_identity=expected_billing_identity,
+                    environment_name=environment_name,
+                    settlement_event_payload={},
+                    settlement_fallback=authority.settlement_fallback,
+                    billing_identity=authority.billing_identity,
                     expected_requested_amount=expected_requested_amount,
                 )
                 reservation_event = Event(
@@ -1100,6 +1498,7 @@ class RunLimitController:
                     reservation = BudgetStepReservation(
                         limit=expected_limit,
                         record=result.record,
+                        request_billing_identity=copy_billing_identity(expected_billing_identity),
                     )
                     # Stage the accepted record for cleanup before either durable
                     # ownership claim can fail or lose its acknowledgement.
@@ -1117,6 +1516,7 @@ class RunLimitController:
                         raise
                     reservation_ids.add(result.record.reservation_id)
                 emitted_events.append(await self._event_writer.emit(reservation_event))
+                await self.recover_pending_budget_settlements()
                 if not result.accepted:
                     reservation_failure = result
                     release_reason = "reservation failed"
@@ -1197,6 +1597,149 @@ class RunLimitController:
             *effective_request_limits,
         )
 
+    async def _commit_expected_reconciliation(
+        self,
+        reservation: BudgetStepReservation,
+        expected: BudgetReconciliation,
+    ) -> BudgetReconciliation:
+        """Commit one publication-safe reconciliation and verify its exact replay."""
+
+        try:
+            expected = _publication_safe_reconciliation(
+                self._event_writer.prepare,
+                reservation=reservation,
+                reconciliation=expected,
+            )
+        except ValueError as exact_error:
+            fallback = budget_reconciliation_preview(
+                reservation.record,
+                actual_amount=reservation.record.reserved_amount,
+                settlement_kind="conservative",
+                reason=reservation.record.settlement_fallback.reconciliation_reason,
+                occurred_at=expected.settled_at,
+            )
+            try:
+                expected = _publication_safe_reconciliation(
+                    self._event_writer.prepare,
+                    reservation=reservation,
+                    reconciliation=fallback,
+                )
+            except Exception as fallback_error:
+                add_exception_note_safely(
+                    exact_error,
+                    "The prevalidated conservative budget-settlement fallback also failed: "
+                    f"{type(fallback_error).__name__}.",
+                )
+                raise exact_error from fallback_error
+        if expected.status != "reconciled" or expected.actual_amount is None:
+            raise ValueError("Expected budget reconciliation must charge a reservation.")
+        if expected.settlement_kind == "released":
+            raise ValueError("Expected budget reconciliation cannot release a reservation.")
+        pricing = _reconciliation_pricing_evidence(expected)
+        billing_identity = copy_billing_identity(
+            expected.billing_identity if reservation.record.billing_identity is not None else None
+        )
+        if billing_identity is None:
+            reconciliation = await self._budget_ledger.reconcile(
+                reservation_id=expected.reservation_id,
+                actual_amount=expected.actual_amount,
+                settlement_kind=expected.settlement_kind,
+                reason=expected.reason,
+                occurred_at=expected.settled_at,
+                pricing=pricing,
+            )
+        else:
+            reconciliation = await self._budget_ledger.reconcile(
+                reservation_id=expected.reservation_id,
+                actual_amount=expected.actual_amount,
+                settlement_kind=expected.settlement_kind,
+                reason=expected.reason,
+                occurred_at=expected.settled_at,
+                billing_identity=billing_identity,
+                pricing=pricing,
+            )
+        reconciliation = _validate_ledger_reconciliation(
+            reconciliation,
+            reservation=reservation,
+            expected_status="reconciled",
+            expected_settlement_kind=expected.settlement_kind,
+            expected_actual_amount=expected.actual_amount,
+            expected_reason=expected.reason,
+            expected_billing_identity=expected.billing_identity,
+            expected_pricing=pricing,
+        )
+        if reconciliation != expected:
+            raise RuntimeError("Budget ledger changed exact settlement evidence.")
+        return reconciliation
+
+    async def _commit_expected_release(
+        self,
+        reservation: BudgetStepReservation,
+        expected: BudgetReconciliation,
+    ) -> BudgetReconciliation:
+        """Commit one publication-safe release and verify its exact replay."""
+
+        try:
+            expected = _publication_safe_reconciliation(
+                self._event_writer.prepare,
+                reservation=reservation,
+                reconciliation=expected,
+            )
+        except ValueError as exact_error:
+            fallback = budget_release_preview(
+                reservation.record,
+                reason=reservation.record.settlement_fallback.release_reason,
+                occurred_at=reservation.record.settlement_fallback.settled_at,
+            )
+            try:
+                expected = _publication_safe_reconciliation(
+                    self._event_writer.prepare,
+                    reservation=reservation,
+                    reconciliation=fallback,
+                )
+            except Exception as fallback_error:
+                add_exception_note_safely(
+                    exact_error,
+                    "The prevalidated budget-release fallback also failed: "
+                    f"{type(fallback_error).__name__}.",
+                )
+                raise exact_error from fallback_error
+        if (
+            expected.status != "released"
+            or expected.settlement_kind != "released"
+            or expected.actual_amount is not None
+        ):
+            raise ValueError("Expected budget release must release one reservation.")
+        reconciliation = await self._budget_ledger.release(
+            reservation_id=expected.reservation_id,
+            reason=expected.reason or "reservation released",
+            occurred_at=expected.settled_at,
+        )
+        reconciliation = _validate_ledger_reconciliation(
+            reconciliation,
+            reservation=reservation,
+            expected_status="released",
+            expected_settlement_kind="released",
+            expected_actual_amount=None,
+            expected_reason=expected.reason,
+            expected_billing_identity=expected.billing_identity,
+        )
+        if reconciliation != expected:
+            expiration_reason = reservation.record.settlement_fallback.expiration_reason
+            if (
+                expiration_reason is None
+                or reconciliation.reason != expiration_reason
+                or reconciliation.settled_at != reservation.record.settlement_fallback.settled_at
+                or _publication_safe_reconciliation(
+                    self._event_writer.prepare,
+                    reservation=reservation,
+                    reconciliation=reconciliation,
+                )
+                != reconciliation
+            ):
+                raise RuntimeError("Budget ledger changed exact release evidence.")
+        return reconciliation
+
     async def reconcile_dispatched_reservations(
         self,
         reservations: list[BudgetStepReservation],
@@ -1227,6 +1770,20 @@ class RunLimitController:
         for dispatch in lifecycle.dispatches:
             if dispatch.settled:
                 continue
+            completed_settlements = (
+                None
+                if dispatch.completion is None
+                else {
+                    reconciliation.reservation_id: reconciliation
+                    for reconciliation in model_completion_budget_settlements(
+                        dispatch.completion,
+                        reservation_ids=(
+                            reservation.record.reservation_id
+                            for reservation in dispatch.reservations
+                        ),
+                    )
+                }
+            )
             emitted_events: list[Event] = []
             settlement_failure: Exception | None = None
             async with lifecycle.reservation_transition_lock:
@@ -1234,80 +1791,37 @@ class RunLimitController:
                     reservation_id = reservation.record.reservation_id
                     if reservation_id in dispatch.settled_reservation_ids:
                         continue
-                    priced_actual = None
-                    completed_billing_identity = None
-                    if dispatch.completion is None:
-                        actual_amount = reservation.record.reserved_amount
-                        reason = unknown_reason
-                        reconciled_at = self._clock()
-                    else:
-                        raw_identity = dispatch.completion.payload.get("billing_identity")
-                        if type(raw_identity) is dict:
-                            completed_billing_identity = BillingIdentity.model_validate(
-                                raw_identity
-                            )
-                        reconciled_at = dispatch.completion.timestamp
-                        try:
-                            priced_actual = budget_actual_cost_for_event(
-                                limit=reservation.limit,
-                                event=dispatch.completion,
-                            )
-                        except ValueError:
-                            actual_amount = reservation.record.reserved_amount
-                            reason = "model completed without priced usage; charged reserved amount"
-                        else:
-                            actual_amount = priced_actual.amount
-                            reason = "model completed"
                     try:
-                        reconciliation_identity = (
-                            priced_actual.line_item.billing_identity
-                            if priced_actual is not None
-                            else completed_billing_identity
+                        expected = (
+                            budget_reconciliation_preview(
+                                reservation.record,
+                                actual_amount=reservation.record.reserved_amount,
+                                settlement_kind="conservative",
+                                reason=unknown_reason,
+                                occurred_at=self._clock(),
+                            )
+                            if completed_settlements is None
+                            else completed_settlements[reservation_id]
                         )
-                        expected_billing_identity = _expected_reconciliation_billing_identity(
+                        assert expected.actual_amount is not None
+                        if expected.settlement_kind == "released":
+                            raise RuntimeError(
+                                "Model completion cannot release a dispatched reservation."
+                            )
+                        reconciliation = await self._commit_expected_reconciliation(
                             reservation,
-                            reconciliation_identity,
+                            expected,
                         )
-                        ledger_billing_identity = copy_billing_identity(reconciliation_identity)
-                        if ledger_billing_identity is None:
-                            reconciliation = await self._budget_ledger.reconcile(
-                                reservation_id=reservation_id,
-                                actual_amount=actual_amount,
-                                reason=reason,
-                                occurred_at=reconciled_at,
+                        settlement = await self._load_committed_settlement(reconciliation)
+                        if (
+                            settlement.session_id != session.id
+                            or settlement.agent_name != agent_name
+                            or settlement.environment_name != environment_name
+                        ):
+                            raise RuntimeError(
+                                "Budget settlement audit context conflicts with its model step."
                             )
-                        else:
-                            reconciliation = await self._budget_ledger.reconcile(
-                                reservation_id=reservation_id,
-                                actual_amount=actual_amount,
-                                reason=reason,
-                                occurred_at=reconciled_at,
-                                billing_identity=ledger_billing_identity,
-                            )
-                        reconciliation = _validate_ledger_reconciliation(
-                            reconciliation,
-                            reservation=reservation,
-                            expected_status="reconciled",
-                            expected_actual_amount=actual_amount,
-                            expected_reason=reason,
-                            expected_billing_identity=expected_billing_identity,
-                        )
-                        if priced_actual is not None:
-                            reconciliation = budget_reconciliation_with_pricing(
-                                reconciliation,
-                                priced_actual.line_item,
-                            )
-                        emitted_events.append(
-                            await self._event_writer.emit(
-                                Event(
-                                    type=EventType.BUDGET_RECONCILED,
-                                    session_id=session.id,
-                                    agent_name=agent_name,
-                                    environment_name=environment_name,
-                                    payload=budget_reconciliation_payload(reconciliation),
-                                )
-                            )
-                        )
+                        emitted_events.append(await self.publish_budget_settlement(settlement))
                     except Exception as exc:
                         settlement_failure = exc
                         break
@@ -1389,7 +1903,306 @@ class RunLimitController:
                             "Budget reservation lease was lost before model dispatch."
                         ) from exc
                     raise
+            deferred_failure = await self.mark_reservations_dispatched(
+                reservations,
+                dispatch_id=model_attempt_identity.model_attempt_id,
+            )
             lifecycle.mark_provider_dispatch(model_attempt_identity)
+            if deferred_failure is not None:
+                raise deferred_failure
+
+    async def mark_reservations_dispatched(
+        self,
+        reservations: Collection[BudgetStepReservation],
+        *,
+        dispatch_id: str,
+    ) -> BaseException | None:
+        """Fence every reservation, exactly replaying an ambiguous acknowledgement."""
+
+        dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        expected_records = tuple(reservation.record for reservation in reservations)
+        if not expected_records:
+            return None
+        dispatched_at = self._clock()
+        reservation_ids = tuple(record.reservation_id for record in expected_records)
+
+        async def mark_once() -> None:
+            marked_records = await self._budget_ledger.mark_dispatched(
+                reservation_ids=reservation_ids,
+                dispatch_id=dispatch_id,
+                dispatched_at=dispatched_at,
+            )
+            if type(marked_records) is not tuple or len(marked_records) != len(expected_records):
+                raise RuntimeError("Budget ledger returned an incomplete dispatch fence.")
+            for expected, marked in zip(expected_records, marked_records, strict=True):
+                if type(marked) is not BudgetReservationRecord:
+                    raise TypeError(
+                        "Budget ledger dispatch fences must be BudgetReservationRecord instances."
+                    )
+                marked = BudgetReservationRecord.model_validate(marked.model_dump(mode="python"))
+                expected_marked = expected.model_copy(
+                    update={
+                        "dispatch_id": dispatch_id,
+                        "dispatched_at": dispatched_at,
+                        # A lease heartbeat immediately before the fence may
+                        # have advanced this ledger-owned timestamp.
+                        "updated_at": marked.updated_at,
+                    },
+                    deep=True,
+                )
+                if marked.updated_at < expected.updated_at or marked != expected_marked:
+                    raise RuntimeError("Budget ledger returned a conflicting dispatch fence.")
+
+        try:
+            await mark_once()
+            return None
+        except BaseException as first_error:
+            cancellation = first_error if isinstance(first_error, asyncio.CancelledError) else None
+            replay_task = asyncio.create_task(mark_once())
+            outcome = await await_shielded_task_outcome(
+                replay_task,
+                cancellation=cancellation,
+            )
+            if outcome.error is not None:
+                replay_error = outcome.error
+                if isinstance(replay_error, asyncio.CancelledError):
+                    replay_error = unexpected_child_cancellation_error(
+                        replay_error,
+                        operation="Budget dispatch-fence acknowledgement replay",
+                    )
+                if outcome.cancellation is not None:
+                    add_exception_note_safely(
+                        outcome.cancellation,
+                        "Budget dispatch-fence acknowledgement replay also failed after "
+                        f"{type(first_error).__name__}.",
+                    )
+                    raise outcome.cancellation from replay_error
+                add_exception_note_safely(
+                    first_error,
+                    "Budget dispatch-fence acknowledgement replay also failed: "
+                    f"{type(replay_error).__name__}.",
+                )
+                raise first_error from replay_error
+            deferred_failure = outcome.cancellation
+            if deferred_failure is None and not isinstance(first_error, Exception):
+                deferred_failure = first_error
+            return deferred_failure
+
+    async def publish_budget_settlement(
+        self,
+        settlement: BudgetSettlementRecord,
+    ) -> Event:
+        """Publish one ledger-owned audit event and acknowledge its exact handoff."""
+
+        settlement = _validate_ledger_settlement_record(settlement)
+        prepared_event = self._event_writer.prepare_exact_replay(settlement.event)
+        persisted = await self._event_writer.persist_exact_replay(prepared_event)
+        if persisted != settlement.event:
+            raise RuntimeError("Budget settlement publication changed its durable audit event.")
+        acknowledged = _validate_ledger_settlement_record(
+            await self._budget_ledger.mark_settlement_event_published(
+                settlement_id=settlement.settlement_id,
+                event_id=settlement.event.id,
+            )
+        )
+        if not acknowledged.event_published or acknowledged.model_copy(
+            update={"event_published": False}, deep=True
+        ) != settlement.model_copy(update={"event_published": False}, deep=True):
+            raise RuntimeError("Budget ledger acknowledged a conflicting settlement event.")
+        await self._event_writer.fan_out_persisted([settlement.event])
+        return settlement.event.model_copy(deep=True)
+
+    async def recover_pending_budget_settlements(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> list[Event]:
+        """Publish reachable settlement outbox rows without reapplying amounts."""
+
+        if session_id is not None:
+            session_id = require_clean_nonblank(session_id, "session_id")
+            return await self._recover_pending_budget_settlement_pages(
+                session_id=session_id,
+                after=None,
+                max_pages=None,
+            )
+        async with self._global_settlement_recovery_lock:
+            return await self._recover_pending_budget_settlement_pages(
+                session_id=None,
+                after=self._global_settlement_recovery_after,
+                max_pages=10,
+            )
+
+    async def _recover_pending_budget_settlement_pages(
+        self,
+        *,
+        session_id: str | None,
+        after: BudgetSettlementCursor | None,
+        max_pages: int | None,
+    ) -> list[Event]:
+        recovered: list[Event] = []
+        pages = 0
+        while True:
+            page_limit = 100
+            pending = _validate_ledger_settlement_page(
+                await self._budget_ledger.list_pending_settlements(
+                    session_id=session_id,
+                    after=after,
+                    limit=page_limit,
+                ),
+                session_id=session_id,
+                after=after,
+                limit=page_limit,
+            )
+            if not pending:
+                if session_id is None:
+                    self._global_settlement_recovery_after = None
+                return recovered
+            pages += 1
+            for settlement in pending:
+                next_cursor = BudgetSettlementCursor(
+                    settled_at=settlement.reconciliation.settled_at,
+                    settlement_id=settlement.settlement_id,
+                )
+                if session_id is None:
+                    try:
+                        owner = await self._session_store.load(settlement.session_id)
+                    except KeyError:
+                        owner = None
+                    if owner is None:
+                        after = next_cursor
+                        self._global_settlement_recovery_after = after
+                        continue
+                    try:
+                        self._event_writer.prepare_exact_replay(settlement.event)
+                    except ValueError:
+                        # The owning publication domain may use a different
+                        # workload-secret policy. Retain the outbox row for it.
+                        after = next_cursor
+                        self._global_settlement_recovery_after = after
+                        continue
+                try:
+                    recovered.append(await self.publish_budget_settlement(settlement))
+                except KeyError:
+                    if session_id is not None:
+                        raise
+                    owner = await self._session_store.load(settlement.session_id)
+                    if owner is not None:
+                        raise
+                after = next_cursor
+                if session_id is None:
+                    self._global_settlement_recovery_after = after
+            if max_pages is not None and pages >= max_pages:
+                return recovered
+
+    async def reconcile_model_completion_settlements(
+        self,
+        completion_event: Event,
+        *,
+        reservation_ids: Collection[str],
+    ) -> list[Event]:
+        """Converge one durable model completion into its original reservations."""
+
+        expected = model_completion_budget_settlements(
+            completion_event,
+            reservation_ids=reservation_ids,
+        )
+        events: list[Event] = []
+        for evidence in expected:
+            if evidence.actual_amount is None or evidence.settlement_kind == "released":
+                raise ValueError("Model completion contains a non-reconcilable settlement.")
+            raw_settlement = await self._budget_ledger.load_settlement(evidence.settlement_id)
+            settlement = (
+                None
+                if raw_settlement is None
+                else _validate_ledger_settlement_record(raw_settlement)
+            )
+            if settlement is None:
+                reconciliation = await self._budget_ledger.reconcile(
+                    reservation_id=evidence.reservation_id,
+                    actual_amount=evidence.actual_amount,
+                    settlement_kind=evidence.settlement_kind,
+                    reason=evidence.reason,
+                    occurred_at=evidence.settled_at,
+                    billing_identity=copy_billing_identity(evidence.billing_identity),
+                    pricing=_reconciliation_pricing_evidence(evidence),
+                )
+                if reconciliation != evidence:
+                    raise RuntimeError(
+                        "Recovered budget settlement conflicts with durable model completion."
+                    )
+                settlement = await self._load_committed_settlement(reconciliation)
+            elif (
+                settlement.reconciliation != evidence
+                or settlement.reservation_id != evidence.reservation_id
+            ):
+                raise RuntimeError(
+                    "Committed budget settlement conflicts with durable model completion."
+                )
+            if settlement.event_published:
+                events.append(settlement.event.model_copy(deep=True))
+            else:
+                events.append(await self.publish_budget_settlement(settlement))
+        return events
+
+    async def _load_committed_settlement(
+        self,
+        reconciliation: BudgetReconciliation,
+    ) -> BudgetSettlementRecord:
+        raw_settlement = await self._budget_ledger.load_settlement(reconciliation.settlement_id)
+        settlement = (
+            None if raw_settlement is None else _validate_ledger_settlement_record(raw_settlement)
+        )
+        if (
+            settlement is None
+            or settlement.reconciliation != reconciliation
+            or settlement.reservation_id != reconciliation.reservation_id
+        ):
+            raise RuntimeError("Budget ledger did not retain its exact committed settlement.")
+        return settlement
+
+    async def budget_settlement_event(
+        self,
+        reconciliation: BudgetReconciliation,
+    ) -> Event:
+        """Return the exact audit event material committed beside a settlement."""
+
+        settlement = await self._load_committed_settlement(reconciliation)
+        return settlement.event.model_copy(deep=True)
+
+    async def acknowledge_budget_settlement_events(
+        self,
+        events: Collection[Event],
+    ) -> None:
+        """Mark already-persisted exact settlement events as published."""
+
+        for event in events:
+            if event.type not in {
+                EventType.BUDGET_RECONCILED,
+                EventType.BUDGET_RESERVATION_RELEASED,
+            }:
+                continue
+            raw_settlement_id = event.payload.get("settlement_id")
+            if type(raw_settlement_id) is not str:
+                continue
+            raw_settlement = await self._budget_ledger.load_settlement(raw_settlement_id)
+            settlement = (
+                None
+                if raw_settlement is None
+                else _validate_ledger_settlement_record(raw_settlement)
+            )
+            if settlement is None or settlement.event != event:
+                raise RuntimeError("Persisted budget event conflicts with its ledger settlement.")
+            acknowledged = _validate_ledger_settlement_record(
+                await self._budget_ledger.mark_settlement_event_published(
+                    settlement_id=settlement.settlement_id,
+                    event_id=event.id,
+                )
+            )
+            if not acknowledged.event_published or acknowledged.model_copy(
+                update={"event_published": False}, deep=True
+            ) != settlement.model_copy(update={"event_published": False}, deep=True):
+                raise RuntimeError("Budget ledger acknowledged a conflicting settlement event.")
 
     async def model_step_events_with_heartbeat(
         self,
@@ -1741,6 +2554,7 @@ class RunLimitController:
                 provider_name=provider_name,
                 model=model,
                 model_attempt_identity=model_attempt_identity,
+                environment_name=environment_name,
                 billing_identity=billing_identity,
                 reservation_identity_guard=identity_guard,
                 rejection_release_reason="reservation failed",
@@ -1763,17 +2577,8 @@ class RunLimitController:
             for reservation_event in setup.events:
                 lifecycle.events.append(await self._event_writer.emit(reservation_event))
             for reconciliation in setup.releases:
-                lifecycle.events.append(
-                    await self._event_writer.emit(
-                        Event(
-                            type=EventType.BUDGET_RESERVATION_RELEASED,
-                            session_id=session.id,
-                            agent_name=agent_name,
-                            environment_name=environment_name,
-                            payload=budget_reconciliation_payload(reconciliation),
-                        )
-                    )
-                )
+                settlement = await self._load_committed_settlement(reconciliation)
+                lifecycle.events.append(await self.publish_budget_settlement(settlement))
             if setup.error is not None:
                 raise setup.error
             if setup.failure is not None:
@@ -1781,7 +2586,13 @@ class RunLimitController:
             else:
 
                 async def run_dispatched_operation() -> _OperationResultT:
+                    deferred_dispatch_failure = await self.mark_reservations_dispatched(
+                        lifecycle.reservations,
+                        dispatch_id=model_attempt_identity.model_attempt_id,
+                    )
                     lifecycle.provider_dispatch_started = True
+                    if deferred_dispatch_failure is not None:
+                        raise deferred_dispatch_failure
                     return await operation()
 
                 result, lease_failure = await self.run_operation_with_reservation_heartbeat(
@@ -1984,17 +2795,8 @@ class RunLimitController:
                         working_reservations,
                         reason=lifecycle.predispatch_release_reason,
                     ):
-                        lifecycle.events.append(
-                            await self._event_writer.emit(
-                                Event(
-                                    type=EventType.BUDGET_RESERVATION_RELEASED,
-                                    session_id=session.id,
-                                    agent_name=agent_name,
-                                    environment_name=environment_name,
-                                    payload=budget_reconciliation_payload(reconciliation),
-                                )
-                            )
-                        )
+                        settlement = await self._load_committed_settlement(reconciliation)
+                        lifecycle.events.append(await self.publish_budget_settlement(settlement))
                 except Exception as exc:
                     settlement_failures.append((reservation.record.reservation_id, exc))
             lifecycle.settled = True
@@ -2037,50 +2839,31 @@ class RunLimitController:
                         priced_actuals[0].line_item.billing_identity or completed_billing_identity
                     )
                 occurred_at = completed_events[-1].timestamp if completed_events else self._clock()
-                expected_billing_identity = _expected_reconciliation_billing_identity(
+                settlement_kind: Literal["completed", "conservative"] = (
+                    "completed"
+                    if completed_events and not uncertain_completion_count
+                    else "conservative"
+                )
+                pricing = (
+                    budget_reconciliation_pricing(priced_actuals[0].line_item)
+                    if len(completed_events) == 1 and len(priced_actuals) == 1
+                    else None
+                )
+                expected = budget_reconciliation_preview(
+                    _accounting_reservation_record(reservation),
+                    actual_amount=actual_amount,
+                    settlement_kind=settlement_kind,
+                    reason=reason,
+                    occurred_at=occurred_at,
+                    billing_identity=completed_billing_identity,
+                    pricing=pricing,
+                )
+                reconciliation = await self._commit_expected_reconciliation(
                     reservation,
-                    completed_billing_identity,
+                    expected,
                 )
-                ledger_billing_identity = copy_billing_identity(completed_billing_identity)
-                if ledger_billing_identity is None:
-                    reconciliation = await self._budget_ledger.reconcile(
-                        reservation_id=reservation.record.reservation_id,
-                        actual_amount=actual_amount,
-                        reason=reason,
-                        occurred_at=occurred_at,
-                    )
-                else:
-                    reconciliation = await self._budget_ledger.reconcile(
-                        reservation_id=reservation.record.reservation_id,
-                        actual_amount=actual_amount,
-                        reason=reason,
-                        occurred_at=occurred_at,
-                        billing_identity=ledger_billing_identity,
-                    )
-                reconciliation = _validate_ledger_reconciliation(
-                    reconciliation,
-                    reservation=reservation,
-                    expected_status="reconciled",
-                    expected_actual_amount=actual_amount,
-                    expected_reason=reason,
-                    expected_billing_identity=expected_billing_identity,
-                )
-                if len(completed_events) == 1 and len(priced_actuals) == 1:
-                    reconciliation = budget_reconciliation_with_pricing(
-                        reconciliation,
-                        priced_actuals[0].line_item,
-                    )
-                lifecycle.events.append(
-                    await self._event_writer.emit(
-                        Event(
-                            type=EventType.BUDGET_RECONCILED,
-                            session_id=session.id,
-                            agent_name=agent_name,
-                            environment_name=environment_name,
-                            payload=budget_reconciliation_payload(reconciliation),
-                        )
-                    )
-                )
+                settlement = await self._load_committed_settlement(reconciliation)
+                lifecycle.events.append(await self.publish_budget_settlement(settlement))
             except Exception as exc:
                 settlement_failures.append((reservation.record.reservation_id, exc))
         lifecycle.settled = True
@@ -2095,6 +2878,8 @@ class RunLimitController:
         provider_name: str | None,
         model: str | None,
         model_attempt_identity: ModelAttemptIdentity,
+        environment_name: str | None = None,
+        settlement_event_payload: dict[str, object] | None = None,
         rejection_release_reason: str,
         accepted_record_error: str,
         reservation_event_factory: Callable[[BudgetReservationResult], Event] | None = None,
@@ -2117,6 +2902,10 @@ class RunLimitController:
         events: list[Event] = []
         releases: list[BudgetReconciliation] = []
         expected_billing_identity = copy_billing_identity(billing_identity)
+        expected_settlement_event_payload = copy_durable_json_object(
+            settlement_event_payload or {},
+            "settlement_event_payload",
+        )
         identity_guard = reservation_identity_guard or self.reservation_identity_guard()
         if reservation_event_factory is None:
 
@@ -2142,7 +2931,10 @@ class RunLimitController:
                 expected_limit = _copy_effective_budget_limit(limit)
                 ledger_limit = _copy_effective_budget_limit(limit)
                 ledger_model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-                ledger_billing_identity = copy_billing_identity(expected_billing_identity)
+                ledger_settlement_event_payload = copy_durable_json_object(
+                    expected_settlement_event_payload,
+                    "settlement_event_payload",
+                )
                 reservation_effective_at = self._clock()
                 expected_requested_amount = _budget_reservation_amount(
                     limit=expected_limit,
@@ -2151,25 +2943,50 @@ class RunLimitController:
                     effective_at=reservation_effective_at,
                     billing_identity=expected_billing_identity,
                 )
+                authority = _new_publishable_budget_reservation_authority(
+                    self._event_writer,
+                    limit=expected_limit,
+                    model_attempt_identity=model_attempt_identity,
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    provider_name=provider_name,
+                    model=model,
+                    settlement_event_payload=expected_settlement_event_payload,
+                    billing_identity=expected_billing_identity,
+                    reserved_amount=expected_requested_amount,
+                    fallback_settled_at=reservation_effective_at,
+                    reservation_ttl_seconds=self.reservation_ttl_seconds,
+                )
+                ledger_billing_identity = copy_billing_identity(authority.billing_identity)
                 try:
-                    if ledger_billing_identity is None:
+                    if expected_billing_identity is None and ledger_billing_identity is None:
                         result = await self._budget_ledger.reserve(
+                            reservation_id=authority.reservation_id,
                             limit=ledger_limit,
                             session_id=session_id,
                             agent_name=agent_name,
                             provider_name=provider_name,
                             model=model,
                             model_attempt_identity=ledger_model_attempt_identity,
+                            environment_name=environment_name,
+                            settlement_event_payload=ledger_settlement_event_payload,
+                            settlement_fallback=authority.settlement_fallback,
                             effective_at=reservation_effective_at,
                         )
                     else:
                         result = await self._budget_ledger.reserve(
+                            reservation_id=authority.reservation_id,
                             limit=ledger_limit,
                             session_id=session_id,
                             agent_name=agent_name,
                             provider_name=provider_name,
                             model=model,
                             model_attempt_identity=ledger_model_attempt_identity,
+                            environment_name=environment_name,
+                            settlement_event_payload=ledger_settlement_event_payload,
+                            settlement_fallback=authority.settlement_fallback,
+                            requested_amount=expected_requested_amount,
                             billing_identity=ledger_billing_identity,
                             effective_at=reservation_effective_at,
                         )
@@ -2180,13 +2997,17 @@ class RunLimitController:
                     )
                 result = _validate_ledger_reservation_result(
                     result,
+                    expected_reservation_id=authority.reservation_id,
                     limit=expected_limit,
                     model_attempt_identity=model_attempt_identity,
                     session_id=session_id,
                     agent_name=agent_name,
                     provider_name=provider_name,
                     model=model,
-                    billing_identity=expected_billing_identity,
+                    environment_name=environment_name,
+                    settlement_event_payload=expected_settlement_event_payload,
+                    settlement_fallback=authority.settlement_fallback,
+                    billing_identity=authority.billing_identity,
                     expected_requested_amount=expected_requested_amount,
                 )
                 reservation_event = event_factory(result)
@@ -2215,6 +3036,7 @@ class RunLimitController:
                 if not result.accepted:
                     results.append(result)
                     events.append(reservation_event)
+                    await self.recover_pending_budget_settlements()
                     async for reconciliation in self.release_operation_reservations(
                         reservations,
                         reason=rejection_release_reason,
@@ -2235,6 +3057,7 @@ class RunLimitController:
                 reservation = BudgetStepReservation(
                     limit=expected_limit,
                     record=result.record,
+                    request_billing_identity=copy_billing_identity(expected_billing_identity),
                 )
                 # Keep an accepted, uniquely identified reservation reachable by
                 # the caller's pre-dispatch cleanup if either ownership domain
@@ -2254,6 +3077,7 @@ class RunLimitController:
                 reservation_ids.add(result.record.reservation_id)
                 results.append(result)
                 events.append(reservation_event)
+                await self.recover_pending_budget_settlements()
             except BaseException as exc:
                 return OperationReservationSetup(
                     reservations=tuple(reservations),
@@ -2327,39 +3151,27 @@ class RunLimitController:
         occurred_at = (
             model_completed_events[-1].timestamp if model_completed_events else self._clock()
         )
-        expected_billing_identity = _expected_reconciliation_billing_identity(
+        settlement_kind: Literal["completed", "conservative"] = (
+            "completed" if priced_actuals else "conservative"
+        )
+        pricing = (
+            budget_reconciliation_pricing(priced_actuals[0].line_item)
+            if len(priced_actuals) == 1
+            else None
+        )
+        expected = budget_reconciliation_preview(
+            _accounting_reservation_record(reservation),
+            actual_amount=actual_amount,
+            settlement_kind=settlement_kind,
+            reason=reason,
+            occurred_at=occurred_at,
+            billing_identity=completed_billing_identity,
+            pricing=pricing,
+        )
+        reconciliation = await self._commit_expected_reconciliation(
             reservation,
-            completed_billing_identity,
+            expected,
         )
-        ledger_billing_identity = copy_billing_identity(completed_billing_identity)
-        if ledger_billing_identity is None:
-            reconciliation = await self._budget_ledger.reconcile(
-                reservation_id=reservation.record.reservation_id,
-                actual_amount=actual_amount,
-                reason=reason,
-                occurred_at=occurred_at,
-            )
-        else:
-            reconciliation = await self._budget_ledger.reconcile(
-                reservation_id=reservation.record.reservation_id,
-                actual_amount=actual_amount,
-                reason=reason,
-                occurred_at=occurred_at,
-                billing_identity=ledger_billing_identity,
-            )
-        reconciliation = _validate_ledger_reconciliation(
-            reconciliation,
-            reservation=reservation,
-            expected_status="reconciled",
-            expected_actual_amount=actual_amount,
-            expected_reason=reason,
-            expected_billing_identity=expected_billing_identity,
-        )
-        if len(priced_actuals) == 1:
-            reconciliation = budget_reconciliation_with_pricing(
-                reconciliation,
-                priced_actuals[0].line_item,
-            )
         return reconciliation
 
     async def reconcile_uncertain_operation_reservations(
@@ -2369,19 +3181,16 @@ class RunLimitController:
         reason: str,
     ) -> AsyncIterator[BudgetReconciliation]:
         for reservation in list(reservations):
-            reconciliation = await self._budget_ledger.reconcile(
-                reservation_id=reservation.record.reservation_id,
+            expected = budget_reconciliation_preview(
+                reservation.record,
                 actual_amount=reservation.record.reserved_amount,
+                settlement_kind="conservative",
                 reason=reason,
                 occurred_at=self._clock(),
             )
-            reconciliation = _validate_ledger_reconciliation(
-                reconciliation,
-                reservation=reservation,
-                expected_status="reconciled",
-                expected_actual_amount=reservation.record.reserved_amount,
-                expected_reason=reason,
-                expected_billing_identity=reservation.record.billing_identity,
+            reconciliation = await self._commit_expected_reconciliation(
+                reservation,
+                expected,
             )
             _remove_reservation(reservations, reservation)
             yield reconciliation
@@ -2393,17 +3202,14 @@ class RunLimitController:
         reason: str,
     ) -> AsyncIterator[BudgetReconciliation]:
         for reservation in list(reservations):
-            reconciliation = await self._budget_ledger.release(
-                reservation_id=reservation.record.reservation_id,
+            expected = budget_release_preview(
+                reservation.record,
                 reason=reason,
+                occurred_at=self._clock(),
             )
-            reconciliation = _validate_ledger_reconciliation(
-                reconciliation,
-                reservation=reservation,
-                expected_status="released",
-                expected_actual_amount=None,
-                expected_reason=reason,
-                expected_billing_identity=reservation.record.billing_identity,
+            reconciliation = await self._commit_expected_release(
+                reservation,
+                expected,
             )
             _remove_reservation(reservations, reservation)
             yield reconciliation
@@ -2418,27 +3224,23 @@ class RunLimitController:
         reason: str,
     ) -> AsyncIterator[Event]:
         for reservation in list(reservations):
-            reconciliation = await self._budget_ledger.release(
-                reservation_id=reservation.record.reservation_id,
+            expected = budget_release_preview(
+                reservation.record,
                 reason=reason,
+                occurred_at=self._clock(),
             )
-            reconciliation = _validate_ledger_reconciliation(
-                reconciliation,
-                reservation=reservation,
-                expected_status="released",
-                expected_actual_amount=None,
-                expected_reason=reason,
-                expected_billing_identity=reservation.record.billing_identity,
+            reconciliation = await self._commit_expected_release(
+                reservation,
+                expected,
             )
-            event = await self._event_writer.emit(
-                Event(
-                    type=EventType.BUDGET_RESERVATION_RELEASED,
-                    session_id=session.id,
-                    agent_name=agent_name,
-                    environment_name=environment_name,
-                    payload=budget_reconciliation_payload(reconciliation),
-                )
-            )
+            settlement = await self._load_committed_settlement(reconciliation)
+            if (
+                settlement.session_id != session.id
+                or settlement.agent_name != agent_name
+                or settlement.environment_name != environment_name
+            ):
+                raise RuntimeError("Budget release audit context conflicts with its reservation.")
+            event = await self.publish_budget_settlement(settlement)
             _remove_reservation(reservations, reservation)
             yield event
 

@@ -164,7 +164,6 @@ from cayu.runtime.budgets import (
     _effective_budget_limit_id,
     budget_check_payload,
     budget_limits_for_session,
-    budget_reconciliation_payload,
     budget_reservation_payload,
     copy_request_budget_limits,
     has_deferred_contextual_price,
@@ -1724,7 +1723,12 @@ class SessionEngine:
 
         if not events:
             return None, cancellation
-        fan_out_task = asyncio.create_task(self._event_writer.fan_out_persisted(events))
+
+        async def acknowledge_and_fan_out() -> list[Event]:
+            await self._run_limit_controller.acknowledge_budget_settlement_events(events)
+            return await self._event_writer.fan_out_persisted(events)
+
+        fan_out_task = asyncio.create_task(acknowledge_and_fan_out())
         outcome = await self._await_session_operation_store_task(
             fan_out_task,
             cancellation=cancellation,
@@ -3133,6 +3137,9 @@ class SessionEngine:
                     unresolved_store_tasks=unresolved_attempt_publication_tasks,
                 )
                 attempt_events.clear()
+                await self._run_limit_controller.acknowledge_budget_settlement_events(
+                    persisted_attempt_events
+                )
                 await self._event_writer.fan_out_persisted(persisted_attempt_events)
                 for event in persisted_attempt_events:
                     yielded_attempt_event_ids.add(event.id)
@@ -3189,6 +3196,9 @@ class SessionEngine:
                     unresolved_store_tasks=unresolved_attempt_publication_tasks,
                 )
                 attempt_events.clear()
+                await self._run_limit_controller.acknowledge_budget_settlement_events(
+                    persisted_attempt_events
+                )
                 await self._event_writer.fan_out_persisted(persisted_attempt_events)
                 for event in persisted_attempt_events:
                     yielded_attempt_event_ids.add(event.id)
@@ -3212,6 +3222,7 @@ class SessionEngine:
                     unresolved_store_tasks=unresolved_attempt_publication_tasks,
                 )
                 attempt_events.clear()
+                await self._run_limit_controller.acknowledge_budget_settlement_events(events)
                 await self._event_writer.fan_out_persisted(events)
                 prepublished_dispatch_events.extend(events)
 
@@ -3643,7 +3654,15 @@ class SessionEngine:
 
                 async def tracked_dispatch() -> tuple[str, dict[str, Any]]:
                     nonlocal provider_dispatch_started
+                    deferred_dispatch_failure = (
+                        await self._run_limit_controller.mark_reservations_dispatched(
+                            dispatch_reservations,
+                            dispatch_id=model_attempt_identity.model_attempt_id,
+                        )
+                    )
                     provider_dispatch_started = True
+                    if deferred_dispatch_failure is not None:
+                        raise deferred_dispatch_failure
                     with _compaction_model_attempt_identity_scope(model_attempt_identity):
                         return await dispatch()
 
@@ -4485,6 +4504,7 @@ class SessionEngine:
                     events=failed_events,
                 )
                 operation_published = True
+                await self._run_limit_controller.acknowledge_budget_settlement_events(failed_events)
                 await self._event_writer.fan_out_persisted(failed_events)
             except BaseException as cleanup_error:
                 cleanup_error.add_note(
@@ -4691,6 +4711,7 @@ class SessionEngine:
                 )
                 operation_published = True
                 failure_accounting_published = True
+                await self._run_limit_controller.acknowledge_budget_settlement_events(failed_events)
                 await self._event_writer.fan_out_persisted(failed_events)
 
             async def stop_heartbeat_and_finalize_failed_operation() -> None:
@@ -5618,6 +5639,22 @@ class SessionEngine:
             provider_name=provider_name,
             model=model,
             model_attempt_identity=model_attempt_identity,
+            environment_name=environment_name,
+            settlement_event_payload=self._event_writer.prepare(
+                Event(
+                    type=EventType.BUDGET_RECONCILED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=_application_compaction_causal_payload(
+                        request=request,
+                        operation_id=operation_id,
+                        attempt_id=attempt_id,
+                        source_cursor=request.expected_transcript_cursor,
+                        compactor=compactor,
+                    ),
+                )
+            ).payload,
             billing_identity=billing_identity,
             reservation_identity_guard=reservation_identity_guard,
             rejection_release_reason="compaction budget reservation failed",
@@ -5641,18 +5678,10 @@ class SessionEngine:
         reservations.extend(setup.reservations)
         events.extend(setup.events)
         events.extend(
-            _application_compaction_ledger_event(
-                event_type=EventType.BUDGET_RESERVATION_RELEASED,
-                payload=budget_reconciliation_payload(reconciliation),
-                request=request,
-                operation_id=operation_id,
-                attempt_id=attempt_id,
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                compactor=compactor,
-            )
-            for reconciliation in setup.releases
+            [
+                await self._run_limit_controller.budget_settlement_event(reconciliation)
+                for reconciliation in setup.releases
+            ]
         )
         if setup.error is not None:
             raise setup.error
@@ -5679,17 +5708,7 @@ class SessionEngine:
                 "compaction completed without priced usage; charged reserved amount"
             ),
         ):
-            yield _application_compaction_ledger_event(
-                event_type=EventType.BUDGET_RECONCILED,
-                payload=budget_reconciliation_payload(reconciliation),
-                request=request,
-                operation_id=operation_id,
-                attempt_id=attempt_id,
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                compactor=compactor,
-            )
+            yield await self._run_limit_controller.budget_settlement_event(reconciliation)
 
     async def _reconcile_uncertain_compaction_budget_reservations(
         self,
@@ -5709,17 +5728,7 @@ class SessionEngine:
             reservations,
             reason="compaction reservation lease lost; charged reserved amount",
         ):
-            yield _application_compaction_ledger_event(
-                event_type=EventType.BUDGET_RECONCILED,
-                payload=budget_reconciliation_payload(reconciliation),
-                request=request,
-                operation_id=operation_id,
-                attempt_id=attempt_id,
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                compactor=compactor,
-            )
+            yield await self._run_limit_controller.budget_settlement_event(reconciliation)
 
     async def _release_compaction_budget_reservations(
         self,
@@ -5738,17 +5747,7 @@ class SessionEngine:
             reservations,
             reason=reason,
         ):
-            yield _application_compaction_ledger_event(
-                event_type=EventType.BUDGET_RESERVATION_RELEASED,
-                payload=budget_reconciliation_payload(reconciliation),
-                request=request,
-                operation_id=operation_id,
-                attempt_id=attempt_id,
-                session=session,
-                registered_agent=registered_agent,
-                environment_name=environment_name,
-                compactor=compactor,
-            )
+            yield await self._run_limit_controller.budget_settlement_event(reconciliation)
 
     async def interrupt_session(
         self, request: InterruptSessionRequest

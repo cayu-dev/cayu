@@ -1324,7 +1324,7 @@ class ModelStepExecutor:
         initial_model_attempt_identity: ModelAttemptIdentity | None,
         retry_policy: RetryPolicy,
         transcript_cursor_before_request: int,
-        record_model_completion: Callable[[Event], None],
+        record_model_completion: Callable[[Event], Event],
         prepare_provider_dispatch: Callable[
             [ModelAttemptIdentity],
             Awaitable[tuple[list[Event], BudgetReservationResult | None, Exception | None]],
@@ -1745,7 +1745,7 @@ class ModelStepExecutor:
         max_attempts: int,
         model_attempt_identity: ModelAttemptIdentity,
         transcript_cursor_before_request: int,
-        record_model_completion: Callable[[Event], None],
+        record_model_completion: Callable[[Event], Event],
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
         structured_output: StructuredOutputSpec | None,
@@ -1967,7 +1967,7 @@ class ModelStepExecutor:
                         completion_diagnostics=completion_diagnostics,
                     )
                     if model_completion_publisher is None:
-                        record_model_completion(completion_event)
+                        completion_event = record_model_completion(completion_event)
                         yield await self._event_writer.emit(completion_event), None
                     if completion_terminal_error is not None:
                         provider_control_failure = completion_terminal_error
@@ -2220,8 +2220,7 @@ class ModelStepExecutor:
                     transcript_cursor=completion_dispatch.stage.source_transcript_cursor,
                 )
             )
-            publication_event = self._event_writer.prepare(publication_event)
-            record_model_completion(publication_event)
+            publication_event = record_model_completion(publication_event)
             publication_request = ModelCompletionPublicationRequest(
                 dispatch=completion_dispatch,
                 assistant_step_result=durable_step_result,
@@ -2925,22 +2924,39 @@ class ModelStepRun:
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,
                     )
+                dispatch_fence_attempted = False
+                dispatch_fence_committed = False
                 try:
                     # Preparation may itself be a remote database round trip. Renew
                     # after it commits so a lease cannot expire in the new gap
                     # between durable staging and provider-controlled code.
                     if budget_reservations and controller.reservation_ttl_seconds is not None:
                         await controller.renew_reservations(budget_reservations)
+                    dispatch_fence_attempted = True
+                    deferred_dispatch_failure = await controller.mark_reservations_dispatched(
+                        pending_reservations,
+                        dispatch_id=prepared.stage.stage_id,
+                    )
+                    dispatch_fence_committed = True
                     dispatch = ModelCompletionDispatch(
                         stage=prepared.stage,
                         request_fingerprint=request_fingerprint,
                     )
                     lifecycle.mark_provider_dispatch(pending_model_attempt_identity)
+                    if deferred_dispatch_failure is not None:
+                        raise deferred_dispatch_failure
                 except BaseException as authoritative_exc:
-                    await self._abandon_pre_dispatch_model_stage(
-                        prepared.stage,
-                        authoritative_failure=authoritative_exc,
-                    )
+                    if not dispatch_fence_attempted or dispatch_fence_committed:
+                        await self._abandon_pre_dispatch_model_stage(
+                            prepared.stage,
+                            authoritative_failure=authoritative_exc,
+                        )
+                    else:
+                        add_exception_note_safely(
+                            authoritative_exc,
+                            "The prepared model-completion stage was retained because the "
+                            "budget dispatch fence could not be reconstructed exactly.",
+                        )
                     if isinstance(authoritative_exc, BudgetReservationLeaseLost):
                         raise BudgetReservationLeaseLostBeforeModelDispatch(
                             "Budget reservation lease was lost before model dispatch."
@@ -2948,6 +2964,13 @@ class ModelStepRun:
                     raise
                 next_dispatch_ordinal += 1
                 return dispatch
+
+        def record_model_completion(event: Event) -> Event:
+            return lifecycle.record_model_completion(
+                event,
+                prepare_event=self._executor._event_writer.prepare,
+                settled_at=controller.budget_settlement_time(),
+            )
 
         flow_outcome: ModelStepFlowOutcome | None = None
         model_step_events = self._run_with_context_overflow_recovery(
@@ -2958,7 +2981,7 @@ class ModelStepRun:
             model_step_identity=model_step_identity,
             initial_model_attempt_identity=initial_model_attempt_identity,
             transcript_cursor_before_request=len(messages),
-            record_model_completion=lifecycle.record_model_completion,
+            record_model_completion=record_model_completion,
             settle_provider_dispatch=settle_provider_dispatch,
             prepare_provider_dispatch=prepare_provider_dispatch,
             before_provider_dispatch=before_provider_dispatch,
@@ -3116,7 +3139,7 @@ class ModelStepRun:
         model_step_identity: ModelStepIdentity,
         initial_model_attempt_identity: ModelAttemptIdentity,
         transcript_cursor_before_request: int,
-        record_model_completion: Callable[[Event], None],
+        record_model_completion: Callable[[Event], Event],
         settle_provider_dispatch: Callable[[], Awaitable[tuple[list[Event], Exception | None]]],
         prepare_provider_dispatch: Callable[
             [ModelAttemptIdentity],

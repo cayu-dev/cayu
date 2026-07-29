@@ -247,3 +247,258 @@ async def assert_idempotent_terminal_settlements(
     )
     assert third.accepted is True
     assert third.actual == Decimal("0.22")
+
+
+async def assert_crash_safe_dispatch_and_settlement_outbox(
+    ledger: BudgetLedger,
+    limit: BudgetLimit,
+    *,
+    clock: MutableClock,
+    ttl_seconds: int,
+) -> None:
+    """Exercise the shared dispatch fence and terminal audit-outbox contract."""
+
+    completion_identity = model_attempt_identity()
+    reserved = await ledger.reserve(
+        limit=limit,
+        session_id="sess_crash_safe_completion",
+        agent_name="assistant",
+        environment_name="sandbox",
+        settlement_event_payload={"audit_context": "trusted"},
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=completion_identity,
+    )
+    assert reserved.accepted is True
+    assert reserved.record is not None
+    reserved.record.settlement_event_payload["forged"] = "caller mutation"
+    dispatch_id = f"{completion_identity.model_step_id}:dispatch:0"
+    dispatched_records = await ledger.mark_dispatched(
+        reservation_ids=(reserved.record.reservation_id,),
+        dispatch_id=dispatch_id,
+        dispatched_at=clock.value,
+    )
+    assert len(dispatched_records) == 1
+    dispatched = dispatched_records[0]
+    assert dispatched.dispatch_id == dispatch_id
+    assert await ledger.mark_dispatched(
+        reservation_ids=(reserved.record.reservation_id,),
+        dispatch_id=dispatch_id,
+        dispatched_at=clock.value + timedelta(seconds=1),
+    ) == (dispatched,)
+    with pytest.raises(ValueError, match="Dispatched budget reservation cannot be released"):
+        await ledger.release(
+            reservation_id=reserved.record.reservation_id,
+            reason="must retain post-dispatch capacity",
+        )
+
+    clock.value += timedelta(seconds=ttl_seconds)
+    blocked = await ledger.reserve(
+        limit=limit,
+        session_id="sess_crash_safe_blocked",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert blocked.accepted is False
+
+    reconciled_at = clock.value
+    reconciled, duplicate = await asyncio.gather(
+        ledger.reconcile(
+            reservation_id=reserved.record.reservation_id,
+            actual_amount=Decimal("0.01"),
+            settlement_kind="completed",
+            reason="model completed",
+            occurred_at=reconciled_at,
+        ),
+        ledger.reconcile(
+            reservation_id=reserved.record.reservation_id,
+            actual_amount=Decimal("0.01"),
+            settlement_kind="completed",
+            reason="model completed",
+            occurred_at=reconciled_at,
+        ),
+    )
+    assert duplicate == reconciled
+    assert reconciled.settlement_kind == "completed"
+    settlement = await ledger.load_settlement(reconciled.settlement_id)
+    assert settlement is not None
+    assert settlement.reconciliation == reconciled
+    assert settlement.event.payload["settlement_id"] == reconciled.settlement_id
+    assert settlement.event.payload["actual_amount"] == "0.01"
+    assert settlement.event.payload["audit_context"] == "trusted"
+    assert "forged" not in settlement.event.payload
+    assert settlement.event.environment_name == "sandbox"
+    assert settlement.event_published is False
+    assert await ledger.list_pending_settlements(
+        session_id=reserved.record.session_id,
+    ) == [settlement]
+
+    with pytest.raises(ValueError, match="conflicting settlement"):
+        await ledger.reconcile(
+            reservation_id=reserved.record.reservation_id,
+            actual_amount=Decimal("0.01"),
+            settlement_kind="conservative",
+            reason="model completed",
+            occurred_at=reconciled_at,
+        )
+
+    published = await ledger.mark_settlement_event_published(
+        settlement_id=settlement.settlement_id,
+        event_id=settlement.event.id,
+    )
+    assert published.event_published is True
+    assert (
+        await ledger.mark_settlement_event_published(
+            settlement_id=settlement.settlement_id,
+            event_id=settlement.event.id,
+        )
+        == published
+    )
+    assert await ledger.list_pending_settlements(session_id=reserved.record.session_id) == []
+
+    pending = await ledger.reserve(
+        limit=limit,
+        session_id="sess_crash_safe_predispatch",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert pending.accepted is True
+    assert pending.record is not None
+    clock.value += timedelta(seconds=ttl_seconds)
+    replacement = await ledger.reserve(
+        limit=limit,
+        session_id="sess_crash_safe_replacement",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert replacement.accepted is True
+    pending_releases = await ledger.list_pending_settlements(
+        session_id=pending.record.session_id,
+    )
+    assert len(pending_releases) == 1, pending_releases
+    assert pending_releases[0].settlement_kind == "released"
+    assert pending_releases[0].reconciliation.reason == (
+        f"Reservation expired: not reconciled within {ttl_seconds}s."
+    )
+
+    audit_limit = limit.model_copy(
+        update={"max_estimated_cost": Decimal("2")},
+        deep=True,
+    )
+    conservative = await ledger.reserve(
+        limit=audit_limit,
+        session_id="sess_conservative_settlement",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert conservative.record is not None
+    await ledger.mark_dispatched(
+        reservation_ids=(conservative.record.reservation_id,),
+        dispatch_id="dispatch:conservative",
+    )
+    conservative_reconciliation = await ledger.reconcile(
+        reservation_id=conservative.record.reservation_id,
+        actual_amount=conservative.record.reserved_amount,
+        settlement_kind="conservative",
+        reason="provider usage unknown after dispatch; charged reserved amount",
+        occurred_at=clock.value,
+    )
+    assert (
+        await ledger.reconcile(
+            reservation_id=conservative.record.reservation_id,
+            actual_amount=conservative.record.reserved_amount,
+            settlement_kind="conservative",
+            reason="provider usage unknown after dispatch; charged reserved amount",
+            occurred_at=clock.value + timedelta(seconds=1),
+        )
+        == conservative_reconciliation
+    )
+    conservative_settlement = await ledger.load_settlement(
+        conservative_reconciliation.settlement_id
+    )
+    assert conservative_settlement is not None
+    assert conservative_settlement.settlement_kind == "conservative"
+    assert conservative_settlement.event_published is False
+
+    releasable = await ledger.reserve(
+        limit=audit_limit,
+        session_id="sess_release_settlement",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert releasable.record is not None
+    released = await ledger.release(
+        reservation_id=releasable.record.reservation_id,
+        reason="provider not dispatched",
+    )
+    assert (
+        await ledger.release(
+            reservation_id=releasable.record.reservation_id,
+            reason="provider not dispatched",
+        )
+        == released
+    )
+    release_settlement = await ledger.load_settlement(released.settlement_id)
+    assert release_settlement is not None
+    assert release_settlement.settlement_kind == "released"
+    assert release_settlement.event_published is False
+
+    atomic_limit = limit.model_copy(
+        update={"max_estimated_cost": Decimal("1")},
+        deep=True,
+    )
+    first = await ledger.reserve(
+        limit=atomic_limit,
+        session_id="sess_atomic_dispatch_first",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    second = await ledger.reserve(
+        limit=atomic_limit,
+        session_id="sess_atomic_dispatch_second",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert first.record is not None
+    assert second.record is not None
+    await ledger.mark_dispatched(
+        reservation_ids=(first.record.reservation_id,),
+        dispatch_id="dispatch:atomic:first",
+    )
+    with pytest.raises(ValueError, match="conflicting dispatch"):
+        await ledger.mark_dispatched(
+            reservation_ids=(
+                first.record.reservation_id,
+                second.record.reservation_id,
+            ),
+            dispatch_id="dispatch:atomic:combined",
+        )
+    clock.value += timedelta(seconds=ttl_seconds)
+    trigger_reap = await ledger.reserve(
+        limit=atomic_limit,
+        session_id="sess_atomic_dispatch_trigger",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+        model_attempt_identity=model_attempt_identity(),
+    )
+    assert trigger_reap.accepted is True
+    second_releases = await ledger.list_pending_settlements(
+        session_id=second.record.session_id,
+    )
+    assert len(second_releases) == 1
+    assert second_releases[0].reservation_id == second.record.reservation_id

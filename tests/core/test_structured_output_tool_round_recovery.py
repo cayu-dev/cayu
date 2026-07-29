@@ -215,7 +215,6 @@ async def _publish_structured_model_step(
             dispatch_ordinal=0,
             purpose="assistant-turn",
             intent=intent,
-            reservation_ids=("reservation:structured-output-recovery",),
         ),
         expected_statuses={SessionStatus.RUNNING},
         expected_run_epoch=running.run_epoch,

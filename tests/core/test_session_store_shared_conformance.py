@@ -80,7 +80,15 @@ from cayu.runtime._model_completion_publication import (
     ModelStepPublicationCheckpoint,
 )
 from cayu.runtime.aggregates import estimate_usage_rollup_cost
-from cayu.runtime.budgets import BudgetLimit, BudgetPolicy, BudgetReservation
+from cayu.runtime.budgets import (
+    MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
+    BudgetLimit,
+    BudgetPolicy,
+    BudgetReconciliation,
+    BudgetReservation,
+    budget_reconciliation_payload,
+    budget_settlement_id,
+)
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
@@ -1086,6 +1094,7 @@ def test_session_store_conformance_inspection_requires_exact_model_budget_join(
                             session_id=session_id,
                             payload={
                                 "reservation_id": f"reservation-{case}",
+                                "settlement_kind": "completed",
                                 "budget_limit_id": f"blim_{index:064x}",
                                 "model_step_id": budget_step_id,
                                 "model_attempt_id": model_attempt_id,
@@ -1822,16 +1831,45 @@ def _assistant_model_completion_publication(
     assistant_message: Message | None,
     classification: dict[str, Any] | None = None,
     event_payload: dict[str, Any] | None = None,
+    reservation_ids: tuple[str, ...] = (),
+    include_classification: bool = True,
 ) -> RuntimePublicationRequest:
     if classification is None:
         assert assistant_message is not None
         classification = {"type": "final"}
     transcript_end_cursor = source_transcript_cursor + int(assistant_message is not None)
     completion_payload = {} if event_payload is None else dict(event_payload)
-    completion_payload.update(
-        step_classification=classification,
-        transcript_cursor=transcript_end_cursor,
-    )
+    completion_timestamp = datetime.now(UTC)
+    if reservation_ids:
+        identity_digest = sha256(stage_id.encode()).hexdigest()
+        model_step_id = f"mstep_{identity_digest[:32]}"
+        model_attempt_id = f"matt_{identity_digest[16:48]}"
+        completion_payload.update(
+            model_step_id=model_step_id,
+            model_attempt_id=model_attempt_id,
+        )
+        completion_payload[MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY] = [
+            budget_reconciliation_payload(
+                BudgetReconciliation(
+                    reservation_id=reservation_id,
+                    settlement_id=budget_settlement_id(reservation_id),
+                    settlement_kind="completed",
+                    budget_limit_id=f"blim_{sha256(reservation_id.encode()).hexdigest()}",
+                    model_step_id=model_step_id,
+                    model_attempt_id=model_attempt_id,
+                    status="reconciled",
+                    reserved_amount=Decimal("1"),
+                    actual_amount=Decimal("0"),
+                    released_amount=Decimal("1"),
+                    reason="model completed",
+                    settled_at=completion_timestamp,
+                )
+            )
+            for reservation_id in reservation_ids
+        ]
+    if include_classification:
+        completion_payload["step_classification"] = classification
+    completion_payload["transcript_cursor"] = transcript_end_cursor
     pointer = ModelStepPublicationCheckpoint(
         logical_step_id=logical_step_id,
         stage_id=stage_id,
@@ -1855,6 +1893,7 @@ def _assistant_model_completion_publication(
             Event(
                 id=completion_event_id,
                 type=EventType.MODEL_COMPLETED,
+                timestamp=completion_timestamp,
                 session_id=session_id,
                 payload=completion_payload,
             ),
@@ -4266,6 +4305,7 @@ def test_session_store_conformance_model_completion_stage_reopens_and_promotes_e
                     "step": 1,
                     "usage": {"input_tokens": 4, "output_tokens": 3},
                 },
+                reservation_ids=("reservation-app", "reservation-session"),
             )
             before_completion_session = await store.load(session_id)
             assert before_completion_session is not None
@@ -4464,6 +4504,7 @@ def test_session_store_conformance_model_completion_abandonment_rejects_wrong_di
                 completion_event_id="abandonment-refusal-completed",
                 source_transcript_cursor=0,
                 assistant_message=Message.text("assistant", "terminal evidence"),
+                reservation_ids=("reservation-1",),
             )
             completed = await store.complete_model_completion_stage(
                 session_id,
@@ -5019,6 +5060,7 @@ def test_session_store_conformance_model_completion_stage_preserves_non_turn_com
                     "finish_reason": "stop",
                     "usage": {"input_tokens": 3, "output_tokens": 0},
                 },
+                reservation_ids=("reservation-contentless-attempt",),
             )
             completed = await store.complete_model_completion_stage(
                 session_id,
@@ -5404,19 +5446,17 @@ def test_session_store_conformance_model_completion_stage_fences_conflicts_and_d
                 await store.complete_model_completion_stage(
                     session_id,
                     stage_id=stage_id,
-                    publication=RuntimePublicationRequest(
-                        publication_id=stage_id,
-                        kind="model-step",
+                    publication=_assistant_model_completion_publication(
+                        session_id=session_id,
+                        stage_id=stage_id,
+                        logical_step_id=stage_id,
                         intent={"logical_step": 1},
-                        mutation=runtime_publication_checkpoint_mutation(None, None),
-                        transcript_messages=[],
-                        events=[
-                            Event(
-                                id="unclassified-contentless-completion",
-                                type=EventType.MODEL_COMPLETED,
-                                session_id=session_id,
-                            )
-                        ],
+                        completion_event_id="unclassified-contentless-completion",
+                        source_transcript_cursor=0,
+                        assistant_message=None,
+                        classification={"type": "invalid"},
+                        reservation_ids=("reservation-1",),
+                        include_classification=False,
                     ),
                 )
 
@@ -5466,6 +5506,7 @@ def test_session_store_conformance_model_completion_stage_fences_conflicts_and_d
                 completion_event_id="authoritative-completion",
                 source_transcript_cursor=0,
                 assistant_message=Message.text("assistant", "authoritative"),
+                reservation_ids=("reservation-1",),
             )
             completed = await store.complete_model_completion_stage(
                 session_id,
@@ -5480,6 +5521,7 @@ def test_session_store_conformance_model_completion_stage_fences_conflicts_and_d
                 completion_event_id="contradictory-completion",
                 source_transcript_cursor=0,
                 assistant_message=Message.text("assistant", "contradictory"),
+                reservation_ids=("reservation-1",),
             )
             with pytest.raises(
                 SessionModelCompletionStageConflict,
@@ -5822,6 +5864,7 @@ def test_session_store_conformance_model_completion_stage_allows_trusted_live_re
                 completion_event_id="live-retry-model-completed",
                 source_transcript_cursor=0,
                 assistant_message=Message.text("assistant", "retry succeeded"),
+                reservation_ids=("reservation-attempt-2",),
             )
             await store.complete_model_completion_stage(
                 session_id,
@@ -5852,6 +5895,7 @@ def test_session_store_conformance_model_completion_stage_allows_trusted_live_re
                 completion_event_id="late-first-model-completed",
                 source_transcript_cursor=0,
                 assistant_message=Message.text("assistant", "late first response"),
+                reservation_ids=("reservation-attempt-1",),
             )
             late_completion = await store.complete_model_completion_stage(
                 session_id,
@@ -5926,6 +5970,7 @@ def test_session_store_conformance_model_completion_stage_concurrent_replay(
                 completion_event_id="concurrent-model-completed",
                 source_transcript_cursor=0,
                 assistant_message=Message.text("assistant", "one authoritative answer"),
+                reservation_ids=("reservation-shared",),
             )
 
             async def complete():
@@ -6110,6 +6155,7 @@ def test_session_store_conformance_model_completion_stage_recovers_lost_acknowle
                     "assistant",
                     "committed before cancellation",
                 ),
+                reservation_ids=("reservation-lost-ack",),
             )
 
             original_complete = store._complete_model_completion_stage_atomic

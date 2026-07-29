@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 POSTGRES_CONTENTION_TABLES = (
+    "cayu_budget_settlements",
     "cayu_budget_reservations",
     "cayu_knowledge_embeddings",
     "cayu_knowledge_labels",

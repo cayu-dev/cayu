@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Literal
 
 from cayu.core import Event, EventType
 from cayu.runtime.budgets import (
     BudgetCheck,
+    BudgetReconciliation,
     budget_check_payload,
+    budget_reconciliation_payload,
     project_budget_inspection_event,
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
@@ -38,6 +42,120 @@ def _pricing_evidence(*, model: str = "model") -> dict[str, object]:
         "effective_through": None,
         "tier_max_input_tokens": None,
     }
+
+
+def _reservation_event(*, value: int) -> Event:
+    return Event(
+        type=EventType.BUDGET_RESERVED,
+        session_id="sess_settlement_states",
+        payload={
+            "reservation_id": f"reservation-state-{value}",
+            "budget_limit_id": _budget_limit_id(value),
+            **_model_attempt_identity(value),
+            "scope": "session",
+            "key": None,
+            "window": "all_time",
+            "currency": "USD",
+            "maximum": "1",
+            "action": "interrupt",
+        },
+    )
+
+
+def _reconciliation(
+    *,
+    value: int,
+    kind: Literal["completed", "conservative"],
+) -> BudgetReconciliation:
+    return BudgetReconciliation(
+        reservation_id=f"reservation-state-{value}",
+        settlement_id=f"settlement-state-{value}",
+        settlement_kind=kind,
+        budget_limit_id=_budget_limit_id(value),
+        **_model_attempt_identity(value),
+        status="reconciled",
+        reserved_amount=Decimal("0.50"),
+        actual_amount=Decimal("0.25"),
+        released_amount=Decimal("0.25"),
+        settled_at=datetime(2026, 7, 29, tzinfo=UTC),
+    )
+
+
+def test_budget_inspection_distinguishes_all_settlement_states() -> None:
+    pending = _reservation_event(value=1)
+    completed_unsettled = _reconciliation(value=2, kind="completed")
+    completed = _reconciliation(value=3, kind="completed")
+    conservative = _reconciliation(value=4, kind="conservative")
+    released = _reservation_event(value=5)
+
+    budget_events = [
+        pending,
+        *(_reservation_event(value=value) for value in range(2, 5)),
+        Event(
+            type=EventType.BUDGET_RECONCILED,
+            session_id="sess_settlement_states",
+            payload={
+                **budget_reconciliation_payload(completed),
+                "pricing": _pricing_evidence(),
+            },
+        ),
+        Event(
+            type=EventType.BUDGET_RECONCILED,
+            session_id="sess_settlement_states",
+            payload={
+                **budget_reconciliation_payload(conservative),
+                "pricing": _pricing_evidence(),
+            },
+        ),
+        released,
+        Event(
+            type=EventType.BUDGET_RESERVATION_RELEASED,
+            session_id="sess_settlement_states",
+            payload={
+                "reservation_id": "reservation-state-5",
+                "settlement_kind": "released",
+                "budget_limit_id": _budget_limit_id(5),
+                **_model_attempt_identity(5),
+            },
+        ),
+    ]
+    terminal_events = [
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_settlement_states",
+            payload={
+                **_model_attempt_identity(2),
+                "budget_settlements": [budget_reconciliation_payload(completed_unsettled)],
+            },
+        ),
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_settlement_states",
+            payload={
+                **_model_attempt_identity(3),
+                "budget_settlements": [budget_reconciliation_payload(completed)],
+            },
+        ),
+        Event(
+            type=EventType.MODEL_ERROR,
+            session_id="sess_settlement_states",
+            payload=_model_attempt_identity(4),
+        ),
+    ]
+
+    inspection = session_budget_inspection(
+        [project_budget_inspection_event(event) for event in budget_events],
+        model_attempt_terminal_events=[
+            project_budget_model_attempt_inspection_event(event) for event in terminal_events
+        ],
+    )
+
+    assert inspection.pending_reservation_count == 1
+    assert inspection.completed_unsettled_reservation_count == 1
+    assert inspection.reconciled_reservation_count == 1
+    assert inspection.conservative_reconciliation_count == 1
+    assert inspection.released_reservation_count == 1
+    assert inspection.cost_state == "partial"
 
 
 def test_budget_inspection_uses_latest_fully_priced_checks_without_reservations() -> None:
@@ -215,6 +333,7 @@ def test_budget_inspection_does_not_double_count_parallel_limit_ledgers() -> Non
                         session_id="sess_parallel_limits",
                         payload={
                             "reservation_id": reservation_id,
+                            "settlement_kind": "completed",
                             "budget_limit_id": budget_limit_id,
                             **_model_attempt_identity(1),
                             "actual_amount": "0.25",
@@ -260,6 +379,7 @@ def test_budget_inspection_does_not_leak_a_currency_for_mixed_attempts() -> None
                     session_id="sess_mixed_attempt_currencies",
                     payload={
                         "reservation_id": reservation_id,
+                        "settlement_kind": "completed",
                         "budget_limit_id": budget_limit_id,
                         **identity,
                         "actual_amount": "0.25",
@@ -300,6 +420,7 @@ def test_budget_inspection_marks_malformed_reservation_evidence_partial() -> Non
             session_id="sess_malformed_evidence",
             payload={
                 "reservation_id": "reservation-valid",
+                "settlement_kind": "completed",
                 "budget_limit_id": budget_limit_id,
                 **_model_attempt_identity(1),
                 "actual_amount": "0.25",
@@ -348,6 +469,7 @@ def test_budget_inspection_projection_fails_closed_for_malformed_accounting() ->
             session_id="sess_malformed_projection",
             payload={
                 "reservation_id": reservation_id,
+                "settlement_kind": "completed",
                 "budget_limit_id": budget_limit_id,
                 **attempt_identity,
                 "scope": "session",
@@ -370,6 +492,7 @@ def test_budget_inspection_projection_fails_closed_for_malformed_accounting() ->
             session_id="sess_malformed_projection",
             payload={
                 "reservation_id": reservation_id,
+                "settlement_kind": "completed",
                 "budget_limit_id": budget_limit_id,
                 **identity,
                 "actual_amount": actual_amount,
@@ -463,6 +586,7 @@ def test_budget_inspection_requires_exactly_one_terminal_settlement_per_reservat
             session_id="sess_terminal_coverage",
             payload={
                 "reservation_id": f"reservation-{index}",
+                "settlement_kind": "released",
                 "budget_limit_id": _budget_limit_id(index),
                 **attempt_identity,
                 "scope": "session",
@@ -477,6 +601,9 @@ def test_budget_inspection_requires_exactly_one_terminal_settlement_per_reservat
     def terminal(index: int, event_type: EventType) -> Event:
         payload: dict[str, object] = {
             "reservation_id": f"reservation-{index}",
+            "settlement_kind": (
+                "completed" if event_type == EventType.BUDGET_RECONCILED else "released"
+            ),
             "budget_limit_id": _budget_limit_id(index),
             **identity,
         }
@@ -597,6 +724,7 @@ def test_budget_inspection_rejects_cross_limit_settlement() -> None:
                 session_id="sess_cross_limit",
                 payload={
                     "reservation_id": "reservation-cross-limit",
+                    "settlement_kind": "completed",
                     "budget_limit_id": settlement_limit_id,
                     **_model_attempt_identity(1),
                     "actual_amount": "0.25",
@@ -634,6 +762,7 @@ def test_budget_inspection_requires_exact_model_terminal_join() -> None:
             session_id="sess_model_terminal_join",
             payload={
                 "reservation_id": "reservation-model-terminal-join",
+                "settlement_kind": "completed",
                 "budget_limit_id": budget_limit_id,
                 **identity,
                 "actual_amount": "0.25",
@@ -743,6 +872,7 @@ def test_budget_inspection_sums_distinct_attempts_without_amount_heuristics() ->
                     session_id="sess_distinct_attempts",
                     payload={
                         "reservation_id": reservation_id,
+                        "settlement_kind": "completed",
                         "budget_limit_id": budget_limit_id,
                         **identity,
                         "actual_amount": amount,
@@ -772,6 +902,7 @@ def test_budget_inspection_rejects_conflicting_costs_for_one_attempt() -> None:
                     session_id="sess_conflicting_attempt_cost",
                     payload={
                         "reservation_id": reservation_id,
+                        "settlement_kind": "completed",
                         "budget_limit_id": budget_limit_id,
                         **identity,
                         "scope": "session",
@@ -788,6 +919,7 @@ def test_budget_inspection_rejects_conflicting_costs_for_one_attempt() -> None:
                     session_id="sess_conflicting_attempt_cost",
                     payload={
                         "reservation_id": reservation_id,
+                        "settlement_kind": "completed",
                         "budget_limit_id": budget_limit_id,
                         **identity,
                         "actual_amount": amount,
@@ -835,6 +967,7 @@ def test_budget_inspection_rejects_one_attempt_id_attached_to_two_steps() -> Non
                     session_id="sess_conflicting_attempt_parent",
                     payload={
                         "reservation_id": reservation_id,
+                        "settlement_kind": "completed",
                         "budget_limit_id": budget_limit_id,
                         **identity,
                         "actual_amount": "0.25",
@@ -901,6 +1034,7 @@ def test_budget_inspection_rejects_malformed_failure_alongside_priced_reservatio
             session_id="sess_malformed_failure_with_reservation",
             payload={
                 "reservation_id": "reservation-valid",
+                "settlement_kind": "completed",
                 "budget_limit_id": _budget_limit_id(1),
                 **identity,
                 "actual_amount": "0.25",
@@ -959,6 +1093,7 @@ def test_budget_inspection_rejects_failure_outcomes_that_contradict_an_attempt()
             session_id="sess_contradictory_failure",
             payload={
                 "reservation_id": f"reservation-{limit_index}",
+                "settlement_kind": "completed",
                 "budget_limit_id": _budget_limit_id(limit_index),
                 **identity,
                 "actual_amount": "0.25",
@@ -1006,6 +1141,7 @@ def test_budget_inspection_accepts_released_siblings_before_reservation_failure(
             session_id="sess_released_before_failure",
             payload={
                 "reservation_id": "reservation-released",
+                "settlement_kind": "released",
                 "budget_limit_id": _budget_limit_id(1),
                 **identity,
                 "scope": "session",
@@ -1035,6 +1171,7 @@ def test_budget_inspection_accepts_released_siblings_before_reservation_failure(
             session_id="sess_released_before_failure",
             payload={
                 "reservation_id": "reservation-released",
+                "settlement_kind": "released",
                 "budget_limit_id": _budget_limit_id(1),
                 **identity,
             },
@@ -1108,6 +1245,7 @@ def test_budget_inspection_rejects_invalid_limit_descriptor_contracts() -> None:
                 session_id="sess_invalid_descriptor",
                 payload={
                     "reservation_id": reservation_id,
+                    "settlement_kind": "completed",
                     "budget_limit_id": budget_limit_id,
                     **identity,
                     "actual_amount": "0.25",
@@ -1150,6 +1288,7 @@ def test_budget_inspection_rejects_unrepresentable_decimal_totals() -> None:
             session_id="sess_extreme_decimal",
             payload={
                 "reservation_id": reservation_id,
+                "settlement_kind": "completed",
                 "budget_limit_id": budget_limit_id,
                 **identity,
                 "actual_amount": "1E+999999999",

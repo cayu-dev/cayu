@@ -69,6 +69,7 @@ def _request(agent_name: str) -> RunRequest:
 
 
 _TABLES = (
+    "cayu_budget_settlements",
     "cayu_budget_reservations",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
@@ -246,6 +247,12 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             await cur.execute("SELECT to_regclass('idx_cayu_sessions_parent_created_id')")
             assert (await cur.fetchone())[0] == "idx_cayu_sessions_parent_created_id"
             await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 25"
+            )
+            assert await cur.fetchone() == ("breaking", 25)
+            await cur.execute("SELECT to_regclass('cayu_budget_settlements')")
+            assert (await cur.fetchone())[0] == "cayu_budget_settlements"
+            await cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "
                 "AND table_name = 'cayu_budget_reservations' "
@@ -262,6 +269,21 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             assert await cur.fetchall() == [
                 ("model_attempt_id",),
                 ("model_step_id",),
+            ]
+            await cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_budget_reservations' "
+                "AND column_name IN ("
+                "'environment_name', 'settlement_event_payload', "
+                "'dispatch_id', 'dispatched_at'"
+                ") ORDER BY column_name"
+            )
+            assert await cur.fetchall() == [
+                ("dispatch_id",),
+                ("dispatched_at",),
+                ("environment_name",),
+                ("settlement_event_payload",),
             ]
             await cur.execute(
                 "SELECT EXISTS(SELECT 1 FROM pg_trigger "

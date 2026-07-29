@@ -2211,8 +2211,8 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         "status_reason",
         "status_payload_json",
     }.issubset(task_columns)
-    # Revisions 2-7, 11-16, 20, and 24 are additive. Revisions 17-19 and 21-23
-    # change durable writer/reader contracts and therefore raise the
+    # Revisions 2-7, 11-16, 20, and 24 are additive. Revisions 17-19, 21-23,
+    # and 25 change durable writer/reader contracts and therefore raise the
     # compatibility floor.
     assert revisions == [(rev.revision, rev.compatible_from) for rev in schema_migrations.REVISIONS]
     assert revisions == [
@@ -2240,6 +2240,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (22, 22),
         (23, 23),
         (24, 23),
+        (25, 25),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

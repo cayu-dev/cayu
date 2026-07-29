@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -225,6 +226,8 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        environment_name: str | None = None,
+        settlement_event_payload: dict[str, Any] | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         self.reserve_calls += 1
@@ -237,6 +240,8 @@ class _CancelSecondReservationLedger(InMemoryBudgetLedger):
             provider_name=provider_name,
             model=model,
             model_attempt_identity=model_attempt_identity,
+            environment_name=environment_name,
+            settlement_event_payload=settlement_event_payload,
             effective_at=effective_at,
         )
         if result.record is not None:
@@ -271,6 +276,8 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        environment_name: str | None = None,
+        settlement_event_payload: dict[str, Any] | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
         result = await super().reserve(
@@ -280,6 +287,8 @@ class _CancelFirstHeartbeatLedger(InMemoryBudgetLedger):
             provider_name=provider_name,
             model=model,
             model_attempt_identity=model_attempt_identity,
+            environment_name=environment_name,
+            settlement_event_payload=settlement_event_payload,
             effective_at=effective_at,
         )
         if result.record is not None:
@@ -306,6 +315,7 @@ class _FailSecondReconcileLedger(InMemoryBudgetLedger):
         actual_amount: Decimal,
         reason: str | None = None,
         occurred_at: datetime | None = None,
+        **kwargs,
     ):
         self.reconcile_calls += 1
         if self.reconcile_calls == 2:
@@ -315,6 +325,7 @@ class _FailSecondReconcileLedger(InMemoryBudgetLedger):
             actual_amount=actual_amount,
             reason=reason,
             occurred_at=occurred_at,
+            **kwargs,
         )
 
 

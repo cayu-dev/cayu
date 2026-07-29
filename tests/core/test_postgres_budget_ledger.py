@@ -12,6 +12,7 @@ from decimal import Decimal
 
 import pytest
 from tests.core._budget_ledger_contract import (
+    assert_crash_safe_dispatch_and_settlement_outbox,
     assert_idempotent_terminal_settlements,
     assert_portable_text_boundaries,
     assert_reservation_identity_collision_is_rejected,
@@ -32,6 +33,7 @@ from cayu.runtime.sessions import BudgetReservationIdentityConflict
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_budget_settlements",
     "cayu_budget_reservations",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
@@ -186,6 +188,101 @@ def test_postgres_budget_ledger_terminal_settlements_are_idempotent(postgres_dsn
     _run(postgres_dsn, ops, clock=clock)
 
 
+def test_postgres_budget_ledger_has_crash_safe_settlement_outbox(postgres_dsn) -> None:
+    clock = MutableClock(datetime(2026, 1, 1, tzinfo=UTC))
+
+    async def ops(ledger):
+        await assert_crash_safe_dispatch_and_settlement_outbox(
+            ledger,
+            _reservation_budget_limit(max_cost="0.25"),
+            clock=clock,
+            ttl_seconds=60,
+        )
+
+    _run(
+        postgres_dsn,
+        ops,
+        clock=clock,
+        reservation_ttl_seconds=60,
+    )
+
+
+def test_postgres_revision_twenty_five_refuses_ambiguous_active_reservations(
+    postgres_dsn,
+) -> None:
+    async def verify_rejection() -> None:
+        import psycopg
+
+        from cayu import PostgresBudgetLedger
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_all(postgres_dsn)
+        creator = PostgresBudgetLedger(
+            postgres_dsn,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            result = await creator.reserve(
+                limit=_reservation_budget_limit(),
+                session_id="sess_active_revision_25",
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+                model_attempt_identity=model_attempt_identity(),
+            )
+            assert result.accepted is True
+        finally:
+            await creator.close()
+
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE cayu_budget_settlements")
+                await cur.execute(
+                    "ALTER TABLE cayu_budget_reservations "
+                    "DROP COLUMN environment_name, "
+                    "DROP COLUMN settlement_event_payload, "
+                    "DROP COLUMN dispatch_id, "
+                    "DROP COLUMN dispatched_at"
+                )
+                await cur.execute("DELETE FROM cayu_schema_migrations WHERE revision = 25")
+            await conn.commit()
+
+        migrator = PostgresBudgetLedger(
+            postgres_dsn,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            with pytest.raises(
+                psycopg.errors.RaiseException,
+                match="cannot migrate active budget reservations",
+            ):
+                await migrator.load_settlement("settlement-probe")
+        finally:
+            await migrator.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute("SELECT revision FROM cayu_schema_migrations WHERE revision = 25")
+            assert await cur.fetchone() is None
+            await cur.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_budget_reservations' "
+                "AND column_name IN ('dispatch_id', 'dispatched_at')"
+            )
+            assert await cur.fetchall() == []
+
+    async def scenario() -> None:
+        try:
+            await verify_rejection()
+        finally:
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(scenario())
+
+
 def test_postgres_budget_ledger_rejects_reservation_identity_collision(postgres_dsn) -> None:
     async def ops(ledger):
         await assert_reservation_identity_collision_is_rejected(
@@ -328,6 +425,11 @@ def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
             existing = await _reserve(creator, limit, "sess_legacy")
             assert existing.record is not None
             reservation_id = existing.record.reservation_id
+            await creator.reconcile(
+                reservation_id=reservation_id,
+                actual_amount=Decimal("0.01"),
+                reason="terminal before schema migration",
+            )
         finally:
             await creator.close()
 
@@ -369,7 +471,7 @@ def test_postgres_budget_ledger_does_not_infer_identity_for_existing_rows(
                 "WHERE reservation_id = %s",
                 (reservation_id,),
             )
-            assert await cur.fetchone() == (None, "active")
+            assert await cur.fetchone() == (None, "reconciled")
 
     asyncio.run(runner())
 
@@ -549,7 +651,7 @@ def test_postgres_budget_ledger_uses_reconciliation_time_for_calendar_window(
     assert active.actual == Decimal("0.44")
 
 
-def test_postgres_budget_ledger_reaps_expired_active_reservations(postgres_dsn) -> None:
+def test_postgres_budget_ledger_does_not_reap_dispatched_reservations(postgres_dsn) -> None:
     clock = MutableClock(datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
 
     async def ops(ledger):
@@ -557,20 +659,29 @@ def test_postgres_budget_ledger_reaps_expired_active_reservations(postgres_dsn) 
         orphaned = await _reserve(ledger, limit, "sess_orphaned")
         assert orphaned.accepted is True
         assert orphaned.record is not None
+        await ledger.mark_dispatched(
+            reservation_ids=(orphaned.record.reservation_id,),
+            dispatch_id="dispatch:postgres:expired",
+        )
         clock.value = datetime(2026, 1, 1, 12, 1, tzinfo=UTC)
-        recovered = await _reserve(ledger, limit, "sess_recovered")
-        # V3: reconciling a reservation reaped while still in flight records the actual
-        # spend instead of crashing the billed run (which would also undercount).
+        blocked = await _reserve(ledger, limit, "sess_blocked")
         reconciled = await ledger.reconcile(
             reservation_id=orphaned.record.reservation_id,
             actual_amount=Decimal("0.01"),
         )
-        return recovered, reconciled
+        recovered = await _reserve(ledger, limit, "sess_recovered")
+        return blocked, reconciled, recovered
 
-    recovered, reconciled = _run(postgres_dsn, ops, clock=clock, reservation_ttl_seconds=60)
+    blocked, reconciled, recovered = _run(
+        postgres_dsn,
+        ops,
+        clock=clock,
+        reservation_ttl_seconds=60,
+    )
 
+    assert blocked.accepted is False
     assert recovered.accepted is True
-    assert recovered.actual == Decimal("0.22")
+    assert recovered.actual == Decimal("0.23")
     assert reconciled.status == "reconciled"
     assert reconciled.actual_amount == Decimal("0.01")
 

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, Literal
 
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -14,21 +15,26 @@ from cayu._validation import (
 from cayu._validation import (
     require_nonblank,
 )
-from cayu.core.billing import BillingIdentity
+from cayu.core.billing import BillingIdentity, copy_billing_identity
 from cayu.runtime.budgets import (
     DEFAULT_RESERVATION_TTL_SECONDS,
     BudgetLedger,
     BudgetLimit,
     BudgetReconciliation,
+    BudgetReconciliationPricing,
     BudgetReservationIdentityConflict,
     BudgetReservationRecord,
     BudgetReservationResult,
+    BudgetSettlementCursor,
+    BudgetSettlementFallback,
+    BudgetSettlementRecord,
     _budget_reservation_amount,
+    _budget_settlement_record,
     _clock_or_utc_now,
+    _copy_budget_settlement_cursor,
     _EffectiveBudgetLimit,
     _ensure_effective_budget_limit,
     _expired_reservation_reason,
-    _is_expired_reservation_reason,
     _reconciled_record,
     _reconciliation_from_record,
     _released_record,
@@ -36,7 +42,11 @@ from cayu.runtime.budgets import (
     _reservation_result,
     _utc_datetime,
     _validate_amount,
+    _validate_reservation_id_batch,
     _validate_reservation_ttl,
+    _validate_settlement_page_limit,
+    copy_budget_settlement_fallback,
+    new_budget_reservation_id,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -46,7 +56,7 @@ from cayu.runtime.execution_units import (
 from . import _sqlite_support as sqlite_support
 from . import migrations as schema
 
-_SQLITE_MIN_REQUIRED_REVISION = 23
+_SQLITE_MIN_REQUIRED_REVISION = 25
 
 
 class SQLiteBudgetLedger(BudgetLedger):
@@ -145,15 +155,25 @@ class SQLiteBudgetLedger(BudgetLedger):
     async def reserve(
         self,
         *,
+        reservation_id: str | None = None,
         limit: BudgetLimit,
         session_id: str,
         agent_name: str,
         provider_name: str,
         model: str,
         model_attempt_identity: ModelAttemptIdentity,
+        environment_name: str | None = None,
+        settlement_event_payload: dict[str, Any] | None = None,
+        settlement_fallback: BudgetSettlementFallback | None = None,
+        requested_amount: Decimal | None = None,
         billing_identity: BillingIdentity | None = None,
         effective_at: datetime | None = None,
     ) -> BudgetReservationResult:
+        reservation_id = (
+            new_budget_reservation_id()
+            if reservation_id is None
+            else require_clean_nonblank(reservation_id, "reservation_id")
+        )
         limit = _ensure_effective_budget_limit(
             limit,
             identity_namespace="app_policy",
@@ -163,25 +183,45 @@ class SQLiteBudgetLedger(BudgetLedger):
         provider_name = require_clean_nonblank(provider_name, "provider_name")
         model = require_clean_nonblank(model, "model")
         model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
+        durable_billing_identity = copy_billing_identity(billing_identity)
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 now = self._clock()
+                durable_settlement_fallback = (
+                    BudgetSettlementFallback(
+                        settled_at=now,
+                        expiration_reason=(
+                            None
+                            if self._reservation_ttl_seconds is None
+                            else _expired_reservation_reason(self._reservation_ttl_seconds)
+                        ),
+                    )
+                    if settlement_fallback is None
+                    else copy_budget_settlement_fallback(settlement_fallback)
+                )
                 pricing_effective_at = (
                     now if effective_at is None else _utc_datetime(effective_at, "effective_at")
                 )
-                requested = _budget_reservation_amount(
-                    limit=limit,
-                    provider_name=provider_name,
-                    model=model,
-                    effective_at=pricing_effective_at,
-                    billing_identity=billing_identity,
+                requested = (
+                    _budget_reservation_amount(
+                        limit=limit,
+                        provider_name=provider_name,
+                        model=model,
+                        effective_at=pricing_effective_at,
+                        billing_identity=durable_billing_identity,
+                    )
+                    if requested_amount is None
+                    else _validate_amount(requested_amount, "requested_amount")
                 )
                 self._reap_expired_unlocked(now, limit=limit)
                 current = self._used_amount_unlocked(limit, now=now)
                 projected = current + requested
                 if projected > limit.max_estimated_cost:
-                    self._connection.rollback()
+                    # Reaping is an independent terminal transition with its
+                    # own outbox evidence. Preserve it even when the new
+                    # reservation is rejected.
+                    self._connection.commit()
                     return _reservation_result(
                         limit=limit,
                         model_attempt_identity=model_attempt_identity,
@@ -195,6 +235,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                     )
 
                 record = BudgetReservationRecord(
+                    reservation_id=reservation_id,
                     budget_limit_id=limit.budget_limit_id,
                     model_step_id=model_attempt_identity.model_step_id,
                     model_attempt_id=model_attempt_identity.model_attempt_id,
@@ -204,9 +245,12 @@ class SQLiteBudgetLedger(BudgetLedger):
                     currency=limit.currency,
                     session_id=session_id,
                     agent_name=agent_name,
+                    environment_name=environment_name,
                     provider_name=provider_name,
                     model=model,
-                    billing_identity=billing_identity,
+                    billing_identity=durable_billing_identity,
+                    settlement_event_payload=settlement_event_payload or {},
+                    settlement_fallback=durable_settlement_fallback,
                     reserved_amount=requested,
                     created_at=now,
                     updated_at=now,
@@ -233,6 +277,55 @@ class SQLiteBudgetLedger(BudgetLedger):
                     record=record,
                 )
             except Exception:
+                self._connection.rollback()
+                raise
+
+    async def mark_dispatched(
+        self,
+        *,
+        reservation_ids: tuple[str, ...],
+        dispatch_id: str,
+        dispatched_at: datetime | None = None,
+    ) -> tuple[BudgetReservationRecord, ...]:
+        reservation_ids = _validate_reservation_id_batch(reservation_ids)
+        dispatch_id = require_clean_nonblank(dispatch_id, "dispatch_id")
+        marked_at = (
+            sqlite_support.parse_datetime(sqlite_support.format_datetime(dispatched_at))
+            if dispatched_at is not None
+            else self._clock()
+        )
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                records = tuple(
+                    self._load_record_unlocked(reservation_id) for reservation_id in reservation_ids
+                )
+                for record in records:
+                    if record.dispatch_id is not None and record.dispatch_id != dispatch_id:
+                        raise ValueError(
+                            "Budget reservation has a conflicting dispatch: "
+                            f"{record.reservation_id}"
+                        )
+                    if record.dispatch_id is None and record.status != "active":
+                        raise ValueError(
+                            f"Budget reservation is not active: {record.reservation_id}"
+                        )
+                dispatched_records = tuple(
+                    (
+                        record
+                        if record.dispatch_id is not None
+                        else record.model_copy(
+                            update={"dispatch_id": dispatch_id, "dispatched_at": marked_at},
+                            deep=True,
+                        )
+                    )
+                    for record in records
+                )
+                for record in dispatched_records:
+                    self._update_record_unlocked(record)
+                self._connection.commit()
+                return dispatched_records
+            except BaseException:
                 self._connection.rollback()
                 raise
 
@@ -263,9 +356,11 @@ class SQLiteBudgetLedger(BudgetLedger):
         *,
         reservation_id: str,
         actual_amount: Decimal,
+        settlement_kind: Literal["completed", "conservative"] = "completed",
         reason: str | None = None,
         occurred_at: datetime | None = None,
         billing_identity: BillingIdentity | None = None,
+        pricing: BudgetReconciliationPricing | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         actual_amount = _validate_amount(actual_amount, "actual_amount")
@@ -285,9 +380,16 @@ class SQLiteBudgetLedger(BudgetLedger):
                     updated_at=reconciled_at,
                     billing_identity=billing_identity,
                 )
+                reconciliation = _reconciliation_from_record(
+                    reconciled,
+                    settlement_kind=settlement_kind,
+                    pricing=pricing,
+                )
+                settlement = _budget_settlement_record(record, reconciliation)
+                self._insert_or_validate_settlement_unlocked(settlement)
                 self._update_record_unlocked(reconciled)
                 self._connection.commit()
-                return _reconciliation_from_record(reconciled)
+                return reconciliation
             except Exception:
                 self._connection.rollback()
                 raise
@@ -297,10 +399,13 @@ class SQLiteBudgetLedger(BudgetLedger):
         *,
         reservation_id: str,
         reason: str,
+        occurred_at: datetime | None = None,
     ) -> BudgetReconciliation:
         reservation_id = require_clean_nonblank(reservation_id, "reservation_id")
         reason = require_clean_nonblank(reason, "reason")
-        released_at = self._clock()
+        released_at = (
+            _utc_datetime(occurred_at, "occurred_at") if occurred_at is not None else self._clock()
+        )
         async with self._lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -310,9 +415,115 @@ class SQLiteBudgetLedger(BudgetLedger):
                     reason=reason,
                     updated_at=released_at,
                 )
+                reconciliation = _reconciliation_from_record(
+                    released,
+                    settlement_kind="released",
+                )
+                settlement = _budget_settlement_record(record, reconciliation)
+                self._insert_or_validate_settlement_unlocked(settlement)
                 self._update_record_unlocked(released)
                 self._connection.commit()
-                return _reconciliation_from_record(released)
+                return reconciliation
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    async def load_settlement(self, settlement_id: str) -> BudgetSettlementRecord | None:
+        settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
+        async with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT settlement_json, event_published
+                FROM cayu_budget_settlements
+                WHERE settlement_id = ?
+                """,
+                (settlement_id,),
+            ).fetchone()
+            return None if row is None else self._settlement_from_row(row)
+
+    async def list_pending_settlements(
+        self,
+        *,
+        session_id: str | None = None,
+        after: BudgetSettlementCursor | None = None,
+        limit: int = 100,
+    ) -> list[BudgetSettlementRecord]:
+        if session_id is not None:
+            session_id = require_clean_nonblank(session_id, "session_id")
+        after = _copy_budget_settlement_cursor(after)
+        limit = _validate_settlement_page_limit(limit)
+        async with self._lock:
+            filters = ["event_published = 0"]
+            parameters: list[object] = []
+            if session_id is not None:
+                filters.append("session_id = ?")
+                parameters.append(session_id)
+            if after is not None:
+                formatted_settled_at = sqlite_support.format_datetime(after.settled_at)
+                filters.append("(settled_at > ? OR (settled_at = ? AND settlement_id > ?))")
+                parameters.extend(
+                    [
+                        formatted_settled_at,
+                        formatted_settled_at,
+                        after.settlement_id,
+                    ]
+                )
+            parameters.append(limit)
+            rows = self._connection.execute(
+                """
+                SELECT settlement_json, event_published
+                FROM cayu_budget_settlements
+                WHERE """
+                + " AND ".join(filters)
+                + """
+                ORDER BY settled_at, settlement_id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            return [self._settlement_from_row(row) for row in rows]
+
+    async def mark_settlement_event_published(
+        self,
+        *,
+        settlement_id: str,
+        event_id: str,
+    ) -> BudgetSettlementRecord:
+        settlement_id = require_clean_nonblank(settlement_id, "settlement_id")
+        event_id = require_clean_nonblank(event_id, "event_id")
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                row = self._connection.execute(
+                    """
+                    SELECT settlement_json, event_published
+                    FROM cayu_budget_settlements
+                    WHERE settlement_id = ?
+                    """,
+                    (settlement_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Budget settlement not found: {settlement_id}")
+                settlement = self._settlement_from_row(row)
+                if settlement.event.id != event_id:
+                    raise ValueError(
+                        "Budget settlement event acknowledgement has conflicting identity."
+                    )
+                if not settlement.event_published:
+                    self._connection.execute(
+                        """
+                        UPDATE cayu_budget_settlements
+                        SET event_published = 1
+                        WHERE settlement_id = ?
+                        """,
+                        (settlement_id,),
+                    )
+                    settlement = settlement.model_copy(
+                        update={"event_published": True},
+                        deep=True,
+                    )
+                self._connection.commit()
+                return settlement
             except Exception:
                 self._connection.rollback()
                 raise
@@ -406,26 +617,39 @@ class SQLiteBudgetLedger(BudgetLedger):
         if self._reservation_ttl_seconds is None:
             return
         cutoff = now - timedelta(seconds=self._reservation_ttl_seconds)
-        # Keep the matching dimensions and inclusive expiry boundary aligned with
-        # _reservation_matches_limit() and _reservation_is_expired(). ``IS`` keeps
-        # the nullable budget key comparison null-safe in SQLite.
-        self._connection.execute(
+        rows = self._connection.execute(
             """
-            UPDATE cayu_budget_reservations
-            SET status = 'released',
-                reason = ?,
-                updated_at = ?
+            SELECT reservation_id
+            FROM cayu_budget_reservations
             WHERE status = 'active'
+              AND dispatch_id IS NULL
               AND updated_at <= ?
               AND budget_limit_id = ?
+            ORDER BY reservation_id
             """,
             (
-                _expired_reservation_reason(self._reservation_ttl_seconds),
-                sqlite_support.format_datetime(now),
                 sqlite_support.format_datetime(cutoff),
                 limit.budget_limit_id,
             ),
-        )
+        ).fetchall()
+        for row in rows:
+            record = self._load_record_unlocked(row["reservation_id"])
+            released = _released_record(
+                record,
+                reason=(
+                    record.settlement_fallback.expiration_reason
+                    or _expired_reservation_reason(self._reservation_ttl_seconds)
+                ),
+                updated_at=record.settlement_fallback.settled_at,
+            )
+            reconciliation = _reconciliation_from_record(
+                released,
+                settlement_kind="released",
+            )
+            self._insert_or_validate_settlement_unlocked(
+                _budget_settlement_record(record, reconciliation)
+            )
+            self._update_record_unlocked(released)
 
     def _insert_record_unlocked(self, record: BudgetReservationRecord) -> None:
         now = sqlite_support.format_datetime(record.created_at)
@@ -443,9 +667,14 @@ class SQLiteBudgetLedger(BudgetLedger):
                 currency,
                 session_id,
                 agent_name,
+                environment_name,
                 provider_name,
                 model,
                 billing_identity_json,
+                settlement_event_payload_json,
+                settlement_fallback_json,
+                dispatch_id,
+                dispatched_at,
                 reserved_amount,
                 actual_amount,
                 status,
@@ -453,7 +682,7 @@ class SQLiteBudgetLedger(BudgetLedger):
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.reservation_id,
@@ -466,12 +695,21 @@ class SQLiteBudgetLedger(BudgetLedger):
                 record.currency,
                 record.session_id,
                 record.agent_name,
+                record.environment_name,
                 record.provider_name,
                 record.model,
                 (
                     None
                     if record.billing_identity is None
                     else record.billing_identity.model_dump_json()
+                ),
+                sqlite_support.json_dumps(record.settlement_event_payload),
+                record.settlement_fallback.model_dump_json(),
+                record.dispatch_id,
+                (
+                    None
+                    if record.dispatched_at is None
+                    else sqlite_support.format_datetime(record.dispatched_at)
                 ),
                 str(record.reserved_amount),
                 None if record.actual_amount is None else str(record.actual_amount),
@@ -489,6 +727,8 @@ class SQLiteBudgetLedger(BudgetLedger):
             UPDATE cayu_budget_reservations
             SET actual_amount = ?,
                 billing_identity_json = ?,
+                dispatch_id = ?,
+                dispatched_at = ?,
                 status = ?,
                 reason = ?,
                 updated_at = ?
@@ -500,6 +740,12 @@ class SQLiteBudgetLedger(BudgetLedger):
                     None
                     if record.billing_identity is None
                     else record.billing_identity.model_dump_json()
+                ),
+                record.dispatch_id,
+                (
+                    None
+                    if record.dispatched_at is None
+                    else sqlite_support.format_datetime(record.dispatched_at)
                 ),
                 record.status,
                 record.reason,
@@ -516,7 +762,9 @@ class SQLiteBudgetLedger(BudgetLedger):
             SELECT reservation_id, budget_limit_id, model_step_id, model_attempt_id,
                    scope, budget_key, budget_window,
                    currency, session_id,
-                   agent_name, provider_name, model, billing_identity_json,
+                   agent_name, environment_name, provider_name, model,
+                   billing_identity_json, settlement_event_payload_json,
+                   settlement_fallback_json, dispatch_id, dispatched_at,
                    reserved_amount, actual_amount,
                    status, reason, created_at, updated_at
             FROM cayu_budget_reservations
@@ -547,6 +795,7 @@ class SQLiteBudgetLedger(BudgetLedger):
             currency=row["currency"],
             session_id=row["session_id"],
             agent_name=row["agent_name"],
+            environment_name=row["environment_name"],
             provider_name=row["provider_name"],
             model=row["model"],
             billing_identity=(
@@ -554,12 +803,77 @@ class SQLiteBudgetLedger(BudgetLedger):
                 if row["billing_identity_json"] is None
                 else BillingIdentity.model_validate(json.loads(row["billing_identity_json"]))
             ),
+            settlement_event_payload=json.loads(row["settlement_event_payload_json"]),
+            settlement_fallback=BudgetSettlementFallback.model_validate_json(
+                row["settlement_fallback_json"]
+            ),
+            dispatch_id=row["dispatch_id"],
+            dispatched_at=(
+                None
+                if row["dispatched_at"] is None
+                else sqlite_support.parse_datetime(row["dispatched_at"])
+            ),
             reserved_amount=Decimal(row["reserved_amount"]),
             actual_amount=(None if row["actual_amount"] is None else Decimal(row["actual_amount"])),
             status=row["status"],
             reason=row["reason"],
             created_at=sqlite_support.parse_datetime(row["created_at"]),
             updated_at=sqlite_support.parse_datetime(row["updated_at"]),
+        )
+
+    def _insert_or_validate_settlement_unlocked(
+        self,
+        settlement: BudgetSettlementRecord,
+    ) -> None:
+        stored = settlement.model_copy(update={"event_published": False}, deep=True)
+        payload = stored.model_dump_json()
+        inserted = self._connection.execute(
+            """
+            INSERT OR IGNORE INTO cayu_budget_settlements (
+                settlement_id,
+                reservation_id,
+                session_id,
+                settled_at,
+                settlement_json,
+                event_published
+            )
+            VALUES (?, ?, ?, ?, ?, 0)
+            """,
+            (
+                stored.settlement_id,
+                stored.reservation_id,
+                stored.session_id,
+                sqlite_support.format_datetime(stored.reconciliation.settled_at),
+                payload,
+            ),
+        )
+        if inserted.rowcount == 1:
+            return
+        row = self._connection.execute(
+            """
+            SELECT settlement_json, event_published
+            FROM cayu_budget_settlements
+            WHERE settlement_id = ?
+            """,
+            (stored.settlement_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Budget settlement disappeared during conflict.")
+        existing = self._settlement_from_row(row).model_copy(
+            update={"event_published": False},
+            deep=True,
+        )
+        if existing != stored:
+            raise ValueError(
+                f"Budget reservation has a conflicting settlement: {stored.reservation_id}"
+            )
+
+    @staticmethod
+    def _settlement_from_row(row: sqlite3.Row) -> BudgetSettlementRecord:
+        value = BudgetSettlementRecord.model_validate_json(row["settlement_json"])
+        return value.model_copy(
+            update={"event_published": bool(row["event_published"])},
+            deep=True,
         )
 
     def _active_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
@@ -570,6 +884,8 @@ class SQLiteBudgetLedger(BudgetLedger):
 
     def _releasable_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
         record = self._load_record_unlocked(reservation_id)
+        if record.status == "active" and record.dispatch_id is not None:
+            raise ValueError(f"Dispatched budget reservation cannot be released: {reservation_id}")
         if record.status in {"active", "released"}:
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")
@@ -577,10 +893,5 @@ class SQLiteBudgetLedger(BudgetLedger):
     def _reconcilable_record_unlocked(self, reservation_id: str) -> BudgetReservationRecord:
         record = self._load_record_unlocked(reservation_id)
         if record.status in {"active", "reconciled"}:
-            return record
-        if record.status == "released" and _is_expired_reservation_reason(record.reason):
-            # Reaped by the TTL while still in flight (a long step or a wall-clock jump).
-            # Reconcile it anyway so the actual spend is recorded rather than crashing the
-            # billed run and silently undercounting the shared budget window.
             return record
         raise ValueError(f"Budget reservation is not active: {reservation_id}")

@@ -1442,5 +1442,5 @@ def test_runtime_rejects_custom_ledger_pricing_for_unpriced_completion() -> None
     assert events[-1].type == EventType.SESSION_FAILED
     assert (
         events[-1].payload["error"]
-        == "Budget ledger settlement returned runtime-owned pricing evidence."
+        == "Budget ledger settlement changed its requested pricing evidence."
     )

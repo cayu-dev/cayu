@@ -6852,7 +6852,9 @@ def test_explicit_compaction_persists_undurable_usage_as_unpriced_evidence(
         assert reserved.payload["actual"] == "1"
         assert reconciled.payload["actual_amount"] == "1"
         assert reconciled.payload["released_amount"] == "0"
-        assert reconciled.payload["reason"] == "application_requested"
+        assert reconciled.payload["reason"] == (
+            "compaction completed without priced usage; charged reserved amount"
+        )
         ledger_record = next(iter(ledger._records.values()))
         assert ledger_record.reason == (
             "compaction completed without priced usage; charged reserved amount"

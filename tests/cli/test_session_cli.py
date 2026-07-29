@@ -578,6 +578,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                             session_id=session_id,
                             payload={
                                 "reservation_id": reservation_id,
+                                "settlement_kind": "completed",
                                 "budget_limit_id": budget_limit_id,
                                 **attempt_identity,
                                 "actual_amount": "0.25",
@@ -623,6 +624,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 session_id=session_id,
                                 payload={
                                     "reservation_id": reservation_id,
+                                    "settlement_kind": "completed",
                                     "budget_limit_id": budget_limit_id,
                                     **attempt_identity,
                                     "actual_amount": "0.25",
@@ -638,6 +640,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                                 session_id=session_id,
                                 payload={
                                     "reservation_id": reservation_id,
+                                    "settlement_kind": "released",
                                     "budget_limit_id": budget_limit_id,
                                     **attempt_identity,
                                 },
@@ -678,6 +681,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                         session_id="sess_parallel_limits",
                         payload={
                             "reservation_id": reservation_id,
+                            "settlement_kind": "completed",
                             "budget_limit_id": budget_limit_id,
                             **parallel_attempt_identity,
                             "actual_amount": "0.25",
@@ -736,6 +740,7 @@ def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
                     session_id="sess_unpriced_cost",
                     payload={
                         "reservation_id": "sess_unpriced_cost-reservation",
+                        "settlement_kind": "completed",
                         "budget_limit_id": _budget_limit_id(1),
                         **unpriced_attempt_identity,
                         "actual_amount": "0.25",
@@ -1027,6 +1032,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                     timestamp=started_at + timedelta(seconds=2),
                     payload={
                         "reservation_id": "reservation-1",
+                        "settlement_kind": "completed",
                         "status": "reconciled",
                         "reserved_amount": "0.25",
                         "actual_amount": "0.01",
@@ -1040,6 +1046,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                     timestamp=started_at + timedelta(seconds=2, milliseconds=500),
                     payload={
                         "reservation_id": "reservation-invalid-pricing",
+                        "settlement_kind": "completed",
                         "reserved_amount": "0.10",
                         "actual_amount": "0.02",
                         "pricing": {"provider_name": 42},
@@ -1069,7 +1076,10 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
                     type=EventType.BUDGET_RESERVATION_RELEASED,
                     session_id="sess_usage",
                     timestamp=started_at + timedelta(seconds=5),
-                    payload={"reservation_id": "reservation-unmatched"},
+                    payload={
+                        "reservation_id": "reservation-unmatched",
+                        "settlement_kind": "released",
+                    },
                 ),
                 Event(
                     type=EventType.BUDGET_RESERVED,
