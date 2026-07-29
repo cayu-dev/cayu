@@ -470,6 +470,8 @@ Interaction pause and terminal publication uses `SessionStore.publish_interactio
 
 An assistant response can be durably complete before later session-scoped terminalization work, such as environment binding finalization or a terminal hook. If that later work fails, the session moves from its original terminal status to `failed`, while the already completed or interrupted interaction remains unchanged; Cayu does not rewrite truthful response evidence to represent a subsequent cleanup failure.
 
+Every runtime queue-delivery call also carries a stable `delivery_id`. The first batch uses the attempted interaction ID directly, and later bounded batches use deterministic ordinals under that identity, so reconstruction begins from the same durable interaction evidence rather than a process-local random key. The store atomically records the selected queue IDs, bounded emitted event snapshots, effective eligibility boundary, and continuation decision beside the transcript append and queue updates. Retrying that identity returns the exact committed `SessionMessageDeliveryBatch`, including an atomically admitted `interaction.started`, without appending transcript content or lifecycle evidence again and without depending on retained event history. Reusing the identity with different delivery arguments fails closed. Breaking schema revision 29 adds this replay record, so all workers sharing a session store must understand the contract.
+
 Observable interaction boundaries include:
 
 - Two ordinary responses in one session receive distinct IDs and distinct scoped evidence.

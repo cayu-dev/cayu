@@ -181,6 +181,10 @@ REVISIONS: tuple[Revision, ...] = (
     # is written atomically with interaction.started and must be understood by
     # every recovery worker, so mixed-version writers are unsafe.
     Revision(revision=28, kind=RevisionKind.BREAKING, compatible_from=28),
+    # Queue delivery attempts gain a durable idempotency record. Every runtime
+    # worker must publish and reconstruct those records so a commit whose
+    # acknowledgement is lost cannot strand an admitted interaction.
+    Revision(revision=29, kind=RevisionKind.BREAKING, compatible_from=29),
 )
 
 #: The revision an empty database is initialized to.

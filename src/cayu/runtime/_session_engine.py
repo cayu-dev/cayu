@@ -3177,19 +3177,40 @@ class SessionEngine:
                 environment_name=environment_name,
                 interaction_id=delivery_interaction_id,
             )
+        delivery_batch_index = 0
         while True:
+            delivery_id = (
+                delivery_interaction_id
+                if delivery_batch_index == 0
+                else f"{delivery_interaction_id}:batch:{delivery_batch_index}"
+            )
             try:
-                batch: SessionMessageDeliveryBatch = (
-                    await self.session_store.deliver_queued_session_messages(
+                try:
+                    batch: SessionMessageDeliveryBatch = (
+                        await self.session_store.deliver_queued_session_messages(
+                            session_id,
+                            include_on_idle=include_on_idle,
+                            delivery_id=delivery_id,
+                            eligible_through=eligible_through,
+                            interaction_id=delivery_interaction_id,
+                            interaction_started_event=(
+                                None if interaction_started else interaction_started_event
+                            ),
+                        )
+                    )
+                except Exception as error:
+                    if isinstance(error, SessionStatusConflict):
+                        raise
+                    batch = await self.session_store.deliver_queued_session_messages(
                         session_id,
                         include_on_idle=include_on_idle,
+                        delivery_id=delivery_id,
                         eligible_through=eligible_through,
                         interaction_id=delivery_interaction_id,
                         interaction_started_event=(
                             None if interaction_started else interaction_started_event
                         ),
                     )
-                )
             except SessionStatusConflict:
                 # An interrupt can win after the loop's durable status check,
                 # between bounded delivery batches, or after completion detects
@@ -3220,6 +3241,7 @@ class SessionEngine:
                 interaction_started = True
             if not batch.has_more:
                 return delivered_events
+            delivery_batch_index += 1
 
     async def _compact_session(
         self,

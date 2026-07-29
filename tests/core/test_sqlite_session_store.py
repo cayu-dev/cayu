@@ -1129,8 +1129,44 @@ def test_sqlite_session_store_revision_twenty_seven_requires_deferred_input_migr
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+
+def test_sqlite_session_store_revision_twenty_eight_requires_delivery_replay_migration(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "sessions.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DELETE FROM cayu_schema_migrations WHERE revision >= 29")
+        connection.execute("DROP TABLE cayu_session_message_deliveries")
+        connection.execute("PRAGMA user_version = 28")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
+        SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
+
+    migrated = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(migrated))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'cayu_session_message_deliveries'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert table == (1,)
 
 
 def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
@@ -1151,7 +1187,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     task_store = SQLiteTaskStore(
@@ -1249,7 +1285,7 @@ def test_sqlite_session_store_revision_thirteen_requires_run_fencing_migration(t
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1288,7 +1324,7 @@ def test_sqlite_session_store_revision_fourteen_requires_cascade_index_migration
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1386,7 +1422,7 @@ def test_sqlite_session_store_revision_sixteen_requires_pending_action_index(tmp
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path)
 
     reopened = SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.MIGRATE)
@@ -1606,7 +1642,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2297,6 +2333,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (26, 25),
         (27, 25),
         (28, 28),
+        (29, 29),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

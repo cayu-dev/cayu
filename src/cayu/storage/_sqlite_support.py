@@ -283,6 +283,24 @@ _BASELINE_DDL = """
         UNIQUE (session_id, idempotency_key)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_session_message_deliveries (
+        delivery_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+        interaction_id TEXT,
+        include_on_idle INTEGER NOT NULL,
+        requested_eligible_through INTEGER,
+        eligible_through INTEGER NOT NULL,
+        batch_limit INTEGER NOT NULL,
+        has_more INTEGER NOT NULL,
+        interaction_started_event_json TEXT,
+        queue_ids_json TEXT NOT NULL,
+        events_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_session_message_deliveries_session
+        ON cayu_session_message_deliveries(session_id, created_at);
+
     CREATE TABLE IF NOT EXISTS cayu_tasks (
         id TEXT PRIMARY KEY,
         type TEXT NOT NULL,
@@ -954,6 +972,24 @@ _MIGRATION_STEPS: dict[int, str] = {
             interaction_id TEXT NOT NULL,
             source_messages_json TEXT NOT NULL
         );
+    """,
+    29: """
+        CREATE TABLE IF NOT EXISTS cayu_session_message_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT,
+            include_on_idle INTEGER NOT NULL,
+            requested_eligible_through INTEGER,
+            eligible_through INTEGER NOT NULL,
+            batch_limit INTEGER NOT NULL,
+            has_more INTEGER NOT NULL,
+            interaction_started_event_json TEXT,
+            queue_ids_json TEXT NOT NULL,
+            events_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cayu_session_message_deliveries_session
+            ON cayu_session_message_deliveries(session_id, created_at);
     """,
 }
 

@@ -334,7 +334,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 28
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 29
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -866,6 +866,26 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             source_messages JSONB NOT NULL
         )
         """,
+    ),
+    29: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_session_message_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES cayu_sessions(id) ON DELETE CASCADE,
+            interaction_id TEXT,
+            include_on_idle BOOLEAN NOT NULL,
+            requested_eligible_through BIGINT,
+            eligible_through BIGINT NOT NULL,
+            batch_limit INTEGER NOT NULL,
+            has_more BOOLEAN NOT NULL,
+            interaction_started_event JSONB,
+            queue_ids JSONB NOT NULL,
+            events JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_session_message_deliveries_session "
+        "ON cayu_session_message_deliveries(session_id, created_at)",
     ),
     23: (
         "ALTER TABLE IF EXISTS cayu_budget_reservations "
@@ -7488,6 +7508,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         session_id: str,
         *,
         include_on_idle: bool,
+        delivery_id: str | None = None,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
@@ -7496,6 +7517,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
         session_id = require_clean_nonblank(session_id, "session_id")
+        delivery_id = (
+            str(uuid4())
+            if delivery_id is None
+            else require_clean_nonblank(delivery_id, "delivery_id")
+        )
         if interaction_id is not None:
             interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
         interaction_started_event = _copy_queued_interaction_started_event(
@@ -7516,6 +7542,64 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     loaded = await self._load_for_update(cur, session_id)
                     if loaded is None:
                         raise KeyError(f"Session not found: {session_id}")
+                    await cur.execute(
+                        """
+                        SELECT session_id, interaction_id, include_on_idle,
+                               requested_eligible_through, eligible_through,
+                               batch_limit, has_more, interaction_started_event,
+                               queue_ids, events
+                        FROM cayu_session_message_deliveries
+                        WHERE delivery_id = %s
+                        """,
+                        (delivery_id,),
+                    )
+                    delivery_row = await cur.fetchone()
+                    if delivery_row is not None:
+                        stored_started_event = (
+                            None if delivery_row[7] is None else Event(**_json_obj(delivery_row[7]))
+                        )
+                        if (
+                            delivery_row[0] != session_id
+                            or delivery_row[1] != interaction_id
+                            or delivery_row[2] != include_on_idle
+                            or delivery_row[3] != eligible_through
+                            or delivery_row[5] != limit
+                            or stored_started_event != interaction_started_event
+                        ):
+                            raise ValueError(
+                                "delivery_id was already used for a different queue delivery."
+                            )
+                        queue_ids = list(delivery_row[8])
+                        queued_by_id: dict[str, SessionQueuedMessage] = {}
+                        replayed_events = tuple(
+                            Event(**_json_obj(event)) for event in delivery_row[9]
+                        )
+                        if queue_ids:
+                            await cur.execute(
+                                f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
+                                "FROM cayu_session_message_queue "
+                                "WHERE queue_id = ANY(%s)",
+                                (queue_ids,),
+                            )
+                            queued_by_id = {
+                                message.queue_id: message
+                                for message in (
+                                    _queued_session_message_from_row(row)
+                                    for row in await cur.fetchall()
+                                )
+                            }
+                        if len(queued_by_id) != len(queue_ids):
+                            raise RuntimeError("Queue delivery replay lost a delivered message.")
+                        await conn.commit()
+                        return SessionMessageDeliveryBatch(
+                            messages=tuple(queued_by_id[queue_id] for queue_id in queue_ids),
+                            events=replayed_events,
+                            delivery_id=delivery_id,
+                            interaction_id=interaction_id,
+                            eligible_through=delivery_row[4],
+                            has_more=delivery_row[6],
+                            replayed=True,
+                        )
                     _assert_session_run_epoch(session_id, loaded)
                     if loaded.status != SessionStatus.RUNNING:
                         raise SessionStatusConflict(
@@ -7551,8 +7635,39 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                         rows = await cur.fetchall()
                     if not rows:
+                        await cur.execute(
+                            """
+                            INSERT INTO cayu_session_message_deliveries (
+                                delivery_id, session_id, interaction_id,
+                                include_on_idle, requested_eligible_through,
+                                eligible_through, batch_limit, has_more,
+                                interaction_started_event, queue_ids, events,
+                                created_at
+                            )
+                            VALUES (
+                                %s, %s, %s, %s, %s, %s, %s, FALSE,
+                                %s, '[]'::jsonb, '[]'::jsonb, %s
+                            )
+                            """,
+                            (
+                                delivery_id,
+                                session_id,
+                                interaction_id,
+                                include_on_idle,
+                                eligible_through,
+                                boundary,
+                                limit,
+                                (
+                                    None
+                                    if interaction_started_event is None
+                                    else _dumps(interaction_started_event.model_dump(mode="json"))
+                                ),
+                                datetime.now(UTC),
+                            ),
+                        )
                         await conn.commit()
                         return SessionMessageDeliveryBatch(
+                            delivery_id=delivery_id,
                             eligible_through=boundary,
                             has_more=False,
                         )
@@ -7701,10 +7816,44 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         (session_id, boundary),
                     )
                     remaining = await cur.fetchone()
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_session_message_deliveries (
+                            delivery_id, session_id, interaction_id,
+                            include_on_idle, requested_eligible_through,
+                            eligible_through, batch_limit, has_more,
+                            interaction_started_event, queue_ids, events,
+                            created_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            delivery_id,
+                            session_id,
+                            interaction_id,
+                            include_on_idle,
+                            eligible_through,
+                            boundary,
+                            limit,
+                            remaining is not None,
+                            (
+                                None
+                                if interaction_started_event is None
+                                else _dumps(interaction_started_event.model_dump(mode="json"))
+                            ),
+                            _dumps([message.queue_id for message in updated_messages]),
+                            _dumps([event.model_dump(mode="json") for event in persisted_events]),
+                            delivered_at,
+                        ),
+                    )
                 await conn.commit()
                 return SessionMessageDeliveryBatch(
                     messages=tuple(updated_messages),
                     events=tuple(persisted_events),
+                    delivery_id=delivery_id,
                     interaction_id=interaction_id,
                     eligible_through=boundary,
                     has_more=remaining is not None,

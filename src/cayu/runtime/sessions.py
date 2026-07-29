@@ -845,9 +845,11 @@ class SessionMessageDeliveryBatch(BaseModel):
 
     messages: tuple[SessionQueuedMessage, ...] = Field(default_factory=tuple)
     events: tuple[Event, ...] = Field(default_factory=tuple)
+    delivery_id: str
     interaction_id: str | None = None
     eligible_through: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
     has_more: StrictBool = False
+    replayed: StrictBool = False
 
     @field_validator("messages", mode="before")
     @classmethod
@@ -859,12 +861,14 @@ class SessionMessageDeliveryBatch(BaseModel):
     def copy_events(cls, value) -> tuple[Event, ...]:
         return tuple(copy_event(event) for event in value)
 
-    @field_validator("interaction_id")
+    @field_validator("delivery_id", "interaction_id")
     @classmethod
-    def validate_interaction_id(cls, value: str | None) -> str | None:
+    def validate_identifiers(cls, value: str | None, info) -> str | None:
         if value is None:
+            if info.field_name == "delivery_id":
+                raise ValueError("delivery_id is required.")
             return None
-        return require_clean_nonblank(value, "interaction_id")
+        return require_clean_nonblank(value, info.field_name)
 
 
 class InteractionTransitionResult(BaseModel):
@@ -4264,12 +4268,18 @@ class SessionStore(ABC):
         session_id: str,
         *,
         include_on_idle: bool,
+        delivery_id: str | None = None,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
-        """Atomically append and mark one bounded queue batch delivered."""
+        """Atomically append and mark one bounded queue batch delivered.
+
+        Runtime callers supply a stable ``delivery_id`` for acknowledgement-loss
+        reconstruction. Omitting it creates a one-shot identity for direct store
+        callers and returns that identity in the result.
+        """
 
     @abstractmethod
     async def publish_checkpoint_and_events(
@@ -5111,6 +5121,17 @@ class _PreparedInMemoryCheckpointStore:
     rebuilt_index_scope: tuple[frozenset[str], str | None, str | None, str | None] | None = None
 
 
+@dataclass(frozen=True)
+class _InMemoryMessageDeliveryRecord:
+    session_id: str
+    include_on_idle: bool
+    requested_eligible_through: int | None
+    limit: int
+    interaction_id: str | None
+    interaction_started_event: Event | None
+    batch: SessionMessageDeliveryBatch
+
+
 class InMemorySessionStore(SessionStore):
     """In-process session store for tests, local development, and examples."""
 
@@ -5184,6 +5205,7 @@ class InMemorySessionStore(SessionStore):
         self._pending_session_messages: dict[
             tuple[str, SessionMessageDeliveryMode], deque[SessionQueuedMessage]
         ] = {}
+        self._session_message_delivery_records: dict[str, _InMemoryMessageDeliveryRecord] = {}
         self._next_session_message_ordering_key = 1
 
     def _index_session_parent_unlocked(self, session: Session) -> None:
@@ -5742,6 +5764,11 @@ class InMemorySessionStore(SessionStore):
             self._session_operation_records.pop(session_id, None)
             self._pending_action_session_ids.discard(session_id)
             self._queued_session_messages_by_idempotency.pop(session_id, None)
+            self._session_message_delivery_records = {
+                delivery_id: record
+                for delivery_id, record in self._session_message_delivery_records.items()
+                if record.session_id != session_id
+            }
             for delivery_mode in SessionMessageDeliveryMode:
                 self._pending_session_messages.pop((session_id, delivery_mode), None)
             self._event_records = [
@@ -6800,12 +6827,18 @@ class InMemorySessionStore(SessionStore):
         session_id: str,
         *,
         include_on_idle: bool,
+        delivery_id: str | None = None,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
         session_id = require_clean_nonblank(session_id, "session_id")
+        delivery_id = (
+            str(uuid4())
+            if delivery_id is None
+            else require_clean_nonblank(delivery_id, "delivery_id")
+        )
         if type(include_on_idle) is not bool:
             raise TypeError("include_on_idle must be a bool.")
         if interaction_id is not None:
@@ -6820,6 +6853,21 @@ class InMemorySessionStore(SessionStore):
         if type(limit) is not int or not 1 <= limit <= SESSION_MESSAGE_DELIVERY_BATCH_LIMIT:
             raise ValueError(f"limit must be between 1 and {SESSION_MESSAGE_DELIVERY_BATCH_LIMIT}.")
         async with self._lock:
+            existing_delivery = self._session_message_delivery_records.get(delivery_id)
+            if existing_delivery is not None:
+                _validate_equivalent_message_delivery(
+                    existing_delivery,
+                    session_id=session_id,
+                    include_on_idle=include_on_idle,
+                    eligible_through=eligible_through,
+                    limit=limit,
+                    interaction_id=interaction_id,
+                    interaction_started_event=interaction_started_event,
+                )
+                return existing_delivery.batch.model_copy(
+                    update={"replayed": True},
+                    deep=True,
+                )
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
@@ -6853,10 +6901,23 @@ class InMemorySessionStore(SessionStore):
                     selected.append(message)
                 break
             if not selected:
-                return SessionMessageDeliveryBatch(
+                batch = SessionMessageDeliveryBatch(
+                    delivery_id=delivery_id,
                     eligible_through=boundary,
                     has_more=False,
                 )
+                self._session_message_delivery_records[delivery_id] = (
+                    _InMemoryMessageDeliveryRecord(
+                        session_id=session_id,
+                        include_on_idle=include_on_idle,
+                        requested_eligible_through=eligible_through,
+                        limit=limit,
+                        interaction_id=interaction_id,
+                        interaction_started_event=interaction_started_event,
+                        batch=batch,
+                    )
+                )
+                return batch
             if selected_key is None:
                 raise RuntimeError("Queued message selection lost its pending index.")
 
@@ -6930,13 +6991,24 @@ class InMemorySessionStore(SessionStore):
             has_more = has_eligible(SessionMessageDeliveryMode.NEXT_TURN) or (
                 include_on_idle and has_eligible(SessionMessageDeliveryMode.ON_IDLE)
             )
-            return SessionMessageDeliveryBatch(
+            batch = SessionMessageDeliveryBatch(
                 messages=tuple(updated_messages),
                 events=tuple(persisted_events),
+                delivery_id=delivery_id,
                 interaction_id=interaction_id,
                 eligible_through=boundary,
                 has_more=has_more,
             )
+            self._session_message_delivery_records[delivery_id] = _InMemoryMessageDeliveryRecord(
+                session_id=session_id,
+                include_on_idle=include_on_idle,
+                requested_eligible_through=eligible_through,
+                limit=limit,
+                interaction_id=interaction_id,
+                interaction_started_event=interaction_started_event,
+                batch=batch,
+            )
+            return batch
 
     async def publish_checkpoint_and_events(
         self,
@@ -12057,6 +12129,27 @@ def _validate_mcp_manifest_publication_state(
                 raise ValueError(
                     "A changed MCP manifest event must differ from the current baseline."
                 )
+
+
+def _validate_equivalent_message_delivery(
+    existing: _InMemoryMessageDeliveryRecord,
+    *,
+    session_id: str,
+    include_on_idle: bool,
+    eligible_through: int | None,
+    limit: int,
+    interaction_id: str | None,
+    interaction_started_event: Event | None,
+) -> None:
+    if (
+        existing.session_id != session_id
+        or existing.include_on_idle != include_on_idle
+        or existing.requested_eligible_through != eligible_through
+        or existing.limit != limit
+        or existing.interaction_id != interaction_id
+        or existing.interaction_started_event != interaction_started_event
+    ):
+        raise ValueError("delivery_id was already used for a different queue delivery.")
 
 
 def _copy_queued_interaction_started_event(

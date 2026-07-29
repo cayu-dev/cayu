@@ -114,6 +114,7 @@ _POSTGRES_TABLES = (
     "cayu_event_watcher_state",
     "cayu_deferred_interaction_inputs",
     "cayu_interaction_latest_events",
+    "cayu_session_message_deliveries",
     "cayu_persisted_event_side_effects",
     "cayu_mcp_manifest_baselines",
     "cayu_budget_reservation_identities",
@@ -8578,6 +8579,107 @@ def test_session_store_conformance_enqueue_completion_race_is_atomic(
                         delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
                     )
                 )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_reconstructs_queue_delivery_acknowledgement(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_queue_delivery_reconstruction"
+            interaction_id = "interaction-queue-delivery-reconstruction"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="evt_queue_delivery_initial_interaction",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id="interaction-queue-delivery-initial",
+                ),
+                interaction_source_messages=[Message.text("user", "initial")],
+            )
+            for index in range(2):
+                await store.enqueue_session_message(
+                    EnqueueSessionMessageRequest(
+                        session_id=session_id,
+                        idempotency_key=f"queue-delivery-reconstruction-{index}",
+                        content=f"queued {index}",
+                        delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                    )
+                )
+
+            started = Event(
+                id="evt_queue_delivery_reconstruction_started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            first = await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=False,
+                delivery_id=interaction_id,
+                limit=1,
+                interaction_id=interaction_id,
+                interaction_started_event=started,
+            )
+            assert first.replayed is False
+            assert first.delivery_id == interaction_id
+            assert first.has_more is True
+
+            store = await _reopen_store(session_store_case, store)
+            replayed = await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=False,
+                delivery_id=interaction_id,
+                limit=1,
+                interaction_id=interaction_id,
+                interaction_started_event=started,
+            )
+            assert replayed.replayed is True
+            assert replayed == first.model_copy(update={"replayed": True})
+
+            with pytest.raises(ValueError, match="different queue delivery"):
+                await store.deliver_queued_session_messages(
+                    session_id,
+                    include_on_idle=True,
+                    delivery_id=interaction_id,
+                    limit=1,
+                    interaction_id=interaction_id,
+                    interaction_started_event=started,
+                )
+
+            second = await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=False,
+                delivery_id=f"{interaction_id}:batch:1",
+                eligible_through=first.eligible_through,
+                limit=1,
+                interaction_id=interaction_id,
+            )
+            assert second.replayed is False
+            assert [message.content for message in second.messages] == ["queued 1"]
+            transcript = await store.load_transcript(session_id)
+            assert [
+                message.content[0].text  # type: ignore[union-attr]
+                for message in transcript
+            ] == ["queued 0", "queued 1"]
+            lifecycle = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_id=started.id,
+                )
+            )
+            assert [record.event for record in lifecycle] == [started]
         finally:
             await _close_store(store)
 

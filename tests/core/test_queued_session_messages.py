@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -220,6 +221,7 @@ class DeliveryFenceStore(InterruptTrackingStore):
         session_id: str,
         *,
         include_on_idle: bool,
+        delivery_id: str | None = None,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
@@ -232,11 +234,47 @@ class DeliveryFenceStore(InterruptTrackingStore):
         return await super().deliver_queued_session_messages(
             session_id,
             include_on_idle=include_on_idle,
+            delivery_id=delivery_id,
             eligible_through=eligible_through,
             limit=limit,
             interaction_id=interaction_id,
             interaction_started_event=interaction_started_event,
         )
+
+
+class CommitThenLoseDeliveryAcknowledgementStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lost_acknowledgement = False
+        self.lost_delivery_id: str | None = None
+        self.attempted_delivery_ids: list[str] = []
+
+    async def deliver_queued_session_messages(
+        self,
+        session_id: str,
+        *,
+        include_on_idle: bool,
+        delivery_id: str | None = None,
+        eligible_through: int | None = None,
+        limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
+        interaction_id: str | None = None,
+        interaction_started_event: Event | None = None,
+    ) -> SessionMessageDeliveryBatch:
+        result = await super().deliver_queued_session_messages(
+            session_id,
+            include_on_idle=include_on_idle,
+            delivery_id=delivery_id,
+            eligible_through=eligible_through,
+            limit=limit,
+            interaction_id=interaction_id,
+            interaction_started_event=interaction_started_event,
+        )
+        self.attempted_delivery_ids.append(result.delivery_id)
+        if result.messages and not result.replayed and not self.lost_acknowledgement:
+            self.lost_acknowledgement = True
+            self.lost_delivery_id = result.delivery_id
+            raise ConnectionError("queue delivery acknowledgement lost")
+        return result
 
 
 def test_enqueue_session_message_request_validates_public_contract() -> None:
@@ -1085,6 +1123,75 @@ def test_enqueue_wins_completion_race_or_is_rejected_without_record() -> None:
     asyncio.run(run())
 
 
+def test_runtime_reconstructs_queued_interaction_after_delivery_acknowledgement_loss() -> None:
+    async def run() -> None:
+        store = CommitThenLoseDeliveryAcknowledgementStore()
+        provider = BlockingTwoTurnProvider()
+        controller = CayuApp(session_store=store, enable_logging=False)
+        controller.register_provider(provider)
+        controller.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        accepting_process = CayuApp(session_store=store, enable_logging=False)
+
+        async def execute() -> list[Event]:
+            return [
+                event
+                async for event in controller.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="sess_queue_delivery_ack_loss",
+                        messages=[Message.text("user", "initial")],
+                    )
+                )
+            ]
+
+        run_task = asyncio.create_task(execute())
+        await provider.first_started.wait()
+        accepted = await accepting_process.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id="sess_queue_delivery_ack_loss",
+                idempotency_key="queue-delivery-ack-loss",
+                content="continue after commit",
+                delivery_mode=SessionMessageDeliveryMode.ON_IDLE,
+            )
+        )
+        provider.release_first.set()
+        events = await run_task
+
+        session = await store.load("sess_queue_delivery_ack_loss")
+        assert session is not None
+        assert session.status is SessionStatus.COMPLETED
+        assert store.lost_acknowledgement is True
+        assert store.lost_delivery_id is not None
+        assert store.attempted_delivery_ids.count(store.lost_delivery_id) == 2
+        delivery_event = next(
+            event for event in events if event.type == EventType.SESSION_MESSAGE_DELIVERED
+        )
+        assert store.lost_delivery_id == delivery_event.interaction_id
+        assert len(provider.requests) == 2
+        replay = await accepting_process.enqueue_session_message(
+            EnqueueSessionMessageRequest(
+                session_id=session.id,
+                idempotency_key="queue-delivery-ack-loss",
+                content="continue after commit",
+                delivery_mode=SessionMessageDeliveryMode.ON_IDLE,
+            )
+        )
+        assert replay.replayed is True
+        assert replay.message.queue_id == accepted.message.queue_id
+        assert replay.message.status == "delivered"
+        transcript = await store.load_transcript(session.id)
+        assert [
+            message.content[0].text  # type: ignore[union-attr]
+            for message in transcript
+            if message.role == "user"
+        ] == ["initial", "continue after commit"]
+        assert sum(event.type == EventType.SESSION_MESSAGE_DELIVERED for event in events) == 1
+        assert sum(event.type == EventType.INTERACTION_STARTED for event in events) == 2
+        assert sum(event.type == EventType.INTERACTION_COMPLETED for event in events) == 2
+
+    asyncio.run(run())
+
+
 def test_sqlite_queue_reconstructs_and_delivers_once_after_reopen(tmp_path) -> None:
     async def run() -> None:
         path = tmp_path / "durable-queue.sqlite"
@@ -1131,5 +1238,75 @@ def test_sqlite_queue_reconstructs_and_delivers_once_after_reopen(tmp_path) -> N
             assert transcript[-1].content[0].text == "survive restart"  # type: ignore[union-attr]
         finally:
             await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_queue_delivery_replay_survives_event_retention(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(tmp_path / "queue-retention.sqlite")
+        session_id = "sess_queue_delivery_retention"
+        interaction_id = "interaction-queue-delivery-retention"
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "initial")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            accepted = await store.enqueue_session_message(
+                EnqueueSessionMessageRequest(
+                    session_id=session_id,
+                    idempotency_key="queue-delivery-retention",
+                    content="survive event pruning",
+                    delivery_mode=SessionMessageDeliveryMode.NEXT_TURN,
+                )
+            )
+            await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            started = Event(
+                id="evt_queue_delivery_retention_started",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            batch = await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=False,
+                delivery_id=interaction_id,
+                interaction_id=interaction_id,
+                interaction_started_event=started,
+            )
+
+            for event in (accepted.event, *batch.events):
+                claim = await store.claim_persisted_event_side_effect(
+                    session_id=session_id,
+                    event_id=event.id,
+                )
+                assert claim is not None
+                await store.mark_persisted_event_side_effect_delivered(claim)
+            assert (
+                await store.prune_events(
+                    before=datetime.now(UTC) + timedelta(days=1),
+                    session_id=session_id,
+                )
+                == 3
+            )
+
+            replayed = await store.deliver_queued_session_messages(
+                session_id,
+                include_on_idle=False,
+                delivery_id=interaction_id,
+                interaction_id=interaction_id,
+                interaction_started_event=started,
+            )
+            assert replayed == batch.model_copy(update={"replayed": True})
+        finally:
+            await store.close()
 
     asyncio.run(run())

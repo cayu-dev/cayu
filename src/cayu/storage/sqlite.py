@@ -226,7 +226,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 28
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 29
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -2952,12 +2952,18 @@ class SQLiteSessionStore(SessionStore):
         session_id: str,
         *,
         include_on_idle: bool,
+        delivery_id: str | None = None,
         eligible_through: int | None = None,
         limit: int = SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
         interaction_id: str | None = None,
         interaction_started_event: Event | None = None,
     ) -> SessionMessageDeliveryBatch:
         session_id = require_clean_nonblank(session_id, "session_id")
+        delivery_id = (
+            str(uuid4())
+            if delivery_id is None
+            else require_clean_nonblank(delivery_id, "delivery_id")
+        )
         if interaction_id is not None:
             interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
         interaction_started_event = _copy_queued_interaction_started_event(
@@ -2980,6 +2986,53 @@ class SQLiteSessionStore(SessionStore):
                 loaded = self._load_unlocked(session_id)
                 if loaded is None:
                     raise KeyError(f"Session not found: {session_id}")
+                delivery_row = connection.execute(
+                    "SELECT * FROM cayu_session_message_deliveries WHERE delivery_id = ?",
+                    (delivery_id,),
+                ).fetchone()
+                if delivery_row is not None:
+                    stored_started_event = (
+                        None
+                        if delivery_row["interaction_started_event_json"] is None
+                        else Event.model_validate_json(
+                            delivery_row["interaction_started_event_json"]
+                        )
+                    )
+                    if (
+                        delivery_row["session_id"] != session_id
+                        or bool(delivery_row["include_on_idle"]) != include_on_idle
+                        or delivery_row["requested_eligible_through"] != eligible_through
+                        or delivery_row["batch_limit"] != limit
+                        or delivery_row["interaction_id"] != interaction_id
+                        or stored_started_event != interaction_started_event
+                    ):
+                        raise ValueError(
+                            "delivery_id was already used for a different queue delivery."
+                        )
+                    queue_ids = json.loads(delivery_row["queue_ids_json"])
+                    replayed_messages: list[SessionQueuedMessage] = []
+                    replayed_events = [
+                        Event.model_validate(event)
+                        for event in json.loads(delivery_row["events_json"])
+                    ]
+                    for queue_id in queue_ids:
+                        queued_row = connection.execute(
+                            "SELECT * FROM cayu_session_message_queue WHERE queue_id = ?",
+                            (queue_id,),
+                        ).fetchone()
+                        if queued_row is None:
+                            raise RuntimeError("Queue delivery replay lost a delivered message.")
+                        replayed_messages.append(_queued_session_message_from_row(queued_row))
+                    connection.commit()
+                    return SessionMessageDeliveryBatch(
+                        messages=tuple(replayed_messages),
+                        events=tuple(replayed_events),
+                        delivery_id=delivery_id,
+                        interaction_id=interaction_id,
+                        eligible_through=delivery_row["eligible_through"],
+                        has_more=bool(delivery_row["has_more"]),
+                        replayed=True,
+                    )
                 _assert_session_run_epoch(session_id, loaded)
                 if loaded.status != SessionStatus.RUNNING:
                     raise SessionStatusConflict(
@@ -3013,8 +3066,37 @@ class SQLiteSessionStore(SessionStore):
                         (session_id, boundary, limit),
                     ).fetchall()
                 if not rows:
+                    connection.execute(
+                        """
+                        INSERT INTO cayu_session_message_deliveries (
+                            delivery_id, session_id, interaction_id, include_on_idle,
+                            requested_eligible_through, eligible_through, batch_limit,
+                            has_more, interaction_started_event_json, queue_ids_json,
+                            events_json, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, '[]', '[]', ?)
+                        """,
+                        (
+                            delivery_id,
+                            session_id,
+                            interaction_id,
+                            include_on_idle,
+                            eligible_through,
+                            boundary,
+                            limit,
+                            (
+                                None
+                                if interaction_started_event is None
+                                else sqlite_support.json_dumps(
+                                    interaction_started_event.model_dump(mode="json")
+                                )
+                            ),
+                            sqlite_support.format_datetime(datetime.now(UTC)),
+                        ),
+                    )
                     connection.commit()
                     return SessionMessageDeliveryBatch(
+                        delivery_id=delivery_id,
                         eligible_through=boundary,
                         has_more=False,
                     )
@@ -3147,10 +3229,46 @@ class SQLiteSessionStore(SessionStore):
                     f"AND {remaining_mode_sql} LIMIT 1",
                     (session_id, boundary),
                 ).fetchone()
+                connection.execute(
+                    """
+                    INSERT INTO cayu_session_message_deliveries (
+                        delivery_id, session_id, interaction_id, include_on_idle,
+                        requested_eligible_through, eligible_through, batch_limit,
+                        has_more, interaction_started_event_json, queue_ids_json,
+                        events_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        delivery_id,
+                        session_id,
+                        interaction_id,
+                        include_on_idle,
+                        eligible_through,
+                        boundary,
+                        limit,
+                        remaining is not None,
+                        (
+                            None
+                            if interaction_started_event is None
+                            else sqlite_support.json_dumps(
+                                interaction_started_event.model_dump(mode="json")
+                            )
+                        ),
+                        sqlite_support.json_dumps(
+                            [message.queue_id for message in updated_messages]
+                        ),
+                        sqlite_support.json_dumps(
+                            [event.model_dump(mode="json") for event in persisted_events]
+                        ),
+                        sqlite_support.format_datetime(delivered_at),
+                    ),
+                )
                 connection.commit()
                 return SessionMessageDeliveryBatch(
                     messages=tuple(updated_messages),
                     events=tuple(persisted_events),
+                    delivery_id=delivery_id,
                     interaction_id=interaction_id,
                     eligible_through=boundary,
                     has_more=remaining is not None,
