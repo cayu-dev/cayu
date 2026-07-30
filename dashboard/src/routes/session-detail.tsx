@@ -260,9 +260,12 @@ type PendingAction =
   | {
       kind: "approval"
       approvalId: string
+      roundId: string
+      toolCallId: string
       toolName: string
       reason: string | null
       arguments: unknown
+      policyEvidence: "unplanned" | "authoritative" | "unregistered" | "ambiguous" | null
     }
   | {
       kind: "user_input"
@@ -285,13 +288,21 @@ type PendingAction =
 
 function pendingActionFromApi(action: ApiPendingAction | undefined): PendingAction | null {
   if (!action) return null
-  if (action.kind === "tool_approval" && action.approval_id) {
+  if (
+    action.kind === "tool_approval" &&
+    action.approval_id &&
+    action.round_id &&
+    action.tool_call_id
+  ) {
     return {
       kind: "approval",
       approvalId: action.approval_id,
+      roundId: action.round_id,
+      toolCallId: action.tool_call_id,
       toolName: action.tool_name || "tool",
       reason: action.detail ?? null,
       arguments: action.arguments || {},
+      policyEvidence: action.policy_evidence ?? null,
     }
   }
   if (action.kind === "user_input" && action.input_id) {
@@ -794,6 +805,7 @@ function PendingActionBanner({
   const controlsDisabled = resolving || unavailableReason !== null
 
   if (action.kind === "approval") {
+    const isAmbiguousPolicyRecovery = action.policyEvidence === "ambiguous"
     return (
       <Card className="border-chart-1/30 bg-chart-1/5">
         <CardContent className="space-y-4 p-4">
@@ -802,12 +814,14 @@ function PendingActionBanner({
               <div className="flex flex-wrap items-center gap-2">
                 <Badge variant="outline" className="border-chart-1/40 bg-background">
                   <ShieldCheck className="mr-1 h-3.5 w-3.5 text-chart-1" />
-                  Awaiting approval
+                  {isAmbiguousPolicyRecovery ? "Policy outcome unavailable" : "Awaiting approval"}
                 </Badge>
                 <Badge variant="secondary">{action.toolName}</Badge>
               </div>
               <p className="mt-2 text-sm font-medium">
-                This session is paused until the tool call is approved or denied.
+                {isAmbiguousPolicyRecovery
+                  ? "Policy evaluation did not produce a durable decision. Continuing will record this call as blocked; it will not execute."
+                  : "This session is paused until the tool call is approved or denied."}
               </p>
               <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
                 approval_id: {action.approvalId}
@@ -830,7 +844,7 @@ function PendingActionBanner({
                 title={unavailableReason ?? undefined}
                 onClick={() => onApprove(reason.trim() || null)}
               >
-                Approve
+                {isAmbiguousPolicyRecovery ? "Continue safely" : "Approve"}
               </Button>
             </div>
           </div>
@@ -2231,6 +2245,8 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
           {
             session_id: sessionId,
             approval_id: action.approvalId,
+            tool_round_id: action.roundId,
+            tool_call_id: action.toolCallId,
             decision,
             reason,
           },
@@ -2315,12 +2331,19 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
     }
 
     if (action.approvalId) {
+      if (!action.roundId) {
+        setActionError("Manual approval recovery requires a tool round identity.")
+        setResolvingAction(false)
+        return
+      }
       const approvalId = action.approvalId
+      const roundId = action.roundId
       await completeManualRecovery((browser, options) =>
         browser.executeRecoverToolApprovalMutation(
           {
             session_id: sessionId,
             approval_id: approvalId,
+            tool_round_id: roundId,
             tool_call_id: action.toolCallId,
             outcome,
             message,

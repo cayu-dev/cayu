@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
@@ -11,6 +11,8 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.core.events import Event, EventType
+from cayu.core.messages import Message, detach_message
+from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
@@ -20,10 +22,14 @@ from cayu.runtime._checkpoint_redaction import (
 )
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
+    ToolPolicyEvidence,
     copy_distinct_pending_tool_call_approvals,
 )
+from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import Session, SessionStatus
+from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
@@ -56,7 +62,16 @@ class PendingToolRound(BaseModel):
     environment_name: str | None = None
     task_id: str | None = None
     tool_calls: list[PendingToolCallApproval]
+    policy_state: Literal["unplanned", "planned"] = "unplanned"
+    policy_context_version: Literal[1] | None = None
+    request_metadata: dict[str, Any] = Field(default_factory=dict)
+    deferred_messages: list[Message] = Field(default_factory=list)
     structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
+    retry_policy: RetryPolicy | None = None
     source_model_step_id: str | None = None
     source_transcript_cursor: StrictInt | None = Field(
         default=None,
@@ -117,6 +132,16 @@ class PendingToolRound(BaseModel):
             owner="Pending tool round",
         )
 
+    @field_validator("request_metadata", mode="before")
+    @classmethod
+    def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return copy_durable_json_value(value, "request_metadata")
+
+    @field_validator("deferred_messages")
+    @classmethod
+    def copy_deferred_messages(cls, value: list[Message]) -> list[Message]:
+        return [detach_message(message) for message in value]
+
     @field_validator("structured_output")
     @classmethod
     def copy_structured_output(
@@ -124,6 +149,27 @@ class PendingToolRound(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @field_validator("limits")
+    @classmethod
+    def copy_limits(cls, value: RunLimits | None) -> RunLimits | None:
+        if value is None:
+            return None
+        return copy_run_limits(value)
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
+        return copy_request_budget_limits(value)
+
+    @field_validator("retry_policy")
+    @classmethod
+    def copy_retry_policy(cls, value: RetryPolicy | None) -> RetryPolicy | None:
+        if value is None:
+            return None
+        return copy_retry_policy(value)
 
     @field_validator("structured_output_validation")
     @classmethod
@@ -177,6 +223,20 @@ class PendingToolRound(BaseModel):
             raise ValueError(
                 "A structured-output finalizer attempt requires authoritative validation."
             )
+        if self.policy_state == "planned" and self.policy_context_version != 1:
+            raise ValueError("A planned pending tool round requires policy context version 1.")
+        if self.policy_state == "unplanned":
+            if any(
+                call.policy_evidence not in {None, ToolPolicyEvidence.UNPLANNED}
+                or (
+                    call.policy_evidence is ToolPolicyEvidence.UNPLANNED
+                    and call.policy_decision is not None
+                )
+                for call in self.tool_calls
+            ):
+                raise ValueError("An unplanned pending tool round cannot contain policy authority.")
+        elif any(call.policy_evidence is ToolPolicyEvidence.UNPLANNED for call in self.tool_calls):
+            raise ValueError("A planned pending tool round cannot contain unplanned calls.")
         return self
 
 
@@ -253,7 +313,16 @@ def checkpoint_with_pending_tool_round(
     task_id: str | None,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
-    structured_output: StructuredOutputSpec | None,
+    policy_state: Literal["unplanned", "planned"] = "unplanned",
+    policy_context_version: Literal[1] | None = None,
+    request_metadata: dict[str, Any] | None = None,
+    deferred_messages: list[Message] | None = None,
+    structured_output: StructuredOutputSpec | None = None,
+    thinking: ThinkingConfig | None = None,
+    max_steps: int | None = None,
+    limits: RunLimits | None = None,
+    budget_limits: tuple[BudgetLimit, ...] | None = None,
+    retry_policy: RetryPolicy | None = None,
     tool_round_identity: ToolRoundIdentity,
     redactor: SecretRedactor | None = None,
     source_model_step_id: str | None = None,
@@ -277,6 +346,11 @@ def checkpoint_with_pending_tool_round(
         raise RuntimeError("Session already has a pending tool round.")
 
     identity = copy_tool_round_identity(tool_round_identity)
+    durable_request_metadata = (
+        {} if request_metadata is None else resolved_redactor.redact_json_values(request_metadata)
+    )
+    if type(durable_request_metadata) is not dict:
+        raise AssertionError("Pending tool-round request metadata must remain an object.")
     pending_round = PendingToolRound(
         **identity.payload(),
         agent_name=agent_name,
@@ -285,9 +359,29 @@ def checkpoint_with_pending_tool_round(
         tool_calls=pending_tool_call_records(
             tool_calls=tool_calls,
             policy_outcomes=policy_outcomes,
+            default_policy_evidence=(
+                ToolPolicyEvidence.UNPLANNED
+                if policy_state == "unplanned"
+                else ToolPolicyEvidence.UNREGISTERED
+            ),
             redactor=redactor,
         ),
+        policy_state=policy_state,
+        policy_context_version=policy_context_version,
+        request_metadata=durable_request_metadata,
+        deferred_messages=(
+            []
+            if deferred_messages is None
+            else [detach_message(message) for message in deferred_messages]
+        ),
         structured_output=copy_structured_output_spec(structured_output),
+        thinking=thinking,
+        max_steps=max_steps,
+        limits=copy_run_limits(limits) if limits is not None else None,
+        budget_limits=(
+            copy_request_budget_limits(budget_limits) if budget_limits is not None else None
+        ),
+        retry_policy=copy_retry_policy(retry_policy) if retry_policy is not None else None,
         source_model_step_id=source_model_step_id,
         source_transcript_cursor=source_transcript_cursor,
         model_step=model_step,
@@ -350,11 +444,14 @@ def pending_tool_call_records(
     *,
     tool_calls: list[runtime_records.ToolCallRequest],
     policy_outcomes: list[runtime_records.ToolCallPolicyOutcome] | None,
+    default_policy_evidence: ToolPolicyEvidence = ToolPolicyEvidence.UNPLANNED,
     redactor: SecretRedactor | None = None,
 ) -> list[PendingToolCallApproval]:
     policy_results_by_id: dict[str, ToolPolicyResult | None] = {}
+    policy_evidence_by_id: dict[str, ToolPolicyEvidence] = {}
     if policy_outcomes is not None:
         policy_results_by_id = {outcome.call.id: outcome.result for outcome in policy_outcomes}
+        policy_evidence_by_id = {outcome.call.id: outcome.evidence for outcome in policy_outcomes}
 
     records: list[PendingToolCallApproval] = []
     for tool_call in tool_calls:
@@ -364,6 +461,10 @@ def pending_tool_call_records(
                 tool_call_id=tool_call.id,
                 tool_name=tool_call.name,
                 arguments=copy_durable_json_value(tool_call.arguments, "arguments"),
+                policy_evidence=policy_evidence_by_id.get(
+                    tool_call.id,
+                    default_policy_evidence,
+                ),
                 policy_decision=policy_result.decision.value if policy_result is not None else None,
                 reason=resume_ledger.policy_reason_for_pending_tool_call(
                     policy_result,

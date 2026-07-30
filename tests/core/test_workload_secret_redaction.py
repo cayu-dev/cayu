@@ -2170,6 +2170,8 @@ def test_approval_denial_schema_keys_do_not_block_model_continuation(secret: str
                 ToolApprovalRequest(
                     session_id=session_id,
                     approval_id=approval["approval_id"],
+                    tool_round_id=approval["tool_round_id"],
+                    tool_call_id=approval["tool_call_id"],
                     decision=ToolApprovalDecision.DENY,
                     reason="operator denied execution",
                     metadata={"safe": "value"},
@@ -3495,6 +3497,7 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
         },
         redactor=SecretRedactor("model"),
     )
+
     assert durable_value_contains_secret(
         {
             "prices": [{"model": "safe-name", "input_per_million": "1"}],
@@ -3571,6 +3574,39 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
         },
         redactor=SecretRedactor("status"),
     )
+
+
+def test_approval_resolution_digest_is_typed_private_checkpoint_state() -> None:
+    from cayu.runtime import _approval_support as approval_support
+    from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
+    from cayu.runtime.approvals import ToolApprovalDecision, ToolApprovalRequest
+    from cayu.vaults import SecretRedactor
+
+    request = ToolApprovalRequest(
+        session_id="session-1",
+        approval_id="approval-1",
+        tool_round_id=f"tround_{'3' * 32}",
+        tool_call_id="call-1",
+        decision=ToolApprovalDecision.APPROVE,
+    )
+    digest = approval_support.approval_resolution_request_digest(request)
+    checkpoint = {
+        approval_support.APPROVAL_RESOLUTION_INTENT_CHECKPOINT_KEY: {
+            "approval_id": request.approval_id,
+            "tool_call_id": request.tool_call_id,
+            "tool_round_id": request.tool_round_id,
+            "model_step_id": f"mstep_{'1' * 32}",
+            "model_attempt_id": f"matt_{'2' * 32}",
+            "decision": request.decision.value,
+            "resolution_request_digest": digest,
+        }
+    }
+
+    for secret in ("resolution", "digest", next(iter(digest))):
+        assert not durable_value_contains_secret(
+            checkpoint,
+            redactor=SecretRedactor(secret),
+        )
 
 
 @pytest.mark.parametrize(

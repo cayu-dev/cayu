@@ -132,6 +132,7 @@ def test_public_auth_helpers_document_tenant_as_provenance_only(public_api) -> N
             {
                 "session_id": "session-1",
                 "approval_id": "approval-1",
+                "tool_round_id": "round_1",
                 "tool_call_id": "call-1",
                 "outcome": "completed",
                 "message": "done",
@@ -303,6 +304,7 @@ def test_auth_guards_read_and_contract_routes(
             {
                 "session_id": "session-1",
                 "approval_id": "approval-1",
+                "tool_round_id": "round_1",
                 "tool_call_id": "call-1",
                 "outcome": "completed",
                 "message": "done",
@@ -627,6 +629,8 @@ def test_authenticated_resolution_derives_resolved_by_from_auth_context() -> Non
         json={
             "session_id": "session_actor",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
         },
     ) as response:
@@ -656,6 +660,8 @@ def test_authenticated_resolution_reserved_auth_subject_returns_400() -> None:
         json={
             "session_id": "session_actor",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
         },
     )
@@ -675,6 +681,8 @@ def test_authenticated_resolution_rejects_body_resolved_by() -> None:
         json={
             "session_id": "session_actor",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
             "resolved_by": {"subject": "someone-else"},
         },

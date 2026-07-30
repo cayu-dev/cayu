@@ -19,6 +19,7 @@ from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
     PendingToolApproval,
+    ToolPolicyEvidence,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.sessions import (
@@ -109,6 +110,18 @@ def pending_action_evidence_round_from_checkpoint(
     approval = approval_support.pending_approval_from_checkpoint(checkpoint)
     pending_input = pending_user_input_from_checkpoint(checkpoint)
     pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+    if approval is not None and pending_round is not None:
+        if (
+            pending_input is not None
+            or pending_round.policy_state != "planned"
+            or pending_round.tool_round_id != approval.tool_round_id
+            or pending_round.model_step_id != approval.model_step_id
+            or pending_round.model_attempt_id != approval.model_attempt_id
+            or [call.model_dump(mode="json") for call in pending_round.tool_calls]
+            != [call.model_dump(mode="json") for call in approval.tool_calls]
+        ):
+            raise ValueError("Checkpoint contains conflicting paired approval state.")
+        return pending_round.model_copy(deep=True)
     candidates = [
         candidate for candidate in (approval, pending_input, pending_round) if candidate is not None
     ]
@@ -119,6 +132,8 @@ def pending_action_evidence_round_from_checkpoint(
     candidate = candidates[0]
     if type(candidate) is tool_round_recovery.PendingToolRound:
         return candidate.model_copy(deep=True)
+    if type(candidate) is PendingToolApproval:
+        return approval_support.planned_tool_round_from_pending_approval(candidate)
     return tool_round_recovery.PendingToolRound(
         tool_round_id=candidate.tool_round_id,
         model_step_id=candidate.model_step_id,
@@ -532,6 +547,30 @@ def _project_payload_object_view(value: Any, keys: frozenset[str]) -> dict[str, 
     return {key: value[key] for key in keys if key in value}
 
 
+def _approval_event_matches_checkpoint(
+    event_pending: PendingToolApproval,
+    checkpoint_pending: PendingToolApproval | None,
+) -> bool:
+    """Compare approval authority while permitting bounded audit metadata."""
+
+    if checkpoint_pending is None:
+        return False
+
+    def authority_view(approval: PendingToolApproval) -> dict[str, Any]:
+        payload = approval.model_dump(mode="json")
+        payload.pop("metadata", None)
+        tool_calls = payload.get("tool_calls")
+        if type(tool_calls) is not list:
+            raise TypeError("Pending approval tool calls must be a list.")
+        for pending_call in tool_calls:
+            if type(pending_call) is not dict:
+                raise TypeError("Pending approval tool calls must be objects.")
+            pending_call.pop("metadata", None)
+        return payload
+
+    return authority_view(event_pending) == authority_view(checkpoint_pending)
+
+
 def pending_action_event_projection_bytes(record: EventRecord) -> int | None:
     value = record.event.payload.get(_OVERSIZED_EVENT_PROJECTION_BYTES_KEY)
     return value if type(value) is int and value > 0 else None
@@ -636,6 +675,7 @@ def _action_from_record(
     input_id: str | None = None,
     round_id: str | None = None,
     tool_call_id: str | None = None,
+    policy_evidence: ToolPolicyEvidence | None = None,
     question: str | None = None,
     options: list[str] | None = None,
     arguments: dict[str, Any] | None = None,
@@ -653,6 +693,7 @@ def _action_from_record(
         input_id=input_id,
         round_id=round_id,
         tool_call_id=tool_call_id,
+        policy_evidence=policy_evidence,
         question=question,
         options=options or [],
         arguments=arguments,
@@ -689,6 +730,11 @@ def _pending_approval_checkpoint_call(
             "tool_call_id": pending.tool_call_id,
             "tool_round_id": pending.tool_round_id,
             "reason": pending.reason,
+            "policy_evidence": approval_support.effective_tool_policy_evidence(
+                next(
+                    call for call in pending.tool_calls if call.tool_call_id == pending.tool_call_id
+                )
+            ),
         }
     if gating_only and pending.tool_call_id != tool_call_id:
         return None
@@ -700,6 +746,7 @@ def _pending_approval_checkpoint_call(
                 "tool_call_id": call.tool_call_id,
                 "tool_round_id": pending.tool_round_id,
                 "reason": pending.reason if call.tool_call_id == pending.tool_call_id else None,
+                "policy_evidence": approval_support.effective_tool_policy_evidence(call),
             }
     return None
 
@@ -904,7 +951,10 @@ def pending_action_from_records(
                     checkpoint_pending = None
                 if (
                     event_pending is not None
-                    and event_pending == checkpoint_pending
+                    and _approval_event_matches_checkpoint(
+                        event_pending,
+                        checkpoint_pending,
+                    )
                     and approval_id is not None
                     and tool_call_id is not None
                 ):
@@ -928,6 +978,7 @@ def pending_action_from_records(
                             approval_id=approval_id,
                             round_id=_optional_payload_string(checkpoint_call, "tool_round_id"),
                             tool_call_id=tool_call_id,
+                            policy_evidence=checkpoint_call.get("policy_evidence"),
                             arguments=_object_payload(checkpoint_call.get("arguments")) or {},
                         )
 

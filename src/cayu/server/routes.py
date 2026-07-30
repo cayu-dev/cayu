@@ -1073,6 +1073,8 @@ class ToolApprovalBody(BaseModel):
 
     session_id: NonBlankString
     approval_id: NonBlankString
+    tool_round_id: NonBlankString
+    tool_call_id: NonBlankString
     decision: ToolApprovalDecision
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -1102,6 +1104,7 @@ class ToolApprovalRecoveryBody(BaseModel):
 
     session_id: NonBlankString
     approval_id: NonBlankString
+    tool_round_id: NonBlankString
     tool_call_id: NonBlankString
     outcome: ToolApprovalRecoveryOutcome
     message: NonBlankString
@@ -3366,6 +3369,8 @@ def create_router(
         request = ToolApprovalRequest(
             session_id=body.session_id,
             approval_id=body.approval_id,
+            tool_round_id=body.tool_round_id,
+            tool_call_id=body.tool_call_id,
             decision=body.decision,
             reason=body.reason,
             metadata=body.metadata,
@@ -3417,6 +3422,7 @@ def create_router(
         request = ToolApprovalRecoveryRequest(
             session_id=body.session_id,
             approval_id=body.approval_id,
+            tool_round_id=body.tool_round_id,
             tool_call_id=body.tool_call_id,
             outcome=body.outcome,
             message=body.message,
@@ -3952,7 +3958,7 @@ def create_router(
                             exclude={"session", "event"},
                         ),
                         "pending_action",
-                        preserve_string_fields={"kind"},
+                        preserve_string_fields={"kind", "policy_evidence"},
                         untrusted_container_fields={"arguments"},
                     ),
                     "session": _serialize_session_base(cayu_app, action.session),

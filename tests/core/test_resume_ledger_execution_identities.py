@@ -7,7 +7,11 @@ from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
-from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+from cayu.runtime.approvals import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolApprovalDecision,
+)
 from cayu.runtime.execution_units import ToolRoundIdentity
 
 
@@ -181,6 +185,53 @@ def test_approval_resolution_history_accepts_exact_pending_call_descriptor() -> 
 
     assert history.has_approved_call is True
     assert history.has_granted_activity is True
+
+
+def test_approval_resolution_history_tracks_pre_grant_resolution_attempt() -> None:
+    approval = _pending_approval()
+    resumed = Event(
+        type=EventType.SESSION_RESUMED,
+        session_id="session-1",
+        agent_name=approval.agent_name,
+        environment_name=approval.environment_name,
+        payload={
+            **_identity().payload(),
+            "approval_id": approval.approval_id,
+            "tool_call_id": approval.tool_call_id,
+            "decision": ToolApprovalDecision.APPROVE.value,
+        },
+    )
+
+    history = approval_support.approval_resolution_history(
+        events=[resumed],
+        approval=approval,
+    )
+
+    assert history.has_resolution_attempt is True
+    assert history.has_resolution_activity is True
+    assert history.has_granted_activity is False
+
+
+def test_approval_resolution_history_rejects_conflicting_resolution_attempt() -> None:
+    approval = _pending_approval()
+    resumed = Event(
+        type=EventType.SESSION_RESUMED,
+        session_id="session-1",
+        agent_name=approval.agent_name,
+        environment_name=approval.environment_name,
+        payload={
+            **_identity().payload(),
+            "approval_id": approval.approval_id,
+            "tool_call_id": "different-call",
+            "decision": ToolApprovalDecision.APPROVE.value,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="contradictory resolution attempt"):
+        approval_support.approval_resolution_history(
+            events=[resumed],
+            approval=approval,
+        )
 
 
 @pytest.mark.parametrize(

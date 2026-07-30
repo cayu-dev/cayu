@@ -973,6 +973,76 @@ def test_ask_user_is_opt_in_not_registered_by_default() -> None:
     assert events[-1].type == EventType.SESSION_COMPLETED
 
 
+def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() -> None:
+    """Registration drift cannot turn a durable non-authority into execution."""
+
+    class FinalProvider(ModelProvider):
+        name = "fake"
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            del request
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    echo = _EchoTool()
+    first_app, store = _build(
+        [
+            ("call_late", "echo", {"text": "must not execute"}),
+            ("call_input", "ask_user", {"question": "continue?"}),
+        ],
+        tools=[UserInputTool()],
+    )
+    pause_events = asyncio.run(
+        _collect(
+            first_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="s_registration_drift",
+                messages=[Message.text("user", "go")],
+            ),
+        )
+    )
+    awaiting = next(
+        event for event in pause_events if event.type is EventType.SESSION_AWAITING_USER_INPUT
+    )
+    pending_calls = awaiting.payload["tool_calls"]
+    assert pending_calls[0]["policy_evidence"] == "unregistered"
+    assert pending_calls[1]["policy_evidence"] == "authoritative"
+
+    resumed_app = CayuApp(session_store=store, enable_logging=False)
+    resumed_app.register_provider(FinalProvider(), default=True)
+    resumed_app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UserInputTool(), echo],
+    )
+    events = asyncio.run(
+        _drain(
+            resumed_app.resolve_user_input(
+                UserInputResponse(
+                    session_id="s_registration_drift",
+                    input_id=awaiting.payload["input_id"],
+                    answer="yes",
+                )
+            )
+        )
+    )
+
+    assert echo.metadata_by_text == {}
+    failed = next(
+        event
+        for event in events
+        if event.type is EventType.TOOL_CALL_FAILED
+        and event.payload.get("tool_call_id") == "call_late"
+    )
+    assert failed.payload["registration_state"] == "unregistered_at_policy_plan"
+    assert not any(
+        event.type is EventType.TOOL_CALL_STARTED
+        and event.payload.get("tool_call_id") == "call_late"
+        for event in events
+    )
+    assert events[-1].type is EventType.SESSION_COMPLETED
+
+
 def test_ask_user_pauses_whole_round_before_any_tool_runs() -> None:
     # A round mixing ask_user with another (parallel-safe) tool pauses before ANY tool runs,
     # so the sibling never executes until the caller answers. Exercises the pause under main's

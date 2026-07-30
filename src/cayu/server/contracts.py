@@ -1084,6 +1084,15 @@ class ApiPendingAction(ApiBaseModel):
     input_id: str | None = None
     round_id: str | None = None
     tool_call_id: str | None = None
+    policy_evidence: (
+        Literal[
+            "unplanned",
+            "authoritative",
+            "unregistered",
+            "ambiguous",
+        ]
+        | None
+    ) = None
     question: str | None = None
     options: list[str] = Field(default_factory=list)
     arguments: dict[str, Any] | None = None

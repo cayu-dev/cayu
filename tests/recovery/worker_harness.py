@@ -755,10 +755,13 @@ async def _run_approval(config: dict[str, Any]) -> dict[str, Any]:
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
         checkpoint = await app.session_store.load_checkpoint(session_id) or {}
-        approval_id = checkpoint["pending_tool_approval"]["approval_id"]
+        pending_approval = checkpoint["pending_tool_approval"]
+        approval_id = pending_approval["approval_id"]
         request = ToolApprovalRequest(
             session_id=session_id,
             approval_id=approval_id,
+            tool_round_id=pending_approval["tool_round_id"],
+            tool_call_id=pending_approval["tool_call_id"],
             decision=(
                 ToolApprovalDecision.APPROVE if action == "approve" else ToolApprovalDecision.DENY
             ),
@@ -771,16 +774,15 @@ async def _run_approval(config: dict[str, Any]) -> dict[str, Any]:
         async for _ in app.resolve_tool_approval(request):
             pass
 
-        retry_rejected = False
-        try:
-            async for _ in app.resolve_tool_approval(request):
-                pass
-        except (RuntimeError, ValueError):
-            retry_rejected = True
+        retry_events = [event async for event in app.resolve_tool_approval(request)]
         return {
             "approval_id": approval_id,
             "recovery_actions": [str(item) for item in recovery.actions],
-            "retry_rejected": retry_rejected,
+            "retry_replayed": (
+                len(retry_events) == 1
+                and retry_events[0].type is EventType.SESSION_CHECKPOINTED
+                and retry_events[0].payload.get("cleared") is True
+            ),
         }
     finally:
         await app.session_store.close()

@@ -37,10 +37,11 @@ from cayu._validation import (
     require_clean_nonblank,
 )
 from cayu.core.events import Event, EventType, copy_event
-from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPart
+from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPart, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
 from cayu.environments import EnvironmentFactoryOperation
+from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
@@ -67,6 +68,7 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
     _is_background_subagent_session,
 )
+from cayu.runtime._message_redaction import redact_message_for_boundary
 from cayu.runtime._run_limits import RunLimitController, SessionUsageTracker
 from cayu.runtime._session_control import (
     ActiveSessionRun,
@@ -75,6 +77,7 @@ from cayu.runtime._session_control import (
 from cayu.runtime._session_queries import query_all_sessions
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
+    ToolApprovalRequired,
     ToolRoundExecutor,
     policy_denial_payload_fields,
 )
@@ -85,6 +88,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
+    ToolPolicyEvidence,
     expiry_resolution_actor,
     resolution_actor_payload,
 )
@@ -117,6 +121,7 @@ from cayu.runtime.sessions import (
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryRequest,
+    RuntimePublicationReceipt,
     Session,
     SessionOrder,
     SessionQuery,
@@ -131,6 +136,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _incomplete_recovery_claim_from_checkpoint,
+    runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
 from cayu.runtime.structured_output import (
@@ -304,6 +310,180 @@ EffectiveRetryPolicy = Callable[[RetryPolicy | None], RetryPolicy]
 RecoveryCleanup = Callable[[], Awaitable[None]]
 
 
+def _pending_approval_and_round_for_atomic_claim(
+    checkpoint: dict[str, Any] | None,
+    *,
+    approval_id: str,
+    tool_round_id: str,
+    gating_tool_call_id: str | None = None,
+    recovery_tool_call_id: str | None = None,
+    redactor: SecretRedactor,
+) -> tuple[PendingToolApproval, tool_round_recovery.PendingToolRound]:
+    if (gating_tool_call_id is None) == (recovery_tool_call_id is None):
+        raise TypeError("Exactly one approval gating or recovery tool-call identity is required.")
+    approval = approval_support.pending_approval_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if approval is None:
+        raise RuntimeError("Session has no pending tool approval.")
+    if approval.approval_id != approval_id or approval.tool_round_id != tool_round_id:
+        raise ValueError("Tool approval identity does not match the current pending approval.")
+    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if pending_round is None:
+        # Compatibility boundary for checkpoints written before the paired
+        # approval/round contract. PendingToolApproval is itself validated and
+        # carries the complete policy-planned call list; the atomic claim below
+        # persists this projection before any resolution work can begin.
+        pending_round = approval_support.planned_tool_round_from_pending_approval(approval)
+    if pending_round.policy_state != "planned":
+        raise RuntimeError("Pending tool approval has no durable policy plan.")
+    if (
+        pending_round.tool_round_id != approval.tool_round_id
+        or pending_round.model_step_id != approval.model_step_id
+        or pending_round.model_attempt_id != approval.model_attempt_id
+        or [call.model_dump(mode="json") for call in pending_round.tool_calls]
+        != [call.model_dump(mode="json") for call in approval.tool_calls]
+    ):
+        raise RuntimeError("Pending tool approval conflicts with its durable tool round.")
+    gating_calls = [
+        call for call in pending_round.tool_calls if call.tool_call_id == approval.tool_call_id
+    ]
+    gating_evidence = (
+        None
+        if len(gating_calls) != 1
+        else approval_support.effective_tool_policy_evidence(gating_calls[0])
+    )
+    if len(gating_calls) != 1 or not (
+        (
+            gating_evidence is ToolPolicyEvidence.AUTHORITATIVE
+            and gating_calls[0].policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+        )
+        or gating_evidence is ToolPolicyEvidence.AMBIGUOUS
+    ):
+        raise RuntimeError(
+            "Pending approval call is neither authoritatively approval-gated "
+            "nor explicitly ambiguous."
+        )
+    resolution_intent = approval_support.approval_resolution_intent_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if resolution_intent is not None:
+        approval_support.require_resolution_intent_matches_approval(
+            resolution_intent,
+            approval=approval,
+        )
+    if gating_tool_call_id is not None and approval.tool_call_id != gating_tool_call_id:
+        raise ValueError("Tool approval identity does not match the current pending approval.")
+    if recovery_tool_call_id is not None and not any(
+        call.tool_call_id == recovery_tool_call_id for call in pending_round.tool_calls
+    ):
+        raise ValueError("Recovery tool call is not part of the pending approval round.")
+    return approval, pending_round
+
+
+def _pending_approval_for_atomic_claim(
+    checkpoint: dict[str, Any] | None,
+    *,
+    approval_id: str,
+    tool_round_id: str,
+    gating_tool_call_id: str | None = None,
+    recovery_tool_call_id: str | None = None,
+    redactor: SecretRedactor,
+) -> PendingToolApproval:
+    approval, _pending_round = _pending_approval_and_round_for_atomic_claim(
+        checkpoint,
+        approval_id=approval_id,
+        tool_round_id=tool_round_id,
+        gating_tool_call_id=gating_tool_call_id,
+        recovery_tool_call_id=recovery_tool_call_id,
+        redactor=redactor,
+    )
+    return approval
+
+
+def _checkpoint_with_legacy_approval_round(
+    checkpoint: dict[str, Any] | None,
+    *,
+    approval: PendingToolApproval,
+    redactor: SecretRedactor,
+) -> dict[str, Any] | None:
+    """Atomically upgrade an approval-only checkpoint at its exact claim."""
+
+    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if pending_round is not None:
+        return checkpoint
+    current_approval = approval_support.pending_approval_from_checkpoint(
+        checkpoint,
+        redactor=redactor,
+    )
+    if current_approval != approval:
+        raise RuntimeError("Pending tool approval changed before legacy round migration.")
+    copied = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+    copied[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY] = (
+        approval_support.planned_tool_round_from_pending_approval(approval).model_dump(mode="json")
+    )
+    return copied
+
+
+def _approval_interrupt_close_intent_matches(
+    checkpoint: dict[str, Any] | None,
+    *,
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> bool:
+    """Require exact durable proof before recovering a cleared approval as interrupted."""
+
+    if checkpoint is None:
+        return False
+    interrupt_payload = checkpoint.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+    if (
+        type(interrupt_payload) is not dict
+        or interrupt_payload.get("interruption_type") != _INTERRUPTION_TYPE_OPERATOR_REQUESTED
+        or type(interrupt_payload.get("interruption_request_id")) is not str
+        or not interrupt_payload["interruption_request_id"].strip()
+        or interrupt_payload["interruption_request_id"].strip()
+        != interrupt_payload["interruption_request_id"]
+    ):
+        return False
+    intent = interrupt_payload.get(approval_support.APPROVAL_INTERRUPT_CLOSE_INTENT_KEY)
+    if type(intent) is not dict:
+        return False
+    identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+    expected = {
+        "tool_call_id": _pending_round_policy_gate_call_id(pending_round),
+        **identity.payload(),
+    }
+    return (
+        all(intent.get(key) == value for key, value in expected.items())
+        and type(intent.get("approval_id")) is str
+    )
+
+
+def _pending_round_policy_gate_call_id(
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> str | None:
+    """Return the call that must own this round's visible policy gate."""
+
+    for call in pending_round.tool_calls:
+        if (
+            approval_support.effective_tool_policy_evidence(call)
+            is ToolPolicyEvidence.AUTHORITATIVE
+            and call.policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+        ):
+            return call.tool_call_id
+    for call in pending_round.tool_calls:
+        if approval_support.effective_tool_policy_evidence(call) is ToolPolicyEvidence.AMBIGUOUS:
+            return call.tool_call_id
+    return None
+
+
 def _require_native_structured_output_support(
     structured_output: StructuredOutputSpec | None,
     *,
@@ -456,6 +636,12 @@ class RecoverySessionRunRequest:
 
 
 @dataclass(frozen=True)
+class DeferredInputMaterialization:
+    messages: list[Message]
+    cancellation: asyncio.CancelledError | None
+
+
+@dataclass(frozen=True)
 class RecoveryTerminalEventRequest:
     event: Event
     phase: RuntimeHookPhase
@@ -477,6 +663,9 @@ class RecoveryLimitStopRequest:
     tool_calls: list[runtime_records.ToolCallRequest]
     completed_tool_outcomes: list[runtime_records.ToolCallOutcome]
     pending_approval_to_clear: PendingToolApproval | None
+    deferred_messages: list[Message]
+    requested_approval_decision: ToolApprovalDecision | None
+    approval_resolution_request_digest: str | None
 
 
 @dataclass(frozen=True)
@@ -603,7 +792,6 @@ RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterat
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
 IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
-MaterializeDeferredInteractionInput = Callable[[str], Awaitable[bool]]
 ResumeInteraction = Callable[
     [
         Session,
@@ -641,7 +829,6 @@ class RecoveryCoordinator:
         interrupt_session_for_recovery: RecoveryInterruptionStream,
         pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
         abandoned_turn_completed: AbandonedTurnCompleted,
-        materialize_deferred_interaction_input: MaterializeDeferredInteractionInput,
         resume_interaction: ResumeInteraction,
     ) -> None:
         self._session_store = session_store
@@ -665,7 +852,6 @@ class RecoveryCoordinator:
         self._interrupt_session_for_recovery = interrupt_session_for_recovery
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
         self._abandoned_turn_completed = abandoned_turn_completed
-        self._materialize_deferred_interaction_input = materialize_deferred_interaction_input
         self._resume_interaction = resume_interaction
 
     async def preflight_model_completion_boundary(self, session: Session) -> bool:
@@ -709,6 +895,7 @@ class RecoveryCoordinator:
             if session.status not in {
                 stage.source_status,
                 SessionStatus.INTERRUPTING,
+                SessionStatus.FAILED,
             }:
                 raise ModelCompletionManualRecoveryRequired(
                     "The completed model stage cannot be promoted from the current session "
@@ -729,11 +916,17 @@ class RecoveryCoordinator:
             raise RuntimeError(
                 "The checkpoint contains conflicting pending approval and user-input pauses."
             )
-        if pending_round is not None and (
-            pending_approval is not None or pending_user_input is not None
-        ):
+        if pending_round is not None and pending_user_input is not None:
             raise RuntimeError(
                 "The checkpoint contains conflicting pending tool-round and pause markers."
+            )
+        if pending_round is not None and pending_approval is not None:
+            _pending_approval_for_atomic_claim(
+                checkpoint,
+                approval_id=pending_approval.approval_id,
+                tool_round_id=pending_approval.tool_round_id,
+                gating_tool_call_id=pending_approval.tool_call_id,
+                redactor=self._secret_redactor,
             )
         if pointer is None:
             if active is not None:
@@ -1286,8 +1479,19 @@ class RecoveryCoordinator:
                     EventType.TOOL_CALL_FAILED,
                 }
                 and started is None
+                and not (
+                    terminal.type is EventType.TOOL_CALL_FAILED
+                    and terminal.payload.get("registration_state") == "unregistered_at_policy_plan"
+                )
             ):
                 raise RuntimeError("Durable executed tool evidence has no preceding started event.")
+            if (
+                terminal.payload.get("registration_state") == "unregistered_at_policy_plan"
+                and started is not None
+            ):
+                raise RuntimeError(
+                    "Durable unregistered-at-plan evidence contains a started event."
+                )
             if terminal.type == EventType.TOOL_CALL_APPROVAL_DENIED and started is not None:
                 raise RuntimeError(
                     "Durable approval-denied tool evidence contains a started event."
@@ -1501,6 +1705,7 @@ class RecoveryCoordinator:
         session_id: str,
         *,
         from_statuses: set[SessionStatus] | None = None,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> tuple[Session, Event | None]:
         """Claim a paused session without leaving cancellation outcome-uncertain.
 
@@ -1532,13 +1737,16 @@ class RecoveryCoordinator:
         )
 
         def reject_active_incomplete_recovery(
-            _session: Session,
+            current_session: Session,
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
-            return _checkpoint_without_active_incomplete_recovery_claim(
+            checkpoint = _checkpoint_without_active_incomplete_recovery_claim(
                 checkpoint,
                 now=self._clock(),
             )
+            if checkpoint_transform is None:
+                return checkpoint
+            return checkpoint_transform(current_session, checkpoint)
 
         transition_task = asyncio.create_task(
             self._session_store.transition_status_and_checkpoint(
@@ -1801,28 +2009,106 @@ class RecoveryCoordinator:
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
 
+        close_receipt = await self._session_store.load_runtime_publication_receipt(
+            loaded_session.id,
+            f"approval-close:{request.approval_id}",
+        )
+        if close_receipt is not None:
+            expected_identity = {
+                "approval_id": request.approval_id,
+                "tool_call_id": request.tool_call_id,
+                "tool_round_id": request.tool_round_id,
+                "requested_decision": request.decision.value,
+                "resolution_request_digest": (
+                    approval_support.approval_resolution_request_digest(request)
+                ),
+            }
+            if close_receipt.kind != "approval-close" or any(
+                close_receipt.intent.get(key) != value for key, value in expected_identity.items()
+            ):
+                raise RuntimeError(
+                    "Tool approval was already closed with a conflicting identity or decision."
+                )
+            if len(close_receipt.appended_event_ids) != 1:
+                raise SessionRuntimePublicationConflict(
+                    "Tool approval closure receipt has invalid event evidence."
+                )
+            closure_records = await self._session_store.query_events(
+                EventQuery(
+                    session_id=loaded_session.id,
+                    event_id=close_receipt.appended_event_ids[0],
+                    limit=2,
+                )
+            )
+            if (
+                len(closure_records) != 1
+                or closure_records[0].event.id != close_receipt.appended_event_ids[0]
+            ):
+                raise SessionRuntimePublicationConflict(
+                    "Tool approval closure event is missing from durable history."
+                )
+            await self.materialize_deferred_input_for_receipt(close_receipt)
+            closure_event = closure_records[0].event
+            yield closure_event
+            return
+
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        candidate_approval, candidate_round = _pending_approval_and_round_for_atomic_claim(
+            checkpoint,
+            approval_id=request.approval_id,
+            tool_round_id=request.tool_round_id,
+            gating_tool_call_id=request.tool_call_id,
+            redactor=self._secret_redactor,
+        )
+        candidate_intent = approval_support.approval_resolution_intent_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
-            consume_on_rejection=True,
         )
-        if pending_approval is None:
-            raise RuntimeError("Session has no pending tool approval.")
-        if pending_approval.approval_id != request.approval_id:
-            raise ValueError(
-                f"Tool approval id does not match pending approval: {request.approval_id}"
+        resolution_request_digest = approval_support.approval_resolution_request_digest(request)
+        can_create_resolution_intent = True
+        try:
+            candidate_events = await self._session_store.load_events(loaded_session.id)
+            candidate_history = approval_support.approval_resolution_history(
+                events=candidate_events,
+                approval=candidate_approval,
             )
+            candidate_decision = request.decision
+            if (
+                approval_support.pending_approval_expired(
+                    candidate_approval,
+                    self._clock(),
+                )
+                and not candidate_history.has_granted_activity
+            ):
+                candidate_decision = ToolApprovalDecision.DENY
+            approval_support.validate_retry_decision(
+                history=candidate_history,
+                approval=candidate_approval,
+                decision=candidate_decision,
+            )
+            candidate_outcomes = approval_support.recorded_tool_outcomes(
+                events=candidate_events,
+                approval=candidate_approval,
+            )
+            if candidate_history.has_resolution_activity or candidate_outcomes:
+                # Durable resolution activity without an existing request digest
+                # cannot prove which audit-bearing request authorized it. Never
+                # infer that identity from redacted or bounded event payloads.
+                can_create_resolution_intent = False
+        except Exception:
+            # The continuation repeats this validation inside its established
+            # interruption-event boundary. Do not let a rejected legacy retry
+            # become durable authority before that happens.
+            can_create_resolution_intent = False
         effective_structured_output = _effective_approval_structured_output(
             structured_output=request.structured_output,
-            pending_approval=pending_approval,
+            pending_approval=candidate_approval,
         )
         require_secret_free_structured_output_spec(
             effective_structured_output,
             redactor=self._secret_redactor,
             field_name="ToolApprovalRequest.structured_output",
         )
-
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
         registered_provider = self._resolve_registered_provider(loaded_session.provider_name)
         _require_native_structured_output_support(
@@ -1831,12 +2117,65 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
+        pending_approval: PendingToolApproval | None = None
+        pending_round: tool_round_recovery.PendingToolRound | None = None
+        claimed_intent: approval_support.ApprovalResolutionIntent | None = None
+
+        def claim_exact_approval(
+            _current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            nonlocal claimed_intent, pending_approval, pending_round
+            pending_approval, pending_round = _pending_approval_and_round_for_atomic_claim(
+                checkpoint,
+                approval_id=request.approval_id,
+                tool_round_id=request.tool_round_id,
+                gating_tool_call_id=request.tool_call_id,
+                redactor=self._secret_redactor,
+            )
+            if pending_approval != candidate_approval or pending_round != candidate_round:
+                raise RuntimeError("Pending tool approval changed before it was claimed.")
+            current_intent = approval_support.approval_resolution_intent_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+            )
+            if current_intent != candidate_intent:
+                raise RuntimeError(
+                    "Approval resolution intent changed before the approval was claimed."
+                )
+            claimed_checkpoint = _checkpoint_with_legacy_approval_round(
+                checkpoint,
+                approval=pending_approval,
+                redactor=self._secret_redactor,
+            )
+            if current_intent is not None:
+                claimed_intent = current_intent
+                return claimed_checkpoint
+            intent_decision = request.decision if can_create_resolution_intent else None
+            if intent_decision is None:
+                claimed_intent = None
+                return claimed_checkpoint
+            claimed_checkpoint = approval_support.checkpoint_with_approval_resolution_intent(
+                claimed_checkpoint,
+                approval=pending_approval,
+                decision=intent_decision,
+                resolution_request_digest=resolution_request_digest,
+                redactor=self._secret_redactor,
+            )
+            claimed_intent = approval_support.approval_resolution_intent_from_checkpoint(
+                claimed_checkpoint,
+                redactor=self._secret_redactor,
+            )
+            return claimed_checkpoint
+
         session, resumed_event = await self._transition_recovery_session_to_running(
-            loaded_session.id
+            loaded_session.id,
+            checkpoint_transform=claim_exact_approval,
         )
+        if pending_approval is None or pending_round is None:
+            raise RuntimeError("Tool approval claim completed without approval state.")
         if resumed_event is not None:
             yield resumed_event
-
         continuation_stream = self.continue_tool_approval_resolution(
             request=request,
             session=session,
@@ -1844,6 +2183,8 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            deferred_messages=pending_round.deferred_messages,
+            claimed_resolution_intent=claimed_intent,
         )
         authoritative_failure: BaseException | None = None
         abandoned = False
@@ -1872,29 +2213,28 @@ class RecoveryCoordinator:
             raise KeyError(f"Session not found: {request.session_id}")
 
         checkpoint = await self._session_store.load_checkpoint(loaded_session.id)
-        pending_approval = approval_support.pending_approval_from_checkpoint(
+        candidate_approval, candidate_round = _pending_approval_and_round_for_atomic_claim(
+            checkpoint,
+            approval_id=request.approval_id,
+            tool_round_id=request.tool_round_id,
+            recovery_tool_call_id=request.tool_call_id,
+            redactor=self._secret_redactor,
+        )
+        candidate_intent = approval_support.approval_resolution_intent_from_checkpoint(
             checkpoint,
             redactor=self._secret_redactor,
-            consume_on_rejection=True,
         )
-        if pending_approval is None:
-            raise RuntimeError("Session has no pending tool approval.")
-        if pending_approval.approval_id != request.approval_id:
-            raise ValueError(
-                f"Tool approval id does not match pending approval: {request.approval_id}"
-            )
         effective_structured_output = _effective_approval_structured_output(
             structured_output=request.structured_output,
-            pending_approval=pending_approval,
+            pending_approval=candidate_approval,
         )
         require_secret_free_structured_output_spec(
             effective_structured_output,
             redactor=self._secret_redactor,
             field_name="ToolApprovalRecoveryRequest.structured_output",
         )
-
         pending_tool_call = approval_support.pending_tool_call_for_recovery(
-            approval=pending_approval,
+            approval=candidate_approval,
             tool_call_id=request.tool_call_id,
         )
         registered_agent = self._resolve_registered_agent(loaded_session.agent_name)
@@ -1905,9 +2245,50 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
+        pending_approval: PendingToolApproval | None = None
+        pending_round: tool_round_recovery.PendingToolRound | None = None
+        claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None = None
+
+        def claim_exact_approval(
+            _current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            nonlocal claimed_resolution_intent, pending_approval, pending_round
+            pending_approval, pending_round = _pending_approval_and_round_for_atomic_claim(
+                checkpoint,
+                approval_id=request.approval_id,
+                tool_round_id=request.tool_round_id,
+                recovery_tool_call_id=request.tool_call_id,
+                redactor=self._secret_redactor,
+            )
+            if pending_approval != candidate_approval or pending_round != candidate_round:
+                raise RuntimeError("Pending tool approval changed before it was claimed.")
+            current_intent = approval_support.approval_resolution_intent_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+            )
+            if current_intent != candidate_intent:
+                raise RuntimeError(
+                    "Approval resolution intent changed before recovery was claimed."
+                )
+            if current_intent is not None:
+                approval_support.require_resolution_intent_matches_approval(
+                    current_intent,
+                    approval=pending_approval,
+                )
+            claimed_resolution_intent = current_intent
+            return _checkpoint_with_legacy_approval_round(
+                checkpoint,
+                approval=pending_approval,
+                redactor=self._secret_redactor,
+            )
+
         session, resumed_event = await self._transition_recovery_session_to_running(
-            loaded_session.id
+            loaded_session.id,
+            checkpoint_transform=claim_exact_approval,
         )
+        if pending_approval is None or pending_round is None:
+            raise RuntimeError("Tool approval recovery claim completed without approval state.")
         if resumed_event is not None:
             yield resumed_event
         recovery_stream = self.recover_tool_approval(
@@ -1919,6 +2300,8 @@ class RecoveryCoordinator:
             registered_agent=registered_agent,
             registered_provider=registered_provider,
             registered_environment=registered_environment,
+            deferred_messages=pending_round.deferred_messages,
+            claimed_resolution_intent=claimed_resolution_intent,
         )
         authoritative_failure: BaseException | None = None
         try:
@@ -1934,6 +2317,20 @@ class RecoveryCoordinator:
                 authoritative_failure=authoritative_failure,
                 finalize_abandoned=False,
                 release_run_fence=False,
+            )
+
+    def _reject_approval_owned_tool_round_recovery(
+        self,
+        checkpoint: dict[str, Any] | None,
+    ) -> None:
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+        )
+        if pending_approval is not None:
+            raise RuntimeError(
+                "Pending approval-owned tool rounds must be recovered with "
+                "ToolApprovalRecoveryRequest."
             )
 
     async def recover_tool_round_request(
@@ -1973,6 +2370,7 @@ class RecoveryCoordinator:
         )
         if pending_round is None:
             raise RuntimeError("Session has no pending tool round.")
+        self._reject_approval_owned_tool_round_recovery(checkpoint)
         if pending_round.tool_round_id != request.round_id:
             raise ValueError(f"Tool round id does not match pending round: {request.round_id}")
         effective_structured_output = _effective_tool_round_structured_output(
@@ -2188,7 +2586,14 @@ class RecoveryCoordinator:
                     tool_outcomes.append(recorded_outcome)
                     continue
 
+                pending_call = pending_by_id[tool_call.id]
+                policy_evidence = approval_support.effective_tool_policy_evidence(pending_call)
+                policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
                 if tool_call.id == pending.tool_call_id:
+                    if policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE:
+                        raise RuntimeError(
+                            "Pending user-input call has no authoritative policy decision."
+                        )
                     registered_tool = registered_agent.tools.get(tool_call.name)
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
@@ -2252,8 +2657,6 @@ class RecoveryCoordinator:
                             tool_outcomes.append(outcome)
                     continue
 
-                pending_call = pending_by_id[tool_call.id]
-                policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
                 call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
                     pending_call
                 )
@@ -2261,7 +2664,11 @@ class RecoveryCoordinator:
                 # the decision, so a DENY must be blocked here explicitly (mirroring the approval
                 # resume) — otherwise a policy-denied sibling would execute. REQUIRE_APPROVAL
                 # cannot occur: it would have preempted the ask_user pause with an approval pause.
-                if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
+                if (
+                    policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+                    and policy_result is not None
+                    and policy_result.decision == ToolPolicyDecision.DENY
+                ):
                     reason = tool_execution.policy_denial_reason(policy_result)
                     blocked_result = tool_execution.blocked_tool_result(
                         policy_result, reason=reason
@@ -2308,6 +2715,34 @@ class RecoveryCoordinator:
                         if outcome is not None:
                             tool_outcomes.append(outcome)
                     continue
+
+                if policy_evidence in {
+                    ToolPolicyEvidence.AMBIGUOUS,
+                    ToolPolicyEvidence.UNREGISTERED,
+                }:
+                    async for (
+                        event,
+                        outcome,
+                    ) in self._emit_non_authoritative_policy_call(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        tool_call=tool_call,
+                        policy_evidence=policy_evidence,
+                        tool_round_identity=tool_round_identity,
+                        task_id=pending.task_id,
+                        input_id=pending.input_id,
+                    ):
+                        yield event
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
+                    continue
+
+                if policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE:
+                    raise RuntimeError(
+                        "Pending user-input sibling has no executable policy authority."
+                    )
 
                 async for event, outcome in self._tool_round_executor.execute_tool_call(
                     session=session,
@@ -2434,6 +2869,121 @@ class RecoveryCoordinator:
         checkpoint.pop(PENDING_USER_INPUT_CHECKPOINT_KEY, None)
         return checkpoint
 
+    async def _emit_non_authoritative_policy_call(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        tool_call: runtime_records.ToolCallRequest,
+        policy_evidence: ToolPolicyEvidence,
+        tool_round_identity: ToolRoundIdentity,
+        task_id: str | None,
+        approval_id: str | None = None,
+        input_id: str | None = None,
+        requested_decision: ToolApprovalDecision | None = None,
+        resolved_by_payload: dict[str, Any] | None = None,
+        resolution_reason: str | None = None,
+        resolution_metadata: dict[str, Any] | None = None,
+    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        """Close a call that lacks positive policy authority without dispatch."""
+
+        if (approval_id is None) == (input_id is None):
+            raise TypeError("Exactly one approval or user-input identity is required.")
+        evidence_payload: dict[str, Any]
+        structured: dict[str, Any]
+        if policy_evidence is ToolPolicyEvidence.AMBIGUOUS:
+            event_type = EventType.TOOL_CALL_BLOCKED
+            reason = (
+                "Tool policy evaluation did not produce a durable decision; "
+                "the call was not executed."
+            )
+            evidence_payload = {
+                "decision": "ambiguous",
+                "blocked_by": "policy_evaluation_ambiguous",
+                "reason": reason,
+            }
+            structured = {
+                "decision": "ambiguous",
+                "blocked_by": "policy_evaluation_ambiguous",
+            }
+        elif policy_evidence is ToolPolicyEvidence.UNREGISTERED:
+            event_type = EventType.TOOL_CALL_FAILED
+            reason = f"Tool was not registered when the policy plan was recorded: {tool_call.name}"
+            evidence_payload = {
+                "registration_state": "unregistered_at_policy_plan",
+            }
+            structured = {
+                "registration_state": "unregistered_at_policy_plan",
+            }
+        else:
+            raise ValueError(
+                "Non-authoritative closure requires ambiguous or unregistered evidence."
+            )
+
+        pause_payload: dict[str, Any]
+        idempotency_options: dict[str, str]
+        if approval_id is not None:
+            pause_payload = {"approval_id": approval_id}
+            idempotency_options = {"approval_id": approval_id}
+            if requested_decision is not None:
+                evidence_payload["requested_decision"] = requested_decision.value
+                evidence_payload["resolution_reason"] = resolution_reason
+                evidence_payload.update(
+                    approval_support.bounded_resolution_metadata_payload(
+                        {} if resolution_metadata is None else resolution_metadata,
+                        redactor=self._secret_redactor,
+                    )
+                )
+            evidence_payload["resolved_by"] = resolved_by_payload
+        else:
+            assert input_id is not None
+            pause_payload = {"input_id": input_id}
+            idempotency_options = {"pause_id": input_id}
+
+        result = ToolResult(
+            content=reason,
+            structured={
+                **tool_round_identity.payload(),
+                **pause_payload,
+                "tool_call_id": tool_call.id,
+                "tool_name": tool_call.name,
+                **structured,
+            },
+            is_error=True,
+        )
+        idempotency_key = tool_execution.tool_idempotency_key(
+            session_id=session.id,
+            tool_round_id=tool_round_identity.tool_round_id,
+            tool_call_id=tool_call.id,
+            **idempotency_options,
+        )
+        async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
+            event=Event(
+                type=event_type,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                tool_name=tool_call.name,
+                payload={
+                    **tool_round_identity.payload(),
+                    **pause_payload,
+                    "tool_call_id": tool_call.id,
+                    "idempotency_key": idempotency_key,
+                    **evidence_payload,
+                    "result": result.model_dump(),
+                },
+            ),
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+            result=result,
+            task_id=task_id,
+        ):
+            yield event, outcome
+
     async def continue_tool_approval_resolution(
         self,
         *,
@@ -2443,8 +2993,11 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        deferred_messages: list[Message] | None = None,
         emit_resume_event: bool = True,
         enforce_expiry: bool = True,
+        claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None = None,
+        recovery_closure_only: bool = False,
     ) -> AsyncGenerator[Event, None]:
         environment_name = _environment_name(registered_environment)
         tool_round_identity = ToolRoundIdentity(
@@ -2455,6 +3008,13 @@ class RecoveryCoordinator:
         pending_approval_cleared = False
         tool_outcomes: list[runtime_records.ToolCallOutcome] = []
         expired = False
+        original_resolution_decision = request.decision
+        resolution_request_digest = approval_support.approval_resolution_request_digest(request)
+        deferred_messages = (
+            []
+            if deferred_messages is None
+            else [detach_message(message) for message in deferred_messages]
+        )
         # Restore the original run's config persisted on the pending approval;
         # explicit overrides on the approval request win. Approvals persisted
         # before this state existed fall back to the historical defaults.
@@ -2501,6 +3061,8 @@ class RecoveryCoordinator:
                 request = ToolApprovalRequest(
                     session_id=request.session_id,
                     approval_id=request.approval_id,
+                    tool_round_id=request.tool_round_id,
+                    tool_call_id=request.tool_call_id,
                     decision=ToolApprovalDecision.DENY,
                     reason=f"Tool approval expired at {expired_at_iso}.",
                     metadata=copy_json_value(request.metadata, "metadata"),
@@ -2523,6 +3085,52 @@ class RecoveryCoordinator:
                 events=approval_events,
                 approval=pending_approval,
             )
+            terminal_outcomes_cover_round = set(recorded_outcomes) == {
+                pending_call.tool_call_id
+                for pending_call in approval_support.pending_round_tool_calls(pending_approval)
+            }
+            if claimed_resolution_intent is None:
+                if history.has_resolution_activity or recorded_outcomes:
+                    raise RuntimeError(
+                        "Tool approval cannot be retried automatically because prior durable "
+                        "resolution activity has no exact resolution request identity."
+                    )
+                raise RuntimeError(
+                    "Tool approval resolution request identity was not durably claimed."
+                )
+            current_checkpoint = await self._session_store.load_checkpoint(session.id)
+            current_intent = approval_support.approval_resolution_intent_from_checkpoint(
+                current_checkpoint,
+                redactor=self._secret_redactor,
+            )
+            if current_intent != claimed_resolution_intent:
+                raise RuntimeError(
+                    "Approval resolution intent changed after the approval was claimed."
+                )
+            if claimed_resolution_intent.decision is not original_resolution_decision:
+                raise RuntimeError(
+                    "Tool approval was already claimed with a different resolution decision."
+                )
+            if claimed_resolution_intent.resolution_request_digest is None:
+                raise RuntimeError(
+                    "Tool approval cannot be retried automatically because its durable "
+                    "resolution intent predates exact resolution request identity."
+                )
+            if recovery_closure_only:
+                if claimed_resolution_intent.decision is not ToolApprovalDecision.APPROVE:
+                    raise RuntimeError(
+                        "Manual tool approval recovery has no durable approval grant."
+                    )
+                if not terminal_outcomes_cover_round:
+                    raise RuntimeError(
+                        "Manual tool approval recovery cannot authorize pending sibling "
+                        "execution; retry the exact original approval request."
+                    )
+                resolution_request_digest = claimed_resolution_intent.resolution_request_digest
+            elif claimed_resolution_intent.resolution_request_digest != (resolution_request_digest):
+                raise RuntimeError(
+                    "Tool approval was already claimed with a different resolution request."
+                )
             factory_started_event = await self._environment_lifecycle.emit_factory_started(
                 session=session,
                 registered_agent=registered_agent,
@@ -2631,12 +3239,16 @@ class RecoveryCoordinator:
                         arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
                     )
                     pending_tool_calls.append(tool_call)
+                    policy_evidence = approval_support.effective_tool_policy_evidence(
+                        pending_tool_call
+                    )
                     policy_result = approval_support.policy_result_from_pending_tool_call(
                         pending_tool_call
                     )
                     if (
-                        policy_result is not None
-                        and policy_result.decision == ToolPolicyDecision.DENY
+                        policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE
+                        or policy_result is None
+                        or policy_result.decision == ToolPolicyDecision.DENY
                     ):
                         continue
                     executable_pending_tool_calls += 1
@@ -2676,10 +3288,12 @@ class RecoveryCoordinator:
                             tool_calls=pending_tool_calls,
                             completed_tool_outcomes=recorded_tool_outcomes,
                             pending_approval_to_clear=pending_approval,
+                            deferred_messages=deferred_messages,
+                            requested_approval_decision=original_resolution_decision,
+                            approval_resolution_request_digest=resolution_request_digest,
                         )
                     ):
                         yield event
-                    pending_approval_cleared = True
                     return
 
             for pending_tool_call in approval_support.pending_round_tool_calls(pending_approval):
@@ -2691,6 +3305,7 @@ class RecoveryCoordinator:
                 policy_result = approval_support.policy_result_from_pending_tool_call(
                     pending_tool_call
                 )
+                policy_evidence = approval_support.effective_tool_policy_evidence(pending_tool_call)
                 call_taint_labels = approval_support.taint_labels_from_pending_tool_call(
                     pending_tool_call
                 )
@@ -2699,7 +3314,11 @@ class RecoveryCoordinator:
                     tool_outcomes.append(recorded_outcome)
                     continue
 
-                if policy_result is not None and policy_result.decision == ToolPolicyDecision.DENY:
+                if (
+                    policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+                    and policy_result is not None
+                    and policy_result.decision == ToolPolicyDecision.DENY
+                ):
                     reason = tool_execution.policy_denial_reason(policy_result)
                     result = tool_execution.blocked_tool_result(policy_result, reason=reason)
                     idempotency_key = tool_execution.tool_idempotency_key(
@@ -2746,32 +3365,32 @@ class RecoveryCoordinator:
                     continue
 
                 if (
-                    policy_result is not None
+                    policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+                    and policy_result is not None
                     and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
                     and request.decision == ToolApprovalDecision.APPROVE
                 ):
-                    yield await self._event_writer.emit(
-                        Event(
-                            type=EventType.TOOL_CALL_APPROVED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload={
-                                **tool_round_identity.payload(),
-                                "approval_id": pending_approval.approval_id,
-                                "tool_call_id": tool_call.id,
-                                "reason": request.reason,
-                                "metadata": request.metadata,
-                                "resolved_by": resolved_by_payload,
-                            },
-                        )
+                    yield await self._publish_tool_approval_granted_once(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        pending_approval=pending_approval,
+                        tool_call=tool_call,
+                        tool_round_identity=tool_round_identity,
+                        reason=request.reason,
+                        metadata=request.metadata,
+                        resolved_by_payload=resolved_by_payload,
+                        durable_events=approval_events,
                     )
 
                 if request.decision == ToolApprovalDecision.DENY:
                     approval_required = (
-                        policy_result is not None
+                        policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+                        and policy_result is not None
                         and policy_result.decision == ToolPolicyDecision.REQUIRE_APPROVAL
+                    ) or (
+                        policy_evidence is ToolPolicyEvidence.AMBIGUOUS
+                        and tool_call.id == pending_approval.tool_call_id
                     )
                     result = approval_support.approval_denied_tool_result(
                         request,
@@ -2802,7 +3421,10 @@ class RecoveryCoordinator:
                                 "idempotency_key": idempotency_key,
                                 "approval_required": approval_required,
                                 "reason": request.reason,
-                                "metadata": request.metadata,
+                                **approval_support.bounded_resolution_metadata_payload(
+                                    request.metadata,
+                                    redactor=self._secret_redactor,
+                                ),
                                 "resolved_by": resolved_by_payload,
                                 "expired": expired,
                                 "result": result.model_dump(),
@@ -2819,6 +3441,36 @@ class RecoveryCoordinator:
                         if outcome is not None:
                             tool_outcomes.append(outcome)
                     continue
+
+                if request.decision == ToolApprovalDecision.APPROVE and policy_evidence in {
+                    ToolPolicyEvidence.AMBIGUOUS,
+                    ToolPolicyEvidence.UNREGISTERED,
+                }:
+                    async for (
+                        event,
+                        outcome,
+                    ) in self._emit_non_authoritative_policy_call(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        tool_call=tool_call,
+                        policy_evidence=policy_evidence,
+                        tool_round_identity=tool_round_identity,
+                        task_id=pending_approval.task_id,
+                        approval_id=pending_approval.approval_id,
+                        requested_decision=request.decision,
+                        resolved_by_payload=resolved_by_payload,
+                        resolution_reason=request.reason,
+                        resolution_metadata=request.metadata,
+                    ):
+                        yield event
+                        if outcome is not None:
+                            tool_outcomes.append(outcome)
+                    continue
+
+                if policy_evidence is not ToolPolicyEvidence.AUTHORITATIVE:
+                    raise RuntimeError("Pending tool call has no executable policy authority.")
 
                 async for event, outcome in self._tool_round_executor.execute_tool_call(
                     session=session,
@@ -2837,29 +3489,113 @@ class RecoveryCoordinator:
                     if outcome is not None:
                         tool_outcomes.append(outcome)
 
+            source_checkpoint = await self._session_store.load_checkpoint(session.id)
+            durable_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                source_checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            if durable_round is None or (
+                durable_round.tool_round_id,
+                durable_round.model_step_id,
+                durable_round.model_attempt_id,
+            ) != (
+                pending_approval.tool_round_id,
+                pending_approval.model_step_id,
+                pending_approval.model_attempt_id,
+            ):
+                raise RuntimeError("Pending approval round changed before atomic closure.")
+            final_events = await self._session_store.load_events(session.id)
+            final_outcomes = approval_support.recorded_tool_outcomes(
+                events=final_events,
+                approval=pending_approval,
+            )
+            lifecycle_event_types = {
+                EventType.TOOL_CALL_STARTED,
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+            }
+            lifecycle_events = [
+                event
+                for event in final_events
+                if event.type in lifecycle_event_types
+                and event.payload.get("approval_id") == pending_approval.approval_id
+                and tool_round_identity.matches_payload(event.payload)
+            ]
+            ordered_outcomes = [
+                final_outcomes[call.tool_call_id] for call in durable_round.tool_calls
+            ]
             tool_result_messages = transcript_helpers.tool_result_messages(
-                tool_outcomes,
+                ordered_outcomes,
                 tool_round_identity=tool_round_identity,
             )
-            transcript.extend(tool_result_messages)
-            cleared_checkpoint = await approval_support.checkpoint_without_pending_approval(
-                self._session_store,
-                session.id,
+            transcript_messages = list(tool_result_messages)
+            target_checkpoint = approval_support.checkpoint_without_exact_pending_approval_round(
+                source_checkpoint,
+                approval=pending_approval,
+                redactor=self._secret_redactor,
             )
-            await self._session_store.append_transcript_messages_and_transform_checkpoint(
-                session.id,
-                tool_result_messages,
-                self._checkpoint_transform(cleared_checkpoint),
+            clear_event = approval_support.cleared_event(
+                session=session,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                approval=pending_approval,
+            )
+            prepared_close = approval_publication.prepare_approval_publication(
+                session_id=session.id,
+                publication_id=f"approval-close:{pending_approval.approval_id}",
+                kind="approval-close",
+                intent={
+                    "schema_version": 1,
+                    "approval_id": pending_approval.approval_id,
+                    "tool_call_id": pending_approval.tool_call_id,
+                    **tool_round_identity.payload(),
+                    "decision": request.decision.value,
+                    "requested_decision": original_resolution_decision.value,
+                    "resolution_request_digest": resolution_request_digest,
+                    "tool_call_ids": [call.tool_call_id for call in durable_round.tool_calls],
+                    "approval_digest": runtime_publication_checkpoint_value_digest(
+                        pending_approval.model_dump(mode="json")
+                    ),
+                    "pending_round_digest": runtime_publication_checkpoint_value_digest(
+                        durable_round.model_dump(mode="json")
+                    ),
+                    "event_ids": [clear_event.id],
+                    "referenced_event_ids": [event.id for event in lifecycle_events],
+                },
+                source_checkpoint=source_checkpoint,
+                target_checkpoint=target_checkpoint,
+                transcript_messages=transcript_messages,
+                events=[clear_event],
+                referenced_events=lifecycle_events,
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=session.run_epoch,
+                expected_transcript_cursor=len(transcript),
+            )
+            prepared_events = prepared_close.request.events
+            if len(prepared_events) != 1:
+                raise AssertionError("Approval closure must publish one checkpoint event.")
+            clear_event = prepared_events[0]
+            close_cancellation = await approval_publication.publish_approval_with_exact_replay(
+                prepared_close,
+                session_store=self._session_store,
+                event_writer=self._event_writer,
+                fan_out=False,
             )
             pending_approval_cleared = True
-            yield await self._event_writer.emit(
-                approval_support.cleared_event(
-                    session=session,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    approval=pending_approval,
-                )
+            materialized = await self.materialize_expected_deferred_input(
+                session.id,
+                deferred_messages,
+                cancellation=close_cancellation,
             )
+            transcript = materialized.messages
+            close_cancellation = materialized.cancellation
+            await self._event_writer.fan_out_persisted([clear_event])
+            yield clear_event
+            if close_cancellation is not None:
+                raise close_cancellation
 
             session_stream = self._run_session(
                 RecoverySessionRunRequest(
@@ -2930,7 +3666,10 @@ class RecoveryCoordinator:
                                 ),
                                 **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                                "approval": pending_approval.model_dump(mode="json"),
+                                **approval_support.bounded_pending_approval_event_payload(
+                                    pending_approval,
+                                    redactor=self._secret_redactor,
+                                ),
                                 "approval_id": pending_approval.approval_id,
                                 "tool_call_id": exc.tool_call_id,
                                 "tool_name": exc.tool_name,
@@ -2945,6 +3684,21 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
+
+            if not pending_approval_cleared:
+                try:
+                    pending_approval_cleared = await self._exact_approval_close_receipt_exists(
+                        session_id=session.id,
+                        approval=pending_approval,
+                        requested_decision=original_resolution_decision,
+                        resolution_request_digest=resolution_request_digest,
+                    )
+                except Exception as receipt_error:
+                    exc.add_note(
+                        "Exact approval-close receipt reconciliation failed; the approval "
+                        "remains fail-closed: "
+                        f"{type(receipt_error).__name__}: {receipt_error}"
+                    )
 
             if not pending_approval_cleared:
                 session = await self._session_store.update_status(
@@ -2965,7 +3719,10 @@ class RecoveryCoordinator:
                                 ),
                                 **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                                "approval": pending_approval.model_dump(mode="json"),
+                                **approval_support.bounded_pending_approval_event_payload(
+                                    pending_approval,
+                                    redactor=self._secret_redactor,
+                                ),
                                 **(
                                     {
                                         resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY: True,
@@ -3043,6 +3800,98 @@ class RecoveryCoordinator:
                 )
             ):
                 yield event
+
+    async def _exact_approval_close_receipt_exists(
+        self,
+        *,
+        session_id: str,
+        approval: PendingToolApproval,
+        requested_decision: ToolApprovalDecision,
+        resolution_request_digest: str,
+    ) -> bool:
+        """Prove that this exact resolution crossed its atomic close boundary."""
+
+        receipt = await self._session_store.load_runtime_publication_receipt(
+            session_id,
+            f"approval-close:{approval.approval_id}",
+        )
+        if receipt is None:
+            return False
+        expected_identity = {
+            "approval_id": approval.approval_id,
+            "tool_call_id": approval.tool_call_id,
+            "tool_round_id": approval.tool_round_id,
+            "requested_decision": requested_decision.value,
+            "resolution_request_digest": resolution_request_digest,
+        }
+        if receipt.kind != "approval-close" or any(
+            receipt.intent.get(key) != value for key, value in expected_identity.items()
+        ):
+            raise SessionRuntimePublicationConflict(
+                "Approval-close receipt conflicts with the claimed resolution request."
+            )
+        if len(receipt.appended_event_ids) != 1:
+            raise SessionRuntimePublicationConflict(
+                "Approval-close receipt has invalid event evidence."
+            )
+        return True
+
+    async def _publish_tool_approval_granted_once(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        pending_approval: PendingToolApproval,
+        tool_call: runtime_records.ToolCallRequest,
+        tool_round_identity: ToolRoundIdentity,
+        reason: str | None,
+        metadata: dict[str, Any],
+        resolved_by_payload: dict[str, Any] | None,
+        durable_events: list[Event],
+    ) -> Event:
+        existing = [
+            event
+            for event in durable_events
+            if event.type == EventType.TOOL_CALL_APPROVED
+            and event.payload.get("approval_id") == pending_approval.approval_id
+            and event.payload.get("tool_call_id") == tool_call.id
+        ]
+        if len(existing) > 1:
+            raise resume_ledger.ToolCallEvidenceConflict(
+                "Tool approval history contains duplicate approval-granted events."
+            )
+        if existing:
+            # The continuation has already matched the retry against the
+            # private immutable request digest, and approval_resolution_history
+            # has validated this event's complete approval/round/call
+            # descriptor. Reuse that durable grant without reconstructing
+            # identity from public, bounded audit fields.
+            persisted = existing[0]
+        else:
+            intended = self._event_writer.prepare(
+                Event(
+                    type=EventType.TOOL_CALL_APPROVED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    tool_name=tool_call.name,
+                    payload={
+                        **tool_round_identity.payload(),
+                        "approval_id": pending_approval.approval_id,
+                        "tool_call_id": tool_call.id,
+                        "reason": reason,
+                        **approval_support.bounded_resolution_metadata_payload(
+                            metadata,
+                            redactor=self._secret_redactor,
+                        ),
+                        "resolved_by": resolved_by_payload,
+                    },
+                )
+            )
+            persisted = await self._event_writer.persist_exact_replay(intended)
+        await self._event_writer.fan_out_persisted([persisted])
+        return persisted
 
     async def _interrupt_for_resumable_manual_recovery(
         self,
@@ -3486,6 +4335,8 @@ class RecoveryCoordinator:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_provider: runtime_records.RegisteredProvider,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        deferred_messages: list[Message],
+        claimed_resolution_intent: approval_support.ApprovalResolutionIntent | None,
     ) -> AsyncGenerator[Event, None]:
         tool_round_identity = ToolRoundIdentity(
             tool_round_id=pending_approval.tool_round_id,
@@ -3553,7 +4404,10 @@ class RecoveryCoordinator:
                             payload={
                                 **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                                "approval": pending_approval.model_dump(mode="json"),
+                                **approval_support.bounded_pending_approval_event_payload(
+                                    pending_approval,
+                                    redactor=self._secret_redactor,
+                                ),
                                 **_environment_factory_resolution_error_payload(
                                     factory_resolution.error,
                                     redactor=self._secret_redactor,
@@ -3588,7 +4442,10 @@ class RecoveryCoordinator:
                         ),
                         "manual_recovery": True,
                         "reason": request.reason,
-                        "metadata": request.metadata,
+                        **approval_support.bounded_resolution_metadata_payload(
+                            request.metadata,
+                            redactor=self._secret_redactor,
+                        ),
                         "resolved_by": resolution_actor_payload(request.resolved_by),
                         "expired": recovered_after_expiry,
                         "result": recovered_result.model_dump(),
@@ -3696,7 +4553,10 @@ class RecoveryCoordinator:
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                            "approval": pending_approval.model_dump(mode="json"),
+                            **approval_support.bounded_pending_approval_event_payload(
+                                pending_approval,
+                                redactor=self._secret_redactor,
+                            ),
                             "approval_id": pending_approval.approval_id,
                             "tool_call_id": pending_tool_call.tool_call_id,
                             **persistence_payload,
@@ -3757,6 +4617,8 @@ class RecoveryCoordinator:
             approval_request = ToolApprovalRequest(
                 session_id=request.session_id,
                 approval_id=request.approval_id,
+                tool_round_id=request.tool_round_id,
+                tool_call_id=request.tool_call_id,
                 decision=ToolApprovalDecision.APPROVE,
                 reason=request.reason,
                 metadata=request.metadata,
@@ -3776,8 +4638,11 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_provider=registered_provider,
                 registered_environment=registered_environment,
+                deferred_messages=deferred_messages,
                 emit_resume_event=False,
                 enforce_expiry=False,
+                claimed_resolution_intent=claimed_resolution_intent,
+                recovery_closure_only=True,
             )
             async for event in continuation_stream:
                 yield event
@@ -3814,6 +4679,7 @@ class RecoveryCoordinator:
         session_before_fence: Session | None = None
 
         def require_matching_pending_call(checkpoint: dict[str, Any] | None) -> None:
+            self._reject_approval_owned_tool_round_recovery(checkpoint)
             current_round = tool_round_recovery.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
@@ -4828,6 +5694,8 @@ class RecoveryCoordinator:
             )
             is not None
         ):
+            await self.materialize_deferred_input_if_present(request.session.id)
+            request.messages[:] = await self._session_store.load_transcript(request.session.id)
             return
         source_checkpoint = await self._session_store.load_checkpoint(request.session.id)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(source_checkpoint)
@@ -4921,6 +5789,7 @@ class RecoveryCoordinator:
             session_id=request.session.id,
             pending_round=pending_round,
         )
+        durable_transcript = await self._session_store.load_transcript(request.session.id)
         prepared = tool_round_publication.prepare_tool_round_publication(
             session_id=request.session.id,
             pending_round=pending_round,
@@ -4932,10 +5801,16 @@ class RecoveryCoordinator:
                 SessionStatus.INTERRUPTED,
             },
             expected_run_epoch=request.session.run_epoch,
-            expected_transcript_cursor=len(request.messages),
+            expected_transcript_cursor=len(durable_transcript),
         )
         cancellation = await self._publish_tool_round_with_exact_replay(prepared)
-        request.messages.extend(prepared.request.transcript_messages)
+        materialized = await self.materialize_expected_deferred_input(
+            request.session.id,
+            pending_round.deferred_messages,
+            cancellation=cancellation,
+        )
+        request.messages[:] = materialized.messages
+        cancellation = materialized.cancellation
         for event in emitted_events:
             yield event
         if cancellation is not None:
@@ -5147,7 +6022,13 @@ class RecoveryCoordinator:
             extension=extension,
         )
         cancellation = await self._publish_tool_round_with_exact_replay(prepared)
-        messages[insert_at:insert_at] = list(prepared.request.transcript_messages)
+        materialized = await self.materialize_expected_deferred_input(
+            session.id,
+            pending_round.deferred_messages,
+            cancellation=cancellation,
+        )
+        messages[:] = materialized.messages
+        cancellation = materialized.cancellation
         for event in emitted_terminal_events:
             yield event
         for event in auxiliary_events:
@@ -5164,6 +6045,130 @@ class RecoveryCoordinator:
             prepared,
             session_store=self._session_store,
             event_writer=self._event_writer,
+        )
+
+    async def materialize_deferred_input_if_present(self, session_id: str) -> bool:
+        """Materialize one private interaction tail using its durable owner identity."""
+
+        deferred = await self._session_store.load_deferred_interaction_input(session_id)
+        if deferred is None:
+            return False
+        return await self._session_store.materialize_deferred_interaction_input(
+            session_id,
+            interaction_id=deferred.interaction_id,
+        )
+
+    async def materialize_deferred_input_for_receipt(
+        self,
+        receipt: RuntimePublicationReceipt,
+    ) -> bool:
+        """Finish only the deferred tail owned by an exact approval receipt."""
+
+        if receipt.kind != "approval-close":
+            raise ValueError("Deferred receipt materialization requires an approval-close receipt.")
+        session = await self._session_store.load(receipt.session_id)
+        if session is None:
+            return False
+        deferred = await self._session_store.load_deferred_interaction_input(receipt.session_id)
+        if (
+            deferred is None
+            or receipt.interaction_id is None
+            or deferred.interaction_id != receipt.interaction_id
+        ):
+            return False
+        transcript = await self._session_store.load_transcript(receipt.session_id)
+        if len(transcript) != receipt.transcript_end_cursor:
+            return False
+        _activate_session_run_fence(session)
+        try:
+            return await self._session_store.materialize_deferred_interaction_input(
+                receipt.session_id,
+                interaction_id=receipt.interaction_id,
+            )
+        except SessionRunFenced:
+            return False
+        finally:
+            _deactivate_session_run_fence(receipt.session_id)
+
+    async def materialize_expected_deferred_input(
+        self,
+        session_id: str,
+        expected_messages: list[Message],
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> DeferredInputMaterialization:
+        """Append a retained recovery tail without losing caller cancellation."""
+
+        expected = [detach_message(message) for message in expected_messages]
+
+        def redacted_transcript_view(messages: list[Message]) -> list[Message]:
+            return [
+                redact_message_for_boundary(
+                    message,
+                    redactor=self._secret_redactor,
+                    field_name=f"session.transcript[{index}]",
+                )
+                for index, message in enumerate(messages)
+            ]
+
+        async def materialize() -> list[Message]:
+            deferred = await self._session_store.load_deferred_interaction_input(session_id)
+            if (
+                expected
+                and deferred is not None
+                and redacted_transcript_view(deferred.source_messages) != expected
+            ):
+                raise RuntimeError(
+                    "Deferred interaction input conflicts with its pending tool-round tail "
+                    f"(durable_count={len(deferred.source_messages)}, "
+                    f"expected_count={len(expected)})."
+                )
+            if deferred is not None:
+                await self._session_store.materialize_deferred_interaction_input(
+                    session_id,
+                    interaction_id=deferred.interaction_id,
+                )
+            transcript = await self._session_store.load_transcript(session_id)
+            transcript_view = redacted_transcript_view(transcript)
+            if expected and (
+                len(transcript_view) < len(expected)
+                or transcript_view[-len(expected) :] != expected
+            ):
+                raise RuntimeError(
+                    "Deferred interaction input was not materialized after its tool result."
+                )
+            return transcript_view
+
+        outcome = await await_shielded_task_outcome(
+            asyncio.create_task(materialize()),
+            cancellation=cancellation,
+        )
+        cancellation = outcome.cancellation
+        error = outcome.error
+        if isinstance(error, asyncio.CancelledError):
+            error = unexpected_child_cancellation_error(
+                error,
+                operation="Deferred interaction input materialization",
+            )
+        if error is not None:
+            if cancellation is not None:
+                cancellation.add_note(
+                    "Deferred interaction input materialization also failed: "
+                    f"{type(error).__name__}."
+                )
+                raise cancellation from error
+            raise error
+        if outcome.result is None:
+            missing_result = RuntimeError(
+                "Deferred interaction input materialization returned no transcript."
+            )
+            if cancellation is not None:
+                cancellation.add_note(str(missing_result))
+                raise cancellation from missing_result
+            raise missing_result
+        return DeferredInputMaterialization(
+            messages=outcome.result,
+            cancellation=cancellation,
         )
 
     async def reattach_subagent_children_in_outcomes(
@@ -5207,6 +6212,7 @@ class RecoveryCoordinator:
         registered_environment: runtime_records.RegisteredEnvironment | None,
         messages: list[Message],
         tail_message_count: int = 0,
+        incomplete_recovery_claimed: bool = False,
     ) -> AsyncGenerator[Event, None]:
         """Repair one durable pending round strictly from recorded evidence."""
         checkpoint = await self._session_store.load_checkpoint(session.id)
@@ -5226,6 +6232,41 @@ class RecoveryCoordinator:
             raise RuntimeError(
                 "Pending tool round belongs to a different environment: "
                 f"{pending_round.environment_name}."
+            )
+        registered_tool_names = frozenset(registered_agent.tools)
+        durable_policy_decisions = frozenset(decision.value for decision in ToolPolicyDecision)
+        ambiguous_interrupt_close_intent = (
+            session.status == SessionStatus.INTERRUPTING
+            and _approval_interrupt_close_intent_matches(
+                checkpoint,
+                pending_round=pending_round,
+            )
+        )
+        invalid_planned_calls = [
+            call
+            for call in pending_round.tool_calls
+            if pending_round.policy_state == "planned"
+            and call.tool_name in registered_tool_names
+            and not (
+                (
+                    call.policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+                    and call.policy_decision in durable_policy_decisions
+                )
+                or call.policy_evidence is ToolPolicyEvidence.UNREGISTERED
+                or (
+                    call.policy_evidence is ToolPolicyEvidence.AMBIGUOUS
+                    and ambiguous_interrupt_close_intent
+                )
+                or (
+                    call.policy_evidence is None
+                    and call.policy_decision in durable_policy_decisions
+                )
+            )
+        ]
+        if invalid_planned_calls:
+            raise RuntimeError(
+                "Policy-planned pending tool round has no authoritative decision for "
+                f"registered call {invalid_planned_calls[0].tool_call_id}."
             )
         pending_tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
         tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
@@ -5255,6 +6296,145 @@ class RecoveryCoordinator:
             ):
                 yield event
             return
+        legacy_policy_plan_is_ambiguous = pending_round.policy_context_version is None and any(
+            call.tool_name in registered_tool_names
+            and call.policy_decision not in durable_policy_decisions
+            for call in pending_round.tool_calls
+        )
+        legacy_policy_plan_requires_approval = (
+            pending_round.policy_context_version is None
+            and any(
+                call.tool_name in registered_tool_names
+                and call.policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+                for call in pending_round.tool_calls
+            )
+            and approval_support.pending_approval_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+            )
+            is None
+        )
+        if pending_round.policy_state == "unplanned" and (
+            pending_round.policy_context_version == 1
+            or legacy_policy_plan_is_ambiguous
+            or legacy_policy_plan_requires_approval
+        ):
+            # A raw round proves only that model output was durably staged. It
+            # cannot prove whether a stateful policy had already returned before
+            # the process stopped. Replaying authorize() and accepting ALLOW
+            # could erase an earlier REQUIRE_APPROVAL result, so recovery
+            # constructs a fail-closed manual gate without invoking policy.
+            #
+            # Legacy unversioned rounds are treated the same way whenever a
+            # registered call lacks a complete recognized decision. Absence of
+            # a decision is not positive authorization. Unversioned rounds with
+            # complete decisions retain those authoritative legacy outcomes.
+            if (
+                session.status
+                not in {
+                    SessionStatus.RUNNING,
+                    SessionStatus.INTERRUPTING,
+                }
+                and not incomplete_recovery_claimed
+            ):
+                raise RuntimeError(
+                    "Pending tool round has no durable policy plan; resume it under a "
+                    "claimed run fence before recovering tool results."
+                )
+            replanned_tool_calls = [
+                runtime_records.ToolCallRequest(
+                    id=call.tool_call_id,
+                    name=call.tool_name,
+                    arguments=copy_json_value(call.arguments, "arguments"),
+                )
+                for call in pending_round.tool_calls
+            ]
+            policy_plan = await self._tool_round_executor.fail_closed_recovery_policy_plan(
+                session=session,
+                registered_agent=registered_agent,
+                tool_calls=replanned_tool_calls,
+                request_metadata=pending_round.request_metadata,
+                durable_tool_calls=(
+                    pending_round.tool_calls
+                    if pending_round.policy_context_version is None
+                    else None
+                ),
+            )
+            if policy_plan.pending_approval is not None:
+                approval_plan = policy_plan.pending_approval
+                (
+                    approval,
+                    approval_events,
+                ) = await self._tool_round_executor.checkpoint_pending_tool_approval(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_call=approval_plan.call,
+                    tool_calls=approval_plan.calls,
+                    policy_outcomes=approval_plan.policy_outcomes,
+                    active_taint_by_id=policy_plan.active_taint_labels,
+                    task_id=pending_round.task_id,
+                    policy_result=approval_plan.policy_result,
+                    structured_output=pending_round.structured_output,
+                    thinking=pending_round.thinking,
+                    max_steps=pending_round.max_steps,
+                    limits=pending_round.limits,
+                    budget_limits=pending_round.budget_limits,
+                    retry_policy=pending_round.retry_policy,
+                    tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                        pending_round
+                    ),
+                    deferred_messages=messages[insert_at:],
+                    recovered=True,
+                )
+                for approval_event in approval_events:
+                    yield approval_event
+                raise ToolApprovalRequired(approval)
+            pending_round = await self._tool_round_executor.checkpoint_tool_round_policy_plan(
+                session=session,
+                registered_agent=registered_agent,
+                tool_calls=replanned_tool_calls,
+                policy_outcomes=policy_plan.outcomes,
+                active_taint_by_id=policy_plan.active_taint_labels,
+                tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
+                recovered=True,
+            )
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+        approval_required_calls = [
+            call
+            for call in pending_round.tool_calls
+            if approval_support.effective_tool_policy_evidence(call)
+            is ToolPolicyEvidence.AUTHORITATIVE
+            and call.policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+        ]
+        if approval_required_calls:
+            current_checkpoint = await self._session_store.load_checkpoint(session.id)
+            paired_approval = approval_support.pending_approval_from_checkpoint(
+                current_checkpoint,
+                redactor=self._secret_redactor,
+            )
+            if paired_approval is None:
+                if not (
+                    session.status == SessionStatus.INTERRUPTING
+                    and _approval_interrupt_close_intent_matches(
+                        current_checkpoint,
+                        pending_round=pending_round,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Policy-planned REQUIRE_APPROVAL round has no matching pending approval."
+                    )
+            elif (
+                paired_approval.tool_round_id != pending_round.tool_round_id
+                or paired_approval.tool_call_id != approval_required_calls[0].tool_call_id
+            ):
+                raise RuntimeError(
+                    "Policy-planned REQUIRE_APPROVAL round has no matching pending approval."
+                )
+            else:
+                raise RuntimeError(
+                    "Pending tool approval must be resolved before recovering its tool round."
+                )
         lifecycle_events = await self._load_tool_round_lifecycle_events(
             session_id=session.id,
             pending_round=pending_round,
@@ -5378,7 +6558,13 @@ class RecoveryCoordinator:
             expected_transcript_cursor=insert_at,
         )
         cancellation = await self._publish_tool_round_with_exact_replay(prepared)
-        messages[insert_at:insert_at] = list(prepared.request.transcript_messages)
+        materialized = await self.materialize_expected_deferred_input(
+            session.id,
+            pending_round.deferred_messages,
+            cancellation=cancellation,
+        )
+        messages[:] = materialized.messages
+        cancellation = materialized.cancellation
         for event in emitted_events:
             yield event
         if cancellation is not None:
@@ -5673,11 +6859,13 @@ class RecoveryCoordinator:
             redactor=self._secret_redactor,
             consume_on_rejection=True,
         )
+        deferred_input = await self._session_store.load_deferred_interaction_input(session.id)
         if (
             session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
             and pending_approval is None
             and pending_user_input is None
             and pending_tool_round is None
+            and deferred_input is None
         ):
             return IncompleteSessionRecoveryResult(
                 session_id=session.id,
@@ -5718,7 +6906,6 @@ class RecoveryCoordinator:
                     events=(),
                     message="Session activity or recovery ownership changed; recovery skipped.",
                 )
-            await self._materialize_deferred_interaction_input(session.id)
             return await self._recover_incomplete_session_with_heartbeat(
                 claim=claim,
                 recovery=lambda: self._recover_incomplete_session(
@@ -6363,6 +7550,10 @@ class RecoveryCoordinator:
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)
         pending_user_input = pending_user_input_from_checkpoint(checkpoint)
         pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if pending_tool_round is None and await self.materialize_deferred_input_if_present(
+            session.id
+        ):
+            actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
 
         if session.status in {SessionStatus.PENDING, SessionStatus.RUNNING}:
             if pending_approval is not None:
@@ -6371,7 +7562,10 @@ class RecoveryCoordinator:
                     "model_attempt_id": pending_approval.model_attempt_id,
                     "tool_round_id": pending_approval.tool_round_id,
                     "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                    "approval": pending_approval.model_dump(mode="json"),
+                    **approval_support.bounded_pending_approval_event_payload(
+                        pending_approval,
+                        redactor=self._secret_redactor,
+                    ),
                     "recovered": True,
                     "reason": reason,
                     "metadata": metadata,
@@ -6406,7 +7600,7 @@ class RecoveryCoordinator:
             try:
                 session = await self._session_store.transition_status_and_checkpoint(
                     session.id,
-                    from_statuses={SessionStatus.PENDING, SessionStatus.RUNNING},
+                    from_statuses={session.status},
                     to_status=SessionStatus.INTERRUPTING,
                     checkpoint_transform=self._pending_session_interrupt_checkpoint(
                         interrupt_payload,
@@ -6427,21 +7621,35 @@ class RecoveryCoordinator:
                 raise
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
+            pending_approval = approval_support.pending_approval_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
             pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
                 checkpoint,
                 redactor=self._secret_redactor,
                 consume_on_rejection=True,
             )
 
-        if pending_tool_round is not None:
+        if pending_tool_round is not None and pending_approval is None:
             transcript = await self._session_store.load_transcript(session.id)
-            async for event in self.recover_pending_tool_round(
-                session=session,
-                registered_agent=registered_agent,
-                registered_environment=registered_environment,
-                messages=transcript,
-            ):
-                events.append(event)
+            try:
+                async for event in self.recover_pending_tool_round(
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    messages=transcript,
+                    incomplete_recovery_claimed=True,
+                ):
+                    events.append(event)
+            except ToolApprovalRequired:
+                # Fail-closed planning of an ambiguous crash boundary may
+                # atomically restore the human gate. Incomplete-session
+                # recovery owns the outer interrupt transition, so retain the
+                # paired approval and finish that transition below instead of
+                # treating the pause as failure.
+                pass
             actions.append(IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND)
             session = await self._require_session(session.id)
             checkpoint = await self._session_store.load_checkpoint(session.id)
@@ -6452,6 +7660,30 @@ class RecoveryCoordinator:
             consume_on_rejection=True,
         )
         if pending_approval is not None:
+            if session.status == SessionStatus.FAILED:
+                interrupt_payload = {
+                    "model_step_id": pending_approval.model_step_id,
+                    "model_attempt_id": pending_approval.model_attempt_id,
+                    "tool_round_id": pending_approval.tool_round_id,
+                    "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                    **approval_support.bounded_pending_approval_event_payload(
+                        pending_approval,
+                        redactor=self._secret_redactor,
+                    ),
+                    "recovered": True,
+                    "reason": reason,
+                    "metadata": metadata,
+                    "interruption_request_id": str(uuid4()),
+                }
+                session = await self._session_store.transition_status_and_checkpoint(
+                    session.id,
+                    from_statuses={SessionStatus.FAILED},
+                    to_status=SessionStatus.INTERRUPTING,
+                    checkpoint_transform=self._pending_session_interrupt_checkpoint(
+                        interrupt_payload,
+                        self._clock(),
+                    ),
+                )
             session = await self._finalize_interrupting_for_recovery(
                 session=session,
                 registered_agent=registered_agent,

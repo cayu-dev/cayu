@@ -695,6 +695,10 @@ export type ApiPendingAction = {
      */
     options?: Array<string>;
     /**
+     * Policy Evidence
+     */
+    policy_evidence?: 'unplanned' | 'authoritative' | 'unregistered' | 'ambiguous' | null;
+    /**
      * Question
      */
     question?: string | null;
@@ -3712,6 +3716,14 @@ export type ToolApprovalBody = {
     session_id: string;
     structured_output?: StructuredOutputSpec | null;
     thinking?: ThinkingConfig | null;
+    /**
+     * Tool Call Id
+     */
+    tool_call_id: string;
+    /**
+     * Tool Round Id
+     */
+    tool_round_id: string;
 };
 
 /**
@@ -3781,6 +3793,10 @@ export type ToolApprovalRecoveryBody = {
      * Tool Call Id
      */
     tool_call_id: string;
+    /**
+     * Tool Round Id
+     */
+    tool_round_id: string;
 };
 
 /**

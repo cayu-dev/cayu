@@ -976,12 +976,15 @@ def test_core_durable_json_producers_reject_nonportable_nested_values(
         lambda value: ToolApprovalRequest(
             session_id="sess_1",
             approval_id="approval_1",
+            tool_round_id="round_1",
+            tool_call_id="call_1",
             decision="approve",
             metadata={"nested": {"bad": value}},
         ),
         lambda value: ToolApprovalRecoveryRequest(
             session_id="sess_1",
             approval_id="approval_1",
+            tool_round_id="round_1",
             tool_call_id="call_1",
             outcome="completed",
             message="completed",

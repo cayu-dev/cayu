@@ -18,6 +18,7 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "model_step_id",
         "name",
         "policy_decision",
+        "policy_evidence",
         "role",
         "round_id",
         "source_model_step_id",
@@ -30,7 +31,27 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "workspace_id",
     }
 )
-_DURABLE_STRUCTURE_KEYS = _DURABLE_STRUCTURE_STRING_FIELDS | {
+_DURABLE_ENUM_STRING_FIELDS = frozenset(
+    {
+        "decision",
+        "policy_decision",
+        "policy_evidence",
+        "policy_state",
+        "role",
+        "source",
+        "status",
+        "strategy",
+        "type",
+    }
+)
+_DURABLE_SHA256_STRING_FIELDS = frozenset(
+    {
+        "resolution_request_digest",
+    }
+)
+_DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
+    "approval_close_intent",
+    "approval_resolution_intent",
     "pending_tool_approval",
     "pending_tool_round",
     "pending_user_input",
@@ -53,6 +74,7 @@ _DURABLE_STRUCTURE_KEYS = _DURABLE_STRUCTURE_STRING_FIELDS | {
     "context_compaction",
     "created_at",
     "currency",
+    "deferred_messages",
     "dimensions",
     "duration_seconds",
     "effort",
@@ -96,6 +118,8 @@ _DURABLE_STRUCTURE_KEYS = _DURABLE_STRUCTURE_STRING_FIELDS | {
     "output_per_million",
     "path",
     "period",
+    "policy_context_version",
+    "policy_state",
     "price_book_version",
     "prices",
     "pricing",
@@ -162,6 +186,7 @@ _DURABLE_STRUCTURE_KEYS = _DURABLE_STRUCTURE_STRING_FIELDS | {
     "provider_count_context_window_tokens",
     "provider_count_input_tokens",
     "request_digest",
+    "request_metadata",
     "source_run_epoch",
     "source_transcript_cursor",
     "status",
@@ -181,6 +206,7 @@ _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
         "options",
         "output",
         "provider_options",
+        "request_metadata",
         "structured",
     }
 )
@@ -197,6 +223,7 @@ _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
         "incomplete_session_recovery_claim",
         "pending_interruption_cascade",
         "pending_session_interrupt",
+        "approval_resolution_intent",
         "pending_tool_approval",
         "pending_tool_round",
         "pending_user_input",
@@ -242,6 +269,22 @@ def durable_value_contains_secret(
     """Return whether a checkpoint tree contains secret text outside schema-owned keys."""
 
     if type(value) is str:
+        if path and path[-1] in _DURABLE_ENUM_STRING_FIELDS and _path_has_typed_schema(path[:-1]):
+            # Typed model validation owns these finite protocol values. A
+            # credential that happens to equal "deny", "planned", or another
+            # enum literal must not erase or reject the protocol decision.
+            return False
+        if (
+            path
+            and path[-1] in _DURABLE_SHA256_STRING_FIELDS
+            and _path_has_typed_schema(path[:-1])
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        ):
+            # This runtime-generated commitment contains no copied secret text.
+            # The owning typed model validates the digest again before it can
+            # become authority, so coincidental substring matches are safe.
+            return False
         return redactor.redact_text(value) != value
     if value is None or type(value) in {bool, int, float}:
         return False

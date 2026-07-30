@@ -397,6 +397,8 @@ def test_approval_resume_budget_notification_retains_the_originating_attempt() -
             ToolApprovalRequest(
                 session_id="sess_approval_budget_identity",
                 approval_id=approval_requested.payload["approval_id"],
+                tool_round_id=approval_requested.payload["tool_round_id"],
+                tool_call_id=approval_requested.payload["tool_call_id"],
                 decision=ToolApprovalDecision.APPROVE,
                 budget_limits=(
                     BudgetLimit(

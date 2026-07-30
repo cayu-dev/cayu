@@ -13,25 +13,34 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
+    IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
     InteractionStatus,
     InteractionSummaryEvidence,
     ModelCompletionManualRecoveryRequired,
     ResumeRequest,
+    RunLimits,
     RunRequest,
     Session,
     SessionIdentity,
     SessionStatus,
 )
+from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _session_engine as session_engine
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+from cayu.runtime.approvals import (
+    PendingToolApproval,
+    PendingToolCallApproval,
+    ToolApprovalDecision,
+    ToolApprovalRequest,
+)
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.sessions import (
@@ -95,6 +104,105 @@ class _PromotionAcknowledgementLostStore(InMemorySessionStore):
         return result
 
 
+class _FailMaterializationStore(InMemorySessionStore):
+    def __init__(self, *, failures: int) -> None:
+        super().__init__()
+        self.remaining_materialization_failures = failures
+
+    async def materialize_deferred_interaction_input(self, session_id: str, **kwargs) -> bool:
+        if self.remaining_materialization_failures:
+            self.remaining_materialization_failures -= 1
+            raise OSError("process stopped before deferred input materialization")
+        return await super().materialize_deferred_interaction_input(session_id, **kwargs)
+
+
+class _FailApprovalCloseBeforeCommitStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed_close = False
+
+    async def publish_runtime_publication(self, session_id: str, **kwargs):
+        if not self.failed_close and kwargs["request"].kind == "approval-close":
+            self.failed_close = True
+            raise OSError("approval close failed before commit")
+        return await super().publish_runtime_publication(session_id, **kwargs)
+
+
+class _PauseCommittedApprovalCloseStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_committed = asyncio.Event()
+        self.release_close_acknowledgement = asyncio.Event()
+        self.paused_close = False
+
+    async def publish_runtime_publication(self, session_id: str, **kwargs):
+        result = await super().publish_runtime_publication(session_id, **kwargs)
+        if not self.paused_close and kwargs["request"].kind == "approval-close":
+            self.paused_close = True
+            self.close_committed.set()
+            await self.release_close_acknowledgement.wait()
+        return result
+
+
+class _FailResumeSetupTranscriptStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_after_deferred_admission = False
+        self._fail_next_transcript_load = False
+
+    async def transition_status_and_checkpoint(self, session_id: str, **kwargs):
+        transitioned = await super().transition_status_and_checkpoint(session_id, **kwargs)
+        if self.fail_after_deferred_admission and kwargs.get("defer_interaction_source") is True:
+            self.fail_after_deferred_admission = False
+            self._fail_next_transcript_load = True
+        return transitioned
+
+    async def load_transcript(self, session_id: str) -> list[Message]:
+        if self._fail_next_transcript_load:
+            self._fail_next_transcript_load = False
+            raise OSError("resume setup transcript load failed")
+        return await super().load_transcript(session_id)
+
+
+class _FailResumePromotionStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.promotion_failures = 0
+
+    async def _promote_model_completion_stage_atomic(self, **kwargs):
+        if self.promotion_failures:
+            self.promotion_failures -= 1
+            raise OSError("model-stage promotion failed before commit")
+        return await super()._promote_model_completion_stage_atomic(**kwargs)
+
+
+class _FailResumeCheckpointInspectionStore(_FailResumeSetupTranscriptStore):
+    def __init__(self, *, failure_mode: str) -> None:
+        super().__init__()
+        self.failure_mode = failure_mode
+        self._fail_next_checkpoint_inspection = False
+
+    async def load_transcript(self, session_id: str) -> list[Message]:
+        try:
+            return await super().load_transcript(session_id)
+        except OSError:
+            self._fail_next_checkpoint_inspection = True
+            raise
+
+    async def load_checkpoint(self, session_id: str):
+        checkpoint = await super().load_checkpoint(session_id)
+        if not self._fail_next_checkpoint_inspection:
+            return checkpoint
+        self._fail_next_checkpoint_inspection = False
+        if self.failure_mode == "read":
+            raise OSError("resume failure checkpoint inspection failed")
+        if self.failure_mode == "malformed":
+            assert checkpoint is not None
+            checkpoint["pending_tool_round"] = {"invalid": True}
+            return checkpoint
+        raise AssertionError(f"Unsupported failure mode: {self.failure_mode}")
+
+
 @dataclass(frozen=True)
 class _StagedCompletion:
     session: Session
@@ -130,6 +238,7 @@ async def _stage_completed_model_boundary(
     tool_arguments: dict | None = None,
     tool_name: str = "echo",
     tool_call_count: int = 1,
+    usage: dict[str, int] | None = None,
 ) -> _StagedCompletion:
     user_message = Message.text("user", "complete this model step once")
     interaction_id = f"interaction-{session_id}"
@@ -279,6 +388,7 @@ async def _stage_completed_model_boundary(
                 "raw_finish_reason": "tool_calls" if with_tool_call else "stop",
                 "status": None,
             },
+            **({} if usage is None else {"usage": dict(usage)}),
             "step_classification": classification,
             "transcript_cursor": source_cursor + 1,
         },
@@ -677,7 +787,7 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
         await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
         app = _register_runtime(store, provider, tool=tool)
 
-        events = [
+        resume_events = [
             event
             async for event in app.resume(
                 ResumeRequest(
@@ -686,7 +796,30 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
                 )
             )
         ]
-        return store, provider, tool, staged, events
+        assert provider.requests == []
+        assert tool.calls == 0
+        approval_event = next(
+            event for event in resume_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        pending = PendingToolApproval.from_event(approval_event)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            await store.load_checkpoint(staged.session.id)
+        )
+        assert pending_round is not None
+        assert pending_round.deferred_messages == [Message.text("user", "continue after recovery")]
+        resolution_events = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id=staged.session.id,
+                    approval_id=pending.approval_id,
+                    tool_round_id=pending.tool_round_id,
+                    tool_call_id=pending.tool_call_id,
+                    decision=ToolApprovalDecision.DENY,
+                )
+            )
+        ]
+        return store, provider, tool, staged, [*resume_events, *resolution_events]
 
     store, provider, tool, staged, events = asyncio.run(run())
     session_id = staged.session.id
@@ -717,7 +850,7 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
     assert recovered_result.type == "tool_result"
     assert recovered_result.tool_call_id == "call-recovered"
     assert recovered_result.structured is not None
-    assert recovered_result.structured["recovery_reason"] == "pending_tool_round_not_started"
+    assert recovered_result.structured["denied_by_approval"] is True
     assert [message.role.value for message in transcript] == [
         "user",
         "assistant",
@@ -725,8 +858,11 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
         "user",
         "assistant",
     ]
+    assert asyncio.run(store.load_deferred_interaction_input(session_id)) is None
     assert model_receipt is not None
-    assert tool_receipt is not None
+    # Approval continuations close the paired checkpoint atomically instead of
+    # publishing an ordinary tool-round receipt.
+    assert tool_receipt is None
     assert (
         tool_round_recovery.pending_tool_round_from_checkpoint(
             asyncio.run(store.load_checkpoint(session_id))
@@ -737,6 +873,852 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
         index for index, event in enumerate(events) if event.type == EventType.MODEL_STARTED
     )
     assert sum(event.type == EventType.MODEL_COMPLETED for event in durable_events) == 2
+
+
+def test_resume_setup_failure_keeps_input_private_while_tool_round_is_pending() -> None:
+    async def run():
+        store = _FailResumeSetupTranscriptStore()
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        deferred_message = Message.text("user", "remain private until the tool result")
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-resume-setup-failure",
+            provider_name=provider.name,
+            with_tool_call=True,
+        )
+        promoted = await store.promote_model_completion_stage(
+            staged.session.id,
+            stage_id=staged.stage.stage_id,
+            expected_run_epoch=staged.session.run_epoch,
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        store.fail_after_deferred_admission = True
+
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        return store, provider, tool, staged, promoted.session, deferred_message, events
+
+    store, provider, tool, staged, promoted, deferred_message, events = asyncio.run(run())
+    checkpoint = asyncio.run(store.load_checkpoint(staged.session.id))
+    pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+    deferred = asyncio.run(store.load_deferred_interaction_input(staged.session.id))
+    session = asyncio.run(store.load(staged.session.id))
+    transcript = asyncio.run(store.load_transcript(staged.session.id))
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert session is not None and session.status is SessionStatus.FAILED
+    assert pending_round is not None
+    assert pending_round.tool_round_id == staged.pointer.tool_round_id
+    assert deferred is not None
+    assert deferred.interaction_id == staged.completion_event.interaction_id
+    assert deferred.source_messages == [deferred_message]
+    assert transcript == [staged.user_message, staged.assistant_message]
+    assert deferred_message not in transcript
+    assert promoted.run_epoch < session.run_epoch
+    assert provider.requests == []
+    assert tool.calls == 0
+
+
+def test_resume_promotion_failure_keeps_input_private_until_restart_recovery() -> None:
+    async def run():
+        store = _FailResumePromotionStore()
+        provider = _RecordingProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("continued after recovered approval"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        tool = _NeverExecutedTool()
+        deferred_message = Message.text("user", "remain private until promotion commits")
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-resume-promotion-failure",
+            provider_name=provider.name,
+            with_tool_call=True,
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        store.promotion_failures = 2
+
+        failed_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        transcript_after_failure = await store.load_transcript(staged.session.id)
+        deferred_after_failure = await store.load_deferred_interaction_input(staged.session.id)
+        active_after_failure = await store.load_active_model_completion_stage(staged.session.id)
+        recovered = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+        )
+        checkpoint_after_recovery = await store.load_checkpoint(staged.session.id)
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint_after_recovery
+        )
+        assert pending_approval is not None
+        transcript_after_recovery = await store.load_transcript(staged.session.id)
+        deferred_after_recovery = await store.load_deferred_interaction_input(staged.session.id)
+        active_after_recovery = await store.load_active_model_completion_stage(staged.session.id)
+        resolution_events = [
+            event
+            async for event in app.resolve_tool_approval(
+                ToolApprovalRequest(
+                    session_id=staged.session.id,
+                    approval_id=pending_approval.approval_id,
+                    tool_round_id=pending_approval.tool_round_id,
+                    tool_call_id=pending_approval.tool_call_id,
+                    decision=ToolApprovalDecision.DENY,
+                )
+            )
+        ]
+        return (
+            store,
+            provider,
+            tool,
+            staged,
+            deferred_message,
+            failed_events,
+            transcript_after_failure,
+            deferred_after_failure,
+            active_after_failure,
+            recovered,
+            pending_approval,
+            transcript_after_recovery,
+            deferred_after_recovery,
+            active_after_recovery,
+            resolution_events,
+        )
+
+    (
+        store,
+        provider,
+        tool,
+        staged,
+        deferred_message,
+        failed_events,
+        transcript_after_failure,
+        deferred_after_failure,
+        active_after_failure,
+        recovered,
+        pending_approval,
+        transcript_after_recovery,
+        deferred_after_recovery,
+        active_after_recovery,
+        resolution_events,
+    ) = asyncio.run(run())
+
+    assert failed_events[-1].type is EventType.SESSION_FAILED
+    assert transcript_after_failure == [staged.user_message]
+    assert deferred_after_failure is not None
+    assert deferred_after_failure.source_messages == [deferred_message]
+    assert active_after_failure is not None
+    assert recovered.status is SessionStatus.INTERRUPTED
+    assert IncompleteSessionRecoveryAction.PENDING_APPROVAL in recovered.actions
+    assert any(event.type is EventType.SESSION_INTERRUPTED for event in recovered.events)
+    assert transcript_after_recovery == [staged.user_message, staged.assistant_message]
+    assert deferred_message not in transcript_after_recovery
+    assert deferred_after_recovery is not None
+    assert deferred_after_recovery.source_messages == [deferred_message]
+    assert active_after_recovery is None
+    checkpoint = asyncio.run(store.load_checkpoint(staged.session.id))
+    assert approval_support.pending_approval_from_checkpoint(checkpoint) is None
+    assert pending_approval.tool_round_id == staged.pointer.tool_round_id
+    assert resolution_events[-1].type is EventType.SESSION_COMPLETED
+    assert len(provider.requests) == 1
+    assert [message.role.value for message in provider.requests[0].messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    final_transcript = asyncio.run(store.load_transcript(staged.session.id))
+    assert [message.role.value for message in final_transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+        "assistant",
+    ]
+    assert final_transcript.count(deferred_message) == 1
+    assert asyncio.run(store.load_deferred_interaction_input(staged.session.id)) is None
+    assert tool.calls == 0
+
+
+@pytest.mark.parametrize("failure_mode", ["read", "malformed"])
+def test_resume_setup_checkpoint_inspection_failure_still_finalizes(
+    failure_mode: str,
+) -> None:
+    async def run():
+        store = _FailResumeCheckpointInspectionStore(failure_mode=failure_mode)
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        deferred_message = Message.text("user", "retain on uncertain checkpoint inspection")
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id=f"model-recovery-checkpoint-inspection-{failure_mode}",
+            provider_name=provider.name,
+            with_tool_call=True,
+        )
+        await store.promote_model_completion_stage(
+            staged.session.id,
+            stage_id=staged.stage.stage_id,
+            expected_run_epoch=staged.session.run_epoch,
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        store.fail_after_deferred_admission = True
+
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        return store, provider, tool, staged, deferred_message, events
+
+    store, provider, tool, staged, deferred_message, events = asyncio.run(run())
+    session = asyncio.run(store.load(staged.session.id))
+    deferred = asyncio.run(store.load_deferred_interaction_input(staged.session.id))
+    transcript = asyncio.run(store.load_transcript(staged.session.id))
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert session is not None and session.status is SessionStatus.FAILED
+    assert deferred is not None
+    assert deferred.source_messages == [deferred_message]
+    assert transcript == [staged.user_message, staged.assistant_message]
+    assert provider.requests == []
+    assert tool.calls == 0
+
+
+def test_restart_closes_recovered_approval_before_materializing_deferred_tail() -> None:
+    async def run():
+        store = InMemorySessionStore()
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-restart-after-approval-clear",
+            provider_name=provider.name,
+            with_tool_call=True,
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        deferred_message = Message.text("user", "continue after recovered approval")
+
+        resume_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        checkpoint = await store.load_checkpoint(staged.session.id)
+        approval = PendingToolApproval.model_validate(checkpoint["pending_tool_approval"])
+        assert approval.tool_calls[0].policy_evidence == "ambiguous"
+        assert await store.load_deferred_interaction_input(staged.session.id) is not None
+
+        # Recreate the durable boundary left when an operator interruption clears
+        # an approval, then the process exits before it can close the retained
+        # tool round. The runtime interruption tests exercise Task.cancel()
+        # delivery; this test isolates restart recovery with real ResumeRequest
+        # admission so its private deferred input is present.
+        await store.transition_status_and_checkpoint(
+            staged.session.id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.INTERRUPTING,
+            checkpoint_transform=session_engine._checkpoint_with_pending_session_interrupt(
+                {
+                    "interruption_type": "operator_requested",
+                    "interruption_request_id": "interrupt-recovered-approval",
+                    "reason": "operator stopped recovered approval",
+                }
+            ),
+        )
+        await app._tool_round_executor.clear_pending_tool_approval_for_tool_round(
+            staged.session.id,
+            [
+                runtime_records.ToolCallRequest(
+                    id=call.tool_call_id,
+                    name=call.tool_name,
+                    arguments=call.arguments,
+                )
+                for call in approval.tool_calls
+            ],
+        )
+        recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+        )
+        return (
+            store,
+            provider,
+            tool,
+            staged,
+            deferred_message,
+            resume_events,
+            recovery,
+        )
+
+    (
+        store,
+        provider,
+        tool,
+        staged,
+        deferred_message,
+        resume_events,
+        recovery,
+    ) = asyncio.run(run())
+    session_id = staged.session.id
+    transcript = asyncio.run(store.load_transcript(session_id))
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
+    session = asyncio.run(store.load(session_id))
+    receipt = asyncio.run(
+        store.load_runtime_publication_receipt(
+            session_id,
+            f"tool-round:{staged.pointer.tool_round_id}",
+        )
+    )
+
+    assert resume_events[-1].type is EventType.SESSION_INTERRUPTED
+    assert recovery.status is SessionStatus.INTERRUPTED
+    assert session is not None and session.status is SessionStatus.INTERRUPTED
+    assert provider.requests == []
+    assert tool.calls == 0
+    assert receipt is not None
+    transcript_roles = [message.role.value for message in transcript]
+    assert transcript_roles == ["user", "assistant", "tool", "user"]
+    assert transcript[-1] == deferred_message
+    assert transcript.count(deferred_message) == 1
+    assert asyncio.run(store.load_deferred_interaction_input(session_id)) is None
+    assert "pending_tool_approval" not in (checkpoint or {})
+    assert "pending_tool_round" not in (checkpoint or {})
+    assert receipt.transcript_end_cursor - receipt.transcript_start_cursor == 1
+
+
+def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> None:
+    async def run():
+        store = _FailMaterializationStore(failures=1)
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-terminal-after-tool-publication",
+            provider_name=provider.name,
+            with_tool_call=True,
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        deferred_message = Message.text("user", "continue after terminal recovery")
+
+        resume_events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        checkpoint = await store.load_checkpoint(staged.session.id)
+        approval = PendingToolApproval.model_validate(checkpoint["pending_tool_approval"])
+
+        await store.transition_status_and_checkpoint(
+            staged.session.id,
+            from_statuses={SessionStatus.INTERRUPTED},
+            to_status=SessionStatus.INTERRUPTING,
+            checkpoint_transform=session_engine._checkpoint_with_pending_session_interrupt(
+                {
+                    "interruption_type": "operator_requested",
+                    "interruption_request_id": "interrupt-before-terminal-materialization",
+                    "reason": "operator stopped recovered approval",
+                }
+            ),
+        )
+        await app._tool_round_executor.clear_pending_tool_approval_for_tool_round(
+            staged.session.id,
+            [
+                runtime_records.ToolCallRequest(
+                    id=call.tool_call_id,
+                    name=call.tool_name,
+                    arguments=call.arguments,
+                )
+                for call in approval.tool_calls
+            ],
+        )
+        with pytest.raises(OSError, match="process stopped before deferred input materialization"):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+            )
+        checkpoint_after_commit = await store.load_checkpoint(staged.session.id)
+        transcript_after_commit = await store.load_transcript(staged.session.id)
+        deferred_after_commit = await store.load_deferred_interaction_input(staged.session.id)
+        receipt_after_commit = await store.load_runtime_publication_receipt(
+            staged.session.id,
+            f"tool-round:{staged.pointer.tool_round_id}",
+        )
+
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        await store.release_run_fence(staged.session.id)
+        second_recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+        )
+        return (
+            store,
+            tool,
+            staged,
+            deferred_message,
+            resume_events,
+            checkpoint_after_commit,
+            transcript_after_commit,
+            deferred_after_commit,
+            receipt_after_commit,
+            second_recovery,
+        )
+
+    (
+        store,
+        tool,
+        staged,
+        deferred_message,
+        resume_events,
+        checkpoint_after_commit,
+        transcript_after_commit,
+        deferred_after_commit,
+        receipt_after_commit,
+        second_recovery,
+    ) = asyncio.run(run())
+
+    assert resume_events[-1].type is EventType.SESSION_INTERRUPTED
+    assert receipt_after_commit is not None
+    assert tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint_after_commit) is None
+    assert transcript_after_commit[-1].role.value == "tool"
+    assert deferred_after_commit is not None
+    assert deferred_after_commit.source_messages == [deferred_message]
+
+    assert second_recovery.status is SessionStatus.INTERRUPTED
+    assert second_recovery.actions == (IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,)
+    transcript = asyncio.run(store.load_transcript(staged.session.id))
+    assert transcript[-2:] == [transcript_after_commit[-1], deferred_message]
+    assert transcript.count(deferred_message) == 1
+    assert asyncio.run(store.load_deferred_interaction_input(staged.session.id)) is None
+    assert tool.calls == 0
+
+
+def test_approval_close_failure_stays_closed_and_exact_retry_survives_recovery_fence() -> None:
+    async def run():
+        store = _FailMaterializationStore(failures=2)
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-approval-close-materialization",
+            provider_name=provider.name,
+            with_tool_call=True,
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        deferred_message = Message.text("user", "continue after exact approval retry")
+
+        paused = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        approval = PendingToolApproval.from_event(
+            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
+        )
+        request = ToolApprovalRequest(
+            session_id=staged.session.id,
+            approval_id=approval.approval_id,
+            tool_round_id=approval.tool_round_id,
+            tool_call_id=approval.tool_call_id,
+            decision=ToolApprovalDecision.DENY,
+        )
+        failed_close = [event async for event in app.resolve_tool_approval(request)]
+        receipt = await store.load_runtime_publication_receipt(
+            staged.session.id,
+            f"approval-close:{approval.approval_id}",
+        )
+        checkpoint_after_close = await store.load_checkpoint(staged.session.id)
+        session_after_close = await store.load(staged.session.id)
+        deferred_after_close = await store.load_deferred_interaction_input(staged.session.id)
+
+        with pytest.raises(OSError, match="process stopped before deferred input materialization"):
+            await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+            )
+        session_after_recovery_fence = await store.load(staged.session.id)
+        replayed = [event async for event in app.resolve_tool_approval(request)]
+        return (
+            store,
+            provider,
+            tool,
+            staged,
+            deferred_message,
+            failed_close,
+            receipt,
+            checkpoint_after_close,
+            session_after_close,
+            deferred_after_close,
+            session_after_recovery_fence,
+            replayed,
+        )
+
+    (
+        store,
+        provider,
+        tool,
+        staged,
+        deferred_message,
+        failed_close,
+        receipt,
+        checkpoint_after_close,
+        session_after_close,
+        deferred_after_close,
+        session_after_recovery_fence,
+        replayed,
+    ) = asyncio.run(run())
+
+    assert failed_close[-1].type is EventType.SESSION_FAILED
+    assert EventType.SESSION_INTERRUPTED not in [event.type for event in failed_close]
+    assert receipt is not None
+    assert "pending_tool_approval" not in (checkpoint_after_close or {})
+    assert "pending_tool_round" not in (checkpoint_after_close or {})
+    assert session_after_close is not None
+    assert session_after_close.status is SessionStatus.FAILED
+    assert deferred_after_close is not None
+    assert deferred_after_close.source_messages == [deferred_message]
+    assert session_after_recovery_fence is not None
+    assert session_after_recovery_fence.run_epoch > session_after_close.run_epoch
+    assert tuple(event.id for event in replayed) == receipt.appended_event_ids
+    transcript = asyncio.run(store.load_transcript(staged.session.id))
+    assert transcript[-1] == deferred_message
+    assert transcript.count(deferred_message) == 1
+    assert asyncio.run(store.load_deferred_interaction_input(staged.session.id)) is None
+    assert provider.requests == []
+    assert tool.calls == 0
+
+
+def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence() -> None:
+    async def run():
+        store = _FailApprovalCloseBeforeCommitStore()
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-limit-close-precommit",
+            provider_name=provider.name,
+            with_tool_call=True,
+            usage={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        deferred_message = Message.text("user", "continue after precommit limit retry")
+
+        paused = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        approval = PendingToolApproval.from_event(
+            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
+        )
+        request = ToolApprovalRequest(
+            session_id=staged.session.id,
+            approval_id=approval.approval_id,
+            tool_round_id=approval.tool_round_id,
+            tool_call_id=approval.tool_call_id,
+            decision=ToolApprovalDecision.APPROVE,
+            limits=RunLimits(max_total_tokens=1, scope="session"),
+        )
+        first = [event async for event in app.resolve_tool_approval(request)]
+        checkpoint_after_failure = await store.load_checkpoint(staged.session.id)
+        receipt_after_failure = await store.load_runtime_publication_receipt(
+            staged.session.id,
+            f"approval-close:{approval.approval_id}",
+        )
+        second = [event async for event in app.resolve_tool_approval(request)]
+        durable_events = await store.load_events(staged.session.id)
+        receipt = await store.load_runtime_publication_receipt(
+            staged.session.id,
+            f"approval-close:{approval.approval_id}",
+        )
+        return (
+            store,
+            provider,
+            tool,
+            staged,
+            deferred_message,
+            approval,
+            first,
+            checkpoint_after_failure,
+            receipt_after_failure,
+            second,
+            durable_events,
+            receipt,
+        )
+
+    (
+        store,
+        provider,
+        tool,
+        staged,
+        deferred_message,
+        approval,
+        first,
+        checkpoint_after_failure,
+        receipt_after_failure,
+        second,
+        durable_events,
+        receipt,
+    ) = asyncio.run(run())
+
+    assert first[-1].type is EventType.SESSION_INTERRUPTED
+    assert receipt_after_failure is None
+    assert approval_support.pending_approval_from_checkpoint(checkpoint_after_failure) is not None
+    assert EventType.SESSION_LIMIT_REACHED in [event.type for event in second]
+    assert second[-1].type is EventType.SESSION_INTERRUPTED
+    assert receipt is not None
+    limit_failures = [
+        event
+        for event in durable_events
+        if event.type is EventType.TOOL_CALL_FAILED
+        and event.payload.get("reason") == "limit_reached"
+    ]
+    assert len(limit_failures) == 1
+    assert limit_failures[0].payload["approval_id"] == approval.approval_id
+    assert limit_failures[0].payload["idempotency_key"] == (
+        tool_execution.tool_idempotency_key(
+            session_id=staged.session.id,
+            tool_round_id=approval.tool_round_id,
+            tool_call_id=approval.tool_call_id,
+            approval_id=approval.approval_id,
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint(staged.session.id))
+    assert approval_support.pending_approval_from_checkpoint(checkpoint) is None
+    transcript = asyncio.run(store.load_transcript(staged.session.id))
+    assert transcript[-1] == deferred_message
+    assert transcript.count(deferred_message) == 1
+    assert asyncio.run(store.load_deferred_interaction_input(staged.session.id)) is None
+    assert provider.requests == []
+    assert tool.calls == 0
+
+
+def test_approval_close_cancellation_materializes_deferred_input_before_propagation() -> None:
+    async def run():
+        store = _PauseCommittedApprovalCloseStore()
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-close-commit-cancellation",
+            provider_name=provider.name,
+            with_tool_call=True,
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        deferred_message = Message.text("user", "materialize before cancellation propagates")
+
+        paused = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        approval = PendingToolApproval.from_event(
+            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
+        )
+
+        async def resolve() -> list[Event]:
+            return [
+                event
+                async for event in app.resolve_tool_approval(
+                    ToolApprovalRequest(
+                        session_id=staged.session.id,
+                        approval_id=approval.approval_id,
+                        tool_round_id=approval.tool_round_id,
+                        tool_call_id=approval.tool_call_id,
+                        decision=ToolApprovalDecision.DENY,
+                    )
+                )
+            ]
+
+        resolution_task = asyncio.create_task(resolve())
+        await asyncio.wait_for(store.close_committed.wait(), timeout=5)
+        assert resolution_task.cancelling() == 0
+        resolution_task.cancel("cancel after approval close commit")
+        assert resolution_task.cancelling() == 1
+        store.release_close_acknowledgement.set()
+        try:
+            await resolution_task
+        except asyncio.CancelledError as cancellation:
+            assert cancellation.args == ("cancel after approval close commit",)
+        else:
+            pytest.fail("Approval close did not preserve caller cancellation.")
+        assert resolution_task.cancelled() is True
+        # The shield helper consumes the request while durable work drains,
+        # then re-raises the captured cancellation as the task's final state.
+        assert resolution_task.cancelling() == 0
+        return store, provider, tool, staged, deferred_message, approval
+
+    store, provider, tool, staged, deferred_message, approval = asyncio.run(run())
+
+    receipt = asyncio.run(
+        store.load_runtime_publication_receipt(
+            staged.session.id,
+            f"approval-close:{approval.approval_id}",
+        )
+    )
+    checkpoint = asyncio.run(store.load_checkpoint(staged.session.id))
+    transcript = asyncio.run(store.load_transcript(staged.session.id))
+    session = asyncio.run(store.load(staged.session.id))
+    assert receipt is not None
+    assert approval_support.pending_approval_from_checkpoint(checkpoint) is None
+    assert session is not None and session.status is SessionStatus.INTERRUPTED
+    assert [message.role.value for message in transcript] == [
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert transcript[-1] == deferred_message
+    assert transcript.count(deferred_message) == 1
+    assert asyncio.run(store.load_deferred_interaction_input(staged.session.id)) is None
+    assert provider.requests == []
+    assert tool.calls == 0
+
+
+def test_limit_approval_close_materialization_failure_stays_closed() -> None:
+    async def run():
+        store = _FailMaterializationStore(failures=1)
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool()
+        staged = await _stage_completed_model_boundary(
+            store,
+            session_id="model-recovery-limit-close-materialization",
+            provider_name=provider.name,
+            with_tool_call=True,
+            usage={"input_tokens": 10, "output_tokens": 1, "total_tokens": 11},
+        )
+        await store.release_run_fence(staged.session.id)
+        await store.update_status(staged.session.id, SessionStatus.INTERRUPTED)
+        app = _register_runtime(store, provider, tool=tool)
+        deferred_message = Message.text("user", "continue after limit approval retry")
+
+        paused = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=staged.session.id,
+                    messages=[deferred_message],
+                )
+            )
+        ]
+        approval = PendingToolApproval.from_event(
+            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
+        )
+        request = ToolApprovalRequest(
+            session_id=staged.session.id,
+            approval_id=approval.approval_id,
+            tool_round_id=approval.tool_round_id,
+            tool_call_id=approval.tool_call_id,
+            decision=ToolApprovalDecision.APPROVE,
+            limits=RunLimits(max_total_tokens=1, scope="session"),
+        )
+        failed_close = [event async for event in app.resolve_tool_approval(request)]
+        receipt = await store.load_runtime_publication_receipt(
+            staged.session.id,
+            f"approval-close:{approval.approval_id}",
+        )
+        checkpoint_after_close = await store.load_checkpoint(staged.session.id)
+        session_after_close = await store.load(staged.session.id)
+        deferred_after_close = await store.load_deferred_interaction_input(staged.session.id)
+        replayed = [event async for event in app.resolve_tool_approval(request)]
+        return (
+            store,
+            provider,
+            tool,
+            staged,
+            deferred_message,
+            failed_close,
+            receipt,
+            checkpoint_after_close,
+            session_after_close,
+            deferred_after_close,
+            replayed,
+        )
+
+    (
+        store,
+        provider,
+        tool,
+        staged,
+        deferred_message,
+        failed_close,
+        receipt,
+        checkpoint_after_close,
+        session_after_close,
+        deferred_after_close,
+        replayed,
+    ) = asyncio.run(run())
+
+    assert EventType.SESSION_LIMIT_REACHED in [event.type for event in failed_close]
+    assert failed_close[-1].type is EventType.SESSION_FAILED
+    assert EventType.SESSION_INTERRUPTED not in [event.type for event in failed_close]
+    assert receipt is not None
+    assert receipt.intent["decision"] == "limit_reached"
+    assert "pending_tool_approval" not in (checkpoint_after_close or {})
+    assert "pending_tool_round" not in (checkpoint_after_close or {})
+    assert session_after_close is not None
+    assert session_after_close.status is SessionStatus.FAILED
+    assert deferred_after_close is not None
+    assert deferred_after_close.source_messages == [deferred_message]
+    assert tuple(event.id for event in replayed) == receipt.appended_event_ids
+    transcript = asyncio.run(store.load_transcript(staged.session.id))
+    assert transcript[-1] == deferred_message
+    assert transcript.count(deferred_message) == 1
+    assert asyncio.run(store.load_deferred_interaction_input(staged.session.id)) is None
+    assert provider.requests == []
+    assert tool.calls == 0
 
 
 @pytest.mark.parametrize(

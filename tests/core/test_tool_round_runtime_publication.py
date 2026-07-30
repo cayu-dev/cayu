@@ -33,8 +33,9 @@ from cayu.runtime._model_completion_publication import (
     model_step_publication_from_checkpoint,
 )
 from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
-from cayu.runtime.context import validate_context_messages
+from cayu.runtime.context import ContextPolicy, ContextRequest, validate_context_messages
 from cayu.runtime.execution_units import ToolRoundIdentity
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class _FailingTerminalToolEventStore(InMemorySessionStore):
@@ -397,10 +398,12 @@ def test_pending_tool_round_recovery_preserves_cancellation_after_exact_replay()
         )
         await asyncio.wait_for(store.publication_committed.wait(), timeout=5)
         recovery_task.cancel("cancel after tool-round publication commit")
+        assert recovery_task.cancelling() == 1
         store.allow_publication_return.set()
         with pytest.raises(asyncio.CancelledError) as cancellation:
             await asyncio.wait_for(recovery_task, timeout=5)
         assert cancellation.value.args == ("cancel after tool-round publication commit",)
+        assert recovery_task.cancelled()
 
         _assert_only_model_step_publication_checkpoint(await store.load_checkpoint(session_id))
         assert (
@@ -412,7 +415,99 @@ def test_pending_tool_round_recovery_preserves_cancellation_after_exact_replay()
         )
         transcript = await store.load_transcript(session_id)
         assert sum(message.role == "tool" for message in transcript) == 1
+        assert transcript[-1] == Message.text("user", "continue")
+        assert transcript.count(Message.text("user", "continue")) == 1
+        assert await store.load_deferred_interaction_input(session_id) is None
         assert tool.calls == [{}]
+
+    asyncio.run(scenario())
+
+
+def test_pending_tool_round_materialization_reapplies_secret_redaction() -> None:
+    class RecordingContextPolicy(ContextPolicy):
+        def __init__(self) -> None:
+            self.requests: list[ContextRequest] = []
+
+        async def build(self, request: ContextRequest) -> list[Message]:
+            self.requests.append(request)
+            return request.messages
+
+    async def scenario() -> None:
+        session_id = "sess_tool_round_materialization_redaction"
+        secret = "dynamic-recovery-secret-canary"
+        store = _FailingTerminalToolEventStore()
+        initial_provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call_1",
+                        name="side_effect",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ]
+            ]
+        )
+        initial_app = CayuApp(session_store=store, enable_logging=False)
+        initial_app.register_provider(initial_provider, default=True)
+        initial_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SideEffectTool()],
+        )
+        initial_events = await collect_events(
+            initial_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", secret)],
+            ),
+        )
+        assert initial_events[-1].type is EventType.SESSION_FAILED
+
+        resumed_provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("recovered"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ]
+            ]
+        )
+        context_policy = RecordingContextPolicy()
+        resumed_app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor(secret),
+            enable_logging=False,
+        )
+        resumed_app.register_provider(resumed_provider, default=True)
+        resumed_app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[SideEffectTool()],
+            context_policy=context_policy,
+        )
+        resumed_events = await collect_resume_events(
+            resumed_app,
+            ResumeRequest(
+                session_id=session_id,
+                messages=[Message.text("user", f"continue with {secret}")],
+            ),
+        )
+
+        assert resumed_events[-1].type is EventType.SESSION_COMPLETED
+        assert len(context_policy.requests) == 1
+        context_payload = repr(
+            [message.model_dump(mode="json") for message in context_policy.requests[0].messages]
+        )
+        provider_payload = repr(
+            [message.model_dump(mode="json") for message in resumed_provider.requests[0].messages]
+        )
+        assert secret not in context_payload
+        assert REDACTED_SECRET in context_payload
+        assert secret not in provider_payload
+        assert REDACTED_SECRET in provider_payload
+        durable_payload = repr(
+            [message.model_dump(mode="json") for message in await store.load_transcript(session_id)]
+        )
+        assert secret in durable_payload
 
     asyncio.run(scenario())
 

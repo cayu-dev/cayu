@@ -3289,6 +3289,11 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         arguments: dict[str, object] | None = None,
         reason: str | None = None,
     ) -> dict[str, object]:
+        pending_call = {
+            **pending_tool_call(tool_call_id, tool_name),
+            "arguments": arguments or {},
+            "policy_decision": "require_approval",
+        }
         return {
             "pending_tool_approval": {
                 **execution_identity(approval_round_id),
@@ -3298,13 +3303,15 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                 "arguments": arguments or {},
                 "agent_name": "assistant",
                 "reason": reason,
-                "tool_calls": [
-                    {
-                        **pending_tool_call(tool_call_id, tool_name),
-                        "arguments": arguments or {},
-                    }
-                ],
-            }
+                "tool_calls": [pending_call],
+            },
+            "pending_tool_round": {
+                **execution_identity(approval_round_id),
+                "agent_name": "assistant",
+                "tool_calls": [pending_call],
+                "policy_state": "planned",
+                "policy_context_version": 1,
+            },
         }
 
     def user_input_checkpoint(
@@ -3395,6 +3402,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                                 {
                                     **pending_tool_call("call_deploy", "deploy"),
                                     "arguments": {"service": "api"},
+                                    "policy_decision": "require_approval",
                                 }
                             ],
                         },
@@ -6098,6 +6106,8 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
             json={
                 "session_id": " ",
                 "approval_id": "approval_1",
+                "tool_round_id": "round_1",
+                "tool_call_id": "call_1",
                 "decision": "approve",
             },
         ).status_code
@@ -6109,6 +6119,7 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
             json={
                 "session_id": " ",
                 "approval_id": "approval_1",
+                "tool_round_id": "round_1",
                 "tool_call_id": "call_1",
                 "outcome": "completed",
                 "message": "confirmed externally",
@@ -6122,6 +6133,7 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
             json={
                 "session_id": "session_1",
                 "approval_id": "approval_1",
+                "tool_round_id": "round_1",
                 "tool_call_id": " ",
                 "outcome": "completed",
                 "message": "confirmed externally",
@@ -6135,6 +6147,7 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
             json={
                 "session_id": "session_1",
                 "approval_id": "approval_1",
+                "tool_round_id": "round_1",
                 "tool_call_id": "call_1",
                 "outcome": "completed",
                 "message": " ",
@@ -6148,6 +6161,8 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
             json={
                 "session_id": "session_1",
                 "approval_id": "approval_1",
+                "tool_round_id": "round_1",
+                "tool_call_id": "call_1",
                 "decision": "maybe",
             },
         ).status_code
@@ -6160,6 +6175,8 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
                 json={
                     "session_id": "session_1",
                     "approval_id": "approval_1",
+                    "tool_round_id": "round_1",
+                    "tool_call_id": "call_1",
                     "decision": "approve",
                     "max_steps": bad_max_steps,
                 },
@@ -6172,6 +6189,7 @@ def test_run_rejects_blank_prompt_and_agent_before_runtime() -> None:
                 json={
                     "session_id": "session_1",
                     "approval_id": "approval_1",
+                    "tool_round_id": "round_1",
                     "tool_call_id": "call_1",
                     "outcome": "completed",
                     "message": "confirmed externally",
@@ -6270,6 +6288,8 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
         json={
             "session_id": "session_resolve_metadata",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
             "metadata": {"actor": "operator"},
         },
@@ -6283,6 +6303,7 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
         json={
             "session_id": "session_recover_metadata",
             "approval_id": "approval_2",
+            "tool_round_id": "round_2",
             "tool_call_id": "call_1",
             "outcome": "completed",
             "message": "confirmed externally",
@@ -6351,6 +6372,8 @@ def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> No
         json={
             "session_id": "session_dev_actor",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
             "resolved_by": {"subject": "operator@example.com", "source": "system"},
         },
@@ -6390,6 +6413,8 @@ def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> No
         json={
             "session_id": "session_dev_actor",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
             "resolved_by": {"subject": "cayu:approval-expiry", "source": "system"},
         },
@@ -6405,6 +6430,8 @@ def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> No
         json={
             "session_id": "session_dev_actor",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
         },
     ) as response:
@@ -9292,6 +9319,8 @@ def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly(
             {
                 "session_id": "session_approval_replay",
                 "approval_id": "approval_1",
+                "tool_round_id": "round_1",
+                "tool_call_id": "call_1",
                 "decision": "approve",
             },
         ),
@@ -9300,6 +9329,7 @@ def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly(
             {
                 "session_id": "session_approval_replay",
                 "approval_id": "approval_1",
+                "tool_round_id": "round_1",
                 "tool_call_id": "call_1",
                 "outcome": "completed",
                 "message": "confirmed externally",
@@ -9439,6 +9469,8 @@ def test_session_scoped_replay_rejects_marker_for_different_session() -> None:
         json={
             "session_id": "session_requested",
             "approval_id": "approval_1",
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
             "decision": "approve",
         },
         headers={"Last-Event-ID": "session_other:event_seen"},

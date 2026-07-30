@@ -733,6 +733,7 @@ def test_incomplete_recovery_fails_mixed_round_without_retry_or_side_effects() -
         ]
         assert EventType.STRUCTURED_OUTPUT_RETRY not in [event.type for event in round_events]
         assert EventType.TOOL_CALL_STARTED not in [event.type for event in events]
+        assert EventType.TOOL_CALL_APPROVAL_REQUESTED not in [event.type for event in events]
         terminal_events = round_events[:2]
         auxiliary_events = round_events[2:]
         assert all(

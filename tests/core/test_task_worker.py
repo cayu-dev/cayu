@@ -530,10 +530,16 @@ def test_run_task_worker_hands_interrupted_session_to_reconstructed_control_plan
         _register_approval_agent(reconstructed)
         approval_id = pending.actions[0].approval_id
         assert approval_id is not None
+        approval_round_id = pending.actions[0].round_id
+        approval_tool_call_id = pending.actions[0].tool_call_id
+        assert approval_round_id is not None
+        assert approval_tool_call_id is not None
         async for _event in reconstructed.resolve_tool_approval(
             ToolApprovalRequest(
                 session_id="session-handoff",
                 approval_id=approval_id,
+                tool_round_id=approval_round_id,
+                tool_call_id=approval_tool_call_id,
                 decision=ToolApprovalDecision.APPROVE,
             )
         ):

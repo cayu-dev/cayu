@@ -987,6 +987,8 @@ def test_step_reuses_resolved_interrupted_child_on_rerun():
                 ToolApprovalRequest(
                     session_id=child_session_id,
                     approval_id=approval["approval_id"],
+                    tool_round_id=approval["tool_round_id"],
+                    tool_call_id=approval["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
                 )
             )

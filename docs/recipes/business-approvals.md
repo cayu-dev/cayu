@@ -157,12 +157,16 @@ from cayu import business_approval_audit
 
 records = business_approval_audit(await store.load_events(session_id))
 for r in records:
-    print(r.approval_id, r.decision, r.outcome, r.condition_text,
+    print(r.approval_id, r.resolution_state, r.decision, r.outcome, r.condition_text,
           r.approver_id, r.approver_tier, r.requested_at, r.resolved_at)
 ```
 
 Each `BusinessApprovalRecord` pairs the request with its resolution:
-`decision` is the raw Cayu decision, `outcome` the business outcome. A record
+`resolution_state` is `pending`, `approved`, `denied`, or `blocked`;
+`decision` is the raw binary Cayu decision, and `outcome` the business outcome.
+An ambiguous recovery gate acknowledged with “Continue safely” is
+`resolution_state=blocked`, `decision=None`, and `pending=False`: the operator
+closed the recovery gate but did not authorize execution. A record
 with `decision` set but `outcome=None` means someone resolved through the raw
 primitive without the stamp — visible instead of hidden. Note the limit: the
 projection records what callers *asserted*, it does not authenticate them; a

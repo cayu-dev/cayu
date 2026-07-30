@@ -491,6 +491,8 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
                 ToolApprovalRequest(
                     session_id="g2b_tool_approval",
                     approval_id=approval_id,
+                    tool_round_id=approval_event.payload["tool_round_id"],
+                    tool_call_id=approval_event.payload["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
                 )
             )

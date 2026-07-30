@@ -66,6 +66,40 @@ envelopes, API event records, and transcript records now require
 OpenAPI surface. Regenerate clients and deploy independently hosted dashboards
 with the matching server version.
 
+### Tool-approval resolution identities are mandatory
+
+The same version-5 protected control-plane contract requires approval and
+manual-recovery requests to carry the exact durable
+`tool_round_id` and gating `tool_call_id` (and approval requests retain their
+`approval_id`). These fields fence stale operators and retries from resolving a
+newly paused round that happens to reuse a session or call identifier.
+The atomic approval claim also stores a canonical digest of the requested
+decision, reason, metadata, and resolver actor. A retry must match that digest
+before environment setup or tool execution. The digest stays in private
+coordination state rather than approval events, whose bounded audit metadata is
+never replay authority. The final approval-close receipt retains the same
+identity even when a run limit closes the round. Durable
+resolution activity written before request digests existed is not reconstructed
+from bounded or redacted audit events; those partial legacy resolutions remain
+interrupted for explicit reconciliation.
+
+Resume input retained behind an unresolved recovered tool round remains private
+until the round's single grouped tool-result message is durably published.
+Receipt replay and restart recovery then materialize that input idempotently
+after the result, so publication validation, transcript ordering, and retry
+identity remain consistent across a process stop.
+
+Manual tool recovery remains a separate authority boundary. It may record an
+externally verified terminal outcome, but it can close the approval
+automatically only when every call in the round is already terminal and a
+modern approval intent supplies the original digest. If a sibling remains,
+recovery leaves the approval interrupted and the exact original approval
+request must be retried before that sibling can execute.
+
+Regenerate clients and upgrade independently deployed Cayu servers and
+dashboards together. The dashboard intentionally rejects version 4 instead of
+submitting an approval without the complete durable identity.
+
 ### Session topology reads are bounded and indexed
 
 The protected server now exposes a session-focused topology read for control

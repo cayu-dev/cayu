@@ -270,16 +270,17 @@ def policy_reason_for_pending_tool_call(
     *,
     redactor: SecretRedactor | None = None,
 ) -> str | None:
-    """Bound only durable denials; approval prompts retain their full policy text."""
+    """Redact durable policy text and bound denial diagnostics."""
 
     if policy_result is None or policy_result.reason is None:
         return None
+    reason = policy_result.reason
+    if redactor is not None:
+        reason = redactor.redact_text(reason)
     if policy_result.decision is ToolPolicyDecision.DENY:
-        reason = policy_result.reason
-        if redactor is not None:
-            reason = redactor.redact_text(reason)
-        return _bound_policy_denial_text(reason)
-    return policy_result.reason
+        bounded = _bound_policy_denial_text(reason)
+        return bounded if redactor is None else redactor.redact_text(bounded)
+    return reason
 
 
 def tool_call_outcome_from_terminal_event(

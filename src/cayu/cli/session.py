@@ -846,6 +846,8 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
     decision_records: dict[_ToolCallKey, EventRecord] = {}
     approval_states: dict[_ToolCallKey, str] = {}
     approval_outcomes: dict[_ToolCallKey, str] = {}
+    approval_completion_records: dict[_ToolCallKey, EventRecord] = {}
+    unregistered_policy_calls: set[_ToolCallKey] = set()
     resolved_approval_keys: set[tuple[str, str, str, str]] = set()
     approval_request_calls: dict[
         tuple[str, str, str, str],
@@ -906,6 +908,9 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
             )
             approval_states[call_key] = outcome
             approval_outcomes[call_key] = outcome
+            return
+        if _is_ambiguous_approval_block(record):
+            approval_states[call_key] = "blocked"
 
     for record in records:
         event = record.event
@@ -958,16 +963,27 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                     approval_request_calls.setdefault(resolution_key, set()).add(call_key)
                     approval_request_rounds.add(resolution_key[:3])
                 policy_decision = call.get("policy_decision")
+                policy_evidence = call.get("policy_evidence")
+                is_ambiguous_call = policy_evidence == "ambiguous" and policy_decision is None
+                is_unregistered_call = policy_evidence == "unregistered" and policy_decision is None
+                if is_unregistered_call:
+                    unregistered_policy_calls.add(call_key)
                 if (
                     not has_nested_calls
                     or policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+                    or (is_ambiguous_call and call_id == approval.get("tool_call_id"))
                 ):
                     approval_states[call_key] = "requested"
                     approval_gated_calls.add(call_key)
-                elif policy_decision not in {
-                    ToolPolicyDecision.ALLOW.value,
-                    ToolPolicyDecision.DENY.value,
-                }:
+                elif (
+                    policy_decision
+                    not in {
+                        ToolPolicyDecision.ALLOW.value,
+                        ToolPolicyDecision.DENY.value,
+                    }
+                    and not is_ambiguous_call
+                    and not is_unregistered_call
+                ):
                     evidence_conflicts.add(call_key)
                     approval_decision_conflicts.add(call_key)
                 approval_scoped_keys.add(call_key)
@@ -990,6 +1006,12 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
             if call_key in terminals:
                 evidence_conflicts.add(call_key)
             terminals.setdefault(call_key, record)
+            if _is_ambiguous_approval_block_candidate(record):
+                approval_scoped_keys.add(call_key)
+                if call_key in decision_records:
+                    evidence_conflicts.add(call_key)
+                    approval_decision_conflicts.add(call_key)
+                decision_records.setdefault(call_key, record)
         elif event.type == EventType.TOOL_CALL_APPROVED:
             approval_scoped_keys.add(call_key)
             if call_key in decision_records:
@@ -1024,6 +1046,11 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 evidence_conflicts.add(call_key)
                 approval_decision_conflicts.add(call_key)
                 continue
+            if decision_record.event.type is EventType.TOOL_CALL_BLOCKED:
+                # Every ambiguous sibling carries the round-level requested
+                # decision. Without the request, the gating call cannot be
+                # identified positively, so retain only the terminal block.
+                continue
             # A bounded --after-sequence window may intentionally exclude the
             # request. Retain the decision's local state without inventing a
             # call-level join to evidence that is not present.
@@ -1035,6 +1062,20 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
             approval_decision_conflicts.add(call_key)
             continue
         if call_key in approval_gated_calls:
+            if decision_record.event.type is EventType.TOOL_CALL_BLOCKED:
+                approval_call = approval_calls.get(call_key)
+                if (
+                    not _is_ambiguous_approval_block(decision_record)
+                    or approval_call is None
+                    or approval_call.get("policy_evidence") != "ambiguous"
+                    or approval_call.get("policy_decision") is not None
+                ):
+                    evidence_conflicts.add(call_key)
+                    approval_decision_conflicts.add(call_key)
+                    continue
+                retain_approval_decision_state(call_key, decision_record)
+                resolved_approval_keys.add(resolution_key)
+                continue
             if (
                 decision_record.event.type == EventType.TOOL_CALL_APPROVAL_DENIED
                 and decision_record.event.payload.get("approval_required") is not True
@@ -1048,17 +1089,54 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
 
         approval_call = approval_calls.get(call_key)
         policy_decision = None if approval_call is None else approval_call.get("policy_decision")
+        policy_evidence = None if approval_call is None else approval_call.get("policy_evidence")
+        if (
+            _is_ambiguous_approval_block(decision_record)
+            and approval_call is not None
+            and approval_call.get("policy_evidence") == "ambiguous"
+            and policy_decision is None
+        ):
+            # The round-level acknowledgement belongs only to the gating call.
+            # Ambiguous siblings still close as blocked terminal tool calls.
+            continue
         if (
             decision_record.event.type == EventType.TOOL_CALL_APPROVAL_DENIED
-            and policy_decision == ToolPolicyDecision.ALLOW.value
+            and (
+                policy_decision == ToolPolicyDecision.ALLOW.value
+                or (policy_evidence in {"ambiguous", "unregistered"} and policy_decision is None)
+            )
             and decision_record.event.payload.get("approval_required") is False
         ):
             approval_outcomes[call_key] = (
                 "expired" if decision_record.event.payload.get("expired") is True else "denied"
             )
+            approval_completion_records[call_key] = decision_record
             continue
         evidence_conflicts.add(call_key)
         approval_decision_conflicts.add(call_key)
+
+    for call_key in unregistered_policy_calls:
+        started = starts.get(call_key)
+        terminal = terminals.get(call_key)
+        decision = decision_records.get(call_key)
+        valid_failed_closure = (
+            terminal is not None
+            and terminal.event.type is EventType.TOOL_CALL_FAILED
+            and terminal.event.payload.get("registration_state") == "unregistered_at_policy_plan"
+        )
+        valid_denied_closure = (
+            decision is not None
+            and decision.event.type is EventType.TOOL_CALL_APPROVAL_DENIED
+            and decision.event.payload.get("approval_required") is False
+        )
+        if (
+            started is not None
+            or (terminal is not None and not valid_failed_closure)
+            or (decision is not None and not valid_denied_closure)
+            or (terminal is not None and decision is not None)
+        ):
+            evidence_conflicts.add(call_key)
+            approval_decision_conflicts.add(call_key)
 
     for call_key, names in tool_names.items():
         if len(names) != 1:
@@ -1128,6 +1206,9 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
         anchor = anchors[call_key]
         evidence_conflict = call_key in evidence_conflicts
         terminal = None if evidence_conflict else terminals.get(call_key)
+        completion_record = (
+            None if evidence_conflict else terminal or approval_completion_records.get(call_key)
+        )
         approval_state = (
             "unavailable"
             if call_key in approval_decision_conflicts
@@ -1212,7 +1293,9 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 "argument_summary": argument_summary,
                 "started_at": (None if started is None else started.event.timestamp.isoformat()),
                 "completed_at": (
-                    None if terminal is None else terminal.event.timestamp.isoformat()
+                    None
+                    if completion_record is None
+                    else completion_record.event.timestamp.isoformat()
                 ),
                 "duration_ms": (None if evidence_conflict else _duration_ms(started, terminal)),
                 "status": (
@@ -1404,6 +1487,29 @@ def _approval_denial_completes_expiry(
         and denial.event.payload.get("expired") is True
         and type(approval_id) is str
         and denial.event.payload.get("approval_id") == approval_id
+    )
+
+
+def _is_ambiguous_approval_block_candidate(record: EventRecord) -> bool:
+    """Return whether a block claims to close an ambiguous approval."""
+
+    payload = record.event.payload
+    return record.event.type is EventType.TOOL_CALL_BLOCKED and (
+        "requested_decision" in payload
+        or payload.get("blocked_by") == "policy_evaluation_ambiguous"
+        or payload.get("decision") == "ambiguous"
+    )
+
+
+def _is_ambiguous_approval_block(record: EventRecord) -> bool:
+    """Recognize the runtime's exact non-authorizing approval resolution."""
+
+    payload = record.event.payload
+    return (
+        record.event.type is EventType.TOOL_CALL_BLOCKED
+        and payload.get("decision") == "ambiguous"
+        and payload.get("blocked_by") == "policy_evaluation_ambiguous"
+        and payload.get("requested_decision") == "approve"
     )
 
 
@@ -1786,6 +1892,7 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
         "approval_id",
         "input_id",
         "approval_required",
+        "registration_state",
     ):
         if key in event.payload:
             payload[key] = event.payload[key]
@@ -1809,7 +1916,12 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
                 compact_approval["tool_calls"] = [
                     {
                         key: item[key]
-                        for key in ("tool_call_id", "tool_name", "policy_decision")
+                        for key in (
+                            "tool_call_id",
+                            "tool_name",
+                            "policy_decision",
+                            "policy_evidence",
+                        )
                         if key in item
                     }
                     | {"_argument_summary": _bounded_argument_summary(item.get("arguments", {}))}
@@ -1841,6 +1953,10 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
         and type(event.payload.get("expired")) is bool
     ):
         payload["expired"] = event.payload["expired"]
+    if event.type == EventType.TOOL_CALL_BLOCKED:
+        for key in ("decision", "blocked_by", "requested_decision"):
+            if key in event.payload:
+                payload[key] = event.payload[key]
     if event.type in _TOOL_TERMINAL_TYPES:
         result = event.payload.get("result")
         result = result if type(result) is dict else {}

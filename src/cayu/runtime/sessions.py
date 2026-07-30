@@ -88,6 +88,7 @@ from cayu.runtime.aggregates import (
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
     ResolutionActor,
+    ToolPolicyEvidence,
     copy_resolution_actor,
     resolution_actor_payload,
 )
@@ -1402,7 +1403,13 @@ _STRUCTURED_OUTPUT_AUXILIARY_INTENT_KEYS = frozenset(
         "event_ids",
     }
 )
-RuntimePublicationKind = Literal["model-step", "context-compaction", "tool-round"]
+RuntimePublicationKind = Literal[
+    "model-step",
+    "context-compaction",
+    "tool-round",
+    "approval-open",
+    "approval-close",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -3034,6 +3041,7 @@ class PendingActionRecord(BaseModel):
     input_id: str | None = None
     round_id: str | None = None
     tool_call_id: str | None = None
+    policy_evidence: ToolPolicyEvidence | None = None
     question: str | None = None
     options: list[str] = Field(default_factory=list)
     arguments: dict[str, Any] | None = None
@@ -10732,7 +10740,16 @@ def _validate_assistant_model_completion_publication(
         "environment_name",
         "task_id",
         "tool_calls",
+        "policy_state",
+        "policy_context_version",
+        "request_metadata",
+        "deferred_messages",
         "structured_output",
+        "thinking",
+        "max_steps",
+        "limits",
+        "budget_limits",
+        "retry_policy",
         "source_model_step_id",
         "source_transcript_cursor",
         "model_step",
@@ -10790,7 +10807,8 @@ def _validate_assistant_model_completion_publication(
         ):
             raise ValueError("The pending tool-round calls conflict with the assistant message.")
         if (
-            pending_call.policy_decision is not None
+            pending_call.policy_evidence != ToolPolicyEvidence.UNPLANNED
+            or pending_call.policy_decision is not None
             or pending_call.reason is not None
             or pending_call.metadata
             or pending_call.active_taint_labels
@@ -11791,6 +11809,7 @@ def _prepare_model_completion_stage_promotion(
         expected_statuses={
             stage.source_status,
             SessionStatus.INTERRUPTING,
+            SessionStatus.FAILED,
         },
         expected_run_epoch=expected_run_epoch,
         expected_transcript_cursor=stage.source_transcript_cursor,
@@ -11820,6 +11839,7 @@ def _replay_promoted_model_completion_stage(
         not in {
             stage.source_status,
             SessionStatus.INTERRUPTING,
+            SessionStatus.FAILED,
         }
         or receipt.transcript_start_cursor != stage.source_transcript_cursor
     ):

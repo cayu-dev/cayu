@@ -235,6 +235,8 @@ async def run_scenario(
     approval_resolution = ToolApprovalRequest(
         session_id=primary_id,
         approval_id=approval_id,
+        tool_round_id=approval_events[0].payload["tool_round_id"],
+        tool_call_id=approval_events[0].payload["tool_call_id"],
         decision=ToolApprovalDecision.APPROVE,
         metadata={
             "external_state_revalidated": state_revalidated,
@@ -255,6 +257,7 @@ async def run_scenario(
             ToolApprovalRecoveryRequest(
                 session_id=primary_id,
                 approval_id=approval_id,
+                tool_round_id=approval_events[0].payload["tool_round_id"],
                 tool_call_id=tool_call_id,
                 outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                 message=receipt.content,
@@ -289,6 +292,8 @@ async def run_scenario(
             ToolApprovalRequest(
                 session_id=stale_id,
                 approval_id=stale_approval["approval_id"],
+                tool_round_id=stale_approval["tool_round_id"],
+                tool_call_id=stale_approval["tool_call_id"],
                 decision=ToolApprovalDecision.APPROVE,
                 metadata={"external_state_version": state.version},
                 limits=advanced_run_limits(),

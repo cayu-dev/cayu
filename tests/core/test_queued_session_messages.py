@@ -644,6 +644,8 @@ def test_queued_message_waits_for_pending_tool_approval_resolution() -> None:
                 ToolApprovalRequest(
                     session_id="sess_approval_steering",
                     approval_id=approval_event.payload["approval"]["approval_id"],
+                    tool_round_id=approval_event.payload["tool_round_id"],
+                    tool_call_id=approval_event.payload["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
                 )
             )

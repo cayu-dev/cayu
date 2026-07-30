@@ -58,6 +58,9 @@ def _approval_checkpoint(
     *,
     arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    pending_call = _pending_call(tool_call_id, tool_name, arguments=arguments)
+    pending_call["policy_evidence"] = "authoritative"
+    pending_call["policy_decision"] = "require_approval"
     return {
         "pending_tool_approval": {
             "approval_id": approval_id,
@@ -66,7 +69,7 @@ def _approval_checkpoint(
             "tool_name": tool_name,
             "arguments": arguments or {},
             "agent_name": "assistant",
-            "tool_calls": [_pending_call(tool_call_id, tool_name, arguments=arguments)],
+            "tool_calls": [pending_call],
         }
     }
 
@@ -775,6 +778,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
     assert by_session["conformance_approval"].kind == PendingActionKind.TOOL_APPROVAL
     assert by_session["conformance_approval"].round_id == _TOOL_ROUND_ID
     assert by_session["conformance_approval"].tool_call_id == "conformance_approval_call"
+    assert by_session["conformance_approval"].policy_evidence == "authoritative"
     assert by_session["conformance_input"].kind == PendingActionKind.USER_INPUT
     assert by_session["conformance_input"].round_id == _TOOL_ROUND_ID
     assert by_session["conformance_input"].tool_call_id == "conformance_input_call"

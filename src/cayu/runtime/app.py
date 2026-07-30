@@ -109,6 +109,7 @@ from cayu.runtime._tool_round_executor import (
 )
 from cayu.runtime.approvals import (
     PendingToolApproval,
+    ToolApprovalDecision,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
     copy_tool_approval_recovery_request,
@@ -603,9 +604,6 @@ class CayuApp:
                 self._pending_session_interrupt_checkpoint_for_recovery
             ),
             abandoned_turn_completed=self._complete_abandoned_recovery_turn,
-            materialize_deferred_interaction_input=(
-                self.session_store.materialize_deferred_interaction_input
-            ),
             resume_interaction=self._resume_recovery_interaction,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
@@ -1683,6 +1681,9 @@ class CayuApp:
             tool_calls=request.tool_calls,
             completed_tool_outcomes=request.completed_tool_outcomes,
             pending_approval_to_clear=request.pending_approval_to_clear,
+            deferred_messages=request.deferred_messages,
+            requested_approval_decision=request.requested_approval_decision,
+            approval_resolution_request_digest=request.approval_resolution_request_digest,
         )
 
     def _interrupt_session_for_recovery(
@@ -1960,6 +1961,9 @@ class CayuApp:
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         pending_approval_to_clear: PendingToolApproval | None = None,
+        deferred_messages: list[Message] | None = None,
+        requested_approval_decision: ToolApprovalDecision | None = None,
+        approval_resolution_request_digest: str | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
@@ -1976,6 +1980,9 @@ class CayuApp:
             tool_calls=tool_calls,
             completed_tool_outcomes=completed_tool_outcomes,
             pending_approval_to_clear=pending_approval_to_clear,
+            deferred_messages=deferred_messages,
+            requested_approval_decision=requested_approval_decision,
+            approval_resolution_request_digest=approval_resolution_request_digest,
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,

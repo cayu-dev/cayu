@@ -402,7 +402,7 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
         )
         tool_calls = [_tool_call()]
         source_checkpoint = await store.load_checkpoint(session.id)
-        checkpoint, _pending_round = checkpoint_with_pending_tool_round(
+        checkpoint, pending_round = checkpoint_with_pending_tool_round(
             source_checkpoint,
             agent_name="assistant",
             environment_name=None,
@@ -412,6 +412,9 @@ def test_tool_round_runner_executes_tool_round_and_persists_results():
             structured_output=None,
             tool_round_identity=_tool_round_identity(),
         )
+        # A live pre-versioning checkpoint is upgraded when the newly evaluated
+        # policy plan is published; it must not fail as unrecoverable legacy state.
+        assert pending_round.policy_context_version is None
         await store.checkpoint(session.id, checkpoint)
         messages = await store.load_transcript(session.id)
         events = [

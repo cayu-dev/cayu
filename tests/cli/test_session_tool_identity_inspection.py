@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from cayu.cli.session import _tool_call_rows, _tool_inspection_record
 from cayu.core import Event, EventType, ToolResult
 from cayu.runtime import EventRecord
@@ -301,6 +303,298 @@ def test_tool_inspection_scopes_approval_state_to_gated_calls_in_mixed_round() -
     assert rows_by_call_id["call-1"]["approval_state"] == "approved"
     assert rows_by_call_id["call-allowed"]["status"] == "success"
     assert rows_by_call_id["call-allowed"]["approval_state"] == "none"
+
+
+def test_tool_inspection_projects_ambiguous_acknowledgement_as_blocked() -> None:
+    approval_id = "approval-1"
+    request = _approval_request(
+        approval_id=approval_id,
+        tool_calls=[
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "side_effect",
+                "arguments": {},
+                "policy_evidence": "ambiguous",
+                "policy_decision": None,
+            },
+            {
+                "tool_call_id": "call-sibling",
+                "tool_name": "sibling_tool",
+                "arguments": {},
+                "policy_evidence": "ambiguous",
+                "policy_decision": None,
+            },
+        ],
+    )
+    blocked = _record(
+        2,
+        EventType.TOOL_CALL_BLOCKED,
+        payload_extra={
+            "approval_id": approval_id,
+            "decision": "ambiguous",
+            "blocked_by": "policy_evaluation_ambiguous",
+            "requested_decision": "approve",
+        },
+        result=ToolResult(content="not executed", is_error=True),
+    )
+    sibling_blocked = _record(
+        3,
+        EventType.TOOL_CALL_BLOCKED,
+        payload_extra={
+            "approval_id": approval_id,
+            "tool_call_id": "call-sibling",
+            "decision": "ambiguous",
+            "blocked_by": "policy_evaluation_ambiguous",
+            "requested_decision": "approve",
+        },
+        result=ToolResult(content="not executed", is_error=True),
+        tool_name="sibling_tool",
+    )
+
+    rows = _tool_call_rows([request, blocked, sibling_blocked])
+
+    rows_by_call_id = {row["tool_call_id"]: row for row in rows}
+    gating = rows_by_call_id["call-1"]
+    assert gating["status"] == "blocked"
+    assert gating["approval_state"] == "blocked"
+    assert gating["completed_at"] == blocked.event.timestamp.isoformat()
+    sibling = rows_by_call_id["call-sibling"]
+    assert sibling["status"] == "blocked"
+    assert sibling["approval_state"] == "none"
+
+    bounded_rows = _tool_call_rows([blocked])
+    assert len(bounded_rows) == 1
+    assert bounded_rows[0]["status"] == "blocked"
+    assert bounded_rows[0]["approval_state"] == "none"
+
+
+def test_tool_inspection_rejects_malformed_ambiguous_resolution_marker() -> None:
+    request = _approval_request(
+        tool_calls=[
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "side_effect",
+                "arguments": {},
+                "policy_evidence": "ambiguous",
+                "policy_decision": None,
+            }
+        ]
+    )
+    malformed = _record(
+        2,
+        EventType.TOOL_CALL_BLOCKED,
+        payload_extra={
+            "approval_id": "approval-1",
+            "decision": "ambiguous",
+            "blocked_by": "different_boundary",
+            "requested_decision": "approve",
+        },
+        result=ToolResult(content="not executed", is_error=True),
+    )
+
+    rows = _tool_call_rows([request, malformed])
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "unavailable"
+    assert rows[0]["approval_state"] == "unavailable"
+
+
+def test_tool_inspection_accepts_unregistered_sibling_policy_evidence() -> None:
+    approval_id = "approval-1"
+    request = _approval_request(
+        approval_id=approval_id,
+        tool_calls=[
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "side_effect",
+                "arguments": {},
+                "policy_evidence": "authoritative",
+                "policy_decision": "require_approval",
+            },
+            {
+                "tool_call_id": "call-unregistered",
+                "tool_name": "missing_tool",
+                "arguments": {},
+                "policy_evidence": "unregistered",
+                "policy_decision": None,
+            },
+        ],
+    )
+    approved = _record(
+        2,
+        EventType.TOOL_CALL_APPROVED,
+        payload_extra={"approval_id": approval_id},
+    )
+    unregistered = _record(
+        3,
+        EventType.TOOL_CALL_FAILED,
+        payload_extra={
+            "approval_id": approval_id,
+            "tool_call_id": "call-unregistered",
+            "registration_state": "unregistered_at_policy_plan",
+        },
+        result=ToolResult(
+            content="Tool was not registered when the policy plan was recorded.",
+            structured={"registration_state": "unregistered_at_policy_plan"},
+            is_error=True,
+        ),
+        tool_name="missing_tool",
+    )
+
+    rows = _tool_call_rows([request, approved, unregistered])
+
+    rows_by_call_id = {row["tool_call_id"]: row for row in rows}
+    missing = rows_by_call_id["call-unregistered"]
+    assert missing["status"] == "error"
+    assert missing["approval_state"] == "none"
+    assert missing["completed_at"] == unregistered.event.timestamp.isoformat()
+    assert rows_by_call_id["call-1"]["approval_state"] == "approved"
+
+    denied_gate = _record(
+        4,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        payload_extra={
+            "approval_id": approval_id,
+            "approval_required": True,
+        },
+        result=ToolResult(content="denied", is_error=True),
+    )
+    denied_unregistered = _record(
+        5,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        payload_extra={
+            "approval_id": approval_id,
+            "tool_call_id": "call-unregistered",
+            "approval_required": False,
+        },
+        result=ToolResult(content="not executed", is_error=True),
+        tool_name="missing_tool",
+    )
+
+    denied_rows = _tool_call_rows([request, denied_gate, denied_unregistered])
+
+    denied_by_call_id = {row["tool_call_id"]: row for row in denied_rows}
+    missing = denied_by_call_id["call-unregistered"]
+    assert missing["status"] == "denied"
+    assert missing["approval_state"] == "none"
+    assert missing["completed_at"] == denied_unregistered.event.timestamp.isoformat()
+    assert denied_by_call_id["call-1"]["approval_state"] == "denied"
+
+
+@pytest.mark.parametrize("reverse_events", [False, True], ids=["gate-first", "sibling-first"])
+def test_tool_inspection_accepts_denied_ambiguous_sibling(
+    reverse_events: bool,
+) -> None:
+    approval_id = "approval-ambiguous"
+    request = _approval_request(
+        approval_id=approval_id,
+        tool_calls=[
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "side_effect",
+                "arguments": {},
+                "policy_evidence": "ambiguous",
+                "policy_decision": None,
+            },
+            {
+                "tool_call_id": "call-sibling",
+                "tool_name": "sibling_effect",
+                "arguments": {},
+                "policy_evidence": "ambiguous",
+                "policy_decision": None,
+            },
+        ],
+    )
+    gate_denial = _record(
+        2,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        payload_extra={
+            "approval_id": approval_id,
+            "approval_required": True,
+        },
+        result=ToolResult(content="denied", is_error=True),
+    )
+    sibling_denial = _record(
+        3,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        payload_extra={
+            "approval_id": approval_id,
+            "tool_call_id": "call-sibling",
+            "approval_required": False,
+        },
+        result=ToolResult(content="not executed", is_error=True),
+        tool_name="sibling_effect",
+    )
+    decisions = [gate_denial, sibling_denial]
+    if reverse_events:
+        decisions.reverse()
+
+    rows = _tool_call_rows([request, *decisions])
+
+    rows_by_call_id = {row["tool_call_id"]: row for row in rows}
+    assert rows_by_call_id["call-1"]["status"] == "denied"
+    assert rows_by_call_id["call-1"]["approval_state"] == "denied"
+    sibling = rows_by_call_id["call-sibling"]
+    assert sibling["status"] == "denied"
+    assert sibling["approval_state"] == "none"
+    assert sibling["completed_at"] == sibling_denial.event.timestamp.isoformat()
+
+
+def test_tool_inspection_rejects_executed_unregistered_sibling_in_any_event_order() -> None:
+    approval_id = "approval-1"
+    request = _approval_request(
+        approval_id=approval_id,
+        tool_calls=[
+            {
+                "tool_call_id": "call-1",
+                "tool_name": "side_effect",
+                "arguments": {},
+                "policy_evidence": "authoritative",
+                "policy_decision": "require_approval",
+            },
+            {
+                "tool_call_id": "call-unregistered",
+                "tool_name": "missing_tool",
+                "arguments": {},
+                "policy_evidence": "unregistered",
+                "policy_decision": None,
+            },
+        ],
+    )
+    approved = _record(
+        2,
+        EventType.TOOL_CALL_APPROVED,
+        payload_extra={"approval_id": approval_id},
+    )
+    started = _record(
+        3,
+        EventType.TOOL_CALL_STARTED,
+        payload_extra={
+            "approval_id": approval_id,
+            "tool_call_id": "call-unregistered",
+        },
+        tool_name="missing_tool",
+    )
+    completed = _record(
+        4,
+        EventType.TOOL_CALL_COMPLETED,
+        payload_extra={
+            "approval_id": approval_id,
+            "tool_call_id": "call-unregistered",
+        },
+        result=ToolResult(content="must not execute"),
+        tool_name="missing_tool",
+    )
+
+    for records in (
+        [request, approved, started, completed],
+        [completed, started, approved, request],
+    ):
+        rows = _tool_call_rows(records)
+        row = next(item for item in rows if item["tool_call_id"] == "call-unregistered")
+        assert row["status"] == "unavailable"
+        assert row["approval_state"] == "unavailable"
+        assert row["completed_at"] is None
 
 
 def test_tool_inspection_scopes_denial_state_to_gated_calls_in_mixed_round() -> None:

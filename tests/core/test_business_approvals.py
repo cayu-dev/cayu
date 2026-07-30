@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -14,6 +15,7 @@ from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     BusinessApprovalOutcome,
+    BusinessApprovalResolutionState,
     BusinessApprovalRouting,
     BusinessApprovalRoutingMissing,
     BusinessApprovalTierMismatch,
@@ -42,6 +44,7 @@ from cayu.runtime import (
     Session,
     SessionStatus,
 )
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 CHAIN = ("area", "national", "corporate")
 
@@ -88,7 +91,11 @@ def _policy_request(tool_name: str = "route_package") -> ToolPolicyRequest:
 
 
 def _paused_app(
-    policy, session_id: str, clock=None
+    policy,
+    session_id: str,
+    clock=None,
+    *,
+    secret_redactor: SecretRedactor | None = None,
 ) -> tuple[CayuApp, InMemorySessionStore, RecordingTool, Event]:
     """Run one session until it pauses on approval; return the pause event."""
     store = InMemorySessionStore()
@@ -107,7 +114,7 @@ def _paused_app(
         ]
     )
     tool = RecordingTool()
-    app = CayuApp(session_store=store, clock=clock)
+    app = CayuApp(session_store=store, clock=clock, secret_redactor=secret_redactor)
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="router", model="fake-model"),
@@ -240,6 +247,46 @@ def test_approved_outcome_stamps_resolution_metadata() -> None:
         _resolve(app, "sess_biz_approved", approval_event, condition_text="n/a")
 
 
+def test_oversized_resolution_metadata_preserves_business_audit_stamp() -> None:
+    secret = "business-approval-audit-secret"
+    app, store, _tool, approval_event = _paused_app(
+        _tiered_policy(),
+        "sess_biz_bounded_audit",
+        secret_redactor=SecretRedactor(secret),
+    )
+    events = _resolve(
+        app,
+        "sess_biz_bounded_audit",
+        approval_event,
+        metadata={
+            "credential": secret,
+            "large": "x" * 20_000,
+        },
+    )
+
+    approved = next(event for event in events if event.type == EventType.TOOL_CALL_APPROVED)
+    assert approved.payload["metadata_truncated"] is True
+    serialized_metadata = json.dumps(
+        approved.payload["metadata"],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert len(serialized_metadata.encode("utf-8")) <= 12 * 1024
+    assert secret not in serialized_metadata
+    assert REDACTED_SECRET in serialized_metadata
+    stamp = approved.payload["metadata"][BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY]
+    assert stamp["kind"] == "cayu.business_approval.v1"
+    assert stamp["outcome"] == "approved"
+    assert stamp["approver_id"] == "u_42"
+    assert stamp["approver_tier"] == "national"
+
+    records = business_approval_audit(asyncio.run(store.load_events("sess_biz_bounded_audit")))
+    assert len(records) == 1
+    assert records[0].outcome is BusinessApprovalOutcome.APPROVED
+    assert records[0].resolved_via_adapter
+    assert records[0].approver_id == "u_42"
+
+
 def test_conditioned_outcome_requires_text_and_reaches_the_tool() -> None:
     app, _store, tool, approval_event = _paused_app(_tiered_policy(), "sess_biz_conditioned")
 
@@ -313,6 +360,8 @@ def test_missing_routing_refuses_loudly() -> None:
                 ToolApprovalRequest(
                     session_id="sess_biz_unrouted",
                     approval_id=pending.approval_id,
+                    tool_round_id=pending.tool_round_id,
+                    tool_call_id=pending.tool_call_id,
                     decision=ToolApprovalDecision.APPROVE,
                 )
             )
@@ -348,6 +397,7 @@ def test_audit_projects_pending_adapter_and_raw_resolutions() -> None:
     assert len(pending_records) == 1
     record = pending_records[0]
     assert record.pending and not record.resolved_via_adapter
+    assert record.resolution_state is BusinessApprovalResolutionState.PENDING
     assert record.routing is not None and record.routing.required_tier == "national"
     assert record.tool_name == "route_package"
     assert record.requested_at is not None and record.resolved_at is None
@@ -370,6 +420,7 @@ def test_audit_projects_pending_adapter_and_raw_resolutions() -> None:
     assert len(adapter_records) == 1
     record = adapter_records[0]
     assert record.decision is ToolApprovalDecision.APPROVE
+    assert record.resolution_state is BusinessApprovalResolutionState.APPROVED
     assert record.outcome is BusinessApprovalOutcome.CONDITIONED
     assert record.condition_text == "Cap at 500 USD."
     assert record.approver_id == "u_42"
@@ -386,6 +437,8 @@ def test_audit_projects_pending_adapter_and_raw_resolutions() -> None:
             ToolApprovalRequest(
                 session_id="sess_audit_raw",
                 approval_id=pending.approval_id,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=pending.tool_call_id,
                 decision=ToolApprovalDecision.APPROVE,
             )
         ):
@@ -396,7 +449,346 @@ def test_audit_projects_pending_adapter_and_raw_resolutions() -> None:
     assert len(raw_records) == 1
     record = raw_records[0]
     assert record.decision is ToolApprovalDecision.APPROVE
+    assert record.resolution_state is BusinessApprovalResolutionState.APPROVED
     assert record.outcome is None and not record.resolved_via_adapter
+
+
+def test_audit_projects_exact_ambiguous_acknowledgement_as_blocked() -> None:
+    _app, _store, _tool, original_request = _paused_app(
+        _tiered_policy(),
+        "sess_audit_ambiguous_block",
+    )
+    payload = dict(original_request.payload)
+    approval = dict(payload["approval"])
+    pending_calls = [dict(call) for call in approval["tool_calls"]]
+    pending_calls[0].update(
+        policy_evidence="ambiguous",
+        policy_decision=None,
+        reason=None,
+        metadata={},
+    )
+    approval.update(reason=None, metadata={}, tool_calls=pending_calls)
+    payload["approval"] = approval
+    request = original_request.model_copy(update={"payload": payload}, deep=True)
+    pending = PendingToolApproval.from_event(request)
+    blocked = Event(
+        type=EventType.TOOL_CALL_BLOCKED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            "model_step_id": pending.model_step_id,
+            "model_attempt_id": pending.model_attempt_id,
+            "tool_round_id": pending.tool_round_id,
+            "approval_id": pending.approval_id,
+            "tool_call_id": pending.tool_call_id,
+            "decision": "ambiguous",
+            "blocked_by": "policy_evaluation_ambiguous",
+            "requested_decision": ToolApprovalDecision.APPROVE.value,
+            "resolution_reason": "Continue without executing this call.",
+            "metadata": {
+                BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY: {
+                    "kind": "cayu.business_approval.v1",
+                    "outcome": BusinessApprovalOutcome.CONDITIONED.value,
+                    "condition_text": "Continue without the side effect.",
+                    "approver_id": "operator-7",
+                    "approver_tier": "national",
+                }
+            },
+            "resolved_by": {
+                "subject": "operator-7",
+                "tenant": "tenant-1",
+                "source": ResolutionActorSource.REQUEST.value,
+            },
+        },
+    )
+
+    records = business_approval_audit([blocked, request])
+
+    assert len(records) == 1
+    record = records[0]
+    assert record.resolution_state is BusinessApprovalResolutionState.BLOCKED
+    assert record.decision is None
+    assert not record.pending
+    assert record.resolved_at == blocked.timestamp
+    assert record.reason == "Continue without executing this call."
+    assert record.outcome is BusinessApprovalOutcome.CONDITIONED
+    assert record.condition_text == "Continue without the side effect."
+    assert record.approver_id == "operator-7"
+    assert record.resolved_by == ResolutionActor(
+        subject="operator-7",
+        tenant="tenant-1",
+        source=ResolutionActorSource.REQUEST,
+    )
+    conflicting = blocked.model_copy(
+        update={
+            "id": "conflicting-ambiguous-resolution",
+            "payload": {
+                **blocked.payload,
+                "blocked_by": "different_boundary",
+            },
+        },
+        deep=True,
+    )
+    assert business_approval_audit([request, blocked, conflicting]) == []
+
+
+def test_audit_rejects_malformed_ambiguous_block() -> None:
+    _app, _store, _tool, request = _paused_app(
+        _tiered_policy(),
+        "sess_audit_invalid_ambiguous_block",
+    )
+    pending = PendingToolApproval.from_event(request)
+    generic_block = Event(
+        type=EventType.TOOL_CALL_BLOCKED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            "model_step_id": pending.model_step_id,
+            "model_attempt_id": pending.model_attempt_id,
+            "tool_round_id": pending.tool_round_id,
+            "approval_id": pending.approval_id,
+            "tool_call_id": pending.tool_call_id,
+            "decision": "ambiguous",
+            "blocked_by": "different_boundary",
+            "requested_decision": ToolApprovalDecision.APPROVE.value,
+        },
+    )
+
+    records = business_approval_audit([request, generic_block])
+
+    assert records == []
+
+
+def test_audit_ignores_ambiguous_sibling_blocks_in_any_event_order() -> None:
+    _app, _store, _tool, original_request = _paused_app(
+        _tiered_policy(),
+        "sess_audit_ambiguous_siblings",
+    )
+    payload = dict(original_request.payload)
+    approval = dict(payload["approval"])
+    first_call = {
+        **approval["tool_calls"][0],
+        "policy_evidence": "ambiguous",
+        "policy_decision": None,
+        "reason": None,
+        "metadata": {},
+    }
+    sibling_call = {
+        **first_call,
+        "tool_call_id": "call_2",
+    }
+    approval.update(
+        reason=None,
+        metadata={},
+        tool_calls=[first_call, sibling_call],
+    )
+    payload["approval"] = approval
+    request = original_request.model_copy(update={"payload": payload}, deep=True)
+    pending = PendingToolApproval.from_event(request)
+
+    def blocked(call_id: str, *, event_id: str) -> Event:
+        return Event(
+            id=event_id,
+            type=EventType.TOOL_CALL_BLOCKED,
+            session_id=request.session_id,
+            agent_name=pending.agent_name,
+            environment_name=pending.environment_name,
+            tool_name=pending.tool_name,
+            payload={
+                "model_step_id": pending.model_step_id,
+                "model_attempt_id": pending.model_attempt_id,
+                "tool_round_id": pending.tool_round_id,
+                "approval_id": pending.approval_id,
+                "tool_call_id": call_id,
+                "decision": "ambiguous",
+                "blocked_by": "policy_evaluation_ambiguous",
+                "requested_decision": ToolApprovalDecision.APPROVE.value,
+                "resolution_reason": "Continue safely.",
+                "metadata": {},
+                "resolved_by": None,
+            },
+        )
+
+    gating_block = blocked(pending.tool_call_id, event_id="ambiguous-gate")
+    sibling_block = blocked("call_2", event_id="ambiguous-sibling")
+
+    for events in (
+        [request, gating_block, sibling_block],
+        [sibling_block, gating_block, request],
+    ):
+        records = business_approval_audit(events)
+        assert len(records) == 1
+        assert records[0].resolution_state is BusinessApprovalResolutionState.BLOCKED
+        assert records[0].decision is None
+        assert not records[0].pending
+
+    conflicting_sibling = sibling_block.model_copy(
+        update={
+            "id": "conflicting-ambiguous-sibling",
+            "payload": {
+                **sibling_block.payload,
+                "resolution_reason": "Different operator context.",
+            },
+        },
+        deep=True,
+    )
+    assert business_approval_audit([request, gating_block, conflicting_sibling]) == []
+
+    common_denial_payload = {
+        "model_step_id": pending.model_step_id,
+        "model_attempt_id": pending.model_attempt_id,
+        "tool_round_id": pending.tool_round_id,
+        "approval_id": pending.approval_id,
+        "reason": "Denied.",
+        "metadata": {},
+        "resolved_by": None,
+    }
+    gating_denial = Event(
+        id="ambiguous-gate-denied",
+        type=EventType.TOOL_CALL_APPROVAL_DENIED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            **common_denial_payload,
+            "tool_call_id": pending.tool_call_id,
+            "expired": False,
+        },
+    )
+    conflicting_expiry = Event(
+        id="ambiguous-sibling-expiry-conflict",
+        type=EventType.TOOL_CALL_APPROVAL_DENIED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            **common_denial_payload,
+            "tool_call_id": "call_2",
+            "expired": True,
+        },
+    )
+    assert business_approval_audit([request, gating_denial, conflicting_expiry]) == []
+    assert business_approval_audit([conflicting_expiry, gating_denial, request]) == []
+
+
+def test_audit_ignores_ambiguous_sibling_of_authoritative_gate_in_any_event_order() -> None:
+    _app, _store, _tool, original_request = _paused_app(
+        _tiered_policy(),
+        "sess_audit_mixed_ambiguous_sibling",
+    )
+    payload = dict(original_request.payload)
+    approval = dict(payload["approval"])
+    authoritative_call = dict(approval["tool_calls"][0])
+    ambiguous_sibling = {
+        **authoritative_call,
+        "tool_call_id": "call_2",
+        "policy_evidence": "ambiguous",
+        "policy_decision": None,
+        "reason": None,
+        "metadata": {},
+    }
+    approval["tool_calls"] = [authoritative_call, ambiguous_sibling]
+    payload["approval"] = approval
+    request = original_request.model_copy(update={"payload": payload}, deep=True)
+    pending = PendingToolApproval.from_event(request)
+    identity_payload = {
+        "model_step_id": pending.model_step_id,
+        "model_attempt_id": pending.model_attempt_id,
+        "tool_round_id": pending.tool_round_id,
+        "approval_id": pending.approval_id,
+    }
+    approved = Event(
+        id="authoritative-gate-approved",
+        type=EventType.TOOL_CALL_APPROVED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            **identity_payload,
+            "tool_call_id": pending.tool_call_id,
+            "reason": "Approved.",
+            "metadata": {},
+            "resolved_by": None,
+        },
+    )
+    sibling_block = Event(
+        id="mixed-ambiguous-sibling",
+        type=EventType.TOOL_CALL_BLOCKED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            **identity_payload,
+            "tool_call_id": "call_2",
+            "decision": "ambiguous",
+            "blocked_by": "policy_evaluation_ambiguous",
+            "requested_decision": ToolApprovalDecision.APPROVE.value,
+            "resolution_reason": "Approved.",
+            "metadata": {},
+            "resolved_by": None,
+        },
+    )
+
+    for events in (
+        [request, approved, sibling_block],
+        [sibling_block, approved, request],
+    ):
+        records = business_approval_audit(events)
+        assert len(records) == 1
+        assert records[0].resolution_state is BusinessApprovalResolutionState.APPROVED
+        assert records[0].decision is ToolApprovalDecision.APPROVE
+        assert not records[0].pending
+
+    conflicting_decision = Event(
+        id="mixed-ambiguous-sibling-denied",
+        type=EventType.TOOL_CALL_APPROVAL_DENIED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            **identity_payload,
+            "tool_call_id": "call_2",
+            "reason": "Approved.",
+            "metadata": {},
+            "resolved_by": None,
+            "expired": False,
+        },
+    )
+    assert business_approval_audit([request, approved, conflicting_decision]) == []
+    assert business_approval_audit([conflicting_decision, approved, request]) == []
+
+    conflicting_sibling_approval = Event(
+        id="mixed-ambiguous-sibling-approved",
+        type=EventType.TOOL_CALL_APPROVED,
+        session_id=request.session_id,
+        agent_name=pending.agent_name,
+        environment_name=pending.environment_name,
+        tool_name=pending.tool_name,
+        payload={
+            **identity_payload,
+            "tool_call_id": "call_2",
+            "reason": "Approved.",
+            "metadata": {},
+            "resolved_by": None,
+        },
+    )
+    assert (
+        business_approval_audit([request, approved, sibling_block, conflicting_sibling_approval])
+        == []
+    )
+    assert (
+        business_approval_audit([conflicting_sibling_approval, sibling_block, approved, request])
+        == []
+    )
 
 
 def test_audit_is_order_insensitive_and_pairs_per_session() -> None:
@@ -539,11 +931,16 @@ def test_lost_resolution_race_surfaces_the_primitives_error() -> None:
             ToolApprovalRequest(
                 session_id=session_id,
                 approval_id=pending.approval_id,
+                tool_round_id=pending.tool_round_id,
+                tool_call_id=pending.tool_call_id,
                 decision=ToolApprovalDecision.APPROVE,
             )
         ):
             pass
-        with pytest.raises(RuntimeError, match="no pending tool approval"):
+        with pytest.raises(
+            RuntimeError,
+            match="already closed with a conflicting identity or decision",
+        ):
             async for _event in stale:
                 pass
 

@@ -42,6 +42,7 @@ from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import (
     Message,
     MessageRole,
+    detach_message,
 )
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
@@ -54,6 +55,7 @@ from cayu.providers import (
     UsageDialect,
     copy_usage_dialect,
 )
+from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
@@ -154,6 +156,7 @@ from cayu.runtime._workflow_structured_output_handoff import (
 )
 from cayu.runtime.approvals import (
     PendingToolApproval,
+    ToolApprovalDecision,
     resolution_actor_payload,
 )
 from cayu.runtime.budgets import (
@@ -285,6 +288,7 @@ from cayu.runtime.sessions import (
     copy_resume_request,
     copy_run_request,
     runtime_publication_checkpoint_mutation,
+    runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -1518,6 +1522,7 @@ def _limit_reached_tool_call_event(
     tool_call_outcome: runtime_records.ToolCallOutcome,
     decision: StopDecision,
     tool_round_identity: ToolRoundIdentity,
+    approval_id: str | None = None,
 ) -> Event:
     identity = copy_tool_round_identity(tool_round_identity)
     payload = {
@@ -1526,12 +1531,15 @@ def _limit_reached_tool_call_event(
             session_id=session.id,
             tool_round_id=identity.tool_round_id,
             tool_call_id=tool_call_outcome.call.id,
+            approval_id=approval_id,
         ),
         "reason": "limit_reached",
         "limit": decision.limit.value,
         "result": tool_call_outcome.result.model_dump(),
         **identity.payload(),
     }
+    if approval_id is not None:
+        payload["approval_id"] = approval_id
     return Event(
         type=EventType.TOOL_CALL_FAILED,
         session_id=session.id,
@@ -6990,18 +6998,65 @@ class SessionEngine:
             raise
         except Exception as exc:
             try:
+                keep_recovery_interaction_open = False
                 if continuing_recovery_boundary:
-                    await self.session_store.materialize_deferred_interaction_input(session.id)
-                (
-                    session,
-                    interaction_failed_event,
-                    _,
-                ) = await self._publish_interaction_transition(
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=_environment_name(registered_environment),
-                    to_status=SessionStatus.FAILED,
-                )
+                    materialization_is_safe = False
+                    try:
+                        active_model_stage = (
+                            await self.session_store.load_active_model_completion_stage(session.id)
+                        )
+                        if active_model_stage is not None:
+                            keep_recovery_interaction_open = True
+                        else:
+                            failure_checkpoint = await self.session_store.load_checkpoint(
+                                session.id
+                            )
+                            pending_failure_round = (
+                                tool_round_recovery.pending_tool_round_from_checkpoint(
+                                    failure_checkpoint,
+                                    redactor=self._secret_redactor,
+                                    consume_on_rejection=True,
+                                )
+                            )
+                            materialization_is_safe = pending_failure_round is None
+                            keep_recovery_interaction_open = pending_failure_round is not None
+                    except Exception as inspection_error:
+                        keep_recovery_interaction_open = True
+                        exc.add_note(
+                            "Deferred resume input remained private because recovery-state "
+                            "inspection failed: "
+                            f"{type(inspection_error).__name__}: {inspection_error}"
+                        )
+                    if materialization_is_safe:
+                        try:
+                            await self.session_store.materialize_deferred_interaction_input(
+                                session.id
+                            )
+                        except Exception as materialization_error:
+                            keep_recovery_interaction_open = True
+                            exc.add_note(
+                                "Deferred resume input remained private because materialization "
+                                "failed: "
+                                f"{type(materialization_error).__name__}: "
+                                f"{materialization_error}"
+                            )
+                if keep_recovery_interaction_open:
+                    session = await self.session_store.update_status(
+                        session.id,
+                        SessionStatus.FAILED,
+                    )
+                    interaction_failed_event = None
+                else:
+                    (
+                        session,
+                        interaction_failed_event,
+                        _,
+                    ) = await self._publish_interaction_transition(
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=_environment_name(registered_environment),
+                        to_status=SessionStatus.FAILED,
+                    )
                 if interaction_failed_event is not None:
                     yield interaction_failed_event
                 yield await self._event_writer.emit(
@@ -7216,6 +7271,18 @@ class SessionEngine:
                     "resolve_user_input(...) first."
                 )
             if (
+                approval_support.pending_approval_from_checkpoint(
+                    source_checkpoint,
+                    redactor=self._secret_redactor,
+                    consume_on_rejection=True,
+                )
+                is not None
+            ):
+                raise RuntimeError(
+                    "Session awaiting tool approval cannot be forked; resolve it with "
+                    "resolve_tool_approval(...) first."
+                )
+            if (
                 tool_round_recovery.pending_tool_round_from_checkpoint(
                     source_checkpoint,
                     redactor=self._secret_redactor,
@@ -7360,7 +7427,13 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
         task_id: str | None,
+        request_metadata: dict[str, Any],
         structured_output: StructuredOutputSpec | None,
+        thinking: ThinkingConfig | None,
+        max_steps: int,
+        limits: RunLimits,
+        budget_limits: tuple[BudgetLimit, ...],
+        retry_policy: RetryPolicy,
         structured_output_attempt: int | None,
     ) -> ModelCompletionPublicationResult:
         """Commit one staged model completion and its next durable action atomically."""
@@ -7401,7 +7474,14 @@ class SessionEngine:
                     task_id=task_id,
                     tool_calls=tool_calls,
                     policy_outcomes=None,
+                    policy_context_version=1,
+                    request_metadata=request_metadata,
                     structured_output=structured_output,
+                    thinking=thinking,
+                    max_steps=max_steps,
+                    limits=limits,
+                    budget_limits=budget_limits,
+                    retry_policy=retry_policy,
                     tool_round_identity=tool_round_identity,
                     redactor=tool_redactor,
                     source_model_step_id=tool_round_identity.model_step_id,
@@ -7915,7 +7995,13 @@ class SessionEngine:
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
                     task_id=task_id,
+                    request_metadata=request_metadata,
                     structured_output=structured_output,
+                    thinking=effective_thinking,
+                    max_steps=max_steps,
+                    limits=limits,
+                    budget_limits=budget_limits,
+                    retry_policy=retry_policy,
                     structured_output_attempt=(
                         structured_output_retries + 1
                         if (
@@ -8719,7 +8805,10 @@ class SessionEngine:
                         "model_step_id": exc.approval.model_step_id,
                         "model_attempt_id": exc.approval.model_attempt_id,
                         "tool_round_id": exc.approval.tool_round_id,
-                        "approval": exc.approval.model_dump(mode="json"),
+                        **approval_support.bounded_pending_approval_event_payload(
+                            exc.approval,
+                            redactor=self._secret_redactor,
+                        ),
                     },
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
@@ -9398,6 +9487,9 @@ class SessionEngine:
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         pending_approval_to_clear: PendingToolApproval | None = None,
+        deferred_messages: list[Message] | None = None,
+        requested_approval_decision: ToolApprovalDecision | None = None,
+        approval_resolution_request_digest: str | None = None,
         tool_round_identity: ToolRoundIdentity | None = None,
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
@@ -9433,6 +9525,9 @@ class SessionEngine:
                 completed_tool_outcomes=completed_tool_outcomes,
                 decision=decision,
                 pending_approval_to_clear=pending_approval_to_clear,
+                deferred_messages=deferred_messages,
+                requested_approval_decision=requested_approval_decision,
+                approval_resolution_request_digest=approval_resolution_request_digest,
                 tool_round_identity=tool_round_identity,
             ):
                 yield event
@@ -9636,6 +9731,9 @@ class SessionEngine:
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         decision: StopDecision,
         pending_approval_to_clear: PendingToolApproval | None = None,
+        deferred_messages: list[Message] | None = None,
+        requested_approval_decision: ToolApprovalDecision | None = None,
+        approval_resolution_request_digest: str | None = None,
         tool_round_identity: ToolRoundIdentity | None = None,
     ) -> AsyncGenerator[Event, None]:
         if tool_round_identity is None and pending_approval_to_clear is not None:
@@ -9647,6 +9745,19 @@ class SessionEngine:
         if tool_round_identity is None:
             raise RuntimeError("Closing a tool round requires its durable identity.")
         if pending_approval_to_clear is not None:
+            if (
+                type(requested_approval_decision) is not ToolApprovalDecision
+                or type(approval_resolution_request_digest) is not str
+                or not approval_resolution_request_digest
+            ):
+                raise RuntimeError(
+                    "Closing a limited approval requires its original resolution request identity."
+                )
+            deferred_messages = (
+                []
+                if deferred_messages is None
+                else [detach_message(message) for message in deferred_messages]
+            )
             expected_tool_calls = [
                 *tool_calls,
                 *(outcome.call for outcome in completed_tool_outcomes),
@@ -9657,14 +9768,26 @@ class SessionEngine:
                 expected_tool_calls,
                 tool_round_identity=tool_round_identity,
             ):
-                cleared_checkpoint = await approval_support.checkpoint_without_pending_approval(
-                    self.session_store,
-                    session.id,
-                )
+
+                def clear_exact_approval_round(
+                    _current_session: Session,
+                    checkpoint: dict[str, Any] | None,
+                ) -> dict[str, Any]:
+                    return approval_support.checkpoint_without_exact_pending_approval_round(
+                        checkpoint,
+                        approval=pending_approval_to_clear,
+                        redactor=self._secret_redactor,
+                    )
+
                 await self.session_store.transform_checkpoint(
                     session.id,
-                    _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
+                    clear_exact_approval_round,
                 )
+                materialized = await self._recovery_coordinator.materialize_expected_deferred_input(
+                    session.id,
+                    deferred_messages,
+                )
+                messages[:] = materialized.messages
                 yield await self._event_writer.emit(
                     approval_support.cleared_event(
                         session=session,
@@ -9673,6 +9796,8 @@ class SessionEngine:
                         approval=pending_approval_to_clear,
                     )
                 )
+                if materialized.cancellation is not None:
+                    raise materialized.cancellation
                 return
             async for event in self._close_limited_approval_tool_round(
                 session=session,
@@ -9683,6 +9808,9 @@ class SessionEngine:
                 completed_tool_outcomes=completed_tool_outcomes,
                 decision=decision,
                 pending_approval_to_clear=pending_approval_to_clear,
+                deferred_messages=deferred_messages,
+                requested_approval_decision=requested_approval_decision,
+                approval_resolution_request_digest=approval_resolution_request_digest,
                 tool_round_identity=tool_round_identity,
             ):
                 yield event
@@ -9697,6 +9825,8 @@ class SessionEngine:
             )
             is not None
         ):
+            await self._recovery_coordinator.materialize_deferred_input_if_present(session.id)
+            messages[:] = await self.session_store.load_transcript(session.id)
             return
 
         completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
@@ -9740,6 +9870,7 @@ class SessionEngine:
             [call.tool_call_id for call in pending_round.tool_calls],
             tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
         )
+        durable_transcript = await self.session_store.load_transcript(session.id)
         prepared = tool_round_publication.prepare_tool_round_publication(
             session_id=session.id,
             pending_round=pending_round,
@@ -9750,14 +9881,20 @@ class SessionEngine:
                 SessionStatus.INTERRUPTING,
             },
             expected_run_epoch=session.run_epoch,
-            expected_transcript_cursor=len(messages),
+            expected_transcript_cursor=len(durable_transcript),
         )
         cancellation = await tool_round_publication.publish_tool_round_with_exact_replay(
             prepared,
             session_store=self.session_store,
             event_writer=self._event_writer,
         )
-        messages.extend(prepared.request.transcript_messages)
+        materialized = await self._recovery_coordinator.materialize_expected_deferred_input(
+            session.id,
+            pending_round.deferred_messages,
+            cancellation=cancellation,
+        )
+        messages[:] = materialized.messages
+        cancellation = materialized.cancellation
         if cancellation is not None:
             raise cancellation
         await self._session_control.raise_if_interrupted(session.id)
@@ -9773,6 +9910,9 @@ class SessionEngine:
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome],
         decision: StopDecision,
         pending_approval_to_clear: PendingToolApproval,
+        deferred_messages: list[Message],
+        requested_approval_decision: ToolApprovalDecision,
+        approval_resolution_request_digest: str,
         tool_round_identity: ToolRoundIdentity,
     ) -> AsyncGenerator[Event, None]:
         completed_ids = {outcome.call.id for outcome in completed_tool_outcomes}
@@ -9801,32 +9941,95 @@ class SessionEngine:
                     tool_call_outcome=skipped_outcome,
                     decision=decision,
                     tool_round_identity=tool_round_identity,
+                    approval_id=pending_approval_to_clear.approval_id,
                 )
             )
+        source_checkpoint = await self.session_store.load_checkpoint(session.id)
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            source_checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        if (
+            pending_round is None
+            or pending_round.tool_round_id != tool_round_identity.tool_round_id
+        ):
+            raise RuntimeError("Pending approval round changed before limit closure.")
+        lifecycle_events = await self.session_store.load_tool_round_lifecycle_events_for_round(
+            session.id,
+            [call.tool_call_id for call in pending_round.tool_calls],
+            tool_round_identity=tool_round_identity,
+        )
         tool_result_messages = ordered_tool_result_messages(
             tool_calls,
             [*completed_tool_outcomes, *skipped_outcomes],
             parallel=True,
             tool_round_identity=tool_round_identity,
         )
-        messages.extend(tool_result_messages)
-        cleared_checkpoint = await approval_support.checkpoint_without_pending_approval(
-            self.session_store,
+        transcript_messages = list(tool_result_messages)
+        target_checkpoint = approval_support.checkpoint_without_exact_pending_approval_round(
+            source_checkpoint,
+            approval=pending_approval_to_clear,
+            redactor=self._secret_redactor,
+        )
+        clear_event = approval_support.cleared_event(
+            session=session,
+            agent_name=registered_agent.spec.name,
+            environment_name=_environment_name(registered_environment),
+            approval=pending_approval_to_clear,
+        )
+        prepared_close = approval_publication.prepare_approval_publication(
+            session_id=session.id,
+            publication_id=f"approval-close:{pending_approval_to_clear.approval_id}",
+            kind="approval-close",
+            intent={
+                "schema_version": 1,
+                "approval_id": pending_approval_to_clear.approval_id,
+                "tool_call_id": pending_approval_to_clear.tool_call_id,
+                **tool_round_identity.payload(),
+                "decision": "limit_reached",
+                "requested_decision": requested_approval_decision.value,
+                "resolution_request_digest": approval_resolution_request_digest,
+                "tool_call_ids": [call.tool_call_id for call in pending_round.tool_calls],
+                "approval_digest": runtime_publication_checkpoint_value_digest(
+                    pending_approval_to_clear.model_dump(mode="json")
+                ),
+                "pending_round_digest": runtime_publication_checkpoint_value_digest(
+                    pending_round.model_dump(mode="json")
+                ),
+                "event_ids": [clear_event.id],
+                "referenced_event_ids": [event.id for event in lifecycle_events],
+            },
+            source_checkpoint=source_checkpoint,
+            target_checkpoint=target_checkpoint,
+            transcript_messages=transcript_messages,
+            events=[clear_event],
+            referenced_events=lifecycle_events,
+            expected_statuses={SessionStatus.RUNNING},
+            expected_run_epoch=session.run_epoch,
+            expected_transcript_cursor=len(messages),
+        )
+        prepared_events = prepared_close.request.events
+        if len(prepared_events) != 1:
+            raise AssertionError("Approval limit closure must publish one checkpoint event.")
+        clear_event = prepared_events[0]
+        cancellation = await approval_publication.publish_approval_with_exact_replay(
+            prepared_close,
+            session_store=self.session_store,
+            event_writer=self._event_writer,
+            fan_out=False,
+        )
+        materialized = await self._recovery_coordinator.materialize_expected_deferred_input(
             session.id,
+            deferred_messages,
+            cancellation=cancellation,
         )
-        await self.session_store.append_transcript_messages_and_transform_checkpoint(
-            session.id,
-            tool_result_messages,
-            _replace_checkpoint_preserving_runtime_state(cleared_checkpoint),
-        )
-        yield await self._event_writer.emit(
-            approval_support.cleared_event(
-                session=session,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                approval=pending_approval_to_clear,
-            )
-        )
+        messages[:] = materialized.messages
+        cancellation = materialized.cancellation
+        await self._event_writer.fan_out_persisted([clear_event])
+        yield clear_event
+        if cancellation is not None:
+            raise cancellation
 
     async def _clear_pending_tool_round_if_matches(
         self,

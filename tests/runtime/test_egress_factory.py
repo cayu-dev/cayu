@@ -3430,13 +3430,17 @@ def test_app_lazily_retries_retained_egress_cleanup_before_new_environment_work(
                 )
             )
         ]
+        # Admission gives retained cleanup a deliberately small polling budget.
+        # Under a loaded event loop the successful retry may still be awaiting
+        # its final harvest when the unrelated run returns.
+        assert adapter.finalize_calls == 2
+        assert await app.drain_environment_cleanups(timeout_s=0.2) is True
         assert inner._fixed_target_owners == {}
         assert inner._states == {}
         assert (
             "sess_retained_egress_cleanup"
             not in app._environment_lifecycle._active_environment_setups
         )
-        assert adapter.finalize_calls == 2
 
     asyncio.run(run())
 

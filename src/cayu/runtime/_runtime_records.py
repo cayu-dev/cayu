@@ -16,6 +16,7 @@ from cayu.environments import (
     ExecutionRequirements,
 )
 from cayu.providers import ModelProvider, UsageDialect
+from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.context import ContextPolicy
 from cayu.runtime.hooks import RuntimeHook
 from cayu.runtime.tool_policy import ToolPolicy, ToolPolicyResult
@@ -112,6 +113,7 @@ class ToolCallOutcome:
 class ToolCallPolicyOutcome:
     call: ToolCallRequest
     result: ToolPolicyResult | None
+    evidence: ToolPolicyEvidence
 
 
 @dataclass(frozen=True)

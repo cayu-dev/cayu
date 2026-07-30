@@ -205,11 +205,10 @@ def test_resolve_tool_approval_never_executes_legacy_redaction_marker() -> None:
             ),
         )
     )
-    approval_id = next(
-        event.payload["approval"]["approval_id"]
-        for event in interrupted
-        if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    approval_event = next(
+        event for event in interrupted if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
+    approval_id = approval_event.payload["approval"]["approval_id"]
     checkpoint = asyncio.run(store.load_checkpoint("sess_legacy_approval_marker"))
     assert checkpoint is not None
     checkpoint["pending_tool_approval"]["arguments"]["value"] = REDACTED_SECRET
@@ -223,6 +222,8 @@ def test_resolve_tool_approval_never_executes_legacy_redaction_marker() -> None:
                 ToolApprovalRequest(
                     session_id="sess_legacy_approval_marker",
                     approval_id=approval_id,
+                    tool_round_id=approval_event.payload["tool_round_id"],
+                    tool_call_id=approval_event.payload["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
                 ),
             )
@@ -235,7 +236,7 @@ def _secret_redacting_paused_approval(
     *,
     session_id: str,
     secret: str,
-) -> tuple[CayuApp, InMemorySessionStore, FakeProvider, str]:
+) -> tuple[CayuApp, InMemorySessionStore, FakeProvider, dict]:
     store = InMemorySessionStore()
     provider = FakeProvider(
         [
@@ -270,16 +271,17 @@ def _secret_redacting_paused_approval(
             ),
         )
     )
-    approval_id = next(
+    approval_event = next(
         event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
-    ).payload["approval"]["approval_id"]
-    return app, store, provider, approval_id
+    )
+    approval = approval_event.payload["approval"]
+    return app, store, provider, approval
 
 
 def test_cayu_app_rejects_secret_structured_output_on_tool_approval() -> None:
     secret = "tool-approval-schema-secret-canary"
     session_id = "sess_secret_tool_approval"
-    app, store, provider, approval_id = _secret_redacting_paused_approval(
+    app, store, provider, approval = _secret_redacting_paused_approval(
         session_id=session_id,
         secret=secret,
     )
@@ -290,7 +292,9 @@ def test_cayu_app_rejects_secret_structured_output_on_tool_approval() -> None:
                 app,
                 ToolApprovalRequest(
                     session_id=session_id,
-                    approval_id=approval_id,
+                    approval_id=approval["approval_id"],
+                    tool_round_id=approval["tool_round_id"],
+                    tool_call_id=approval["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
                     structured_output=StructuredOutputSpec(
                         json_schema={"type": "string", "const": secret},
@@ -307,7 +311,7 @@ def test_cayu_app_rejects_secret_structured_output_on_tool_approval() -> None:
 def test_cayu_app_rejects_secret_structured_output_on_tool_approval_recovery() -> None:
     secret = "tool-approval-recovery-schema-secret-canary"
     session_id = "sess_secret_tool_approval_recovery"
-    app, store, provider, approval_id = _secret_redacting_paused_approval(
+    app, store, provider, approval = _secret_redacting_paused_approval(
         session_id=session_id,
         secret=secret,
     )
@@ -318,7 +322,8 @@ def test_cayu_app_rejects_secret_structured_output_on_tool_approval_recovery() -
                 app,
                 ToolApprovalRecoveryRequest(
                     session_id=session_id,
-                    approval_id=approval_id,
+                    approval_id=approval["approval_id"],
+                    tool_round_id=approval["tool_round_id"],
                     tool_call_id="call_1",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                     message="side effect completed externally",

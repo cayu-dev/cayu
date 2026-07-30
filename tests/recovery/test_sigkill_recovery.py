@@ -201,7 +201,7 @@ def test_sigkill_after_durable_approval_request_preserves_resolution(
             session_id=session_id,
         )
         result = recovery_worker.wait_success()
-        assert result["retry_rejected"] is True
+        assert result["retry_replayed"] is True
 
         recovered = asyncio.run(harness.load_session_state(session_id))
         assert recovered.session is not None

@@ -649,7 +649,12 @@ def test_thinking_threads_through_request_copies() -> None:
 
     cfg = ThinkingConfig(effort="high")
     approval = ToolApprovalRequest(
-        session_id="s", approval_id="a", decision=ToolApprovalDecision.APPROVE, thinking=cfg
+        session_id="s",
+        approval_id="a",
+        tool_round_id="r",
+        tool_call_id="c",
+        decision=ToolApprovalDecision.APPROVE,
+        thinking=cfg,
     )
     assert copy_tool_approval_request(approval).thinking == cfg
 

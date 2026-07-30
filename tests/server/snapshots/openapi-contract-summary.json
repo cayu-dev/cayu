@@ -1287,6 +1287,23 @@
           "title": "Options",
           "type": "array"
         },
+        "policy_evidence": {
+          "anyOf": [
+            {
+              "enum": [
+                "unplanned",
+                "authoritative",
+                "unregistered",
+                "ambiguous"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Policy Evidence"
+        },
         "question": {
           "anyOf": [
             {
@@ -7077,11 +7094,23 @@
               "type": "null"
             }
           ]
+        },
+        "tool_call_id": {
+          "minLength": 1,
+          "title": "Tool Call Id",
+          "type": "string"
+        },
+        "tool_round_id": {
+          "minLength": 1,
+          "title": "Tool Round Id",
+          "type": "string"
         }
       },
       "required": [
         "session_id",
         "approval_id",
+        "tool_round_id",
+        "tool_call_id",
         "decision"
       ],
       "title": "ToolApprovalBody",
@@ -7234,11 +7263,17 @@
           "minLength": 1,
           "title": "Tool Call Id",
           "type": "string"
+        },
+        "tool_round_id": {
+          "minLength": 1,
+          "title": "Tool Round Id",
+          "type": "string"
         }
       },
       "required": [
         "session_id",
         "approval_id",
+        "tool_round_id",
         "tool_call_id",
         "outcome",
         "message"

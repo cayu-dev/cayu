@@ -14,6 +14,7 @@ from cayu._validation import (
 )
 from cayu.core.events import Event, EventType
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime._policy_evidence import ToolPolicyEvidence
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -145,6 +146,8 @@ class ToolApprovalRequest(BaseModel):
 
     session_id: str
     approval_id: str
+    tool_round_id: str
+    tool_call_id: str
     decision: ToolApprovalDecision
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -160,7 +163,7 @@ class ToolApprovalRequest(BaseModel):
         exclude=True,
     )
 
-    @field_validator("session_id", "approval_id")
+    @field_validator("session_id", "approval_id", "tool_round_id", "tool_call_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
@@ -227,6 +230,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
 
     session_id: str
     approval_id: str
+    tool_round_id: str
     tool_call_id: str
     outcome: ToolApprovalRecoveryOutcome
     message: str
@@ -246,7 +250,7 @@ class ToolApprovalRecoveryRequest(BaseModel):
         exclude=True,
     )
 
-    @field_validator("session_id", "approval_id", "tool_call_id")
+    @field_validator("session_id", "approval_id", "tool_round_id", "tool_call_id")
     @classmethod
     def validate_nonblank_ids(cls, value: str, info) -> str:
         return require_durable_clean_nonblank(value, info.field_name)
@@ -313,6 +317,9 @@ class PendingToolCallApproval(BaseModel):
     tool_call_id: str
     tool_name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
+    # ``None`` is accepted only as a legacy representation. Callers must use
+    # ``effective_tool_policy_evidence`` before making an authority decision.
+    policy_evidence: ToolPolicyEvidence | None = None
     policy_decision: str | None = None
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -351,6 +358,32 @@ class PendingToolCallApproval(BaseModel):
     @classmethod
     def copy_json_fields(cls, value: dict[str, Any], info) -> dict[str, Any]:
         return copy_durable_json_value(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_policy_evidence(self) -> PendingToolCallApproval:
+        recognized_decisions = {
+            "allow",
+            "deny",
+            "require_approval",
+        }
+        if (
+            self.policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
+            and self.policy_decision not in recognized_decisions
+        ):
+            raise ValueError("Authoritative tool-policy evidence requires a recognized decision.")
+        if (
+            self.policy_evidence
+            in {
+                ToolPolicyEvidence.UNPLANNED,
+                ToolPolicyEvidence.UNREGISTERED,
+                ToolPolicyEvidence.AMBIGUOUS,
+            }
+            and self.policy_decision is not None
+        ):
+            raise ValueError(
+                "Non-authoritative tool-policy evidence cannot carry a policy decision."
+            )
+        return self
 
 
 class PendingToolApproval(BaseModel):
@@ -551,6 +584,8 @@ def copy_tool_approval_request(request: ToolApprovalRequest) -> ToolApprovalRequ
     return ToolApprovalRequest(
         session_id=request.session_id,
         approval_id=request.approval_id,
+        tool_round_id=request.tool_round_id,
+        tool_call_id=request.tool_call_id,
         decision=request.decision,
         **_copy_approval_resume_fields(request),
     )
@@ -564,6 +599,7 @@ def copy_tool_approval_recovery_request(
     return ToolApprovalRecoveryRequest(
         session_id=request.session_id,
         approval_id=request.approval_id,
+        tool_round_id=request.tool_round_id,
         tool_call_id=request.tool_call_id,
         outcome=request.outcome,
         message=request.message,
@@ -614,6 +650,7 @@ def copy_pending_tool_call_approval(
         tool_call_id=call.tool_call_id,
         tool_name=call.tool_name,
         arguments=copy_durable_json_value(call.arguments, "arguments"),
+        policy_evidence=call.policy_evidence,
         policy_decision=call.policy_decision,
         reason=call.reason,
         metadata=copy_durable_json_value(call.metadata, "metadata"),

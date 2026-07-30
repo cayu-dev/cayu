@@ -915,13 +915,11 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
         if path == "/api/contract":
             response = await route.fetch()
             body = await response.json()
-            # Reconstruct the immediately preceding valid v3 response. That
-            # contract predates the required usage surface and must be rejected
-            # before navigation evaluates any capability requirement.
-            body["contract_version"] = "3"
-            body["versioning"]["contract_version"] = "3"
-            usage = body["capabilities"]["surfaces"].pop("usage", None)
-            require(usage is not None, "the v4 fixture must expose the required usage surface")
+            # Reconstruct the immediately preceding valid v4 response. It
+            # predates approval-resolution identity fencing and must be
+            # rejected before navigation evaluates any capability requirement.
+            body["contract_version"] = "4"
+            body["versioning"]["contract_version"] = "4"
             await route.fulfill(
                 response=response,
                 json=body,
@@ -938,13 +936,13 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
     try:
         await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
         await expect(page.get_by_test_id("dashboard-contract-gate")).to_contain_text(
-            "Dashboard expects CAYU server contract v4, but the server reports v3."
+            "Dashboard expects CAYU server contract v5, but the server reports v4."
         )
         await expect(page.get_by_role("heading", name="Usage", exact=True)).to_have_count(0)
         require_equal(
             api_requests_beyond_contract,
             [],
-            "a previous valid v3 contract must not start route-specific API requests",
+            "a previous valid v4 contract must not start route-specific API requests",
         )
     finally:
         await page.unroute("**/api/**", serve_incompatible_contract)
@@ -1122,7 +1120,7 @@ async def _exercise_system_page(page: Page, base_url: str) -> None:
             "does not probe databases, workers, networks, or external services"
         )
         await expect(page.get_by_text("Server contract", exact=True)).to_be_visible()
-        await expect(page.get_by_text("v4", exact=True)).to_be_visible()
+        await expect(page.get_by_text("v5", exact=True)).to_be_visible()
         require_equal(diagnostics_requests, 1, "the System page must load one initial snapshot")
 
         await page.wait_for_timeout(5_500)

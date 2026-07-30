@@ -39,6 +39,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRecoveryOutcome,
     ToolApprovalRecoveryRequest,
     ToolApprovalRequest,
+    ToolPolicyEvidence,
 )
 from cayu.runtime.budgets import (
     BudgetAction,
@@ -69,6 +70,7 @@ from cayu.runtime.business_approvals import (
     BusinessApprovalError,
     BusinessApprovalOutcome,
     BusinessApprovalRecord,
+    BusinessApprovalResolutionState,
     BusinessApprovalRouting,
     BusinessApprovalRoutingMissing,
     BusinessApprovalTierMismatch,
@@ -474,6 +476,7 @@ __all__ = [
     "BusinessApprovalError",
     "BusinessApprovalOutcome",
     "BusinessApprovalRecord",
+    "BusinessApprovalResolutionState",
     "BusinessApprovalRouting",
     "BusinessApprovalRoutingMissing",
     "BusinessApprovalTierMismatch",
@@ -705,6 +708,7 @@ __all__ = [
     "ToolManifest",
     "ToolPolicy",
     "ToolPolicyDecision",
+    "ToolPolicyEvidence",
     "ToolPolicyRequest",
     "ToolPolicyResult",
     "ToolRoundIdentity",

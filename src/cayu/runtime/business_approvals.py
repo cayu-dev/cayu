@@ -43,11 +43,13 @@ from cayu._validation import (
     require_durable_nonblank,
 )
 from cayu.core.events import Event, EventType
+from cayu.runtime import _approval_support as approval_support
 from cayu.runtime.approvals import (
     PendingToolApproval,
     ResolutionActor,
     ToolApprovalDecision,
     ToolApprovalRequest,
+    ToolPolicyEvidence,
     pending_tool_call_for_approval_event,
 )
 from cayu.runtime.budgets import BudgetLimit
@@ -69,7 +71,9 @@ if TYPE_CHECKING:
 
 BUSINESS_APPROVAL_ROUTING_METADATA_KEY = "cayu:business_approval_routing"
 BUSINESS_APPROVAL_ROUTING_KIND = "cayu.business_approval.routing.v1"
-BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY = "cayu:business_approval"
+BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY = (
+    approval_support.BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY
+)
 BUSINESS_APPROVAL_RESOLUTION_KIND = "cayu.business_approval.v1"
 
 
@@ -77,6 +81,15 @@ class BusinessApprovalOutcome(StrEnum):
     APPROVED = "approved"
     CONDITIONED = "conditioned"
     DECLINED = "declined"
+
+
+class BusinessApprovalResolutionState(StrEnum):
+    """Durable lifecycle state of one business approval."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    BLOCKED = "blocked"
 
 
 class BusinessApprovalError(Exception):
@@ -372,6 +385,8 @@ async def resolve_business_approval(
     request = ToolApprovalRequest(
         session_id=session_id,
         approval_id=approval_id,
+        tool_round_id=pending.tool_round_id,
+        tool_call_id=pending.tool_call_id,
         decision=decision,
         reason=reason,
         metadata=resolution_metadata,
@@ -391,7 +406,9 @@ async def resolve_business_approval(
 class BusinessApprovalRecord:
     """One business approval, projected from the session's approval events.
 
-    ``decision`` is the raw Cayu decision (``None`` while pending);
+    ``resolution_state`` distinguishes a pending request, a binary runtime
+    decision, and a non-authorizing recovery acknowledgement. ``decision`` is
+    the raw Cayu decision (``None`` while pending or safely blocked);
     ``outcome`` is the business outcome stamped by the adapter (``None`` while
     pending, and ``None`` on unstamped resolutions made through the raw
     primitive). ``resolved_by`` is the typed ``ResolutionActor`` provenance
@@ -410,6 +427,7 @@ class BusinessApprovalRecord:
     tool_name: str
     agent_name: str
     routing: BusinessApprovalRouting | None
+    resolution_state: BusinessApprovalResolutionState
     decision: ToolApprovalDecision | None
     outcome: BusinessApprovalOutcome | None
     condition_text: str | None
@@ -423,7 +441,7 @@ class BusinessApprovalRecord:
 
     @property
     def pending(self) -> bool:
-        return self.decision is None
+        return self.resolution_state is BusinessApprovalResolutionState.PENDING
 
     @property
     def resolved_via_adapter(self) -> bool:
@@ -456,6 +474,8 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
     pending_by_key: dict[tuple[str, str], PendingToolApproval] = {}
     identities: dict[tuple[str, str], ToolRoundIdentity] = {}
     contradictory_request_keys: set[tuple[str, str]] = set()
+    resolution_context_descriptors: dict[tuple[str, str], dict[str, Any]] = {}
+    call_resolution_states: dict[tuple[str, str, str], str] = {}
     resolution_descriptors: dict[tuple[str, str], dict[str, Any]] = {}
     contradictory_resolution_keys: set[tuple[str, str]] = set()
     for event in materialized:
@@ -496,6 +516,7 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
             "tool_name": pending.tool_name,
             "agent_name": pending.agent_name,
             "routing": routing,
+            "resolution_state": BusinessApprovalResolutionState.PENDING,
             "decision": None,
             "outcome": None,
             "condition_text": None,
@@ -509,16 +530,24 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
         }
 
     for event in materialized:
-        if event.type not in (
+        if event.type not in {
             EventType.TOOL_CALL_APPROVED,
             EventType.TOOL_CALL_APPROVAL_DENIED,
-        ):
+            EventType.TOOL_CALL_BLOCKED,
+        }:
             continue
         approval_id = event.payload.get("approval_id")
         if type(approval_id) is not str:
             continue
         record_key = (event.session_id, approval_id)
         if record_key not in records or not identities[record_key].matches_payload(event.payload):
+            continue
+        is_ambiguous_block_candidate = event.type is EventType.TOOL_CALL_BLOCKED and (
+            "requested_decision" in event.payload
+            or event.payload.get("decision") == "ambiguous"
+            or event.payload.get("blocked_by") == "policy_evaluation_ambiguous"
+        )
+        if event.type is EventType.TOOL_CALL_BLOCKED and not is_ambiguous_block_candidate:
             continue
         try:
             resolution_call = pending_tool_call_for_approval_event(
@@ -529,13 +558,81 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
             contradictory_resolution_keys.add(record_key)
             records.pop(record_key, None)
             continue
-        descriptor = copy_durable_json_value(
+        is_gating_call = resolution_call.tool_call_id == records[record_key]["tool_call_id"]
+        is_valid_ambiguous_block = (
+            event.type is EventType.TOOL_CALL_BLOCKED
+            and resolution_call.policy_evidence is ToolPolicyEvidence.AMBIGUOUS
+            and resolution_call.policy_decision is None
+            and event.payload.get("decision") == "ambiguous"
+            and event.payload.get("blocked_by") == "policy_evaluation_ambiguous"
+            and event.payload.get("requested_decision") == ToolApprovalDecision.APPROVE.value
+        )
+        if event.type is EventType.TOOL_CALL_BLOCKED and not is_valid_ambiguous_block:
+            contradictory_resolution_keys.add(record_key)
+            records.pop(record_key, None)
+            continue
+        if event.type is EventType.TOOL_CALL_APPROVED and not (
+            resolution_call.policy_evidence
+            in {
+                None,
+                ToolPolicyEvidence.AUTHORITATIVE,
+            }
+            and resolution_call.policy_decision == ToolPolicyDecision.REQUIRE_APPROVAL.value
+        ):
+            contradictory_resolution_keys.add(record_key)
+            records.pop(record_key, None)
+            continue
+        is_ambiguous_block = event.type is EventType.TOOL_CALL_BLOCKED
+        call_resolution_key = (*record_key, resolution_call.tool_call_id)
+        resolution_state = str(event.type)
+        previous_call_resolution_state = call_resolution_states.setdefault(
+            call_resolution_key,
+            resolution_state,
+        )
+        if previous_call_resolution_state != resolution_state:
+            contradictory_resolution_keys.add(record_key)
+            records.pop(record_key, None)
+            continue
+        normalized_decision = (
+            event.payload.get("requested_decision")
+            if is_ambiguous_block
+            else ToolApprovalDecision.APPROVE.value
+            if event.type is EventType.TOOL_CALL_APPROVED
+            else ToolApprovalDecision.DENY.value
+        )
+        resolution_context = copy_durable_json_value(
             {
-                "decision": str(event.type),
+                "decision": normalized_decision,
                 "expired": event.payload.get("expired") is True,
                 "resolved_by": event.payload.get("resolved_by"),
-                "reason": event.payload.get("reason"),
+                "reason": (
+                    event.payload.get("resolution_reason")
+                    if is_ambiguous_block
+                    else event.payload.get("reason")
+                ),
                 "metadata": event.payload.get("metadata"),
+            },
+            "approval_resolution_context_descriptor",
+        )
+        previous_context = resolution_context_descriptors.setdefault(
+            record_key,
+            resolution_context,
+        )
+        if previous_context != resolution_context:
+            contradictory_resolution_keys.add(record_key)
+            records.pop(record_key, None)
+            continue
+        if record_key in contradictory_resolution_keys:
+            continue
+        if not is_gating_call:
+            # Runtime resolution events are round-scoped, but only the exact
+            # gating call owns the approval decision. Valid sibling outcomes
+            # corroborate operator context without resolving the projection.
+            continue
+        descriptor = copy_durable_json_value(
+            {
+                "resolution_state": str(event.type),
+                **resolution_context,
             },
             "approval_resolution_descriptor",
         )
@@ -547,18 +644,16 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
         if record_key in contradictory_resolution_keys:
             continue
         record = records[record_key]
-        # The runtime emits one event per call in the round; every one carries the
-        # resolution metadata, but prefer the gating call's event for identity.
-        already_resolved = record["decision"] is not None
-        is_gating_call = resolution_call.tool_call_id == record["tool_call_id"]
-        if already_resolved and not is_gating_call:
-            continue
 
-        record["decision"] = (
-            ToolApprovalDecision.APPROVE
-            if event.type == EventType.TOOL_CALL_APPROVED
-            else ToolApprovalDecision.DENY
-        )
+        if is_ambiguous_block:
+            record["resolution_state"] = BusinessApprovalResolutionState.BLOCKED
+            record["decision"] = None
+        elif event.type is EventType.TOOL_CALL_APPROVED:
+            record["resolution_state"] = BusinessApprovalResolutionState.APPROVED
+            record["decision"] = ToolApprovalDecision.APPROVE
+        else:
+            record["resolution_state"] = BusinessApprovalResolutionState.DENIED
+            record["decision"] = ToolApprovalDecision.DENY
         record["resolved_at"] = event.timestamp
         record["expired"] = event.payload.get("expired") is True
         actor_payload = event.payload.get("resolved_by")
@@ -569,9 +664,12 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
                 record["resolved_by"] = None
         else:
             record["resolved_by"] = None
-        record["reason"] = (
-            event.payload.get("reason") if type(event.payload.get("reason")) is str else None
+        raw_reason = (
+            event.payload.get("resolution_reason")
+            if is_ambiguous_block
+            else event.payload.get("reason")
         )
+        record["reason"] = raw_reason if type(raw_reason) is str else None
         stamp = event.payload.get("metadata")
         stamp = (
             stamp.get(BUSINESS_APPROVAL_RESOLUTION_METADATA_KEY) if type(stamp) is dict else None
