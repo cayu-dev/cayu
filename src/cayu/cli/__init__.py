@@ -25,6 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     from cayu.cli.auth import add_auth_parser
     from cayu.cli.check import add_check_parser
+    from cayu.cli.cloud import add_cloud_parser
     from cayu.cli.console import add_console_parser
     from cayu.cli.evals import add_eval_parser
     from cayu.cli.generate import add_generate_parser
@@ -37,6 +38,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     add_auth_parser(subparsers)
     add_check_parser(subparsers)
+    add_cloud_parser(subparsers)
     add_console_parser(subparsers)
     add_eval_parser(subparsers)
     add_generate_parser(subparsers)
@@ -57,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from cayu.cli.auth import run_auth
     from cayu.cli.check import run_check
+    from cayu.cli.cloud import run_cloud
     from cayu.cli.console import run_console
     from cayu.cli.evals import run_eval_command
     from cayu.cli.generate import run_generate
@@ -73,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "auth":
         return run_auth(args)
+
+    if args.command == "cloud":
+        return run_cloud(args)
 
     if args.command == "new":
         return run_new(args)
