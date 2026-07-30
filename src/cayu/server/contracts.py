@@ -46,7 +46,19 @@ from cayu.runtime.sessions import (
     SessionAggregateFilter,
     SessionOperationalSnapshot,
 )
-from cayu.runtime.tasks import TaskAggregateFilter, TaskOperationalSnapshot
+from cayu.runtime.tasks import (
+    TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
+    TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
+    TASK_TOPOLOGY_MAX_CURSOR_BYTES,
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+    TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
+    TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    TASK_TOPOLOGY_MAX_NODES,
+    TaskAggregateFilter,
+    TaskOperationalSnapshot,
+    TaskTopologyTruncatedField,
+)
 from cayu.runtime.usage import (
     AggregateUsageMetrics,
     CausalBudgetUsageSummary,
@@ -70,6 +82,7 @@ MAX_SYSTEM_PRICING_METADATA_CHARS = 256
 DEFAULT_SESSION_TOPOLOGY_RESULT_BYTES = 1024 * 1024
 MAX_SESSION_TOPOLOGY_RESULT_BYTES = 4 * 1024 * 1024
 MAX_SESSION_TOPOLOGY_REQUEST_BYTES = 256 * 1024
+MAX_EXECUTION_TOPOLOGY_EDGES = 1500
 
 SessionTopologyIdentifier = Annotated[
     str,
@@ -83,6 +96,20 @@ SessionTopologyCursor = Annotated[
     StringConstraints(
         min_length=1,
         max_length=SESSION_TOPOLOGY_MAX_CURSOR_BYTES,
+    ),
+]
+TaskTopologyIdentifier = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    ),
+]
+TaskTopologyCursor = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=TASK_TOPOLOGY_MAX_CURSOR_BYTES,
     ),
 ]
 
@@ -754,6 +781,32 @@ class SessionTopologyRequest(ApiBaseModel):
         ge=1,
         le=SESSION_TOPOLOGY_MAX_CHILD_LIMIT,
     )
+    linked_task_session_ids: tuple[TaskTopologyIdentifier, ...] = Field(
+        default_factory=tuple,
+        max_length=TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
+    )
+    task_session_cursors: dict[TaskTopologyIdentifier, TaskTopologyCursor] = Field(
+        default_factory=dict,
+        max_length=TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS,
+    )
+    expanded_task_parent_ids: tuple[TaskTopologyIdentifier, ...] = Field(
+        default_factory=tuple,
+        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
+    )
+    task_child_cursors: dict[TaskTopologyIdentifier, TaskTopologyCursor] = Field(
+        default_factory=dict,
+        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS,
+    )
+    task_session_limit: StrictInt = Field(
+        default=TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
+        ge=1,
+        le=TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
+    )
+    task_child_limit: StrictInt = Field(
+        default=TASK_TOPOLOGY_DEFAULT_BRANCH_LIMIT,
+        ge=1,
+        le=TASK_TOPOLOGY_MAX_BRANCH_LIMIT,
+    )
     max_result_bytes: StrictInt = Field(
         default=DEFAULT_SESSION_TOPOLOGY_RESULT_BYTES,
         ge=1024,
@@ -775,6 +828,43 @@ class SessionTopologyRequest(ApiBaseModel):
                 ) from exc
             if len(encoded) > SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES:
                 raise ValueError("A session topology identifier exceeds its byte limit.")
+        return values
+
+    @field_validator("linked_task_session_ids", "expanded_task_parent_ids")
+    @classmethod
+    def validate_task_topology_identifier_bytes(
+        cls,
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        for value in values:
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "Task topology identifiers must contain portable Unicode text."
+                ) from exc
+            if len(encoded) > TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES:
+                raise ValueError("A task topology identifier exceeds its byte limit.")
+        return values
+
+    @field_validator("task_session_cursors", "task_child_cursors")
+    @classmethod
+    def validate_task_topology_cursor_bytes(
+        cls,
+        values: dict[str, str],
+    ) -> dict[str, str]:
+        for scope_id, cursor in values.items():
+            try:
+                encoded_scope_id = scope_id.encode("utf-8")
+                encoded_cursor = cursor.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "Task topology identifiers and cursors must contain portable Unicode text."
+                ) from exc
+            if len(encoded_scope_id) > TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES:
+                raise ValueError("A task topology identifier exceeds its byte limit.")
+            if len(encoded_cursor) > TASK_TOPOLOGY_MAX_CURSOR_BYTES:
+                raise ValueError("A task topology cursor exceeds its byte limit.")
         return values
 
     @field_validator("child_cursors")
@@ -818,9 +908,75 @@ class ApiSessionTopologyBranch(ApiBaseModel):
     has_more: StrictBool
 
 
+class ApiTaskTopologyNode(ApiBaseModel):
+    id: TaskTopologyIdentifier
+    type: str | None = Field(max_length=TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES)
+    title: str | None = Field(max_length=TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES)
+    status: str
+    status_reason: str | None = Field(max_length=TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES)
+    session_id: TaskTopologyIdentifier | None
+    parent_task_id: TaskTopologyIdentifier | None
+    assigned_agent_name: str | None = Field(max_length=TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES)
+    created_at: str
+    updated_at: str
+    truncated_fields: list[TaskTopologyTruncatedField] = Field(max_length=4)
+
+
+class ApiTaskTopologySessionBranch(ApiBaseModel):
+    session_id: TaskTopologyIdentifier
+    tasks: list[ApiTaskTopologyNode] = Field(max_length=TASK_TOPOLOGY_MAX_BRANCH_LIMIT)
+    next_cursor: TaskTopologyCursor | None
+    has_more: StrictBool
+
+
+class ApiTaskTopologyChildBranch(ApiBaseModel):
+    parent_task_id: TaskTopologyIdentifier
+    children: list[ApiTaskTopologyNode] = Field(max_length=TASK_TOPOLOGY_MAX_BRANCH_LIMIT)
+    next_cursor: TaskTopologyCursor | None
+    has_more: StrictBool
+
+
+class ApiTaskTopologyProjection(ApiBaseModel):
+    status: Literal["available", "not_configured", "unsupported"]
+    observed_at: datetime | None
+    session_branches: list[ApiTaskTopologySessionBranch] = Field(
+        max_length=TASK_TOPOLOGY_MAX_EXPANDED_SESSIONS
+    )
+    expanded_parents: list[ApiTaskTopologyNode] = Field(
+        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS
+    )
+    child_branches: list[ApiTaskTopologyChildBranch] = Field(
+        max_length=TASK_TOPOLOGY_MAX_EXPANDED_PARENTS
+    )
+    unique_node_count: StrictInt = Field(ge=0, le=TASK_TOPOLOGY_MAX_NODES)
+
+    @model_validator(mode="after")
+    def validate_availability(self) -> ApiTaskTopologyProjection:
+        has_projection = bool(
+            self.observed_at is not None
+            or self.session_branches
+            or self.expanded_parents
+            or self.child_branches
+            or self.unique_node_count
+        )
+        if self.status == "available" and self.observed_at is None:
+            raise ValueError("Available task topology requires an observation timestamp.")
+        if self.status != "available" and has_projection:
+            raise ValueError("Unavailable task topology cannot include projected task data.")
+        return self
+
+
+class ApiExecutionTopologyEdge(ApiBaseModel):
+    kind: Literal["session_parent", "task_parent", "task_session"]
+    source_id: SessionTopologyIdentifier
+    target_id: SessionTopologyIdentifier
+    target_loaded: StrictBool
+
+
 class SessionTopologyResponse(ApiBaseModel):
     scope: Literal["session_focus"] = "session_focus"
     observed_at: datetime
+    cross_store_atomic: Literal[False]
     focus: ApiSessionTopologyNode
     ancestors: list[ApiSessionTopologyNode] = Field(max_length=SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH)
     expanded_parents: list[ApiSessionTopologyNode] = Field(
@@ -830,23 +986,28 @@ class SessionTopologyResponse(ApiBaseModel):
         max_length=SESSION_TOPOLOGY_MAX_EXPANDED_PARENTS
     )
     unique_node_count: StrictInt = Field(ge=1, le=SESSION_TOPOLOGY_MAX_NODES)
+    task_projection: ApiTaskTopologyProjection
+    edges: list[ApiExecutionTopologyEdge] = Field(max_length=MAX_EXECUTION_TOPOLOGY_EDGES)
 
 
 SESSION_TOPOLOGY_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {
-        "description": "The focus session or one requested expanded parent does not exist.",
+        "description": (
+            "The focus session or one requested expanded session/task parent does not exist."
+        ),
         "model": ApiErrorResponse,
     },
     409: {
         "description": (
-            "Durable lineage is inconsistent, or continuation authority cannot "
+            "Durable session/task lineage is inconsistent, or continuation authority cannot "
             "cross the configured redaction boundary."
         ),
         "model": ApiErrorResponse,
     },
     413: {
         "description": (
-            "The request bytes, ancestor depth, or serialized response exceed a safety bound."
+            "The request bytes, session/task ancestry, or serialized response exceed "
+            "a safety bound."
         ),
         "model": ApiErrorResponse,
     },

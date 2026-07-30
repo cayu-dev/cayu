@@ -422,6 +422,28 @@ export type ApiEventSummary = {
 };
 
 /**
+ * ApiExecutionTopologyEdge
+ */
+export type ApiExecutionTopologyEdge = {
+    /**
+     * Kind
+     */
+    kind: 'session_parent' | 'task_parent' | 'task_session';
+    /**
+     * Source Id
+     */
+    source_id: string;
+    /**
+     * Target Id
+     */
+    target_id: string;
+    /**
+     * Target Loaded
+     */
+    target_loaded: boolean;
+};
+
+/**
  * ApiInteractionSummary
  */
 export type ApiInteractionSummary = {
@@ -1222,6 +1244,130 @@ export type ApiTaskListItem = {
      * Worker Id
      */
     worker_id: string | null;
+};
+
+/**
+ * ApiTaskTopologyChildBranch
+ */
+export type ApiTaskTopologyChildBranch = {
+    /**
+     * Children
+     */
+    children: Array<ApiTaskTopologyNode>;
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
+     * Parent Task Id
+     */
+    parent_task_id: string;
+};
+
+/**
+ * ApiTaskTopologyNode
+ */
+export type ApiTaskTopologyNode = {
+    /**
+     * Assigned Agent Name
+     */
+    assigned_agent_name: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Parent Task Id
+     */
+    parent_task_id: string | null;
+    /**
+     * Session Id
+     */
+    session_id: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Status Reason
+     */
+    status_reason: string | null;
+    /**
+     * Title
+     */
+    title: string | null;
+    /**
+     * Truncated Fields
+     */
+    truncated_fields: Array<'type' | 'title' | 'assigned_agent_name' | 'status_reason'>;
+    /**
+     * Type
+     */
+    type: string | null;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * ApiTaskTopologyProjection
+ */
+export type ApiTaskTopologyProjection = {
+    /**
+     * Child Branches
+     */
+    child_branches: Array<ApiTaskTopologyChildBranch>;
+    /**
+     * Expanded Parents
+     */
+    expanded_parents: Array<ApiTaskTopologyNode>;
+    /**
+     * Observed At
+     */
+    observed_at: string | null;
+    /**
+     * Session Branches
+     */
+    session_branches: Array<ApiTaskTopologySessionBranch>;
+    /**
+     * Status
+     */
+    status: 'available' | 'not_configured' | 'unsupported';
+    /**
+     * Unique Node Count
+     */
+    unique_node_count: number;
+};
+
+/**
+ * ApiTaskTopologySessionBranch
+ */
+export type ApiTaskTopologySessionBranch = {
+    /**
+     * Has More
+     */
+    has_more: boolean;
+    /**
+     * Next Cursor
+     */
+    next_cursor: string | null;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Tasks
+     */
+    tasks: Array<ApiTaskTopologyNode>;
 };
 
 /**
@@ -2908,9 +3054,37 @@ export type SessionTopologyRequest = {
      */
     expanded_parent_ids?: Array<string>;
     /**
+     * Expanded Task Parent Ids
+     */
+    expanded_task_parent_ids?: Array<string>;
+    /**
+     * Linked Task Session Ids
+     */
+    linked_task_session_ids?: Array<string>;
+    /**
      * Max Result Bytes
      */
     max_result_bytes?: number;
+    /**
+     * Task Child Cursors
+     */
+    task_child_cursors?: {
+        [key: string]: string;
+    };
+    /**
+     * Task Child Limit
+     */
+    task_child_limit?: number;
+    /**
+     * Task Session Cursors
+     */
+    task_session_cursors?: {
+        [key: string]: string;
+    };
+    /**
+     * Task Session Limit
+     */
+    task_session_limit?: number;
 };
 
 /**
@@ -2926,6 +3100,14 @@ export type SessionTopologyResponse = {
      */
     branches: Array<ApiSessionTopologyBranch>;
     /**
+     * Cross Store Atomic
+     */
+    cross_store_atomic: false;
+    /**
+     * Edges
+     */
+    edges: Array<ApiExecutionTopologyEdge>;
+    /**
      * Expanded Parents
      */
     expanded_parents: Array<ApiSessionTopologyNode>;
@@ -2938,6 +3120,7 @@ export type SessionTopologyResponse = {
      * Scope
      */
     scope?: 'session_focus';
+    task_projection: ApiTaskTopologyProjection;
     /**
      * Unique Node Count
      */
@@ -5681,15 +5864,15 @@ export type GetSessionTopologyApiSessionsSessionIdTopologyPostData = {
 
 export type GetSessionTopologyApiSessionsSessionIdTopologyPostErrors = {
     /**
-     * The focus session or one requested expanded parent does not exist.
+     * The focus session or one requested expanded session/task parent does not exist.
      */
     404: ApiErrorResponse;
     /**
-     * Durable lineage is inconsistent, or continuation authority cannot cross the configured redaction boundary.
+     * Durable session/task lineage is inconsistent, or continuation authority cannot cross the configured redaction boundary.
      */
     409: ApiErrorResponse;
     /**
-     * The request bytes, ancestor depth, or serialized response exceed a safety bound.
+     * The request bytes, session/task ancestry, or serialized response exceed a safety bound.
      */
     413: ApiErrorResponse;
     /**

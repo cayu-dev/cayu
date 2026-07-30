@@ -503,6 +503,23 @@ id)`. Custom stores must leave `supports_session_topology = False` unless they
 implement the same snapshot, ordering, corruption detection, node ceiling, and
 parent-bound continuation contract.
 
+Task topology is an independent optional `TaskStore` capability.
+`query_task_topology(...)` batch-loads tasks attached to a bounded set of
+session IDs and direct children for a bounded set of task-parent IDs. Each
+branch uses `(created_at, id)` keyset ordering and its own scope-bound cursor;
+the complete result also has one shared task-node ceiling. The projection
+contains task identity, type/title, lifecycle status and reason, session and
+parent links, assigned agent, and timestamps only. It never hydrates task
+input, result, error, metadata, status payload, worker, or lease fields.
+The shared node budget is allocated before candidate hydration: at most 500
+returned nodes including expanded parents, plus one continuation sentinel per
+requested branch, cross the store boundary. Parent-chain validation is batched
+by depth and fails clearly after 128 ancestor levels or 4,096 validation nodes;
+cycles therefore cannot be hidden by choosing a smaller page.
+Out-of-tree stores must leave `supports_task_topology = False` unless they
+provide the same snapshot, bounded-query, safe-projection, orphan/cycle,
+ordering, and continuation guarantees.
+
 `query_events_bounded(...)` is a separate optional safety primitive for legacy
 server compositions that still require event records. Built-in stores measure
 the selected page inside the same database snapshot and reject it before
@@ -752,6 +769,15 @@ concurrently; SQLite installs the equivalent index through the normal migration
 step. This prevents a Workflow expansion from becoming one full session-table
 scan per parent.
 
+Schema revision 27 adds `(session_id, created_at, id)` and
+`(parent_task_id, created_at, id)` for bounded task-topology branches. It is
+also additive with revision 26 as its rolling-compatibility floor. Current
+SQLite and PostgreSQL task stores require revision 27 before advertising the
+operation. PostgreSQL builds and validates both indexes concurrently; SQLite
+installs them through the normal migration step. PostgreSQL applies the `C`
+collation to the task-ID tie breaker so its cursor order matches SQLite and the
+in-memory store regardless of database locale.
+
 `query_pending_actions(PendingActionQuery(...))` is a required `SessionStore`
 operation and the bounded control-plane read for tool approvals, user-input
 waits, and manual recovery. The latest
@@ -979,6 +1005,32 @@ responses are `private, no-store`. If redaction would alter an ID, parent edge,
 causal-budget ID, or cursor authority, the endpoint fails closed rather than
 returning duplicate or unusable graph identities. The endpoint never fetches
 event or transcript history.
+
+The same request can select at most 50 of the loaded session IDs for task
+linkage and expand at most 50 task-parent IDs. Omitting the session selection
+loads the focus session's task branch only; clients choose additional visible
+sessions explicitly instead of creating one task query for every session node
+in a high-fan-out graph. Session-task and task-child branches each default to
+25 rows and accept at most 100, use independent scope-bound cursors, and share
+a 500-task-node ceiling. A node omitted because of the shared ceiling remains
+reachable through that branch's continuation cursor. The server allocates that
+ceiling before querying stores, so a maximum-fan-out request hydrates no more
+than 500 returned nodes (including its 50 expanded parents) plus 100 branch
+sentinels rather than fetching 100 full pages first.
+
+Task nodes expose only bounded task ID/type/title/status/status reason,
+session/parent links, assigned agent, and creation/update timestamps. Oversized
+display fields are omitted with `truncated_fields`; malformed structural
+identity, contradictory links, reachable parent cycles, and missing durable
+task parents fail closed. Parent chains are validated independently of the
+visible page under explicit 128-level and 4,096-node safety ceilings, so a
+cycle split across continuation pages also fails deterministically. Typed
+`session_parent`, `task_parent`, and
+`task_session` edges state whether their target is loaded in the current
+projection. An absent or non-participating task store yields `not_configured`
+or `unsupported` while preserving the session graph. The session and task
+stores are read in separate snapshots, exposed as `cross_store_atomic=false`;
+clients must refresh when they require a newer combined view.
 
 The optional server also exposes `GET /api/sessions/{session_id}/transcript`
 for paginated transcript inspection. It accepts `offset`, `limit`, and `role`

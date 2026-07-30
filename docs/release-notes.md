@@ -90,6 +90,33 @@ ceilings are exceeded. Custom stores must implement the optional byte-bounded
 event query primitive for that legacy summary; the server does not substitute
 an unsafe full-payload read.
 
+### Task topology linkage is bounded and optional
+
+The protected session-topology read can now project tasks attached to explicitly
+selected visible sessions and independently expand direct child-task branches.
+Typed edges distinguish session ancestry, task ancestry, and durable
+task-to-session links. Task data is deliberately limited to bounded identity,
+display, lifecycle, assignment, and timestamp fields; inputs, results, errors,
+metadata, status payloads, workers, and leases never cross this boundary.
+
+Task linkage is an optional `TaskStore` capability. The response distinguishes
+`not_configured`, `unsupported`, and `available`, so a custom or absent task
+store does not disable the session graph. Session and task reads are separate
+store snapshots and the response reports `cross_store_atomic=false` rather than
+implying an atomic relationship that the storage contract does not provide.
+
+Schema revision 27 adds `(session_id, created_at, id)` and
+`(parent_task_id, created_at, id)` task indexes. It is additive and preserves
+revision 26's rolling-compatibility floor, but current built-in task stores
+require `cayu storage migrate` before topology reads are available. Each request
+can select at most 50 visible session-to-task branches and 50 task-parent
+branches; every branch has its own stable cursor, while one shared 500-task-node
+and 4 MiB response ceiling prevents high-fan-out workflows from becoming an
+unbounded control-plane read. The shared cap is allocated before stores hydrate
+candidate rows, parent chains are validated under explicit depth/node bounds so
+pagination cannot hide cycles, and PostgreSQL uses locale-independent task-ID
+tie-breaking equivalent to SQLite and the in-memory store.
+
 ### Usage and dashboard pricing advertise separate capabilities
 
 The control-plane contract now reports usage aggregation independently from the

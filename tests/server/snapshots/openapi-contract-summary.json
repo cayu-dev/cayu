@@ -742,6 +742,44 @@
       "title": "ApiEventSummary",
       "type": "object"
     },
+    "ApiExecutionTopologyEdge": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "session_parent",
+            "task_parent",
+            "task_session"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "source_id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "target_id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Target Id",
+          "type": "string"
+        },
+        "target_loaded": {
+          "title": "Target Loaded",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "source_id",
+        "target_id",
+        "target_loaded"
+      ],
+      "title": "ApiExecutionTopologyEdge",
+      "type": "object"
+    },
     "ApiInteractionSummary": {
       "additionalProperties": false,
       "properties": {
@@ -2377,6 +2415,286 @@
         "completed_at"
       ],
       "title": "ApiTaskListItem",
+      "type": "object"
+    },
+    "ApiTaskTopologyChildBranch": {
+      "additionalProperties": false,
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTaskTopologyNode"
+          },
+          "maxItems": 100,
+          "title": "Children",
+          "type": "array"
+        },
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "parent_task_id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Parent Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_task_id",
+        "children",
+        "next_cursor",
+        "has_more"
+      ],
+      "title": "ApiTaskTopologyChildBranch",
+      "type": "object"
+    },
+    "ApiTaskTopologyNode": {
+      "additionalProperties": false,
+      "properties": {
+        "assigned_agent_name": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Assigned Agent Name"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "parent_task_id": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Task Id"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Session Id"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "status_reason": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Status Reason"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Title"
+        },
+        "truncated_fields": {
+          "items": {
+            "enum": [
+              "type",
+              "title",
+              "assigned_agent_name",
+              "status_reason"
+            ],
+            "type": "string"
+          },
+          "maxItems": 4,
+          "title": "Truncated Fields",
+          "type": "array"
+        },
+        "type": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Type"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "title",
+        "status",
+        "status_reason",
+        "session_id",
+        "parent_task_id",
+        "assigned_agent_name",
+        "created_at",
+        "updated_at",
+        "truncated_fields"
+      ],
+      "title": "ApiTaskTopologyNode",
+      "type": "object"
+    },
+    "ApiTaskTopologyProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "child_branches": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTaskTopologyChildBranch"
+          },
+          "maxItems": 50,
+          "title": "Child Branches",
+          "type": "array"
+        },
+        "expanded_parents": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTaskTopologyNode"
+          },
+          "maxItems": 50,
+          "title": "Expanded Parents",
+          "type": "array"
+        },
+        "observed_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed At"
+        },
+        "session_branches": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTaskTopologySessionBranch"
+          },
+          "maxItems": 50,
+          "title": "Session Branches",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "available",
+            "not_configured",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "unique_node_count": {
+          "maximum": 500.0,
+          "minimum": 0.0,
+          "title": "Unique Node Count",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status",
+        "observed_at",
+        "session_branches",
+        "expanded_parents",
+        "child_branches",
+        "unique_node_count"
+      ],
+      "title": "ApiTaskTopologyProjection",
+      "type": "object"
+    },
+    "ApiTaskTopologySessionBranch": {
+      "additionalProperties": false,
+      "properties": {
+        "has_more": {
+          "title": "Has More",
+          "type": "boolean"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Next Cursor"
+        },
+        "session_id": {
+          "maxLength": 1024,
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "tasks": {
+          "items": {
+            "$ref": "#/components/schemas/ApiTaskTopologyNode"
+          },
+          "maxItems": 100,
+          "title": "Tasks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "session_id",
+        "tasks",
+        "next_cursor",
+        "has_more"
+      ],
+      "title": "ApiTaskTopologySessionBranch",
       "type": "object"
     },
     "ApiToolSummary": {
@@ -5541,11 +5859,73 @@
           "title": "Expanded Parent Ids",
           "type": "array"
         },
+        "expanded_task_parent_ids": {
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 50,
+          "title": "Expanded Task Parent Ids",
+          "type": "array"
+        },
+        "linked_task_session_ids": {
+          "items": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 50,
+          "title": "Linked Task Session Ids",
+          "type": "array"
+        },
         "max_result_bytes": {
           "default": 1048576,
           "maximum": 4194304.0,
           "minimum": 1024.0,
           "title": "Max Result Bytes",
+          "type": "integer"
+        },
+        "task_child_cursors": {
+          "additionalProperties": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxProperties": 50,
+          "propertyNames": {
+            "maxLength": 1024,
+            "minLength": 1
+          },
+          "title": "Task Child Cursors",
+          "type": "object"
+        },
+        "task_child_limit": {
+          "default": 25,
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "title": "Task Child Limit",
+          "type": "integer"
+        },
+        "task_session_cursors": {
+          "additionalProperties": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxProperties": 50,
+          "propertyNames": {
+            "maxLength": 1024,
+            "minLength": 1
+          },
+          "title": "Task Session Cursors",
+          "type": "object"
+        },
+        "task_session_limit": {
+          "default": 25,
+          "maximum": 100.0,
+          "minimum": 1.0,
+          "title": "Task Session Limit",
           "type": "integer"
         }
       },
@@ -5571,6 +5951,19 @@
           "title": "Branches",
           "type": "array"
         },
+        "cross_store_atomic": {
+          "const": false,
+          "title": "Cross Store Atomic",
+          "type": "boolean"
+        },
+        "edges": {
+          "items": {
+            "$ref": "#/components/schemas/ApiExecutionTopologyEdge"
+          },
+          "maxItems": 1500,
+          "title": "Edges",
+          "type": "array"
+        },
         "expanded_parents": {
           "items": {
             "$ref": "#/components/schemas/ApiSessionTopologyNode"
@@ -5593,6 +5986,9 @@
           "title": "Scope",
           "type": "string"
         },
+        "task_projection": {
+          "$ref": "#/components/schemas/ApiTaskTopologyProjection"
+        },
         "unique_node_count": {
           "maximum": 500.0,
           "minimum": 1.0,
@@ -5602,11 +5998,14 @@
       },
       "required": [
         "observed_at",
+        "cross_store_atomic",
         "focus",
         "ancestors",
         "expanded_parents",
         "branches",
-        "unique_node_count"
+        "unique_node_count",
+        "task_projection",
+        "edges"
       ],
       "title": "SessionTopologyResponse",
       "type": "object"

@@ -123,7 +123,21 @@ from cayu.runtime.sessions import (
 )
 from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import StructuredOutputSpec
-from cayu.runtime.tasks import Task, TaskCreate, TaskOrder, TaskQuery, TaskStatus
+from cayu.runtime.tasks import (
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+    Task,
+    TaskCreate,
+    TaskOrder,
+    TaskQuery,
+    TaskStatus,
+    TaskTopologyCycle,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+    TaskTopologyQuery,
+    TaskTopologyStoreResult,
+    TaskTopologyTraversalLimitExceeded,
+    decode_task_topology_cursor,
+)
 from cayu.runtime.tool_rounds import ToolRoundRecoveryRequest
 from cayu.runtime.usage import (
     AggregateUsageMetrics,
@@ -1554,6 +1568,263 @@ def _serialize_session_topology_cursor(
                 ),
             )
     return cursor
+
+
+def _task_topology_nodes(
+    result: TaskTopologyStoreResult,
+) -> tuple[TaskTopologyNode, ...]:
+    nodes_by_id: dict[str, TaskTopologyNode] = {}
+    for node in (
+        *result.expanded_parents,
+        *(task for branch in result.session_branches for task in branch.tasks),
+        *(task for branch in result.child_branches for task in branch.children),
+    ):
+        nodes_by_id.setdefault(node.id, node)
+    return tuple(nodes_by_id.values())
+
+
+def _require_safe_task_topology_authority(
+    cayu_app: Any,
+    result: TaskTopologyStoreResult,
+) -> None:
+    """Fail closed when redaction would corrupt task identity or linkage."""
+
+    structural_values: set[str] = set()
+    for node in _task_topology_nodes(result):
+        structural_values.add(node.id)
+        if node.session_id is not None:
+            structural_values.add(node.session_id)
+        if node.parent_task_id is not None:
+            structural_values.add(node.parent_task_id)
+    structural_values.update(branch.session_id for branch in result.session_branches)
+    structural_values.update(branch.parent_task_id for branch in result.child_branches)
+    for value in structural_values:
+        redacted = _redact_control_plane_json(
+            cayu_app,
+            value,
+            "task_topology.authority",
+        )
+        if type(redacted) is not str or redacted != value:
+            raise HTTPException(
+                status_code=409,
+                detail=("Task topology identity cannot cross the configured redaction boundary."),
+            )
+
+
+def _serialize_task_topology_node(
+    cayu_app: Any,
+    node: TaskTopologyNode,
+) -> dict[str, Any]:
+    serialized = _redact_control_plane_values(
+        cayu_app,
+        {
+            "id": node.id,
+            "type": node.type,
+            "title": node.title,
+            "status": node.status.value,
+            "status_reason": node.status_reason,
+            "session_id": node.session_id,
+            "parent_task_id": node.parent_task_id,
+            "assigned_agent_name": node.assigned_agent_name,
+            "created_at": node.created_at.isoformat(),
+            "updated_at": node.updated_at.isoformat(),
+        },
+        "task_topology.node",
+        preserve_string_fields={"created_at", "status", "updated_at"},
+    )
+    truncated_fields = set(node.truncated_fields)
+    for field_name in (
+        "type",
+        "title",
+        "assigned_agent_name",
+        "status_reason",
+    ):
+        value = serialized[field_name]
+        if value is not None and len(value.encode("utf-8")) > (
+            TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES
+        ):
+            # Replacing a short secret with the redaction marker can enlarge a
+            # field beyond the store projection's bound. Omit it truthfully
+            # rather than letting post-redaction output escape that ceiling.
+            serialized[field_name] = None
+            truncated_fields.add(field_name)
+    canonical_fields = ("type", "title", "assigned_agent_name", "status_reason")
+    serialized["truncated_fields"] = [
+        field_name for field_name in canonical_fields if field_name in truncated_fields
+    ]
+    return serialized
+
+
+def _serialize_task_topology_cursor(
+    cayu_app: Any,
+    cursor: str | None,
+    *,
+    scope_kind: Literal["session", "parent_task"],
+    scope_id: str,
+) -> str | None:
+    if cursor is None:
+        return None
+    redacted_cursor = _redact_control_plane_json(
+        cayu_app,
+        cursor,
+        "task_topology.cursor",
+    )
+    if type(redacted_cursor) is not str or redacted_cursor != cursor:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Task topology cannot continue because its cursor authority "
+                "contains a configured workload secret."
+            ),
+        )
+    try:
+        _, task_id = decode_task_topology_cursor(
+            cursor,
+            scope_kind=scope_kind,
+            scope_id=scope_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="The task store returned an invalid topology cursor.",
+        ) from exc
+    for field_name, value in (("scope_id", scope_id), ("task_id", task_id)):
+        redacted = _redact_control_plane_json(
+            cayu_app,
+            value,
+            f"task_topology.cursor.{field_name}",
+        )
+        if type(redacted) is not str or redacted != value:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Task topology cannot continue because its cursor authority "
+                    "contains a configured workload secret."
+                ),
+            )
+    return cursor
+
+
+def _serialize_task_topology_projection(
+    cayu_app: Any,
+    result: TaskTopologyStoreResult | None,
+    *,
+    status: Literal["available", "not_configured", "unsupported"],
+) -> dict[str, Any]:
+    if result is None:
+        return {
+            "status": status,
+            "observed_at": None,
+            "session_branches": [],
+            "expanded_parents": [],
+            "child_branches": [],
+            "unique_node_count": 0,
+        }
+    return {
+        "status": "available",
+        "observed_at": result.observed_at,
+        "session_branches": [
+            {
+                "session_id": branch.session_id,
+                "tasks": [_serialize_task_topology_node(cayu_app, task) for task in branch.tasks],
+                "next_cursor": _serialize_task_topology_cursor(
+                    cayu_app,
+                    branch.next_cursor,
+                    scope_kind="session",
+                    scope_id=branch.session_id,
+                ),
+                "has_more": branch.has_more,
+            }
+            for branch in result.session_branches
+        ],
+        "expanded_parents": [
+            _serialize_task_topology_node(cayu_app, node) for node in result.expanded_parents
+        ],
+        "child_branches": [
+            {
+                "parent_task_id": branch.parent_task_id,
+                "children": [
+                    _serialize_task_topology_node(cayu_app, child) for child in branch.children
+                ],
+                "next_cursor": _serialize_task_topology_cursor(
+                    cayu_app,
+                    branch.next_cursor,
+                    scope_kind="parent_task",
+                    scope_id=branch.parent_task_id,
+                ),
+                "has_more": branch.has_more,
+            }
+            for branch in result.child_branches
+        ],
+        "unique_node_count": len(_task_topology_nodes(result)),
+    }
+
+
+def _execution_topology_edges(
+    session_result: SessionTopologyStoreResult,
+    task_result: TaskTopologyStoreResult | None,
+) -> list[dict[str, Any]]:
+    session_nodes_by_id: dict[str, SessionTopologyNode] = {}
+    for node in (
+        session_result.focus,
+        *session_result.ancestors,
+        *session_result.expanded_parents,
+        *(child for branch in session_result.branches for child in branch.children),
+    ):
+        session_nodes_by_id.setdefault(node.id, node)
+
+    edges: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def append_edge(
+        kind: Literal["session_parent", "task_parent", "task_session"],
+        source_id: str,
+        target_id: str,
+        *,
+        target_loaded: bool,
+    ) -> None:
+        key = (kind, source_id, target_id)
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append(
+            {
+                "kind": kind,
+                "source_id": source_id,
+                "target_id": target_id,
+                "target_loaded": target_loaded,
+            }
+        )
+
+    loaded_session_ids = set(session_nodes_by_id)
+    for node in session_nodes_by_id.values():
+        if node.parent_session_id is not None:
+            append_edge(
+                "session_parent",
+                node.id,
+                node.parent_session_id,
+                target_loaded=node.parent_session_id in loaded_session_ids,
+            )
+
+    if task_result is not None:
+        task_nodes = _task_topology_nodes(task_result)
+        loaded_task_ids = {node.id for node in task_nodes}
+        for node in task_nodes:
+            if node.parent_task_id is not None:
+                append_edge(
+                    "task_parent",
+                    node.id,
+                    node.parent_task_id,
+                    target_loaded=node.parent_task_id in loaded_task_ids,
+                )
+            if node.session_id is not None:
+                append_edge(
+                    "task_session",
+                    node.id,
+                    node.session_id,
+                    target_loaded=node.session_id in loaded_session_ids,
+                )
+    return edges
 
 
 def _redact_control_plane_json(cayu_app: Any, value: Any, field_name: str) -> Any:
@@ -3829,6 +4100,111 @@ def create_router(
             ) from exc
 
         _require_safe_session_topology_authority(cayu_app, result)
+        loaded_session_ids = {
+            result.focus.id,
+            *(node.id for node in result.ancestors),
+            *(node.id for node in result.expanded_parents),
+            *(child.id for branch in result.branches for child in branch.children),
+        }
+        linked_task_session_ids = (
+            body.linked_task_session_ids if body.linked_task_session_ids else (result.focus.id,)
+        )
+        if set(linked_task_session_ids).difference(loaded_session_ids):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "linked_task_session_ids may contain only sessions loaded by "
+                    "this topology request."
+                ),
+            )
+        if set(body.task_session_cursors).difference(linked_task_session_ids):
+            raise HTTPException(
+                status_code=422,
+                detail=("task_session_cursors keys must identify selected task-linked sessions."),
+            )
+        if set(body.task_child_cursors).difference(body.expanded_task_parent_ids):
+            raise HTTPException(
+                status_code=422,
+                detail=("task_child_cursors keys must identify expanded task parents."),
+            )
+        for session_id_with_cursor, cursor in body.task_session_cursors.items():
+            try:
+                decode_task_topology_cursor(
+                    cursor,
+                    scope_kind="session",
+                    scope_id=session_id_with_cursor,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid task topology cursor.",
+                ) from exc
+        for parent_task_id, cursor in body.task_child_cursors.items():
+            try:
+                decode_task_topology_cursor(
+                    cursor,
+                    scope_kind="parent_task",
+                    scope_id=parent_task_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid task topology cursor.",
+                ) from exc
+        try:
+            task_query = TaskTopologyQuery(
+                linked_session_ids=linked_task_session_ids,
+                session_cursors=body.task_session_cursors,
+                expanded_parent_ids=body.expanded_task_parent_ids,
+                child_cursors=body.task_child_cursors,
+                session_task_limit=body.task_session_limit,
+                child_limit=body.task_child_limit,
+            )
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=exc.errors(include_input=False),
+            ) from exc
+
+        task_result: TaskTopologyStoreResult | None = None
+        if task_store is None:
+            task_projection_status: Literal["available", "not_configured", "unsupported"] = (
+                "not_configured"
+            )
+        elif not task_store.supports_task_topology:
+            task_projection_status = "unsupported"
+        else:
+            try:
+                task_result = await task_store.query_task_topology(task_query)
+                task_result.validate_for_query(task_query)
+            except KeyError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail="A requested expanded task parent was not found.",
+                ) from exc
+            except TaskTopologyCycle as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The loaded durable task topology contains a cycle.",
+                ) from exc
+            except TaskTopologyTraversalLimitExceeded as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "Task topology ancestry exceeds the server's bounded validation limits."
+                    ),
+                ) from exc
+            except (TaskTopologyInconsistent, ValidationError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The task store returned an inconsistent topology projection.",
+                ) from exc
+            except NotImplementedError:
+                task_projection_status = "unsupported"
+            else:
+                task_projection_status = "available"
+                _require_safe_task_topology_authority(cayu_app, task_result)
+
         serialized_branches = []
         for branch in result.branches:
             next_cursor = _serialize_session_topology_cursor(
@@ -3861,6 +4237,7 @@ def create_router(
         response_value = SessionTopologyResponse.model_validate(
             {
                 "observed_at": observed_at,
+                "cross_store_atomic": False,
                 "focus": _serialize_session_topology_node(cayu_app, result.focus),
                 "ancestors": [
                     _serialize_session_topology_node(cayu_app, node) for node in result.ancestors
@@ -3871,6 +4248,12 @@ def create_router(
                 ],
                 "branches": serialized_branches,
                 "unique_node_count": len(unique_node_ids),
+                "task_projection": _serialize_task_topology_projection(
+                    cayu_app,
+                    task_result,
+                    status=task_projection_status,
+                ),
+                "edges": _execution_topology_edges(result, task_result),
             }
         )
         response_payload = response_value.model_dump(mode="json")
@@ -3882,7 +4265,7 @@ def create_router(
                 status_code=413,
                 detail=(
                     "Session topology exceeds max_result_bytes. Request fewer "
-                    "expanded branches or a smaller child_limit."
+                    "expanded session/task branches or smaller branch limits."
                 ),
             )
         response.headers["Cache-Control"] = "private, no-store"
