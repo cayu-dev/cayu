@@ -225,7 +225,9 @@ from cayu.runtime.context import (
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage import (
     InMemoryKnowledgeStore,
+    KnowledgeChunk,
     KnowledgeEntry,
+    KnowledgeHit,
     SQLiteBudgetLedger,
     SQLiteSessionStore,
 )
@@ -243,7 +245,7 @@ from cayu.tools.commands import (
     CommandRequest,
 )
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import ResolvedSecret, SecretRedactor, SecretRef, StaticVault
+from cayu.vaults import REDACTED_SECRET, ResolvedSecret, SecretRedactor, SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace, Workspace, WorkspaceListResult, WorkspaceReadResult
 
 
@@ -2104,6 +2106,240 @@ def test_cayu_app_knowledge_injection_caps_inserted_context_bytes() -> None:
     assert "[knowledge context truncated]" in injected_text
     injected_event = next(event for event in events if event.type == EventType.KNOWLEDGE_INJECTED)
     assert injected_event.payload["injected_bytes"] <= 220
+
+
+@pytest.mark.parametrize("cutoff_delta", [-1, 0, 1])
+def test_knowledge_injection_redacts_complete_field_before_byte_cutoff(
+    cutoff_delta: int,
+) -> None:
+    secret = "knowledge-cutoff-boundary-secret"
+    max_bytes = 1_000
+    baseline_hit = KnowledgeHit(
+        entry=KnowledgeEntry(id="entry", text=secret, title="title"),
+    )
+    baseline, _ = runtime_context_module._format_knowledge_injection(
+        [baseline_hit],
+        prefix="Knowledge:",
+        max_bytes=10_000,
+    )
+    baseline_start = baseline.encode().index(secret.encode())
+    retained_bytes = max_bytes - len(
+        runtime_context_module._KNOWLEDGE_INJECTION_TRUNCATION_MARKER.encode()
+    )
+    target_start = retained_bytes - len(secret.encode()) + cutoff_delta
+    filler = "x" * (target_start - baseline_start)
+    hit = KnowledgeHit(
+        entry=KnowledgeEntry(id="entry", text=filler + secret + ":tail", title="title"),
+    )
+
+    injected, injected_bytes = runtime_context_module._format_knowledge_injection(
+        [hit],
+        prefix="Knowledge:",
+        max_bytes=max_bytes,
+        redactor=SecretRedactor(secret),
+    )
+
+    assert injected_bytes <= max_bytes
+    assert secret not in injected
+    assert secret[:12] not in injected
+    assert secret[-12:] not in injected
+    assert REDACTED_SECRET in injected
+
+
+def test_knowledge_injection_redacts_all_complete_model_facing_fields() -> None:
+    secret = "knowledge-field-secret"
+    hit = KnowledgeHit(
+        entry=KnowledgeEntry(
+            id=f"id:{secret}",
+            kind=f"kind:{secret}",
+            title=f"title:{secret}",
+            text=f"text:{secret}",
+        )
+    )
+
+    injected, _ = runtime_context_module._format_knowledge_injection(
+        [hit],
+        prefix=f"prefix:{secret}",
+        max_bytes=2_000,
+        redactor=SecretRedactor(secret),
+    )
+
+    assert secret not in injected
+    assert injected.count(REDACTED_SECRET) == 5
+
+
+def test_knowledge_injection_stops_scanning_once_its_redacted_bound_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BoundedCallRedactor(SecretRedactor):
+        def redact_text(self, value: str) -> str:
+            # Final stabilization may revisit the bounded capture, but the
+            # formatter must never pass an entire unbounded source here.
+            assert len(value.encode("utf-8")) <= 256
+            return super().redact_text(value)
+
+    first = KnowledgeHit(
+        entry=KnowledgeEntry(
+            id="first",
+            text="large source " * 100_000,
+        ),
+    )
+    second = KnowledgeHit(
+        entry=KnowledgeEntry(
+            id="second",
+            text="must never be inspected",
+        ),
+    )
+    original_complete_text = runtime_context_module._complete_knowledge_hit_text
+
+    def guarded_complete_text(hit: KnowledgeHit) -> str:
+        if hit is second:
+            raise AssertionError("formatter inspected a hit beyond its observable bound")
+        return original_complete_text(hit)
+
+    monkeypatch.setattr(
+        runtime_context_module,
+        "_complete_knowledge_hit_text",
+        guarded_complete_text,
+    )
+
+    injected, injected_bytes = runtime_context_module._format_knowledge_injection(
+        [first, second],
+        prefix="Knowledge:",
+        max_bytes=128,
+        redactor=BoundedCallRedactor("unrelated-secret"),
+    )
+
+    assert injected_bytes <= 128
+    assert "[knowledge context truncated]" in injected
+    assert "must never be inspected" not in injected
+
+
+def test_knowledge_injection_bounds_an_ambiguous_marker_chain() -> None:
+    hit = KnowledgeHit(
+        entry=KnowledgeEntry(
+            id="entry",
+            text="[" + "a" * 100_000,
+        ),
+    )
+
+    injected, injected_bytes = runtime_context_module._format_knowledge_injection(
+        [hit],
+        prefix="Knowledge:",
+        max_bytes=512,
+        redactor=SecretRedactor(["[", "]a"]),
+    )
+
+    assert injected_bytes <= 512
+    assert injected.startswith("Knowledge:")
+    assert runtime_context_module._KNOWLEDGE_INJECTION_CLOSE_TAG not in injected
+    assert REDACTED_SECRET[:8] not in injected
+
+
+def test_knowledge_injection_does_not_publish_a_store_truncated_secret_preview() -> None:
+    secret = "knowledge-store-preview-secret"
+    preview_prefix = secret[:14]
+    hit = KnowledgeHit(
+        entry=KnowledgeEntry(
+            id="entry",
+            text=f"authoritative:{secret}:tail",
+        ),
+        text_preview=f"authoritative:{preview_prefix}",
+    )
+
+    injected, _ = runtime_context_module._format_knowledge_injection(
+        [hit],
+        prefix="Knowledge:",
+        max_bytes=1_000,
+        redactor=SecretRedactor(secret),
+    )
+
+    assert secret not in injected
+    assert preview_prefix not in injected
+    assert f"authoritative:{REDACTED_SECRET}:tail" in injected
+
+
+def test_knowledge_injection_preserves_the_complete_selected_preview_source() -> None:
+    secret = "knowledge-selected-source-secret"
+    title_hit = KnowledgeHit(
+        entry=KnowledgeEntry(
+            id="title-entry",
+            title=f"title:{secret}:tail",
+            text="different entry text",
+        ),
+        reason="title match",
+        text_preview=f"title:{secret[:10]}",
+    )
+    chunk_hit = KnowledgeHit(
+        entry=KnowledgeEntry(id="chunk-entry", text="different entry text"),
+        chunk=KnowledgeChunk(
+            id="chunk",
+            entry_id="chunk-entry",
+            text=f"chunk:{secret}:tail",
+            chunk_index=0,
+        ),
+        reason="chunk text match",
+        text_preview=f"chunk:{secret[:10]}",
+    )
+
+    injected, _ = runtime_context_module._format_knowledge_injection(
+        [title_hit, chunk_hit],
+        prefix="Knowledge:",
+        max_bytes=2_000,
+        redactor=SecretRedactor(secret),
+    )
+
+    assert secret not in injected
+    assert f"title:{REDACTED_SECRET}:tail" in injected
+    assert f"chunk:{REDACTED_SECRET}:tail" in injected
+    assert injected.count("different entry text") == 0
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_source"),
+    [
+        ("semantic chunk match", "chunk"),
+        ("hybrid semantic chunk match; chunk text match", "chunk"),
+        ("hybrid semantic chunk match; title match", "title"),
+        ("hybrid semantic chunk match; entry text match", "entry"),
+    ],
+)
+def test_knowledge_injection_preserves_semantic_selected_preview_source(
+    reason: str,
+    expected_source: str,
+) -> None:
+    shared_prefix = "selected semantic prefix"
+    sources = {
+        "title": f"{shared_prefix}:title-tail",
+        "entry": f"{shared_prefix}:entry-tail",
+        "chunk": f"{shared_prefix}:chunk-tail",
+    }
+    hit = KnowledgeHit(
+        entry=KnowledgeEntry(
+            id="semantic-entry",
+            title=sources["title"],
+            text=sources["entry"],
+        ),
+        chunk=KnowledgeChunk(
+            id="semantic-chunk",
+            entry_id="semantic-entry",
+            text=sources["chunk"],
+            chunk_index=0,
+        ),
+        reason=reason,
+        text_preview=shared_prefix,
+    )
+
+    injected, _ = runtime_context_module._format_knowledge_injection(
+        [hit],
+        prefix="Knowledge:",
+        max_bytes=2_000,
+    )
+
+    assert f"\n{sources[expected_source]}\n\n</untrusted_knowledge>" in injected
+    for source_name, source_text in sources.items():
+        if source_name != expected_source:
+            assert f"\n{source_text}\n\n</untrusted_knowledge>" not in injected
 
 
 def test_cayu_app_knowledge_injection_search_failure_can_opt_into_fail_open() -> None:

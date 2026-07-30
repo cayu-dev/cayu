@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -31,6 +32,7 @@ from cayu.providers import (
     UsageDialect,
     build_chat_completions_payload,
 )
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.chat_completions import chat_completions_stream_events
 
@@ -961,29 +963,117 @@ async def test_chat_completions_stream_events_raises_on_mid_stream_error_chunk()
                 "message": "upstream connection reset",
                 "type": "server_error",
                 "code": "internal_error",
+                "request_id": "req_stream_error",
             }
         }
 
     with pytest.raises(ChatCompletionsAPIError) as exc_info:
         [event async for event in chat_completions_stream_events(raw_events())]
 
-    assert "upstream connection reset" in str(exc_info.value)
+    assert str(exc_info.value) == (
+        "Chat Completions stream reported an error: [provider response body omitted]"
+    )
     assert exc_info.value.error_type == "server_error"
     assert exc_info.value.error_code == "internal_error"
+    assert exc_info.value.request_id == "req_stream_error"
+    assert exc_info.value.response_body is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "secret_start",
+    [
+        MAX_PROVIDER_ERROR_BODY_CHARS - len("workload-secret-canary-ABCDEFGHIJKLMNOP"),
+        MAX_PROVIDER_ERROR_BODY_CHARS - 10,
+        MAX_PROVIDER_ERROR_BODY_CHARS,
+    ],
+    ids=("ends-at-old-bound", "crosses-old-bound", "starts-at-old-bound"),
+)
+async def test_chat_completions_stream_error_omits_raw_message_at_old_cutoff(
+    secret_start: int,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    raw_event = {
+        "error": {
+            "message": "x" * secret_start + secret,
+            "type": "server_error",
+            "code": "internal_error",
+            "request_id": "req_cutoff",
+        }
+    }
+
+    async def raw_events():
+        yield raw_event
+
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    rendered = repr((str(exc_info.value), vars(exc_info.value)))
+    assert str(exc_info.value) == (
+        "Chat Completions stream reported an error: [provider response body omitted]"
+    )
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+    assert exc_info.value.error_type == "server_error"
+    assert exc_info.value.error_code == "internal_error"
+    assert exc_info.value.request_id == "req_cutoff"
+    assert_cayu_traceback_does_not_retain(exc_info.value, raw_event)
+
+
+@pytest.mark.anyio
+async def test_chat_completions_provider_stream_omits_cutoff_secret_fragment() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "error": {
+                        "message": "x" * (MAX_PROVIDER_ERROR_BODY_CHARS - 10) + secret,
+                        "type": "server_error",
+                        "code": "internal_error",
+                        "request_id": "req_provider_cutoff",
+                    }
+                }
+            ]
+        ]
+    )
+    provider = ChatCompletionsProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="test-model", messages=[Message.text("user", "hello")])
+
+    events = [event async for event in provider.stream(request)]
+
+    rendered = repr([event.model_dump(mode="json") for event in events])
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+    assert events[0].payload["provider_error_type"] == "server_error"
+    assert events[0].payload["provider_error_code"] == "internal_error"
+    assert "request_id" not in events[0].payload
 
 
 @pytest.mark.anyio
 async def test_chat_completions_stream_events_mid_stream_error_context_overflow() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+
     async def raw_events():
         yield {
             "error": {
-                "message": "This model's maximum context length is 8192 tokens.",
+                "message": (
+                    "x" * (MAX_PROVIDER_ERROR_BODY_CHARS + 1)
+                    + " This model's maximum context length is 8192 tokens. "
+                    + secret
+                ),
                 "code": "context_length_exceeded",
             }
         }
 
-    with pytest.raises(ChatCompletionsContextOverflowError):
+    with pytest.raises(ChatCompletionsContextOverflowError) as exc_info:
         [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert str(exc_info.value) == (
+        "Chat Completions stream reported an error: [provider response body omitted]"
+    )
+    assert secret not in repr((str(exc_info.value), vars(exc_info.value)))
+    assert exc_info.value.error_code == "context_length_exceeded"
+    assert exc_info.value.response_body is None
 
 
 @pytest.mark.anyio

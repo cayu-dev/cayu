@@ -35,6 +35,13 @@ from cayu.tools._errors import (
     structured_invalid_arguments,
     tool_argument_validation,
 )
+from cayu.tools._redaction import (
+    active_secret_redactor,
+    active_secret_redactor_snapshot,
+    await_revision_stable_secret_output,
+    record_ambiguous_secret_output,
+    unstable_secret_redaction_result,
+)
 from cayu.workspaces import (
     Workspace,
     WorkspaceReadResult,
@@ -332,13 +339,29 @@ async def _read_workspace_file(
             pages=pages,
             initial_result=result,
         )
-    fetch_offset = max(0, offset - 3)
-    prefix_bytes = offset - fetch_offset
-    result = await workspace.read_bytes(
-        path,
-        offset=fetch_offset,
-        max_bytes=prefix_bytes + max_bytes + 4,
-    )
+
+    async def read_window(redactor):
+        redaction_overlap = redactor.pagination_overlap_utf8_bytes
+        fetch_offset = max(0, offset - redaction_overlap - 3)
+        prefix_bytes = offset - fetch_offset
+        result = await workspace.read_bytes(
+            path,
+            offset=fetch_offset,
+            max_bytes=prefix_bytes + max_bytes + redaction_overlap + 4,
+        )
+        return result, redaction_overlap, fetch_offset
+
+    captured = await await_revision_stable_secret_output(ctx, read_window)
+    if captured is None:
+        return unstable_secret_redaction_result()
+    (result, redaction_overlap, fetch_offset), capture_snapshot = captured
+    redactor = capture_snapshot.redactor
+    if result.offset != fetch_offset:
+        return _secret_redaction_window_unavailable_result(
+            offset=offset,
+            required_window_start=fetch_offset,
+            observed_window_start=result.offset,
+        )
     page_or_error = _utf8_workspace_page(
         result,
         path=path,
@@ -366,9 +389,38 @@ async def _read_workspace_file(
         return invalid_tool_arguments_result(
             ValueError("Tool argument `pages` is only valid for PDF files.")
         )
-    text = page.decode("utf-8")
-    truncated = next_offset is not None
+    page_end = offset + len(page)
+    required_window_end = min(
+        result.total_bytes,
+        page_end + redaction_overlap,
+    )
+    observed_window_end = result.offset + len(result.content)
+    if observed_window_end < required_window_end:
+        return _secret_redaction_window_unavailable_result(
+            offset=offset,
+            required_window_end=required_window_end,
+            observed_window_end=observed_window_end,
+        )
+    if redactor.has_values:
+        text, redaction_truncated = redactor.redact_utf8_page(
+            result.content,
+            window_offset=result.offset,
+            page_offset=offset,
+            page_end=page_end,
+            max_bytes=max_bytes,
+            source_complete=next_offset is None,
+        )
+    else:
+        # With no registered values there is no redaction boundary to enforce.
+        # In particular, a literal public marker is ordinary workspace content
+        # and must remain byte-for-byte pageable instead of becoming an atomic
+        # replacement token.
+        text = page.decode("utf-8")
+        redaction_truncated = False
+    truncated = next_offset is not None or redaction_truncated
     complete = offset == 0 and not truncated
+    if not complete:
+        record_ambiguous_secret_output(ctx, capture_snapshot)
     structured = {
         "source": "workspace",
         "path": path,
@@ -384,6 +436,35 @@ async def _read_workspace_file(
     return ToolResult(
         content=_model_visible_workspace_text(text, structured),
         structured=structured,
+    )
+
+
+def _secret_redaction_window_unavailable_result(
+    *,
+    offset: int,
+    required_window_start: int | None = None,
+    observed_window_start: int | None = None,
+    required_window_end: int | None = None,
+    observed_window_end: int | None = None,
+) -> ToolResult:
+    structured = {
+        "error": "secret_redaction_window_unavailable",
+        "offset": offset,
+    }
+    if required_window_start is not None:
+        structured["required_window_start"] = required_window_start
+    if observed_window_start is not None:
+        structured["observed_window_start"] = observed_window_start
+    if required_window_end is not None:
+        structured["required_window_end"] = required_window_end
+    if observed_window_end is not None:
+        structured["observed_window_end"] = observed_window_end
+    return ToolResult(
+        content=(
+            "Workspace text could not be safely paginated with the active secret-redaction scope."
+        ),
+        structured=structured,
+        is_error=True,
     )
 
 
@@ -768,12 +849,18 @@ class TextArtifactReader:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `pages` is only valid for PDF artifacts.")
             )
-        text = request.initial_read.content.decode("utf-8", errors="replace")
+        text, redaction_truncated = active_secret_redactor(request.ctx).redact_utf8_head(
+            request.initial_read.content,
+            max_bytes=request.options.max_bytes,
+            source_complete=not request.initial_read.truncated,
+        )
+        truncated = request.initial_read.truncated or redaction_truncated
         return ToolResult(
-            content=f"{text}\n\n[file truncated]" if request.initial_read.truncated else text,
+            content=f"{text}\n\n[file truncated]" if truncated else text,
             structured={
                 **request.structured,
                 "encoding": "utf-8",
+                "truncated": truncated,
             },
         )
 
@@ -1345,11 +1432,14 @@ class EditFileTool(Tool):
                 tofile=f"b/{path}",
             )
         )
-        diff_preview, diff_truncated = _truncate_utf8_text(
+        diff_snapshot = active_secret_redactor_snapshot(ctx)
+        diff_preview, diff_truncated = diff_snapshot.redactor.redact_text_bounded_with_marker(
             diff,
-            max_diff_bytes,
-            marker="\n[edit diff truncated]",
+            max_bytes=max_diff_bytes,
+            truncation_marker="\n[edit diff truncated]",
         )
+        if diff_truncated:
+            record_ambiguous_secret_output(ctx, diff_snapshot)
         try:
             mutation = await workspace.replace_bytes(
                 path,
@@ -1750,19 +1840,23 @@ class ListArtifactsTool(Tool):
 
 
 def _require_workspace(ctx: ToolContext) -> Workspace | None:
-    if ctx.workspace is None:
+    authority = ctx._authoritative_workspace_for_builtin()
+    workspace = authority if authority is not None else ctx.workspace
+    if workspace is None:
         return None
-    if not isinstance(ctx.workspace, Workspace):
+    if not isinstance(workspace, Workspace):
         raise TypeError("Tool context workspace must implement Workspace.")
-    return ctx.workspace
+    return workspace
 
 
 def _require_artifact_store(ctx: ToolContext) -> ArtifactStore | None:
-    if ctx.artifact_store is None:
+    authority = ctx._authoritative_artifact_store_for_builtin()
+    artifact_store = authority if authority is not None else ctx.artifact_store
+    if artifact_store is None:
         return None
-    if not isinstance(ctx.artifact_store, ArtifactStore):
+    if not isinstance(artifact_store, ArtifactStore):
         raise TypeError("Tool context artifact_store must implement ArtifactStore.")
-    return ctx.artifact_store
+    return artifact_store
 
 
 async def _read_artifact_store(

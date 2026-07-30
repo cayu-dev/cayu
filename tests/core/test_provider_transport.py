@@ -22,18 +22,24 @@ import pytest
 
 from cayu.providers import (
     AnthropicAPIError,
+    AnthropicError,
     ChatCompletionsAPIError,
+    ChatCompletionsError,
     ChatCompletionsProtocolError,
     HttpxAnthropicTransport,
     HttpxChatCompletionsTransport,
     HttpxOpenAITransport,
     HttpxVertexTransport,
+    ModelProviderError,
     OpenAIAPIError,
+    OpenAIError,
     OpenAIProtocolError,
     VertexAPIError,
+    VertexError,
 )
 from cayu.providers._http import (
     SharedAsyncClient,
+    credential_safe_error_event,
     new_async_client,
     retry_after_seconds,
     validate_base_url,
@@ -56,6 +62,90 @@ class _StreamingResponse:
             if self._heartbeat_sleep_s:
                 await asyncio.sleep(self._heartbeat_sleep_s)
             yield line
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "provider_label"),
+    [
+        ("openai", "OpenAI"),
+        ("chat_completions", "Chat Completions"),
+        ("anthropic", "Anthropic"),
+        ("vertex", "Vertex"),
+    ],
+)
+def test_provider_error_projection_omits_arbitrary_identity_strings(
+    provider_name: str,
+    provider_label: str,
+) -> None:
+    secret = "provider-identity-secret-canary-ABCDEFGHIJKLMNOP"
+    error = ModelProviderError(
+        "fixed provider failure",
+        provider=provider_name,
+        status_code=500,
+        error_type=secret,
+        error_code=secret[:16],
+        request_id=secret,
+        retryable=True,
+    )
+
+    event = credential_safe_error_event(
+        error,
+        provider_label=provider_label,
+        provider_name=provider_name,
+        credential_values=("provider-credential",),
+    )
+
+    assert event.payload["status_code"] == 500
+    assert event.payload["retryable"] is True
+    assert "provider_error_type" not in event.payload
+    assert "provider_error_code" not in event.payload
+    assert "request_id" not in event.payload
+    assert secret not in repr(event.payload)
+    assert secret[:16] not in repr(event.payload)
+
+
+@pytest.mark.parametrize("credential_values", [(), ("provider-credential",)])
+def test_provider_error_projection_omits_arbitrary_exception_type_names(
+    credential_values: tuple[str, ...],
+) -> None:
+    secret = "provider_identity_secret_canary_ABCDEFGHIJKLMNOP"
+    secret_named_error = type(secret, (RuntimeError,), {})
+
+    event = credential_safe_error_event(
+        secret_named_error("fixed failure"),
+        provider_label="OpenAI",
+        provider_name="openai",
+        credential_values=credential_values,
+    )
+
+    assert event.payload["error_type"] == "Exception"
+    assert event.payload["error"] == "Exception: OpenAI provider failed"
+    assert secret not in repr(event.payload)
+
+
+@pytest.mark.parametrize(
+    ("error_type", "provider_name", "provider_label"),
+    [
+        (AnthropicError, "anthropic", "Anthropic"),
+        (ChatCompletionsError, "chat_completions", "Chat Completions"),
+        (OpenAIError, "openai", "OpenAI"),
+        (VertexError, "vertex", "Vertex"),
+    ],
+)
+def test_provider_error_projection_preserves_fixed_cayu_exception_types(
+    error_type: type[RuntimeError],
+    provider_name: str,
+    provider_label: str,
+) -> None:
+    event = credential_safe_error_event(
+        error_type("provider-owned fixed failure"),
+        provider_label=provider_label,
+        provider_name=provider_name,
+        credential_values=(),
+    )
+
+    assert event.payload["error_type"] == error_type.__name__
+    assert event.payload["error"] == f"{error_type.__name__}: {provider_label} provider failed"
 
 
 def test_new_async_client_uses_certifi_without_extra_ca(
@@ -283,6 +373,29 @@ async def test_openai_transport_classifies_only_transient_request_errors_as_retr
 
     assert captured.value.error_type == error_type.__name__
     assert captured.value.retryable is retryable
+
+
+@pytest.mark.anyio
+async def test_openai_transport_omits_arbitrary_request_error_subclass_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "transport-subclass-secret-canary-ABCDEFGHIJKLMNOP"
+    secret_error = type(secret, (httpx.RequestError,), {})
+    monkeypatch.setattr(
+        "cayu.providers._http.httpx.AsyncClient",
+        _request_error_client_factory(secret_error),
+    )
+
+    with pytest.raises(OpenAIAPIError) as captured:
+        await HttpxOpenAITransport().create_response(
+            url="https://api.openai.com/v1/responses",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+        )
+
+    assert captured.value.error_type == "RequestError"
+    assert secret not in captured.value.error_type
 
 
 _KEEPALIVE_LINES = [

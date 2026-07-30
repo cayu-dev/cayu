@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from pydantic import (
     BaseModel,
@@ -26,6 +26,9 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
+
+if TYPE_CHECKING:
+    from cayu.runners.base import ExecCommand, ExecResult
 
 
 class ToolEffect(StrEnum):
@@ -355,12 +358,24 @@ class ArtifactStoreHandle(Protocol):
 
 @runtime_checkable
 class RunnerHandle(Protocol):
-    """Structural contract for the command runner handed to tools.
+    """Narrow invocation-aware command capability handed to tools.
 
-    Mirrors ``cayu.runners.Runner``.
+    Runtime-created contexts redact output with the invocation's current secret
+    scope before a runner capture limit can discard matching context. Lifecycle
+    methods and raw runner identity are deliberately not part of this contract.
     """
 
-    async def exec(self, command: Any, **kwargs: Any) -> Any: ...
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = ...,
+    ) -> ExecResult: ...
 
 
 @runtime_checkable
@@ -424,12 +439,44 @@ class ToolContext(BaseModel):
     workspace: WorkspaceHandle | None = Field(default=None, exclude=True)
     artifact_store: ArtifactStoreHandle | None = Field(default=None, exclude=True)
     runner: RunnerHandle | None = Field(default=None, exclude=True)
+    invocation_secret_redactor: Callable[[], Any] | None = Field(default=None, exclude=True)
+    invocation_secret_snapshot_provider: Callable[[], Any] | None = Field(
+        default=None,
+        exclude=True,
+    )
+    invocation_secret_capture_observer: Callable[[int], None] | None = Field(
+        default=None,
+        exclude=True,
+    )
     vault: VaultHandle | None = Field(default=None, exclude=True)
     proxy: CredentialProxyHandle | None = Field(default=None, exclude=True)
     knowledge_store: KnowledgeStoreHandle | None = Field(default=None, exclude=True)
     mcp_servers: tuple[Any, ...] = Field(default_factory=tuple, exclude=True)
     metadata: dict[str, Any] = Field(default_factory=dict)
     _policy_denials: list[_PolicyDenialSignal] = PrivateAttr(default_factory=list)
+    _runtime_workspace_authority: Any = PrivateAttr(default=None)
+    _runtime_artifact_store_authority: Any = PrivateAttr(default=None)
+
+    def _bind_runtime_resource_authorities(
+        self,
+        *,
+        workspace: Any,
+        artifact_store: Any,
+    ) -> None:
+        """Attach raw authorities used only by Cayu-owned capture implementations."""
+
+        if self._runtime_workspace_authority is not None:
+            raise RuntimeError("Runtime workspace authority is already bound.")
+        if self._runtime_artifact_store_authority is not None:
+            raise RuntimeError("Runtime artifact-store authority is already bound.")
+        self._runtime_workspace_authority = workspace
+        self._runtime_artifact_store_authority = artifact_store
+
+    def _authoritative_workspace_for_builtin(self) -> Any:
+        return self._runtime_workspace_authority
+
+    def _authoritative_artifact_store_for_builtin(self) -> Any:
+        return self._runtime_artifact_store_authority
 
     def _record_policy_denial(
         self,

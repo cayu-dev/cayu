@@ -22,6 +22,7 @@ from cayu.runners._cleanup import (
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
 )
+from cayu.runners._redacted_output import redact_completed_exec_result
 from cayu.runners._subprocess import (
     copy_runner_env,
     remove_runner_env,
@@ -37,6 +38,7 @@ from cayu.runners.base import (
     RunnerSystemExecutionMode,
     attach_cancellation_artifacts,
 )
+from cayu.vaults import SecretRedactor
 
 DEFAULT_LAMBDA_MICROVM_CWD = "/workspace"
 DEFAULT_LAMBDA_MICROVM_PORT = 8080
@@ -47,7 +49,7 @@ DEFAULT_LAMBDA_MICROVM_READY_TIMEOUT_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_TOKEN_REFRESH_SKEW_SECONDS = 60.0
 DEFAULT_LAMBDA_MICROVM_EXEC_TIMEOUT_GRACE_SECONDS = 5.0
 DEFAULT_LAMBDA_MICROVM_MIN_POLL_INTERVAL_SECONDS = 0.01
-LAMBDA_MICROVM_PROTOCOL_VERSION = "1"
+LAMBDA_MICROVM_PROTOCOL_VERSION = "2"
 
 LambdaMicroVMCloseAction = Literal["terminate", "suspend", "none"]
 
@@ -192,8 +194,8 @@ class HttpxLambdaMicroVMEndpointTransport:
             raise LambdaMicroVMEndpointUnauthorized("Lambda MicroVM endpoint token was rejected.")
         if response.status_code >= 400:
             raise LambdaMicroVMError(
-                f"Lambda MicroVM endpoint returned HTTP {response.status_code}: "
-                f"{response.text[:1000]}"
+                f"Lambda MicroVM endpoint returned HTTP {response.status_code}; "
+                "response body omitted"
             )
         try:
             decoded = response.json()
@@ -436,6 +438,33 @@ class LambdaMicroVMRunner(Runner):
         return await self._exec(
             command,
             execution_profile="agent",
+            output_redactor=None,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+
+    async def exec_redacted(
+        self,
+        command: ExecCommand,
+        *,
+        redactor: SecretRedactor,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        if not isinstance(redactor, SecretRedactor):
+            raise TypeError("LambdaMicroVMRunner redactor must be a SecretRedactor.")
+        return await self._exec(
+            command,
+            execution_profile="agent",
+            output_redactor=redactor,
             cwd=cwd,
             env=env,
             env_remove=env_remove,
@@ -459,6 +488,7 @@ class LambdaMicroVMRunner(Runner):
         return await self._exec(
             command,
             execution_profile="trusted",
+            output_redactor=None,
             cwd=cwd,
             env=env,
             env_remove=env_remove,
@@ -472,6 +502,7 @@ class LambdaMicroVMRunner(Runner):
         command: ExecCommand,
         *,
         execution_profile: Literal["agent", "trusted"],
+        output_redactor: SecretRedactor | None,
         cwd: str | None,
         env: dict[str, str] | None,
         env_remove: tuple[str, ...],
@@ -504,6 +535,12 @@ class LambdaMicroVMRunner(Runner):
             ),
             "timeout_s": timeout,
             "output_limit_bytes": output_limit,
+            # The sidecar does not receive the workload-secret registry. When
+            # host-side redaction is required, it must therefore omit a
+            # pre-truncated channel whose missing suffix could complete a
+            # secret. Ordinary/system executions retain their established
+            # bounded-output contract.
+            "omit_truncated_output": output_redactor is not None,
         }
         if command.kind == "process":
             payload["argv"] = list(command.argv or [])
@@ -526,6 +563,13 @@ class LambdaMicroVMRunner(Runner):
                     state = _required_response_string(response, "state")
                     if state in {"completed", "cancelled", "failed"}:
                         result = _exec_result(response)
+                        if output_redactor is not None:
+                            result = redact_completed_exec_result(
+                                result,
+                                redactor=output_redactor,
+                                output_limit_bytes=output_limit,
+                                omit_pretruncated=True,
+                            )
                         if result.timed_out:
                             cleanup = await self._cleanup_exec_command(
                                 handle=handle,
@@ -558,7 +602,12 @@ class LambdaMicroVMRunner(Runner):
                 policy=self.timeout_cleanup,
                 start_acknowledged=start_acknowledged,
             )
-            result = await self._host_timeout_result(command_id, cleanup)
+            result = await self._host_timeout_result(
+                command_id,
+                cleanup,
+                output_redactor=output_redactor,
+                output_limit_bytes=output_limit,
+            )
             result.artifacts.append(cleanup.artifact)
             return result
         except Exception:
@@ -594,6 +643,9 @@ class LambdaMicroVMRunner(Runner):
         self,
         command_id: str,
         cleanup: RunnerCleanupResult,
+        *,
+        output_redactor: SecretRedactor | None,
+        output_limit_bytes: int | None,
     ) -> ExecResult:
         result = ExecResult(exit_code=-9, timed_out=True)
         artifact = cleanup.artifact
@@ -608,6 +660,13 @@ class LambdaMicroVMRunner(Runner):
             if state not in {"completed", "cancelled", "failed"}:
                 return result
             terminal = _exec_result(response)
+            if output_redactor is not None:
+                terminal = redact_completed_exec_result(
+                    terminal,
+                    redactor=output_redactor,
+                    output_limit_bytes=output_limit_bytes,
+                    omit_pretruncated=True,
+                )
         except Exception:
             return result
         return ExecResult(

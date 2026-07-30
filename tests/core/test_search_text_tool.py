@@ -30,6 +30,9 @@ from cayu import (
 )
 from cayu.providers import ModelRequest, build_openai_payload
 from cayu.runners import LocalRunner, RunnerUnavailableError
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._runner import InvocationRunnerHandle
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class _ResultRunner(Runner):
@@ -64,6 +67,20 @@ class _ResultRunner(Runner):
         if not self.results:
             raise AssertionError("No configured result remains for Runner.exec().")
         return self.results[0] if self.repeat_result else self.results.pop(0)
+
+
+def test_search_preview_bound_never_splits_redaction_marker() -> None:
+    value = "prefix-" + REDACTED_SECRET + "-suffix"
+
+    bounded, truncated = search_module._truncate_utf8(
+        value,
+        len("prefix-[REDA"),
+        marker=" [match preview truncated]",
+    )
+
+    assert truncated is True
+    assert "[REDA" not in bounded
+    assert len(bounded.encode()) <= len("prefix-[REDA")
 
 
 class _SwapToOutsideSymlinkRunner(LocalRunner):
@@ -150,6 +167,71 @@ def test_search_text_files_mode_returns_a_bounded_page() -> None:
         "projected_content_bytes": len(expected_content.encode("utf-8")),
         "projected_matches_bytes": 41,
     }
+
+
+def test_search_text_uses_invocation_redactor_before_runner_capture_limit() -> None:
+    secret = "search-capture-boundary-secret"
+
+    def redactor_provider() -> SecretRedactor:
+        return SecretRedactor(secret)
+
+    complete_runner = _ResultRunner(
+        ExecResult(
+            stdout=f"src/a.py\0{1}\x1fprefix:{secret}:suffix\n",
+            stdout_bytes=len(secret) + 30,
+        )
+    )
+    context = ToolContext(
+        session_id="sess_1",
+        runner=InvocationRunnerHandle(
+            complete_runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=redactor_provider(),
+            ),
+        ),
+        invocation_secret_redactor=redactor_provider,
+    )
+
+    complete = asyncio.run(
+        SearchTextTool().run(
+            context,
+            {"pattern": "prefix", "mode": "content"},
+        )
+    )
+
+    assert secret not in complete.content
+    assert REDACTED_SECRET in complete.content
+
+    ambiguous_runner = _ResultRunner(
+        ExecResult(
+            stdout=f"src/a.py\0{1}\x1f{secret[:10]}",
+            stdout_truncated=True,
+            stdout_bytes=10_000,
+        )
+    )
+    ambiguous_context = ToolContext(
+        session_id="sess_2",
+        runner=InvocationRunnerHandle(
+            ambiguous_runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=redactor_provider(),
+            ),
+        ),
+        invocation_secret_redactor=redactor_provider,
+    )
+
+    ambiguous = asyncio.run(
+        SearchTextTool().run(
+            ambiguous_context,
+            {"pattern": "prefix", "mode": "content"},
+        )
+    )
+
+    serialized = json.dumps(ambiguous.model_dump(mode="json"))
+    assert secret not in serialized
+    assert secret[:10] not in serialized
 
 
 def test_search_text_content_mode_bounds_a_single_minified_line() -> None:

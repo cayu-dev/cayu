@@ -26,7 +26,13 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
 )
-from cayu.vaults import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
+from cayu.vaults import (
+    SecretEnv,
+    SecretRedactor,
+    SecretRef,
+    SecretResolver,
+    resolve_secret_env,
+)
 
 if TYPE_CHECKING:
     from cayu.environments.admission import (
@@ -160,6 +166,58 @@ class LocalRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
+        operation = self._exec(
+            command,
+            output_redactor=SecretRedactor(),
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        del command, cwd, env, stdin
+        return await operation
+
+    async def exec_redacted(
+        self,
+        command: ExecCommand,
+        *,
+        redactor: SecretRedactor,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        if not isinstance(redactor, SecretRedactor):
+            raise TypeError("LocalRunner redactor must be a SecretRedactor.")
+        operation = self._exec(
+            command,
+            output_redactor=redactor,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        del command, cwd, env, stdin
+        return await operation
+
+    async def _exec(
+        self,
+        command: ExecCommand,
+        *,
+        output_redactor: SecretRedactor,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("LocalRunner command must be an ExecCommand.")
         self._ensure_exec_open()
@@ -175,7 +233,9 @@ class LocalRunner(Runner):
         )
         environment = merge_secret_env_values(environment, resolved_secrets)
         environment = remove_runner_env(environment, env_remove)
-        invocation_redactor = resolved_secret_redactor(resolved_secrets)
+        invocation_redactor = resolved_secret_redactor(resolved_secrets).merged_with(
+            output_redactor
+        )
         subprocess_command = _subprocess_command(command)
         subprocess_run = run_subprocess(
             subprocess_command,

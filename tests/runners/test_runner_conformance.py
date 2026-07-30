@@ -601,7 +601,7 @@ class _ProtocolTransport:
         health: dict[str, Any] | None = None,
         command: dict[str, Any] | None = None,
     ) -> None:
-        self.health_response = health or {"status": "ok", "protocol_version": "1"}
+        self.health_response = health or {"status": "ok", "protocol_version": "2"}
         self.command_response = command or {"state": "not_found"}
 
     async def health(self, **_kwargs: Any) -> dict[str, Any]:
@@ -627,7 +627,7 @@ async def _probe_lambda_microvm_protocol(
         await LambdaMicroVMRunner.create(
             "arn:aws:lambda:us-east-1:123:microvm-image:conformance",
             client=mismatch_client,
-            endpoint_transport=_ProtocolTransport(health={"status": "ok", "protocol_version": "2"}),
+            endpoint_transport=_ProtocolTransport(health={"status": "ok", "protocol_version": "1"}),
             default_cwd=str(root),
             ready_timeout_s=0.2,
             poll_interval_s=0,

@@ -4,7 +4,7 @@ import asyncio
 from typing import Any, cast
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from cayu import (
     Environment,
@@ -22,9 +22,11 @@ from cayu import (
     RememberKnowledgePolicy,
     RememberKnowledgeTool,
     SearchKnowledgeTool,
+    SecretRedactor,
     ToolContext,
     ToolSpec,
 )
+from cayu.core.tools import Tool, ToolEffect, ToolResult
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -32,6 +34,9 @@ from cayu.embeddings import (
     TextEmbeddingResult,
 )
 from cayu.environments import copy_environment
+from cayu.runtime._invocation_secrets import InvocationSecretTracker
+from cayu.runtime._tool_execution import run_tool
+from cayu.vaults import ResolvedSecret
 
 
 class KeywordEmbeddingProvider(TextEmbeddingProvider):
@@ -932,6 +937,229 @@ def test_search_knowledge_caps_model_facing_preview_per_hit() -> None:
     assert "read_knowledge" in result.content
 
 
+@pytest.mark.parametrize("store_max_bytes", [16, 10_000])
+def test_search_knowledge_redacts_preview_before_every_byte_bound(
+    store_max_bytes: int,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="secret",
+                text=secret,
+            )
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=store,
+                invocation_secret_redactor=lambda: SecretRedactor(secret),
+            ),
+            {
+                "query": "workload",
+                "preview_bytes": 16,
+                "max_bytes": store_max_bytes,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    rendered = repr(result.model_dump(mode="json"))
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+    assert result.structured["hits"][0]["text_preview_truncated"] is True
+
+
+def test_search_knowledge_retries_when_secret_resolves_during_store_read() -> None:
+    secret = "knowledge-search-race-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run():
+        search_started = asyncio.Event()
+        allow_search = asyncio.Event()
+
+        class BlockingSearchStore(InMemoryKnowledgeStore):
+            search_calls = 0
+
+            async def search(self, query: KnowledgeQuery):
+                self.search_calls += 1
+                if self.search_calls == 1:
+                    search_started.set()
+                    await allow_search.wait()
+                return await super().search(query)
+
+        store = BlockingSearchStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="secret",
+                text=secret,
+            )
+        )
+        tracker = InvocationSecretTracker(SecretRedactor())
+        task = asyncio.create_task(
+            SearchKnowledgeTool().run(
+                ToolContext(
+                    session_id="session_search_revision",
+                    knowledge_store=store,
+                    invocation_secret_redactor=lambda: tracker.redactor,
+                    invocation_secret_snapshot_provider=tracker.snapshot,
+                    invocation_secret_capture_observer=(tracker.record_ambiguous_output_capture),
+                ),
+                {
+                    "query": "knowledge",
+                    "preview_bytes": 16,
+                    "max_bytes": 16,
+                },
+            )
+        )
+        await search_started.wait()
+        tracker.record(
+            ResolvedSecret(
+                name="token",
+                value=SecretStr(secret),
+            )
+        )
+        allow_search.set()
+        result = await task
+        return result, store.search_calls, tracker.seal_for_publication()
+
+    result, search_calls, publication = asyncio.run(run())
+
+    rendered = repr(result.model_dump(mode="json"))
+    assert search_calls == 2
+    assert publication.unsafe_output is False
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+def test_search_source_bounded_capture_fails_closed_when_secret_resolves_before_publication() -> (
+    None
+):
+    secret = "knowledge-search-late-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(entry_id="secret", text=secret)
+        )
+        tracker = InvocationSecretTracker(SecretRedactor())
+        ctx = ToolContext(
+            session_id="session_search_late_publication",
+            knowledge_store=store,
+            invocation_secret_redactor=lambda: tracker.redactor,
+            invocation_secret_snapshot_provider=tracker.snapshot,
+            invocation_secret_capture_observer=tracker.record_ambiguous_output_capture,
+        )
+
+        class SearchThenResolveTool(Tool):
+            spec = ToolSpec(
+                name="search_then_resolve",
+                description="Exercise the bounded search publication boundary.",
+                input_schema={"type": "object", "properties": {}},
+            )
+
+            async def run(self, tool_ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                result = await SearchKnowledgeTool().run(
+                    tool_ctx,
+                    {
+                        "query": "knowledge",
+                        "preview_bytes": 100,
+                        "max_bytes": 16,
+                    },
+                )
+                tracker.record(ResolvedSecret(name="token", value=SecretStr(secret)))
+                return result
+
+        return await run_tool(
+            tool=SearchThenResolveTool(),
+            effect=ToolEffect.NONE,
+            ctx=ctx,
+            arguments={},
+            redactor=lambda: tracker.redactor,
+            finalize_publication=tracker.seal_for_publication,
+        )
+
+    outcome = asyncio.run(run())
+
+    rendered = repr(outcome)
+    assert outcome.result.is_error is True
+    assert outcome.result.structured["terminal_outcome"] == "invalid_tool_output"
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+def test_search_preview_completeness_uses_the_selected_authoritative_field() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="secret", text=secret[:16]),
+            [
+                KnowledgeChunk(
+                    id="secret:0",
+                    entry_id="secret",
+                    text=secret,
+                    chunk_index=0,
+                )
+            ],
+        )
+        return await SearchKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=store,
+                invocation_secret_redactor=lambda: SecretRedactor(secret),
+            ),
+            {
+                "query": "ABCDEFGHIJKLMNOP",
+                "preview_bytes": 100,
+                "max_bytes": 16,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    rendered = repr(result.model_dump(mode="json"))
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+    assert result.structured["hits"][0]["text_preview_truncated"] is True
+
+
+def test_search_result_limit_does_not_mark_complete_preview_as_truncated() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        indexer = KnowledgeIndexer(store)
+        for entry_id in ("first", "second"):
+            await indexer.index_text(
+                KnowledgeIndexRequest(
+                    entry_id=entry_id,
+                    text="needle complete preview a",
+                )
+            )
+        return await SearchKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=store,
+                invocation_secret_redactor=lambda: SecretRedactor("abc-secret"),
+            ),
+            {
+                "query": "needle",
+                "limit": 1,
+                "preview_bytes": 100,
+                "max_bytes": 10_000,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.structured["truncated"] is True
+    assert result.structured["hits"][0]["text_preview"] == "needle complete preview a"
+    assert result.structured["hits"][0]["text_preview_truncated"] is False
+    assert "[preview truncated]" not in result.content
+
+
 def test_list_knowledge_discovers_entries_and_facets() -> None:
     async def run():
         store = InMemoryKnowledgeStore()
@@ -1303,6 +1531,186 @@ def test_list_knowledge_caps_model_facing_preview_per_entry() -> None:
     assert entry["text_preview_truncated"] is True
     assert len(entry["text_preview"].encode("utf-8")) <= 20
     assert "[preview truncated]" in result.content
+
+
+@pytest.mark.parametrize("store_max_bytes", [16, 10_000])
+def test_list_knowledge_redacts_preview_before_every_byte_bound(
+    store_max_bytes: int,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="secret",
+                text=secret,
+            )
+        )
+        return await ListKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=store,
+                invocation_secret_redactor=lambda: SecretRedactor(secret),
+            ),
+            {
+                "preview_bytes": 16,
+                "max_bytes": store_max_bytes,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    rendered = repr(result.model_dump(mode="json"))
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+    assert result.structured["entries"][0]["text_preview_truncated"] is True
+
+
+def test_list_knowledge_retries_when_secret_resolves_during_store_read() -> None:
+    secret = "knowledge-list-race-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run():
+        list_started = asyncio.Event()
+        allow_list = asyncio.Event()
+
+        class BlockingListStore(InMemoryKnowledgeStore):
+            list_calls = 0
+
+            async def list_entries(self, query):
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    list_started.set()
+                    await allow_list.wait()
+                return await super().list_entries(query)
+
+        store = BlockingListStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="secret",
+                text=secret,
+            )
+        )
+        tracker = InvocationSecretTracker(SecretRedactor())
+        task = asyncio.create_task(
+            ListKnowledgeTool().run(
+                ToolContext(
+                    session_id="session_list_revision",
+                    knowledge_store=store,
+                    invocation_secret_redactor=lambda: tracker.redactor,
+                    invocation_secret_snapshot_provider=tracker.snapshot,
+                    invocation_secret_capture_observer=(tracker.record_ambiguous_output_capture),
+                ),
+                {
+                    "preview_bytes": 16,
+                    "max_bytes": 16,
+                },
+            )
+        )
+        await list_started.wait()
+        tracker.record(
+            ResolvedSecret(
+                name="token",
+                value=SecretStr(secret),
+            )
+        )
+        allow_list.set()
+        result = await task
+        return result, store.list_calls, tracker.seal_for_publication()
+
+    result, list_calls, publication = asyncio.run(run())
+
+    rendered = repr(result.model_dump(mode="json"))
+    assert list_calls == 2
+    assert publication.unsafe_output is False
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+def test_list_source_bounded_capture_fails_closed_when_secret_resolves_before_publication() -> None:
+    secret = "knowledge-list-late-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await KnowledgeIndexer(store).index_text(
+            KnowledgeIndexRequest(entry_id="secret", text=secret)
+        )
+        tracker = InvocationSecretTracker(SecretRedactor())
+        ctx = ToolContext(
+            session_id="session_list_late_publication",
+            knowledge_store=store,
+            invocation_secret_redactor=lambda: tracker.redactor,
+            invocation_secret_snapshot_provider=tracker.snapshot,
+            invocation_secret_capture_observer=tracker.record_ambiguous_output_capture,
+        )
+
+        class ListThenResolveTool(Tool):
+            spec = ToolSpec(
+                name="list_then_resolve",
+                description="Exercise the bounded list publication boundary.",
+                input_schema={"type": "object", "properties": {}},
+            )
+
+            async def run(self, tool_ctx: ToolContext, args: dict) -> ToolResult:
+                del args
+                result = await ListKnowledgeTool().run(
+                    tool_ctx,
+                    {
+                        "preview_bytes": 100,
+                        "max_bytes": 16,
+                    },
+                )
+                tracker.record(ResolvedSecret(name="token", value=SecretStr(secret)))
+                return result
+
+        return await run_tool(
+            tool=ListThenResolveTool(),
+            effect=ToolEffect.NONE,
+            ctx=ctx,
+            arguments={},
+            redactor=lambda: tracker.redactor,
+            finalize_publication=tracker.seal_for_publication,
+        )
+
+    outcome = asyncio.run(run())
+
+    rendered = repr(outcome)
+    assert outcome.result.is_error is True
+    assert outcome.result.structured["terminal_outcome"] == "invalid_tool_output"
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+def test_list_result_limit_does_not_mark_complete_preview_as_truncated() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        indexer = KnowledgeIndexer(store)
+        for entry_id in ("first", "second"):
+            await indexer.index_text(
+                KnowledgeIndexRequest(
+                    entry_id=entry_id,
+                    text="complete listed preview a",
+                )
+            )
+        return await ListKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                knowledge_store=store,
+                invocation_secret_redactor=lambda: SecretRedactor("abc-secret"),
+            ),
+            {
+                "limit": 1,
+                "preview_bytes": 100,
+                "max_bytes": 10_000,
+            },
+        )
+
+    result = asyncio.run(run())
+
+    assert result.structured["truncated"] is True
+    assert result.structured["entries"][0]["text_preview"] == "complete listed preview a"
+    assert result.structured["entries"][0]["text_preview_truncated"] is False
+    assert "[preview truncated]" not in result.content
 
 
 def test_search_knowledge_delegates_mode_support_to_store() -> None:

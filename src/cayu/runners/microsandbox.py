@@ -25,6 +25,7 @@ from cayu.runners._cleanup import (
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
 )
+from cayu.runners._redacted_output import RedactedOutputCapture
 from cayu.runners._subprocess import (
     copy_runner_env,
     remove_runner_env,
@@ -37,11 +38,14 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerExecutionError,
     RunnerUnavailableError,
     RunnerWorkspaceCapability,
     RunnerWorkspaceCapabilityT,
     attach_cancellation_artifacts,
+    runner_execution_error,
 )
+from cayu.vaults import SecretRedactor
 
 DEFAULT_MICROSANDBOX_IMAGE = "python:3.13"
 DEFAULT_MICROSANDBOX_CWD = "/workspace"
@@ -827,6 +831,33 @@ class MicrosandboxRunner(Runner):
         async with self._exec_lock:
             return await self._exec_serialized(
                 command,
+                output_redactor=SecretRedactor(),
+                cwd=cwd,
+                env=env,
+                env_remove=env_remove,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                output_limit_bytes=output_limit_bytes,
+            )
+
+    async def exec_redacted(
+        self,
+        command: ExecCommand,
+        *,
+        redactor: SecretRedactor,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        if not isinstance(redactor, SecretRedactor):
+            raise TypeError("MicrosandboxRunner redactor must be a SecretRedactor.")
+        async with self._exec_lock:
+            return await self._exec_serialized(
+                command,
+                output_redactor=redactor,
                 cwd=cwd,
                 env=env,
                 env_remove=env_remove,
@@ -839,6 +870,7 @@ class MicrosandboxRunner(Runner):
         self,
         command: ExecCommand,
         *,
+        output_redactor: SecretRedactor,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         env_remove: tuple[str, ...] = (),
@@ -861,10 +893,12 @@ class MicrosandboxRunner(Runner):
         sdk_stdin = standard_input.encode("utf-8") if standard_input is not None else None
         output_limit = validate_output_limit(output_limit_bytes)
 
-        stdout = _LimitedBytes(output_limit)
-        stderr = _LimitedBytes(output_limit)
+        stdout = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
+        stderr = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
         handle = None
         exit_code: int | None = None
+        execution_failure: RunnerExecutionError | None = None
+        liveness_diagnostic: dict[str, Any] | None = None
 
         async def run_command() -> None:
             nonlocal exit_code
@@ -911,6 +945,8 @@ class MicrosandboxRunner(Runner):
         try:
             await asyncio.wait_for(run_command(), timeout=timeout)
         except asyncio.CancelledError as exc:
+            stdout.abort()
+            stderr.abort()
             start_acknowledged = handle is not None
             cleanup = await cleanup_runner_command_with_diagnostic(
                 self._sandbox,
@@ -928,45 +964,59 @@ class MicrosandboxRunner(Runner):
             raise
         except Exception as exc:
             if not _is_timeout_error(exc):
+                stdout.abort()
+                stderr.abort()
                 module = _microsandbox_module(self._sandbox_module)
                 if _is_opaque_microsandbox_exec_failure(module, exc):
-                    await self._confirm_agent_available(
-                        {
-                            "exit_code": exit_code,
-                            "timed_out": False,
-                            "cancelled": False,
-                            "stdout_bytes": stdout.total_bytes,
-                            "stderr_bytes": stderr.total_bytes,
-                            "error_type": type(exc).__name__,
-                            "error": str(exc),
-                        }
-                    )
-                raise
-            start_acknowledged = handle is not None
-            cleanup = await cleanup_runner_command_with_diagnostic(
-                self._sandbox,
-                handle=handle,
-                adapter="microsandbox",
-                timeout_s=self.cancel_timeout_s,
-                policy=self.timeout_cleanup,
-            )
-            self._apply_cleanup_result(cleanup)
-            if not start_acknowledged and self.timeout_cleanup == "none":
-                self._close_exec(
-                    "microsandbox command start was not acknowledged; command state is unknown"
+                    liveness_diagnostic = {
+                        "exit_code": exit_code,
+                        "timed_out": False,
+                        "cancelled": False,
+                        "stdout_bytes": stdout.total_bytes,
+                        "stderr_bytes": stderr.total_bytes,
+                        "error_type": type(exc).__name__,
+                    }
+                execution_failure = runner_execution_error(
+                    exc,
+                    adapter="microsandbox",
+                    stdout_bytes=stdout.total_bytes,
+                    stderr_bytes=stderr.total_bytes,
                 )
-            return ExecResult(
-                stdout=stdout.text(),
-                stderr=stderr.text(),
-                exit_code=exit_code if exit_code is not None else -9,
-                timed_out=True,
-                stdout_truncated=stdout.truncated,
-                stderr_truncated=stderr.truncated,
-                stdout_bytes=stdout.total_bytes,
-                stderr_bytes=stderr.total_bytes,
-                artifacts=[cleanup.artifact],
-            )
+            else:
+                stdout.abort()
+                stderr.abort()
+                start_acknowledged = handle is not None
+                cleanup = await cleanup_runner_command_with_diagnostic(
+                    self._sandbox,
+                    handle=handle,
+                    adapter="microsandbox",
+                    timeout_s=self.cancel_timeout_s,
+                    policy=self.timeout_cleanup,
+                )
+                self._apply_cleanup_result(cleanup)
+                if not start_acknowledged and self.timeout_cleanup == "none":
+                    self._close_exec(
+                        "microsandbox command start was not acknowledged; command state is unknown"
+                    )
+                return ExecResult(
+                    stdout=stdout.text(),
+                    stderr=stderr.text(),
+                    exit_code=exit_code if exit_code is not None else -9,
+                    timed_out=True,
+                    stdout_truncated=stdout.truncated,
+                    stderr_truncated=stderr.truncated,
+                    stdout_bytes=stdout.total_bytes,
+                    stderr_bytes=stderr.total_bytes,
+                    artifacts=[cleanup.artifact],
+                )
 
+        if liveness_diagnostic is not None:
+            await self._confirm_agent_available(liveness_diagnostic)
+        if execution_failure is not None:
+            raise execution_failure
+
+        stdout.finish_complete()
+        stderr.finish_complete()
         result = ExecResult(
             stdout=stdout.text(),
             stderr=stderr.text(),
@@ -986,7 +1036,6 @@ class MicrosandboxRunner(Runner):
                     "stdout_bytes": result.stdout_bytes,
                     "stderr_bytes": result.stderr_bytes,
                     "error_type": None,
-                    "error": None,
                 }
             )
         return result
@@ -1040,9 +1089,7 @@ class MicrosandboxRunner(Runner):
             "timeout_s": self.liveness_timeout_s,
             "registry_status": registry_status,
             "error_type": type(ping_error).__name__,
-            "error": str(ping_error),
             "status_error_type": type(status_error).__name__ if status_error is not None else None,
-            "status_error": str(status_error) if status_error is not None else None,
         }
         error = MicrosandboxUnavailableError(
             sandbox_name=self.name,
@@ -1052,7 +1099,7 @@ class MicrosandboxRunner(Runner):
         self._unavailable_last_command = copy_json_value(error.last_command, "last_command")
         self._unavailable_probe = copy_json_value(error.probe, "probe")
         self._close_exec("microsandbox guest agent unavailable after an abnormal command outcome")
-        raise error from ping_error
+        raise error from None
 
     def _apply_cleanup_result(self, cleanup: Any) -> None:
         # Unlike the base contract, a failed command kill does not latch the
@@ -1073,38 +1120,6 @@ class MicrosandboxRunner(Runner):
             and cleanup.artifact.get("status") == "completed"
         ):
             self._closed = True
-
-
-class _LimitedBytes:
-    def __init__(self, limit: int | None) -> None:
-        self.limit = limit
-        self.content = bytearray()
-        self.total_bytes = 0
-        self.truncated = False
-
-    def append(self, data: bytes) -> None:
-        if not data:
-            return
-        self.total_bytes += len(data)
-        if self.limit is None:
-            self.content.extend(data)
-            return
-        remaining = self.limit - len(self.content)
-        if remaining <= 0:
-            self.truncated = True
-            return
-        self.content.extend(data[:remaining])
-        if len(data) > remaining:
-            self.truncated = True
-
-    def replace(self, data: bytes) -> None:
-        self.content.clear()
-        self.total_bytes = 0
-        self.truncated = False
-        self.append(data)
-
-    def text(self) -> str:
-        return bytes(self.content).decode("utf-8", errors="replace")
 
 
 async def _close_quietly(resource: Any) -> None:
@@ -1217,8 +1232,8 @@ def _exec_output_exit_code(output: Any) -> int:
 
 
 def _apply_collected_output(
-    stdout: _LimitedBytes,
-    stderr: _LimitedBytes,
+    stdout: RedactedOutputCapture,
+    stderr: RedactedOutputCapture,
     output: Any,
 ) -> None:
     _replace_with_collected_stream(stdout, output, "stdout")
@@ -1226,12 +1241,12 @@ def _apply_collected_output(
 
 
 def _replace_with_collected_stream(
-    buffer: _LimitedBytes,
+    buffer: RedactedOutputCapture,
     output: Any,
     stream_name: Literal["stdout", "stderr"],
 ) -> None:
     data = _collected_stream_bytes(output, stream_name)
-    if data is not None and (data or not buffer.content):
+    if data is not None and (data or buffer.total_bytes == 0):
         buffer.replace(data)
 
 
@@ -1659,7 +1674,6 @@ def _microsandbox_cleanup_diagnostic(
     }
     if error is not None:
         diagnostic["error_type"] = type(error).__name__
-        diagnostic["error"] = str(error)
     return copy_json_value(diagnostic, "diagnostic")
 
 

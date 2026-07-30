@@ -41,6 +41,7 @@ from cayu.providers._credential_boundary import (
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
+    OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
     aclose_transport,
     copy_headers,
@@ -54,7 +55,6 @@ from cayu.providers._http import (
     safe_error_response_text,
     sanitize_provider_cancellation,
     stream_sse_json_events,
-    truncate_error_text,
     validate_base_url,
     validate_url,
 )
@@ -406,6 +406,7 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             error_event = credential_safe_error_event(
                 exc,
                 provider_label="OpenAI",
+                provider_name="openai",
                 credential_values=credential_sanitization_values(
                     self.api_key,
                     extra_headers=self.extra_headers,
@@ -756,7 +757,16 @@ def openai_response_events(response: Mapping[str, Any]) -> list[ModelStreamEvent
 
     error = response.get("error")
     if error is not None:
-        raise OpenAIProtocolError(f"OpenAI response error: {_safe_error_value(error)}")
+        failure = _openai_error_value_exception(
+            error,
+            safe_message=f"OpenAI response error: {OMITTED_PROVIDER_ERROR_BODY}",
+            request_id=optional_error_string(response.get("request_id")),
+        )
+        # This exported parser is a public exception boundary. Do not retain
+        # the raw provider envelope in traceback frame locals.
+        error = None
+        response = {}
+        raise failure from None
 
     output = response.get("output")
     if not isinstance(output, list):
@@ -917,8 +927,12 @@ async def openai_stream_events(
             completed = True
             continue
         if event_type in {"response.failed", "error"}:
-            _raise_openai_stream_context_overflow_if_applicable(event)
-            raise OpenAIAPIError(f"OpenAI streaming error: {_stream_error_message(event)}")
+            failure = _openai_stream_error_exception(event)
+            # Keep raw provider envelopes out of direct parser tracebacks; the
+            # outer provider wrapper is not the only supported caller.
+            event = {}
+            del events
+            raise failure from None
 
     if not completed:
         raise OpenAIProtocolError("OpenAI streaming response ended before response.completed.")
@@ -1299,40 +1313,50 @@ def _stream_response_object(event: Mapping[str, Any]) -> Mapping[str, Any]:
     return response
 
 
-def _stream_error_message(event: Mapping[str, Any]) -> str:
+def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
     event_type = event.get("type")
     if event_type == "response.failed":
         response = _stream_response_object(event)
         error = response.get("error")
-        if error is not None:
-            return _safe_error_value(error)
-        return _safe_error_value(response)
-    if event_type == "error":
-        return _safe_error_json(event)
-    return _safe_error_value(event)
+        return _openai_error_value_exception(
+            response if error is None else error,
+            safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
+            request_id=optional_error_string(response.get("request_id")),
+        )
+    return _openai_error_value_exception(
+        event,
+        safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
+        request_id=optional_error_string(event.get("request_id")),
+    )
 
 
-def _raise_openai_stream_context_overflow_if_applicable(event: Mapping[str, Any]) -> None:
-    event_type = event.get("type")
-    error: Mapping[str, Any] | None = None
-    request_id = None
-    if event_type == "response.failed":
-        response = _stream_response_object(event)
-        response_error = response.get("error")
-        if isinstance(response_error, Mapping):
-            error = response_error
-        request_id_value = response.get("request_id")
-        if isinstance(request_id_value, str):
-            request_id = request_id_value
-    elif event_type == "error":
-        error = event
-    if error is None:
-        return
-    _raise_openai_context_overflow_from_error(
-        status_code=None,
-        error=error,
-        request_id=request_id,
-        response_body=_stream_error_message(event),
+def _openai_error_value_exception(
+    error: Any,
+    *,
+    safe_message: str,
+    request_id: str | None,
+) -> OpenAIAPIError:
+    error_mapping = error if isinstance(error, Mapping) else {}
+    error_type = optional_error_string(error_mapping.get("type"))
+    error_code = optional_error_string(error_mapping.get("code"))
+    param = optional_error_string(error_mapping.get("param"))
+    resolved_request_id = request_id or optional_error_string(error_mapping.get("request_id"))
+    raw_message = optional_error_string(error_mapping.get("message"))
+    if _is_openai_context_overflow(code=error_code, message=raw_message):
+        return OpenAIContextOverflowError(
+            "OpenAI model context overflow",
+            error_type=error_type,
+            error_code=error_code,
+            request_id=resolved_request_id,
+            response_body=None,
+        )
+    return OpenAIAPIError(
+        safe_message,
+        error_type=error_type,
+        error_code=error_code,
+        param=param,
+        request_id=resolved_request_id,
+        response_body=None,
     )
 
 
@@ -1987,14 +2011,6 @@ def _is_openai_context_overflow(*, code: str | None, message: str | None) -> boo
 
 def _safe_error_json(decoded: Mapping[str, Any]) -> str:
     return safe_error_json(decoded, include_request_id=True)
-
-
-def _safe_error_value(value: Any) -> str:
-    if isinstance(value, Mapping):
-        return _safe_error_json(value)
-    if isinstance(value, str):
-        return truncate_error_text(value)
-    return truncate_error_text(str(value))
 
 
 _STALE_CHAIN_ERROR_CODE = "previous_response_not_found"

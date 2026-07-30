@@ -20,7 +20,12 @@ from types import MappingProxyType
 from typing import Any, TypeVar, cast
 from uuid import uuid4
 
-from cayu._exception_groups import exception_group_children, iter_exception_tree
+from cayu._exception_groups import (
+    exception_cause,
+    exception_group_children,
+    iter_exception_tree,
+    set_exception_cause,
+)
 from cayu._task_wait import (
     consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
@@ -47,6 +52,14 @@ from cayu.core.tools import (
     _bound_policy_denial_text,
 )
 from cayu.mcp import McpToolAdapter, McpToolset
+from cayu.runners._cleanup import (
+    attach_runner_cancellation_failure,
+    pop_runner_cancellation_failure,
+    runner_cancellation_failure,
+    sanitize_runner_artifacts,
+    transfer_runner_cancellation_failures,
+)
+from cayu.runners.base import attach_cancellation_artifacts
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -144,6 +157,16 @@ from cayu.runtime.user_input import (
     PendingUserInput,
     copy_pending_user_input,
     pending_user_input_from_checkpoint,
+)
+from cayu.tools._resources import (
+    invocation_artifact_store_handle,
+    invocation_workspace_handle,
+)
+from cayu.tools._runner import (
+    invocation_runner_handle,
+    is_current_runner_cancellation_group,
+    sanitize_runner_failure,
+    sanitize_runner_failure_group,
 )
 from cayu.vaults import SecretRedactor
 
@@ -1509,6 +1532,12 @@ class ToolRoundExecutor:
         )
         if taint_labels:
             ctx_metadata[TAINT_LABELS_METADATA_KEY] = sorted(taint_labels)
+
+        def redactor_provider():
+            return invocation_secret_scope.redactor
+
+        raw_workspace = _workspace(registered_environment)
+        raw_artifact_store = _artifact_store(registered_environment)
         tool_context = ToolContext(
             session_id=session.id,
             agent_name=registered_agent.spec.name,
@@ -1517,21 +1546,44 @@ class ToolRoundExecutor:
             workspace_id=_workspace_id(registered_environment),
             artifact_store_id=_artifact_store_id(registered_environment),
             idempotency_key=idempotency_key,
-            workspace=_workspace(registered_environment),
-            artifact_store=_artifact_store(registered_environment),
-            runner=_runner(registered_environment),
+            workspace=invocation_workspace_handle(
+                raw_workspace,
+                redactor_snapshot_provider=invocation_secret_scope.snapshot,
+                capture_observer=invocation_secret_scope.record_ambiguous_output_capture,
+            ),
+            artifact_store=invocation_artifact_store_handle(
+                raw_artifact_store,
+                redactor_snapshot_provider=invocation_secret_scope.snapshot,
+                capture_observer=invocation_secret_scope.record_ambiguous_output_capture,
+            ),
+            runner=invocation_runner_handle(
+                _runner(registered_environment),
+                redactor_snapshot_provider=invocation_secret_scope.snapshot,
+                ambiguous_capture_observer=(
+                    invocation_secret_scope.record_ambiguous_output_capture
+                ),
+            ),
+            invocation_secret_redactor=redactor_provider,
+            invocation_secret_snapshot_provider=invocation_secret_scope.snapshot,
+            invocation_secret_capture_observer=(
+                invocation_secret_scope.record_ambiguous_output_capture
+            ),
             vault=invocation_secrets.vault_for_environment(
                 registered_environment,
-                on_resolve=invocation_secret_scope.record,
+                tracker=invocation_secret_scope,
             ),
             proxy=invocation_secrets.proxy_for_environment(
                 registered_environment,
-                on_resolve=invocation_secret_scope.record,
+                tracker=invocation_secret_scope,
                 on_authorize=proxy_authorizations.append,
             ),
             knowledge_store=_knowledge_store(registered_environment),
             mcp_servers=_mcp_servers(registered_environment),
             metadata=ctx_metadata,
+        )
+        tool_context._bind_runtime_resource_authorities(
+            workspace=raw_workspace,
+            artifact_store=raw_artifact_store,
         )
         try:
             execution_outcome = await tool_execution.run_tool(
@@ -1540,8 +1592,24 @@ class ToolRoundExecutor:
                 ctx=tool_context,
                 arguments=effective_tool_call.arguments,
                 redactor=lambda: invocation_secret_scope.redactor,
+                finalize_publication=invocation_secret_scope.seal_for_publication,
                 timeout_seconds=self._tool_timeout_seconds,
             )
+        except BaseExceptionGroup as exc:
+            if is_current_runner_cancellation_group(exc):
+                for candidate in iter_exception_tree(exc):
+                    if not isinstance(candidate, asyncio.CancelledError):
+                        continue
+                    invocation_secrets.initialize_cancellation_evidence(candidate)
+                    invocation_secrets.set_cancellation_redactor(
+                        candidate,
+                        invocation_secret_scope.redactor,
+                    )
+                    invocation_secrets.set_cancellation_tool_call_id(
+                        candidate,
+                        tool_call.id,
+                    )
+            raise
         except asyncio.CancelledError as exc:
             invocation_secrets.initialize_cancellation_evidence(exc)
             invocation_secrets.set_cancellation_redactor(
@@ -2671,6 +2739,8 @@ class ToolRoundRun:
             raise UserInputRequired(pending_input)
 
         segments = self._tool_round_segments(tool_calls)
+        round_task = asyncio.current_task()
+        round_cancellation_baseline = 0 if round_task is None else round_task.cancelling()
         try:
             for run_parallel, segment_calls in segments:
                 if run_parallel:
@@ -2703,7 +2773,76 @@ class ToolRoundRun:
                     break
             if self.stopped_for_limit:
                 return
-        except (SessionInterruptedByRequest, asyncio.CancelledError) as exc:
+        except BaseExceptionGroup as exc:
+            if not is_current_runner_cancellation_group(exc):
+                raise
+            interrupt: asyncio.CancelledError | BaseExceptionGroup = exc
+            interrupt_cause: BaseException | None = None
+            if round_task is not None and round_task.cancelling() > round_cancellation_baseline:
+                cancellation_sources = _ordered_cancellation_sources(
+                    exc,
+                    child_cancellations=[],
+                    tool_calls=tool_calls,
+                )
+                cancellation = _authoritative_task_cancellation(
+                    round_task,
+                    cancellation_sources=cancellation_sources,
+                )
+                _transfer_cancellation_evidence(
+                    cancellation,
+                    cancellation_sources,
+                    tool_calls=tool_calls,
+                )
+                interrupt_cause = _cancellation_failure_cause(
+                    sanitize_runner_failure_group(
+                        exc,
+                        caller_cancelled=True,
+                    ),
+                    runner_cleanup_failures=[],
+                )
+                if interrupt_cause is not None:
+                    attach_runner_cancellation_failure(
+                        cancellation,
+                        interrupt_cause,
+                    )
+                    set_exception_cause(cancellation, interrupt_cause)
+                interrupt = cancellation
+            closure_failed = False
+            try:
+                async for event in self.close_after_interrupt(
+                    interrupt,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    tool_outcomes=tool_outcomes,
+                    tool_round_identity=tool_round_identity,
+                ):
+                    yield event
+            except BaseException:
+                closure_failed = True
+            if closure_failed:
+                _raise_after_interrupted_round_closure_failure(interrupt)
+            if isinstance(interrupt, asyncio.CancelledError):
+                invocation_secrets.sanitize_external_cancellation(interrupt)
+                raise interrupt from exception_cause(interrupt)
+            raise
+        except asyncio.CancelledError as exc:
+            closure_failed = False
+            try:
+                async for event in self.close_after_interrupt(
+                    exc,
+                    messages=messages,
+                    tool_calls=tool_calls,
+                    tool_outcomes=tool_outcomes,
+                    tool_round_identity=tool_round_identity,
+                ):
+                    yield event
+            except BaseException:
+                closure_failed = True
+            if closure_failed:
+                _raise_after_interrupted_round_closure_failure(exc)
+            invocation_secrets.sanitize_external_cancellation(exc)
+            raise
+        except SessionInterruptedByRequest as exc:
             async for event in self.close_after_interrupt(
                 exc,
                 messages=messages,
@@ -2786,11 +2925,27 @@ class ToolRoundRun:
         cancellation_redactors_by_id: dict[str, SecretRedactor] | None = None
         if isinstance(exc, SessionInterruptedByRequest):
             pass
+        elif isinstance(exc, BaseExceptionGroup):
+            if not is_current_runner_cancellation_group(exc):
+                raise TypeError("Unsupported interrupt exception group.")
+            (
+                cancellation_artifacts,
+                cancellation_artifacts_by_id,
+                cancellation_redactors_by_id,
+            ) = _grouped_cancellation_evidence(
+                exc,
+                tool_calls=tool_calls,
+            )
         elif isinstance(exc, asyncio.CancelledError):
-            if not await self._executor._session_control.interrupt_requested(self._session.id):
+            interrupt_requested = await self._executor._session_control.interrupt_requested(
+                self._session.id
+            )
+            has_tool_evidence = invocation_secrets.has_cancellation_evidence(exc)
+            if not interrupt_requested and not has_tool_evidence:
                 invocation_secrets.sanitize_external_cancellation(exc)
                 return
-            clear_current_task_cancellation()
+            if interrupt_requested:
+                clear_current_task_cancellation()
             cancellation_artifacts = invocation_secrets.cancellation_artifacts(exc)
             cancellation_artifacts_by_id = invocation_secrets.cancellation_artifacts_by_id(exc)
             cancellation_redactors_by_id = invocation_secrets.cancellation_redactors_by_id(exc)
@@ -2942,40 +3097,116 @@ class ToolRoundRun:
                     if outcome is not None:
                         tool_outcomes.append(outcome)
 
+        current_cancellation_failure: BaseExceptionGroup | None = None
+        current_cancellation: asyncio.CancelledError | None = None
+        current_cancellation_cause: BaseException | None = None
+        parent_task = asyncio.current_task()
+        cancellation_baseline = 0 if parent_task is None else parent_task.cancelling()
         try:
             async with asyncio.TaskGroup() as task_group:
                 for index, tool_call in enumerate(tool_calls):
                     task_group.create_task(execute_call(index, tool_call))
         except BaseExceptionGroup as exc_group:
             flush_completed_outcomes()
-            raise _parallel_tool_round_exception(exc_group) from exc_group
+            child_runner_failures: list[BaseException] = []
+            observed_runner_failures: set[int] = set()
+
+            def preserve_runner_failure(failure: BaseException | None) -> None:
+                if failure is None or id(failure) in observed_runner_failures:
+                    return
+                observed_runner_failures.add(id(failure))
+                child_runner_failures.append(sanitize_runner_failure(failure))
+
+            for child_cancellation in child_cancellations:
+                if child_cancellation is not None:
+                    preserve_runner_failure(runner_cancellation_failure(child_cancellation))
+            for candidate in iter_exception_tree(exc_group):
+                if not isinstance(candidate, asyncio.CancelledError):
+                    continue
+                preserve_runner_failure(pop_runner_cancellation_failure(candidate))
+                set_exception_cause(candidate, None)
+            cancellation_sources = _ordered_cancellation_sources(
+                exc_group,
+                child_cancellations=child_cancellations,
+                tool_calls=tool_calls,
+            )
+            if parent_task is not None and parent_task.cancelling() > cancellation_baseline:
+                current_cancellation = _authoritative_task_cancellation(
+                    parent_task,
+                    cancellation_sources=cancellation_sources,
+                )
+                _transfer_cancellation_evidence(
+                    current_cancellation,
+                    cancellation_sources,
+                    tool_calls=tool_calls,
+                )
+                if not invocation_secrets.has_cancellation_evidence(current_cancellation):
+                    invocation_secrets.initialize_cancellation_evidence(current_cancellation)
+                sanitized_group = sanitize_runner_failure_group(
+                    exc_group,
+                    caller_cancelled=True,
+                )
+                current_cancellation_cause = _cancellation_failure_cause(
+                    sanitized_group,
+                    runner_cleanup_failures=child_runner_failures,
+                )
+                if current_cancellation_cause is not None:
+                    attach_runner_cancellation_failure(
+                        current_cancellation,
+                        current_cancellation_cause,
+                    )
+                    set_exception_cause(
+                        current_cancellation,
+                        current_cancellation_cause,
+                    )
+            elif any(
+                isinstance(candidate, BaseExceptionGroup)
+                and is_current_runner_cancellation_group(candidate)
+                for candidate in iter_exception_tree(exc_group)
+            ):
+                sanitized_group = sanitize_runner_failure_group(
+                    exc_group,
+                    caller_cancelled=True,
+                )
+                current_cancellation_failure = sanitized_group
+                if child_runner_failures:
+                    current_cancellation_failure = sanitize_runner_failure_group(
+                        BaseExceptionGroup(
+                            "Parallel tool execution and runner cleanup failures.",
+                            [sanitized_group, *child_runner_failures],
+                        ),
+                        caller_cancelled=True,
+                    )
+            else:
+                parallel_failure = _parallel_tool_round_exception(exc_group)
+                if child_runner_failures:
+                    failure_cause = _parallel_tool_round_cause(
+                        exc_group,
+                        primary=parallel_failure,
+                        runner_cleanup_failures=child_runner_failures,
+                    )
+                    raise parallel_failure from failure_cause
+                raise parallel_failure from exc_group
         except asyncio.CancelledError as cancellation:
             flush_completed_outcomes()
-            artifacts_by_id: dict[str, list[dict[str, Any]]] = {}
-            redactors_by_id: dict[str, SecretRedactor] = {}
-            for index, child_exc in enumerate(child_cancellations):
-                if child_exc is None:
-                    continue
-                tool_call_id = tool_calls[index].id
-                child_artifacts = invocation_secrets.cancellation_artifacts(child_exc)
-                child_redactor = invocation_secrets.cancellation_redactor(child_exc)
-                if child_artifacts:
-                    artifacts_by_id[tool_call_id] = child_artifacts
-                if child_redactor is not None:
-                    redactors_by_id[tool_call_id] = child_redactor
-            if artifacts_by_id or redactors_by_id:
-                invocation_secrets.initialize_cancellation_evidence(cancellation)
-            if artifacts_by_id:
-                invocation_secrets.set_cancellation_artifacts_by_id(
-                    cancellation,
-                    artifacts_by_id,
-                )
-            if redactors_by_id:
-                invocation_secrets.set_cancellation_redactors_by_id(
-                    cancellation,
-                    redactors_by_id,
-                )
+            transfer_runner_cancellation_failures(
+                cancellation,
+                child_cancellations,
+            )
+            _transfer_cancellation_evidence(
+                cancellation,
+                [
+                    (child_exc, tool_calls[index].id)
+                    for index, child_exc in enumerate(child_cancellations)
+                    if child_exc is not None
+                ],
+                tool_calls=tool_calls,
+            )
             raise
+        if current_cancellation is not None:
+            raise current_cancellation from current_cancellation_cause
+        if current_cancellation_failure is not None:
+            raise current_cancellation_failure
         for index, tool_call in enumerate(tool_calls):
             if all(outcome is None for _, outcome in buffers[index]):
                 buffers[index].append(
@@ -3100,6 +3331,261 @@ def _parallel_tool_round_exception(group: BaseExceptionGroup) -> BaseException:
         if not isinstance(exc, asyncio.CancelledError):
             return exc
     return flattened[0]
+
+
+def _parallel_tool_round_cause(
+    group: BaseExceptionGroup,
+    *,
+    primary: BaseException,
+    runner_cleanup_failures: list[BaseException],
+) -> BaseException:
+    """Preserve non-primary siblings plus detached runner cleanup evidence."""
+
+    remaining: list[BaseException] = []
+    for candidate in iter_exception_tree(group):
+        if isinstance(candidate, BaseExceptionGroup) or candidate is primary:
+            continue
+        if any(existing is candidate for existing in remaining):
+            continue
+        remaining.append(candidate)
+    for failure in runner_cleanup_failures:
+        if any(existing is failure for existing in remaining):
+            continue
+        remaining.append(failure)
+    if not remaining:
+        return RuntimeError("Parallel tool execution failed.")
+    if len(remaining) == 1:
+        return remaining[0]
+    return BaseExceptionGroup(
+        "Parallel tool execution and runner cleanup failures.",
+        remaining,
+    )
+
+
+def _ordered_cancellation_sources(
+    group: BaseExceptionGroup,
+    *,
+    child_cancellations: list[asyncio.CancelledError | None],
+    tool_calls: list[runtime_records.ToolCallRequest],
+) -> list[tuple[asyncio.CancelledError, str | None]]:
+    """Return authenticated cancellation evidence in tool-call order."""
+
+    sources: list[tuple[asyncio.CancelledError, str | None]] = []
+    observed: set[int] = set()
+    for index, cancellation in enumerate(child_cancellations):
+        if cancellation is None or id(cancellation) in observed:
+            continue
+        observed.add(id(cancellation))
+        sources.append((cancellation, tool_calls[index].id))
+    for candidate in iter_exception_tree(group):
+        if not isinstance(candidate, asyncio.CancelledError) or id(candidate) in observed:
+            continue
+        observed.add(id(candidate))
+        sources.append(
+            (
+                candidate,
+                invocation_secrets.cancellation_tool_call_id(candidate),
+            )
+        )
+    return sources
+
+
+def _authoritative_task_cancellation(
+    task: asyncio.Task[Any],
+    *,
+    cancellation_sources: list[tuple[asyncio.CancelledError, str | None]],
+) -> asyncio.CancelledError:
+    """Detach the parent task's cancellation from child TaskGroup tracebacks."""
+
+    args: tuple[object, ...] = ()
+    cancel_message = getattr(task, "_cancel_message", None)
+    if cancel_message is not None:
+        args = (cancel_message,)
+    if not args and cancellation_sources:
+        try:
+            candidate_args = BaseException.__dict__["args"].__get__(
+                cancellation_sources[0][0],
+                BaseException,
+            )
+        except BaseException:
+            candidate_args = ()
+        if type(candidate_args) is tuple:
+            args = candidate_args
+    return asyncio.CancelledError(*args)
+
+
+def _transfer_cancellation_evidence(
+    target: asyncio.CancelledError,
+    sources: list[tuple[asyncio.CancelledError, str | None]],
+    *,
+    tool_calls: list[runtime_records.ToolCallRequest],
+) -> None:
+    """Move authenticated cleanup evidence onto one authoritative cancellation."""
+
+    artifacts_by_id: dict[str, list[dict[str, Any]]] = {}
+    redactors_by_id: dict[str, SecretRedactor] = {}
+    unassigned_artifacts: list[dict[str, Any]] = []
+    public_artifacts: list[dict[str, Any]] = []
+    producer_ids: list[str] = []
+
+    def extend_artifacts(
+        destination: list[dict[str, Any]],
+        artifacts: list[dict[str, Any]],
+    ) -> None:
+        copied = copy_json_value(artifacts, "cancellation_artifacts")
+        if type(copied) is not list:
+            return
+        for artifact in copied:
+            if type(artifact) is not dict:
+                continue
+            if artifact not in destination:
+                destination.append(artifact)
+            for public_artifact in sanitize_runner_artifacts([artifact]):
+                if public_artifact not in public_artifacts:
+                    public_artifacts.append(public_artifact)
+
+    for source, fallback_tool_call_id in sources:
+        source_artifacts_by_id = invocation_secrets.cancellation_artifacts_by_id(source)
+        if source_artifacts_by_id is not None:
+            for tool_call_id, artifacts in source_artifacts_by_id.items():
+                extend_artifacts(
+                    artifacts_by_id.setdefault(tool_call_id, []),
+                    artifacts,
+                )
+        source_redactors_by_id = invocation_secrets.cancellation_redactors_by_id(source)
+        if source_redactors_by_id is not None:
+            redactors_by_id.update(source_redactors_by_id)
+
+        source_artifacts = invocation_secrets.cancellation_artifacts(source)
+        producer_id = invocation_secrets.cancellation_tool_call_id(source) or fallback_tool_call_id
+        if producer_id is not None and producer_id not in producer_ids:
+            producer_ids.append(producer_id)
+        if source_artifacts:
+            if producer_id is not None:
+                extend_artifacts(
+                    artifacts_by_id.setdefault(producer_id, []),
+                    source_artifacts,
+                )
+            else:
+                extend_artifacts(unassigned_artifacts, source_artifacts)
+        source_redactor = invocation_secrets.cancellation_redactor(source)
+        if source_redactor is not None and producer_id is not None:
+            redactors_by_id[producer_id] = source_redactor
+
+    if unassigned_artifacts and len(tool_calls) == 1:
+        extend_artifacts(
+            artifacts_by_id.setdefault(tool_calls[0].id, []),
+            unassigned_artifacts,
+        )
+        unassigned_artifacts = []
+    if not sources:
+        return
+
+    invocation_secrets.initialize_cancellation_evidence(target)
+    if len(producer_ids) == 1:
+        invocation_secrets.set_cancellation_tool_call_id(
+            target,
+            producer_ids[0],
+        )
+    if artifacts_by_id:
+        invocation_secrets.set_cancellation_artifacts_by_id(
+            target,
+            artifacts_by_id,
+        )
+    if redactors_by_id:
+        invocation_secrets.set_cancellation_redactors_by_id(
+            target,
+            redactors_by_id,
+        )
+    if public_artifacts:
+        attach_cancellation_artifacts(target, public_artifacts)
+
+
+def _grouped_cancellation_evidence(
+    group: BaseExceptionGroup,
+    *,
+    tool_calls: list[runtime_records.ToolCallRequest],
+) -> tuple[
+    list[dict[str, Any]] | None,
+    dict[str, list[dict[str, Any]]] | None,
+    dict[str, SecretRedactor] | None,
+]:
+    """Project grouped cancellation leaves onto interrupted-round evidence."""
+
+    sources = [
+        (
+            candidate,
+            invocation_secrets.cancellation_tool_call_id(candidate),
+        )
+        for candidate in iter_exception_tree(group)
+        if isinstance(candidate, asyncio.CancelledError)
+    ]
+    if not sources:
+        return None, None, None
+    cancellation = asyncio.CancelledError()
+    _transfer_cancellation_evidence(
+        cancellation,
+        sources,
+        tool_calls=tool_calls,
+    )
+    artifacts_by_id = invocation_secrets.cancellation_artifacts_by_id(cancellation)
+    redactors_by_id = invocation_secrets.cancellation_redactors_by_id(cancellation)
+    artifacts = invocation_secrets.cancellation_artifacts(cancellation)
+    if artifacts_by_id is not None:
+        artifacts = []
+    return (
+        artifacts or None,
+        artifacts_by_id,
+        redactors_by_id,
+    )
+
+
+def _cancellation_failure_cause(
+    group: BaseExceptionGroup,
+    *,
+    runner_cleanup_failures: list[BaseException],
+) -> BaseException | None:
+    """Retain sanitized non-cancellation failures beside parent cancellation."""
+
+    failures: list[BaseException] = []
+    for candidate in iter_exception_tree(group):
+        if isinstance(candidate, (BaseExceptionGroup, asyncio.CancelledError)):
+            continue
+        if any(existing is candidate for existing in failures):
+            continue
+        failures.append(candidate)
+    for failure in runner_cleanup_failures:
+        if any(existing is failure for existing in failures):
+            continue
+        failures.append(failure)
+    if not failures:
+        return None
+    if len(failures) == 1:
+        return failures[0]
+    return BaseExceptionGroup(
+        "Parallel tool execution and runner cleanup failures.",
+        failures,
+    )
+
+
+def _raise_after_interrupted_round_closure_failure(
+    interrupt: asyncio.CancelledError | BaseExceptionGroup,
+) -> None:
+    """Keep interruption authoritative when its durable closure also fails."""
+
+    if isinstance(interrupt, asyncio.CancelledError):
+        invocation_secrets.sanitize_external_cancellation(interrupt)
+    closure_failure = RuntimeError("Interrupted tool-round closure failed.")
+    prior_cause = exception_cause(interrupt)
+    if prior_cause is None:
+        combined_cause: BaseException = closure_failure
+    else:
+        combined_cause = BaseExceptionGroup(
+            "Interrupted tool-round cleanup and closure failures.",
+            [prior_cause, closure_failure],
+        )
+    set_exception_cause(interrupt, combined_cause)
+    raise interrupt from combined_cause
 
 
 def _copy_agent_spec(spec: AgentSpec) -> AgentSpec:

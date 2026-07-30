@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from cayu.cli.lambda_microvm import _render_manifest
+from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
 
 _ROOT = Path(__file__).parents[2]
 _SIDECAR_SOURCE = _ROOT / "examples" / "aws" / "lambda_microvm_sidecar"
@@ -144,7 +145,7 @@ def _sidecar_with_nested_file() -> dict[str, bytes]:
     sidecar[_MANIFEST] = _render_manifest(
         files,
         cayu_version=_VERSION,
-        protocol_version="1",
+        protocol_version=LAMBDA_MICROVM_PROTOCOL_VERSION,
     )
     return sidecar
 

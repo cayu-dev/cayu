@@ -1452,7 +1452,6 @@ BEDROCK = ProviderConformanceRegistration(
         provider_cache_observation=CapabilityClaim.supported(),
     ),
     reports_model_identity=False,
-    projects_request_ids=False,
 )
 
 REGISTRATIONS = (

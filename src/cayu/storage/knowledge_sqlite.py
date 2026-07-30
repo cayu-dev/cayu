@@ -496,7 +496,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 truncated = True
                 break
             returned_bytes = len(preview.encode("utf-8"))
-            if returned_bytes < preview_bytes:
+            preview_complete = returned_bytes == preview_bytes
+            if not preview_complete:
                 truncated = True
             remaining -= returned_bytes
             hits.append(
@@ -508,6 +509,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     rank=len(hits) + 1,
                     reason=reason,
                     text_preview=preview,
+                    text_preview_complete=preview_complete,
                 )
             )
         return hits, truncated
@@ -544,7 +546,8 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 truncated = True
                 break
             returned_bytes = len(preview.encode("utf-8"))
-            if returned_bytes < preview_bytes:
+            preview_complete = returned_bytes == preview_bytes
+            if not preview_complete:
                 truncated = True
             remaining -= returned_bytes
             items.append(
@@ -552,6 +555,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                     entry=entry,
                     chunk_count=chunk_counts.get(entry.id, 0),
                     text_preview=preview,
+                    text_preview_complete=preview_complete,
                 )
             )
         return items, truncated

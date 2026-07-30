@@ -388,6 +388,7 @@ class VertexProvider(ModelProvider):
             error_event = credential_safe_error_event(
                 exc,
                 provider_label="Vertex",
+                provider_name="vertex",
                 credential_values=(token,) if token is not None else (),
             )
         token = None

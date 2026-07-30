@@ -12,12 +12,14 @@ from collections.abc import AsyncIterator
 from importlib import import_module
 
 import pytest
+from pydantic import SecretStr
 
 import cayu.tools.files as files_module
 from cayu import (
     DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
     DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
     DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
+    REDACTED_SECRET,
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     ArtifactMetadata,
     ArtifactReadResult,
@@ -25,6 +27,7 @@ from cayu import (
     ArtifactStore,
     Environment,
     EnvironmentSpec,
+    SecretRedactor,
     file_attachment,
 )
 from cayu.artifacts import LocalArtifactStore
@@ -34,6 +37,7 @@ from cayu.core.tools import (
     _POLICY_DENIAL_TRUNCATION_MARKER,
     Tool,
     ToolContext,
+    ToolEffect,
     ToolResult,
     ToolSpec,
     _bound_policy_denial_text,
@@ -51,11 +55,16 @@ from cayu.runtime import (
     RuntimeHook,
     ToolCallHookContext,
 )
+from cayu.runtime._invocation_secrets import InvocationSecretTracker
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
 )
+from cayu.runtime._tool_execution import run_tool
 from cayu.tools import ExecCommandTool
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._resources import InvocationArtifactStoreHandle, InvocationWorkspaceHandle
+from cayu.tools._runner import InvocationRunnerHandle
 from cayu.tools.commands import (
     DEFAULT_OUTPUT_LIMIT_BYTES,
     DEFAULT_TIMEOUT_SECONDS,
@@ -83,6 +92,7 @@ from cayu.tools.files import (
     ReadFileTool,
     WriteFileTool,
 )
+from cayu.vaults import ResolvedSecret
 from cayu.workspaces import LocalWorkspace, WorkspaceReadResult
 
 TINY_PNG_BYTES = (
@@ -551,6 +561,38 @@ def test_edit_file_applies_multiple_exact_replacements_atomically(tmp_path):
     assert "+gamma = 30" in result.structured["diff"]
 
 
+def test_edit_file_redacts_complete_diff_before_bounding_it(tmp_path):
+    secret = "edit-diff-secret-canary-ABCDEFGHIJKLMNOP"
+    path = tmp_path / "notes.txt"
+    original = (("x" * 165) + secret + "\ntarget = old\n").encode()
+    path.write_bytes(original)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(
+        EditFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "expected_revision": f"sha256:{hashlib.sha256(original).hexdigest()}",
+                "edits": [{"old_text": "target = old", "new_text": "target = new"}],
+                "max_diff_bytes": 256,
+            },
+        )
+    )
+
+    rendered = json.dumps(result.model_dump(mode="json"))
+    assert result.is_error is False
+    assert result.structured["diff_truncated"] is True
+    assert secret not in rendered
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+    assert REDACTED_SECRET in rendered
+    assert path.read_bytes() == (("x" * 165) + secret + "\ntarget = new\n").encode()
+
+
 def test_edit_file_rolls_back_all_replacements_when_one_precondition_fails(tmp_path):
     path = tmp_path / "notes.txt"
     original = b"alpha = 1\nbeta = 2\n"
@@ -821,6 +863,33 @@ def test_read_file_pages_text_and_only_complete_snapshot_has_revision(tmp_path):
     assert suffix.structured["revision"] is None
 
 
+def test_read_file_pages_preserve_literal_redaction_marker_without_active_secrets(tmp_path):
+    content = f"abc{REDACTED_SECRET}xyz"
+    (tmp_path / "notes.txt").write_text(content)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+    visible_pages: list[str] = []
+    offset = 0
+
+    while True:
+        page = asyncio.run(
+            ReadFileTool().run(
+                ctx,
+                {"path": "notes.txt", "offset": offset, "max_bytes": 5},
+            )
+        )
+        visible_pages.append(page.content.rsplit("[/read_file metadata]\n", 1)[1])
+        next_offset = page.structured["next_offset"]
+        if next_offset is None:
+            break
+        assert next_offset > offset
+        offset = next_offset
+
+    assert "".join(visible_pages) == content
+
+
 def test_read_file_pages_utf8_only_at_complete_scalar_boundaries(tmp_path):
     (tmp_path / "notes.txt").write_text("A€B")
     ctx = ToolContext(
@@ -852,6 +921,491 @@ def test_read_file_pages_utf8_only_at_complete_scalar_boundaries(tmp_path):
     assert third.content.endswith("[/read_file metadata]\nB")
     assert split_start.is_error is True
     assert split_start.structured == {"error": "invalid_arguments"}
+
+
+def test_read_file_discards_workspace_secret_prefix_after_pretruncated_read(tmp_path):
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("secret.txt", secret.encode()))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {
+                "path": "secret.txt",
+                "max_bytes": 16,
+            },
+        )
+    )
+
+    rendered = json.dumps(result.model_dump(mode="json"))
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+    assert '"truncated":true' in result.content
+    assert result.content.endswith("[/read_file metadata]\n")
+    assert result.structured["bytes"] == 16
+    assert result.structured["total_bytes"] == len(secret.encode())
+    assert result.structured["truncated"] is True
+
+
+def test_read_file_omits_secret_suffix_from_noninitial_workspace_page(tmp_path):
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("secret.txt", secret.encode()))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {
+                "path": "secret.txt",
+                "offset": 16,
+                "max_bytes": 16,
+            },
+        )
+    )
+
+    rendered = json.dumps(result.model_dump(mode="json"))
+    assert secret[16:32] not in rendered
+    assert result.content.endswith("[/read_file metadata]\n")
+    assert result.structured["offset"] == 16
+    assert result.structured["truncated"] is True
+
+
+def test_read_file_preserves_unrelated_continuation_pages_with_active_secret(tmp_path):
+    secret = "unrelated-workload-secret-canary-ABCDEFGHIJKLMNOP"
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("notes.txt", b"abcdef"))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 2}))
+    second = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "offset": first.structured["next_offset"],
+                "max_bytes": 2,
+            },
+        )
+    )
+    third = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "offset": second.structured["next_offset"],
+                "max_bytes": 2,
+            },
+        )
+    )
+
+    assert first.content.endswith("[/read_file metadata]\nab")
+    assert second.content.endswith("[/read_file metadata]\ncd")
+    assert third.content.endswith("[/read_file metadata]\nef")
+    assert (first.structured["next_offset"], second.structured["next_offset"]) == (2, 4)
+    assert third.structured["next_offset"] is None
+
+
+@pytest.mark.parametrize(
+    "revisioned_provider",
+    [False, True],
+    ids=["legacy-redactor", "revisioned-redactor"],
+)
+def test_read_file_retries_with_latest_redactor_after_secret_resolves_during_read(
+    tmp_path,
+    revisioned_provider: bool,
+) -> None:
+    secret = "workspace-read-race-secret-canary-ABCDEFGHIJKLMNOP"
+    read_started = asyncio.Event()
+    allow_read = asyncio.Event()
+
+    class BlockingWorkspace(LocalWorkspace):
+        read_calls = 0
+
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            self.read_calls += 1
+            if self.read_calls == 1:
+                read_started.set()
+                await allow_read.wait()
+            return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
+    workspace = BlockingWorkspace(tmp_path, workspace_id="blocking")
+    asyncio.run(workspace.write_bytes("secret.txt", secret.encode()))
+    tracker = InvocationSecretTracker(SecretRedactor())
+    ctx = ToolContext(
+        session_id="sess_read_revision",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: tracker.redactor,
+        invocation_secret_snapshot_provider=(tracker.snapshot if revisioned_provider else None),
+        invocation_secret_capture_observer=(
+            tracker.record_ambiguous_output_capture if revisioned_provider else None
+        ),
+    )
+
+    async def run() -> ToolResult:
+        task = asyncio.create_task(
+            ReadFileTool().run(
+                ctx,
+                {"path": "secret.txt", "max_bytes": 16},
+            )
+        )
+        await read_started.wait()
+        tracker.record(
+            ResolvedSecret(
+                name="token",
+                value=SecretStr(secret),
+            )
+        )
+        allow_read.set()
+        return await task
+
+    result = asyncio.run(run())
+    publication = tracker.seal_for_publication()
+
+    rendered = repr(result.model_dump(mode="json"))
+    assert workspace.read_calls == 2
+    assert publication.unsafe_output is False
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+def test_read_file_capture_fails_closed_when_secret_resolves_before_publication(
+    tmp_path,
+) -> None:
+    secret = "workspace-late-publication-secret-canary-ABCDEFGHIJKLMNOP"
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("secret.txt", secret.encode()))
+    tracker = InvocationSecretTracker(SecretRedactor())
+    ctx = ToolContext(
+        session_id="sess_read_late_publication",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: tracker.redactor,
+        invocation_secret_snapshot_provider=tracker.snapshot,
+        invocation_secret_capture_observer=tracker.record_ambiguous_output_capture,
+    )
+
+    class ReadThenResolveTool(Tool):
+        spec = ToolSpec(
+            name="read_then_resolve",
+            description="Exercise the bounded read publication boundary.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, tool_ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            result = await ReadFileTool().run(
+                tool_ctx,
+                {"path": "secret.txt", "max_bytes": 16},
+            )
+            tracker.record(
+                ResolvedSecret(
+                    name="token",
+                    value=SecretStr(secret),
+                )
+            )
+            return result
+
+    outcome = asyncio.run(
+        run_tool(
+            tool=ReadThenResolveTool(),
+            effect=ToolEffect.NONE,
+            ctx=ctx,
+            arguments={},
+            redactor=lambda: tracker.redactor,
+            finalize_publication=tracker.seal_for_publication,
+        )
+    )
+
+    rendered = repr(outcome)
+    assert outcome.result.is_error is True
+    assert outcome.result.structured["terminal_outcome"] == "invalid_tool_output"
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+def test_read_file_fails_closed_after_repeated_secret_revision_changes(tmp_path) -> None:
+    tracker = InvocationSecretTracker(SecretRedactor())
+
+    class ChangingWorkspace(LocalWorkspace):
+        read_calls = 0
+
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            result = await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+            self.read_calls += 1
+            tracker.record(
+                ResolvedSecret(
+                    name=f"token_{self.read_calls}",
+                    value=SecretStr(f"changing-secret-{self.read_calls}-ABCDEFGHIJKLMNOP"),
+                )
+            )
+            return result
+
+    workspace = ChangingWorkspace(tmp_path, workspace_id="changing")
+    asyncio.run(workspace.write_bytes("notes.txt", b"ordinary text"))
+    result = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(
+                session_id="sess_read_unstable",
+                workspace=workspace,
+                invocation_secret_redactor=lambda: tracker.redactor,
+                invocation_secret_snapshot_provider=tracker.snapshot,
+                invocation_secret_capture_observer=(tracker.record_ambiguous_output_capture),
+            ),
+            {"path": "notes.txt", "max_bytes": 4},
+        )
+    )
+
+    assert workspace.read_calls == 2
+    assert result.is_error is True
+    assert result.structured == {"error": "secret_redaction_scope_unstable"}
+
+
+def test_read_file_secret_crossing_page_boundary_omits_only_secret_remainder(tmp_path):
+    secret = "boundary-secret-canary"
+    content = ("A" * 15 + secret + "visible-tail").encode()
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("notes.txt", content))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 20}))
+    pages = [first]
+    while pages[-1].structured["next_offset"] is not None:
+        pages.append(
+            asyncio.run(
+                ReadFileTool().run(
+                    ctx,
+                    {
+                        "path": "notes.txt",
+                        "offset": pages[-1].structured["next_offset"],
+                        "max_bytes": 20,
+                    },
+                )
+            )
+        )
+
+    rendered = json.dumps(
+        [page.model_dump(mode="json") for page in pages],
+        ensure_ascii=False,
+    )
+    assert secret not in rendered
+    assert secret[:5] not in rendered
+    assert secret[5:] not in rendered
+    assert first.content.endswith("[/read_file metadata]\n" + "A" * 15)
+    visible_text = "".join(page.content.rsplit("[/read_file metadata]\n", 1)[1] for page in pages)
+    assert visible_text == "A" * 15 + "visible-tail"
+    assert first.structured["next_offset"] == 20
+    assert pages[-1].structured["next_offset"] is None
+
+
+def test_read_file_pages_cannot_reconstruct_redacted_secret_when_concatenated(tmp_path):
+    secret = "CE"
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("notes.txt", b"CCEE"))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 2}))
+    second = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {
+                "path": "notes.txt",
+                "offset": first.structured["next_offset"],
+                "max_bytes": 2,
+            },
+        )
+    )
+    visible_text = "".join(
+        page.content.rsplit("[/read_file metadata]\n", 1)[1] for page in (first, second)
+    )
+
+    assert visible_text == "E"
+    assert secret not in visible_text
+    assert first.structured["next_offset"] == 2
+    assert second.structured["next_offset"] is None
+
+
+def test_read_file_redacted_pagination_preserves_utf8_boundaries_and_progress(tmp_path):
+    secret = "密钥值-boundary-secret"
+    content = ("αβ" + secret + "終わり").encode()
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("notes.txt", content))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    offset = 0
+    seen_offsets: list[int] = []
+    rendered_pages: list[str] = []
+    while True:
+        page = asyncio.run(
+            ReadFileTool().run(
+                ctx,
+                {"path": "notes.txt", "offset": offset, "max_bytes": 8},
+            )
+        )
+        assert page.is_error is False
+        rendered_pages.append(page.content)
+        next_offset = page.structured["next_offset"]
+        if next_offset is None:
+            break
+        assert next_offset > offset
+        seen_offsets.append(next_offset)
+        offset = next_offset
+
+    rendered = json.dumps(rendered_pages, ensure_ascii=False)
+    assert secret not in rendered
+    assert seen_offsets == sorted(set(seen_offsets))
+    visible_text = "".join(page.rsplit("[/read_file metadata]\n", 1)[1] for page in rendered_pages)
+    assert visible_text == "αβ終わり"
+
+
+def test_read_file_fails_closed_when_backend_omits_required_redaction_prefix(tmp_path):
+    class IncompleteWindowWorkspace(LocalWorkspace):
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            result = await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+            if offset == 0 or not result.content:
+                return result
+            shifted_content = result.content[1:]
+            return WorkspaceReadResult(
+                content=shifted_content,
+                total_bytes=result.total_bytes,
+                truncated=result.offset + 1 + len(shifted_content) < result.total_bytes,
+                offset=result.offset + 1,
+            )
+
+    workspace = IncompleteWindowWorkspace(tmp_path, workspace_id="incomplete")
+    asyncio.run(workspace.write_bytes("notes.txt", b"x" * 80))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor("token"),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": 40, "max_bytes": 8},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "secret_redaction_window_unavailable",
+        "offset": 40,
+        "required_window_start": 15,
+        "observed_window_start": 16,
+    }
+
+
+def test_read_file_omits_sensitive_page_suffix_across_workspace_replacement(tmp_path):
+    secret = "SECRET"
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("notes.txt", b"SECREaaaaa"))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    first = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "max_bytes": 5},
+        )
+    )
+    asyncio.run(workspace.write_bytes("notes.txt", b"aaaaaTbbbb"))
+    second = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": 5, "max_bytes": 5},
+        )
+    )
+
+    first_text = first.content.rsplit("[/read_file metadata]\n", 1)[1]
+    second_text = second.content.rsplit("[/read_file metadata]\n", 1)[1]
+    assert first_text == ""
+    assert second_text == "Tbbbb"
+    assert secret not in first_text + second_text
+    assert first.structured["next_offset"] == 5
+    assert second.structured["next_offset"] is None
+
+
+def test_read_file_discards_text_artifact_secret_prefix_after_pretruncated_read(tmp_path):
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact = asyncio.run(
+        artifact_store.put_bytes(
+            secret.encode(),
+            filename="secret.txt",
+            content_type="text/plain",
+            session_id="sess_1",
+        )
+    )
+    ctx = ToolContext(
+        session_id="sess_1",
+        artifact_store=artifact_store,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {
+                "artifact_id": artifact.id,
+                "max_bytes": 16,
+            },
+        )
+    )
+
+    rendered = json.dumps(result.model_dump(mode="json"))
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+    assert "[file truncated]" in result.content
+    assert result.structured["bytes"] == 16
+    assert result.structured["total_bytes"] == len(secret.encode())
+    assert result.structured["truncated"] is True
 
 
 def test_read_file_snapshots_workspace_pdf_as_artifact_attachment(tmp_path):
@@ -1836,6 +2390,52 @@ def test_exec_command_tool_runs_process_and_reports_failures(tmp_path):
     assert failed.content == "Command exited with code 3."
 
 
+def test_exec_command_tool_redacts_at_runner_capture_before_output_bound(tmp_path) -> None:
+    secret = "exec-command-boundary-secret"
+    prefix = "p" * 45
+
+    def redactor_provider() -> SecretRedactor:
+        return SecretRedactor(secret)
+
+    ctx = ToolContext(
+        session_id="sess_1",
+        runner=InvocationRunnerHandle(
+            LocalRunner(tmp_path),
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=redactor_provider(),
+            ),
+        ),
+        invocation_secret_redactor=redactor_provider,
+    )
+
+    result = asyncio.run(
+        ExecCommandTool().run(
+            ctx,
+            {
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os,sys,time; secret=os.environ['TOKEN']; "
+                        f"sys.stdout.write({prefix!r} + secret[:10]); sys.stdout.flush(); "
+                        "time.sleep(0.02); sys.stdout.write(secret[10:]); sys.stdout.flush()"
+                    ),
+                ],
+                "env": {"TOKEN": secret},
+                "max_output_bytes": 50,
+            },
+        )
+    )
+
+    serialized = json.dumps(result.model_dump(mode="json"))
+    assert secret not in serialized
+    assert secret[:10] not in serialized
+    assert REDACTED_SECRET not in result.content
+    assert result.structured["stdout"] == prefix
+    assert result.structured["stdout_truncated"] is True
+
+
 def test_builtin_tools_truncate_model_facing_large_outputs(tmp_path):
     workspace = LocalWorkspace(tmp_path, workspace_id="local")
     file_ctx = ToolContext(session_id="sess_1", workspace=workspace)
@@ -2047,11 +2647,17 @@ def test_runner_unavailable_diagnostic_reaches_durable_tool_event() -> None:
     stored_events = asyncio.run(run())
 
     failed = next(event for event in stored_events if event.type == EventType.TOOL_CALL_FAILED)
+    safe_runtime_diagnostic = {
+        "type": "cayu.runner_unavailable.v1",
+        "adapter": "unknown",
+        "status": "unavailable",
+        "error_type": "RunnerUnavailableError",
+    }
     assert failed.payload["result"]["structured"] == {
         "error": "runner_unavailable",
-        "diagnostic": diagnostic,
+        "diagnostic": safe_runtime_diagnostic,
     }
-    assert failed.payload["result"]["artifacts"] == [diagnostic]
+    assert failed.payload["result"]["artifacts"] == [safe_runtime_diagnostic]
 
 
 def test_exec_command_tool_nonzero_exit_prefixes_output_with_exit_code():
@@ -3046,9 +3652,75 @@ def test_runtime_passes_environment_services_to_tool_context(tmp_path):
     assert tool.context.environment_name == "local-dev"
     assert tool.context.workspace_id == "local"
     assert tool.context.artifact_store_id == "artifacts"
-    assert tool.context.workspace is workspace
-    assert tool.context.artifact_store is artifact_store
-    assert tool.context.runner is runner
+    assert isinstance(tool.context.workspace, InvocationWorkspaceHandle)
+    assert tool.context.workspace is not workspace
+    assert isinstance(tool.context.artifact_store, InvocationArtifactStoreHandle)
+    assert tool.context.artifact_store is not artifact_store
+    assert tool.context._authoritative_workspace_for_builtin() is workspace
+    assert tool.context._authoritative_artifact_store_for_builtin() is artifact_store
+    assert isinstance(tool.context.runner, InvocationRunnerHandle)
+    assert tool.context.runner is not runner
+    assert not hasattr(tool.context.runner, "close")
+
+
+def test_builtin_file_tools_use_falsey_raw_runtime_authorities(tmp_path):
+    class FalseyWorkspace(LocalWorkspace):
+        def __bool__(self) -> bool:
+            return False
+
+    class FalseyArtifactStore(LocalArtifactStore):
+        def __bool__(self) -> bool:
+            return False
+
+    async def exercise() -> tuple[ToolResult, ToolResult]:
+        secret = "falsey-resource-secret-canary-ABCDEFGHIJKLMNOP"
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        workspace = FalseyWorkspace(workspace_root, workspace_id="local")
+        artifact_store = FalseyArtifactStore(
+            tmp_path / "artifacts",
+            store_id="artifacts",
+        )
+        await workspace.write_bytes("secret.txt", secret.encode())
+        artifact = await artifact_store.put_bytes(
+            secret.encode(),
+            filename="secret.txt",
+            content_type="text/plain",
+            session_id="sess_1",
+        )
+        tracker = InvocationSecretTracker(SecretRedactor(secret))
+        ctx = ToolContext(
+            session_id="sess_1",
+            workspace=InvocationWorkspaceHandle(
+                workspace,
+                redactor_snapshot_provider=tracker.snapshot,
+                capture_observer=tracker.record_ambiguous_output_capture,
+            ),
+            artifact_store=InvocationArtifactStoreHandle(
+                artifact_store,
+                redactor_snapshot_provider=tracker.snapshot,
+                capture_observer=tracker.record_ambiguous_output_capture,
+            ),
+            invocation_secret_redactor=lambda: tracker.redactor,
+            invocation_secret_snapshot_provider=tracker.snapshot,
+            invocation_secret_capture_observer=tracker.record_ambiguous_output_capture,
+        )
+        ctx._bind_runtime_resource_authorities(
+            workspace=workspace,
+            artifact_store=artifact_store,
+        )
+        workspace_result = await ReadFileTool().run(ctx, {"path": "secret.txt"})
+        artifact_result = await ReadFileTool().run(ctx, {"artifact_id": artifact.id})
+        return workspace_result, artifact_result
+
+    workspace_result, artifact_result = asyncio.run(exercise())
+
+    assert workspace_result.is_error is False
+    assert workspace_result.structured["source"] == "workspace"
+    assert artifact_result.is_error is False
+    assert artifact_result.structured["source"] == "artifact"
+    assert REDACTED_SECRET in workspace_result.content
+    assert REDACTED_SECRET in artifact_result.content
 
 
 def test_runtime_executes_in_the_local_canonical_cwd_authorized_by_policy(tmp_path):

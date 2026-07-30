@@ -164,6 +164,8 @@ class ArtifactReadResult:
     content: bytes
     total_bytes: int
     truncated: bool = False
+    source_bytes_read: int | None = None
+    redaction_truncated: bool = False
 
     def __post_init__(self) -> None:
         if type(self.metadata) is not ArtifactMetadata:
@@ -177,14 +179,30 @@ class ArtifactReadResult:
             raise ValueError("ArtifactReadResult total_bytes must be non-negative.")
         if type(self.truncated) is not bool:
             raise TypeError("ArtifactReadResult truncated must be a bool.")
-        if self.total_bytes < len(self.content):
-            raise ValueError("ArtifactReadResult total_bytes cannot be smaller than content.")
-        expected_truncated = len(self.content) < self.total_bytes
+        source_bytes_read = (
+            len(self.content) if self.source_bytes_read is None else self.source_bytes_read
+        )
+        if type(source_bytes_read) is not int:
+            raise TypeError("ArtifactReadResult source_bytes_read must be an integer or None.")
+        if source_bytes_read < 0:
+            raise ValueError("ArtifactReadResult source_bytes_read must be non-negative.")
+        if source_bytes_read < len(self.content):
+            raise ValueError("ArtifactReadResult source progress cannot be smaller than content.")
+        if self.total_bytes < source_bytes_read:
+            raise ValueError(
+                "ArtifactReadResult total_bytes cannot be smaller than content or source progress."
+            )
+        expected_truncated = source_bytes_read < self.total_bytes
         if self.truncated != expected_truncated:
-            raise ValueError("ArtifactReadResult truncated must match content and total_bytes.")
+            raise ValueError(
+                "ArtifactReadResult truncated must match source progress and total_bytes."
+            )
+        if type(self.redaction_truncated) is not bool:
+            raise TypeError("ArtifactReadResult redaction_truncated must be a bool.")
         if metadata.size_bytes != self.total_bytes:
             raise ValueError("ArtifactReadResult metadata size_bytes must equal total_bytes.")
         object.__setattr__(self, "metadata", metadata)
+        object.__setattr__(self, "source_bytes_read", source_bytes_read)
 
 
 def copy_artifact_read_result(
@@ -207,6 +225,8 @@ def copy_artifact_read_result(
         content=value.content,
         total_bytes=value.total_bytes,
         truncated=value.truncated,
+        source_bytes_read=value.source_bytes_read,
+        redaction_truncated=value.redaction_truncated,
     )
     if expected_artifact_id is not None and copied.metadata.id != expected_artifact_id:
         raise ValueError("Artifact store returned metadata for a different artifact id.")

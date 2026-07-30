@@ -4532,7 +4532,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 truncated = True
                 break
             returned_bytes = len(preview.encode("utf-8"))
-            if returned_bytes < preview_bytes:
+            preview_complete = returned_bytes == preview_bytes
+            if not preview_complete:
                 truncated = True
             remaining -= returned_bytes
             hits.append(
@@ -4544,6 +4545,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     rank=len(hits) + 1,
                     reason=reason,
                     text_preview=preview,
+                    text_preview_complete=preview_complete,
                 )
             )
         return hits, truncated
@@ -4587,7 +4589,8 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 truncated = True
                 break
             returned_bytes = len(preview.encode("utf-8"))
-            if returned_bytes < preview_bytes:
+            preview_complete = returned_bytes == preview_bytes
+            if not preview_complete:
                 truncated = True
             remaining -= returned_bytes
             items.append(
@@ -4595,6 +4598,7 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                     entry=entry,
                     chunk_count=chunk_counts.get(entry.id, 0),
                     text_preview=preview,
+                    text_preview_complete=preview_complete,
                 )
             )
         return items, truncated
@@ -5101,10 +5105,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         rows: list[tuple[str, str, float]],
         query: KnowledgeQuery,
     ) -> tuple[
-        list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]], bool
+        list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]],
+        bool,
     ]:
         scored: list[
-            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]
+            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]
         ] = []
         byte_truncated = False
         semantic_min_score = self.semantic_min_score if query.min_score is None else query.min_score
@@ -5140,7 +5145,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 continue
             if score <= 0:
                 continue
-            scored.append((score, entry, chunk, reason, preview_text, score_normalized))
+            scored.append((score, entry, chunk, reason, preview_text, score_normalized, True))
         scored.sort(
             key=lambda item: (
                 -item[0],
@@ -5153,11 +5158,13 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
 
     def _merge_keyword_hits(
         self,
-        scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]],
+        scored: list[
+            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]
+        ],
         keyword_result: KnowledgeSearchResult,
-    ) -> list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]]:
+    ) -> list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]]:
         merged = list(scored)
-        seen_entry_ids = {entry.id for _, entry, _, _, _, _ in merged}
+        seen_entry_ids = {entry.id for _, entry, _, _, _, _, _ in merged}
         for hit in keyword_result.hits:
             if hit.entry.id in seen_entry_ids:
                 continue
@@ -5179,6 +5186,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     f"hybrid keyword match; {hit.reason or 'keyword match'}",
                     hit.text_preview or hit.entry.title or hit.entry.id,
                     None,
+                    hit.text_preview_complete,
                 )
             )
         merged.sort(

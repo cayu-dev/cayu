@@ -5,7 +5,7 @@ import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from cayu._validation import (
     FrozenJsonDict,
@@ -15,9 +15,17 @@ from cayu._validation import (
     thaw_json_value,
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
+from cayu.runners import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.tool_policy import ToolPolicyResult
+from cayu.tools._runner import (
+    is_current_runner_cancellation_group,
+    sanitize_runner_failure_group,
+)
 from cayu.vaults import SecretRedactor
+
+if TYPE_CHECKING:
+    from cayu.runtime._invocation_secrets import InvocationPublicationSnapshot
 
 _OUTCOME_CONSTRUCTION_TOKEN = object()
 
@@ -116,9 +124,57 @@ async def run_tool(
     ctx: ToolContext,
     arguments: dict[str, Any],
     redactor: Callable[[], SecretRedactor],
+    finalize_publication: Callable[[], InvocationPublicationSnapshot] | None = None,
     timeout_seconds: float | None = None,
 ) -> ToolExecutionOutcome:
+    """Execute one tool and seal its evolving secret scope before publication."""
+
+    if finalize_publication is not None and not callable(finalize_publication):
+        raise TypeError("finalize_publication must be callable or None.")
+    try:
+        outcome = await _run_tool(
+            tool=tool,
+            effect=effect,
+            ctx=ctx,
+            arguments=arguments,
+            redactor=redactor,
+            timeout_seconds=timeout_seconds,
+        )
+    except BaseException:
+        if finalize_publication is not None:
+            finalize_publication()
+        raise
+    if finalize_publication is None:
+        return outcome
+    publication = finalize_publication()
+    if not publication.unsafe_output:
+        return outcome
+    ctx._discard_policy_denials_for(tool)
+    result, controls = tool_results.terminal_failure_result(
+        terminal_outcome="invalid_tool_output",
+        effect=effect,
+        message=(
+            "Tool output was omitted because its secret-redaction scope could "
+            "not be finalized safely before publication."
+        ),
+        redactor=publication.redactor,
+    )
+    return _execution_outcome(result, controls)
+
+
+async def _run_tool(
+    *,
+    tool: Tool,
+    effect: ToolEffect,
+    ctx: ToolContext,
+    arguments: dict[str, Any],
+    redactor: Callable[[], SecretRedactor],
+    timeout_seconds: float | None,
+) -> ToolExecutionOutcome:
     timer: asyncio.Timeout | None = None
+    grouped_failure: BaseExceptionGroup | None = None
+    current_task = asyncio.current_task()
+    cancellation_baseline = 0 if current_task is None else current_task.cancelling()
     if type(effect) is not ToolEffect:
         raise TypeError("effect must be a ToolEffect.")
     if not callable(redactor):
@@ -155,6 +211,50 @@ async def run_tool(
             redactor=active_redactor,
         )
         return _execution_outcome(result, controls)
+    except BaseExceptionGroup as exc:
+        ctx._discard_policy_denials_for(tool)
+        if timer is not None and timer.expired():
+            result, controls = tool_results.terminal_failure_result(
+                terminal_outcome="tool_execution_timeout",
+                effect=effect,
+                message=f"Tool call timed out after {timeout_seconds} seconds.",
+                redactor=_active_redactor(redactor),
+            )
+            return _execution_outcome(result, controls)
+        if isinstance(exc, Exception):
+            active_redactor = _active_redactor(redactor)
+            result, controls = tool_results.terminal_failure_result(
+                terminal_outcome="tool_execution_error",
+                effect=effect,
+                message="Tool execution reported multiple failures.",
+                redactor=active_redactor,
+            )
+            return _execution_outcome(result, controls)
+        current_cancellation = is_current_runner_cancellation_group(exc) or (
+            current_task is not None and current_task.cancelling() > cancellation_baseline
+        )
+        if not current_cancellation:
+            active_redactor = _active_redactor(redactor)
+            result, controls = tool_results.terminal_failure_result(
+                terminal_outcome="tool_execution_error",
+                effect=effect,
+                message="Tool execution reported multiple failures.",
+                redactor=active_redactor,
+            )
+            return _execution_outcome(result, controls)
+        grouped_failure = sanitize_runner_failure_group(
+            exc,
+            caller_cancelled=True,
+        )
+    except (RunnerExecutionError, RunnerUnavailableError) as exc:
+        ctx._discard_policy_denials_for(tool)
+        active_redactor = _active_redactor(redactor)
+        result, controls = _runner_failure_result(
+            exc,
+            effect=effect,
+            redactor=active_redactor,
+        )
+        return _execution_outcome(result, controls)
     except Exception as exc:
         ctx._discard_policy_denials_for(tool)
         active_redactor = _active_redactor(redactor)
@@ -173,6 +273,8 @@ async def run_tool(
         )
         return _execution_outcome(result, controls)
 
+    if grouped_failure is not None:
+        raise grouped_failure
     if type(raw_result) is not ToolResult:
         ctx._discard_policy_denials_for(tool)
         active_redactor = _active_redactor(redactor)
@@ -210,6 +312,73 @@ async def run_tool(
         )
         return _execution_outcome(result, controls)
     return _execution_outcome(validated_result)
+
+
+def _runner_failure_result(
+    error: RunnerExecutionError | RunnerUnavailableError,
+    *,
+    effect: ToolEffect,
+    redactor: SecretRedactor,
+) -> tuple[ToolResult, dict[str, Any]]:
+    """Preserve only the runner boundary's fixed typed failure evidence."""
+
+    if isinstance(error, RunnerUnavailableError):
+        source = _base_exception_namespace_value(error, "diagnostic")
+        if type(source) is not dict:
+            source = {}
+        source = cast("dict[str, Any]", source)
+        adapter = source.get("adapter")
+        diagnostic = {
+            "type": "cayu.runner_unavailable.v1",
+            "adapter": (
+                adapter
+                if adapter in {"docker", "e2b", "lambda-microvm", "local", "microsandbox"}
+                else "unknown"
+            ),
+            "status": "unavailable",
+            "error_type": "RunnerUnavailableError",
+        }
+        error_code = "runner_unavailable"
+    else:
+        diagnostic = copy_durable_json_object(
+            error.diagnostic,
+            "runner_failure_diagnostic",
+        )
+        error_code = "runner_execution_failed"
+    result, controls = tool_results.terminal_failure_result(
+        terminal_outcome="tool_execution_error",
+        effect=effect,
+        message=(
+            "Runner is unavailable."
+            if isinstance(error, RunnerUnavailableError)
+            else "Runner command execution failed."
+        ),
+        redactor=redactor,
+    )
+    structured = dict(result.structured or {})
+    structured.update(
+        {
+            "error": error_code,
+            "diagnostic": diagnostic,
+        }
+    )
+    return (
+        result.model_copy(
+            update={
+                "structured": structured,
+                "artifacts": [diagnostic],
+            }
+        ),
+        controls,
+    )
+
+
+def _base_exception_namespace_value(error: BaseException, name: str) -> object:
+    try:
+        namespace = BaseException.__dict__["__dict__"].__get__(error, BaseException)
+    except BaseException:
+        return None
+    return dict.get(namespace, name) if type(namespace) is dict else None
 
 
 def _active_redactor(redactor: Callable[[], SecretRedactor]) -> SecretRedactor:

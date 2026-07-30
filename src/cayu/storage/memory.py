@@ -459,6 +459,7 @@ class KnowledgeHit(BaseModel):
     score_kind: str | None = None
     score_normalized: float | None = None
     text_preview: str | None = None
+    text_preview_complete: bool = Field(default=False, exclude=True, repr=False)
 
     @field_validator("entry")
     @classmethod
@@ -502,10 +503,19 @@ class KnowledgeHit(BaseModel):
             return None
         return require_nonblank(value, info.field_name)
 
+    @field_validator("text_preview_complete", mode="before")
+    @classmethod
+    def validate_text_preview_complete(cls, value, info) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"`{info.field_name}` must be a boolean.")
+        return value
+
     @model_validator(mode="after")
     def validate_chunk_belongs_to_entry(self) -> KnowledgeHit:
         if self.chunk is not None and self.chunk.entry_id != self.entry.id:
             raise ValueError("`chunk.entry_id` must match `entry.id`.")
+        if self.text_preview is None and self.text_preview_complete:
+            raise ValueError("`text_preview_complete` requires `text_preview`.")
         return self
 
 
@@ -573,6 +583,7 @@ class KnowledgeListItem(BaseModel):
     entry: KnowledgeEntry
     chunk_count: int = 0
     text_preview: str | None = None
+    text_preview_complete: bool = Field(default=False, exclude=True, repr=False)
 
     @field_validator("entry")
     @classmethod
@@ -591,6 +602,19 @@ class KnowledgeListItem(BaseModel):
         if value is None:
             return None
         return require_nonblank(value, info.field_name)
+
+    @field_validator("text_preview_complete", mode="before")
+    @classmethod
+    def validate_text_preview_complete(cls, value, info) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"`{info.field_name}` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_text_preview_provenance(self) -> KnowledgeListItem:
+        if self.text_preview is None and self.text_preview_complete:
+            raise ValueError("`text_preview_complete` requires `text_preview`.")
+        return self
 
 
 class KnowledgeFacet(BaseModel):
@@ -985,7 +1009,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if not preview:
                 truncated = True
                 break
-            if len(preview.encode("utf-8")) < source_bytes:
+            preview_complete = len(preview.encode("utf-8")) == source_bytes
+            if not preview_complete:
                 truncated = True
             remaining -= len(preview.encode("utf-8"))
             hits.append(
@@ -997,6 +1022,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                     rank=rank,
                     reason=reason,
                     text_preview=preview,
+                    text_preview_complete=preview_complete,
                 )
             )
         return KnowledgeSearchResult(
@@ -1039,7 +1065,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if not preview:
                 truncated = True
                 break
-            if len(preview.encode("utf-8")) < len(preview_source.encode("utf-8")):
+            preview_complete = len(preview.encode("utf-8")) == len(preview_source.encode("utf-8"))
+            if not preview_complete:
                 truncated = True
             remaining -= len(preview.encode("utf-8"))
             items.append(
@@ -1047,6 +1074,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                     entry=entry,
                     chunk_count=len(self._chunks.get(entry.id, [])),
                     text_preview=preview,
+                    text_preview_complete=preview_complete,
                 )
             )
         return KnowledgeListResult(
@@ -1192,7 +1220,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             else knowledge_query.min_score
         )
         scored: list[
-            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]
+            tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]
         ] = []
         for entry in candidates:
             semantic_score, chunk = self._best_semantic_score(entry, query_vector)
@@ -1228,7 +1256,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
                 continue
             if score <= 0:
                 continue
-            scored.append((score, entry, chunk, reason, preview_text, score_normalized))
+            scored.append((score, entry, chunk, reason, preview_text, score_normalized, True))
         scored.sort(
             key=lambda item: (
                 -item[0],
@@ -1452,6 +1480,7 @@ def copy_knowledge_hit(hit: KnowledgeHit) -> KnowledgeHit:
         score_kind=hit.score_kind,
         score_normalized=hit.score_normalized,
         text_preview=hit.text_preview,
+        text_preview_complete=hit.text_preview_complete,
     )
 
 
@@ -1462,6 +1491,7 @@ def copy_knowledge_list_item(item: KnowledgeListItem) -> KnowledgeListItem:
         entry=copy_knowledge_entry(item.entry),
         chunk_count=item.chunk_count,
         text_preview=item.text_preview,
+        text_preview_complete=item.text_preview_complete,
     )
 
 
@@ -1709,7 +1739,7 @@ def _entry_matches_none_terms(
 
 
 def _search_result_from_scored_embeddings(
-    scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None]],
+    scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str, float | None, bool]],
     query: KnowledgeQuery,
     *,
     score_kind: str,
@@ -1717,7 +1747,15 @@ def _search_result_from_scored_embeddings(
     hits: list[KnowledgeHit] = []
     remaining = query.max_bytes
     truncated = False
-    for rank, (score, entry, chunk, reason, preview_text, normalized_score) in enumerate(
+    for rank, (
+        score,
+        entry,
+        chunk,
+        reason,
+        preview_text,
+        normalized_score,
+        source_complete,
+    ) in enumerate(
         scored[: query.limit],
         start=1,
     ):
@@ -1729,7 +1767,8 @@ def _search_result_from_scored_embeddings(
         if not preview:
             truncated = True
             break
-        if len(preview.encode("utf-8")) < source_bytes:
+        preview_complete = source_complete and len(preview.encode("utf-8")) == source_bytes
+        if not preview_complete:
             truncated = True
         remaining -= len(preview.encode("utf-8"))
         hits.append(
@@ -1742,6 +1781,7 @@ def _search_result_from_scored_embeddings(
                 rank=rank,
                 reason=reason,
                 text_preview=preview,
+                text_preview_complete=preview_complete,
             )
         )
     return KnowledgeSearchResult(

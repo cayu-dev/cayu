@@ -496,6 +496,36 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert tasks[0]["lease_expires_at"] is None
 
 
+@pytest.mark.parametrize("secret_start", [62, 63, 64, 79, 80])
+def test_server_redacts_complete_prompt_before_task_title_bound(secret_start: int) -> None:
+    secret = "task-title-boundary-secret"
+    prompt = "p" * secret_start + secret + ":tail"
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        task_store=task_store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    with client.stream("POST", "/api/run", json={"prompt": prompt}) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    task = asyncio.run(task_store.list_tasks())[0]
+    expected_prompt = "p" * secret_start + REDACTED_SECRET + ":tail"
+    assert task.input == {"prompt": expected_prompt}
+    assert task.title is not None
+    assert len(task.title) <= 80
+    assert secret not in task.title
+    assert secret[:10] not in task.title
+    assert not any(
+        task.title.endswith(REDACTED_SECRET[:length]) for length in range(1, len(REDACTED_SECRET))
+    )
+
+
 def test_server_dashboard_accepts_default_price_book_config() -> None:
     app = CayuApp()
     price_book = default_price_book()

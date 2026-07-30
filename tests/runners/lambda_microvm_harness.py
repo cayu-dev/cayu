@@ -65,7 +65,7 @@ class SupervisorTransport:
         self._scripted_results: dict[str, dict[str, Any]] = {}
 
     async def health(self, **_kwargs: Any) -> dict[str, str]:
-        return {"status": "ok", "protocol_version": "1"}
+        return {"status": "ok", "protocol_version": "2"}
 
     async def start_command(
         self,

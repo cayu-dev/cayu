@@ -4,7 +4,7 @@ import asyncio
 import posixpath
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar, cast
 
 from pydantic import (
     BaseModel,
@@ -18,9 +18,14 @@ from pydantic import (
 
 from cayu._validation import copy_json_value, require_nonblank
 from cayu.runners._cleanup import RunnerCleanupResult
+from cayu.runners._diagnostics import (
+    trusted_runner_error_type_name,
+    trusted_runner_exception_type_name,
+)
 
 if TYPE_CHECKING:
     from cayu.environments.admission import ExecutionAdmissionCandidate
+    from cayu.vaults import SecretRedactor
 
 DEFAULT_EXEC_OUTPUT_LIMIT_BYTES = 1024 * 1024
 RunnerSystemExecutionMode = Literal["shared", "separate"]
@@ -54,6 +59,99 @@ class RunnerUnavailableError(RuntimeError):
         self.diagnostic: dict[str, Any] = copied
         self.artifacts: list[dict[str, Any]] = [copy_json_value(self.diagnostic, "diagnostic")]
         super().__init__(require_nonblank(message, "message"))
+
+
+class RunnerExecutionError(RuntimeError):
+    """A fixed-message command failure with typed, secret-safe evidence."""
+
+    def __init__(self, *, diagnostic: dict[str, Any]) -> None:
+        copied = _safe_runner_execution_diagnostic(diagnostic)
+        self.diagnostic: dict[str, Any] = copied
+        self.artifacts: list[dict[str, Any]] = [copy_json_value(copied, "diagnostic")]
+        super().__init__("Runner command execution failed.")
+
+
+def runner_execution_error(
+    error: BaseException,
+    *,
+    adapter: str,
+    stdout_bytes: int | None = None,
+    stderr_bytes: int | None = None,
+) -> RunnerExecutionError:
+    """Detach an opaque runner failure from its raw message and traceback."""
+
+    if type(adapter) is not str or adapter not in {
+        "docker",
+        "e2b",
+        "lambda-microvm",
+        "local",
+        "microsandbox",
+    }:
+        adapter = "unknown"
+    error_type = trusted_runner_exception_type_name(error)
+    source_diagnostic = _base_exception_namespace_value(error, "diagnostic")
+    if type(source_diagnostic) is dict:
+        source_diagnostic = cast("dict[str, Any]", source_diagnostic)
+        source_type = trusted_runner_error_type_name(source_diagnostic.get("error_type"))
+        if source_type is not None:
+            error_type = source_type
+        if stdout_bytes is None:
+            candidate = source_diagnostic.get("stdout_bytes")
+            if type(candidate) is int and candidate >= 0:
+                stdout_bytes = candidate
+        if stderr_bytes is None:
+            candidate = source_diagnostic.get("stderr_bytes")
+            if type(candidate) is int and candidate >= 0:
+                stderr_bytes = candidate
+    diagnostic: dict[str, Any] = {
+        "type": "cayu.runner_execution_error.v1",
+        "adapter": adapter,
+        "status": "failed",
+        "error_type": error_type,
+        "timed_out": False,
+        "cancelled": False,
+    }
+    if type(stdout_bytes) is int and stdout_bytes >= 0:
+        diagnostic["stdout_bytes"] = stdout_bytes
+    if type(stderr_bytes) is int and stderr_bytes >= 0:
+        diagnostic["stderr_bytes"] = stderr_bytes
+    return RunnerExecutionError(diagnostic=diagnostic)
+
+
+def _safe_runner_execution_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
+    if type(diagnostic) is not dict:
+        raise TypeError("Runner execution diagnostic must be a dict.")
+    adapter = diagnostic.get("adapter")
+    if type(adapter) is not str or adapter not in {
+        "docker",
+        "e2b",
+        "lambda-microvm",
+        "local",
+        "microsandbox",
+    }:
+        adapter = "unknown"
+    error_type = trusted_runner_error_type_name(diagnostic.get("error_type")) or "Exception"
+    safe: dict[str, Any] = {
+        "type": "cayu.runner_execution_error.v1",
+        "adapter": adapter,
+        "status": "failed",
+        "error_type": error_type,
+        "timed_out": diagnostic.get("timed_out") is True,
+        "cancelled": diagnostic.get("cancelled") is True,
+    }
+    for field in ("stdout_bytes", "stderr_bytes"):
+        value = diagnostic.get(field)
+        if type(value) is int and value >= 0:
+            safe[field] = value
+    return safe
+
+
+def _base_exception_namespace_value(error: BaseException, name: str) -> object:
+    try:
+        namespace = BaseException.__dict__["__dict__"].__get__(error, BaseException)
+    except BaseException:
+        return None
+    return dict.get(namespace, name) if type(namespace) is dict else None
 
 
 class RunnerCancelledError(asyncio.CancelledError):
@@ -217,6 +315,47 @@ class Runner(ABC):
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         """Execute a command and return stdout/stderr/exit metadata."""
+
+    async def exec_redacted(
+        self,
+        command: ExecCommand,
+        *,
+        redactor: SecretRedactor,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        """Execute with an invocation redactor at the closest supported boundary.
+
+        Bundled runners override this to redact while capturing. The default
+        preserves compatibility for custom runners but treats a channel that
+        was already truncated as irrecoverably ambiguous and omits its text.
+        """
+
+        from cayu.runners._redacted_output import redact_completed_exec_result
+        from cayu.vaults import SecretRedactor
+
+        if not isinstance(redactor, SecretRedactor):
+            raise TypeError("Runner.exec_redacted redactor must be a SecretRedactor.")
+        kwargs: dict[str, Any] = {
+            "cwd": cwd,
+            "env": env,
+            "timeout_s": timeout_s,
+            "stdin": stdin,
+            "output_limit_bytes": output_limit_bytes,
+        }
+        if env_remove:
+            kwargs["env_remove"] = env_remove
+        result = await self.exec(command, **kwargs)
+        return redact_completed_exec_result(
+            result,
+            redactor=redactor,
+            output_limit_bytes=output_limit_bytes,
+            omit_pretruncated=True,
+        )
 
     async def exec_system(
         self,

@@ -2434,6 +2434,14 @@ and any recovery dispatch receives a new attempt identity.
 Built-in HTTP transports preserve concrete request exceptions in
 `provider_error_type` and mark transient transport failures as retryable, so
 classification survives provider error events without relying on message text.
+Provider-authored error messages are not retained in non-2xx response bodies,
+stream error envelopes, or buffered response error envelopes because these
+adapters do not own the workload-secret registry. OpenAI, Chat Completions,
+Anthropic, and Vertex inspect a complete in-band message transiently for
+context-overflow classification, then expose only a fixed diagnostic and
+explicitly allowlisted error type/code. Arbitrary provider-authored identity
+strings and request IDs are omitted; numeric status, retryability, retry delay,
+and fixed classifications needed for overflow or stale-chain recovery remain.
 OpenAI, Chat Completions, Vertex, and Anthropic HTTP errors also preserve valid
 `Retry-After` delta-seconds and HTTP-date headers as `retry_after_s`; the runtime
 uses that delay in preference to exponential backoff, capped by
@@ -2633,7 +2641,7 @@ Tool failures are recoverable by default. They are recorded as `tool.call.failed
 
 Framework-native tools reserve `structured.error="invalid_arguments"` for model-controlled input that fails parsing, bounded-value validation, or `ExecCommandTool`'s initial `runner.resolve_cwd(...)` call. That working-directory resolution is part of argument validation and happens before policy evaluation; later calls into the command policy or `runner.exec(...)` are operational. A `CommandPolicy` denial or approval requirement remains an explicit policy result. Exceptions raised after argument validation by a policy implementation or by an authorized runner, workspace, artifact store, knowledge store, provider, or other runtime dependency retain their operational meaning merely because their Python type is `ValueError`; they are not relabeled as model-repairable input. This includes backend-specific validation performed by third-party stores after a tool has validated its own arguments. Existing typed operational mappings, including `runner_unavailable`, remain unchanged, and built-in tools do not serialize arbitrary operational exception details into an `invalid_arguments` result.
 
-Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them.
+Framework-native tools receive runtime services through `ToolContext`: workspace, artifact store, runner, vault, credential proxy, knowledge store, and MCP server specs. These references are intentionally runtime-only. They are excluded from `ToolContext.model_dump()` so context metadata can cross storage, event, dashboard, and replay boundaries without serializing live service objects. Serializable service identity fields such as `workspace_id` and `artifact_store_id` may be present when the active environment exposes them. The runner exposed to a tool is an invocation-scoped command handle, not the lifecycle-owning environment runner. Its `exec(...)` path applies the invocation's current workload-secret registry at the runner capture boundary before any public output limit. If the registry changes while a command is running, complete channels are projected again through the latest registry and already-incomplete channels are omitted while preserving their byte counts and truncation flags. Opaque runner and cleanup failures retain fixed typed status, adapter, error-type, and available byte-count evidence rather than external error text; caller cancellation remains the original `CancelledError`. Lifecycle methods such as `close()` are deliberately unavailable.
 
 Virtual-egress environments preserve the same public runner/workspace contract.
 `VirtualEgressEnvironmentFactory` has no implicit runner default: callers must
@@ -2669,7 +2677,7 @@ deny path even when its scheme is missing or unrecognized; it cannot fall
 through to a credentialless destination. Header scheme selection is therefore
 part of the credential grant, not a caller-owned rewrite hint.
 
-A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.read_bytes(path, offset=..., max_bytes=...)` returns a `WorkspaceReadResult`. Complete offset-zero snapshots carry an opaque `revision` and diagnostic `sha256`. Use `create_bytes`, `replace_bytes(expected_revision=...)`, or `delete_if_revision(expected_revision=...)` for model-facing mutations; a separate read followed by unconditional `write_bytes` or `delete` is not a safe precondition. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
+A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.read_bytes(path, offset=..., max_bytes=...)` and `ctx.artifact_store.read_bytes(...)` return invocation-safe byte projections. Runtime-created contexts redact complete source windows before the requested bound and fail closed if the invocation's secret registry changes repeatedly during the read. `source_bytes_read` records raw-source cursor progress even when redaction changes `len(content)`; `redaction_truncated` reports bytes withheld by the safety projection separately from raw `truncated`. Complete offset-zero workspace snapshots carry an opaque source `revision` and diagnostic `sha256`. Use `create_bytes`, `replace_bytes(expected_revision=...)`, or `delete_if_revision(expected_revision=...)` for model-facing mutations; a separate read followed by unconditional `write_bytes` or `delete` is not a safe precondition. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
 
 Conditional mutations compare the expected revision and mutate as one backend
 operation. Built-in backends serialize conforming Cayu clients by backend
@@ -3545,7 +3553,7 @@ were not omitted.
 
 Workspace result objects enforce consistent metadata:
 
-- `WorkspaceReadResult`: `truncated` must equal `offset + len(content) < total_bytes`; revision and SHA-256 metadata require a complete offset-zero snapshot
+- `WorkspaceReadResult`: `truncated` must equal `offset + source_bytes_read < total_bytes`; `next_offset` advances by raw `source_bytes_read`, while `content` may be shorter after redaction and `redaction_truncated` reports projection loss; revision and SHA-256 metadata require a complete offset-zero source snapshot
 - `WorkspaceMutationResult`: create has only after metadata, delete has only before metadata, and replace has both
 - `WorkspaceListResult` complete list: `truncated=false` and `total_count == len(paths)`
 - `WorkspaceListResult` truncated list: `truncated=true` and `total_count is None or total_count >= len(paths)`
@@ -4050,7 +4058,11 @@ Postgres embedding operational contract:
 `search(...)`. It does not rewrite the copied `KnowledgeEntry` or
 `KnowledgeChunk` objects inside each `KnowledgeHit`; model-facing knowledge tools
 and automatic injection layers must build their own bounded provider context
-from previews or explicitly read bounded chunks.
+from previews or explicitly read bounded chunks. Stores set the non-serialized
+`text_preview_complete` provenance bit on `KnowledgeHit` and `KnowledgeListItem`
+only when the returned preview contains the complete authoritative source field.
+The bit defaults to false so custom stores that cannot prove completeness fail
+closed at later redaction boundaries.
 
 The store contract is intentionally entry/chunk oriented:
 

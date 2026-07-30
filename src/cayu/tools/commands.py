@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -20,7 +21,7 @@ from cayu.core.tools import (
     ToolSpec,
     _bound_policy_denial_result,
 )
-from cayu.runners import ExecCommand, ExecResult, Runner, RunnerUnavailableError
+from cayu.runners import ExecCommand, ExecResult, RunnerUnavailableError
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
@@ -393,11 +394,18 @@ def _validate_command_text(value: str, field_name: str) -> None:
         raise ValueError(f"Tool argument `{field_name}` must not contain NUL characters.")
 
 
-def _require_runner(ctx: ToolContext) -> Runner | None:
+@runtime_checkable
+class _CommandRunnerHandle(Protocol):
+    async def exec(self, command: ExecCommand, **kwargs) -> object: ...
+
+    def resolve_cwd(self, cwd: str | None = None) -> str: ...
+
+
+def _require_runner(ctx: ToolContext) -> _CommandRunnerHandle | None:
     if ctx.runner is None:
         return None
-    if not isinstance(ctx.runner, Runner):
-        raise TypeError("Tool context runner must implement Runner.")
+    if not isinstance(ctx.runner, _CommandRunnerHandle):
+        raise TypeError("Tool context runner must support command execution and cwd resolution.")
     return ctx.runner
 
 

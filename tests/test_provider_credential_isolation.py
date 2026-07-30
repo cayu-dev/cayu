@@ -506,6 +506,7 @@ def test_unresolved_provider_auth_failure_uses_a_content_free_error_projection()
     event = credential_safe_error_event(
         RuntimeError(f"credential resolver failed near {canary}"),
         provider_label="Anthropic",
+        provider_name="anthropic",
         credential_values=(),
     )
 

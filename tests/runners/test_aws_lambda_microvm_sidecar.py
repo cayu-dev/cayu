@@ -6,6 +6,7 @@ import importlib.util
 import os
 import shlex
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,10 @@ SPEC.loader.exec_module(SUPERVISOR_MODULE)
 CommandSupervisor = SUPERVISOR_MODULE.CommandSupervisor
 CommandConflictError = SUPERVISOR_MODULE.CommandConflictError
 CommandExecutionBoundary = SUPERVISOR_MODULE.CommandExecutionBoundary
+READ_CHUNK_BYTES = SUPERVISOR_MODULE.READ_CHUNK_BYTES
+_LimitedBuffer = SUPERVISOR_MODULE._LimitedBuffer
+_drain = SUPERVISOR_MODULE._drain
+_result = SUPERVISOR_MODULE._result
 
 
 def test_sidecar_dockerfile_pins_supported_python() -> None:
@@ -316,6 +321,137 @@ def test_sidecar_executes_process_form_without_host_env_and_bounds_output(
     assert result["stderr_truncated"] is True
     assert result["timed_out"] is False
     assert result["cancelled"] is False
+
+
+def test_sidecar_omits_only_negotiated_pretruncated_output(tmp_path: Path) -> None:
+    supervisor = CommandSupervisor(root=tmp_path)
+    supervisor.start(
+        "cmd-redacted-output",
+        {
+            "kind": "process",
+            "argv": [sys.executable, "-c", "print('secret-crosses-the-boundary')"],
+            "cwd": str(tmp_path),
+            "env": {},
+            "stdin_base64": None,
+            "timeout_s": 2,
+            "output_limit_bytes": 8,
+            "omit_truncated_output": True,
+        },
+    )
+
+    result = wait_for_terminal(supervisor, "cmd-redacted-output")
+
+    assert base64.b64decode(result["stdout_base64"]) == b""
+    assert result["stdout_bytes"] == len(b"secret-crosses-the-boundary\n")
+    assert result["stdout_truncated"] is True
+
+
+def test_sidecar_omits_output_when_a_descendant_keeps_the_pipe_incomplete(
+    tmp_path: Path,
+) -> None:
+    secret = "sidecar-incomplete-drain-secret"
+    prefix = secret[:16]
+    supervisor = CommandSupervisor(root=tmp_path, cancel_timeout_s=0.02)
+    script = (
+        "import subprocess,sys,time; "
+        f"sys.stdout.write('p' * ({READ_CHUNK_BYTES} - {len(prefix)}) + {prefix!r}); "
+        "sys.stdout.flush(); "
+        "subprocess.Popen("
+        "[sys.executable, '-c', 'import time; time.sleep(0.3)'], "
+        "stdout=sys.stdout"
+        "); time.sleep(0.1)"
+    )
+    supervisor.start(
+        "cmd-incomplete-drain",
+        {
+            "kind": "process",
+            "argv": [sys.executable, "-c", script],
+            "cwd": str(tmp_path),
+            "env": {},
+            "stdin_base64": None,
+            "timeout_s": 2,
+            "output_limit_bytes": 128,
+            "omit_truncated_output": True,
+        },
+    )
+
+    result = wait_for_terminal(supervisor, "cmd-incomplete-drain")
+
+    assert base64.b64decode(result["stdout_base64"]) == b""
+    assert result["stdout_bytes"] == READ_CHUNK_BYTES
+    assert result["stdout_truncated"] is True
+
+
+def test_sidecar_reader_start_failure_is_terminal_and_omits_untrusted_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sidecar-reader-start-secret"
+    original_start = threading.Thread.start
+
+    def start_or_fail(self: threading.Thread) -> None:
+        if getattr(self, "_target", None) is _drain:
+            raise RuntimeError(f"reader failed with {secret}")
+        original_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start_or_fail)
+    supervisor = CommandSupervisor(root=tmp_path)
+    supervisor.start(
+        "cmd-reader-start-failure",
+        {
+            "kind": "process",
+            "argv": [sys.executable, "-c", "import time; time.sleep(30)"],
+            "cwd": str(tmp_path),
+            "env": {},
+            "stdin_base64": None,
+            "timeout_s": 2,
+            "output_limit_bytes": 128,
+            "omit_truncated_output": True,
+        },
+    )
+
+    result = wait_for_terminal(supervisor, "cmd-reader-start-failure")
+
+    assert result["state"] == "failed"
+    assert result["error_type"] == "RuntimeError"
+    assert base64.b64decode(result["stderr_base64"]) == b""
+    assert secret not in repr(result)
+
+
+def test_sidecar_reader_failure_marks_partial_output_for_omission() -> None:
+    secret = "sidecar-reader-failure-secret"
+    prefix = secret[:12].encode()
+
+    class FailingPipe:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def read(self, _size: int) -> bytes:
+            self.calls += 1
+            if self.calls == 1:
+                return prefix
+            raise OSError(f"reader failed with {secret}")
+
+    stdout = _LimitedBuffer(128)
+    stderr = _LimitedBuffer(128)
+
+    _drain(FailingPipe(), stdout)
+    result = _result(
+        "cmd-reader-failure",
+        state="failed",
+        exit_code=-1,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=False,
+        cancelled=False,
+        omit_truncated_output=True,
+    )
+
+    assert result["stdout_base64"] == ""
+    assert result["stdout_bytes"] == len(prefix)
+    assert result["stdout_truncated"] is True
+    assert secret not in repr(result)
+    assert secret[:12] not in repr(result)
 
 
 def test_sidecar_times_out_and_stops_process_group(tmp_path: Path) -> None:

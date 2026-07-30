@@ -26,6 +26,7 @@ from cayu.runners._cleanup import (
     validate_cancel_timeout,
     validate_runner_cleanup_policy,
 )
+from cayu.runners._redacted_output import RedactedOutputCapture
 from cayu.runners._subprocess import (
     copy_runner_env,
     remove_runner_env,
@@ -38,10 +39,13 @@ from cayu.runners.base import (
     ExecCommand,
     ExecResult,
     Runner,
+    RunnerExecutionError,
     RunnerWorkspaceCapability,
     RunnerWorkspaceCapabilityT,
     attach_cancellation_artifacts,
+    runner_execution_error,
 )
+from cayu.vaults import SecretRedactor
 
 DEFAULT_E2B_CWD = "/home/user/workspace"
 E2B_SANDBOX_ID_MAX_BYTES = 256
@@ -1065,6 +1069,60 @@ class E2BRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
+        operation = self._exec(
+            command,
+            output_redactor=SecretRedactor(),
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        env = None
+        stdin = None
+        return await operation
+
+    async def exec_redacted(
+        self,
+        command: ExecCommand,
+        *,
+        redactor: SecretRedactor,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        if not isinstance(redactor, SecretRedactor):
+            raise TypeError("E2BRunner redactor must be a SecretRedactor.")
+        operation = self._exec(
+            command,
+            output_redactor=redactor,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        env = None
+        stdin = None
+        return await operation
+
+    async def _exec(
+        self,
+        command: ExecCommand,
+        *,
+        output_redactor: SecretRedactor,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("E2BRunner command must be an ExecCommand.")
         self._ensure_exec_open()
@@ -1072,14 +1130,16 @@ class E2BRunner(Runner):
         working_dir = self.resolve_cwd(cwd)
         environment = copy_runner_env(env, inherit_env=False)
         environment = remove_runner_env(environment, env_remove)
+        env = None
         if self.env_overlay:
             environment.update(self.env_overlay)
         timeout = validate_timeout(timeout_s)
         standard_input = validate_stdin(stdin)
+        stdin = None
         output_limit = validate_output_limit(output_limit_bytes)
         script = _command_to_e2b_script(command)
-        stdout = _LimitedText(output_limit)
-        stderr = _LimitedText(output_limit)
+        stdout = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
+        stderr = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
         handle = None
         start_task: asyncio.Task[Any] | None = None
 
@@ -1091,6 +1151,7 @@ class E2BRunner(Runner):
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout if timeout is not None else None
+        execution_failure: RunnerExecutionError | None = None
         try:
             run_options: dict[str, Any] = {
                 "background": True,
@@ -1115,6 +1176,8 @@ class E2BRunner(Runner):
                 remaining = max(deadline - loop.time(), 0.0)
                 result = await asyncio.wait_for(handle.wait(), timeout=remaining)
         except asyncio.CancelledError as exc:
+            stdout.abort()
+            stderr.abort()
             cleanup = await self._cleanup_interrupted_command(
                 start_task,
                 current_handle=handle,
@@ -1125,6 +1188,8 @@ class E2BRunner(Runner):
             raise
         except Exception as exc:
             if _is_timeout_error(exc):
+                stdout.abort()
+                stderr.abort()
                 cleanup = await self._cleanup_interrupted_command(
                     start_task,
                     current_handle=handle,
@@ -1144,8 +1209,17 @@ class E2BRunner(Runner):
                 )
             if _is_command_exit(exc):
                 return _exec_result_from_e2b_result(exc, stdout, stderr)
-            raise
+            stdout.abort()
+            stderr.abort()
+            execution_failure = runner_execution_error(
+                exc,
+                adapter="e2b",
+                stdout_bytes=stdout.total_bytes,
+                stderr_bytes=stderr.total_bytes,
+            )
 
+        if execution_failure is not None:
+            raise execution_failure
         return _exec_result_from_e2b_result(result, stdout, stderr)
 
     async def _await_started_handle(
@@ -1359,44 +1433,6 @@ class E2BRunner(Runner):
             )
 
 
-class _LimitedText:
-    def __init__(self, limit: int | None) -> None:
-        self.limit = limit
-        self.content = bytearray()
-        self.total_bytes = 0
-        self.truncated = False
-
-    def append(self, data: str | bytes) -> None:
-        if type(data) is str:
-            chunk = data.encode("utf-8")
-        elif type(data) is bytes:
-            chunk = data
-        else:
-            raise TypeError("E2B command output chunks must be strings or bytes.")
-        if not chunk:
-            return
-        self.total_bytes += len(chunk)
-        if self.limit is None:
-            self.content.extend(chunk)
-            return
-        remaining = self.limit - len(self.content)
-        if remaining <= 0:
-            self.truncated = True
-            return
-        self.content.extend(chunk[:remaining])
-        if len(chunk) > remaining:
-            self.truncated = True
-
-    def seed_if_empty(self, data: Any) -> None:
-        if self.content:
-            return
-        if type(data) is str or type(data) is bytes:
-            self.append(data)
-
-    def text(self) -> str:
-        return bytes(self.content).decode("utf-8", errors="replace")
-
-
 def _e2b_module(module: ModuleType | Any | None = None) -> ModuleType | Any:
     if module is not None:
         return module
@@ -1478,11 +1514,13 @@ def _command_to_e2b_script(command: ExecCommand) -> str:
 
 def _exec_result_from_e2b_result(
     result: Any,
-    stdout: _LimitedText,
-    stderr: _LimitedText,
+    stdout: RedactedOutputCapture,
+    stderr: RedactedOutputCapture,
 ) -> ExecResult:
     stdout.seed_if_empty(getattr(result, "stdout", None))
     stderr.seed_if_empty(getattr(result, "stderr", None))
+    stdout.finish_complete()
+    stderr.finish_complete()
     exit_code = getattr(result, "exit_code", None)
     if type(exit_code) is not int:
         raise TypeError("E2B command result missing integer exit_code.")

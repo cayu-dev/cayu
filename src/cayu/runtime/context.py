@@ -110,7 +110,8 @@ from cayu.storage.memory import (
     KnowledgeSearchMode,
     KnowledgeVisibility,
 )
-from cayu.vaults import SecretRedactor
+from cayu.vaults import REDACTED_SECRET, SecretRedactionCapacityError, SecretRedactor
+from cayu.vaults.redaction import _bounded_redacted_head, _bounded_stream_retention_bytes
 
 _COMPACTION_CHECKPOINT_KEY = "context_compaction"
 _COMPACTION_CHECKPOINT_VERSION = 2
@@ -1698,6 +1699,7 @@ class KnowledgeInjectionPolicy(RuntimeManagedContextPolicy):
             search_result.hits,
             prefix=self.prefix,
             max_bytes=self.max_bytes,
+            redactor=_active_context_secret_redactor(),
         )
         tool_call_id = f"{_KNOWLEDGE_INJECTION_TOOL_CALL_ID_PREFIX}{request.step}"
         injected_messages = _append_knowledge_tool_round(
@@ -6202,38 +6204,193 @@ def _format_knowledge_injection(
     *,
     prefix: str,
     max_bytes: int,
+    redactor: SecretRedactor | None = None,
 ) -> tuple[str, int]:
-    lines = [
-        prefix,
-        _KNOWLEDGE_INJECTION_TAINT_NOTICE,
-        _KNOWLEDGE_INJECTION_OPEN_TAG,
-    ]
+    resolved_redactor = redactor or SecretRedactor()
+    output = _BoundedRedactedKnowledgeText(
+        redactor=resolved_redactor,
+        max_bytes=max_bytes,
+    )
+    output.append(prefix)
+    output.append(f"\n\n{_KNOWLEDGE_INJECTION_TAINT_NOTICE}")
+    output.append(f"\n\n{_KNOWLEDGE_INJECTION_OPEN_TAG}")
     for index, hit in enumerate(hits, start=1):
         entry = hit.entry
-        title = f" title={entry.title!r}" if entry.title else ""
+        if not output.append(f"\n\n{index}. entry_id='"):
+            break
+        if not output.append(entry.id):
+            break
+        if not output.append("' kind='"):
+            break
+        if not output.append(entry.kind):
+            break
+        if not output.append("'"):
+            break
+        if entry.title:
+            if not output.append(" title='"):
+                break
+            if not output.append(entry.title):
+                break
+            if not output.append("'"):
+                break
         chunk = f" chunk_index={hit.chunk.chunk_index}" if hit.chunk is not None else ""
         score = f" score={hit.score:.4f}" if hit.score is not None else ""
-        text = hit.text_preview or (hit.chunk.text if hit.chunk is not None else entry.text)
-        lines.append(
-            f"{index}. entry_id={entry.id!r} kind={entry.kind!r}{title}{chunk}{score}\n{text}"
-        )
-    lines.append(_KNOWLEDGE_INJECTION_CLOSE_TAG)
-    injected = _truncate_text_to_bytes("\n\n".join(lines), max_bytes)
+        if not output.append(f"{chunk}{score}\n"):
+            break
+        if not output.append(_complete_knowledge_hit_text(hit)):
+            break
+    if not output.truncated:
+        output.append(f"\n\n{_KNOWLEDGE_INJECTION_CLOSE_TAG}")
+    injected = output.finish()
     if not injected:
-        injected = prefix
+        injected = _bounded_redacted_head(
+            resolved_redactor.redact_text(prefix).encode("utf-8"),
+            max_bytes=max_bytes,
+        ).decode("utf-8", errors="ignore")
     return injected, len(injected.encode("utf-8"))
 
 
-def _truncate_text_to_bytes(text: str, max_bytes: int) -> str:
-    encoded = text.encode("utf-8")
+def _complete_knowledge_hit_text(hit: KnowledgeHit) -> str:
+    """Resolve a bounded preview back to a complete authoritative hit field."""
+
+    preview = hit.text_preview
+    if preview is None:
+        return hit.chunk.text if hit.chunk is not None else hit.entry.text
+
+    candidates: list[str] = []
+    reason = hit.reason.rsplit("; ", 1)[-1] if hit.reason is not None else None
+    if reason == "title match" and hit.entry.title is not None:
+        candidates.append(hit.entry.title)
+    elif reason in {"entry text match", "semantic entry match"}:
+        candidates.append(hit.entry.text)
+    elif reason in {"chunk text match", "semantic chunk match"} and hit.chunk is not None:
+        candidates.append(hit.chunk.text)
+
+    # A populated ``chunk`` is the strongest generic indication of the selected
+    # source for semantic and extension-store hits. Exact keyword reasons above
+    # still take precedence because hybrid search can retain a semantic chunk
+    # while selecting a title or entry preview.
+    if hit.chunk is not None:
+        candidates.append(hit.chunk.text)
+    if hit.entry.title is not None:
+        candidates.append(hit.entry.title)
+    candidates.append(hit.entry.text)
+
+    seen_candidates: set[int] = set()
+    for candidate in candidates:
+        # Avoid hashing complete, potentially very large source fields merely
+        # to de-duplicate references selected through more than one hint.
+        identity = id(candidate)
+        if identity in seen_candidates:
+            continue
+        seen_candidates.add(identity)
+        if candidate.startswith(preview):
+            return candidate
+
+    # Extension stores may return a derived excerpt without retaining its
+    # complete source in KnowledgeHit. Publishing that already-bounded excerpt
+    # could expose an unrecoverable secret fragment, so fall back to a complete
+    # authoritative field rather than treating the preview as trusted.
+    return hit.chunk.text if hit.chunk is not None else hit.entry.text
+
+
+class _BoundedRedactedKnowledgeText:
+    """Build a bounded injection without materializing its unbounded source."""
+
+    _SOURCE_CHARS_PER_CHUNK = 4096
+
+    def __init__(self, *, redactor: SecretRedactor, max_bytes: int) -> None:
+        self._redactor = redactor
+        self._stream = redactor.stream_bytes(
+            max_retained_bytes=_bounded_stream_retention_bytes(
+                redactor,
+                max_bytes=max_bytes,
+            )
+        )
+        self._max_bytes = max_bytes
+        self._capture_limit = max_bytes + len(REDACTED_SECRET.encode("utf-8"))
+        self._content = bytearray()
+        self._released_bytes = 0
+        self._finished = False
+        self.truncated = False
+
+    def append(self, value: str) -> bool:
+        """Append source text and return whether more source can be observable."""
+
+        if self._finished or self.truncated:
+            return False
+        for offset in range(0, len(value), self._SOURCE_CHARS_PER_CHUNK):
+            raw = value[offset : offset + self._SOURCE_CHARS_PER_CHUNK].encode(
+                "utf-8",
+                "replace",
+            )
+            try:
+                self._capture(self._stream.feed(raw))
+            except SecretRedactionCapacityError as exc:
+                self._capture(exc.released)
+                self.truncated = True
+                return False
+            if self.truncated:
+                # Stable redacted output already exceeds the public bound, so
+                # later source cannot affect the observable prefix.
+                self._stream.abort()
+                return False
+        return True
+
+    def finish(self) -> str:
+        if self._finished:
+            raise RuntimeError("Knowledge injection output is already finished.")
+        self._finished = True
+        if not self.truncated:
+            self._capture(self._stream.finish_complete())
+        captured = bytes(self._content).decode("utf-8", "ignore")
+        if not self.truncated:
+            return captured
+        return _truncate_text_to_bytes(
+            captured,
+            self._max_bytes,
+            redactor=self._redactor,
+        )
+
+    def _capture(self, released: bytes) -> None:
+        if not released:
+            return
+        self._released_bytes += len(released)
+        remaining = self._capture_limit - len(self._content)
+        if remaining > 0:
+            self._content.extend(released[:remaining])
+        if self._released_bytes > self._max_bytes:
+            self.truncated = True
+
+
+def _truncate_text_to_bytes(
+    text: str,
+    max_bytes: int,
+    *,
+    redactor: SecretRedactor | None = None,
+) -> str:
+    resolved_redactor = redactor or SecretRedactor()
+    encoded = resolved_redactor.redact_text(text).encode("utf-8")
     if len(encoded) <= max_bytes:
-        return text
+        return encoded.decode("utf-8")
     marker = _KNOWLEDGE_INJECTION_TRUNCATION_MARKER
     marker_bytes = marker.encode("utf-8")
     if max_bytes <= len(marker_bytes):
-        return marker[:max_bytes]
-    clipped = encoded[: max_bytes - len(marker_bytes)]
-    return clipped.decode("utf-8", errors="ignore").rstrip() + marker
+        return _bounded_redacted_head(encoded, max_bytes=max_bytes).decode(
+            "utf-8",
+            errors="ignore",
+        )
+    clipped = _bounded_redacted_head(
+        encoded,
+        max_bytes=max_bytes - len(marker_bytes),
+    )
+    candidate = clipped.decode("utf-8", errors="ignore").rstrip() + marker
+    if resolved_redactor.redact_text(candidate) == candidate:
+        return candidate
+    return _bounded_redacted_head(encoded, max_bytes=max_bytes).decode(
+        "utf-8",
+        errors="ignore",
+    )
 
 
 def _knowledge_search_telemetry(

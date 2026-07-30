@@ -219,6 +219,7 @@ from cayu.storage import (
     KnowledgeReviewWorkflow,
     KnowledgeVisibility,
 )
+from cayu.vaults import REDACTED_SECRET
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +466,22 @@ def _redacted_stream_error_text(cayu_app: Any, error: BaseException) -> str:
     if type(redacted) is not str:
         return fallback
     return redacted
+
+
+def _bounded_run_task_title(redacted_prompt: str) -> str:
+    """Apply the 80-character task-title limit without splitting a marker."""
+
+    max_chars = 80
+    if len(redacted_prompt) <= max_chars:
+        return redacted_prompt
+    marker_start = redacted_prompt.rfind(
+        REDACTED_SECRET,
+        0,
+        max_chars + len(REDACTED_SECRET),
+    )
+    if marker_start >= 0 and marker_start < max_chars < marker_start + len(REDACTED_SECRET):
+        return redacted_prompt[:marker_start]
+    return redacted_prompt[:max_chars]
 
 
 def _stream_error_sse_message(
@@ -3098,14 +3115,17 @@ def create_router(
                 # so the interrupted session can resume it later.
                 if state.status in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
                     return
+                redacted_prompt = cayu_app.redact_json(body.prompt)
+                if type(redacted_prompt) is not str:
+                    raise TypeError("CayuApp prompt redaction must return a string.")
                 await task_store.create_running_task(
                     TaskCreate(
                         task_id=task_id,
                         type="run",
-                        title=body.prompt[:80],
+                        title=_bounded_run_task_title(redacted_prompt),
                         session_id=session_id,
                         assigned_agent_name=body.agent,
-                        input={"prompt": body.prompt},
+                        input={"prompt": redacted_prompt},
                     )
                 )
 

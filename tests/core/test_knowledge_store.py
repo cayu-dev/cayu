@@ -35,7 +35,11 @@ from cayu.storage import (
     KnowledgeStore,
     KnowledgeVisibility,
 )
-from cayu.storage.memory import copy_knowledge_entry
+from cayu.storage.memory import (
+    copy_knowledge_entry,
+    copy_knowledge_hit,
+    copy_knowledge_list_item,
+)
 
 
 class KeywordEmbeddingProvider(TextEmbeddingProvider):
@@ -276,6 +280,34 @@ def test_knowledge_hit_owns_copies() -> None:
 
     assert hit.entry.id == "entry_1"
     assert hit.entry.metadata == {"nested": {"value": "original"}}
+
+
+def test_knowledge_preview_completeness_is_typed_internal_provenance() -> None:
+    entry = KnowledgeEntry(id="entry_1", text="complete preview")
+    hit = KnowledgeHit(
+        entry=entry,
+        text_preview=entry.text,
+        text_preview_complete=True,
+    )
+    item = KnowledgeListItem(
+        entry=entry,
+        text_preview=entry.text,
+        text_preview_complete=True,
+    )
+
+    assert hit.text_preview_complete is True
+    assert item.text_preview_complete is True
+    assert copy_knowledge_hit(hit).text_preview_complete is True
+    assert copy_knowledge_list_item(item).text_preview_complete is True
+    assert "text_preview_complete" not in hit.model_dump()
+    assert "text_preview_complete" not in item.model_dump()
+
+    with pytest.raises(ValidationError, match="must be a boolean"):
+        KnowledgeHit(
+            entry=entry,
+            text_preview=entry.text,
+            text_preview_complete=1,
+        )
 
 
 def test_knowledge_hit_rejects_chunk_for_different_entry() -> None:

@@ -67,7 +67,7 @@ class FailOnceTerminateControlClient(FakeControlClient):
 
 class HealthyTransport:
     async def health(self, *, endpoint: str, token: str, timeout_s: float) -> dict[str, str]:
-        return {"status": "ok", "protocol_version": "1"}
+        return {"status": "ok", "protocol_version": "2"}
 
 
 @pytest.mark.anyio

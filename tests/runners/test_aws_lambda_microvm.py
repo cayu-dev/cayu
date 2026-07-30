@@ -8,16 +8,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 import cayu.runners.aws_lambda_microvm as lambda_microvm_module
 from cayu import ExecCommand, LambdaMicroVMRunner, RunnerWorkspace
 from cayu.runners import (
+    HttpxLambdaMicroVMEndpointTransport,
     LambdaMicroVMEndpointUnauthorized,
     LambdaMicroVMError,
     LambdaMicroVMProtocolError,
 )
 from cayu.testing import verify_provider_credential_isolation
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 SUPERVISOR_PATH = (
     Path(__file__).resolve().parents[2]
@@ -34,7 +37,10 @@ SUPERVISOR_MODULE = importlib.util.module_from_spec(SUPERVISOR_SPEC)
 sys.modules[SUPERVISOR_SPEC.name] = SUPERVISOR_MODULE
 SUPERVISOR_SPEC.loader.exec_module(SUPERVISOR_MODULE)
 CommandSupervisor = SUPERVISOR_MODULE.CommandSupervisor
-HEALTH_RESPONSE = {"status": "ok", "protocol_version": "1"}
+HEALTH_RESPONSE = {
+    "status": "ok",
+    "protocol_version": lambda_microvm_module.LAMBDA_MICROVM_PROTOCOL_VERSION,
+}
 
 
 class FakeLambdaMicroVMClient:
@@ -184,6 +190,103 @@ class FakeEndpointTransport:
         self.closed = True
 
 
+@pytest.mark.anyio
+async def test_lambda_http_transport_omits_untrusted_error_body() -> None:
+    secret = "lambda-http-error-boundary-secret"
+
+    class ClientOwner:
+        def __init__(self) -> None:
+            self.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        500,
+                        request=request,
+                        text="x" * 995 + secret,
+                    )
+                )
+            )
+
+        def get(self) -> httpx.AsyncClient:
+            return self.client
+
+        async def aclose(self) -> None:
+            await self.client.aclose()
+
+    transport = HttpxLambdaMicroVMEndpointTransport()
+    owner = ClientOwner()
+    transport._client = owner
+    try:
+        with pytest.raises(LambdaMicroVMError) as exc_info:
+            await transport.health(
+                endpoint="example.lambda-microvm.us-east-1.on.aws",
+                token="endpoint-token",
+                timeout_s=1,
+            )
+    finally:
+        await transport.aclose()
+
+    message = str(exc_info.value)
+    assert message == "Lambda MicroVM endpoint returned HTTP 500; response body omitted"
+    assert secret not in message
+    assert secret[:10] not in message
+
+
+@pytest.mark.anyio
+async def test_lambda_runner_redacts_complete_output_and_omits_pretruncated_output() -> None:
+    secret = "lambda-output-boundary-secret"
+    complete = f"prefix:{secret}:suffix".encode()
+    complete_transport = FakeEndpointTransport(
+        result_overrides={
+            "stdout_base64": base64.b64encode(complete).decode("ascii"),
+            "stdout_bytes": len(complete),
+            "stdout_truncated": False,
+        }
+    )
+    complete_runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-complete",
+        endpoint="complete.lambda-microvm.us-east-1.on.aws",
+        endpoint_transport=complete_transport,
+        poll_interval_s=0,
+    )
+
+    complete_result = await complete_runner.exec_redacted(
+        ExecCommand.process("echo", "ignored"),
+        redactor=SecretRedactor(secret),
+        output_limit_bytes=128,
+    )
+
+    assert complete_result.stdout == f"prefix:{REDACTED_SECRET}:suffix"
+    assert complete_result.stdout_bytes == len(complete)
+    assert complete_result.stdout_truncated is False
+    assert complete_transport.start_calls[0]["payload"]["omit_truncated_output"] is True
+
+    truncated_transport = FakeEndpointTransport(
+        result_overrides={
+            "stdout_base64": base64.b64encode(secret[:12].encode()).decode("ascii"),
+            "stdout_bytes": len(secret),
+            "stdout_truncated": True,
+        }
+    )
+    truncated_runner = LambdaMicroVMRunner(
+        FakeLambdaMicroVMClient(),
+        microvm_id="mvm-truncated",
+        endpoint="truncated.lambda-microvm.us-east-1.on.aws",
+        endpoint_transport=truncated_transport,
+        poll_interval_s=0,
+    )
+
+    truncated_result = await truncated_runner.exec_redacted(
+        ExecCommand.process("echo", "ignored"),
+        redactor=SecretRedactor(secret),
+        output_limit_bytes=12,
+    )
+
+    assert truncated_result.stdout == ""
+    assert truncated_result.stdout_bytes == len(secret)
+    assert truncated_result.stdout_truncated is True
+
+
 class BlockingEndpointTransport(FakeEndpointTransport):
     def __init__(self) -> None:
         super().__init__()
@@ -257,7 +360,7 @@ class FailingHealthEndpointTransport(FakeEndpointTransport):
 
 class MismatchedProtocolEndpointTransport(FakeEndpointTransport):
     async def health(self, *, endpoint: str, token: str, timeout_s: float) -> dict[str, str]:
-        return {"status": "ok", "protocol_version": "2"}
+        return {"status": "ok", "protocol_version": "1"}
 
 
 class LegacyEndpointTransport(FakeEndpointTransport):
@@ -475,6 +578,7 @@ async def test_lambda_microvm_runner_creates_and_executes_without_host_env_leak(
         "stdin_base64": base64.b64encode(b"input").decode("ascii"),
         "timeout_s": 10,
         "output_limit_bytes": 5,
+        "omit_truncated_output": False,
     }
     assert "CAYU_HOST_SECRET_SHOULD_NOT_LEAK" not in transport.start_calls[0]["payload"]["env"]
     assert result.stdout == "hello�"
@@ -863,7 +967,7 @@ async def test_lambda_microvm_runner_rejects_sidecar_protocol_mismatch(
 ) -> None:
     client = FakeLambdaMicroVMClient()
 
-    with pytest.raises(LambdaMicroVMProtocolError, match="expected 1"):
+    with pytest.raises(LambdaMicroVMProtocolError, match="expected 2"):
         await asyncio.wait_for(
             LambdaMicroVMRunner.create(
                 "arn:aws:lambda:us-west-2:123:microvm-image:cayu",

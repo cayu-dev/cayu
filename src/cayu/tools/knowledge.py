@@ -39,6 +39,12 @@ from cayu.storage.memory import (
     KnowledgeVisibility,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._redaction import (
+    await_revision_stable_secret_output,
+    record_ambiguous_secret_output,
+    unstable_secret_redaction_result,
+)
+from cayu.vaults import SecretRedactor
 
 DEFAULT_KNOWLEDGE_TOOL_LIMIT = DEFAULT_KNOWLEDGE_LIMIT
 MAX_KNOWLEDGE_TOOL_LIMIT = 25
@@ -361,9 +367,24 @@ class SearchKnowledgeTool(Tool):
                 default=DEFAULT_SEARCH_KNOWLEDGE_PREVIEW_BYTES,
                 maximum=MAX_KNOWLEDGE_TOOL_PREVIEW_BYTES,
             )
-        result = await store.search(query)
+
+        async def search(_redactor: SecretRedactor):
+            return await store.search(query)
+
+        captured = await await_revision_stable_secret_output(ctx, search)
+        if captured is None:
+            return unstable_secret_redaction_result()
+        result, capture_snapshot = captured
+        redactor = capture_snapshot.redactor
         filtered_hits = _filter_search_hits(result.hits, min_score=effective_min_score)
-        hits = [_knowledge_hit_payload(hit, preview_bytes=preview_bytes) for hit in filtered_hits]
+        hits = [
+            _knowledge_hit_payload(
+                hit,
+                preview_bytes=preview_bytes,
+                redactor=redactor,
+            )
+            for hit in filtered_hits
+        ]
         filtered_count = len(result.hits) - len(filtered_hits)
         min_score_applied = _min_score_applied(
             result.hits,
@@ -373,13 +394,23 @@ class SearchKnowledgeTool(Tool):
         content = (
             "No knowledge results found."
             if not hits
-            else _format_search_hits(filtered_hits, preview_bytes=preview_bytes)
+            else _format_search_hits(
+                filtered_hits,
+                preview_bytes=preview_bytes,
+                redactor=redactor,
+            )
         )
         if min_score_applied is False:
             content += (
                 f"\nNote: min_score {effective_min_score} was not applied because the "
                 "store returned no normalized-scored hits."
             )
+        if any(
+            source.text_preview is not None
+            and (not source.text_preview_complete or payload["text_preview_truncated"])
+            for source, payload in zip(filtered_hits, hits, strict=True)
+        ):
+            record_ambiguous_secret_output(ctx, capture_snapshot)
         return ToolResult(
             content=content,
             structured={
@@ -927,20 +958,33 @@ class ListKnowledgeTool(Tool):
                 "include_entries",
                 default=not group_by,
             )
-        result = await store.list_entries(
-            _list_query_with_group(query, group_by[0] if group_by else None)
-        )
-        all_facets = list(result.facets)
-        facets_truncated = bool(getattr(result, "facets_truncated", False))
-        for group in group_by[1:]:
-            grouped_result = await store.list_entries(_list_query_with_group(query, group))
-            all_facets.extend(grouped_result.facets)
-            facets_truncated = facets_truncated or bool(
-                getattr(grouped_result, "facets_truncated", False)
+
+        async def list_entries(_redactor: SecretRedactor):
+            result = await store.list_entries(
+                _list_query_with_group(query, group_by[0] if group_by else None)
             )
+            all_facets = list(result.facets)
+            facets_truncated = bool(getattr(result, "facets_truncated", False))
+            for group in group_by[1:]:
+                grouped_result = await store.list_entries(_list_query_with_group(query, group))
+                all_facets.extend(grouped_result.facets)
+                facets_truncated = facets_truncated or bool(
+                    getattr(grouped_result, "facets_truncated", False)
+                )
+            return result, all_facets, facets_truncated
+
+        captured = await await_revision_stable_secret_output(ctx, list_entries)
+        if captured is None:
+            return unstable_secret_redaction_result()
+        (result, all_facets, facets_truncated), capture_snapshot = captured
+        redactor = capture_snapshot.redactor
         exposed_entries = result.entries if include_entries else []
         entries = [
-            _knowledge_list_item_payload(item, preview_bytes=preview_bytes)
+            _knowledge_list_item_payload(
+                item,
+                preview_bytes=preview_bytes,
+                redactor=redactor,
+            )
             for item in exposed_entries
         ]
         facets = [_knowledge_facet_payload(facet) for facet in all_facets]
@@ -951,9 +995,16 @@ class ListKnowledgeTool(Tool):
             total_entries_known=result.total_entries_known,
             include_entries=include_entries,
             preview_bytes=preview_bytes,
+            redactor=redactor,
             facets_truncated=facets_truncated,
             search_modes=search_modes,
         )
+        if any(
+            source.text_preview is not None
+            and (not source.text_preview_complete or payload["text_preview_truncated"])
+            for source, payload in zip(exposed_entries, entries, strict=True)
+        ):
+            record_ambiguous_secret_output(ctx, capture_snapshot)
         return ToolResult(
             content=content,
             structured={
@@ -1317,9 +1368,19 @@ def _optional_nonnegative_int(
     return value
 
 
-def _knowledge_hit_payload(hit: KnowledgeHit, *, preview_bytes: int) -> dict[str, Any]:
+def _knowledge_hit_payload(
+    hit: KnowledgeHit,
+    *,
+    preview_bytes: int,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
     entry = hit.entry
-    text_preview, preview_truncated = _bounded_preview(hit.text_preview, preview_bytes)
+    text_preview, preview_truncated = _bounded_preview(
+        hit.text_preview,
+        preview_bytes,
+        redactor=redactor,
+        source_complete=hit.text_preview_complete,
+    )
     return {
         "entry_id": entry.id,
         "namespace": entry.namespace,
@@ -1375,9 +1436,15 @@ def _knowledge_list_item_payload(
     item: KnowledgeListItem,
     *,
     preview_bytes: int,
+    redactor: SecretRedactor,
 ) -> dict[str, Any]:
     entry = item.entry
-    text_preview, preview_truncated = _bounded_preview(item.text_preview, preview_bytes)
+    text_preview, preview_truncated = _bounded_preview(
+        item.text_preview,
+        preview_bytes,
+        redactor=redactor,
+        source_complete=item.text_preview_complete,
+    )
     return {
         "entry_id": entry.id,
         "namespace": entry.namespace,
@@ -1590,7 +1657,12 @@ def _search_query_payload(query: KnowledgeQuery) -> dict[str, Any]:
     }
 
 
-def _format_search_hits(hits: list[KnowledgeHit], *, preview_bytes: int) -> str:
+def _format_search_hits(
+    hits: list[KnowledgeHit],
+    *,
+    preview_bytes: int,
+    redactor: SecretRedactor,
+) -> str:
     lines = ["Knowledge results:"]
     for index, hit in enumerate(hits, start=1):
         entry = hit.entry
@@ -1600,7 +1672,12 @@ def _format_search_hits(hits: list[KnowledgeHit], *, preview_bytes: int) -> str:
             chunk = f" chunk_index={hit.chunk.chunk_index}"
         score = f" score={hit.score:.4f}" if hit.score is not None else ""
         lines.append(f"{index}. entry_id={entry.id!r} kind={entry.kind!r}{title}{chunk}{score}")
-        text_preview, preview_truncated = _bounded_preview(hit.text_preview, preview_bytes)
+        text_preview, preview_truncated = _bounded_preview(
+            hit.text_preview,
+            preview_bytes,
+            redactor=redactor,
+            source_complete=hit.text_preview_complete,
+        )
         if text_preview:
             suffix = " [preview truncated]" if preview_truncated else ""
             lines.append(f"{text_preview}{suffix}")
@@ -1615,6 +1692,7 @@ def _format_knowledge_list(
     total_entries_known: int | None,
     include_entries: bool,
     preview_bytes: int,
+    redactor: SecretRedactor,
     facets_truncated: bool,
     search_modes: list[str],
 ) -> str:
@@ -1658,6 +1736,8 @@ def _format_knowledge_list(
             text_preview, preview_truncated = _bounded_preview(
                 item.text_preview,
                 preview_bytes,
+                redactor=redactor,
+                source_complete=item.text_preview_complete,
             )
             if text_preview:
                 suffix = " [preview truncated]" if preview_truncated else ""
@@ -1674,10 +1754,18 @@ def _format_chunks(entry_id: str, chunks: list[KnowledgeChunk]) -> str:
     return "\n".join(lines)
 
 
-def _bounded_preview(text: str | None, max_bytes: int) -> tuple[str | None, bool]:
+def _bounded_preview(
+    text: str | None,
+    max_bytes: int,
+    *,
+    redactor: SecretRedactor,
+    source_complete: bool,
+) -> tuple[str | None, bool]:
     if text is None:
         return None, False
-    encoded = text.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return text, False
-    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(), True
+    preview, truncated = redactor.redact_utf8_head(
+        text.encode("utf-8"),
+        max_bytes=max_bytes,
+        source_complete=source_complete,
+    )
+    return (preview.rstrip() if truncated else preview), truncated

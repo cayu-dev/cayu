@@ -18,7 +18,7 @@ from cayu.runners.docker import (
     _validate_mount_path,
 )
 from cayu.testing import verify_provider_credential_isolation
-from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRef, StaticVault
+from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRedactor, SecretRef, StaticVault
 
 
 def test_require_docker_uses_explicit_path():
@@ -293,6 +293,28 @@ def test_exec_forwards_to_run_subprocess(monkeypatch):
     assert "PATH" in calls["kwargs"]["env"]
 
 
+def test_exec_redacted_forwards_invocation_redactor_to_subprocess_capture(monkeypatch) -> None:
+    secret = "docker-exec-boundary-secret"
+    calls: dict[str, Any] = {}
+
+    async def fake_run_subprocess(command, **kwargs):
+        calls["redactor"] = kwargs["output_redactor"]
+        return ExecResult(stdout=kwargs["output_redactor"].redact_text(secret))
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner("a1", docker_path="/usr/bin/docker")
+
+    result = asyncio.run(
+        runner.exec_redacted(
+            ExecCommand.process("echo", "ignored"),
+            redactor=SecretRedactor(secret),
+        )
+    )
+
+    assert isinstance(calls["redactor"], SecretRedactor)
+    assert result.stdout == REDACTED_SECRET
+
+
 def test_exec_keeps_stdin_attached_to_supervised_command(monkeypatch):
     calls = {}
 
@@ -373,6 +395,66 @@ def test_close_remove_failure_keeps_runner_open(monkeypatch):
     with pytest.raises(RuntimeError, match="docker rm failed"):
         asyncio.run(r.close())
     assert r._closed is False
+
+
+@pytest.mark.parametrize("close_action", ["remove", "stop"])
+def test_docker_lifecycle_redacts_complete_stderr_before_bounding(
+    monkeypatch,
+    close_action,
+) -> None:
+    secret = "docker-lifecycle-boundary-secret"
+    stderr = "x" * 290 + secret + "tail"
+
+    async def fake_run_subprocess(command, **kwargs):
+        return ExecResult(stderr=stderr, exit_code=1)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner(
+        "a1",
+        docker_path="/usr/bin/docker",
+        close_action=close_action,
+        env_overlay={"WORKLOAD_TOKEN": secret},
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(runner.close())
+
+    message = str(exc_info.value)
+    assert secret not in message
+    assert secret[:12] not in message
+    assert "[truncated]" in message
+    assert len(message.encode()) < 400
+
+
+@pytest.mark.parametrize("close_action", ["remove", "stop"])
+def test_docker_lifecycle_refreshes_rotated_allowlisted_credentials(
+    monkeypatch,
+    close_action,
+) -> None:
+    env_name = "CAYU_TEST_ROTATED_DOCKER_CREDENTIAL"
+    old_secret = "old-docker-lifecycle-secret"
+    current_secret = "current-docker-lifecycle-secret"
+    monkeypatch.setenv(env_name, old_secret)
+    runner = DockerRunner(
+        "a1",
+        docker_path="/usr/bin/docker",
+        close_action=close_action,
+        docker_cli_env_allowlist=(env_name,),
+    )
+    monkeypatch.setenv(env_name, current_secret)
+
+    async def fake_run_subprocess(command, **kwargs):
+        return ExecResult(stderr=f"failure:{current_secret}", exit_code=1)
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(runner.close())
+
+    message = str(exc_info.value)
+    assert current_secret not in message
+    assert current_secret[:12] not in message
+    assert REDACTED_SECRET in message
 
 
 def test_close_stop_failure_keeps_runner_open(monkeypatch):
@@ -585,6 +667,45 @@ def test_create_run_failure_cleans_up(monkeypatch):
         asyncio.run(DockerRunner.create("a1", docker_path="/usr/bin/docker"))
     # cleanup rm -f issued after the failure (in addition to the replace rm)
     assert issued.count(["/usr/bin/docker", "rm", "-f", "a1"]) >= 1
+
+
+@pytest.mark.parametrize("failure_stage", ["run", "mkdir", "setup"])
+def test_docker_create_lifecycle_redacts_before_bounding(
+    monkeypatch,
+    failure_stage: str,
+) -> None:
+    secret = "docker-create-lifecycle-boundary-secret"
+    stderr = "x" * 290 + secret + "tail"
+
+    async def fake_run_subprocess(command, **kwargs):
+        argv = command.argv
+        stage = None
+        if argv[1] == "run":
+            stage = "run"
+        elif argv[-1] == "mkdir -p /workspace":
+            stage = "mkdir"
+        elif argv[-1] == "setup-command":
+            stage = "setup"
+        if stage == failure_stage:
+            return ExecResult(exit_code=1, stderr=stderr)
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(
+            DockerRunner.create(
+                "a1",
+                docker_path="/usr/bin/docker",
+                setup_commands=("setup-command",),
+                env_overlay={"WORKLOAD_TOKEN": secret},
+            )
+        )
+
+    message = str(exc_info.value)
+    assert secret not in message
+    assert secret[:12] not in message
+    assert "[truncated]" in message
 
 
 def test_resolve_cwd_relative_path():

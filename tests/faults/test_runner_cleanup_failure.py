@@ -200,7 +200,7 @@ def test_runner_cleanup_failure_latches_exec_and_preserves_a_coherent_session(
     timeout_result = failed_calls[0].payload["result"]
     cleanup_artifact = {
         "type": "cayu.runner_cleanup.v1",
-        "adapter": "fault-injection",
+        "adapter": "unknown",
         "action": "kill_command",
         "status": "failed",
         "timeout_s": 0.1,
@@ -208,7 +208,8 @@ def test_runner_cleanup_failure_latches_exec_and_preserves_a_coherent_session(
     }
     assert timeout_result["artifacts"] == [cleanup_artifact]
     assert timeout_result["structured"]["artifacts"] == [cleanup_artifact]
-    assert "command state is unknown" in failed_calls[1].payload["result"]["content"]
+    assert failed_calls[1].payload["result"]["content"] == "Runner command execution failed."
+    assert failed_calls[1].payload["result"]["structured"]["error"] == ("runner_execution_failed")
     assert runner.exec_attempts == 1
     assert events[-1].type == EventType.SESSION_COMPLETED
 

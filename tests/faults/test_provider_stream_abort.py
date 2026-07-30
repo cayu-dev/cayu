@@ -175,7 +175,7 @@ async def test_real_provider_transport_abort_fails_durably_without_tool_executio
     assert model_error.payload["error_type"] == "ChatCompletionsAPIError"
     assert model_error.payload["provider"] == "chat_completions"
     assert model_error.payload["retryable"] is True
-    assert isinstance(model_error.payload["provider_error_type"], str)
+    assert model_error.payload["provider_error_type"] == "RemoteProtocolError"
     model_retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
     assert model_retry.payload["reason"] == "connection"
 

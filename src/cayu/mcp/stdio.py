@@ -44,7 +44,7 @@ from cayu.mcp.base import (
     McpToolResult,
 )
 from cayu.vaults import (
-    REDACTED_SECRET,
+    SecretRedactionTail,
     SecretRedactor,
     SecretResolver,
     resolve_secret_env,
@@ -238,7 +238,10 @@ class StdioMcpSession(McpSession):
         self._closed = False
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._write_lock = asyncio.Lock()
-        self._stderr_tail = bytearray()
+        self._stderr_tail = SecretRedactionTail(
+            self._secret_redactor,
+            max_bytes=DEFAULT_MCP_STDERR_CAPTURE_BYTES,
+        )
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._close_task: asyncio.Task[None] | None = None
@@ -762,39 +765,24 @@ class StdioMcpSession(McpSession):
     async def _drain_stderr(self) -> None:
         stderr = self.process.stderr
         if stderr is None:
+            self._stderr_tail.finish_complete()
             return
-        while True:
-            chunk = await stderr.read(4096)
-            if not chunk:
-                return
-            self._append_stderr(chunk)
+        try:
+            while True:
+                chunk = await stderr.read(4096)
+                if not chunk:
+                    self._stderr_tail.finish_complete()
+                    return
+                self._append_stderr(chunk)
+        except BaseException:
+            self._stderr_tail.abort()
+            raise
 
     def _append_stderr(self, chunk: bytes) -> None:
-        buffer = self._stderr_tail
-        buffer.extend(chunk)
-        capture_bytes = (
-            DEFAULT_MCP_STDERR_CAPTURE_BYTES + self._secret_redactor.max_secret_utf8_bytes
-        )
-        overflow = len(buffer) - capture_bytes
-        if overflow > 0:
-            del buffer[:overflow]
+        self._stderr_tail.feed(chunk)
 
     def _stderr_snapshot(self) -> str:
-        if not self._stderr_tail:
-            return ""
-        tail = bytes(self._stderr_tail).decode("utf-8", "replace")
-        redacted = self._secret_redactor.redact_text(tail)
-        encoded = redacted.encode("utf-8", "replace")
-        if len(encoded) > DEFAULT_MCP_STDERR_CAPTURE_BYTES:
-            cut = len(encoded) - DEFAULT_MCP_STDERR_CAPTURE_BYTES
-            marker = REDACTED_SECRET.encode()
-            marker_start = encoded.rfind(marker, 0, cut + len(marker))
-            if marker_start >= 0 and marker_start + len(marker) > cut:
-                suffix = encoded[marker_start + len(marker) :]
-                encoded = marker + suffix[-(DEFAULT_MCP_STDERR_CAPTURE_BYTES - len(marker)) :]
-            else:
-                encoded = encoded[cut:]
-        return encoded.decode("utf-8", "ignore").strip()
+        return self._stderr_tail.text().strip()
 
     def _protocol_error(self, message: str) -> McpProtocolError:
         tail = self._stderr_snapshot()

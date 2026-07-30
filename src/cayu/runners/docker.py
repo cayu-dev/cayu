@@ -42,11 +42,18 @@ from cayu.runners.base import (
     Runner,
     attach_cancellation_artifacts,
 )
-from cayu.vaults import SecretEnv, SecretRef, SecretResolver, resolve_secret_env
+from cayu.vaults import (
+    SecretEnv,
+    SecretRedactor,
+    SecretRef,
+    SecretResolver,
+    resolve_secret_env,
+)
 
 DEFAULT_DOCKER_IMAGE = "debian:stable-slim"
 DEFAULT_DOCKER_CWD = "/workspace"
 DOCKER_COMMAND_STATE_DIR = "/tmp/cayu-docker-commands"
+_DOCKER_LIFECYCLE_DIAGNOSTIC_MAX_BYTES = 300
 
 DockerCloseAction = Literal["remove", "stop", "none"]
 
@@ -65,6 +72,29 @@ def _validate_close_action(action: str) -> str:
     if action not in {"remove", "stop", "none"}:
         raise ValueError("close_action must be 'remove', 'stop', or 'none'.")
     return action
+
+
+def _docker_lifecycle_redactor(
+    env_overlay: Mapping[str, str] | None,
+    docker_cli_env_allowlist: Sequence[str],
+) -> SecretRedactor:
+    values = [
+        value
+        for value in (
+            *(env_overlay or {}).values(),
+            *(os.environ.get(name) for name in docker_cli_env_allowlist),
+        )
+        if type(value) is str and value
+    ]
+    return SecretRedactor(values)
+
+
+def _docker_lifecycle_detail(value: str, redactor: SecretRedactor) -> str:
+    detail = redactor.redact_text_bounded(
+        value.strip(),
+        max_bytes=_DOCKER_LIFECYCLE_DIAGNOSTIC_MAX_BYTES,
+    )
+    return detail or "no stderr"
 
 
 def _validate_guest_cwd(cwd: str) -> str:
@@ -146,10 +176,15 @@ async def _run_docker(
     docker_cli_env_allowlist: Sequence[str] = (),
     timeout_s: int | None = None,
 ) -> ExecResult:
+    host_env = docker_cli_env(docker_cli_env_allowlist)
+    allowlisted_redactor = SecretRedactor(
+        tuple(value for name in docker_cli_env_allowlist if (value := host_env.get(name)))
+    )
     return await run_subprocess(
         SubprocessCommand(argv=[docker_path, *args]),
-        env=docker_cli_env(docker_cli_env_allowlist),
+        env=host_env,
         timeout_s=timeout_s,
+        output_redactor=allowlisted_redactor,
     )
 
 
@@ -412,9 +447,11 @@ class DockerRunner(Runner):
                 docker_cli_env_allowlist=docker_cli_allowlist,
             )
             if started.exit_code != 0:
-                raise RuntimeError(
-                    f"docker run failed (exit {started.exit_code}): {started.stderr[:300]}"
+                detail = _docker_lifecycle_detail(
+                    started.stderr,
+                    _docker_lifecycle_redactor(env_overlay, docker_cli_allowlist),
                 )
+                raise RuntimeError(f"docker run failed (exit {started.exit_code}): {detail}")
             # Isolated mode: create the in-container workspace root (runs as root;
             # plain docker's default exec user is root, so no chmod needed). Bind
             # mode reuses the existing host dir, so skip (and never chmod the host).
@@ -433,7 +470,11 @@ class DockerRunner(Runner):
                     docker_cli_env_allowlist=docker_cli_allowlist,
                 )
                 if made.exit_code != 0:
-                    raise RuntimeError(f"docker workspace mkdir failed: {made.stderr[:300]}")
+                    detail = _docker_lifecycle_detail(
+                        made.stderr,
+                        _docker_lifecycle_redactor(env_overlay, docker_cli_allowlist),
+                    )
+                    raise RuntimeError(f"docker workspace mkdir failed: {detail}")
             # Setup runs on the (already-attached) network with the egress
             # overlay applied, so any setup traffic is brokered like the app's —
             # it is subject to the same egress policy, so bake tools that need
@@ -452,7 +493,11 @@ class DockerRunner(Runner):
                         timeout_s=300,
                     )
                 if res.exit_code != 0:
-                    raise RuntimeError(f"docker setup command failed: {cmd!r}: {res.stderr[:300]}")
+                    detail = _docker_lifecycle_detail(
+                        res.stderr,
+                        _docker_lifecycle_redactor(env_overlay, docker_cli_allowlist),
+                    )
+                    raise RuntimeError(f"docker setup command failed: {detail}")
         except BaseException:
             await _run_docker(
                 docker,
@@ -487,6 +532,60 @@ class DockerRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
+        operation = self._exec(
+            command,
+            output_redactor=SecretRedactor(),
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        env = None
+        stdin = None
+        return await operation
+
+    async def exec_redacted(
+        self,
+        command: ExecCommand,
+        *,
+        redactor: SecretRedactor,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        if not isinstance(redactor, SecretRedactor):
+            raise TypeError("DockerRunner redactor must be a SecretRedactor.")
+        operation = self._exec(
+            command,
+            output_redactor=redactor,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        env = None
+        stdin = None
+        return await operation
+
+    async def _exec(
+        self,
+        command: ExecCommand,
+        *,
+        output_redactor: SecretRedactor,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("DockerRunner command must be an ExecCommand.")
         self._ensure_exec_open()
@@ -499,7 +598,9 @@ class DockerRunner(Runner):
         )
         environment = merge_secret_env_values(environment, resolved_secrets)
         environment = remove_runner_env(environment, env_remove)
-        invocation_redactor = resolved_secret_redactor(resolved_secrets)
+        invocation_redactor = resolved_secret_redactor(resolved_secrets).merged_with(
+            output_redactor
+        )
         if self.env_overlay:
             # Applied last: the enforced egress overlay must win over model env.
             environment.update(self.env_overlay)
@@ -584,9 +685,15 @@ class DockerRunner(Runner):
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         if result.exit_code != 0:
+            detail = _docker_lifecycle_detail(
+                result.stderr,
+                _docker_lifecycle_redactor(
+                    self.env_overlay,
+                    self.docker_cli_env_allowlist,
+                ),
+            )
             raise RuntimeError(
-                f"docker rm failed for container '{self.name}' "
-                f"(exit {result.exit_code}): {result.stderr[:300]}"
+                f"docker rm failed for container '{self.name}' (exit {result.exit_code}): {detail}"
             )
 
     async def _stop_container(self) -> None:
@@ -596,7 +703,14 @@ class DockerRunner(Runner):
             docker_cli_env_allowlist=self.docker_cli_env_allowlist,
         )
         if result.exit_code != 0:
+            detail = _docker_lifecycle_detail(
+                result.stderr,
+                _docker_lifecycle_redactor(
+                    self.env_overlay,
+                    self.docker_cli_env_allowlist,
+                ),
+            )
             raise RuntimeError(
                 f"docker stop failed for container '{self.name}' "
-                f"(exit {result.exit_code}): {result.stderr[:300]}"
+                f"(exit {result.exit_code}): {detail}"
             )

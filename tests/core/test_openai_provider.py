@@ -42,6 +42,7 @@ from cayu.providers import (
     openai_response_events,
     preflight_openai_native_structured_output_schema,
 )
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.openai import openai_stream_events
 
@@ -1566,12 +1567,14 @@ def test_openai_response_events_preserves_end_turn(end_turn: bool | None) -> Non
 
 
 def test_openai_response_events_sanitizes_response_error() -> None:
-    with pytest.raises(OpenAIProtocolError) as exc_info:
+    with pytest.raises(OpenAIAPIError) as exc_info:
         openai_response_events(
             {
+                "request_id": "req_buffered",
                 "error": {
                     "type": "invalid_request_error",
                     "code": "bad_request",
+                    "param": "input",
                     "message": "bad request",
                     "debug": "not persisted",
                 },
@@ -1580,12 +1583,73 @@ def test_openai_response_events_sanitizes_response_error() -> None:
         )
 
     message = str(exc_info.value)
-    assert (
-        message == 'OpenAI response error: {"code":"bad_request",'
-        '"message":"bad request","type":"invalid_request_error"}'
-    )
+    assert message == "OpenAI response error: [provider response body omitted]"
     assert "debug" not in message
     assert "not persisted" not in message
+    assert exc_info.value.error_type == "invalid_request_error"
+    assert exc_info.value.error_code == "bad_request"
+    assert exc_info.value.param == "input"
+    assert exc_info.value.request_id == "req_buffered"
+    assert exc_info.value.response_body is None
+
+
+@pytest.mark.parametrize(
+    "secret_start",
+    [
+        MAX_PROVIDER_ERROR_BODY_CHARS - len("workload-secret-canary-ABCDEFGHIJKLMNOP"),
+        MAX_PROVIDER_ERROR_BODY_CHARS - 10,
+        MAX_PROVIDER_ERROR_BODY_CHARS,
+    ],
+    ids=("ends-at-old-bound", "crosses-old-bound", "starts-at-old-bound"),
+)
+def test_openai_buffered_error_omits_raw_message_at_old_cutoff(secret_start: int) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    raw_response = {
+        "request_id": "req_buffered_cutoff",
+        "error": {
+            "type": "server_error",
+            "code": "internal_error",
+            "message": "x" * secret_start + secret,
+        },
+    }
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        openai_response_events(raw_response)
+
+    rendered = repr((str(exc_info.value), vars(exc_info.value)))
+    assert str(exc_info.value) == "OpenAI response error: [provider response body omitted]"
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+    assert exc_info.value.error_type == "server_error"
+    assert exc_info.value.error_code == "internal_error"
+    assert exc_info.value.request_id == "req_buffered_cutoff"
+    assert_cayu_traceback_does_not_retain(exc_info.value, raw_response)
+
+
+def test_openai_buffered_error_classifies_overflow_after_old_cutoff() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+
+    with pytest.raises(OpenAIContextOverflowError) as exc_info:
+        openai_response_events(
+            {
+                "request_id": "req_buffered_overflow",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                    "message": (
+                        "x" * (MAX_PROVIDER_ERROR_BODY_CHARS + 1)
+                        + " Context length exceeded. "
+                        + secret
+                    ),
+                },
+            }
+        )
+
+    assert str(exc_info.value) == "OpenAI model context overflow"
+    assert secret not in repr((str(exc_info.value), vars(exc_info.value)))
+    assert exc_info.value.error_type == "invalid_request_error"
+    assert exc_info.value.error_code == "context_length_exceeded"
+    assert exc_info.value.request_id == "req_buffered_overflow"
+    assert exc_info.value.response_body is None
 
 
 def test_openai_response_events_emits_refusal_text() -> None:
@@ -1942,9 +2006,12 @@ async def test_openai_stream_events_extracts_response_failed_error() -> None:
             "type": "response.failed",
             "response": {
                 "id": "resp_1",
+                "request_id": "req_stream",
                 "status": "failed",
                 "error": {
                     "code": "server_error",
+                    "type": "server_error",
+                    "param": "input",
                     "message": "The model failed.",
                     "debug": "not persisted",
                 },
@@ -1956,11 +2023,14 @@ async def test_openai_stream_events_extracts_response_failed_error() -> None:
         [event async for event in openai_module.openai_stream_events(raw_events())]
 
     message = str(exc_info.value)
-    assert message == (
-        'OpenAI streaming error: {"code":"server_error","message":"The model failed."}'
-    )
+    assert message == "OpenAI streaming error: [provider response body omitted]"
     assert "debug" not in message
     assert "not persisted" not in message
+    assert exc_info.value.error_type == "server_error"
+    assert exc_info.value.error_code == "server_error"
+    assert exc_info.value.param == "input"
+    assert exc_info.value.request_id == "req_stream"
+    assert exc_info.value.response_body is None
 
 
 @pytest.mark.anyio
@@ -1971,16 +2041,97 @@ async def test_openai_stream_events_extracts_top_level_error_event() -> None:
             "code": "rate_limit_exceeded",
             "message": "Too many requests.",
             "param": None,
+            "request_id": "req_top_level",
             "sequence_number": 1,
         }
 
     with pytest.raises(OpenAIAPIError) as exc_info:
         [event async for event in openai_module.openai_stream_events(raw_events())]
 
-    assert str(exc_info.value) == (
-        'OpenAI streaming error: {"code":"rate_limit_exceeded",'
-        '"message":"Too many requests.","type":"error"}'
+    assert str(exc_info.value) == "OpenAI streaming error: [provider response body omitted]"
+    assert exc_info.value.error_type == "error"
+    assert exc_info.value.error_code == "rate_limit_exceeded"
+    assert exc_info.value.request_id == "req_top_level"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("event_type", ["response.failed", "error"])
+@pytest.mark.parametrize(
+    "secret_start",
+    [
+        MAX_PROVIDER_ERROR_BODY_CHARS - len("workload-secret-canary-ABCDEFGHIJKLMNOP"),
+        MAX_PROVIDER_ERROR_BODY_CHARS - 10,
+        MAX_PROVIDER_ERROR_BODY_CHARS,
+    ],
+    ids=("ends-at-old-bound", "crosses-old-bound", "starts-at-old-bound"),
+)
+async def test_openai_stream_error_omits_raw_message_at_old_cutoff(
+    event_type: str,
+    secret_start: int,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    error = {
+        "type": "server_error",
+        "code": "internal_error",
+        "message": "x" * secret_start + secret,
+    }
+    event = (
+        {
+            "type": "response.failed",
+            "response": {
+                "request_id": "req_cutoff",
+                "error": error,
+            },
+        }
+        if event_type == "response.failed"
+        else {**error, "type": "error", "request_id": "req_cutoff"}
     )
+
+    async def raw_events():
+        yield event
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        [event async for event in openai_stream_events(raw_events())]
+
+    rendered = repr((str(exc_info.value), vars(exc_info.value)))
+    assert str(exc_info.value) == "OpenAI streaming error: [provider response body omitted]"
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+    assert exc_info.value.error_code == "internal_error"
+    assert exc_info.value.request_id == "req_cutoff"
+    assert_cayu_traceback_does_not_retain(exc_info.value, event)
+
+
+@pytest.mark.anyio
+async def test_openai_provider_stream_omits_cutoff_secret_fragment() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "request_id": "req_provider_cutoff",
+                        "error": {
+                            "type": "server_error",
+                            "code": "internal_error",
+                            "message": ("x" * (MAX_PROVIDER_ERROR_BODY_CHARS - 10) + secret),
+                        },
+                    },
+                }
+            ]
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    request = ModelRequest(model="test-model", messages=[Message.text("user", "hello")])
+
+    events = [event async for event in provider.stream(request)]
+
+    rendered = repr([event.model_dump(mode="json") for event in events])
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+    assert events[0].payload["provider_error_type"] == "server_error"
+    assert events[0].payload["provider_error_code"] == "internal_error"
+    assert "request_id" not in events[0].payload
 
 
 def test_openai_response_events_rejects_unsupported_output_item() -> None:
@@ -2282,11 +2433,11 @@ async def test_httpx_openai_transport_sanitizes_error_body(monkeypatch) -> None:
         )
 
     message = str(exc_info.value)
-    assert (
-        message == "OpenAI API request failed with HTTP 400: "
-        '{"code":"bad_request","message":"bad request",'
-        '"request_id":"req_123","type":"invalid_request_error"}'
-    )
+    assert message == ("OpenAI API request failed with HTTP 400: [provider response body omitted]")
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "invalid_request_error"
+    assert exc_info.value.error_code == "bad_request"
+    assert exc_info.value.request_id == "req_123"
     assert "debug" not in message
     assert "not persisted" not in message
 
@@ -2356,6 +2507,8 @@ async def test_httpx_openai_transport_classifies_context_overflow(monkeypatch) -
 
 @pytest.mark.anyio
 async def test_openai_stream_events_classifies_context_overflow() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+
     async def raw_events():
         yield {
             "type": "response.failed",
@@ -2365,7 +2518,11 @@ async def test_openai_stream_events_classifies_context_overflow() -> None:
                 "error": {
                     "type": "invalid_request_error",
                     "code": "context_length_exceeded",
-                    "message": "Context length exceeded.",
+                    "message": (
+                        "x" * (MAX_PROVIDER_ERROR_BODY_CHARS + 1)
+                        + " Context length exceeded. "
+                        + secret
+                    ),
                 },
             },
             "sequence_number": 1,
@@ -2378,6 +2535,9 @@ async def test_openai_stream_events_classifies_context_overflow() -> None:
     assert isinstance(exc_info.value, ModelContextOverflowError)
     assert isinstance(exc_info.value, OpenAIAPIError)
     assert exc_info.value.error_code == "context_length_exceeded"
+    assert str(exc_info.value) == "OpenAI model context overflow"
+    assert secret not in repr((str(exc_info.value), vars(exc_info.value)))
+    assert exc_info.value.response_body is None
 
 
 @pytest.mark.anyio

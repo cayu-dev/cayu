@@ -28,6 +28,7 @@ from cayu.providers import (
     VertexProtocolError,
     VertexProvider,
 )
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers.vertex import (
     VERTEX_OAUTH_SCOPE,
     _import_google,
@@ -389,10 +390,15 @@ async def test_httpx_vertex_transport_wraps_gcp_error_envelope(
         )
 
     monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
-    with pytest.raises(VertexAPIError, match="PERMISSION_DENIED"):
+    with pytest.raises(VertexAPIError) as exc_info:
         await HttpxVertexTransport().create_message(
             url=_VERTEX_URL, headers={}, payload={"a": 1}, timeout_s=10.0
         )
+    assert str(exc_info.value) == (
+        "Vertex AI request failed with HTTP 403: [provider response body omitted]"
+    )
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.error_type == "PERMISSION_DENIED"
 
 
 @pytest.mark.anyio
@@ -696,12 +702,18 @@ async def test_vertex_provider_streams_sse_events_incrementally() -> None:
 
 @pytest.mark.anyio
 async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
     transport = StreamingRecordingTransport(
         event_batches=[
             [
                 {
                     "type": "error",
-                    "error": {"type": "overloaded_error", "message": "Overloaded"},
+                    "request_id": "req_vertex_cutoff",
+                    "error": {
+                        "type": "overloaded_error",
+                        "code": "overloaded",
+                        "message": "x" * (MAX_PROVIDER_ERROR_BODY_CHARS - 10) + secret,
+                    },
                 }
             ]
         ]
@@ -715,16 +727,28 @@ async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors() -> 
     assert events[0].payload["error_type"] == "VertexAPIError"
     assert events[0].payload["provider"] == "vertex"
     assert events[0].payload["provider_error_type"] == "overloaded_error"
+    rendered = repr([event.model_dump(mode="json") for event in events])
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
 
 
 @pytest.mark.anyio
 async def test_vertex_provider_stream_error_event_propagates_context_overflow() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
     transport = StreamingRecordingTransport(
         event_batches=[
             [
                 {
                     "type": "error",
-                    "error": {"type": "invalid_request_error", "message": "prompt is too long"},
+                    "request_id": "req_vertex_overflow",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                        "message": (
+                            "x" * (MAX_PROVIDER_ERROR_BODY_CHARS + 1)
+                            + " prompt is too long "
+                            + secret
+                        ),
+                    },
                 }
             ]
         ]
@@ -735,6 +759,9 @@ async def test_vertex_provider_stream_error_event_propagates_context_overflow() 
         [event async for event in provider.stream(_request())]
 
     assert isinstance(exc_info.value, ModelContextOverflowError)
+    assert exc_info.value.error_type == "invalid_request_error"
+    assert secret not in repr((str(exc_info.value), vars(exc_info.value)))
+    assert exc_info.value.response_body is None
     assert exc_info.value.provider == "vertex"
     assert exc_info.value.retryable is False
 

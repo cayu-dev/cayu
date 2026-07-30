@@ -21,6 +21,8 @@ class WorkspaceReadResult:
     offset: int = 0
     revision: str | None = None
     sha256: str | None = None
+    source_bytes_read: int | None = None
+    redaction_truncated: bool = False
 
     def __post_init__(self) -> None:
         if type(self.content) is not bytes:
@@ -37,13 +39,27 @@ class WorkspaceReadResult:
             raise ValueError("WorkspaceReadResult offset must be non-negative.")
         if self.offset > self.total_bytes:
             raise ValueError("WorkspaceReadResult offset cannot exceed total_bytes.")
-        if self.total_bytes < self.offset + len(self.content):
+        source_bytes_read = (
+            len(self.content) if self.source_bytes_read is None else self.source_bytes_read
+        )
+        if type(source_bytes_read) is not int:
+            raise TypeError("WorkspaceReadResult source_bytes_read must be an integer or None.")
+        if source_bytes_read < 0:
+            raise ValueError("WorkspaceReadResult source_bytes_read must be non-negative.")
+        if source_bytes_read < len(self.content):
+            raise ValueError("WorkspaceReadResult source progress cannot be smaller than content.")
+        if self.total_bytes < self.offset + source_bytes_read:
             raise ValueError(
-                "WorkspaceReadResult total_bytes cannot be smaller than content at its offset."
+                "WorkspaceReadResult total_bytes cannot be smaller than content "
+                "or source-page progress."
             )
-        expected_truncated = self.offset + len(self.content) < self.total_bytes
+        expected_truncated = self.offset + source_bytes_read < self.total_bytes
         if self.truncated != expected_truncated:
-            raise ValueError("WorkspaceReadResult truncated must match content and total_bytes.")
+            raise ValueError(
+                "WorkspaceReadResult truncated must match source progress and total_bytes."
+            )
+        if type(self.redaction_truncated) is not bool:
+            raise TypeError("WorkspaceReadResult redaction_truncated must be a bool.")
         if self.revision is not None and (
             type(self.revision) is not str or not self.revision.strip()
         ):
@@ -62,10 +78,15 @@ class WorkspaceReadResult:
             raise ValueError(
                 "WorkspaceReadResult revision metadata requires a complete offset-zero snapshot."
             )
+        object.__setattr__(self, "source_bytes_read", source_bytes_read)
 
     @property
     def next_offset(self) -> int | None:
-        return self.offset + len(self.content) if self.truncated and self.content else None
+        return (
+            self.offset + self.source_bytes_read
+            if self.truncated and self.source_bytes_read
+            else None
+        )
 
 
 WorkspaceMutationOperation = Literal["create", "replace", "delete"]

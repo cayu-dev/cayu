@@ -54,7 +54,7 @@ def test_lambda_microvm_sidecar_export_is_reproducible(
     assert manifest["schema_version"] == 1
     assert manifest["artifact_version"] == 1
     assert manifest["cayu_version"] == _project_version()
-    assert manifest["protocol_version"] == "1"
+    assert manifest["protocol_version"] == "2"
     assert manifest["content_digest"] in first_output.out
     assert set(_tree_contents(first)) == {
         _MANIFEST,

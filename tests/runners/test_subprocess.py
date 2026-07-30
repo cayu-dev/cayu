@@ -18,6 +18,7 @@ from cayu.runners._subprocess import (
     validate_stdin,
     validate_timeout,
 )
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 def test_subprocess_command_accepts_exactly_one_command_shape() -> None:
@@ -29,6 +30,30 @@ def test_subprocess_command_accepts_exactly_one_command_shape() -> None:
 
     with pytest.raises(ValueError, match="exactly one"):
         SubprocessCommand(argv=["echo"], shell="echo ok")
+
+
+def test_local_runner_redacts_split_output_before_bounding(tmp_path) -> None:
+    secret = "local-subprocess-boundary-secret"
+    script = (
+        "import os,sys,time; "
+        "secret=os.environ['TOKEN']; "
+        "sys.stdout.write('prefix:' + secret[:9]); sys.stdout.flush(); "
+        "time.sleep(0.02); "
+        "sys.stdout.write(secret[9:] + ':suffix'); sys.stdout.flush()"
+    )
+
+    result = asyncio.run(
+        LocalRunner(tmp_path).exec_redacted(
+            ExecCommand.process(sys.executable, "-c", script),
+            redactor=SecretRedactor(secret),
+            env={"TOKEN": secret},
+            output_limit_bytes=128,
+        )
+    )
+
+    assert result.stdout == f"prefix:{REDACTED_SECRET}:suffix"
+    assert result.stdout_bytes == len(f"prefix:{secret}:suffix".encode())
+    assert result.stdout_truncated is False
 
 
 def test_subprocess_command_rejects_invalid_argv_and_shell() -> None:

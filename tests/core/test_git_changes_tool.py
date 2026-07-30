@@ -8,10 +8,42 @@ from pathlib import Path
 
 import pytest
 
+import cayu.tools.git as git_module
 from cayu.core.tools import ToolContext
 from cayu.runners import LocalRunner
 from cayu.tools import GitChangesTool
-from cayu.workspaces import RunnerWorkspace
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._runner import InvocationRunnerHandle
+from cayu.tools.git import _workspace_cwd
+from cayu.vaults import SecretRedactor
+from cayu.workspaces import (
+    E2BWorkspace,
+    LocalWorkspace,
+    MicrosandboxWorkspace,
+    RunnerWorkspace,
+)
+
+
+def test_git_secondary_bounds_never_split_redaction_marker() -> None:
+    content = "prefix-" + "[REDACTED_SECRET]" + "-suffix"
+
+    bounded, truncated = git_module._bounded_text(content, len("prefix-[REDA"))
+
+    assert truncated is True
+    assert "[REDA" not in bounded
+    assert len(bounded.encode()) <= len("prefix-[REDA")
+
+
+def test_git_diff_offset_rejects_position_inside_redaction_marker() -> None:
+    content = "prefix-" + "[REDACTED_SECRET]" + "-suffix"
+
+    with pytest.raises(ValueError, match="splits a redaction marker"):
+        git_module._page_diff_text(
+            content,
+            offset=len("prefix-[REDA"),
+            maximum=128,
+            capture_truncated=False,
+        )
 
 
 def _git(root: Path, *args: str) -> None:
@@ -163,6 +195,95 @@ def test_git_changes_uses_the_bound_workspace_cwd(tmp_path: Path) -> None:
 
     assert result.is_error is False
     assert [change["path"] for change in result.structured["changes"]] == ["tracked.txt"]
+
+
+@pytest.mark.parametrize("workspace_kind", ["local", "runner"])
+def test_git_changes_uses_authenticated_invocation_workspace_cwd(
+    tmp_path: Path,
+    workspace_kind: str,
+) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    _repository(repository)
+    (repository / "tracked.txt").write_text("workspace change\n")
+    runner = LocalRunner(tmp_path)
+    workspace = (
+        LocalWorkspace(repository, workspace_id="local")
+        if workspace_kind == "local"
+        else RunnerWorkspace(runner, cwd="repo")
+    )
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+    ctx = ToolContext(session_id="session", runner=handle, workspace=workspace)
+
+    result = asyncio.run(GitChangesTool().run(ctx, {}))
+
+    assert result.is_error is False
+    assert [change["path"] for change in result.structured["changes"]] == ["tracked.txt"]
+
+
+def test_git_changes_invocation_handle_rejects_mismatched_workspace(tmp_path: Path) -> None:
+    runner_root = tmp_path / "runner"
+    workspace_root = tmp_path / "workspace"
+    runner_root.mkdir()
+    workspace_root.mkdir()
+    handle = InvocationRunnerHandle(
+        LocalRunner(runner_root),
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+    ctx = ToolContext(
+        session_id="session",
+        runner=handle,
+        workspace=LocalWorkspace(workspace_root, workspace_id="local"),
+    )
+
+    result = asyncio.run(GitChangesTool().run(ctx, {}))
+
+    assert result.is_error is True
+    assert result.structured == {"error": "workspace_runner_mismatch"}
+
+
+@pytest.mark.parametrize(
+    ("workspace_type", "root"),
+    [
+        (E2BWorkspace, "/home/user/workspace"),
+        (MicrosandboxWorkspace, "/workspace"),
+    ],
+)
+def test_git_changes_invocation_handle_authenticates_remote_workspace_binding(
+    tmp_path: Path,
+    workspace_type: type[E2BWorkspace] | type[MicrosandboxWorkspace],
+    root: str,
+) -> None:
+    runner = LocalRunner(tmp_path)
+    workspace = object.__new__(workspace_type)
+    workspace._runner = runner
+    workspace.root = root
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+
+    cwd = _workspace_cwd(
+        ToolContext(
+            session_id="session",
+            runner=handle,
+            workspace=workspace,
+        )
+    )
+
+    assert cwd == root
 
 
 def test_git_changes_refuses_upward_repository_discovery(tmp_path: Path) -> None:

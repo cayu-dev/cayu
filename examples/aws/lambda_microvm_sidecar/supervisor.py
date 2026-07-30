@@ -333,6 +333,7 @@ class CommandSupervisor:
         stdout = _LimitedBuffer(payload["output_limit_bytes"])
         stderr = _LimitedBuffer(payload["output_limit_bytes"])
         process: subprocess.Popen[bytes] | None = None
+        readers: list[tuple[threading.Thread, _LimitedBuffer]] = []
         timed_out = False
         try:
             argv = payload["argv"]
@@ -352,12 +353,21 @@ class CommandSupervisor:
             if cancel_requested:
                 _stop_process_group(process)
 
-            readers = [
-                threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
-                threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
+            pending_readers = [
+                (
+                    threading.Thread(target=_drain, args=(process.stdout, stdout), daemon=True),
+                    stdout,
+                ),
+                (
+                    threading.Thread(target=_drain, args=(process.stderr, stderr), daemon=True),
+                    stderr,
+                ),
             ]
-            for reader in readers:
+            for reader, output in pending_readers:
                 reader.start()
+                # Only a successfully started thread may be joined during
+                # failure cleanup; Thread.join() rejects unstarted threads.
+                readers.append((reader, output))
             writer = threading.Thread(
                 target=_feed_stdin,
                 args=(process.stdin, payload["stdin"]),
@@ -370,8 +380,7 @@ class CommandSupervisor:
                 timed_out = True
                 _stop_process_group(process)
                 process.wait(timeout=self.cancel_timeout_s)
-            for reader in readers:
-                reader.join(timeout=self.cancel_timeout_s)
+            _join_output_readers(readers, timeout_s=self.cancel_timeout_s)
             writer.join(timeout=self.cancel_timeout_s)
             with record.lock:
                 cancelled = record.cancel_requested and not timed_out
@@ -385,11 +394,14 @@ class CommandSupervisor:
                     stderr=stderr,
                     timed_out=timed_out,
                     cancelled=cancelled,
+                    omit_truncated_output=payload["omit_truncated_output"],
                 )
         except BaseException as exc:
             if process is not None and process.poll() is None:
                 _stop_process_group(process)
-            stderr.add(f"{type(exc).__name__}: {exc}\n".encode("utf-8", errors="replace"))
+            _join_output_readers(readers, timeout_s=self.cancel_timeout_s)
+            if not payload["omit_truncated_output"]:
+                stderr.add(f"{type(exc).__name__}: {exc}\n".encode("utf-8", errors="replace"))
             with record.lock:
                 cancelled = record.cancel_requested
                 state = "cancelled" if cancelled else "failed"
@@ -402,6 +414,7 @@ class CommandSupervisor:
                     stderr=stderr,
                     timed_out=timed_out,
                     cancelled=cancelled,
+                    omit_truncated_output=payload["omit_truncated_output"],
                     error=exc,
                 )
         finally:
@@ -498,6 +511,10 @@ def _validated_payload(
         "stdin": stdin,
         "timeout_s": timeout_s,
         "output_limit_bytes": output_limit,
+        "omit_truncated_output": _boolean(
+            request.get("omit_truncated_output", False),
+            "omit_truncated_output",
+        ),
     }
 
 
@@ -561,11 +578,31 @@ def _copy_socket(source: socket.socket, destination: socket.socket) -> None:
 def _drain(pipe: Any, output: _LimitedBuffer) -> None:
     if pipe is None:
         return
-    while True:
-        chunk = pipe.read(READ_CHUNK_BYTES)
-        if not chunk:
-            return
-        output.add(chunk)
+    try:
+        while True:
+            chunk = pipe.read(READ_CHUNK_BYTES)
+            if not chunk:
+                return
+            output.add(chunk)
+    except BaseException:
+        # Thread failures cannot propagate back through ``Thread.join``. Mark
+        # the observed bytes as an incomplete prefix so negotiated redacted
+        # executions omit them instead of treating thread termination as EOF.
+        output.truncated = True
+
+
+def _join_output_readers(
+    readers: list[tuple[threading.Thread, _LimitedBuffer]],
+    *,
+    timeout_s: float,
+) -> None:
+    for reader, output in readers:
+        reader.join(timeout=timeout_s)
+        if reader.is_alive():
+            # A descendant can retain the pipe after the command's direct
+            # process exits. The bytes observed so far are only a prefix, even
+            # when they fit within the configured buffer.
+            output.truncated = True
 
 
 def _feed_stdin(pipe: Any, content: bytes) -> None:
@@ -617,6 +654,7 @@ def _result(
     stderr: _LimitedBuffer,
     timed_out: bool,
     cancelled: bool,
+    omit_truncated_output: bool,
     error: BaseException | None = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -625,8 +663,16 @@ def _result(
         "exit_code": exit_code,
         "timed_out": timed_out,
         "cancelled": cancelled,
-        "stdout_base64": base64.b64encode(stdout.content).decode("ascii"),
-        "stderr_base64": base64.b64encode(stderr.content).decode("ascii"),
+        "stdout_base64": (
+            ""
+            if omit_truncated_output and stdout.truncated
+            else base64.b64encode(stdout.content).decode("ascii")
+        ),
+        "stderr_base64": (
+            ""
+            if omit_truncated_output and stderr.truncated
+            else base64.b64encode(stderr.content).decode("ascii")
+        ),
         "stdout_bytes": stdout.total_bytes,
         "stderr_bytes": stderr.total_bytes,
         "stdout_truncated": stdout.truncated,
@@ -634,7 +680,6 @@ def _result(
     }
     if error is not None:
         result["error_type"] = type(error).__name__
-        result["error"] = str(error)
     return result
 
 
@@ -670,4 +715,10 @@ def _nonblank_string(value: object, field_name: str) -> str:
 def _string(value: object, field_name: str) -> str:
     if type(value) is not str:
         raise CommandRequestError(f"{field_name} must be a string")
+    return value
+
+
+def _boolean(value: object, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise CommandRequestError(f"{field_name} must be a boolean")
     return value

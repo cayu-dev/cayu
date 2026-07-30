@@ -21,7 +21,9 @@ from cayu.proxies import (
     copy_proxy_authorization_result,
 )
 from cayu.runners import RunnerCancelledError
+from cayu.runners._cleanup import pop_runner_cancellation_failure
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.vaults import (
     ResolvedSecret,
     SecretRedactor,
@@ -35,6 +37,9 @@ _CANCELLATION_EVIDENCE_ATTRIBUTE = "_cayu_tool_cancellation_evidence"
 _CANCELLATION_EVIDENCE_TOKEN = object()
 _LEGACY_CANCELLATION_TOOL_CALL_ID_ATTRIBUTE = "_cayu_cancellation_tool_call_id"
 _BASE_EXCEPTION_ARGS_DESCRIPTOR = BaseException.__dict__["args"]
+_BASE_EXCEPTION_TRACEBACK_DESCRIPTOR = BaseException.__dict__["__traceback__"]
+_BASE_EXCEPTION_CAUSE_DESCRIPTOR = BaseException.__dict__["__cause__"]
+_BASE_EXCEPTION_CONTEXT_DESCRIPTOR = BaseException.__dict__["__context__"]
 _BASE_EXCEPTION_DICT_DESCRIPTOR = BaseException.__dict__["__dict__"]
 
 
@@ -47,6 +52,14 @@ class ProxyAuthorizationRecord:
     result: ProxyAuthorizationResult
 
 
+@dataclass(frozen=True, slots=True)
+class InvocationPublicationSnapshot:
+    """Final secret scope and whether invocation output is safe to publish."""
+
+    redactor: SecretRedactor
+    unsafe_output: bool
+
+
 class InvocationSecretTracker:
     """Own the secret-redaction scope for one tool invocation."""
 
@@ -54,15 +67,89 @@ class InvocationSecretTracker:
         if not isinstance(redactor, SecretRedactor):
             raise TypeError("redactor must be a SecretRedactor.")
         self._redactor = redactor
+        self._revision = 0
+        self._active_resolutions: set[object] = set()
+        self._ambiguous_capture_revisions: list[int] = []
+        self._sealed = False
+        self._publication_snapshot: InvocationPublicationSnapshot | None = None
 
     @property
     def redactor(self) -> SecretRedactor:
         return self._redactor
 
+    def snapshot(self) -> InvocationRedactorSnapshot:
+        """Return an atomic view for an external capture boundary."""
+
+        return InvocationRedactorSnapshot(
+            revision=self._revision,
+            redactor=self._redactor,
+        )
+
+    def begin_resolution(self) -> object:
+        """Claim one secret resolution before crossing its asynchronous boundary."""
+
+        if self._sealed:
+            raise RuntimeError("Secret resolution is unavailable after tool publication.")
+        token = object()
+        self._active_resolutions.add(token)
+        return token
+
+    def complete_resolution(self, token: object, secret: ResolvedSecret) -> bool:
+        """Record a secret, or reject it without raising through a secret-bearing frame."""
+
+        if token not in self._active_resolutions:
+            return False
+        self._active_resolutions.remove(token)
+        if self._sealed:
+            return False
+        self.record(secret)
+        return True
+
+    def abandon_resolution(self, token: object) -> None:
+        """Release a failed resolution claim without changing the secret revision."""
+
+        self._active_resolutions.discard(token)
+
     def record(self, secret: ResolvedSecret) -> None:
         if type(secret) is not ResolvedSecret:
             raise TypeError("Resolved secrets must be ResolvedSecret instances.")
-        self._redactor = self._redactor.with_secret(secret)
+        if self._sealed:
+            raise RuntimeError("Secret registration is unavailable after tool publication.")
+        updated = self._redactor.with_secret(secret)
+        if updated is self._redactor:
+            return
+        self._redactor = updated
+        self._revision += 1
+
+    def record_ambiguous_output_capture(self, revision: int) -> None:
+        """Remember a bounded output whose safety depends on this exact revision."""
+
+        if type(revision) is not int or revision < 0:
+            raise TypeError("Output capture revision must be a non-negative integer.")
+        if self._sealed:
+            raise RuntimeError("Output capture completed after tool publication.")
+        self._ambiguous_capture_revisions.append(revision)
+
+    def record_ambiguous_runner_capture(self, revision: int) -> None:
+        """Compatibility alias for runner-specific capture callers."""
+
+        self.record_ambiguous_output_capture(revision)
+
+    def seal_for_publication(self) -> InvocationPublicationSnapshot:
+        """Freeze secret registration and classify revision-stale bounded captures."""
+
+        if self._publication_snapshot is not None:
+            return self._publication_snapshot
+        self._sealed = True
+        unsafe_output = bool(self._active_resolutions) or any(
+            revision != self._revision for revision in self._ambiguous_capture_revisions
+        )
+        snapshot = InvocationPublicationSnapshot(
+            redactor=self._redactor,
+            unsafe_output=unsafe_output,
+        )
+        self._publication_snapshot = snapshot
+        return snapshot
 
 
 class _TrackingVault(Vault):
@@ -71,14 +158,14 @@ class _TrackingVault(Vault):
     def __init__(
         self,
         vault: Vault,
-        on_resolve: Callable[[ResolvedSecret], None],
+        tracker: InvocationSecretTracker,
     ) -> None:
         if not isinstance(vault, Vault):
             raise TypeError("vault must be a Vault.")
-        if not callable(on_resolve):
-            raise TypeError("on_resolve must be callable.")
+        if not isinstance(tracker, InvocationSecretTracker):
+            raise TypeError("tracker must be an InvocationSecretTracker.")
         self._vault = vault
-        self._on_resolve = on_resolve
+        self._tracker = tracker
 
     async def get(
         self,
@@ -103,31 +190,42 @@ class _TrackingVault(Vault):
     ) -> ResolvedSecret:
         copied_ref = copy_secret_ref(ref)
         copied_scope = None if scope is None else copy_json_object(scope, "scope")
-        secret = await self._vault.resolve(
-            copied_ref,
-            scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
-        )
+        token = self._tracker.begin_resolution()
+        try:
+            secret = await self._vault.resolve(
+                copied_ref,
+                scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
+            )
+        except BaseException:
+            self._tracker.abandon_resolution(token)
+            raise
         if type(secret) is not ResolvedSecret:
+            self._tracker.abandon_resolution(token)
             raise TypeError("Vault secret resolution must return ResolvedSecret.")
-        self._on_resolve(copy_resolved_secret(secret))
-        return copy_resolved_secret(secret)
+        copied_secret = copy_resolved_secret(secret)
+        del secret
+        accepted = self._tracker.complete_resolution(token, copied_secret)
+        if not accepted:
+            del copied_secret
+            raise RuntimeError("Secret resolution completed after tool publication.")
+        return copy_resolved_secret(copied_secret)
 
 
 class _TrackingCredentialProxy(CredentialProxy):
     def __init__(
         self,
         proxy: CredentialProxy,
-        on_resolve: Callable[[ResolvedSecret], None],
+        tracker: InvocationSecretTracker,
         on_authorize: Callable[[ProxyAuthorizationRecord], None],
     ) -> None:
         if not isinstance(proxy, CredentialProxy):
             raise TypeError("proxy must be a CredentialProxy.")
-        if not callable(on_resolve):
-            raise TypeError("on_resolve must be callable.")
+        if not isinstance(tracker, InvocationSecretTracker):
+            raise TypeError("tracker must be an InvocationSecretTracker.")
         if not callable(on_authorize):
             raise TypeError("on_authorize must be callable.")
         self._proxy = proxy
-        self._on_resolve = on_resolve
+        self._tracker = tracker
         self._on_authorize = on_authorize
 
     async def resolve(
@@ -138,14 +236,25 @@ class _TrackingCredentialProxy(CredentialProxy):
     ) -> ResolvedSecret:
         copied_ref = copy_secret_ref(ref)
         copied_scope = None if scope is None else copy_json_object(scope, "scope")
-        secret = await self._proxy.resolve(
-            copied_ref,
-            scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
-        )
+        token = self._tracker.begin_resolution()
+        try:
+            secret = await self._proxy.resolve(
+                copied_ref,
+                scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
+            )
+        except BaseException:
+            self._tracker.abandon_resolution(token)
+            raise
         if type(secret) is not ResolvedSecret:
+            self._tracker.abandon_resolution(token)
             raise TypeError("Proxy secret resolution must return ResolvedSecret.")
-        self._on_resolve(copy_resolved_secret(secret))
-        return copy_resolved_secret(secret)
+        copied_secret = copy_resolved_secret(secret)
+        del secret
+        accepted = self._tracker.complete_resolution(token, copied_secret)
+        if not accepted:
+            del copied_secret
+            raise RuntimeError("Secret resolution completed after tool publication.")
+        return copy_resolved_secret(copied_secret)
 
     async def authorize_request(
         self,
@@ -199,20 +308,20 @@ class _TrackingCredentialProxy(CredentialProxy):
 def vault_for_environment(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     *,
-    on_resolve: Callable[[ResolvedSecret], None],
+    tracker: InvocationSecretTracker,
 ) -> Vault | None:
     if registered_environment is None:
         return None
     vault = registered_environment.environment.vault
     if vault is None:
         return None
-    return _TrackingVault(vault, on_resolve)
+    return _TrackingVault(vault, tracker)
 
 
 def proxy_for_environment(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     *,
-    on_resolve: Callable[[ResolvedSecret], None],
+    tracker: InvocationSecretTracker,
     on_authorize: Callable[[ProxyAuthorizationRecord], None],
 ) -> CredentialProxy | None:
     if registered_environment is None:
@@ -220,7 +329,7 @@ def proxy_for_environment(
     proxy = registered_environment.environment.proxy
     if proxy is None:
         return None
-    return _TrackingCredentialProxy(proxy, on_resolve, on_authorize)
+    return _TrackingCredentialProxy(proxy, tracker, on_authorize)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +351,12 @@ def initialize_cancellation_evidence(cancellation: asyncio.CancelledError) -> No
         _ToolCancellationEvidence(token=_CANCELLATION_EVIDENCE_TOKEN),
     ):
         raise RuntimeError("Could not attach runtime cancellation evidence.")
+
+
+def has_cancellation_evidence(cancellation: asyncio.CancelledError) -> bool:
+    """Return whether the runtime authenticated this cancellation handoff."""
+
+    return _cancellation_evidence(cancellation) is not None
 
 
 def set_cancellation_tool_call_id(
@@ -343,6 +458,18 @@ def cancellation_artifacts(
 def sanitize_external_cancellation(cancellation: asyncio.CancelledError) -> None:
     """Scrub runtime-only evidence before ordinary cancellation escapes Cayu."""
 
+    runner_failure = pop_runner_cancellation_failure(cancellation)
+    if runner_failure is not None:
+        try:
+            # Import at the publication boundary to avoid making invocation
+            # secret tracking depend on the framework-tools package at import
+            # time. The authenticated object was visible to extension code, so
+            # rebuild it now rather than trusting its current mutable state.
+            from cayu.tools._runner import sanitize_runner_failure
+
+            runner_failure = sanitize_runner_failure(runner_failure)
+        except BaseException:
+            runner_failure = None
     evidence = _cancellation_evidence(cancellation)
     redactors = []
     if evidence is not None:
@@ -376,6 +503,17 @@ def sanitize_external_cancellation(cancellation: asyncio.CancelledError) -> None
 
     pop_exception_state(cancellation, _CANCELLATION_EVIDENCE_ATTRIBUTE)
     _clear_legacy_cancellation_tool_call_id(cancellation)
+    # A tool can await its runner while handling a secret-bearing exception.
+    # Python attaches that active exception only when cancellation crosses back
+    # into the tool, after the runner boundary has already detached its own
+    # frames. This is the first runtime-owned boundary that sees the complete
+    # tool failure tree, so sever every historical exception path here before
+    # ordinary cancellation escapes Cayu.
+    _BASE_EXCEPTION_TRACEBACK_DESCRIPTOR.__set__(cancellation, None)
+    _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__set__(cancellation, None)
+    _BASE_EXCEPTION_CONTEXT_DESCRIPTOR.__set__(cancellation, None)
+    if runner_failure is not None:
+        _BASE_EXCEPTION_CAUSE_DESCRIPTOR.__set__(cancellation, runner_failure)
 
 
 def _cancellation_evidence(

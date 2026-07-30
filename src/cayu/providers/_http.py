@@ -35,8 +35,139 @@ from cayu.providers.base import (
 from cayu.vaults.redaction import SecretRedactor
 
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
+OMITTED_PROVIDER_ERROR_BODY = "[provider response body omitted]"
 _PROVIDER_CA_BUNDLE_ENV = "CAYU_PROVIDER_CA_BUNDLE"
 _ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
+_TRUSTED_HTTPX_REQUEST_ERROR_TYPES: dict[type[httpx.RequestError], str] = {
+    httpx.CloseError: "CloseError",
+    httpx.ConnectError: "ConnectError",
+    httpx.ConnectTimeout: "ConnectTimeout",
+    httpx.DecodingError: "DecodingError",
+    httpx.LocalProtocolError: "LocalProtocolError",
+    httpx.NetworkError: "NetworkError",
+    httpx.PoolTimeout: "PoolTimeout",
+    httpx.ProtocolError: "ProtocolError",
+    httpx.ProxyError: "ProxyError",
+    httpx.ReadError: "ReadError",
+    httpx.ReadTimeout: "ReadTimeout",
+    httpx.RemoteProtocolError: "RemoteProtocolError",
+    httpx.RequestError: "RequestError",
+    httpx.TimeoutException: "TimeoutException",
+    httpx.TooManyRedirects: "TooManyRedirects",
+    httpx.TransportError: "TransportError",
+    httpx.UnsupportedProtocol: "UnsupportedProtocol",
+    httpx.WriteError: "WriteError",
+    httpx.WriteTimeout: "WriteTimeout",
+}
+_SAFE_INTERNAL_PROVIDER_ERROR_TYPES = frozenset(_TRUSTED_HTTPX_REQUEST_ERROR_TYPES.values())
+_SAFE_PROVIDER_ERROR_TYPES = {
+    "anthropic": frozenset(
+        {
+            "authentication_error",
+            "invalid_request_error",
+            "not_found_error",
+            "overloaded_error",
+            "permission_error",
+            "rate_limit_error",
+            "request_too_large",
+        }
+    ),
+    "chat_completions": frozenset(
+        {
+            "authentication_error",
+            "error",
+            "invalid_request_error",
+            "not_found_error",
+            "permission_error",
+            "rate_limit_error",
+            "server_error",
+        }
+    ),
+    "openai": frozenset(
+        {
+            "authentication_error",
+            "error",
+            "invalid_request_error",
+            "not_found_error",
+            "permission_error",
+            "rate_limit_error",
+            "server_error",
+        }
+    ),
+    "vertex": frozenset(
+        {
+            "DEADLINE_EXCEEDED",
+            "INTERNAL",
+            "INVALID_ARGUMENT",
+            "PERMISSION_DENIED",
+            "RESOURCE_EXHAUSTED",
+            "UNAUTHENTICATED",
+            "UNAVAILABLE",
+            "invalid_request_error",
+            "overloaded_error",
+            "rate_limit_error",
+            "request_too_large",
+        }
+    ),
+}
+_SAFE_PROVIDER_ERROR_CODES = {
+    "anthropic": frozenset(
+        {
+            "context_length_exceeded",
+            "rate_limit_exceeded",
+        }
+    ),
+    "chat_completions": frozenset(
+        {
+            "context_length_exceeded",
+            "internal_error",
+            "rate_limit_exceeded",
+            "server_error",
+        }
+    ),
+    "openai": frozenset(
+        {
+            "bad_request",
+            "context_length_exceeded",
+            "internal_error",
+            "previous_response_not_found",
+            "rate_limit_exceeded",
+            "server_error",
+        }
+    ),
+    "vertex": frozenset(
+        {
+            "context_length_exceeded",
+            "rate_limit_exceeded",
+        }
+    ),
+}
+_SAFE_PROVIDER_EXCEPTION_TYPE_NAMES = frozenset(
+    {
+        "AnthropicAPIError",
+        "AnthropicContextOverflowError",
+        "AnthropicError",
+        "AnthropicProtocolError",
+        "ChatCompletionsAPIError",
+        "ChatCompletionsContextOverflowError",
+        "ChatCompletionsError",
+        "ChatCompletionsProtocolError",
+        "Exception",
+        "ModelContextOverflowError",
+        "ModelProviderError",
+        "OpenAIAPIError",
+        "OpenAIContextOverflowError",
+        "OpenAIError",
+        "OpenAIProtocolError",
+        "OpenAISubscriptionAuthError",
+        "RuntimeError",
+        "SseIdleTimeoutError",
+        "VertexAPIError",
+        "VertexContextOverflowError",
+        "VertexError",
+        "VertexProtocolError",
+    }
+)
 
 
 def new_async_client() -> httpx.AsyncClient:
@@ -244,9 +375,15 @@ def _request_api_error(
 ) -> Exception:
     return api_error(
         f"{request_label} request failed for {url}: {cause}",
-        error_type=type(cause).__name__,
+        error_type=_trusted_httpx_request_error_type(cause),
         retryable=_is_retryable_transport_error(cause),
     )
+
+
+def _trusted_httpx_request_error_type(error: httpx.RequestError) -> str:
+    """Return a fixed classification without exposing arbitrary subclass names."""
+
+    return _TRUSTED_HTTPX_REQUEST_ERROR_TYPES.get(type(error), "RequestError")
 
 
 def _response_api_error(
@@ -374,21 +511,16 @@ def safe_error_response_text(
     *,
     format_error_json: Callable[[Any], str | None],
 ) -> str:
-    """Render an error response body safely (sanitized JSON or truncated text).
+    """Omit an untrusted body when the active workload redactor is unavailable.
 
-    ``format_error_json`` receives the decoded JSON body and returns the
-    sanitized text, or ``None`` to fall back to the truncated raw body.
+    Provider adapters run below the application-owned workload-secret scope.
+    Retaining even a parsed or truncated body here could preserve a recoverable
+    secret fragment before the application gets a chance to redact it. Typed
+    provider exceptions retain authoritative HTTP status/type/code fields.
     """
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        try:
-            decoded = response.json()
-        except ValueError:
-            return truncate_error_text(response.text)
-        formatted = format_error_json(decoded)
-        if formatted is not None:
-            return formatted
-    return truncate_error_text(response.text)
+
+    del response, format_error_json
+    return OMITTED_PROVIDER_ERROR_BODY
 
 
 def safe_error_json(decoded: Mapping[str, Any], *, include_request_id: bool = False) -> str:
@@ -486,6 +618,7 @@ def credential_safe_error_event(
     exc: Exception,
     *,
     provider_label: str,
+    provider_name: str,
     credential_values: Sequence[str],
     unresolved_message: str | None = None,
 ) -> ModelStreamEvent:
@@ -501,7 +634,7 @@ def credential_safe_error_event(
     safe_message = (
         require_nonblank(unresolved_message, "unresolved_message")
         if unresolved_message is not None
-        else f"{type(exc).__name__}: {provider_label} provider failed"
+        else f"{safe_provider_exception_type_name(exc)}: {provider_label} provider failed"
     )
     if not credential_values:
         # Authentication may fail before a deferred credential resolver returns
@@ -509,7 +642,7 @@ def credential_safe_error_event(
         # text or structured string field is safe to retain.
         payload: dict[str, Any] = {
             "error": safe_message,
-            "error_type": type(exc).__name__,
+            "error_type": safe_provider_exception_type_name(exc),
         }
         if isinstance(exc, ModelProviderError):
             if type(exc.status_code) is int:
@@ -519,10 +652,29 @@ def credential_safe_error_event(
             if type(exc.retry_after_s) in {int, float}:
                 payload["retry_after_s"] = exc.retry_after_s
         return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
-    event = ModelStreamEvent.error(
-        safe_message,
-        cause=exc,
-    )
+    if isinstance(exc, ModelProviderError):
+        safe_exception = credential_safe_provider_exception(
+            exc,
+            provider_label=provider_label,
+            provider_name=provider_name,
+            credential_values=credential_values,
+            safe_message=safe_message,
+        )
+        event = ModelStreamEvent.error(
+            safe_message,
+            cause=safe_exception,
+        )
+        payload = dict(event.payload)
+        payload["error_type"] = safe_provider_exception_type_name(exc)
+        event = ModelStreamEvent(type=event.type, payload=payload)
+    else:
+        event = ModelStreamEvent(
+            type=ModelStreamEventType.ERROR,
+            payload={
+                "error": safe_message,
+                "error_type": safe_provider_exception_type_name(exc),
+            },
+        )
     redacted = SecretRedactor(credential_values).redact_json_values(event.payload)
     if type(redacted) is not dict:  # pragma: no cover - SecretRedactor contract guard
         raise AssertionError("provider error payload redaction returned a non-object")
@@ -547,13 +699,23 @@ def credential_safe_provider_exception(
     elif isinstance(exc, ModelContextOverflowError):
         message = f"{provider_label} model context window exceeded"
     else:
-        message = f"{type(exc).__name__}: {provider_label} provider failed"
+        message = f"{safe_provider_exception_type_name(exc)}: {provider_label} provider failed"
 
     source = exc if isinstance(exc, ModelProviderError) else None
     string_fields: dict[str, str | None] = {
-        "error_type": source.error_type if source is not None else None,
-        "error_code": source.error_code if source is not None else None,
-        "request_id": source.request_id if source is not None else None,
+        "error_type": _safe_provider_identity_field(
+            provider_name,
+            "error_type",
+            source.error_type if source is not None else None,
+        ),
+        "error_code": _safe_provider_identity_field(
+            provider_name,
+            "error_code",
+            source.error_code if source is not None else None,
+        ),
+        # Provider request IDs are arbitrary provider-controlled strings. They
+        # cannot be compared with a workload secret registry at this boundary.
+        "request_id": None,
     }
     if redactor.has_values:
         string_fields = {
@@ -578,6 +740,38 @@ def credential_safe_provider_exception(
         **common,
         retryable=source.retryable if source is not None else None,
         retry_after_s=source.retry_after_s if source is not None else None,
+    )
+
+
+def _safe_provider_identity_field(
+    provider_name: str,
+    field_name: str,
+    value: object,
+) -> str | None:
+    if type(value) is not str:
+        return None
+    if field_name == "error_type":
+        allowed = (
+            _SAFE_PROVIDER_ERROR_TYPES.get(
+                provider_name,
+                frozenset(),
+            )
+            | _SAFE_INTERNAL_PROVIDER_ERROR_TYPES
+        )
+    else:
+        allowed = _SAFE_PROVIDER_ERROR_CODES.get(provider_name, frozenset())
+    return value if value in allowed else None
+
+
+def safe_provider_exception_type_name(error: BaseException) -> str:
+    """Return only fixed provider-boundary exception classifications."""
+
+    try:
+        name = type.__getattribute__(type(error), "__name__")
+    except BaseException:
+        return "Exception"
+    return (
+        name if type(name) is str and name in _SAFE_PROVIDER_EXCEPTION_TYPE_NAMES else "Exception"
     )
 
 
@@ -609,6 +803,7 @@ def sanitize_provider_cancellation(
 
 __all__ = [
     "MAX_PROVIDER_ERROR_BODY_CHARS",
+    "OMITTED_PROVIDER_ERROR_BODY",
     "SharedAsyncClient",
     "aclose_transport",
     "copy_headers",
@@ -625,6 +820,7 @@ __all__ = [
     "safe_error_json",
     "safe_error_response_text",
     "safe_flat_error_json",
+    "safe_provider_exception_type_name",
     "sanitize_provider_cancellation",
     "stream_sse_json_events",
     "truncate_error_text",

@@ -18,6 +18,7 @@ from cayu._validation import (
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, RunnerUnavailableError
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.vaults import SecretRedactor
 
 DEFAULT_SEARCH_LIMIT = 100
 MAX_SEARCH_LIMIT = 500
@@ -254,6 +255,7 @@ class SearchTextTool(Tool):
         deadline = started_at + self.timeout_s
         if scope_globs:
             visible_result = await _run_search_command(
+                ctx,
                 runner,
                 _file_listing_argv(
                     exclude_directories=self.exclude_directories,
@@ -323,6 +325,7 @@ class SearchTextTool(Tool):
             argv.extend(["--glob", f"!**/{directory}/**"])
         argv.extend(["--", pattern, "."])
         raw = await _run_search_command(
+            ctx,
             runner,
             argv,
             timeout_s=self.timeout_s,
@@ -495,6 +498,7 @@ def _require_exec_result(value: object) -> ExecResult:
 
 
 async def _run_search_command(
+    ctx: ToolContext,
     runner: Any,
     argv: list[str],
     *,
@@ -803,12 +807,11 @@ def _render_search_metadata(
 
 
 def _truncate_utf8(value: str, maximum: int, *, marker: str) -> tuple[str, bool]:
-    encoded = value.encode("utf-8", errors="replace")
-    if len(encoded) <= maximum:
-        return encoded.decode("utf-8"), False
-    marker_bytes = marker.encode("utf-8")
-    prefix = encoded[: maximum - len(marker_bytes)]
-    return prefix.decode("utf-8", errors="ignore").rstrip() + marker, True
+    return SecretRedactor().redact_text_bounded_with_marker(
+        value,
+        max_bytes=maximum,
+        truncation_marker=marker,
+    )
 
 
 def _bounded_message(value: str, maximum: int) -> str:

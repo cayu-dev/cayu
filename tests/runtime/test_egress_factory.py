@@ -53,7 +53,7 @@ from cayu.environments.factory import (
     environment_factory_cleanup_settlement_task,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runners import LambdaMicroVMRunner, LocalRunner
+from cayu.runners import LambdaMicroVMRunner, LocalRunner, RunnerExecutionError
 from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
 from cayu.runtime._environment_lifecycle import (
@@ -61,6 +61,8 @@ from cayu.runtime._environment_lifecycle import (
     _reconcile_binding_finalize_failure_event,
 )
 from cayu.runtime.event_sinks import EventSink
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 from cayu.workspaces import (
     LocalWorkspace,
@@ -1080,6 +1082,43 @@ def test_factory_wires_runner_grants_and_events(monkeypatch: pytest.MonkeyPatch)
         assert REAL_SECRET not in str(event.payload)
 
 
+def test_egress_wrapped_runner_failure_preserves_backend_identity() -> None:
+    async def run() -> dict[str, Any]:
+        result = await _virtual_factory(adapter=_RecordingAdapter("docker")).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_failure_adapter",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert runner is not None
+        handle = InvocationRunnerHandle(
+            runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(),
+            ),
+        )
+        try:
+            with pytest.raises(RunnerExecutionError) as exc_info:
+                await handle.exec(ExecCommand.process("fail"))
+            return exc_info.value.diagnostic
+        finally:
+            await runner.close()
+
+    diagnostic = asyncio.run(run())
+
+    assert diagnostic == {
+        "type": "cayu.runner_execution_error.v1",
+        "adapter": "docker",
+        "status": "failed",
+        "error_type": "NotImplementedError",
+        "timed_out": False,
+        "cancelled": False,
+    }
+
+
 def test_factory_requires_a_credential() -> None:
     with pytest.raises(ValueError, match="at least one credential"):
         VirtualEgressEnvironmentFactory(
@@ -1555,6 +1594,48 @@ def test_virtual_egress_executes_provider_isolation_probe_on_create_and_reconnec
     assert reconnect_virtual.startswith("sk_test_cayu_vc_")
     assert created_virtual != REAL_SECRET
     assert reconnect_virtual != REAL_SECRET
+
+
+def test_virtual_egress_redacted_exec_includes_generated_workload_credentials(
+    tmp_path: Path,
+) -> None:
+    guest_root = tmp_path / "virtual-egress-redaction"
+    guest_root.mkdir()
+
+    async def runner_factory(request: Any) -> Runner:
+        return _ExecutingVirtualRunner(guest_root, request.env_overlay)
+
+    adapter = _LifecycleRecordingAdapter(runner_factory=runner_factory)
+
+    async def run() -> tuple[ExecResult, str]:
+        created = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_virtual_redaction",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = created.environment.runner
+        assert runner is not None
+        virtual_value = adapter.captured["runner_request"].env_overlay["STRIPE_SECRET_KEY"]
+        try:
+            result = await runner.exec_redacted(
+                ExecCommand.process(
+                    "python3",
+                    "-c",
+                    "import os; print(os.environ['STRIPE_SECRET_KEY'])",
+                ),
+                redactor=SecretRedactor(),
+            )
+        finally:
+            await runner.close()
+        return result, virtual_value
+
+    result, virtual_value = asyncio.run(run())
+
+    assert result.stdout.strip() == REDACTED_SECRET
+    assert virtual_value not in result.stdout
+    assert result.stdout_bytes == len(f"{virtual_value}\n".encode())
 
 
 def test_factory_passes_and_returns_adapter_reconnect_metadata() -> None:
@@ -2289,8 +2370,10 @@ def test_egress_teardown_does_not_read_runner_bound_target_after_quiescence(
     assert adapter.finalize_calls == ["interrupted"]
 
 
+@pytest.mark.parametrize("redacted", [False, True], ids=["plain", "redacted"])
 def test_egress_teardown_drains_dispatched_write_before_authoritative_sync(
     tmp_path: Path,
+    redacted: bool,
 ) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -2348,14 +2431,22 @@ def test_egress_teardown_drains_dispatched_write_before_authoritative_sync(
         )
         target = target_holder[0]
 
-        mutation_task = asyncio.create_task(runner.exec(ExecCommand.process("write-late-state")))
+        async def dispatch(command: ExecCommand) -> ExecResult:
+            if redacted:
+                return await runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                )
+            return await runner.exec(command)
+
+        mutation_task = asyncio.create_task(dispatch(ExecCommand.process("write-late-state")))
         await mutation_started.wait()
         finalize_task = asyncio.create_task(binding.finalize(bound, outcome="completed"))
         while runner._workspace_dispatch_gate_owner is None:  # type: ignore[attr-defined]
             await asyncio.sleep(0)
 
         with pytest.raises(RuntimeError, match="dispatch is closed"):
-            await runner.exec(ExecCommand.process("new-work-after-finalization"))
+            await dispatch(ExecCommand.process("new-work-after-finalization"))
         assert not finalize_task.done()
         assert (source_root / "state.txt").read_bytes() == b"initial"
 
@@ -2372,8 +2463,10 @@ def test_egress_teardown_drains_dispatched_write_before_authoritative_sync(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("redacted", [False, True], ids=["plain", "redacted"])
 def test_egress_teardown_waits_for_deferred_command_settlement_before_sync(
     tmp_path: Path,
+    redacted: bool,
 ) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -2452,7 +2545,14 @@ def test_egress_teardown_waits_for_deferred_command_settlement_before_sync(
             session_id="sess_deferred_command_settlement",
         )
 
-        command_task = asyncio.create_task(runner.exec(ExecCommand.process("late-command")))
+        if redacted:
+            command_operation = runner.exec_redacted(
+                ExecCommand.process("late-command"),
+                redactor=SecretRedactor(),
+            )
+        else:
+            command_operation = runner.exec(ExecCommand.process("late-command"))
+        command_task = asyncio.create_task(command_operation)
         await command_started.wait()
         command_task.cancel("interrupt deferred command")
         with pytest.raises(asyncio.CancelledError, match="interrupt deferred command"):
@@ -2685,10 +2785,12 @@ def test_egress_teardown_retires_target_killed_by_command_cleanup(
         ("child_cancel", "was cancelled without caller cancellation"),
     ],
 )
+@pytest.mark.parametrize("redacted", [False, True], ids=["plain", "redacted"])
 def test_egress_teardown_retains_owner_when_command_settlement_is_uncertain(
     tmp_path: Path,
     settlement_mode: str,
     error_pattern: str,
+    redacted: bool,
 ) -> None:
     source_root = tmp_path / "source"
     target_root = tmp_path / "target"
@@ -2749,7 +2851,13 @@ def test_egress_teardown_retains_owner_when_command_settlement_is_uncertain(
             runner,
             session_id="sess_uncertain_command_settlement",
         )
-        command_result = await runner.exec(ExecCommand.process("uncertain-command"))
+        if redacted:
+            command_result = await runner.exec_redacted(
+                ExecCommand.process("uncertain-command"),
+                redactor=SecretRedactor(),
+            )
+        else:
+            command_result = await runner.exec(ExecCommand.process("uncertain-command"))
         assert command_result.timed_out
 
         current_task = asyncio.current_task()
@@ -5092,6 +5200,7 @@ def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle(
             "stdin_base64": "YWdlbnQtaW5wdXQ=",
             "timeout_s": 17,
             "output_limit_bytes": 321,
+            "omit_truncated_output": False,
             "argv": ["agent-command"],
         },
         {
@@ -5102,6 +5211,7 @@ def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle(
             "stdin_base64": "dHJ1c3RlZC1pbnB1dA==",
             "timeout_s": 23,
             "output_limit_bytes": 654,
+            "omit_truncated_output": False,
             "argv": ["system-command"],
         },
     ]

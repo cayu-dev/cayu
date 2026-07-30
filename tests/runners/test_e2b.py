@@ -7,6 +7,7 @@ from math import inf, nan
 from typing import Any
 
 import pytest
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu.runners import (
     DEFAULT_E2B_CWD,
@@ -16,8 +17,12 @@ from cayu.runners import (
     E2BWorkspaceCapability,
     ExecCommand,
     ExecResult,
+    RunnerExecutionError,
 )
 from cayu.testing import verify_provider_credential_isolation
+from cayu.tools._redaction import InvocationRedactorSnapshot
+from cayu.tools._runner import InvocationRunnerHandle
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 @dataclass
@@ -94,6 +99,8 @@ class FakeCommands:
         self.foreground_results: list[FakeCommandResult] = []
         self.foreground_exceptions: dict[int, Exception] = {}
         self.foreground_call_count = 0
+        self.stdout_chunks = ["abcdef"]
+        self.stderr_chunks = ["uvwxyz"]
 
     async def run(self, cmd: str, **kwargs: Any) -> Any:
         self.calls.append({"cmd": cmd, **kwargs})
@@ -118,13 +125,15 @@ class FakeCommands:
             on_stdout = kwargs.get("on_stdout")
             on_stderr = kwargs.get("on_stderr")
             if on_stdout is not None:
-                maybe = on_stdout("abcdef")
-                if hasattr(maybe, "__await__"):
-                    await maybe
+                for chunk in self.stdout_chunks:
+                    maybe = on_stdout(chunk)
+                    if hasattr(maybe, "__await__"):
+                        await maybe
             if on_stderr is not None:
-                maybe = on_stderr("uvwxyz")
-                if hasattr(maybe, "__await__"):
-                    await maybe
+                for chunk in self.stderr_chunks:
+                    maybe = on_stderr(chunk)
+                    if hasattr(maybe, "__await__"):
+                        await maybe
             return self.next_handle
         if self.fail_next_setup:
             self.fail_next_setup = False
@@ -1363,6 +1372,28 @@ def test_e2b_runner_executes_process_with_shell_quoting_and_isolated_env(
     assert sandbox.commands.next_handle.stdin_closed is True
 
 
+def test_e2b_runner_redacts_callback_chunks_before_bounding() -> None:
+    secret = "e2b-callback-boundary-secret"
+    sandbox = FakeSandbox()
+    sandbox.commands.stdout_chunks = ["prefix:", secret[:9], secret[9:], ":suffix"]
+    sandbox.commands.stderr_chunks = [secret[:4], secret[4:]]
+    sandbox.commands.next_handle = FakeHandle(result=FakeCommandResult())
+    runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+
+    result = asyncio.run(
+        runner.exec_redacted(
+            ExecCommand.process("echo", "ignored"),
+            redactor=SecretRedactor(secret),
+            output_limit_bytes=128,
+        )
+    )
+
+    assert result.stdout == f"prefix:{REDACTED_SECRET}:suffix"
+    assert result.stderr == REDACTED_SECRET
+    assert result.stdout_bytes == len(f"prefix:{secret}:suffix".encode())
+    assert result.stderr_bytes == len(secret.encode())
+
+
 def test_e2b_runner_pins_commands_to_configured_exec_user() -> None:
     sandbox = FakeSandbox()
     runner = E2BRunner(sandbox, exec_user="sandbox-user", e2b_module=FakeE2BModule)
@@ -1413,6 +1444,42 @@ def test_e2b_runner_returns_nonzero_exit_as_exec_result() -> None:
     assert result.exit_code == 42
     assert result.stdout == "abcdef"
     assert result.stderr == "uvwxyz"
+
+
+@pytest.mark.parametrize(
+    "failure_message",
+    [
+        "workload-secret-canary-ABCDEFGHIJKLMNOP",
+        "workload-secret-",
+    ],
+    ids=["complete-secret", "recoverable-prefix"],
+)
+def test_e2b_runner_detaches_opaque_sdk_failure_text(
+    failure_message: str,
+) -> None:
+    sandbox = FakeSandbox()
+    sandbox.commands.next_handle = FakeHandle(
+        raise_exit=RuntimeError(failure_message)  # type: ignore[arg-type]
+    )
+    runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+
+    with pytest.raises(RunnerExecutionError) as exc_info:
+        asyncio.run(runner.exec(ExecCommand.process("pwd")))
+
+    assert str(exc_info.value) == "Runner command execution failed."
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.diagnostic == {
+        "type": "cayu.runner_execution_error.v1",
+        "adapter": "e2b",
+        "status": "failed",
+        "error_type": "RuntimeError",
+        "timed_out": False,
+        "cancelled": False,
+        "stdout_bytes": 6,
+        "stderr_bytes": 6,
+    }
+    assert failure_message not in repr(exc_info.value.diagnostic)
 
 
 def test_e2b_runner_kills_command_on_timeout_by_default() -> None:
@@ -1529,7 +1596,6 @@ def test_e2b_runner_reports_timeout_cleanup_failure() -> None:
             "status": "failed",
             "timeout_s": 5.0,
             "error_type": "RuntimeError",
-            "error": "kill failed",
         }
     ]
     sandbox.commands.next_handle = FakeHandle()
@@ -1570,6 +1636,144 @@ def test_e2b_runner_kills_command_on_cancellation_by_default() -> None:
             "timeout_s": 5.0,
         }
     ]
+
+
+def test_invocation_handle_detaches_e2b_secret_bearing_cancellation_traceback() -> None:
+    secret = "e2b-cancellation-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def run() -> tuple[asyncio.CancelledError, int, bool, ExecResult]:
+        sandbox = FakeSandbox()
+        remote_handle = BlockingHandle()
+        sandbox.commands.next_handle = remote_handle
+        runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+        invocation_handle = InvocationRunnerHandle(
+            runner,
+            redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+                revision=0,
+                redactor=SecretRedactor(secret),
+            ),
+        )
+        task = asyncio.create_task(
+            invocation_handle.exec(
+                ExecCommand.process("sleep", "30"),
+                env={"WORKLOAD_TOKEN": secret},
+                stdin=secret,
+            )
+        )
+        await remote_handle.wait_started.wait()
+        task.cancel("caller cancelled")
+        cancelling = task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        sandbox.commands.next_handle = FakeHandle(result=FakeCommandResult())
+        retry = await invocation_handle.exec(ExecCommand.process("echo", "retry"))
+        return exc_info.value, cancelling, task.cancelled(), retry
+
+    cancellation, cancelling, cancelled, retry = asyncio.run(run())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert type(cancellation) is asyncio.CancelledError
+    assert cancellation.args == ("caller cancelled",)
+    assert cancellation.__cause__ is None
+    assert cancellation.__context__ is None
+    assert retry.exit_code == 0
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if is_cayu_source_filename(frame.f_code.co_filename):
+            for name, value in frame.f_locals.items():
+                assert secret not in repr(value), (
+                    frame.f_code.co_filename,
+                    frame.f_code.co_name,
+                    name,
+                )
+        traceback = traceback.tb_next
+
+
+def test_e2b_redaction_discards_uncertain_suffix_and_fences_retry_after_cleanup_failure() -> None:
+    secret = "e2b-cancel-boundary-secret"
+    secret_prefix = secret[:13]
+
+    async def run() -> tuple[asyncio.Task[ExecResult], BaseException, RuntimeError]:
+        sandbox = FakeSandbox()
+        interrupted_handle = BlockingHandle()
+        interrupted_handle.fail_kill = True
+        sandbox.commands.next_handle = interrupted_handle
+        sandbox.commands.stdout_chunks = ["safe-prefix:", secret_prefix]
+        sandbox.commands.stderr_chunks = [secret[:7]]
+        runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+        redactor = SecretRedactor(secret)
+
+        task = asyncio.create_task(
+            runner.exec_redacted(
+                ExecCommand.process("sleep", "30"),
+                redactor=redactor,
+                output_limit_bytes=128,
+            )
+        )
+        await interrupted_handle.wait_started.wait()
+        task.cancel("caller cancelled")
+        assert task.cancelling() == 1
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        assert task.cancelled()
+
+        sandbox.commands.stdout_chunks = [secret[:9], secret[9:]]
+        sandbox.commands.stderr_chunks = []
+        sandbox.commands.next_handle = FakeHandle(result=FakeCommandResult())
+        with pytest.raises(RuntimeError, match="mutation quiescence") as retry_info:
+            await runner.exec_redacted(
+                ExecCommand.process("echo", "retry"),
+                redactor=redactor,
+                output_limit_bytes=128,
+            )
+        return task, exc_info.value, retry_info.value
+
+    task, cancellation, retry_error = asyncio.run(run())
+
+    assert task.cancelled()
+    assert secret not in repr(cancellation)
+    assert secret_prefix not in repr(cancellation)
+    assert cancellation.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "e2b",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+            "error_type": "RuntimeError",
+        }
+    ]
+    assert secret not in repr(retry_error)
+    assert secret_prefix not in repr(retry_error)
+
+
+def test_e2b_redaction_discards_uncertain_suffix_on_timeout() -> None:
+    secret = "e2b-timeout-boundary-secret"
+    secret_prefix = secret[:12]
+    sandbox = FakeSandbox()
+    sandbox.commands.next_handle = BlockingHandle()
+    sandbox.commands.stdout_chunks = ["safe-prefix:", secret_prefix]
+    sandbox.commands.stderr_chunks = [secret[:5]]
+    runner = E2BRunner(sandbox, e2b_module=FakeE2BModule)
+
+    result = asyncio.run(
+        runner.exec_redacted(
+            ExecCommand.process("sleep", "30"),
+            redactor=SecretRedactor(secret),
+            timeout_s=1,
+            output_limit_bytes=128,
+        )
+    )
+
+    assert result.stdout == "safe-prefix:"
+    assert result.stderr == ""
+    assert result.stdout_bytes == len(f"safe-prefix:{secret_prefix}".encode())
+    assert result.stderr_bytes == len(secret[:5].encode())
+    assert result.stdout_truncated is True
+    assert result.stderr_truncated is True
+    assert result.timed_out is True
 
 
 def test_e2b_runner_can_kill_sandbox_on_cancellation_explicitly() -> None:
@@ -2263,7 +2467,6 @@ def test_e2b_runner_fences_failed_command_kill_until_operator_verification() -> 
             "status": "failed",
             "timeout_s": 5.0,
             "error_type": "RuntimeError",
-            "error": "kill failed",
         }
     ]
 

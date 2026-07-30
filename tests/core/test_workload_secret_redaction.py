@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import sys
 from datetime import UTC, datetime
 from typing import Any, cast
 
@@ -18,6 +19,16 @@ from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.runtime.sessions as sessions_module
+from cayu import (
+    InMemoryKnowledgeStore,
+    KnowledgeIndexer,
+    KnowledgeIndexRequest,
+    ListKnowledgeTool,
+    LocalRunner,
+    LocalWorkspace,
+    ReadFileTool,
+    SearchKnowledgeTool,
+)
 from cayu.core import (
     AgentSpec,
     Event,
@@ -36,7 +47,14 @@ from cayu.environments import (
     EnvironmentSpec,
 )
 from cayu.providers import ModelStreamEvent
-from cayu.runners import RunnerCancelledError
+from cayu.runners import (
+    ExecCommand,
+    ExecResult,
+    Runner,
+    RunnerCancelledError,
+    RunnerExecutionError,
+    attach_cancellation_artifacts,
+)
 from cayu.runtime import (
     CayuApp,
     ForkSessionRequest,
@@ -1875,6 +1893,689 @@ def test_cayu_app_redacts_direct_vault_secrets_for_the_whole_tool_invocation() -
     assert REDACTED_SECRET in rendered_events
 
 
+def test_runtime_read_file_discards_pretruncated_secret_prefix_at_every_publication(
+    tmp_path,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    session_id = "sess_read_file_pretruncated_secret"
+    workspace = LocalWorkspace(tmp_path, workspace_id="local")
+    asyncio.run(workspace.write_bytes("secret.txt", secret.encode()))
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_read_secret",
+                    name="read_file",
+                    arguments={"path": "secret.txt", "max_bytes": 16},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            workspace=workspace,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ReadFileTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "read the file")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript(session_id))
+    rendered = repr(
+        (
+            [event.model_dump(mode="json") for event in events],
+            [message.model_dump(mode="json") for message in transcript],
+            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+        )
+    )
+
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool", "arguments"),
+    [
+        (
+            "search_knowledge",
+            SearchKnowledgeTool(),
+            {"query": "workload", "preview_bytes": 16},
+        ),
+        (
+            "list_knowledge",
+            ListKnowledgeTool(),
+            {"preview_bytes": 16},
+        ),
+    ],
+)
+@pytest.mark.parametrize("store_max_bytes", [16, 10_000])
+def test_runtime_knowledge_preview_redacts_before_bound_at_every_publication(
+    tool_name: str,
+    tool: Tool,
+    arguments: dict[str, Any],
+    store_max_bytes: int,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    session_id = "sess_knowledge_preview_secret"
+    store = InMemorySessionStore()
+    knowledge_store = InMemoryKnowledgeStore()
+    asyncio.run(
+        KnowledgeIndexer(knowledge_store).index_text(
+            KnowledgeIndexRequest(
+                entry_id="secret",
+                text=secret,
+            )
+        )
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_knowledge_secret",
+                    name=tool_name,
+                    arguments={**arguments, "max_bytes": store_max_bytes},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            knowledge_store=knowledge_store,
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "search knowledge")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript(session_id))
+    rendered = repr(
+        (
+            [event.model_dump(mode="json") for event in events],
+            [message.model_dump(mode="json") for message in transcript],
+            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+        )
+    )
+
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+def test_custom_tool_runner_uses_secret_resolved_after_context_creation(tmp_path) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    session_id = "sess_custom_runner_dynamic_secret"
+
+    class DynamicRunnerTool(Tool):
+        spec = ToolSpec(
+            name="dynamic_runner",
+            description="Resolve a vault secret and execute through the documented runner handle.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.vault is not None
+            assert ctx.runner is not None
+            resolved = await ctx.vault.resolve(SecretRef(name="api_key"))
+            raw_secret = resolved.value.get_secret_value()
+            result = await ctx.runner.exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    "import os,sys; sys.stdout.write(os.environ['TOKEN'])",
+                ),
+                env={"TOKEN": raw_secret},
+                output_limit_bytes=16,
+            )
+            return ToolResult(
+                content=result.stdout,
+                structured={
+                    "stdout": result.stdout,
+                    "stdout_bytes": result.stdout_bytes,
+                    "stdout_truncated": result.stdout_truncated,
+                },
+            )
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_dynamic_runner",
+                    name="dynamic_runner",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            runner=LocalRunner(tmp_path),
+            vault=StaticVault({"api_key": secret}),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[DynamicRunnerTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript(session_id))
+    rendered = repr(
+        (
+            [event.model_dump(mode="json") for event in events],
+            [message.model_dump(mode="json") for message in transcript],
+            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+        )
+    )
+
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+
+
+@pytest.mark.parametrize(
+    ("output_limit_bytes", "expected_stdout", "expected_truncated"),
+    [
+        (128, REDACTED_SECRET, False),
+        (16, "", True),
+    ],
+    ids=["complete-output", "truncated-output"],
+)
+def test_custom_tool_runner_rechecks_secret_resolved_during_real_local_dispatch(
+    tmp_path,
+    output_limit_bytes: int,
+    expected_stdout: str,
+    expected_truncated: bool,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    session_id = f"sess_runner_inflight_secret_{output_limit_bytes}"
+    started_path = tmp_path / f"started-{output_limit_bytes}"
+    release_path = tmp_path / f"release-{output_limit_bytes}"
+
+    class ConcurrentSecretRunnerTool(Tool):
+        spec = ToolSpec(
+            name="concurrent_secret_runner",
+            description="Resolve a secret while a real local command is running.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            assert ctx.vault is not None
+            script = (
+                "import os,pathlib,sys,time\n"
+                f"pathlib.Path({str(started_path)!r}).write_text('started')\n"
+                f"release = pathlib.Path({str(release_path)!r})\n"
+                "while not release.exists():\n"
+                "    time.sleep(0.01)\n"
+                "sys.stdout.write(os.environ['TOKEN'])\n"
+            )
+            command_task = asyncio.create_task(
+                ctx.runner.exec(
+                    ExecCommand.process(sys.executable, "-c", script),
+                    env={"TOKEN": secret},
+                    output_limit_bytes=output_limit_bytes,
+                )
+            )
+            while not started_path.exists():
+                await asyncio.sleep(0)
+            await ctx.vault.resolve(SecretRef(name="api_key"))
+            release_path.write_text("release")
+            result = await command_task
+            return ToolResult(
+                content=result.stdout,
+                structured={
+                    "stdout": result.stdout,
+                    "stdout_bytes": result.stdout_bytes,
+                    "stdout_truncated": result.stdout_truncated,
+                },
+            )
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_concurrent_secret_runner",
+                    name="concurrent_secret_runner",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            runner=LocalRunner(tmp_path),
+            vault=StaticVault({"api_key": secret}),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ConcurrentSecretRunnerTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript(session_id))
+    tool_event = next(event for event in events if event.type is EventType.TOOL_CALL_COMPLETED)
+    result = tool_event.payload["result"]
+    rendered = repr(
+        (
+            [event.model_dump(mode="json") for event in events],
+            [message.model_dump(mode="json") for message in transcript],
+            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+        )
+    )
+
+    assert result["structured"]["stdout"] == expected_stdout
+    assert result["structured"]["stdout_truncated"] is expected_truncated
+    assert secret not in rendered
+    assert secret[:16] not in rendered
+    if expected_stdout:
+        assert REDACTED_SECRET in rendered
+
+
+def test_runtime_fails_closed_when_secret_resolves_after_bounded_runner_completion(
+    tmp_path,
+) -> None:
+    secret = "late-registered-secret-canary-ABCDEFGHIJKLMNOP"
+    session_id = "sess_runner_late_secret"
+
+    class LateSecretRunnerTool(Tool):
+        spec = ToolSpec(
+            name="late_secret_runner",
+            description="Resolve a secret after a bounded command completes.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            assert ctx.vault is not None
+            result = await ctx.runner.exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    "import os,sys; sys.stdout.write(os.environ['TOKEN'])",
+                ),
+                env={"TOKEN": secret},
+                output_limit_bytes=16,
+            )
+            assert result.stdout_truncated is True
+            await ctx.vault.resolve(SecretRef(name="api_key"))
+            return ToolResult(
+                content=result.stdout,
+                structured={
+                    "stdout": result.stdout,
+                    "stdout_truncated": result.stdout_truncated,
+                },
+            )
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_late_secret_runner",
+                    name="late_secret_runner",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            runner=LocalRunner(tmp_path),
+            vault=StaticVault({"api_key": secret}),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[LateSecretRunnerTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript(session_id))
+    failed = next(event for event in events if event.type is EventType.TOOL_CALL_FAILED)
+    rendered = repr(
+        (
+            [event.model_dump(mode="json") for event in events],
+            [message.model_dump(mode="json") for message in transcript],
+            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+        )
+    )
+
+    assert failed.payload["terminal_outcome"] == "invalid_tool_output"
+    assert failed.payload["result"]["is_error"] is True
+    assert "late-registered-" not in rendered
+    assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    "failure_message",
+    [
+        "workload-secret-canary-ABCDEFGHIJKLMNOP",
+        "workload-secret-",
+    ],
+    ids=["complete-secret", "recoverable-prefix"],
+)
+def test_runtime_runner_failure_omits_opaque_diagnostic_at_every_publication(
+    failure_message: str,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    session_id = f"sess_runner_failure_{len(failure_message)}"
+
+    class OpaqueFailureRunner(Runner):
+        isolation = "microsandbox"
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            raise RuntimeError(failure_message)
+
+    class FailingRunnerTool(Tool):
+        spec = ToolSpec(
+            name="failing_runner",
+            description="Exercise a runner operational failure.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            await ctx.runner.exec(ExecCommand.process("fail"))
+            return ToolResult(content="unexpected")
+
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_failing_runner",
+                    name="failing_runner",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            runner=OpaqueFailureRunner(),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[FailingRunnerTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "run")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript(session_id))
+    rendered = repr(
+        (
+            [event.model_dump(mode="json") for event in events],
+            [message.model_dump(mode="json") for message in transcript],
+            [message.model_dump(mode="json") for message in provider.requests[1].messages],
+        )
+    )
+
+    assert failure_message not in rendered
+    assert secret[:16] not in rendered
+    assert "Runner command execution failed." in rendered
+    assert "'error': 'runner_execution_failed'" in rendered
+    assert "'error_type': 'RuntimeError'" in rendered
+
+
+@pytest.mark.parametrize(
+    "cleanup_message",
+    [
+        "workload-secret-canary-ABCDEFGHIJKLMNOP",
+        "workload-secret-",
+    ],
+    ids=["complete-secret", "recoverable-prefix"],
+)
+def test_operator_interrupt_runner_cleanup_omits_opaque_diagnostic(
+    cleanup_message: str,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    session_id = f"sess_runner_cleanup_{len(cleanup_message)}"
+
+    class CleanupFailureRunner(Runner):
+        isolation = "microsandbox"
+
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            assert self.started is not None
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                attach_cancellation_artifacts(
+                    exc,
+                    [
+                        {
+                            "type": "cayu.runner_cleanup.v1",
+                            "adapter": "microsandbox",
+                            "action": "kill_command",
+                            "status": "failed",
+                            "timeout_s": 5.0,
+                            "error_type": "RuntimeError",
+                            "error": cleanup_message,
+                        }
+                    ],
+                )
+                raise
+            return ExecResult()
+
+    class CancelledRunnerTool(Tool):
+        spec = ToolSpec(
+            name="cancelled_runner",
+            description="Exercise runner cleanup during operator interruption.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            assert ctx.vault is not None
+            await ctx.vault.resolve(SecretRef(name="api_key"))
+            await ctx.runner.exec(ExecCommand.process("blocked"))
+            return ToolResult(content="unexpected")
+
+    runner = CleanupFailureRunner()
+    store = InMemorySessionStore()
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_cancelled_runner",
+                    name="cancelled_runner",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ]
+    )
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            runner=runner,
+            vault=StaticVault({"api_key": secret}),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[CancelledRunnerTool()],
+    )
+
+    async def scenario():
+        runner.started = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await runner.started.wait()
+        interrupt_events = [
+            event
+            async for event in app.interrupt_session(
+                InterruptSessionRequest(
+                    session_id=session_id,
+                    reason="operator stop",
+                )
+            )
+        ]
+        run_events = await run_task
+        stored_events = await store.load_events(session_id)
+        transcript = await store.load_transcript(session_id)
+        return interrupt_events, run_events, stored_events, transcript
+
+    interrupt_events, run_events, stored_events, transcript = asyncio.run(scenario())
+    rendered = repr(
+        (
+            [event.model_dump(mode="json") for event in interrupt_events],
+            [event.model_dump(mode="json") for event in run_events],
+            [event.model_dump(mode="json") for event in stored_events],
+            [message.model_dump(mode="json") for message in transcript],
+        )
+    )
+
+    assert run_events[-1].type is EventType.SESSION_INTERRUPTED
+    assert cleanup_message not in rendered
+    assert secret[:16] not in rendered
+    assert "'error_type': 'RuntimeError'" in rendered
+    assert "'error':" not in rendered
+
+
 def test_tool_failure_redacts_dynamically_resolved_secret_before_diagnostic_bound() -> None:
     from cayu.runtime._diagnostics import MAX_DIAGNOSTIC_UTF8_BYTES
 
@@ -2917,6 +3618,260 @@ def test_parallel_generic_cancellation_preserves_caller_signal_without_secret_ev
     assert cancellation.args == ("caller cancelled",)
     assert secret_value not in repr((cancellation.args, cancellation.__dict__))
     assert cancellation.__dict__ == {}
+    assert cancellation.__cause__ is None
+    assert cancellation.__context__ is None
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            assert all(
+                secret_value not in repr(value) for value in traceback.tb_frame.f_locals.values()
+            )
+        traceback = traceback.tb_next
+
+
+def test_runner_cancellation_drops_secret_context_added_by_tool_exception_handler() -> None:
+    secret_value = "runner-tool-context-secret-canary-ABCDEFGHIJKLMNOP"
+
+    class BlockingRunner(Runner):
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+
+        async def exec(
+            self,
+            command: ExecCommand,
+            **kwargs: Any,
+        ) -> ExecResult:
+            # Intentionally retain the complete request in this adapter frame;
+            # the invocation handle must keep it out of the escaped traceback.
+            request = (command, kwargs)
+            assert request
+            assert self.started is not None
+            self.started.set()
+            await asyncio.Event().wait()
+            return ExecResult()
+
+    class ExceptionHandlingRunnerTool(Tool):
+        spec = ToolSpec(
+            name="exception_handling_runner_tool",
+            description="Await a runner while handling a secret-bearing exception.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.vault is not None
+            assert ctx.runner is not None
+            resolved = await ctx.vault.resolve(SecretRef(name="api_key"))
+            raw_secret = resolved.value.get_secret_value()
+            try:
+                raise RuntimeError(raw_secret)
+            except RuntimeError:
+                await ctx.runner.exec(
+                    ExecCommand.process("blocked", raw_secret),
+                    env={"WORKLOAD_TOKEN": raw_secret},
+                    stdin=raw_secret,
+                )
+            return ToolResult(content="unexpected")
+
+    runner = BlockingRunner()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        FakeProvider(
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_exception_handling_runner",
+                    name="exception_handling_runner_tool",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            runner=runner,
+            vault=StaticVault({"api_key": secret_value}),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ExceptionHandlingRunnerTool()],
+    )
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        runner.started = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_runner_tool_context_cancel",
+                    messages=[Message.text("user", "use tool")],
+                ),
+            )
+        )
+        await runner.started.wait()
+        run_task.cancel("caller cancelled")
+        cancelling = run_task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await run_task
+        return exc_info.value, cancelling, run_task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == ("caller cancelled",)
+    assert cancellation.__cause__ is None
+    assert cancellation.__context__ is None
+    assert cancellation.__dict__ == {}
+    _assert_cayu_traceback_does_not_retain_text(cancellation, secret_value)
+
+
+def test_runtime_sanitizes_grouped_runner_failure_from_real_caller_cancellation() -> None:
+    secret_value = "grouped-runner-cancellation-secret-canary-ABCDEFGHIJKLMNOP"
+
+    class GroupedCancellationRunner(Runner):
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            assert self.started is not None
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                attach_cancellation_artifacts(
+                    cancellation,
+                    [
+                        {
+                            "type": "cayu.runner_cleanup.v1",
+                            "adapter": "microsandbox",
+                            "action": "kill_command",
+                            "status": "failed",
+                            "timeout_s": 5.0,
+                            "error": secret_value,
+                        }
+                    ],
+                )
+                cleanup = RuntimeError(f"cleanup exposed {secret_value}")
+                raise BaseExceptionGroup(
+                    f"runner cleanup exposed {secret_value}",
+                    [cancellation, cleanup],
+                ) from cleanup
+            return ExecResult()
+
+    class GroupedCancellationTool(Tool):
+        spec = ToolSpec(
+            name="grouped_cancellation",
+            description="Resolve a secret and block in the runner.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.vault is not None
+            assert ctx.runner is not None
+            await ctx.vault.resolve(SecretRef(name="api_key"))
+            await ctx.runner.exec(ExecCommand.process("blocked"))
+            return ToolResult(content="unexpected")
+
+    runner = GroupedCancellationRunner()
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(
+        FakeProvider(
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_grouped_cancellation",
+                    name="grouped_cancellation",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_environment(
+        Environment(
+            EnvironmentSpec(name="local"),
+            runner=runner,
+            vault=StaticVault({"api_key": secret_value}),
+        ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[GroupedCancellationTool()],
+    )
+
+    async def scenario():
+        runner.started = asyncio.Event()
+        run_task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_grouped_runner_cancel",
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await runner.started.wait()
+        run_task.cancel("caller cancellation")
+        cancelling = run_task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await run_task
+        stored_events = await store.load_events("sess_grouped_runner_cancel")
+        transcript = await store.load_transcript("sess_grouped_runner_cancel")
+        return (
+            exc_info.value,
+            cancelling,
+            run_task.cancelled(),
+            stored_events,
+            transcript,
+        )
+
+    failure, cancelling, cancelled, stored_events, transcript = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert failure.args == ("caller cancellation",)
+    assert failure.artifacts == [
+        {
+            "type": "cayu.runner_cleanup.v1",
+            "adapter": "microsandbox",
+            "action": "kill_command",
+            "status": "failed",
+            "timeout_s": 5.0,
+        }
+    ]
+    assert isinstance(failure.__cause__, ExceptionGroup)
+    assert len(failure.__cause__.exceptions) == 1
+    assert isinstance(failure.__cause__.exceptions[0], RunnerExecutionError)
+    assert [event.type for event in stored_events].count(EventType.SESSION_INTERRUPTED) == 1
+    assert all(event.type is not EventType.SESSION_COMPLETED for event in stored_events)
+    interrupted_events = [
+        event
+        for event in stored_events
+        if event.type is EventType.TOOL_CALL_FAILED
+        and event.payload.get("tool_call_id") == "call_grouped_cancellation"
+    ]
+    assert len(interrupted_events) == 1
+    assert interrupted_events[0].payload["result"]["artifacts"] == failure.artifacts
+    rendered = repr(
+        (
+            failure,
+            [event.model_dump(mode="json") for event in stored_events],
+            [message.model_dump(mode="json") for message in transcript],
+        )
+    )
+    assert secret_value not in rendered
+    assert "cleanup exposed" not in rendered
 
 
 def test_caller_cancellation_cannot_spoof_runtime_cleanup_artifacts() -> None:

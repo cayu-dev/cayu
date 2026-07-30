@@ -575,7 +575,7 @@ def _credential_safe_bedrock_error(
 def _safe_bedrock_structured_field(value: str | None) -> str | None:
     """Retain only explicitly recognized provider classification fields."""
 
-    return value if value in _SAFE_BEDROCK_STRUCTURED_FIELDS else None
+    return value if type(value) is str and value in _SAFE_BEDROCK_STRUCTURED_FIELDS else None
 
 
 def build_bedrock_converse_payload(

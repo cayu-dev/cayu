@@ -26,20 +26,19 @@ from cayu.core.messages import (
 from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._credential_boundary import detach_provider_stream_traceback
 from cayu.providers._http import (
+    OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
     aclose_transport,
     copy_headers,
     credential_safe_error_event,
     credential_safe_provider_exception,
     credential_sanitization_values,
-    json_error_text,
     optional_error_string,
     response_json_object,
     safe_error_json,
     safe_error_response_text,
     sanitize_provider_cancellation,
     stream_sse_json_events,
-    truncate_error_text,
     validate_base_url,
     validate_url,
 )
@@ -390,6 +389,7 @@ class ChatCompletionsProvider(ModelProvider):
             error_event = credential_safe_error_event(
                 exc,
                 provider_label="Chat Completions",
+                provider_name="chat_completions",
                 credential_values=credential_sanitization_values(
                     self.api_key,
                     extra_headers=self.extra_headers,
@@ -536,7 +536,13 @@ async def chat_completions_stream_events(
         # otherwise trigger downstream.
         error = event.get("error")
         if error is not None:
-            raise _stream_error_chunk_exception(error)
+            failure = _stream_error_chunk_exception(error)
+            # The exported parser is itself a public exception boundary. Do
+            # not retain the raw provider envelope in traceback frame locals.
+            error = None
+            event = {}
+            del events
+            raise failure from None
 
         choices = event.get("choices")
         if choices is None:
@@ -619,13 +625,23 @@ def _stream_error_chunk_exception(error: Any) -> ChatCompletionsError:
     error_type = optional_error_string(error_mapping.get("type"))
     code = optional_error_string(error_mapping.get("code"))
     message = optional_error_string(error_mapping.get("message"))
-    detail = message or json_error_text(error)
-    full_message = f"Chat Completions stream reported an error: {truncate_error_text(detail)}"
+    request_id = optional_error_string(error_mapping.get("request_id"))
+    safe_message = f"Chat Completions stream reported an error: {OMITTED_PROVIDER_ERROR_BODY}"
     if _is_chat_context_overflow(status_code=0, error_type=error_type, code=code, message=message):
         return ChatCompletionsContextOverflowError(
-            full_message, error_type=error_type, error_code=code
+            safe_message,
+            error_type=error_type,
+            error_code=code,
+            request_id=request_id,
+            response_body=None,
         )
-    return ChatCompletionsAPIError(full_message, error_type=error_type, error_code=code)
+    return ChatCompletionsAPIError(
+        safe_message,
+        error_type=error_type,
+        error_code=code,
+        request_id=request_id,
+        response_body=None,
+    )
 
 
 def _tool_call_names_function(tool_call: Mapping[str, Any]) -> bool:

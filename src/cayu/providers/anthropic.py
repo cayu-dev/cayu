@@ -28,6 +28,7 @@ from cayu.providers._credential_boundary import (
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
+    OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
     aclose_transport,
     copy_headers,
@@ -453,6 +454,7 @@ class AnthropicProvider(ModelProvider):
             error_event = credential_safe_error_event(
                 exc,
                 provider_label="Anthropic",
+                provider_name="anthropic",
                 credential_values=credential_sanitization_values(
                     resolved_api_key,
                     extra_headers=self.extra_headers,
@@ -1076,19 +1078,28 @@ async def anthropic_stream_events(
             error = raw_error if isinstance(raw_error, Mapping) else {}
             error_type = optional_error_string(error.get("type"))
             error_message = optional_error_string(error.get("message"))
+            safe_message = f"{provider_label} streaming error: {OMITTED_PROVIDER_ERROR_BODY}"
             if _is_anthropic_stream_error_context_overflow(
                 error_type=error_type,
                 message=error_message,
             ):
-                raise context_overflow_error(
+                failure = context_overflow_error(
                     f"{provider_label} model context overflow",
                     error_type=error_type,
                 )
-            detail = error_message or error_type or "unknown error"
-            raise api_error(
-                f"{provider_label} streaming error: {detail}",
-                error_type=error_type,
-            )
+            else:
+                failure = api_error(
+                    safe_message,
+                    error_type=error_type,
+                )
+            # The exported parser serves both Anthropic and Vertex. Clear the
+            # untrusted envelope and source iterator before exposing failure.
+            raw_error = None
+            error = {}
+            error_message = None
+            event = {}
+            del events
+            raise failure from None
         # Unknown event types are ignored for forward compatibility, as the
         # Anthropic streaming docs require.
 

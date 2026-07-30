@@ -5,6 +5,8 @@
 ``ExecCommandTool`` uses. Any bespoke tool (a coverage parser, a screenshot
 runner, a flaky-test detector) reaches for these. This example writes a file
 through the workspace, counts its lines through the runner, and reads it back.
+The runner handle is invocation-scoped: command output is redacted using secrets
+resolved during the tool call before the runner's public capture limit applies.
 
 Run it (no API key; a scripted provider drives the one tool call):
 

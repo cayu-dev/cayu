@@ -57,6 +57,13 @@ def test_concrete_implementations_satisfy_tool_context_protocols(tmp_path) -> No
     )
 
 
+def test_runner_handle_protocol_exposes_environment_removal() -> None:
+    parameter = inspect.signature(RunnerHandle.exec).parameters["env_remove"]
+
+    assert parameter.annotation == "tuple[str, ...]"
+    assert parameter.default == ()
+
+
 def test_tool_context_accepts_structural_handles(tmp_path) -> None:
     class DuckWorkspace:
         async def read_bytes(

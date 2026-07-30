@@ -93,9 +93,11 @@ uv run python scripts/generate_sidecar_manifest.py --check
 
 ## Protocol
 
-The sidecar implements Cayu Lambda MicroVM command protocol version `1`. `GET /health` returns
-`{"status":"ok","protocol_version":"1"}` so the host can reject an incompatible image before
-sending a command.
+The sidecar implements Cayu Lambda MicroVM command protocol version `2`. `GET /health` returns
+`{"status":"ok","protocol_version":"2"}` so the host can reject an incompatible image before
+sending a command. Version 2 adds the boolean `omit_truncated_output` command field: redacted
+executions use it to suppress a channel whose unavailable suffix could complete a workload
+secret, while ordinary and trusted executions retain their bounded output.
 
 - `GET /health`
 - `POST /v1/commands`

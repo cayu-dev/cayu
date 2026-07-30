@@ -18,7 +18,13 @@ from cayu.vaults.base import (
 )
 from cayu.vaults.composite import ChainVault, RoutedVault
 from cayu.vaults.local_env import LocalEnvVault
-from cayu.vaults.redaction import REDACTED_SECRET, SecretRedactor, contains_redacted_secret
+from cayu.vaults.redaction import (
+    REDACTED_SECRET,
+    SecretRedactionCapacityError,
+    SecretRedactionTail,
+    SecretRedactor,
+    contains_redacted_secret,
+)
 from cayu.vaults.static import StaticVault
 
 __all__ = [
@@ -29,6 +35,8 @@ __all__ = [
     "RoutedVault",
     "SecretEnv",
     "SecretNotFound",
+    "SecretRedactionCapacityError",
+    "SecretRedactionTail",
     "SecretRedactor",
     "SecretRef",
     "SecretResolver",

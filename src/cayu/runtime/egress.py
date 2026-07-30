@@ -573,6 +573,7 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
                 egress_binding=binding,
                 ca_dir=ca_dir,
                 authority_revoker=authority_revoker,
+                output_redactor=SecretRedactor(tuple(grant.presented_value for grant in grants)),
                 audit=audit,
             )
             runner = None
@@ -1124,13 +1125,17 @@ class _EgressManagedRunner(Runner):
         egress_binding: EgressBinding,
         ca_dir: str,
         authority_revoker: _EgressAuthorityRevoker,
+        output_redactor: SecretRedactor,
         audit: _EgressAuditBridge | None = None,
     ) -> None:
+        if not isinstance(output_redactor, SecretRedactor):
+            raise TypeError("output_redactor must be a SecretRedactor.")
         self._runner = runner
         self._adapter = adapter
         self._egress_binding = egress_binding
         self._ca_dir = ca_dir
         self._authority_revoker = authority_revoker
+        self._output_redactor = output_redactor
         self._audit = audit
         self._teardown_timeout_s = egress_binding.teardown_timeout_s
         self._runner_close_task: asyncio.Task[RunnerFinalizationResult] | None = None
@@ -1227,6 +1232,38 @@ class _EgressManagedRunner(Runner):
         dispatch_id = self._begin_workspace_dispatch()
         try:
             result = await self._runner.exec(command, **kwargs)
+        except BaseException as exc:
+            self._finish_workspace_dispatch(dispatch_id=dispatch_id, error=exc)
+            raise
+        self._finish_workspace_dispatch(dispatch_id=dispatch_id, result=result)
+        return result
+
+    async def exec_redacted(
+        self,
+        command: ExecCommand,
+        *,
+        redactor: SecretRedactor,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        self._ensure_exec_open()
+        kwargs: dict[str, Any] = {
+            "redactor": self._output_redactor.merged_with(redactor),
+            "cwd": cwd,
+            "env": env,
+            "timeout_s": timeout_s,
+            "stdin": stdin,
+            "output_limit_bytes": output_limit_bytes,
+        }
+        if env_remove:
+            kwargs["env_remove"] = env_remove
+        dispatch_id = self._begin_workspace_dispatch()
+        try:
+            result = await self._runner.exec_redacted(command, **kwargs)
         except BaseException as exc:
             self._finish_workspace_dispatch(dispatch_id=dispatch_id, error=exc)
             raise

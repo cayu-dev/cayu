@@ -10,9 +10,12 @@ from decimal import Decimal
 
 import pytest
 
+import cayu.runtime._invocation_secrets as invocation_secrets
+from cayu._exception_groups import iter_exception_tree
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.runners import RunnerExecutionError, attach_cancellation_artifacts
 from cayu.runtime import (
     BudgetLimit,
     CayuApp,
@@ -33,6 +36,8 @@ from cayu.runtime._tool_round_executor import ToolRoundRun, _copy_agent_spec
 from cayu.runtime._tool_round_recovery import checkpoint_with_pending_tool_round
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.interactions import InteractionStatus, InteractionSummaryEvidence
+from cayu.tools._runner import sanitize_runner_failure_group
+from cayu.vaults import SecretRedactor
 
 
 class _FakeProvider(ModelProvider):
@@ -315,6 +320,126 @@ def test_tool_round_interrupt_close_handles_requested_cancellation():
     assert [event.type for event in events] == [EventType.TOOL_CALL_FAILED]
     assert events[0].payload["tool_call_id"] == "call_1"
     assert messages[-1].role == "tool"
+
+
+def test_grouped_cancellation_remains_authoritative_when_interrupt_closure_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, store, _ = _app_with_completed_session("sess_grouped_close_failure")
+    closure_secret = "interrupt-closure-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        session = await store.transition_status(
+            "sess_grouped_close_failure",
+            from_statuses={SessionStatus.COMPLETED},
+            to_status=SessionStatus.RUNNING,
+        )
+        runner = await _tool_round_run(app, session, limits=RunLimits())
+        tool_calls = [_tool_call()]
+        checkpoint, _pending_round = checkpoint_with_pending_tool_round(
+            await store.load_checkpoint(session.id),
+            agent_name="assistant",
+            environment_name=None,
+            task_id=None,
+            tool_calls=tool_calls,
+            policy_outcomes=None,
+            structured_output=None,
+            tool_round_identity=_tool_round_identity(),
+        )
+        await store.checkpoint(session.id, checkpoint)
+        started = asyncio.Event()
+
+        async def grouped_call_stream(**kwargs):
+            del kwargs
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancellation:
+                await store.update_status(session.id, SessionStatus.INTERRUPTING)
+                attach_cancellation_artifacts(
+                    cancellation,
+                    [
+                        {
+                            "type": "cayu.runner_cleanup.v1",
+                            "adapter": "microsandbox",
+                            "action": "kill_command",
+                            "status": "failed",
+                            "timeout_s": 5.0,
+                        }
+                    ],
+                )
+                group = sanitize_runner_failure_group(
+                    BaseExceptionGroup(
+                        "runner cleanup failed",
+                        [cancellation, RuntimeError("runner cleanup failed")],
+                    ),
+                    caller_cancelled=True,
+                )
+                for candidate in iter_exception_tree(group):
+                    if not isinstance(candidate, asyncio.CancelledError):
+                        continue
+                    invocation_secrets.initialize_cancellation_evidence(candidate)
+                    invocation_secrets.set_cancellation_tool_call_id(
+                        candidate,
+                        tool_calls[0].id,
+                    )
+                    invocation_secrets.set_cancellation_redactor(
+                        candidate,
+                        SecretRedactor(),
+                    )
+                raise group from None
+            if False:  # pragma: no cover - declares this as an async iterator
+                yield
+
+        async def fail_close(request):
+            del request
+            if False:  # pragma: no cover - declares this as an async iterator
+                yield
+            raise RuntimeError(closure_secret)
+
+        monkeypatch.setattr(
+            runner,
+            "_run_tool_calls_sequential",
+            grouped_call_stream,
+        )
+        monkeypatch.setattr(
+            runner._executor,
+            "_close_interrupted_round",
+            fail_close,
+        )
+
+        async def consume_round() -> None:
+            async for _ in runner.run(
+                messages=await store.load_transcript(session.id),
+                tool_calls=tool_calls,
+                tool_round_identity=_tool_round_identity(),
+            ):
+                pass
+
+        task = asyncio.create_task(consume_round())
+        await started.wait()
+        task.cancel("operator cancellation")
+        cancelling = task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return exc_info.value, cancelling, task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+    assert cancelling == 1
+    assert cancelled is True
+    assert isinstance(cancellation.__cause__, BaseExceptionGroup)
+    failures = [
+        candidate
+        for candidate in iter_exception_tree(cancellation.__cause__)
+        if not isinstance(candidate, BaseExceptionGroup)
+    ]
+    assert any(isinstance(failure, RunnerExecutionError) for failure in failures)
+    assert any(
+        type(failure) is RuntimeError and str(failure) == "Interrupted tool-round closure failed."
+        for failure in failures
+    )
+    assert closure_secret not in repr(cancellation)
+    assert closure_secret not in repr(cancellation.__cause__)
 
 
 def test_tool_round_interrupt_close_rejects_unrelated_exceptions():

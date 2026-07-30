@@ -10,6 +10,8 @@ from cayu._validation import require_nonblank, require_unicode_scalar_text
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner, RunnerUnavailableError
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._runner import InvocationRunnerHandle
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace
 
 DEFAULT_GIT_CHANGES_LIMIT = 50
@@ -492,6 +494,16 @@ def _workspace_cwd(ctx: ToolContext) -> str | ToolResult:
     runner = ctx.runner
     if runner is None:
         raise AssertionError("runner checked before resolving Git workspace")
+    workspace = ctx.workspace
+    if type(runner) is InvocationRunnerHandle:
+        cwd = runner.authenticated_workspace_cwd(workspace)
+        if cwd is not None:
+            return cwd
+        return ToolResult(
+            content="Git inspection requires a workspace bound to the active runner.",
+            structured={"error": "workspace_runner_mismatch"},
+            is_error=True,
+        )
     resolve_cwd = getattr(runner, "resolve_cwd", None)
     if not callable(resolve_cwd):
         return ToolResult(
@@ -499,7 +511,6 @@ def _workspace_cwd(ctx: ToolContext) -> str | ToolResult:
             structured={"error": "runner_unavailable"},
             is_error=True,
         )
-    workspace = ctx.workspace
     if workspace is None:
         return resolve_cwd(None)
     if isinstance(workspace, RunnerBoundWorkspace):
@@ -780,12 +791,11 @@ def _fit_entries(
 
 
 def _bounded_text(content: str, maximum: int) -> tuple[str, bool]:
-    encoded = content.encode("utf-8")
-    if len(encoded) <= maximum:
-        return content, False
-    marker = _TRUNCATION_MARKER.encode()
-    prefix = encoded[: maximum - len(marker)]
-    return prefix.decode("utf-8", errors="ignore").rstrip() + _TRUNCATION_MARKER, True
+    return SecretRedactor().redact_text_bounded_with_marker(
+        content,
+        max_bytes=maximum,
+        truncation_marker=_TRUNCATION_MARKER,
+    )
 
 
 def _page_diff_text(
@@ -801,6 +811,17 @@ def _page_diff_text(
             "Tool argument `diff_offset` splits a UTF-8 character; use the previous "
             "`next_diff_offset` value."
         )
+    redaction_marker = REDACTED_SECRET.encode("utf-8")
+    marker_start = encoded.rfind(
+        redaction_marker,
+        0,
+        min(len(encoded), offset + len(redaction_marker)),
+    )
+    if marker_start >= 0 and marker_start < offset < marker_start + len(redaction_marker):
+        raise ValueError(
+            "Tool argument `diff_offset` splits a redaction marker; use the previous "
+            "`next_diff_offset` value."
+        )
     if offset > len(encoded) and not capture_truncated:
         return "No textual diff at the requested diff offset.", False, None
     remaining = encoded[offset:]
@@ -809,8 +830,10 @@ def _page_diff_text(
         return remaining.decode("utf-8"), False, None
     marker = _TRUNCATION_MARKER.encode()
     payload_limit = max(0, maximum - len(marker))
-    prefix = remaining[:payload_limit]
-    page = prefix.decode("utf-8", errors="ignore")
+    page, _ = SecretRedactor().redact_text_head(
+        remaining.decode("utf-8"),
+        max_bytes=max(1, payload_limit),
+    )
     consumed = len(page.encode("utf-8"))
     return page.rstrip() + _TRUNCATION_MARKER, True, offset + consumed
 

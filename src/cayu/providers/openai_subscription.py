@@ -37,6 +37,7 @@ from cayu.providers._http import (
     aclose_transport,
     copy_headers,
     credential_sanitization_values,
+    safe_provider_exception_type_name,
     sanitize_provider_cancellation,
     validate_base_url,
 )
@@ -981,21 +982,27 @@ def _safe_subscription_error_event(
         message = "OpenAI subscription provider failed."
     payload: dict[str, Any] = {
         "error": message,
-        "error_type": type(exc).__name__,
+        "error_type": safe_provider_exception_type_name(exc),
     }
     if isinstance(exc, ModelProviderError):
-        typed_fields = exc.error_payload_fields()
-        if credentials is not None:
-            typed_fields = _subscription_credential_redactor(
-                credentials,
-                extra_header_values=extra_header_values,
-            ).redact_json(typed_fields)
-        elif credentials is None:
-            typed_fields = {
-                key: value
-                for key, value in typed_fields.items()
-                if key in {"status_code", "retryable", "retry_after_s"}
-            }
+        typed_fields = {
+            key: value
+            for key, value in exc.error_payload_fields().items()
+            if key in {"status_code", "retryable", "retry_after_s"}
+        }
+        typed_fields["provider"] = "openai"
+        safe_error_type = _safe_subscription_error_identity(
+            exc.error_type,
+            field_name="error_type",
+        )
+        safe_error_code = _safe_subscription_error_identity(
+            exc.error_code,
+            field_name="error_code",
+        )
+        if safe_error_type is not None:
+            typed_fields["provider_error_type"] = safe_error_type
+        if safe_error_code is not None:
+            typed_fields["provider_error_code"] = safe_error_code
         payload.update(typed_fields)
     else:
         status_code = getattr(exc, "status_code", None)
@@ -1017,35 +1024,48 @@ def _safe_subscription_context_overflow(
     extra_header_values: tuple[str, ...] = (),
 ) -> ModelContextOverflowError:
     message = "OpenAI subscription context window exceeded."
-    redactor = (
-        _subscription_credential_redactor(
-            credentials,
-            extra_header_values=extra_header_values,
-        )
-        if credentials is not None
-        else None
-    )
-    provider = _safe_subscription_error_field(exc.provider, redactor) or "openai"
+    del credentials, extra_header_values
+    provider = "openai"
     return ModelContextOverflowError(
         message,
         provider=provider,
         status_code=exc.status_code,
-        error_type=_safe_subscription_error_field(exc.error_type, redactor),
-        error_code=_safe_subscription_error_field(exc.error_code, redactor),
-        request_id=_safe_subscription_error_field(exc.request_id, redactor),
+        error_type=_safe_subscription_error_identity(
+            exc.error_type,
+            field_name="error_type",
+        ),
+        error_code=_safe_subscription_error_identity(
+            exc.error_code,
+            field_name="error_code",
+        ),
+        request_id=None,
     )
 
 
-def _safe_subscription_error_field(
-    value: str | None,
-    redactor: SecretRedactor | None,
+def _safe_subscription_error_identity(
+    value: object,
+    *,
+    field_name: str,
 ) -> str | None:
-    if value is None:
+    if type(value) is not str:
         return None
-    if redactor is None:
-        return None
-    redacted = redactor.redact_text(value)
-    return value if redacted == value else None
+    allowed = (
+        {
+            "authentication_error",
+            "error",
+            "invalid_request_error",
+            "rate_limit_error",
+            "server_error",
+        }
+        if field_name == "error_type"
+        else {
+            "context_length_exceeded",
+            "internal_error",
+            "rate_limit_exceeded",
+            "server_error",
+        }
+    )
+    return value if value in allowed else None
 
 
 def _subscription_credential_redactor(

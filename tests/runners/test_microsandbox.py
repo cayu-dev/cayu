@@ -16,12 +16,14 @@ from cayu.runners import (
     MicrosandboxCleanupError,
     MicrosandboxRunner,
     MicrosandboxUnavailableError,
+    RunnerExecutionError,
 )
 from cayu.runners.microsandbox import (
     _defer_reconnect_restoration,
     microsandbox_reconnect_settlement_task,
 )
 from cayu.testing import verify_provider_credential_isolation
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 @dataclass
@@ -539,6 +541,38 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
     assert "CAYU_SECRET_HOST_ENV" not in sandbox.exec_calls[0]["env"]
 
 
+def test_microsandbox_runner_redacts_stream_events_before_bounding() -> None:
+    secret = "microsandbox-stream-boundary-secret"
+    sandbox = FakeSandbox("runner")
+    sandbox.next_handle = FakeHandle(
+        [
+            FakeEvent("stdout", f"prefix:{secret[:11]}".encode()),
+            FakeEvent("stdout", f"{secret[11:]}:suffix".encode()),
+            FakeEvent("stderr", secret[:5].encode()),
+            FakeEvent("stderr", secret[5:].encode()),
+            FakeEvent("exited", code=0),
+        ]
+    )
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    result = asyncio.run(
+        runner.exec_redacted(
+            ExecCommand.process("echo", "ignored"),
+            redactor=SecretRedactor(secret),
+            output_limit_bytes=128,
+        )
+    )
+
+    assert result.stdout == f"prefix:{REDACTED_SECRET}:suffix"
+    assert result.stderr == REDACTED_SECRET
+    assert result.stdout_bytes == len(f"prefix:{secret}:suffix".encode())
+    assert result.stderr_bytes == len(secret.encode())
+
+
 def test_microsandbox_reconnect_passes_provider_credential_isolation_probe(
     provider_credential_canaries,
 ) -> None:
@@ -658,7 +692,6 @@ def test_microsandbox_runner_latches_typed_unavailable_state_after_failed_ping()
             "stdout_bytes": 0,
             "stderr_bytes": 0,
             "error_type": None,
-            "error": None,
         },
         "probe": {
             "method": "Sandbox.ping",
@@ -666,15 +699,13 @@ def test_microsandbox_runner_latches_typed_unavailable_state_after_failed_ping()
             "timeout_s": 1.0,
             "registry_status": "running",
             "error_type": "ConnectionResetError",
-            "error": "agent connection reset",
             "status_error_type": None,
-            "status_error": None,
         },
         "remediation": "Reconnect to or replace the Microsandbox before executing more commands.",
     }
     assert first.diagnostic == expected_diagnostic
     assert first.artifacts == [expected_diagnostic]
-    assert isinstance(first.__cause__, ConnectionResetError)
+    assert first.__cause__ is None
     assert second.diagnostic == expected_diagnostic
     assert second.__cause__ is None
 
@@ -749,11 +780,9 @@ def test_microsandbox_runner_bounds_guest_agent_ping() -> None:
         "timeout_s": 0.01,
         "registry_status": None,
         "error_type": "TimeoutError",
-        "error": "Microsandbox guest-agent liveness probe timed out.",
         "status_error_type": None,
-        "status_error": None,
     }
-    assert isinstance(error.__cause__, TimeoutError)
+    assert error.__cause__ is None
 
 
 def test_microsandbox_runner_classifies_no_exit_event_when_agent_ping_fails() -> None:
@@ -784,14 +813,13 @@ def test_microsandbox_runner_classifies_no_exit_event_when_agent_ping_fails() ->
         "stdout_bytes": 0,
         "stderr_bytes": 0,
         "error_type": "FakeMicrosandboxError",
-        "error": "runtime error: exec session ended without exit event",
     }
     assert error.probe["registry_status"] == "stopped"
     assert error.probe["status"] == "failed"
-    assert isinstance(error.__cause__, ConnectionResetError)
+    assert error.__cause__ is None
 
 
-def test_microsandbox_runner_preserves_no_exit_event_when_agent_ping_succeeds() -> None:
+def test_microsandbox_runner_sanitizes_no_exit_event_when_agent_ping_succeeds() -> None:
     sandbox = FakeSandbox("live-agent")
     command_error = FakeMicrosandboxError("runtime error: exec session ended without exit event")
     sandbox.next_handle = FakeHandle([], collect_error=command_error)
@@ -801,15 +829,26 @@ def test_microsandbox_runner_preserves_no_exit_event_when_agent_ping_succeeds() 
         sandbox_module=FakeMicrosandboxModule,
     )
 
-    with pytest.raises(FakeMicrosandboxError, match="ended without exit event") as exc_info:
+    with pytest.raises(RunnerExecutionError) as exc_info:
         asyncio.run(runner.exec(ExecCommand.process("sleep", "30")))
 
-    assert exc_info.value is command_error
+    assert exc_info.value.diagnostic == {
+        "type": "cayu.runner_execution_error.v1",
+        "adapter": "microsandbox",
+        "status": "failed",
+        "error_type": "Exception",
+        "timed_out": False,
+        "cancelled": False,
+        "stdout_bytes": 0,
+        "stderr_bytes": 0,
+    }
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert sandbox.ping_calls == 1
     assert runner._exec_closed is False
 
 
-def test_microsandbox_runner_preserves_other_exact_base_error_without_liveness_probe() -> None:
+def test_microsandbox_runner_sanitizes_other_exact_base_error_without_liveness_probe() -> None:
     sandbox = FakeSandbox("runner")
     command_error = FakeMicrosandboxError("protocol error: response ended mid-frame")
     sandbox.next_handle = FakeHandle([], collect_error=command_error)
@@ -820,12 +859,43 @@ def test_microsandbox_runner_preserves_other_exact_base_error_without_liveness_p
         sandbox_module=FakeMicrosandboxModule,
     )
 
-    with pytest.raises(FakeMicrosandboxError, match="response ended mid-frame") as exc_info:
+    with pytest.raises(RunnerExecutionError) as exc_info:
         asyncio.run(runner.exec(ExecCommand.process("pwd")))
 
-    assert exc_info.value is command_error
+    assert exc_info.value.diagnostic["error_type"] == "Exception"
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
     assert sandbox.ping_calls == 0
     assert runner._exec_closed is False
+
+
+@pytest.mark.parametrize(
+    "failure_message",
+    [
+        "workload-secret-canary-ABCDEFGHIJKLMNOP",
+        "workload-secret-",
+    ],
+    ids=["complete-secret", "recoverable-prefix"],
+)
+def test_microsandbox_runner_detaches_opaque_sdk_failure_text(
+    failure_message: str,
+) -> None:
+    sandbox = FakeSandbox("runner")
+    sandbox.stream_error = FakeMicrosandboxError(failure_message)
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    with pytest.raises(RunnerExecutionError) as exc_info:
+        asyncio.run(runner.exec(ExecCommand.process("pwd")))
+
+    assert str(exc_info.value) == "Runner command execution failed."
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert exc_info.value.diagnostic["error_type"] == "Exception"
+    assert failure_message not in repr(exc_info.value.diagnostic)
 
 
 @pytest.mark.parametrize(
@@ -833,7 +903,7 @@ def test_microsandbox_runner_preserves_other_exact_base_error_without_liveness_p
     [RuntimeError("sandbox is stopped"), ConnectionError("transport failed")],
     ids=["sandbox-stopped", "transport-failed"],
 )
-def test_microsandbox_runner_does_not_reclassify_other_sdk_failures(
+def test_microsandbox_runner_sanitizes_other_sdk_failures(
     stream_error: Exception,
 ) -> None:
     sandbox = FakeSandbox("runner")
@@ -844,9 +914,11 @@ def test_microsandbox_runner_does_not_reclassify_other_sdk_failures(
         sandbox_module=FakeMicrosandboxModule,
     )
 
-    with pytest.raises(type(stream_error), match=str(stream_error)):
+    with pytest.raises(RunnerExecutionError) as exc_info:
         asyncio.run(runner.exec(ExecCommand.process("pwd")))
 
+    assert exc_info.value.diagnostic["error_type"] == type(stream_error).__name__
+    assert exc_info.value.__cause__ is None
     assert sandbox.ping_calls == 0
     assert runner._exec_closed is False
 
@@ -2509,7 +2581,6 @@ def test_microsandbox_runner_reports_explicit_sandbox_cleanup_failure() -> None:
             "status": "failed",
             "timeout_s": 5.0,
             "error_type": "RuntimeError",
-            "error": "sandbox kill failed",
         }
     ]
 
@@ -2583,7 +2654,6 @@ def test_microsandbox_runner_stays_reusable_when_command_kill_fails() -> None:
             "status": "failed",
             "timeout_s": 5.0,
             "error_type": "RuntimeError",
-            "error": "kill failed",
         }
     ]
 
@@ -2724,7 +2794,6 @@ def test_microsandbox_runner_preserves_timeout_when_command_kill_fails() -> None
             "status": "failed",
             "timeout_s": 5.0,
             "error_type": "RuntimeError",
-            "error": "kill failed",
         }
     ]
 

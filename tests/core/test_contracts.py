@@ -3926,6 +3926,14 @@ def test_artifact_result_types_validate_boundary_values():
     with pytest.raises(ValueError, match="smaller than content"):
         ArtifactReadResult(metadata=artifact, content=b"abc", total_bytes=1)
 
+    with pytest.raises(ValueError, match="source progress"):
+        ArtifactReadResult(
+            metadata=artifact,
+            content=b"abc",
+            total_bytes=3,
+            source_bytes_read=1,
+        )
+
     with pytest.raises(ValueError, match="truncated must match"):
         ArtifactReadResult(metadata=artifact, content=b"abc", total_bytes=3, truncated=True)
 
@@ -4116,6 +4124,9 @@ def test_workspace_result_types_validate_boundary_values():
 
     with pytest.raises(ValueError, match="smaller than content"):
         WorkspaceReadResult(content=b"abc", total_bytes=1)
+
+    with pytest.raises(ValueError, match="source progress"):
+        WorkspaceReadResult(content=b"abc", total_bytes=3, source_bytes_read=1)
 
     with pytest.raises(ValueError, match="truncated must match"):
         WorkspaceReadResult(content=b"abc", total_bytes=3, truncated=True)

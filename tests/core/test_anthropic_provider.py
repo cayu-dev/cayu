@@ -36,6 +36,7 @@ from cayu.providers import (
     anthropic_stream_events,
     build_anthropic_payload,
 )
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers.cache import resolve_cache_policy
 from cayu.vaults import SecretRef, StaticVault
 
@@ -855,11 +856,11 @@ async def test_httpx_transport_sanitizes_anthropic_error_body(monkeypatch) -> No
         )
 
     message = str(exc_info.value)
-    assert (
-        message == "Anthropic API request failed with HTTP 400: "
-        '{"message":"bad request","request_id":"req_123",'
-        '"type":"invalid_request_error"}'
+    assert message == (
+        "Anthropic API request failed with HTTP 400: [provider response body omitted]"
     )
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.error_type == "invalid_request_error"
     assert "debug" not in message
     assert "not persisted" not in message
 
@@ -1120,7 +1121,7 @@ async def test_anthropic_provider_stream_propagates_context_overflow() -> None:
     assert isinstance(exc_info.value, ModelContextOverflowError)
     assert exc_info.value.status_code == 413
     assert exc_info.value.error_type == "request_too_large"
-    assert exc_info.value.request_id == "req_overflow"
+    assert exc_info.value.request_id is None
     assert exc_info.value.retryable is False
 
 
@@ -1153,7 +1154,6 @@ async def test_anthropic_provider_stream_emits_typed_api_error_payload() -> None
         "provider": "anthropic",
         "status_code": 429,
         "provider_error_type": "rate_limit_error",
-        "request_id": "req_429",
         "retryable": True,
         "retry_after_s": 1.5,
     }
@@ -1530,12 +1530,21 @@ async def test_anthropic_stream_events_emits_redacted_thinking_and_empty_tool_in
 
 @pytest.mark.anyio
 async def test_anthropic_provider_stream_error_event_yields_typed_error() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
     events = [
         {
             "type": "message_start",
             "message": {"id": "msg_s3", "model": "claude-test", "usage": {}},
         },
-        {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}},
+        {
+            "type": "error",
+            "request_id": "req_anthropic_cutoff",
+            "error": {
+                "type": "overloaded_error",
+                "code": "overloaded",
+                "message": "x" * (MAX_PROVIDER_ERROR_BODY_CHARS - 10) + secret,
+            },
+        },
     ]
     transport = StreamingRecordingTransport([events])
     provider = AnthropicProvider(api_key="test-key", transport=transport)
@@ -1548,14 +1557,59 @@ async def test_anthropic_provider_stream_error_event_yields_typed_error() -> Non
     assert emitted[0].payload["error_type"] == "AnthropicAPIError"
     assert emitted[0].payload["provider"] == "anthropic"
     assert emitted[0].payload["provider_error_type"] == "overloaded_error"
+    rendered = repr([event.model_dump(mode="json") for event in emitted])
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "secret_start",
+    [
+        MAX_PROVIDER_ERROR_BODY_CHARS - len("workload-secret-canary-ABCDEFGHIJKLMNOP"),
+        MAX_PROVIDER_ERROR_BODY_CHARS - 10,
+        MAX_PROVIDER_ERROR_BODY_CHARS,
+    ],
+    ids=("ends-at-old-bound", "crosses-old-bound", "starts-at-old-bound"),
+)
+async def test_anthropic_stream_error_omits_raw_message_at_old_cutoff(
+    secret_start: int,
+) -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    raw_event = {
+        "type": "error",
+        "request_id": "req_anthropic_parser",
+        "error": {
+            "type": "overloaded_error",
+            "code": "overloaded",
+            "message": "x" * secret_start + secret,
+        },
+    }
+
+    with pytest.raises(AnthropicAPIError) as exc_info:
+        [event async for event in anthropic_stream_events(_aiter_events([raw_event]))]
+
+    rendered = repr((str(exc_info.value), vars(exc_info.value)))
+    assert str(exc_info.value) == ("Anthropic streaming error: [provider response body omitted]")
+    assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+    assert exc_info.value.error_type == "overloaded_error"
+    assert exc_info.value.response_body is None
+    assert_cayu_traceback_does_not_retain(exc_info.value, raw_event)
 
 
 @pytest.mark.anyio
 async def test_anthropic_provider_stream_error_event_propagates_context_overflow() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
     events = [
         {
             "type": "error",
-            "error": {"type": "invalid_request_error", "message": "prompt is too long"},
+            "request_id": "req_anthropic_overflow",
+            "error": {
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+                "message": (
+                    "x" * (MAX_PROVIDER_ERROR_BODY_CHARS + 1) + " prompt is too long " + secret
+                ),
+            },
         },
     ]
     transport = StreamingRecordingTransport([events])
@@ -1567,6 +1621,68 @@ async def test_anthropic_provider_stream_error_event_propagates_context_overflow
 
     assert isinstance(exc_info.value, ModelContextOverflowError)
     assert exc_info.value.retryable is False
+    assert exc_info.value.error_type == "invalid_request_error"
+    assert secret not in repr((str(exc_info.value), vars(exc_info.value)))
+    assert exc_info.value.response_body is None
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_error_preserves_legacy_custom_factory_signature() -> None:
+    class CompatibleError(RuntimeError):
+        def __init__(self, message: str, *, error_type: str | None = None) -> None:
+            super().__init__(message)
+            self.error_type = error_type
+
+    with pytest.raises(CompatibleError) as exc_info:
+        [
+            event
+            async for event in anthropic_stream_events(
+                _aiter_events(
+                    [
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "overloaded_error",
+                                "message": "provider-authored detail",
+                            },
+                        }
+                    ]
+                ),
+                api_error=CompatibleError,
+            )
+        ]
+
+    assert str(exc_info.value) == "Anthropic streaming error: [provider response body omitted]"
+    assert exc_info.value.error_type == "overloaded_error"
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_overflow_preserves_legacy_custom_factory_signature() -> None:
+    class CompatibleOverflowError(RuntimeError):
+        def __init__(self, message: str, *, error_type: str | None = None) -> None:
+            super().__init__(message)
+            self.error_type = error_type
+
+    with pytest.raises(CompatibleOverflowError) as exc_info:
+        [
+            event
+            async for event in anthropic_stream_events(
+                _aiter_events(
+                    [
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": "prompt is too long",
+                            },
+                        }
+                    ]
+                ),
+                context_overflow_error=CompatibleOverflowError,
+            )
+        ]
+
+    assert str(exc_info.value) == "Anthropic model context overflow"
     assert exc_info.value.error_type == "invalid_request_error"
 
 
