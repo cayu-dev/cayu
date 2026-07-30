@@ -27,7 +27,15 @@ from cayu.runtime.sessions import (
     SessionOrder,
     SessionStatus,
 )
-from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
+from cayu.runtime.tasks import (
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    Task,
+    TaskOrder,
+    TaskStatus,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+)
 from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 
@@ -500,6 +508,10 @@ _BASELINE_DDL = """
         ON cayu_tasks(session_id);
     CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_task_id
         ON cayu_tasks(parent_task_id);
+    CREATE INDEX IF NOT EXISTS idx_cayu_tasks_session_created_id
+        ON cayu_tasks(session_id, created_at, id);
+    CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_created_id
+        ON cayu_tasks(parent_task_id, created_at, id);
     CREATE INDEX IF NOT EXISTS idx_cayu_tasks_assigned_agent_name
         ON cayu_tasks(assigned_agent_name);
     CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery
@@ -1003,6 +1015,12 @@ _MIGRATION_STEPS: dict[int, str] = {
         );
         CREATE INDEX IF NOT EXISTS idx_cayu_session_message_deliveries_session
             ON cayu_session_message_deliveries(session_id, created_at);
+    """,
+    27: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_session_created_id
+            ON cayu_tasks(session_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_created_id
+            ON cayu_tasks(parent_task_id, created_at, id);
     """,
 }
 
@@ -1993,6 +2011,117 @@ def task_from_row(row: sqlite3.Row) -> Task:
         started_at=parse_optional_datetime(row["started_at"]),
         completed_at=parse_optional_datetime(row["completed_at"]),
     )
+
+
+_TASK_TOPOLOGY_MAX_TIMESTAMP_BYTES = 128
+
+TASK_TOPOLOGY_COLUMNS = f"""
+    CASE
+        WHEN length(CAST(id AS BLOB)) <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        THEN id
+    END AS topology_id,
+    length(CAST(id AS BLOB)) > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        AS topology_id_oversized,
+    CASE
+        WHEN length(CAST(type AS BLOB)) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN type
+    END AS topology_type,
+    length(CAST(type AS BLOB)) > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_type_truncated,
+    CASE
+        WHEN title IS NULL
+          OR length(CAST(title AS BLOB)) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN title
+    END AS topology_title,
+    title IS NOT NULL
+      AND length(CAST(title AS BLOB)) > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_title_truncated,
+    CASE
+        WHEN length(CAST(status AS BLOB)) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN status
+    END AS topology_status,
+    CASE
+        WHEN status_reason IS NULL
+          OR length(CAST(status_reason AS BLOB)) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN status_reason
+    END AS topology_status_reason,
+    status_reason IS NOT NULL
+      AND length(CAST(status_reason AS BLOB)) > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_status_reason_truncated,
+    CASE
+        WHEN session_id IS NULL
+          OR length(CAST(session_id AS BLOB)) <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        THEN session_id
+    END AS topology_session_id,
+    session_id IS NOT NULL
+      AND length(CAST(session_id AS BLOB)) > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        AS topology_session_id_oversized,
+    CASE
+        WHEN parent_task_id IS NULL
+          OR length(CAST(parent_task_id AS BLOB)) <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        THEN parent_task_id
+    END AS topology_parent_task_id,
+    parent_task_id IS NOT NULL
+      AND length(CAST(parent_task_id AS BLOB)) > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        AS topology_parent_task_id_oversized,
+    CASE
+        WHEN assigned_agent_name IS NULL
+          OR length(CAST(assigned_agent_name AS BLOB))
+             <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN assigned_agent_name
+    END AS topology_assigned_agent_name,
+    assigned_agent_name IS NOT NULL
+      AND length(CAST(assigned_agent_name AS BLOB))
+          > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_assigned_agent_name_truncated,
+    CASE
+        WHEN length(CAST(created_at AS BLOB)) <= {_TASK_TOPOLOGY_MAX_TIMESTAMP_BYTES}
+        THEN created_at
+    END AS topology_created_at,
+    CASE
+        WHEN length(CAST(updated_at AS BLOB)) <= {_TASK_TOPOLOGY_MAX_TIMESTAMP_BYTES}
+        THEN updated_at
+    END AS topology_updated_at
+"""
+
+
+def task_topology_node_from_row(row: sqlite3.Row) -> TaskTopologyNode:
+    if (
+        row["topology_id_oversized"]
+        or row["topology_session_id_oversized"]
+        or row["topology_parent_task_id_oversized"]
+    ):
+        raise TaskTopologyInconsistent(
+            "A task topology record contains an oversized structural identifier."
+        )
+    truncated_fields = tuple(
+        field_name
+        for field_name, column_name in (
+            ("type", "topology_type_truncated"),
+            ("title", "topology_title_truncated"),
+            ("assigned_agent_name", "topology_assigned_agent_name_truncated"),
+            ("status_reason", "topology_status_reason_truncated"),
+        )
+        if row[column_name]
+    )
+    try:
+        return TaskTopologyNode(
+            id=row["topology_id"],
+            type=row["topology_type"],
+            title=row["topology_title"],
+            status=TaskStatus(row["topology_status"]),
+            status_reason=row["topology_status_reason"],
+            session_id=row["topology_session_id"],
+            parent_task_id=row["topology_parent_task_id"],
+            assigned_agent_name=row["topology_assigned_agent_name"],
+            created_at=parse_datetime(row["topology_created_at"]),
+            updated_at=parse_datetime(row["topology_updated_at"]),
+            truncated_fields=truncated_fields,
+        )
+    except (TypeError, ValueError) as exc:
+        raise TaskTopologyInconsistent(
+            "A task record cannot be represented by the bounded topology contract."
+        ) from exc
 
 
 def session_from_row(row: sqlite3.Row, labels: dict[str, str] | None = None) -> Session:

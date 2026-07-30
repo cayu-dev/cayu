@@ -174,6 +174,10 @@ REVISIONS: tuple[Revision, ...] = (
     # queue/transition records. This prerelease contract intentionally does not
     # migrate populated pre-interaction session databases.
     Revision(revision=26, kind=RevisionKind.BREAKING, compatible_from=26),
+    # Add composite session/task and parent-task traversal indexes used by
+    # bounded task-topology reads. Both indexes are additive; revision-26
+    # writers continue to maintain every indexed source column.
+    Revision(revision=27, kind=RevisionKind.ADDITIVE, compatible_from=26),
 )
 
 #: The revision an empty database is initialized to.

@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar, TypeVar, cast
+from typing import Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
 
 from cayu._validation import (
@@ -200,6 +200,7 @@ from cayu.runtime.sessions import (
     validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
     TaskAggregateFilter,
     TaskCreate,
@@ -209,6 +210,12 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskStatusCounts,
     TaskStore,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+    TaskTopologyQuery,
+    TaskTopologyStoreResult,
+    _allocate_task_topology_branch_limits,
+    _bounded_optional_task_topology_parent_id,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
     _ensure_can_hold_task,
@@ -219,9 +226,12 @@ from cayu.runtime.tasks import (
     _raise_task_claim_attach_error,
     _running_task_from_create,
     _task_from_create,
+    _validate_task_topology_ancestry,
+    build_task_topology_result,
     copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
+    decode_task_topology_cursor,
     task_query_from_aggregate_filter,
 )
 from cayu.storage import _session_store_sql as session_store_sql
@@ -232,6 +242,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 26
+_SQLITE_TASK_TOPOLOGY_MIN_REQUIRED_REVISION = 27
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -6960,6 +6971,8 @@ class SQLiteSessionStore(SessionStore):
 class SQLiteTaskStore(TaskStore):
     """SQLite-backed task store for durable local work items."""
 
+    supports_task_topology: ClassVar[bool] = True
+
     def __init__(
         self,
         path: str | Path,
@@ -7092,6 +7105,186 @@ class SQLiteTaskStore(TaskStore):
                 params,
             ).fetchall()
             return [sqlite_support.task_from_row(row) for row in rows]
+
+    async def query_task_topology(
+        self,
+        query: TaskTopologyQuery,
+    ) -> TaskTopologyStoreResult:
+        if type(query) is not TaskTopologyQuery:
+            raise TypeError("Task topology queries must be TaskTopologyQuery instances.")
+        query = TaskTopologyQuery.model_validate(query.model_dump(mode="python"))
+        session_branch_limits, child_branch_limits = _allocate_task_topology_branch_limits(query)
+
+        def read_branch_candidates(
+            *,
+            branch_ids: tuple[str, ...],
+            cursors: dict[str, str],
+            scope_kind: Literal["session", "parent_task"],
+            scope_column: Literal["session_id", "parent_task_id"],
+            branch_limits: tuple[int, ...],
+        ) -> list[list[TaskTopologyNode]]:
+            candidates: list[list[TaskTopologyNode]] = [[] for _ in branch_ids]
+            if not branch_ids:
+                return candidates
+            branch_queries: list[str] = []
+            branch_params: list[object] = []
+            for branch_order, (branch_id, branch_limit) in enumerate(
+                zip(branch_ids, branch_limits, strict=True)
+            ):
+                cursor = cursors.get(branch_id)
+                if cursor is None:
+                    cursor_clause = ""
+                    cursor_params: list[object] = []
+                else:
+                    cursor_created_at, cursor_id = decode_task_topology_cursor(
+                        cursor,
+                        scope_kind=scope_kind,
+                        scope_id=branch_id,
+                    )
+                    cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
+                    formatted = sqlite_support.format_datetime(cursor_created_at)
+                    cursor_params = [formatted, formatted, cursor_id]
+                branch_queries.append(
+                    f"""
+                    SELECT branch_order, candidate.*
+                    FROM (
+                        SELECT ? AS branch_order, {sqlite_support.TASK_TOPOLOGY_COLUMNS}
+                        FROM cayu_tasks
+                        WHERE {scope_column} = ?
+                          {cursor_clause}
+                        ORDER BY created_at ASC, id ASC
+                        LIMIT ?
+                    ) AS candidate
+                    """
+                )
+                branch_params.extend(
+                    [
+                        branch_order,
+                        branch_id,
+                        *cursor_params,
+                        branch_limit + 1,
+                    ]
+                )
+            rows = self._connection.execute(
+                f"""
+                {" UNION ALL ".join(branch_queries)}
+                ORDER BY branch_order ASC, topology_created_at ASC, topology_id ASC
+                """,
+                branch_params,
+            ).fetchall()
+            for row in rows:
+                candidates[row["branch_order"]].append(
+                    sqlite_support.task_topology_node_from_row(row)
+                )
+            return candidates
+
+        async with self._lock:
+            self._connection.execute("BEGIN")
+            try:
+                observed_row = self._connection.execute(
+                    "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+                ).fetchone()
+                if observed_row is None:
+                    raise RuntimeError("SQLite did not return a topology snapshot timestamp.")
+                observed_at = sqlite_support.parse_datetime(observed_row[0])
+
+                expanded_parents: list[TaskTopologyNode] = []
+                if query.expanded_parent_ids:
+                    placeholders = ", ".join("?" for _ in query.expanded_parent_ids)
+                    rows = self._connection.execute(
+                        f"""
+                        SELECT {sqlite_support.TASK_TOPOLOGY_COLUMNS}
+                        FROM cayu_tasks
+                        WHERE id IN ({placeholders})
+                        """,
+                        query.expanded_parent_ids,
+                    ).fetchall()
+                    parents_by_id = {
+                        row["topology_id"]: sqlite_support.task_topology_node_from_row(row)
+                        for row in rows
+                    }
+                    for parent_id in query.expanded_parent_ids:
+                        parent = parents_by_id.get(parent_id)
+                        if parent is None:
+                            raise KeyError(f"Task not found: {parent_id}")
+                        expanded_parents.append(parent)
+
+                session_candidates = read_branch_candidates(
+                    branch_ids=query.linked_session_ids,
+                    cursors=query.session_cursors,
+                    scope_kind="session",
+                    scope_column="session_id",
+                    branch_limits=session_branch_limits,
+                )
+                child_candidates = read_branch_candidates(
+                    branch_ids=query.expanded_parent_ids,
+                    cursors=query.child_cursors,
+                    scope_kind="parent_task",
+                    scope_column="parent_task_id",
+                    branch_limits=child_branch_limits,
+                )
+
+                async def load_parent_links(
+                    task_ids: tuple[str, ...],
+                ) -> dict[str, str | None]:
+                    links: dict[str, str | None] = {}
+                    for index in range(0, len(task_ids), 500):
+                        batch = task_ids[index : index + 500]
+                        placeholders = ", ".join("?" for _ in batch)
+                        rows = self._connection.execute(
+                            f"""
+                            SELECT
+                                id,
+                                CASE
+                                    WHEN parent_task_id IS NULL
+                                      OR length(CAST(parent_task_id AS BLOB))
+                                         <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+                                    THEN parent_task_id
+                                END AS topology_parent_task_id,
+                                parent_task_id IS NOT NULL
+                                  AND length(CAST(parent_task_id AS BLOB))
+                                      > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+                                    AS topology_parent_task_id_oversized
+                            FROM cayu_tasks
+                            WHERE id IN ({placeholders})
+                            """,
+                            batch,
+                        ).fetchall()
+                        for row in rows:
+                            if row["topology_parent_task_id_oversized"]:
+                                raise TaskTopologyInconsistent(
+                                    "A task topology ancestor contains an oversized "
+                                    "parent identifier."
+                                )
+                            links[row["id"]] = _bounded_optional_task_topology_parent_id(
+                                row["topology_parent_task_id"]
+                            )
+                    return links
+
+                await _validate_task_topology_ancestry(
+                    (
+                        *expanded_parents,
+                        *(task for branch in session_candidates for task in branch),
+                        *(task for branch in child_candidates for task in branch),
+                    ),
+                    load_parent_links,
+                )
+                result = build_task_topology_result(
+                    observed_at=observed_at,
+                    linked_session_ids=query.linked_session_ids,
+                    session_branch_candidates=session_candidates,
+                    session_branch_limits=session_branch_limits,
+                    expanded_parents=expanded_parents,
+                    child_branch_candidates=child_candidates,
+                    child_branch_limits=child_branch_limits,
+                    session_task_limit=query.session_task_limit,
+                    child_limit=query.child_limit,
+                )
+                self._connection.commit()
+                return result
+            except Exception:
+                self._connection.rollback()
+                raise
 
     async def aggregate_operational_snapshot(
         self,
@@ -7571,7 +7764,7 @@ class SQLiteTaskStore(TaskStore):
         sqlite_support.reconcile_schema(
             self._connection,
             self._schema_mode,
-            app_min_supported=_SQLITE_NON_SESSION_MIN_REQUIRED_REVISION,
+            app_min_supported=_SQLITE_TASK_TOPOLOGY_MIN_REQUIRED_REVISION,
         )
 
     def _load_task_unlocked(self, task_id: str) -> Task | None:

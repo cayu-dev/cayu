@@ -271,6 +271,7 @@ from cayu.runtime.sessions import (
     validate_persisted_event_side_effect_error,
 )
 from cayu.runtime.tasks import (
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
     Task,
     TaskAggregateFilter,
     TaskCreate,
@@ -280,6 +281,12 @@ from cayu.runtime.tasks import (
     TaskStatus,
     TaskStatusCounts,
     TaskStore,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+    TaskTopologyQuery,
+    TaskTopologyStoreResult,
+    _allocate_task_topology_branch_limits,
+    _bounded_optional_task_topology_parent_id,
     _copy_optional_status_payload,
     _copy_optional_status_reason,
     _ensure_can_hold_task,
@@ -290,9 +297,12 @@ from cayu.runtime.tasks import (
     _raise_task_claim_attach_error,
     _running_task_from_create,
     _task_from_create,
+    _validate_task_topology_ancestry,
+    build_task_topology_result,
     copy_task_aggregate_filter,
     copy_task_create,
     copy_task_query,
+    decode_task_topology_cursor,
     task_query_from_aggregate_filter,
 )
 from cayu.storage import _postgres_aggregates as postgres_aggregates
@@ -1412,6 +1422,7 @@ class _ConcurrentIndexMigration:
     predicate_definition: str | None
     create_statement: str
     drop_statement: str
+    required_key_collations: tuple[str | None, ...] = ()
     unique: bool = False
 
 
@@ -1686,6 +1697,34 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             drop_statement=(
                 "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_sessions_parent_created_id"
             ),
+        ),
+    ),
+    27: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_tasks_session_created_id",
+            table_name="cayu_tasks",
+            key_definitions=("session_id", "created_at", "id"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_tasks_session_created_id "
+                'ON cayu_tasks(session_id, created_at, id COLLATE "C")'
+            ),
+            drop_statement=("DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_tasks_session_created_id"),
+            required_key_collations=(None, None, "C"),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_tasks_parent_created_id",
+            table_name="cayu_tasks",
+            key_definitions=("parent_task_id", "created_at", "id"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_tasks_parent_created_id "
+                'ON cayu_tasks(parent_task_id, created_at, id COLLATE "C")'
+            ),
+            drop_statement=("DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_tasks_parent_created_id"),
+            required_key_collations=(None, None, "C"),
         ),
     ),
 }
@@ -2306,6 +2345,19 @@ class _PostgresStoreBase:
                     ) AS key_position
                     ORDER BY key_position
                 ),
+                ARRAY(
+                    SELECT index_collation.collname
+                    FROM unnest(index_definition.indcollation::oid[])
+                         WITH ORDINALITY AS key_collation(
+                             collation_oid,
+                             key_position
+                         )
+                    LEFT JOIN pg_catalog.pg_collation AS index_collation
+                      ON index_collation.oid = key_collation.collation_oid
+                    WHERE key_collation.key_position
+                          <= index_definition.indnkeyatts
+                    ORDER BY key_collation.key_position
+                ),
                 pg_get_expr(
                     index_definition.indpred,
                     index_definition.indrelid,
@@ -2340,25 +2392,46 @@ class _PostgresStoreBase:
         expected_keys = tuple(
             _normalize_postgres_index_expression(value) for value in index.key_definitions
         )
-        predicate = _normalize_postgres_index_expression(row[5])
+        key_collations = tuple(None if value is None else str(value) for value in (row[5] or []))
+        required_key_collations = index.required_key_collations
+        collations_match = not required_key_collations or (
+            len(key_collations) == len(required_key_collations)
+            and all(
+                required is None or actual == required
+                for actual, required in zip(
+                    key_collations,
+                    required_key_collations,
+                    strict=True,
+                )
+            )
+        )
+        predicate = _normalize_postgres_index_expression(row[6])
         expected_predicate = _normalize_postgres_index_expression(index.predicate_definition)
         expected_definition = (
             bool(row[0])
             and bool(row[2])
             and bool(row[3])
             and key_definitions == expected_keys
+            and collations_match
             and predicate == expected_predicate
-            and bool(row[6]) is index.unique
+            and bool(row[7]) is index.unique
         )
         if not expected_definition:
-            columns = ", ".join(index.key_definitions)
+            columns = ", ".join(
+                (f'{key} COLLATE "{collation}"' if collation is not None else key)
+                for key, collation in zip(
+                    index.key_definitions,
+                    index.required_key_collations or (None,) * len(index.key_definitions),
+                    strict=True,
+                )
+            )
             index_kind = "unique B-tree" if index.unique else "B-tree"
             raise RuntimeError(
                 f"Postgres schema object {index.index_name!r} conflicts with the required "
                 f"{index_kind} index on {index.table_name}({columns}). Remove or rename the "
                 "conflicting object, then rerun `cayu storage migrate`."
             )
-        return bool(row[1]), bool(row[7])
+        return bool(row[1]), bool(row[8])
 
     async def _record_revision(self, cur: Any, rev: schema.Revision) -> None:
         await cur.execute(
@@ -11318,6 +11391,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     """Postgres-backed task store for durable multi-tenant work items."""
 
+    supports_task_topology: ClassVar[bool] = True
+    _min_required_revision = 27
+
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
         await self._ensure_ready()
@@ -11421,6 +11497,208 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
             )
             rows = await cur.fetchall()
             return [pg_support.task_from_row(row) for row in rows]
+
+    async def query_task_topology(
+        self,
+        query: TaskTopologyQuery,
+    ) -> TaskTopologyStoreResult:
+        if type(query) is not TaskTopologyQuery:
+            raise TypeError("Task topology queries must be TaskTopologyQuery instances.")
+        query = TaskTopologyQuery.model_validate(query.model_dump(mode="python"))
+        session_branch_limits, child_branch_limits = _allocate_task_topology_branch_limits(query)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    await cur.execute("SELECT transaction_timestamp()")
+                    observed_row = await cur.fetchone()
+                    if observed_row is None:
+                        raise RuntimeError("Postgres did not return a topology snapshot timestamp.")
+
+                    expanded_parents: list[TaskTopologyNode] = []
+                    if query.expanded_parent_ids:
+                        await cur.execute(
+                            cast(
+                                "LiteralString",
+                                f"""
+                                SELECT {pg_support.TASK_TOPOLOGY_COLUMNS}
+                                FROM cayu_tasks
+                                WHERE id = ANY(%s)
+                                """,
+                            ),
+                            (list(query.expanded_parent_ids),),
+                        )
+                        parents_by_id = {
+                            row[0]: pg_support.task_topology_node_from_row(row)
+                            for row in await cur.fetchall()
+                        }
+                        for parent_id in query.expanded_parent_ids:
+                            parent = parents_by_id.get(parent_id)
+                            if parent is None:
+                                raise KeyError(f"Task not found: {parent_id}")
+                            expanded_parents.append(parent)
+
+                    async def read_branch_candidates(
+                        *,
+                        branch_ids: tuple[str, ...],
+                        cursors: dict[str, str],
+                        scope_kind: Literal["session", "parent_task"],
+                        scope_column: Literal["session_id", "parent_task_id"],
+                        branch_limits: tuple[int, ...],
+                    ) -> list[list[TaskTopologyNode]]:
+                        candidates: list[list[TaskTopologyNode]] = [[] for _ in branch_ids]
+                        if not branch_ids:
+                            return candidates
+                        cursor_created_ats: list[datetime | None] = []
+                        cursor_ids: list[str | None] = []
+                        for branch_id in branch_ids:
+                            cursor = cursors.get(branch_id)
+                            if cursor is None:
+                                cursor_created_ats.append(None)
+                                cursor_ids.append(None)
+                                continue
+                            cursor_created_at, cursor_id = decode_task_topology_cursor(
+                                cursor,
+                                scope_kind=scope_kind,
+                                scope_id=branch_id,
+                            )
+                            cursor_created_ats.append(cursor_created_at)
+                            cursor_ids.append(cursor_id)
+                        branch_sql: LiteralString = f"""
+                                WITH requested_branches AS (
+                                    SELECT branch_id, cursor_created_at, cursor_id,
+                                           candidate_limit, branch_order
+                                    FROM unnest(
+                                        %s::text[],
+                                        %s::timestamptz[],
+                                        %s::text[],
+                                        %s::integer[]
+                                    ) WITH ORDINALITY AS requested(
+                                        branch_id,
+                                        cursor_created_at,
+                                        cursor_id,
+                                        candidate_limit,
+                                        branch_order
+                                    )
+                                )
+                                SELECT requested.branch_order, candidate.*
+                                FROM requested_branches AS requested
+                                CROSS JOIN LATERAL (
+                                    SELECT {pg_support.TASK_TOPOLOGY_COLUMNS}
+                                    FROM cayu_tasks
+                                    WHERE cayu_tasks.{scope_column} = requested.branch_id
+                                      AND (
+                                          requested.cursor_created_at IS NULL
+                                          OR cayu_tasks.created_at >
+                                             requested.cursor_created_at
+                                          OR (
+                                              cayu_tasks.created_at =
+                                                  requested.cursor_created_at
+                                              AND cayu_tasks.id COLLATE "C" >
+                                                  requested.cursor_id COLLATE "C"
+                                          )
+                                      )
+                                    ORDER BY cayu_tasks.created_at ASC,
+                                             cayu_tasks.id COLLATE "C" ASC
+                                    LIMIT requested.candidate_limit
+                                ) AS candidate
+                                ORDER BY requested.branch_order ASC,
+                                         candidate.topology_created_at ASC,
+                                         candidate.topology_id COLLATE "C" ASC
+                                """
+                        await cur.execute(
+                            branch_sql,
+                            (
+                                list(branch_ids),
+                                cursor_created_ats,
+                                cursor_ids,
+                                [limit + 1 for limit in branch_limits],
+                            ),
+                        )
+                        for row in await cur.fetchall():
+                            branch_index = int(row[0]) - 1
+                            candidates[branch_index].append(
+                                pg_support.task_topology_node_from_row(row[1:])
+                            )
+                        return candidates
+
+                    session_candidates = await read_branch_candidates(
+                        branch_ids=query.linked_session_ids,
+                        cursors=query.session_cursors,
+                        scope_kind="session",
+                        scope_column="session_id",
+                        branch_limits=session_branch_limits,
+                    )
+                    child_candidates = await read_branch_candidates(
+                        branch_ids=query.expanded_parent_ids,
+                        cursors=query.child_cursors,
+                        scope_kind="parent_task",
+                        scope_column="parent_task_id",
+                        branch_limits=child_branch_limits,
+                    )
+
+                    async def load_parent_links(
+                        task_ids: tuple[str, ...],
+                    ) -> dict[str, str | None]:
+                        await cur.execute(
+                            cast(
+                                "LiteralString",
+                                f"""
+                                SELECT
+                                    id,
+                                    CASE
+                                        WHEN parent_task_id IS NULL
+                                          OR octet_length(parent_task_id)
+                                             <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+                                        THEN parent_task_id
+                                    END AS topology_parent_task_id,
+                                    parent_task_id IS NOT NULL
+                                      AND octet_length(parent_task_id)
+                                          > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+                                        AS topology_parent_task_id_oversized
+                                FROM cayu_tasks
+                                WHERE id = ANY(%s)
+                                """,
+                            ),
+                            (list(task_ids),),
+                        )
+                        links: dict[str, str | None] = {}
+                        for task_id, parent_task_id, parent_id_oversized in await cur.fetchall():
+                            if parent_id_oversized:
+                                raise TaskTopologyInconsistent(
+                                    "A task topology ancestor contains an oversized "
+                                    "parent identifier."
+                                )
+                            links[task_id] = _bounded_optional_task_topology_parent_id(
+                                parent_task_id
+                            )
+                        return links
+
+                    await _validate_task_topology_ancestry(
+                        (
+                            *expanded_parents,
+                            *(task for branch in session_candidates for task in branch),
+                            *(task for branch in child_candidates for task in branch),
+                        ),
+                        load_parent_links,
+                    )
+                    result = build_task_topology_result(
+                        observed_at=observed_row[0],
+                        linked_session_ids=query.linked_session_ids,
+                        session_branch_candidates=session_candidates,
+                        session_branch_limits=session_branch_limits,
+                        expanded_parents=expanded_parents,
+                        child_branch_candidates=child_candidates,
+                        child_branch_limits=child_branch_limits,
+                        session_task_limit=query.session_task_limit,
+                        child_limit=query.child_limit,
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return result
 
     async def aggregate_operational_snapshot(
         self,

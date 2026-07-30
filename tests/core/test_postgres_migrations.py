@@ -252,6 +252,8 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 await cur.execute("DROP TABLE cayu_persisted_event_side_effects")
                 await cur.execute("DROP TABLE cayu_session_message_queue")
                 await cur.execute("DROP INDEX idx_cayu_sessions_parent_created_id")
+                await cur.execute("DROP INDEX idx_cayu_tasks_session_created_id")
+                await cur.execute("DROP INDEX idx_cayu_tasks_parent_created_id")
             await conn.commit()
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
@@ -263,7 +265,8 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         task_validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            await task_validator.ensure_schema()
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 27"):
+                await task_validator.ensure_schema()
         finally:
             await task_validator.close()
 
@@ -319,6 +322,33 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
                 "SELECT to_regclass('idx_cayu_budget_reservation_identities_session')"
             )
             assert (await cur.fetchone())[0] == ("idx_cayu_budget_reservation_identities_session")
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 27"
+            )
+            assert await cur.fetchone() == ("additive", 26)
+            await cur.execute("SELECT to_regclass('idx_cayu_tasks_session_created_id')")
+            assert (await cur.fetchone())[0] == "idx_cayu_tasks_session_created_id"
+            await cur.execute("SELECT to_regclass('idx_cayu_tasks_parent_created_id')")
+            assert (await cur.fetchone())[0] == "idx_cayu_tasks_parent_created_id"
+            await cur.execute(
+                """
+                SELECT pg_get_indexdef(index_class.oid)
+                FROM pg_catalog.pg_class AS index_class
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = index_class.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND index_class.relname IN (
+                      'idx_cayu_tasks_session_created_id',
+                      'idx_cayu_tasks_parent_created_id'
+                  )
+                ORDER BY index_class.relname
+                """
+            )
+            task_topology_index_definitions = [row[0] for row in await cur.fetchall()]
+            assert len(task_topology_index_definitions) == 2
+            assert all(
+                'id COLLATE "C"' in definition for definition in task_topology_index_definitions
+            )
             await cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

@@ -1283,6 +1283,8 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
         connection.execute("DROP TABLE cayu_persisted_event_side_effects")
         connection.execute("DROP TABLE cayu_session_message_queue")
         connection.execute("DROP INDEX idx_cayu_sessions_parent_created_id")
+        connection.execute("DROP INDEX idx_cayu_tasks_session_created_id")
+        connection.execute("DROP INDEX idx_cayu_tasks_parent_created_id")
         connection.execute("PRAGMA user_version = 18")
         connection.commit()
     finally:
@@ -1291,11 +1293,11 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 26"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
-    task_store = SQLiteTaskStore(
-        db_path,
-        schema_mode=schema_migrations.SchemaMode.VALIDATE,
-    )
-    asyncio.run(task_store.close())
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 27"):
+        SQLiteTaskStore(
+            db_path,
+            schema_mode=schema_migrations.SchemaMode.VALIDATE,
+        )
 
     migrated = SQLiteSessionStore(
         db_path,
@@ -1336,6 +1338,17 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
             "SELECT name FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_cayu_sessions_parent_created_id'"
         ).fetchone()
+        task_topology_revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 27"
+        ).fetchone()
+        task_session_topology_index = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_tasks_session_created_id'"
+        ).fetchone()
+        task_parent_topology_index = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_tasks_parent_created_id'"
+        ).fetchone()
         legacy_writer_trigger = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 'cayu_events_enqueue_persisted_side_effect'"
@@ -1355,6 +1368,9 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     assert manifest_revision == ("breaking", 22)
     assert topology_revision == ("additive", 23)
     assert topology_index == ("idx_cayu_sessions_parent_created_id",)
+    assert task_topology_revision == ("additive", 26)
+    assert task_session_topology_index == ("idx_cayu_tasks_session_created_id",)
+    assert task_parent_topology_index == ("idx_cayu_tasks_parent_created_id",)
     assert legacy_writer_trigger is None
     assert retention_guard == ("cayu_protect_undelivered_event_side_effects",)
 
@@ -1924,6 +1940,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (24, 23),
         (25, 25),
         (26, 26),
+        (27, 26),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

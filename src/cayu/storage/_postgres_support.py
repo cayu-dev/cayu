@@ -12,7 +12,15 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionTopologyNode,
 )
-from cayu.runtime.tasks import Task, TaskOrder, TaskStatus
+from cayu.runtime.tasks import (
+    TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
+    TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES,
+    Task,
+    TaskOrder,
+    TaskStatus,
+    TaskTopologyInconsistent,
+    TaskTopologyNode,
+)
 from cayu.storage import _session_store_sql as session_store_sql
 
 # Postgres schema mirrors the SQLite store (both at ADR 0001 baseline revision 1)
@@ -329,6 +337,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_type ON cayu_tasks(type)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_session_id ON cayu_tasks(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_task_id ON cayu_tasks(parent_task_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_session_created_id "
+    'ON cayu_tasks(session_id, created_at, id COLLATE "C")',
+    "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_created_id "
+    'ON cayu_tasks(parent_task_id, created_at, id COLLATE "C")',
     "CREATE INDEX IF NOT EXISTS idx_cayu_tasks_assigned_agent_name "
     "ON cayu_tasks(assigned_agent_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_event_watcher_state_delivery "
@@ -519,6 +531,105 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         started_at=to_utc_optional(row[18]),
         completed_at=to_utc_optional(row[19]),
     )
+
+
+TASK_TOPOLOGY_COLUMNS = f"""
+    CASE
+        WHEN octet_length(id) <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        THEN id
+    END AS topology_id,
+    octet_length(id) > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        AS topology_id_oversized,
+    CASE
+        WHEN octet_length(type) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN type
+    END AS topology_type,
+    octet_length(type) > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_type_truncated,
+    CASE
+        WHEN title IS NULL
+          OR octet_length(title) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN title
+    END AS topology_title,
+    title IS NOT NULL
+      AND octet_length(title) > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_title_truncated,
+    CASE
+        WHEN octet_length(status) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN status
+    END AS topology_status,
+    CASE
+        WHEN status_reason IS NULL
+          OR octet_length(status_reason) <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN status_reason
+    END AS topology_status_reason,
+    status_reason IS NOT NULL
+      AND octet_length(status_reason) > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_status_reason_truncated,
+    CASE
+        WHEN session_id IS NULL
+          OR octet_length(session_id) <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        THEN session_id
+    END AS topology_session_id,
+    session_id IS NOT NULL
+      AND octet_length(session_id) > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        AS topology_session_id_oversized,
+    CASE
+        WHEN parent_task_id IS NULL
+          OR octet_length(parent_task_id) <= {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        THEN parent_task_id
+    END AS topology_parent_task_id,
+    parent_task_id IS NOT NULL
+      AND octet_length(parent_task_id) > {TASK_TOPOLOGY_MAX_IDENTIFIER_BYTES}
+        AS topology_parent_task_id_oversized,
+    CASE
+        WHEN assigned_agent_name IS NULL
+          OR octet_length(assigned_agent_name)
+             <= {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        THEN assigned_agent_name
+    END AS topology_assigned_agent_name,
+    assigned_agent_name IS NOT NULL
+      AND octet_length(assigned_agent_name)
+          > {TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES}
+        AS topology_assigned_agent_name_truncated,
+    created_at AS topology_created_at,
+    updated_at AS topology_updated_at
+"""
+
+
+def task_topology_node_from_row(row: tuple[Any, ...]) -> TaskTopologyNode:
+    if row[1] or row[10] or row[12]:
+        raise TaskTopologyInconsistent(
+            "A task topology record contains an oversized structural identifier."
+        )
+    truncated_fields = tuple(
+        field_name
+        for field_name, truncated in (
+            ("type", row[3]),
+            ("title", row[5]),
+            ("assigned_agent_name", row[14]),
+            ("status_reason", row[8]),
+        )
+        if truncated
+    )
+    try:
+        return TaskTopologyNode(
+            id=row[0],
+            type=row[2],
+            title=row[4],
+            status=TaskStatus(row[6]),
+            status_reason=row[7],
+            session_id=row[9],
+            parent_task_id=row[11],
+            assigned_agent_name=row[13],
+            created_at=to_utc(row[15]),
+            updated_at=to_utc(row[16]),
+            truncated_fields=truncated_fields,
+        )
+    except (TypeError, ValueError) as exc:
+        raise TaskTopologyInconsistent(
+            "A task record cannot be represented by the bounded topology contract."
+        ) from exc
 
 
 def session_order_sql(order_by: SessionOrder) -> str:

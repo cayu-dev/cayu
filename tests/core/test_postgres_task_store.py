@@ -7,12 +7,24 @@ Dockerized Postgres. They skip automatically when Docker is unavailable.
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 import pytest
 from pydantic import ValidationError
 from tests.core.task_store_conformance import assert_task_claim_lost_conformance
+from tests.core.task_topology_conformance import (
+    assert_task_topology_bounded_projection_conformance,
+    assert_task_topology_store_conformance,
+)
 
-from cayu import TaskClaimLost, TaskCreate, TaskOrder, TaskQuery, TaskStatus
+from cayu import (
+    TaskClaimLost,
+    TaskCreate,
+    TaskOrder,
+    TaskQuery,
+    TaskStatus,
+    TaskTopologyQuery,
+)
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
@@ -70,6 +82,184 @@ def _run(dsn: str, coro_factory) -> object:
 def test_postgres_task_store_task_claim_lost_conformance(postgres_dsn):
     async def ops(store):
         await assert_task_claim_lost_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_store_task_topology_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_task_topology_store_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_topology_bounded_projection_conformance(postgres_dsn):
+    async def ops(store):
+        await assert_task_topology_bounded_projection_conformance(store)
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_topology_uses_canonical_id_ordering(postgres_dsn):
+    async def ops(store):
+        import psycopg
+
+        await store.ensure_schema()
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO cayu_tasks (
+                        id, type, status, session_id, input, metadata,
+                        created_at, updated_at
+                    )
+                    VALUES
+                        (
+                            'collation-a', 'step', 'pending', 'collation-session',
+                            '{}'::jsonb, '{}'::jsonb,
+                            TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                            TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                        ),
+                        (
+                            'collation-B', 'step', 'pending', 'collation-session',
+                            '{}'::jsonb, '{}'::jsonb,
+                            TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                            TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                        )
+                    """
+                )
+            await conn.commit()
+
+        first = await store.query_task_topology(
+            TaskTopologyQuery(
+                linked_session_ids=("collation-session",),
+                session_task_limit=1,
+            )
+        )
+        first_branch = first.session_branches[0]
+        assert [task.id for task in first_branch.tasks] == ["collation-B"]
+        assert first_branch.has_more is True
+        assert first_branch.next_cursor is not None
+
+        continuation = await store.query_task_topology(
+            TaskTopologyQuery(
+                linked_session_ids=("collation-session",),
+                session_cursors={"collation-session": first_branch.next_cursor},
+                session_task_limit=1,
+            )
+        )
+        continuation_branch = continuation.session_branches[0]
+        assert [task.id for task in continuation_branch.tasks] == ["collation-a"]
+        assert continuation_branch.has_more is False
+        assert continuation_branch.next_cursor is None
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_task_topology_branch_plan_is_bounded(postgres_dsn):
+    async def ops(store):
+        import psycopg
+
+        await store.create_task(
+            TaskCreate(
+                task_id="topology-plan-parent",
+                type="workflow",
+                session_id="topology-plan-session",
+            )
+        )
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                """
+                INSERT INTO cayu_tasks (
+                    id, type, status, session_id, parent_task_id,
+                    input, metadata, created_at, updated_at
+                )
+                SELECT
+                    'topology-plan-child-' || lpad(value::text, 6, '0'),
+                    'step',
+                    'pending',
+                    'topology-plan-session',
+                    'topology-plan-parent',
+                    '{}'::jsonb,
+                    '{}'::jsonb,
+                    TIMESTAMPTZ '2026-01-01T00:00:00Z',
+                    TIMESTAMPTZ '2026-01-01T00:00:00Z'
+                FROM generate_series(0, 99999) AS value
+                """
+            )
+            await conn.commit()
+            await cur.execute("SET LOCAL enable_seqscan = off")
+
+            async def explain(
+                scope_column: Literal["session_id", "parent_task_id"],
+                branch_id: str,
+            ):
+                await cur.execute(
+                    f"""
+                    EXPLAIN (ANALYZE, COSTS OFF, FORMAT JSON)
+                    WITH requested_branches AS (
+                        SELECT branch_id, cursor_created_at, cursor_id,
+                               candidate_limit, branch_order
+                        FROM unnest(
+                            %s::text[],
+                            %s::timestamptz[],
+                            %s::text[],
+                            %s::integer[]
+                        ) WITH ORDINALITY AS requested(
+                            branch_id,
+                            cursor_created_at,
+                            cursor_id,
+                            candidate_limit,
+                            branch_order
+                        )
+                    )
+                    SELECT child.*
+                    FROM requested_branches AS requested
+                    CROSS JOIN LATERAL (
+                        SELECT id, created_at
+                        FROM cayu_tasks
+                        WHERE cayu_tasks.{scope_column} = requested.branch_id
+                          AND (
+                              requested.cursor_created_at IS NULL
+                              OR cayu_tasks.created_at > requested.cursor_created_at
+                              OR (
+                                  cayu_tasks.created_at = requested.cursor_created_at
+                                  AND cayu_tasks.id COLLATE "C" >
+                                      requested.cursor_id COLLATE "C"
+                              )
+                          )
+                        ORDER BY cayu_tasks.created_at ASC,
+                                 cayu_tasks.id COLLATE "C" ASC
+                        LIMIT requested.candidate_limit
+                    ) AS child
+                    ORDER BY requested.branch_order ASC,
+                             child.created_at ASC,
+                             child.id COLLATE "C" ASC
+                    """,
+                    ([branch_id], [None], [None], [26]),
+                )
+                return (await cur.fetchone())[0][0]["Plan"]
+
+            parent_plan = await explain("parent_task_id", "topology-plan-parent")
+            session_plan = await explain("session_id", "topology-plan-session")
+
+        def plan_nodes(node):
+            yield node
+            for child in node.get("Plans", []):
+                yield from plan_nodes(child)
+
+        for plan, index_name in (
+            (parent_plan, "idx_cayu_tasks_parent_created_id"),
+            (session_plan, "idx_cayu_tasks_session_created_id"),
+        ):
+            index_nodes = [
+                node for node in plan_nodes(plan) if node.get("Index Name") == index_name
+            ]
+            assert index_nodes
+            assert all(node["Actual Rows"] <= 26 for node in index_nodes)
 
     _run(postgres_dsn, ops)
 
