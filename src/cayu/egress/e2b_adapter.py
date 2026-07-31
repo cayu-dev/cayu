@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime
 from ipaddress import ip_address
 from pathlib import Path
@@ -109,11 +109,14 @@ class E2BEgressAdapter(SandboxEgressAdapter):
         sandbox_timeout_s: int | None = None,
         proxy_server_factory: ProxyServerFactory = DEFAULT_PROXY_SERVER_FACTORY,
         preflight_timeout_s: int = 20,
+        protected_bootstrap: (Callable[[E2BGuestProvisioner], Awaitable[None]] | None) = None,
     ) -> None:
         if not bind_host.strip():
             raise ValueError("E2B proxy bind_host must be nonblank.")
         if type(preflight_timeout_s) is not int or preflight_timeout_s <= 0:
             raise ValueError("preflight_timeout_s must be a positive integer.")
+        if protected_bootstrap is not None and not callable(protected_bootstrap):
+            raise TypeError("E2B protected_bootstrap must be an async callable.")
         options = dict(e2b_options or {})
         reserved = sorted(_RESERVED_E2B_OPTIONS.intersection(options))
         if reserved:
@@ -128,6 +131,7 @@ class E2BEgressAdapter(SandboxEgressAdapter):
         self._sandbox_timeout_s = sandbox_timeout_s
         self._proxy_server_factory = proxy_server_factory
         self._preflight_timeout_s = preflight_timeout_s
+        self._protected_bootstrap = protected_bootstrap
         self._runner_preflight_observations: weakref.WeakKeyDictionary[
             Runner,
             datetime,
@@ -180,6 +184,8 @@ class E2BEgressAdapter(SandboxEgressAdapter):
                 ca_cert_pem,
                 mode=0o444,
             )
+            if self._protected_bootstrap is not None:
+                await self._protected_bootstrap(provisioner)
 
         async def guest_setup(runner: E2BRunner) -> None:
             preflight_observed_at = await run_enforcement_preflight(

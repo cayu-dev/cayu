@@ -606,6 +606,16 @@ route, direct public TLS denial, MMDS GET, and token acquisition before any
 configured setup command runs. The preflight retains its configured timeout,
 and each setup command retains its 300-second execution limit; the adapter adds
 all of those allowances to the bounded handoff deadline.
+
+Trusted control planes that need an additional root-owned verification input
+may pass `protected_bootstrap=async_callback` to `E2BEgressAdapter`. The callback
+receives the same typed `E2BGuestProvisioner` used for the session CA, runs
+before guest setup, and is covered by the same one-way handoff and rollback
+contract. It can install protected files or directories but cannot execute
+arbitrary root commands. Failure aborts handoff and triggers exact sandbox
+cleanup; the adapter never returns a runner before those assets are sealed and
+verified.
+
 Cayu repeats the common guest and protected-file verification before publishing
 the runner. All later commands and native workspace operations are pinned to
 that same verified guest user, regardless of the template's configured default.

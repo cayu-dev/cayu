@@ -3139,6 +3139,11 @@ restore root execution. Applications should use `E2BWorkspace` for mutable
 agent files and keep trusted verification inputs under a protected root-owned
 path such as `/opt/cayu-verification`.
 
+`E2BEgressAdapter` composes its session-CA installation with an optional
+`protected_bootstrap(E2BGuestProvisioner)` callback inside this same bootstrap
+phase. Both installations complete before the provisioner is sealed or any
+guest callback runs, and either failure follows the handoff rollback contract.
+
 The handoff is irreversible in the capability and lifecycle sense: Cayu seals
 its privileged provisioner before publishing the runner and never exposes an
 ambient root-execution API. It is not an audit of every privilege path in an

@@ -25,7 +25,7 @@ from cayu.egress.e2b_adapter import (
 )
 from cayu.egress.proxy_exposure import ExposedProxy
 from cayu.environments import ExecutionRequirements, evaluate_execution_admission
-from cayu.runners import E2BRunner
+from cayu.runners import E2BGuestProvisioner, E2BRunner
 from cayu.runners.e2b import _contains_cancellation
 from cayu.vaults import SecretRef, StaticVault
 
@@ -1017,6 +1017,126 @@ def test_e2b_adapter_handoff_budget_covers_every_setup_command(
 
     assert runner is returned_runner
     assert captured["handoff_timeout_s"] == 1080
+
+
+def test_e2b_adapter_installs_host_protected_assets_inside_one_way_bootstrap(
+    tmp_path: Path,
+) -> None:
+    async def protected_bootstrap(provisioner: E2BGuestProvisioner) -> None:
+        await provisioner.install_file(
+            "/etc/cayu/replay.json",
+            b'{"virtual":"credential"}',
+            mode=0o400,
+        )
+
+    async def run() -> tuple[E2BRunner, _FakeSandbox]:
+        _FakeAsyncSandbox.created = []
+        _FakeAsyncSandbox.sandbox = None
+        _FakeCommands.background_result = _FakeCommandResult()
+        _FakeCommands.foreground_results = []
+        adapter = E2BEgressAdapter(
+            exposure=_FakeExposure(),
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+            protected_bootstrap=protected_bootstrap,
+        )
+        ca_path = tmp_path / "ca.pem"
+        ca_path.write_bytes(b"session-ca")
+        runner = await adapter.create_runner(
+            VirtualEgressRunnerRequest(
+                name="sandbox-1",
+                runner_kind="e2b",
+                image="base-template",
+                binding=EgressBinding(
+                    proxy_url="http://203.0.113.10:8443",
+                    guest_ca_path="/etc/cayu/ca.pem",
+                ),
+                env_overlay={},
+                ca_cert_host_path=str(ca_path),
+                guest_ca_path="/etc/cayu/ca.pem",
+                setup_commands=(),
+                egress_destinations=("api.stripe.com",),
+            )
+        )
+        assert _FakeAsyncSandbox.sandbox is not None
+        return runner, _FakeAsyncSandbox.sandbox
+
+    runner, sandbox = asyncio.run(run())
+
+    assert isinstance(runner, E2BRunner)
+    assert [write["data"] for write in sandbox.files.writes] == [
+        b"session-ca",
+        b'{"virtual":"credential"}',
+    ]
+    command_calls = sandbox.commands.calls
+    protected_install_index = next(
+        index
+        for index, call in enumerate(command_calls)
+        if call.get("envs", {}).get("CAYU_PROTECTED_PATH") == "/etc/cayu/replay.json"
+    )
+    first_guest_verification_index = next(
+        index for index, call in enumerate(command_calls) if "sudo -n true" in call["command"]
+    )
+    assert command_calls[protected_install_index]["envs"]["CAYU_PROTECTED_MODE"] == "400"
+    assert protected_install_index < first_guest_verification_index
+
+
+def test_e2b_adapter_rolls_back_when_protected_bootstrap_fails(
+    tmp_path: Path,
+) -> None:
+    failure = RuntimeError("protected bootstrap failed")
+
+    async def protected_bootstrap(provisioner: E2BGuestProvisioner) -> None:
+        del provisioner
+        raise failure
+
+    async def run() -> _FakeSandbox:
+        _FakeAsyncSandbox.created = []
+        _FakeAsyncSandbox.sandbox = None
+        _FakeCommands.background_result = _FakeCommandResult()
+        _FakeCommands.foreground_results = []
+        adapter = E2BEgressAdapter(
+            exposure=_FakeExposure(),
+            e2b_module=_FakeE2BModule,
+            proxy_server_factory=_FakeProxyServer,
+            protected_bootstrap=protected_bootstrap,
+        )
+        ca_path = tmp_path / "ca.pem"
+        ca_path.write_bytes(b"session-ca")
+
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.create_runner(
+                VirtualEgressRunnerRequest(
+                    name="sandbox-1",
+                    runner_kind="e2b",
+                    image="base-template",
+                    binding=EgressBinding(
+                        proxy_url="http://203.0.113.10:8443",
+                        guest_ca_path="/etc/cayu/ca.pem",
+                    ),
+                    env_overlay={},
+                    ca_cert_host_path=str(ca_path),
+                    guest_ca_path="/etc/cayu/ca.pem",
+                    setup_commands=(),
+                    egress_destinations=("api.stripe.com",),
+                )
+            )
+
+        assert raised.value is failure
+        assert _FakeAsyncSandbox.sandbox is not None
+        return _FakeAsyncSandbox.sandbox
+
+    sandbox = asyncio.run(run())
+
+    assert sandbox.killed is True
+
+
+def test_e2b_adapter_rejects_noncallable_protected_bootstrap() -> None:
+    with pytest.raises(TypeError, match="protected_bootstrap"):
+        E2BEgressAdapter(
+            exposure=_FakeExposure(),
+            protected_bootstrap="not-callable",  # type: ignore[arg-type]
+        )
 
 
 def test_e2b_adapter_closes_sandbox_when_guest_hardening_fails(
