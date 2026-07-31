@@ -14,10 +14,8 @@ from typing import Any, Protocol
 from cayu._validation import copy_json_value
 from cayu.core.events import Event, EventType
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._session_control import (
-    clear_current_task_cancellation,
-    interruption_request_id_from_payload,
-)
+from cayu.runtime._session_control import clear_current_task_cancellation
+from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.sessions import (
     InterruptSessionRequest,

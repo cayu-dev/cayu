@@ -12,17 +12,22 @@ supplied through narrow callbacks by the composition root.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
+import json
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from hashlib import sha256
 from typing import Any, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from cayu._exception_groups import (
+    add_exception_note_safely,
     exception_cause,
     iter_exception_tree,
     set_exception_cause,
@@ -62,7 +67,10 @@ from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
 )
-from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._event_writer import (
+    RuntimeEventWriter,
+    _reconcile_exact_persisted_event,
+)
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
@@ -75,6 +83,12 @@ from cayu.runtime._session_control import (
     SessionControl,
 )
 from cayu.runtime._session_queries import query_all_sessions
+from cayu.runtime._terminal_evidence import (
+    TERMINAL_EVIDENCE_EVENT_TYPES,
+    TERMINAL_EVIDENCE_QUERY_LIMIT,
+    classify_current_terminal_evidence,
+    interruption_request_id_from_payload,
+)
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolApprovalRequired,
@@ -112,6 +126,9 @@ from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
+    MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
+    MAX_SESSION_LIST_CURSOR_BYTES,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     CheckpointTransform,
     EventOrder,
@@ -120,6 +137,7 @@ from cayu.runtime.sessions import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
     RuntimePublicationReceipt,
     Session,
@@ -133,9 +151,13 @@ from cayu.runtime.sessions import (
     TranscriptQuery,
     _activate_session_interaction,
     _activate_session_run_fence,
+    _checkpoint_with_session_run_operation,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+    _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
+    _session_run_operation_from_checkpoint,
+    _SessionRunOperation,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
@@ -171,10 +193,31 @@ _INCOMPLETE_RECOVERY_CLAIM_LEASE = timedelta(minutes=5)
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _INCOMPLETE_RECOVERY_CLAIM_HEARTBEAT_RETRY_SECONDS = 5.0
 _MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS = 0.25
+_TERMINAL_EVIDENCE_REPAIR_NAMESPACE = UUID("bd021bef-ec8f-4e1e-950d-734e2c9ac513")
+_INCOMPLETE_RECOVERY_CURSOR_VERSION = 1
+# Opaque store cursors require consuming each fetched page completely. When
+# only one result slot remains, that can force one-candidate pages; cap the
+# database round trips and continue through Cayu's outer cursor instead.
+_INCOMPLETE_RECOVERY_MAX_STORE_PAGES = 10
+_INCOMPLETE_RECOVERY_STATUS_ORDER = (
+    # Process the target status before states recovery can move into it, so a
+    # continuation page cannot rediscover a session this sweep interrupted.
+    SessionStatus.INTERRUPTED,
+    SessionStatus.INTERRUPTING,
+    SessionStatus.RUNNING,
+    SessionStatus.PENDING,
+    SessionStatus.FAILED,
+    SessionStatus.COMPLETED,
+)
 _RECOVERY_RESUMABLE_SESSION_STATUSES = {
     SessionStatus.COMPLETED,
     SessionStatus.FAILED,
     SessionStatus.INTERRUPTED,
+}
+_TERMINAL_EVENT_TYPE_BY_STATUS = {
+    SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+    SessionStatus.FAILED: EventType.SESSION_FAILED,
+    SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
 }
 _TOOL_ROUND_RECOVERABLE_SESSION_STATUSES = {
     SessionStatus.RUNNING,
@@ -712,6 +755,16 @@ class _IncompleteRecoveryClaim:
     claim_expires_at: datetime
     session_before_fence: Session
     session: Session
+    run_operation: _SessionRunOperation | None = None
+
+
+@dataclass(frozen=True)
+class _TerminalEvidenceInspection:
+    event: Event | None
+    pending_interrupt_payload: dict[str, Any] | None
+    pending_action_interrupt_payload: dict[str, Any] | None
+    run_operation: _SessionRunOperation | None
+    terminal_event_required: bool
 
 
 class _IncompleteRecoveryClaimLost(RuntimeError):
@@ -792,6 +845,11 @@ RecoveryInterruptionStream = Callable[[RecoveryInterruptionRequest], AsyncIterat
 PendingSessionInterruptCheckpoint = Callable[[dict[str, Any], datetime], CheckpointTransform]
 AbandonedTurnCompleted = Callable[[RecoveryAbandonedTurnRequest], Awaitable[Session]]
 IncompleteRecoveryScopeHook = Callable[[str], Awaitable[None]]
+IncompleteRecoveryResultHook = Callable[
+    [IncompleteSessionRecoveryResult],
+    Awaitable[IncompleteSessionRecoveryResult],
+]
+MaterializeDeferredInteractionInput = Callable[[str], Awaitable[bool]]
 ResumeInteraction = Callable[
     [
         Session,
@@ -1702,8 +1760,9 @@ class RecoveryCoordinator:
 
     async def _transition_recovery_session_to_running(
         self,
-        session_id: str,
+        loaded_session: Session,
         *,
+        checkpoint: dict[str, Any] | None,
         from_statuses: set[SessionStatus] | None = None,
         checkpoint_transform: CheckpointTransform | None = None,
     ) -> tuple[Session, Event | None]:
@@ -1716,6 +1775,18 @@ class RecoveryCoordinator:
         arrived, the claim is finalized and released before that cancellation is
         propagated.
         """
+        expected_statuses = (
+            {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
+        )
+        if loaded_session.status in expected_statuses:
+            (
+                loaded_session,
+                checkpoint,
+            ) = await self._reconcile_terminal_evidence_before_continuation(
+                session=loaded_session,
+                checkpoint=checkpoint,
+            )
+        session_id = loaded_session.id
         latest_events = await self._session_store.query_events(
             EventQuery(
                 session_id=session_id,
@@ -1732,9 +1803,7 @@ class RecoveryCoordinator:
         interaction_id = latest_events[0].event.interaction_id
         if interaction_id is None:
             raise RuntimeError("Interaction lifecycle event has no interaction identity.")
-        expected_statuses = (
-            {SessionStatus.INTERRUPTED} if from_statuses is None else set(from_statuses)
-        )
+        run_operation_id = str(uuid4())
 
         def reject_active_incomplete_recovery(
             current_session: Session,
@@ -1744,9 +1813,13 @@ class RecoveryCoordinator:
                 checkpoint,
                 now=self._clock(),
             )
-            if checkpoint_transform is None:
-                return checkpoint
-            return checkpoint_transform(current_session, checkpoint)
+            if checkpoint_transform is not None:
+                checkpoint = checkpoint_transform(current_session, checkpoint)
+            return _checkpoint_with_session_run_operation(
+                checkpoint=checkpoint,
+                current_session=current_session,
+                operation_id=run_operation_id,
+            )
 
         transition_task = asyncio.create_task(
             self._session_store.transition_status_and_checkpoint(
@@ -1891,7 +1964,8 @@ class RecoveryCoordinator:
             loaded_session.environment_name
         )
         session, resumed_event = await self._transition_recovery_session_to_running(
-            loaded_session.id
+            loaded_session,
+            checkpoint=checkpoint,
         )
         if resumed_event is not None:
             yield resumed_event
@@ -1971,7 +2045,8 @@ class RecoveryCoordinator:
             loaded_session.environment_name
         )
         session, resumed_event = await self._transition_recovery_session_to_running(
-            loaded_session.id
+            loaded_session,
+            checkpoint=checkpoint,
         )
         if resumed_event is not None:
             yield resumed_event
@@ -2169,7 +2244,8 @@ class RecoveryCoordinator:
             return claimed_checkpoint
 
         session, resumed_event = await self._transition_recovery_session_to_running(
-            loaded_session.id,
+            loaded_session,
+            checkpoint=checkpoint,
             checkpoint_transform=claim_exact_approval,
         )
         if pending_approval is None or pending_round is None:
@@ -2284,7 +2360,8 @@ class RecoveryCoordinator:
             )
 
         session, resumed_event = await self._transition_recovery_session_to_running(
-            loaded_session.id,
+            loaded_session,
+            checkpoint=checkpoint,
             checkpoint_transform=claim_exact_approval,
         )
         if pending_approval is None or pending_round is None:
@@ -2399,6 +2476,42 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
+        pending_operator_interruption = (
+            checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in checkpoint
+        )
+        if (
+            checkpoint is not None
+            and _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY in checkpoint
+            and not pending_operator_interruption
+        ):
+            raise _ManualRecoveryCascadePending(
+                "Session has an incomplete background interruption cascade."
+            )
+        if (
+            loaded_session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
+            and not pending_operator_interruption
+        ):
+            original_pending_round = pending_round
+            (
+                loaded_session,
+                checkpoint,
+            ) = await self._reconcile_terminal_evidence_before_continuation(
+                session=loaded_session,
+                checkpoint=checkpoint,
+            )
+            pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            if pending_round is None or pending_round != original_pending_round:
+                raise RuntimeError(
+                    "Pending tool round changed while terminal evidence was reconciled."
+                )
+            pending_tool_call = approval_support.round_tool_call_for_recovery(
+                pending_calls=pending_round.tool_calls,
+                tool_call_id=request.tool_call_id,
+            )
         if self._session_control.has_active_tasks(loaded_session.id):
             raise RuntimeError(f"Session has active work in this process: {loaded_session.id}")
         # Reserve the in-process slot before awaiting the durable transition. The
@@ -4674,8 +4787,10 @@ class RecoveryCoordinator:
     ) -> _IncompleteRecoveryClaim | _ManualRecoveryInterruptionFence:
         """Claim recovery or fence an operator interruption that won the race."""
         claim_id = str(uuid4())
+        run_operation_id = str(uuid4())
         claim_expires_at: datetime | None = None
         claim_run_epoch: int | None = None
+        claimed_run_operation_id: str | None = None
         session_before_fence: Session | None = None
 
         def require_matching_pending_call(checkpoint: dict[str, Any] | None) -> None:
@@ -4702,7 +4817,8 @@ class RecoveryCoordinator:
             current_session: Session,
             checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any]:
-            nonlocal claim_expires_at, claim_run_epoch, session_before_fence
+            nonlocal claim_expires_at, claim_run_epoch
+            nonlocal claimed_run_operation_id, session_before_fence
             claimed_at = self._clock()
             _require_aware_datetime(claimed_at, "manual recovery claim clock")
             pending_operator_interruption = (
@@ -4748,7 +4864,20 @@ class RecoveryCoordinator:
                 **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                 "tool_call_id": pending_tool_call.tool_call_id,
             }
-            return updated
+            existing_operation = _session_run_operation_from_checkpoint(updated)
+            if current_session.status == SessionStatus.RUNNING and existing_operation is not None:
+                claimed_run_operation_id = existing_operation.operation_id
+                return _checkpoint_with_rebased_session_run_operation(
+                    updated,
+                    previous_run_epoch=current_session.run_epoch,
+                    run_epoch=claim_run_epoch,
+                )
+            claimed_run_operation_id = run_operation_id
+            return _checkpoint_with_session_run_operation(
+                checkpoint=updated,
+                current_session=current_session,
+                operation_id=run_operation_id,
+            )
 
         transition_task = asyncio.create_task(
             self._session_store.transition_status_and_checkpoint(
@@ -4793,7 +4922,11 @@ class RecoveryCoordinator:
                         **tool_round_recovery.pending_tool_round_identity(pending_round).payload(),
                         "tool_call_id": pending_tool_call.tool_call_id,
                     }
-                    return updated
+                    return _checkpoint_with_rebased_session_run_operation(
+                        updated,
+                        previous_run_epoch=_current_session.run_epoch,
+                        run_epoch=claim_run_epoch,
+                    )
 
                 fence_outcome = await await_shielded_task_outcome(
                     asyncio.create_task(
@@ -4936,6 +5069,7 @@ class RecoveryCoordinator:
         if (
             claim_expires_at is None
             or claim_run_epoch is None
+            or claimed_run_operation_id is None
             or session_before_fence is None
             or claimed_session.run_epoch != claim_run_epoch
         ):
@@ -4966,6 +5100,10 @@ class RecoveryCoordinator:
             claim_expires_at=claim_expires_at,
             session_before_fence=session_before_fence,
             session=claimed_session,
+            run_operation=_SessionRunOperation(
+                operation_id=claimed_run_operation_id,
+                run_epoch=claimed_session.run_epoch,
+            ),
         )
         if outcome.cancellation is None:
             return claim
@@ -5082,6 +5220,7 @@ class RecoveryCoordinator:
             request=request,
             loaded_session=claim.session_before_fence,
             session=claim.session,
+            run_operation=claim.run_operation,
             pending_round=pending_round,
             pending_tool_call=pending_tool_call,
             registered_agent=registered_agent,
@@ -5303,6 +5442,7 @@ class RecoveryCoordinator:
         request: ToolRoundRecoveryRequest,
         loaded_session: Session,
         session: Session,
+        run_operation: _SessionRunOperation | None,
         pending_round: tool_round_recovery.PendingToolRound,
         pending_tool_call: PendingToolCallApproval,
         registered_agent: runtime_records.RegisteredAgentState,
@@ -5311,6 +5451,8 @@ class RecoveryCoordinator:
         effective_structured_output: StructuredOutputSpec | None,
     ) -> AsyncGenerator[Event, None]:
         """Persist one operator-verified ordinary tool outcome and continue safely."""
+        if run_operation is None:
+            raise RuntimeError("Manual tool-round recovery has no durable run operation.")
         recovered_result = ToolResult(
             content=request.message,
             structured=request.structured,
@@ -5549,10 +5691,25 @@ class RecoveryCoordinator:
                         yield event
                     return
                 try:
-                    await self._session_store.transition_status(
+
+                    def restore_checkpoint(
+                        _current_session: Session,
+                        checkpoint: dict[str, Any] | None,
+                    ) -> dict[str, Any] | None:
+                        current_operation = _session_run_operation_from_checkpoint(checkpoint)
+                        if checkpoint is None or current_operation != run_operation:
+                            raise RuntimeError(
+                                "Manual recovery run operation changed before rollback."
+                            )
+                        updated = copy_json_value(checkpoint, "checkpoint")
+                        updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY)
+                        return updated
+
+                    await self._session_store.transition_status_and_checkpoint(
                         session.id,
                         from_statuses={SessionStatus.RUNNING},
                         to_status=loaded_session.status,
+                        checkpoint_transform=restore_checkpoint,
                     )
                 except SessionStatusConflict:
                     current = await self._require_session(session.id)
@@ -6688,19 +6845,34 @@ class RecoveryCoordinator:
         except Exception:
             return
         with contextlib.suppress(BaseException):
-            await self._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=finalized.id,
-                    agent_name=finalized.agent_name,
-                    environment_name=finalized.environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                        "reason": _ABANDONED_RUN_REASON,
-                        "abandoned": True,
-                    },
-                )
+            terminal_event = Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=finalized.id,
+                agent_name=finalized.agent_name,
+                environment_name=finalized.environment_name,
+                payload={
+                    "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                    "reason": _ABANDONED_RUN_REASON,
+                    "abandoned": True,
+                },
             )
+            checkpoint = await self._session_store.load_checkpoint(finalized.id)
+            run_operation = _session_run_operation_from_checkpoint(checkpoint)
+            if run_operation is not None:
+                if run_operation.run_epoch != finalized.run_epoch:
+                    raise RuntimeError(
+                        "Abandoned session run operation does not match the active run epoch."
+                    )
+                terminal_event = _event_with_session_run_operation(
+                    terminal_event,
+                    run_operation,
+                )
+            await self._event_writer.emit(terminal_event)
+            if run_operation is not None:
+                await self._clear_session_run_operation(
+                    session_id=finalized.id,
+                    operation=run_operation,
+                )
 
     async def recover_incomplete_session(
         self,
@@ -6723,85 +6895,209 @@ class RecoveryCoordinator:
         *,
         before_recovery: IncompleteRecoveryScopeHook | None = None,
         after_recovery: IncompleteRecoveryScopeHook | None = None,
-    ) -> list[IncompleteSessionRecoveryResult]:
-        """Fault-isolate recovery across the requested non-terminal sessions."""
-        sessions: list[Session] = []
-        seen_session_ids: set[str] = set()
-        for status in (
-            SessionStatus.INTERRUPTING,
-            SessionStatus.RUNNING,
-            SessionStatus.PENDING,
-        ):
-            if status not in request.statuses:
-                continue
-            if len(sessions) >= request.limit:
-                break
-            candidates = (
-                await self._session_store.list_sessions(
+        reconcile_result: IncompleteRecoveryResultHook | None = None,
+    ) -> IncompleteSessionsRecoveryPage:
+        """Fault-isolate one bounded, resumable recovery page."""
+        requested_statuses = tuple(
+            status for status in _INCOMPLETE_RECOVERY_STATUS_ORDER if status in request.statuses
+        )
+        start_index = 0
+        initial_session_cursor: str | None = None
+        if request.cursor is not None:
+            cursor_status, initial_session_cursor = _decode_incomplete_recovery_cursor(
+                request.cursor,
+                request=request,
+            )
+            start_index = requested_statuses.index(cursor_status)
+
+        results: list[IncompleteSessionRecoveryResult] = []
+        result_session_ids: set[str] = set()
+        inspected_session_count = 0
+        store_page_count = 0
+
+        def continuation_after_status(status_index: int) -> str | None:
+            next_index = status_index + 1
+            if next_index >= len(requested_statuses):
+                return None
+            return _encode_incomplete_recovery_cursor(
+                status=requested_statuses[next_index],
+                session_cursor=None,
+                request=request,
+            )
+
+        for status_index in range(start_index, len(requested_statuses)):
+            status = requested_statuses[status_index]
+            terminal_status = status in _RECOVERY_RESUMABLE_SESSION_STATUSES
+            cursor = initial_session_cursor if status_index == start_index else None
+            seen_cursors = set() if cursor is None else {cursor}
+            while (
+                len(results) < request.limit and inspected_session_count < request.inspection_limit
+            ):
+                inspection_remaining = request.inspection_limit - inspected_session_count
+                result_remaining = request.limit - len(results)
+                # SessionStore cursors are opaque. Never stop partway through a
+                # store page and try to synthesize a cursor from a Session:
+                # custom stores may not use Cayu's built-in cursor encoding.
+                # With at most one result per candidate and a page no larger
+                # than the remaining result capacity, either bound can be
+                # reached only on the final candidate in this store page.
+                query_limit = min(1000, inspection_remaining, result_remaining)
+                page = await self._session_store.list_sessions(
                     SessionQuery(
                         status=status,
                         last_activity_before=request.inactive_before,
-                        limit=min(1000, request.limit - len(sessions)),
+                        limit=query_limit,
+                        cursor=cursor,
+                        order_by=SessionOrder.UPDATED_AT_DESC,
                     )
                 )
-            ).sessions
-            for candidate in candidates:
-                if (
-                    request.inactive_before is not None
-                    and candidate.last_activity_at > request.inactive_before
-                ):
-                    continue
-                if candidate.id in seen_session_ids:
-                    continue
-                seen_session_ids.add(candidate.id)
-                sessions.append(candidate)
-                if len(sessions) >= request.limit:
+                store_page_count += 1
+                if not page.sessions:
+                    if page.next_cursor is not None:
+                        raise RuntimeError(
+                            "Session store returned an empty recovery page with a cursor."
+                        )
+                    if store_page_count >= _INCOMPLETE_RECOVERY_MAX_STORE_PAGES:
+                        return IncompleteSessionsRecoveryPage(
+                            results=tuple(results),
+                            inspected_session_count=inspected_session_count,
+                            next_cursor=continuation_after_status(status_index),
+                        )
                     break
-
-        results: list[IncompleteSessionRecoveryResult] = []
-        for session in sessions:
-            try:
-                if before_recovery is not None:
-                    await before_recovery(session.id)
-                try:
-                    result = await self._recover_incomplete_session_scoped(
-                        session=session,
-                        inactive_before=request.inactive_before,
-                        reason=request.reason,
-                        metadata=request.metadata,
+                if len(page.sessions) > query_limit:
+                    raise RuntimeError(
+                        "Session store returned more recovery candidates than requested."
                     )
-                finally:
-                    if after_recovery is not None:
-                        await after_recovery(session.id)
-            except Exception as exc:
-                diagnostic = exception_diagnostic(
-                    exc,
-                    empty_message="recovery failed",
-                    nonportable_message="Recovery failed with a non-portable diagnostic.",
-                    redactor=self._secret_redactor,
+                encoded_page_cursor: str | None = None
+                if page.next_cursor is not None:
+                    if page.next_cursor in seen_cursors:
+                        raise RuntimeError(
+                            "Session store returned a repeated cursor during "
+                            "incomplete-session recovery."
+                        )
+                    encoded_page_cursor = _encode_incomplete_recovery_cursor(
+                        status=status,
+                        session_cursor=page.next_cursor,
+                        request=request,
+                    )
+
+                for candidate_index, candidate in enumerate(page.sessions):
+                    inspected_session_count += 1
+                    if (
+                        request.inactive_before is not None
+                        and candidate.last_activity_at > request.inactive_before
+                    ) or candidate.id in result_session_ids:
+                        result = None
+                    else:
+                        result = await self._recover_incomplete_session_fault_isolated(
+                            session=candidate,
+                            request=request,
+                            before_recovery=before_recovery,
+                            after_recovery=after_recovery,
+                            reconcile_result=reconcile_result,
+                        )
+                    if result is not None and not (
+                        terminal_status
+                        and result.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+                    ):
+                        results.append(result)
+                        result_session_ids.add(result.session_id)
+
+                    result_limit_reached = len(results) >= request.limit
+                    inspection_limit_reached = inspected_session_count >= request.inspection_limit
+                    if not result_limit_reached and not inspection_limit_reached:
+                        continue
+
+                    if candidate_index + 1 < len(page.sessions):
+                        raise RuntimeError(
+                            "Incomplete-session recovery reached a page bound before "
+                            "consuming the store page."
+                        )
+                    next_cursor = (
+                        encoded_page_cursor
+                        if encoded_page_cursor is not None
+                        else continuation_after_status(status_index)
+                    )
+                    return IncompleteSessionsRecoveryPage(
+                        results=tuple(results),
+                        inspected_session_count=inspected_session_count,
+                        next_cursor=next_cursor,
+                    )
+
+                if store_page_count >= _INCOMPLETE_RECOVERY_MAX_STORE_PAGES:
+                    next_cursor = (
+                        encoded_page_cursor
+                        if encoded_page_cursor is not None
+                        else continuation_after_status(status_index)
+                    )
+                    return IncompleteSessionsRecoveryPage(
+                        results=tuple(results),
+                        inspected_session_count=inspected_session_count,
+                        next_cursor=next_cursor,
+                    )
+                if page.next_cursor is None:
+                    break
+                seen_cursors.add(page.next_cursor)
+                cursor = page.next_cursor
+
+            initial_session_cursor = None
+
+        return IncompleteSessionsRecoveryPage(
+            results=tuple(results),
+            inspected_session_count=inspected_session_count,
+            next_cursor=None,
+        )
+
+    async def _recover_incomplete_session_fault_isolated(
+        self,
+        *,
+        session: Session,
+        request: IncompleteSessionsRecoveryRequest,
+        before_recovery: IncompleteRecoveryScopeHook | None,
+        after_recovery: IncompleteRecoveryScopeHook | None,
+        reconcile_result: IncompleteRecoveryResultHook | None,
+    ) -> IncompleteSessionRecoveryResult:
+        try:
+            if before_recovery is not None:
+                await before_recovery(session.id)
+            try:
+                result = await self._recover_incomplete_session_scoped(
+                    session=session,
+                    inactive_before=request.inactive_before,
+                    reason=request.reason,
+                    metadata=request.metadata,
                 )
-                logger.warning(
-                    "Recovery failed for session %s (agent %s): error_type=%s error=%s",
-                    session.id,
-                    session.agent_name,
-                    diagnostic.error_type,
-                    diagnostic.message,
-                )
-                try:
-                    reloaded = await self._session_store.load(session.id)
-                except Exception:
-                    reloaded = None
-                result = IncompleteSessionRecoveryResult(
-                    session_id=session.id,
-                    previous_status=session.status,
-                    status=session.status if reloaded is None else reloaded.status,
-                    actions=(IncompleteSessionRecoveryAction.FAILED,),
-                    message=bound_diagnostic_text(
-                        f"Recovery failed: {diagnostic.error_type}: {diagnostic.message}"
-                    ),
-                )
-            results.append(result)
-        return results
+                return result if reconcile_result is None else await reconcile_result(result)
+            finally:
+                if after_recovery is not None:
+                    await after_recovery(session.id)
+        except Exception as exc:
+            diagnostic = exception_diagnostic(
+                exc,
+                empty_message="recovery failed",
+                nonportable_message="Recovery failed with a non-portable diagnostic.",
+                redactor=self._secret_redactor,
+            )
+            logger.warning(
+                "Recovery failed for session %s (agent %s): error_type=%s error=%s",
+                session.id,
+                session.agent_name,
+                diagnostic.error_type,
+                diagnostic.message,
+            )
+            try:
+                reloaded = await self._session_store.load(session.id)
+            except Exception:
+                reloaded = None
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=session.status,
+                status=session.status if reloaded is None else reloaded.status,
+                actions=(IncompleteSessionRecoveryAction.FAILED,),
+                message=bound_diagnostic_text(
+                    f"Recovery failed: {diagnostic.error_type}: {diagnostic.message}"
+                ),
+            )
 
     async def _recover_incomplete_session_scoped(
         self,
@@ -6860,25 +7156,44 @@ class RecoveryCoordinator:
             consume_on_rejection=True,
         )
         deferred_input = await self._session_store.load_deferred_interaction_input(session.id)
-        if (
-            session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES
-            and pending_approval is None
-            and pending_user_input is None
-            and pending_tool_round is None
-            and deferred_input is None
-        ):
-            return IncompleteSessionRecoveryResult(
-                session_id=session.id,
-                previous_status=previous_status,
-                status=session.status,
-                actions=(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,),
-                events=(),
-                message="Session is terminal; recovery skipped.",
+        terminal_repair_required = False
+        if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES:
+            terminal_repair = await self._terminal_evidence_repair_required(
+                session=session,
+                checkpoint=checkpoint,
             )
+            terminal_repair_required = terminal_repair
+            has_pending_work = (
+                pending_approval is not None
+                or pending_user_input is not None
+                or pending_tool_round is not None
+                or deferred_input is not None
+            )
+            if not terminal_repair and not has_pending_work:
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=session.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,),
+                    events=(),
+                    message="Session is terminal and has durable terminal evidence.",
+                )
+            if terminal_repair and not has_pending_work:
+                return await self._repair_terminal_evidence_owned(
+                    session=session,
+                    inactive_before=inactive_before,
+                    previous_status=previous_status,
+                )
 
         try:
             registered_agent = self._resolve_registered_agent(session.agent_name)
         except KeyError:
+            if terminal_repair_required:
+                return await self._repair_terminal_evidence_owned(
+                    session=session,
+                    inactive_before=inactive_before,
+                    previous_status=previous_status,
+                )
             return IncompleteSessionRecoveryResult(
                 session_id=session.id,
                 previous_status=previous_status,
@@ -6887,7 +7202,16 @@ class RecoveryCoordinator:
                 events=(),
                 message=(f"Agent not registered: {session.agent_name!r}; session left untouched."),
             )
-        registered_environment = self._resolve_registered_environment(session.environment_name)
+        try:
+            registered_environment = self._resolve_registered_environment(session.environment_name)
+        except KeyError:
+            if terminal_repair_required:
+                return await self._repair_terminal_evidence_owned(
+                    session=session,
+                    inactive_before=inactive_before,
+                    previous_status=previous_status,
+                )
+            raise
 
         claim: _IncompleteRecoveryClaim | None = None
         authoritative_failure: BaseException | None = None
@@ -6917,6 +7241,7 @@ class RecoveryCoordinator:
                     metadata=metadata,
                     registered_agent=registered_agent,
                     registered_environment=registered_environment,
+                    claim_id=claim.claim_id,
                 ),
             )
         except BaseException as exc:
@@ -6929,6 +7254,505 @@ class RecoveryCoordinator:
                     claim_id=claim.claim_id,
                     authoritative_failure=authoritative_failure,
                 )
+
+    async def _terminal_evidence_repair_required(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> bool:
+        inspection = await self._inspect_terminal_evidence(
+            session=session,
+            checkpoint=checkpoint,
+        )
+        return (
+            (inspection.event is None and inspection.terminal_event_required)
+            or inspection.pending_interrupt_payload is not None
+            or inspection.run_operation is not None
+            or (checkpoint is not None and _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY in checkpoint)
+        )
+
+    async def _reconcile_terminal_evidence_before_continuation(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> tuple[Session, dict[str, Any] | None]:
+        """Finish a previous run's terminal publication before claiming the next run."""
+        existing_claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+        now = self._clock()
+        _require_aware_datetime(now, "terminal evidence reconciliation clock")
+        if existing_claim is not None and existing_claim[1] > now:
+            raise RuntimeError("Session has an active incomplete-session recovery operation.")
+        if session.status not in _RECOVERY_RESUMABLE_SESSION_STATUSES:
+            if _session_run_operation_from_checkpoint(checkpoint) is None:
+                return session, checkpoint
+            raise RuntimeError(
+                "A non-terminal session retains incomplete terminal evidence for a prior run."
+            )
+        if not await self._terminal_evidence_repair_required(
+            session=session,
+            checkpoint=checkpoint,
+        ):
+            return session, checkpoint
+        if self._session_control.has_active_tasks(session.id):
+            raise RuntimeError(
+                f"Session has active work while terminal evidence is incomplete: {session.id}"
+            )
+        await self._repair_terminal_evidence_owned(
+            session=session,
+            inactive_before=None,
+            previous_status=session.status,
+        )
+        current = await self._require_session(session.id)
+        current_checkpoint = await self._session_store.load_checkpoint(session.id)
+        if await self._terminal_evidence_repair_required(
+            session=current,
+            checkpoint=current_checkpoint,
+        ):
+            current_claim = _incomplete_recovery_claim_from_checkpoint(current_checkpoint)
+            current_now = self._clock()
+            _require_aware_datetime(
+                current_now,
+                "terminal evidence reconciliation clock",
+            )
+            if current_claim is not None and current_claim[1] > current_now:
+                raise RuntimeError("Session has an active incomplete-session recovery operation.")
+            raise RuntimeError(
+                "Session terminal evidence recovery did not finish the previous run boundary."
+            )
+        return current, current_checkpoint
+
+    async def _inspect_terminal_evidence(
+        self,
+        *,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> _TerminalEvidenceInspection:
+        expected_event_type = _TERMINAL_EVENT_TYPE_BY_STATUS.get(session.status)
+        if expected_event_type is None:
+            raise ValueError(f"Session is not terminal: {session.status}.")
+        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+
+        pending_interrupt_payload: dict[str, Any] | None = None
+        pending_interrupt_request_id: str | None = None
+        if checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in checkpoint:
+            marker = checkpoint[_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY]
+            if type(marker) is not dict:
+                raise ValueError("Pending session interrupt checkpoint must be an object.")
+            pending_interrupt_payload = copy_json_value(marker, "pending_session_interrupt")
+            if session.status != SessionStatus.INTERRUPTED:
+                raise RuntimeError(
+                    "Terminal evidence is contradictory: a non-interrupted session retains "
+                    "a pending interruption marker."
+                )
+            pending_interrupt_request_id = interruption_request_id_from_payload(
+                pending_interrupt_payload
+            )
+            if pending_interrupt_request_id is None:
+                raise RuntimeError(
+                    "Terminal evidence is not repairable: the pending interruption marker "
+                    "has no stable request identity."
+                )
+
+        pending_approval = approval_support.pending_approval_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_user_input = pending_user_input_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        pending_tool_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        approval_owns_tool_round = False
+        if pending_approval is not None and pending_tool_round is not None:
+            _pending_approval_and_round_for_atomic_claim(
+                checkpoint,
+                approval_id=pending_approval.approval_id,
+                tool_round_id=pending_approval.tool_round_id,
+                gating_tool_call_id=pending_approval.tool_call_id,
+                redactor=self._secret_redactor,
+            )
+            approval_owns_tool_round = True
+        pending_actions = tuple(
+            action
+            for action in (
+                pending_approval,
+                pending_user_input,
+                None if approval_owns_tool_round else pending_tool_round,
+            )
+            if action is not None
+        )
+        if len(pending_actions) > 1:
+            raise RuntimeError(
+                "Terminal evidence is not repairable: the checkpoint contains "
+                "conflicting pending actions."
+            )
+        pending_action_interrupt_payload: dict[str, Any] | None = None
+        if pending_approval is not None and session.status == SessionStatus.INTERRUPTED:
+            pending_action_interrupt_payload = {
+                "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                "model_step_id": pending_approval.model_step_id,
+                "model_attempt_id": pending_approval.model_attempt_id,
+                "tool_round_id": pending_approval.tool_round_id,
+                "approval": pending_approval.model_dump(mode="json"),
+            }
+        elif pending_user_input is not None and session.status == SessionStatus.INTERRUPTED:
+            pending_action_interrupt_payload = {
+                "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                "model_step_id": pending_user_input.model_step_id,
+                "model_attempt_id": pending_user_input.model_attempt_id,
+                "tool_round_id": pending_user_input.tool_round_id,
+                "user_input": pending_user_input.model_dump(mode="json"),
+            }
+        elif pending_tool_round is not None and session.status == SessionStatus.INTERRUPTED:
+            pending_action_interrupt_payload = {
+                **tool_round_recovery.pending_tool_round_identity(pending_tool_round).payload(),
+                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                "reason": "terminal_event_evidence_repaired",
+                "recovered": True,
+            }
+
+        evidence_records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                event_types=TERMINAL_EVIDENCE_EVENT_TYPES,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=TERMINAL_EVIDENCE_QUERY_LIMIT,
+            )
+        )
+        classification = classify_current_terminal_evidence(
+            evidence_events=tuple(record.event for record in evidence_records),
+            expected_event_type=expected_event_type,
+            run_operation_id=(None if run_operation is None else run_operation.operation_id),
+            interruption_request_id=pending_interrupt_request_id,
+        )
+        terminal_events = classification.events
+        if classification.run_operation_conflict:
+            raise RuntimeError(
+                "Terminal evidence is contradictory: the interruption event and "
+                "pending run operation have different identities."
+            )
+        if any(event.type != expected_event_type for event in terminal_events):
+            raise RuntimeError(
+                "Terminal evidence is contradictory: the durable event type does not "
+                f"match session status {session.status.value}."
+            )
+        if len(terminal_events) > 1:
+            raise RuntimeError(
+                "Terminal evidence is contradictory: more than one terminal event exists "
+                "for the current run."
+            )
+
+        existing_event = None if not terminal_events else terminal_events[0].model_copy(deep=True)
+        return _TerminalEvidenceInspection(
+            event=existing_event,
+            pending_interrupt_payload=pending_interrupt_payload,
+            pending_action_interrupt_payload=pending_action_interrupt_payload,
+            run_operation=run_operation,
+            terminal_event_required=(
+                run_operation is not None
+                or pending_interrupt_payload is not None
+                or pending_action_interrupt_payload is not None
+                or classification.latest_lifecycle_event_type != EventType.SESSION_FORKED
+            ),
+        )
+
+    async def _repair_terminal_evidence_owned(
+        self,
+        *,
+        session: Session,
+        inactive_before: datetime | None,
+        previous_status: SessionStatus,
+    ) -> IncompleteSessionRecoveryResult:
+        claim: _IncompleteRecoveryClaim | None = None
+        authoritative_failure: BaseException | None = None
+        try:
+            claim = await self._claim_incomplete_recovery(
+                session=session,
+                inactive_before=inactive_before,
+            )
+            if claim is None:
+                current = await self._require_session(session.id)
+                return IncompleteSessionRecoveryResult(
+                    session_id=session.id,
+                    previous_status=previous_status,
+                    status=current.status,
+                    actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    events=(),
+                    message="Session activity or recovery ownership changed; recovery skipped.",
+                )
+            return await self._recover_incomplete_session_with_heartbeat(
+                claim=claim,
+                recovery=lambda: self._repair_terminal_evidence(
+                    session=claim.session,
+                    terminal_run_epoch=claim.session_before_fence.run_epoch,
+                    terminal_timestamp=claim.session_before_fence.updated_at,
+                    previous_status=previous_status,
+                    claim_id=claim.claim_id,
+                ),
+            )
+        except BaseException as exc:
+            authoritative_failure = exc
+            raise
+        finally:
+            if claim is not None:
+                await self._cleanup_incomplete_recovery_claim(
+                    session_id=session.id,
+                    claim_id=claim.claim_id,
+                    authoritative_failure=authoritative_failure,
+                )
+
+    async def _repair_terminal_evidence(
+        self,
+        *,
+        session: Session,
+        terminal_run_epoch: int,
+        terminal_timestamp: datetime,
+        previous_status: SessionStatus,
+        claim_id: str,
+    ) -> IncompleteSessionRecoveryResult:
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        inspection = await self._inspect_terminal_evidence(
+            session=session,
+            checkpoint=checkpoint,
+        )
+        terminal_event = inspection.event
+        if terminal_event is None and inspection.terminal_event_required:
+            terminal_event = await self._persist_terminal_evidence_repair_event(
+                self._terminal_evidence_repair_event(
+                    session=session,
+                    terminal_run_epoch=terminal_run_epoch,
+                    terminal_timestamp=terminal_timestamp,
+                    pending_interrupt_payload=inspection.pending_interrupt_payload,
+                    pending_action_interrupt_payload=(inspection.pending_action_interrupt_payload),
+                    run_operation=inspection.run_operation,
+                )
+            )
+
+        if inspection.pending_interrupt_payload is not None:
+            await self._clear_repaired_pending_interrupt(
+                session_id=session.id,
+                claim_id=claim_id,
+                expected_payload=inspection.pending_interrupt_payload,
+            )
+        if inspection.run_operation is not None:
+            await self._clear_session_run_operation(
+                session_id=session.id,
+                operation=inspection.run_operation,
+                required_claim_id=claim_id,
+            )
+
+        if terminal_event is not None:
+            try:
+                await self._event_writer.fan_out_persisted([terminal_event])
+            except Exception as exc:
+                logger.warning(
+                    "Terminal evidence was repaired but durable side-effect delivery remains "
+                    "pending: session_id=%s event_id=%s error_type=%s",
+                    session.id,
+                    terminal_event.id,
+                    type(exc).__name__,
+                )
+
+        current = await self._require_session(session.id)
+        if current.status != session.status or current.run_epoch != session.run_epoch:
+            raise RuntimeError("Terminal session changed while its evidence was repaired.")
+        return IncompleteSessionRecoveryResult(
+            session_id=session.id,
+            previous_status=previous_status,
+            status=current.status,
+            actions=(IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,),
+            events=(() if terminal_event is None else (terminal_event,)),
+            message=(
+                "Reconciled durable terminal evidence."
+                if terminal_event is None
+                else "Repaired durable terminal event evidence."
+            ),
+        )
+
+    def _terminal_evidence_repair_event(
+        self,
+        *,
+        session: Session,
+        terminal_run_epoch: int,
+        terminal_timestamp: datetime,
+        pending_interrupt_payload: dict[str, Any] | None,
+        pending_action_interrupt_payload: dict[str, Any] | None,
+        run_operation: _SessionRunOperation | None,
+    ) -> Event:
+        event_type = _TERMINAL_EVENT_TYPE_BY_STATUS[session.status]
+        pending_interrupt_request_id = (
+            None
+            if pending_interrupt_payload is None
+            else interruption_request_id_from_payload(pending_interrupt_payload)
+        )
+        if pending_interrupt_request_id is not None:
+            operation_identity = f"interrupt_request:{pending_interrupt_request_id}"
+        elif run_operation is not None:
+            operation_identity = run_operation.operation_id
+        else:
+            operation_identity = f"run_epoch:{terminal_run_epoch}"
+        event_id = str(
+            uuid5(
+                _TERMINAL_EVIDENCE_REPAIR_NAMESPACE,
+                f"{session.id}\0{operation_identity}\0{session.status.value}",
+            )
+        )
+        if session.status == SessionStatus.COMPLETED:
+            payload: dict[str, Any] = {
+                "recovered": True,
+                "terminal_evidence_repaired": True,
+            }
+        elif session.status == SessionStatus.FAILED:
+            payload = {
+                "error": "Original terminal failure details were not durably recorded.",
+                "error_type": "TerminalFailureEvidenceUnavailable",
+                "recovered": True,
+                "terminal_evidence_repaired": True,
+            }
+        elif pending_interrupt_payload is not None:
+            payload = copy_json_value(
+                pending_interrupt_payload,
+                "pending_session_interrupt",
+            )
+        elif pending_action_interrupt_payload is not None:
+            payload = copy_json_value(
+                pending_action_interrupt_payload,
+                "pending_action_interrupt",
+            )
+        else:
+            payload = {
+                "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+                "reason": "terminal_event_evidence_repaired",
+                "recovered": True,
+                "terminal_evidence_repaired": True,
+            }
+        event = Event(
+            id=event_id,
+            type=event_type,
+            session_id=session.id,
+            timestamp=terminal_timestamp,
+            agent_name=session.agent_name,
+            environment_name=session.environment_name,
+            payload=payload,
+        )
+        return (
+            event
+            if run_operation is None
+            else _event_with_session_run_operation(event, run_operation)
+        )
+
+    async def _persist_terminal_evidence_repair_event(self, event: Event) -> Event:
+        # Freeze the publication-safe shape before the append attempt. The
+        # writer may redact workload secrets, so acknowledgement-loss
+        # reconciliation must compare durable evidence with this prepared
+        # snapshot rather than with the raw checkpoint-derived payload.
+        event = self._event_writer.prepare(event)
+        try:
+            return await self._event_writer.persist(event)
+        except Exception as append_failure:
+            try:
+                records = await self._session_store.query_events(
+                    EventQuery(
+                        session_id=event.session_id,
+                        event_id=event.id,
+                        limit=1,
+                    )
+                )
+            except Exception as reconciliation_failure:
+                add_exception_note_safely(
+                    append_failure,
+                    "Terminal evidence append reconciliation failed: "
+                    f"{type(reconciliation_failure).__name__}.",
+                )
+                raise ExceptionGroup(
+                    "Terminal evidence append and reconciliation both failed.",
+                    [append_failure, reconciliation_failure],
+                ) from None
+            try:
+                persisted = _reconcile_exact_persisted_event(
+                    event,
+                    records,
+                    conflict_message=(
+                        "Terminal evidence repair event identity is already used by "
+                        "different durable evidence."
+                    ),
+                )
+            except RuntimeError as conflict:
+                raise conflict from append_failure
+            if persisted is None:
+                raise
+            return persisted
+
+    async def _clear_repaired_pending_interrupt(
+        self,
+        *,
+        session_id: str,
+        claim_id: str,
+        expected_payload: dict[str, Any],
+    ) -> None:
+        def clear_marker(
+            current_session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            if current_session.status != SessionStatus.INTERRUPTED:
+                raise RuntimeError("Session status changed during terminal interruption repair.")
+            if checkpoint is None:
+                raise _IncompleteRecoveryClaimLost(
+                    "Terminal evidence recovery checkpoint disappeared."
+                )
+            updated = copy_json_value(checkpoint, "checkpoint")
+            claim = _incomplete_recovery_claim_from_checkpoint(updated)
+            if claim is None or claim[0] != claim_id:
+                raise _IncompleteRecoveryClaimLost(
+                    "Terminal evidence recovery ownership changed before marker cleanup."
+                )
+            current_payload = updated.get(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            if current_payload != expected_payload:
+                raise RuntimeError(
+                    "Pending interruption identity changed during terminal evidence repair."
+                )
+            updated.pop(_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY)
+            return updated
+
+        await self._session_store.transform_checkpoint(session_id, clear_marker)
+
+    async def _clear_session_run_operation(
+        self,
+        *,
+        session_id: str,
+        operation: _SessionRunOperation,
+        required_claim_id: str | None = None,
+    ) -> None:
+        def clear_operation(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            current_operation = _session_run_operation_from_checkpoint(checkpoint)
+            if current_operation is None:
+                return checkpoint
+            if current_operation != operation:
+                raise RuntimeError(
+                    "Session run operation changed before terminal evidence cleanup."
+                )
+            if required_claim_id is not None:
+                claim = _incomplete_recovery_claim_from_checkpoint(checkpoint)
+                if claim is None or claim[0] != required_claim_id:
+                    raise _IncompleteRecoveryClaimLost(
+                        "Terminal evidence recovery ownership changed before run cleanup."
+                    )
+            updated = copy_json_value(checkpoint, "checkpoint")
+            updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY)
+            return updated
+
+        await self._session_store.transform_checkpoint(session_id, clear_operation)
 
     async def _cleanup_incomplete_recovery_claim(
         self,
@@ -7012,7 +7836,8 @@ class RecoveryCoordinator:
                         "Expired incomplete-session recovery ownership changed."
                     )
                 claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
-                claim_run_epoch = current_session.run_epoch + 1
+                next_run_epoch = current_session.run_epoch + 1
+                claim_run_epoch = next_run_epoch
                 session_before_fence = current_session.model_copy(deep=True)
                 updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
                 updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
@@ -7021,7 +7846,11 @@ class RecoveryCoordinator:
                     "claimed_at": claimed_at.isoformat(),
                     "claim_expires_at": claim_expires_at.isoformat(),
                 }
-                return updated
+                return _checkpoint_with_rebased_session_run_operation(
+                    updated,
+                    previous_run_epoch=current_session.run_epoch,
+                    run_epoch=next_run_epoch,
+                )
 
             fence_task = asyncio.create_task(
                 self._session_store.fence_run_and_transform_checkpoint(
@@ -7153,7 +7982,8 @@ class RecoveryCoordinator:
                     "Incomplete-session recovery ownership changed before it was claimed."
                 )
             claim_expires_at = claimed_at + _INCOMPLETE_RECOVERY_CLAIM_LEASE
-            claim_run_epoch = current_session.run_epoch + 1
+            next_run_epoch = current_session.run_epoch + 1
+            claim_run_epoch = next_run_epoch
             session_before_fence = current_session.model_copy(deep=True)
             updated = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
             updated[_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY] = {
@@ -7162,7 +7992,11 @@ class RecoveryCoordinator:
                 "claimed_at": claimed_at.isoformat(),
                 "claim_expires_at": claim_expires_at.isoformat(),
             }
-            return updated
+            return _checkpoint_with_rebased_session_run_operation(
+                updated,
+                previous_run_epoch=current_session.run_epoch,
+                run_epoch=next_run_epoch,
+            )
 
         fence_claimed = False
         try:
@@ -7502,6 +8336,7 @@ class RecoveryCoordinator:
         metadata: dict[str, Any],
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
+        claim_id: str,
     ) -> IncompleteSessionRecoveryResult:
         actions: list[IncompleteSessionRecoveryAction] = []
         events: list[Event] = []
@@ -7522,6 +8357,24 @@ class RecoveryCoordinator:
             consume_on_rejection=True,
         )
         environment_name = _environment_name(registered_environment)
+
+        if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES and (
+            await self._terminal_evidence_repair_required(
+                session=session,
+                checkpoint=checkpoint,
+            )
+        ):
+            repaired = await self._repair_terminal_evidence(
+                session=session,
+                terminal_run_epoch=session_before_fence.run_epoch,
+                terminal_timestamp=session_before_fence.updated_at,
+                previous_status=previous_status,
+                claim_id=claim_id,
+            )
+            actions.extend(repaired.actions)
+            events.extend(repaired.events)
+            session = await self._require_session(session.id)
+            checkpoint = await self._session_store.load_checkpoint(session.id)
 
         if inactive_before is not None:
             events.append(
@@ -7838,6 +8691,148 @@ def _checkpoint_without_active_incomplete_recovery_claim(
     if existing[1] > now:
         raise RuntimeError("Session has an active incomplete-session recovery operation.")
     updated.pop(_INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY, None)
+    return updated
+
+
+def _incomplete_recovery_request_fingerprint(
+    request: IncompleteSessionsRecoveryRequest,
+) -> str:
+    material = {
+        "statuses": sorted(status.value for status in request.statuses),
+        "inactive_before": (
+            None if request.inactive_before is None else request.inactive_before.isoformat()
+        ),
+        "reason": request.reason,
+        "metadata": request.metadata,
+    }
+    return sha256(
+        canonical_durable_json_bytes(material, "incomplete sessions recovery cursor")
+    ).hexdigest()
+
+
+def _encode_incomplete_recovery_cursor(
+    *,
+    status: SessionStatus,
+    session_cursor: str | None,
+    request: IncompleteSessionsRecoveryRequest,
+) -> str:
+    if status not in request.statuses:
+        raise ValueError("Recovery cursor status is not part of the request.")
+    encoded_session_cursor: str | None = None
+    if session_cursor is not None:
+        session_cursor = require_clean_nonblank(session_cursor, "session cursor")
+        session_cursor_bytes = session_cursor.encode("utf-8")
+        if len(session_cursor_bytes) > MAX_SESSION_LIST_CURSOR_BYTES:
+            raise ValueError(
+                "Session-store recovery cursor exceeds its "
+                f"{MAX_SESSION_LIST_CURSOR_BYTES}-byte contract."
+            )
+        encoded_session_cursor = base64.urlsafe_b64encode(session_cursor_bytes).decode("ascii")
+    material = {
+        "version": _INCOMPLETE_RECOVERY_CURSOR_VERSION,
+        "status": status.value,
+        "session_cursor_b64": encoded_session_cursor,
+        "request_fingerprint": _incomplete_recovery_request_fingerprint(request),
+    }
+    encoded = base64.urlsafe_b64encode(
+        canonical_durable_json_bytes(material, "incomplete sessions recovery cursor")
+    ).decode("ascii")
+    if len(encoded.encode("ascii")) > MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES:
+        raise RuntimeError("Incomplete-session recovery cursor exceeds its byte limit.")
+    return encoded
+
+
+def _decode_incomplete_recovery_cursor(
+    cursor: str,
+    *,
+    request: IncompleteSessionsRecoveryRequest,
+) -> tuple[SessionStatus, str | None]:
+    try:
+        if len(cursor.encode("utf-8")) > MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES:
+            raise ValueError("Incomplete-session recovery cursor exceeds its byte limit.")
+        encoded_cursor = cursor.encode("ascii")
+        raw = base64.b64decode(
+            encoded_cursor,
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(raw) != encoded_cursor:
+            raise ValueError("Non-canonical incomplete-session recovery cursor.")
+        decoded = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, binascii.Error, ValueError) as exc:
+        raise ValueError("Invalid incomplete-session recovery cursor.") from exc
+    expected_keys = {
+        "version",
+        "status",
+        "session_cursor_b64",
+        "request_fingerprint",
+    }
+    if type(decoded) is not dict or set(decoded) != expected_keys:
+        raise ValueError("Invalid incomplete-session recovery cursor.")
+    if (
+        type(decoded["version"]) is not int
+        or decoded["version"] != _INCOMPLETE_RECOVERY_CURSOR_VERSION
+    ):
+        raise ValueError("Unsupported incomplete-session recovery cursor version.")
+    try:
+        status = SessionStatus(decoded["status"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid incomplete-session recovery cursor status.") from exc
+    if status not in request.statuses:
+        raise ValueError("Incomplete-session recovery cursor does not match the request.")
+    if type(decoded["request_fingerprint"]) is not str or decoded[
+        "request_fingerprint"
+    ] != _incomplete_recovery_request_fingerprint(request):
+        raise ValueError("Incomplete-session recovery cursor does not match the request.")
+    encoded_session_cursor = decoded["session_cursor_b64"]
+    session_cursor: str | None = None
+    if encoded_session_cursor is not None:
+        if type(encoded_session_cursor) is not str:
+            raise ValueError("Invalid incomplete-session recovery cursor.")
+        try:
+            encoded_session_cursor_bytes = encoded_session_cursor.encode("ascii")
+            session_cursor_bytes = base64.b64decode(
+                encoded_session_cursor_bytes,
+                altchars=b"-_",
+                validate=True,
+            )
+            if base64.urlsafe_b64encode(session_cursor_bytes) != encoded_session_cursor_bytes:
+                raise ValueError("Non-canonical session-store recovery cursor.")
+            if len(session_cursor_bytes) > MAX_SESSION_LIST_CURSOR_BYTES:
+                raise ValueError("Session-store recovery cursor exceeds its byte limit.")
+            session_cursor = require_clean_nonblank(
+                session_cursor_bytes.decode("utf-8"),
+                "session cursor",
+            )
+        except (UnicodeError, binascii.Error, ValueError) as exc:
+            raise ValueError("Invalid incomplete-session recovery cursor.") from exc
+    return status, session_cursor
+
+
+def _checkpoint_with_rebased_session_run_operation(
+    checkpoint: dict[str, Any],
+    *,
+    previous_run_epoch: int,
+    run_epoch: int,
+) -> dict[str, Any]:
+    """Transfer an unfinished run publication to a newly fenced recovery epoch."""
+    if run_epoch != previous_run_epoch + 1:
+        raise ValueError(
+            "A session run operation can be rebased only to the next fenced run epoch."
+        )
+    operation = _session_run_operation_from_checkpoint(checkpoint)
+    if operation is None:
+        return checkpoint
+    if operation.run_epoch > previous_run_epoch:
+        raise RuntimeError(
+            "Session run operation belongs to a future run epoch and cannot be recovered."
+        )
+    updated = copy_json_value(checkpoint, "checkpoint")
+    updated[_SESSION_RUN_OPERATION_CHECKPOINT_KEY] = {
+        "version": 1,
+        "operation_id": operation.operation_id,
+        "run_epoch": run_epoch,
+    }
     return updated
 
 

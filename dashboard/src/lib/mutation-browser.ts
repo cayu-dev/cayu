@@ -221,7 +221,14 @@ export function createMutationBrowserIO(
               const error = parseMutationSseError(message.data)
               throw new MutationAttemptStopped(
                 error.kind === "runtime"
-                  ? { kind: "runtime_failed", accepted: true, error }
+                  ? {
+                      kind:
+                        error.code === "terminal_event_publication_uncertain"
+                          ? "runtime_uncertain"
+                          : "runtime_failed",
+                      accepted: true,
+                      error,
+                    }
                   : { kind: "observer_failed", accepted: true, error },
               )
             }

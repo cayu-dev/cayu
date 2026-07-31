@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import heapq
 import json
@@ -66,6 +67,12 @@ from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
+)
+from cayu.runtime._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    TERMINAL_EVIDENCE_EVENT_TYPES,
+    TERMINAL_EVIDENCE_QUERY_LIMIT,
+    classify_current_terminal_evidence,
 )
 from cayu.runtime.aggregates import (
     EXACT_AGGREGATE,
@@ -151,6 +158,13 @@ class PersistedEventSideEffectClaimLost(RuntimeError):
 
 
 PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES = 4096
+# These budgets are nested deliberately. A maximum-size session ID is
+# base64-encoded into a list cursor that fits 4 KiB; a maximum-size custom-store
+# list cursor is base64-encoded into a recovery cursor that fits 8 KiB.
+MAX_SESSION_ID_BYTES = 2048
+MAX_SESSION_LIST_CURSOR_BYTES = 4096
+MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES = 8192
+_SESSION_CURSOR_VERSION = 1
 _NONPORTABLE_PERSISTED_EVENT_SIDE_EFFECT_ERROR = (
     "Persisted event side effect failed with non-portable error details."
 )
@@ -193,6 +207,22 @@ def portable_persisted_event_side_effect_error(value: object) -> str:
             return prefix.decode("utf-8") + suffix
         except UnicodeDecodeError:
             prefix = prefix[:-1]
+
+
+def _require_bounded_session_id(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > MAX_SESSION_ID_BYTES:
+        raise ValueError(f"`{field_name}` must not exceed {MAX_SESSION_ID_BYTES} UTF-8 bytes.")
+    return value
+
+
+def _require_bounded_session_list_cursor(value: str, field_name: str) -> str:
+    value = require_clean_nonblank(value, field_name)
+    if len(value.encode("utf-8")) > MAX_SESSION_LIST_CURSOR_BYTES:
+        raise ValueError(
+            f"`{field_name}` must not exceed {MAX_SESSION_LIST_CURSOR_BYTES} UTF-8 bytes."
+        )
+    return value
 
 
 class SessionQueuedMessagesPending(RuntimeError):
@@ -655,8 +685,18 @@ class RunRequest(BaseModel):
     def validate_nonblank_agent_name(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
 
+    @field_validator("session_id")
+    @classmethod
+    def validate_optional_session_id(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return _require_bounded_session_id(value, info.field_name)
+
     @field_validator(
-        "session_id",
         "parent_session_id",
         "causal_budget_id",
         "task_id",
@@ -1061,13 +1101,18 @@ class ForkSessionRequest(BaseModel):
     copy_checkpoint: StrictBool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator(
-        "source_session_id",
-        "session_id",
-        "agent_name",
-        "model",
-        "environment_name",
-    )
+    @field_validator("session_id")
+    @classmethod
+    def validate_optional_destination_session_id(
+        cls,
+        value: str | None,
+        info,
+    ) -> str | None:
+        if value is None:
+            return None
+        return _require_bounded_session_id(value, info.field_name)
+
+    @field_validator("source_session_id", "agent_name", "model", "environment_name")
     @classmethod
     def validate_optional_nonblank_strings(
         cls,
@@ -1154,7 +1199,6 @@ class Session(BaseModel):
         return copy_label_map(value, "labels")
 
     @field_validator(
-        "id",
         "agent_name",
         "provider_name",
         "model",
@@ -1163,6 +1207,14 @@ class Session(BaseModel):
     )
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str, info) -> str:
+        # The byte ceiling is a creation-boundary contract. Session records may
+        # predate it or come from an external store, and must remain loadable so
+        # operators can inspect and migrate them.
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("parent_session_id", "environment_name", "runtime_version")
@@ -2660,7 +2712,7 @@ class SessionQuery(BaseModel):
     def validate_cursor(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, "cursor")
+        return _require_bounded_session_list_cursor(value, "cursor")
 
     @model_validator(mode="after")
     def reject_cursor_with_offset(self) -> SessionQuery:
@@ -3390,6 +3442,7 @@ class IncompleteSessionRecoveryAction(StrEnum):
     SKIPPED_ACTIVE = "skipped_active"
     SKIPPED_TERMINAL = "skipped_terminal"
     SKIPPED_UNREGISTERED_AGENT = "skipped_unregistered_agent"
+    REPAIRED_TERMINAL_EVIDENCE = "repaired_terminal_evidence"
     PENDING_APPROVAL = "pending_approval"
     PENDING_USER_INPUT = "pending_user_input"
     REPAIRED_TOOL_ROUND = "repaired_tool_round"
@@ -3427,10 +3480,14 @@ class IncompleteSessionRecoveryRequest(BaseModel):
 
 
 class IncompleteSessionsRecoveryRequest(BaseModel):
+    """Select and bound one resumable incomplete-session recovery page."""
+
     model_config = ConfigDict(extra="forbid")
 
     statuses: set[SessionStatus]
     limit: StrictInt = Field(default=100, ge=1, le=1000)
+    inspection_limit: StrictInt = Field(default=1000, ge=1, le=10_000)
+    cursor: str | None = None
     inactive_before: datetime | None = None
     reason: str = "worker_recovered_incomplete_session"
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -3453,6 +3510,9 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
             SessionStatus.PENDING,
             SessionStatus.RUNNING,
             SessionStatus.INTERRUPTING,
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
         }
         unsupported_statuses = statuses - recoverable_statuses
         if unsupported_statuses:
@@ -3468,6 +3528,18 @@ class IncompleteSessionsRecoveryRequest(BaseModel):
     @classmethod
     def validate_reason(cls, value: str) -> str:
         return require_clean_nonblank(value, "reason")
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, "cursor")
+        if len(value.encode("utf-8")) > MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES:
+            raise ValueError(
+                f"cursor exceeds its {MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES}-byte limit."
+            )
+        return value
 
     @field_validator("inactive_before")
     @classmethod
@@ -3505,6 +3577,41 @@ class IncompleteSessionRecoveryResult(BaseModel):
     @classmethod
     def copy_events(cls, value) -> tuple[Event, ...]:
         return tuple(copy_event(event) for event in value)
+
+
+class IncompleteSessionsRecoveryPage(BaseModel):
+    """One bounded batch-recovery page and its continuation position."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    results: tuple[IncompleteSessionRecoveryResult, ...] = Field(
+        default_factory=tuple,
+        max_length=1000,
+    )
+    inspected_session_count: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    next_cursor: str | None = None
+
+    @field_validator("results")
+    @classmethod
+    def copy_results(cls, value) -> tuple[IncompleteSessionRecoveryResult, ...]:
+        return tuple(result.model_copy(deep=True) for result in value)
+
+    @field_validator("next_cursor")
+    @classmethod
+    def validate_next_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, "next_cursor")
+        if len(value.encode("utf-8")) > MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES:
+            raise ValueError(
+                "next_cursor exceeds its "
+                f"{MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES}-byte limit."
+            )
+        return value
 
 
 class EventQuery(BaseModel):
@@ -3687,6 +3794,13 @@ class SessionListResult(BaseModel):
     next_cursor: str | None = None
     # None unless the query opted in via include_total_count (COUNT is expensive at scale).
     total_count: StrictInt | None = Field(default=None, ge=0, le=MAX_DURABLE_JSON_INTEGER)
+
+    @field_validator("next_cursor")
+    @classmethod
+    def validate_next_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _require_bounded_session_list_cursor(value, "next_cursor")
 
 
 SESSION_TOPOLOGY_MAX_ANCESTOR_DEPTH = 32
@@ -5064,8 +5178,9 @@ class SessionStore(ABC):
         """Delete a session and cascade to its events, transcript, and checkpoint.
 
         Raises ``ValueError`` if the session is in-flight (``RUNNING`` or
-        ``INTERRUPTING`` — interrupt it first), or if one of its accepted budget
-        reservations has no fully delivered terminal settlement audit event.
+        ``INTERRUPTING`` — interrupt it first), has incomplete current-run terminal
+        evidence, or if one of its accepted budget reservations has no fully
+        delivered terminal settlement audit event.
         Idempotent: deleting a session that does not exist is a no-op.
 
         Default raises ``NotImplementedError`` so out-of-tree stores keep working.
@@ -5848,6 +5963,28 @@ class InMemorySessionStore(SessionStore):
                 raise ValueError(
                     "Cannot delete a session while incomplete-session recovery claim "
                     f"{active_recovery_claim_id} is active: {session_id}"
+                )
+            run_operation = _session_run_operation_from_checkpoint(checkpoint)
+            if run_operation is not None:
+                raise ValueError(
+                    "Cannot delete a session while terminal publication "
+                    f"{run_operation.operation_id} is incomplete: {session_id}"
+                )
+            evidence_events: list[Event] = []
+            for record in reversed(self._session_event_records.get(session_id, [])):
+                if record.event.type not in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES:
+                    continue
+                evidence_events.append(record.event)
+                if len(evidence_events) == _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT:
+                    break
+            terminal_publication_block = _terminal_publication_delete_block_reason(
+                session=session,
+                checkpoint=checkpoint,
+                evidence_events=evidence_events,
+            )
+            if terminal_publication_block is not None:
+                raise ValueError(
+                    f"Cannot delete a session while {terminal_publication_block}: {session_id}"
                 )
             active_operation_id = _active_unexpired_session_operation_id(
                 checkpoint,
@@ -9194,6 +9331,8 @@ def copy_incomplete_sessions_recovery_request(
     return IncompleteSessionsRecoveryRequest(
         statuses=set(request.statuses),
         limit=request.limit,
+        inspection_limit=request.inspection_limit,
+        cursor=request.cursor,
         inactive_before=request.inactive_before,
         reason=request.reason,
         metadata=copy_durable_json_object(request.metadata, "metadata"),
@@ -13434,6 +13573,73 @@ def _sort_sessions(sessions: list[Session], order_by: SessionOrder) -> list[Sess
 DELETE_BLOCKED_SESSION_STATUSES = frozenset({SessionStatus.RUNNING, SessionStatus.INTERRUPTING})
 _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY = "incomplete_session_recovery_claim"
 INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY = "initial_transcript_pending"
+_TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS = {
+    SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+    SessionStatus.FAILED: EventType.SESSION_FAILED,
+    SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+}
+# Storage implementations import these aliases while collecting the same
+# bounded evidence consumed by the shared runtime classifier.
+_TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES = TERMINAL_EVIDENCE_EVENT_TYPES
+_TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT = TERMINAL_EVIDENCE_QUERY_LIMIT
+_TERMINAL_PENDING_ACTION_CHECKPOINT_KEYS = frozenset(
+    {
+        "pending_tool_approval",
+        "pending_user_input",
+        _PENDING_TOOL_ROUND_CHECKPOINT_KEY,
+    }
+)
+
+
+def _terminal_publication_delete_block_reason(
+    *,
+    session: Session,
+    checkpoint: dict[str, Any] | None,
+    evidence_events: Sequence[Event],
+) -> str | None:
+    """Return why deletion would erase repairable current-run terminal evidence.
+
+    ``evidence_events`` must contain the newest lifecycle/terminal events in
+    descending session-sequence order, bounded by
+    ``_TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT``.
+    """
+
+    expected_event_type = _TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS.get(session.status)
+    if expected_event_type is None:
+        return None
+    if len(evidence_events) > _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT:
+        raise ValueError("Terminal publication deletion evidence exceeds its bounded query.")
+
+    if checkpoint is not None and "pending_session_interrupt" in checkpoint:
+        return "pending interruption terminal publication is incomplete"
+
+    run_operation = _session_run_operation_from_checkpoint(checkpoint)
+    classification = classify_current_terminal_evidence(
+        evidence_events=evidence_events,
+        expected_event_type=expected_event_type,
+        run_operation_id=(None if run_operation is None else run_operation.operation_id),
+        interruption_request_id=None,
+    )
+    terminal_events = classification.events
+    if classification.run_operation_conflict:
+        return "terminal publication evidence contradicts the pending run operation"
+
+    if any(event.type != expected_event_type for event in terminal_events):
+        return "terminal publication evidence contradicts the durable session status"
+    if len(terminal_events) > 1:
+        return "terminal publication contains duplicate current-run evidence"
+
+    pending_action = checkpoint is not None and any(
+        key in checkpoint for key in _TERMINAL_PENDING_ACTION_CHECKPOINT_KEYS
+    )
+    terminal_event_required = (
+        run_operation is not None
+        or pending_action
+        or classification.latest_lifecycle_event_type != EventType.SESSION_FORKED
+    )
+    if terminal_event_required and not terminal_events:
+        return "terminal publication evidence is incomplete"
+    return None
 
 
 def _initial_transcript_pending_checkpoint(interaction_id: str) -> dict[str, Any]:
@@ -13477,6 +13683,77 @@ def _checkpoint_after_initial_transcript_publication(
     updated = copy_durable_json_object(checkpoint, "checkpoint")
     updated.pop(INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY)
     return updated or None
+
+
+_SESSION_RUN_OPERATION_CHECKPOINT_KEY = "session_run_operation"
+_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY = SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+
+
+@dataclass(frozen=True)
+class _SessionRunOperation:
+    operation_id: str
+    run_epoch: int
+
+
+def _session_run_operation_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> _SessionRunOperation | None:
+    """Parse the durable identity of the latest resumed/continued session run."""
+    if checkpoint is None or _SESSION_RUN_OPERATION_CHECKPOINT_KEY not in checkpoint:
+        return None
+    marker = checkpoint[_SESSION_RUN_OPERATION_CHECKPOINT_KEY]
+    if type(marker) is not dict or marker.get("version") != 1:
+        raise ValueError("Session run operation checkpoint is invalid.")
+    operation_id = require_clean_nonblank(
+        marker.get("operation_id"),
+        "session_run_operation.operation_id",
+    )
+    run_epoch = marker.get("run_epoch")
+    if type(run_epoch) is not int or run_epoch < 1 or run_epoch > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Session run operation checkpoint run_epoch is invalid.")
+    return _SessionRunOperation(
+        operation_id=operation_id,
+        run_epoch=run_epoch,
+    )
+
+
+def _checkpoint_with_session_run_operation(
+    *,
+    checkpoint: dict[str, Any] | None,
+    current_session: Session,
+    operation_id: str,
+) -> dict[str, Any]:
+    """Record the next running epoch in the same transaction as its status claim."""
+    operation_id = require_clean_nonblank(operation_id, "session run operation_id")
+    existing_operation = _session_run_operation_from_checkpoint(checkpoint)
+    if existing_operation is not None:
+        raise RuntimeError(
+            "Session has incomplete terminal evidence for its previous run. "
+            "Recover the session before starting another run."
+        )
+    next_run_epoch = current_session.run_epoch + 1
+    if next_run_epoch > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Session run operation run_epoch exceeds the durable integer limit.")
+    updated = {} if checkpoint is None else copy_durable_json_object(checkpoint, "checkpoint")
+    updated[_SESSION_RUN_OPERATION_CHECKPOINT_KEY] = {
+        "version": 1,
+        "operation_id": operation_id,
+        "run_epoch": next_run_epoch,
+    }
+    return updated
+
+
+def _event_with_session_run_operation(
+    event: Event,
+    operation: _SessionRunOperation,
+) -> Event:
+    """Bind terminal evidence to the durable run operation that produced it."""
+    payload = copy_durable_json_object(event.payload, "event payload")
+    existing_operation_id = payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+    if existing_operation_id not in {None, operation.operation_id}:
+        raise ValueError("Terminal event carries a conflicting session run operation identity.")
+    payload[_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = operation.operation_id
+    return event.model_copy(update={"payload": payload}, deep=True)
 
 
 def _incomplete_recovery_claim_from_checkpoint(
@@ -13617,26 +13894,58 @@ def encode_session_cursor(
 ) -> str:
     """Opaque keyset cursor for the last row of a page: (sort value, session id)."""
     sort_value = _session_sort_value(session, order_by).astimezone(UTC).isoformat()
-    raw = json.dumps([sort_value, session.id], separators=(",", ":"))
-    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    session_id = _require_bounded_session_id(session.id, "session.id")
+    material = {
+        "version": _SESSION_CURSOR_VERSION,
+        "sort_value": sort_value,
+        "session_id_b64": base64.urlsafe_b64encode(session_id.encode("utf-8")).decode("ascii"),
+    }
+    encoded = base64.urlsafe_b64encode(
+        canonical_durable_json_bytes(material, "session cursor")
+    ).decode("ascii")
+    return _require_bounded_session_list_cursor(encoded, "session cursor")
 
 
 def decode_session_cursor(cursor: str) -> tuple[datetime, str]:
     """Decode a cursor to (sort value, session id). Raises ValueError if malformed."""
     try:
-        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
-        decoded = json.loads(raw)
-    except (ValueError, TypeError) as exc:
+        cursor = _require_bounded_session_list_cursor(cursor, "cursor")
+        encoded = cursor.encode("ascii")
+        raw = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw) != encoded:
+            raise ValueError("Non-canonical session cursor.")
+        decoded = json.loads(raw.decode("utf-8"))
+        if (
+            type(decoded) is not dict
+            or set(decoded) != {"version", "sort_value", "session_id_b64"}
+            or type(decoded["version"]) is not int
+            or decoded["version"] != _SESSION_CURSOR_VERSION
+            or type(decoded["sort_value"]) is not str
+            or type(decoded["session_id_b64"]) is not str
+        ):
+            raise ValueError("Invalid session cursor material.")
+        encoded_session_id = decoded["session_id_b64"].encode("ascii")
+        session_id_bytes = base64.b64decode(
+            encoded_session_id,
+            altchars=b"-_",
+            validate=True,
+        )
+        if base64.urlsafe_b64encode(session_id_bytes) != encoded_session_id:
+            raise ValueError("Non-canonical session identifier.")
+        session_id = _require_bounded_session_id(
+            session_id_bytes.decode("utf-8"),
+            "session cursor id",
+        )
+    except (
+        binascii.Error,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
         raise ValueError("Invalid session cursor.") from exc
-    if (
-        type(decoded) is not list
-        or len(decoded) != 2
-        or type(decoded[0]) is not str
-        or type(decoded[1]) is not str
-    ):
-        raise ValueError("Invalid session cursor.")
     try:
-        sort_value = datetime.fromisoformat(decoded[0])
+        sort_value = datetime.fromisoformat(decoded["sort_value"])
     except ValueError as exc:
         raise ValueError("Invalid session cursor.") from exc
     # Sort values are always encoded as UTC-aware timestamps; a naive datetime is
@@ -13644,7 +13953,7 @@ def decode_session_cursor(cursor: str) -> tuple[datetime, str]:
     # against the timezone-aware session timestamps.
     if sort_value.tzinfo is None:
         raise ValueError("Invalid session cursor.")
-    return sort_value, decoded[1]
+    return sort_value, session_id
 
 
 def encode_session_topology_cursor(

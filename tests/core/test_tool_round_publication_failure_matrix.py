@@ -338,7 +338,10 @@ def test_two_call_round_recovers_after_process_loss_without_reexecution(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
 
-        assert recovery.actions == (IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,)
+        assert recovery.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+        )
         assert sorted(tool.calls) == ["first", "second"]
         assert len(tool.calls) == 2
         assert len(provider.requests) == 1
@@ -387,7 +390,10 @@ def test_two_call_round_concurrent_recovery_has_one_publication_winner(
         store.release_claim.set()
         winner = await asyncio.wait_for(first_recovery, timeout=5)
 
-        assert winner.actions == (IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,)
+        assert winner.actions == (
+            IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+            IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+        )
         assert sorted(tool.calls) == ["first", "second"]
         assert len(tool.calls) == 2
         assert competing_tool.calls == []

@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import re
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -68,6 +69,7 @@ from cayu.runtime import (
     CheckpointCompactionContextPolicy,
     EventQuery,
     EventRecord,
+    IncompleteSessionsRecoveryPage,
     InMemoryEventSink,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -80,6 +82,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionListResult,
     SessionStatus,
+    TerminalEventPublicationUncertain,
     TranscriptDigestCompactor,
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
@@ -8299,6 +8302,244 @@ def test_runtime_failure_survives_cancelled_stream_cleanup() -> None:
     assert error["code"] == "runtime_failed"
 
 
+def test_terminal_publication_uncertainty_requests_durable_reconciliation() -> None:
+    publication_failure = ConnectionError("terminal append acknowledgement lost")
+    reconciliation_failure = TimeoutError("terminal reconciliation unavailable")
+
+    async def uncertain_stream() -> AsyncIterator[Event]:
+        yield Event(
+            id="event_before_terminal_uncertainty",
+            type="custom.before_terminal_uncertainty",
+            session_id="session_terminal_uncertainty",
+        )
+        raise TerminalEventPublicationUncertain(
+            event=Event(
+                id="event_terminal",
+                type=EventType.SESSION_COMPLETED,
+                session_id="session_terminal_uncertainty",
+            ),
+            publication_failure=publication_failure,
+            reconciliation_failure=reconciliation_failure,
+        )
+
+    async def exercise() -> list[dict[str, str]]:
+        response = await _accepted_event_stream_response(
+            uncertain_stream(),
+            cayu_app=CayuApp(enable_logging=False),
+            session_id="session_terminal_uncertainty",
+        )
+        return [message async for message in response.body_iterator]
+
+    messages = asyncio.run(exercise())
+
+    assert messages[0]["id"] == ("session_terminal_uncertainty:event_before_terminal_uncertainty")
+    assert messages[-1]["event"] == "error"
+    error = json.loads(messages[-1]["data"])
+    assert error["kind"] == "runtime"
+    assert error["code"] == "terminal_event_publication_uncertain"
+    assert error["retryable"] is True
+    assert error["session_id"] == "session_terminal_uncertainty"
+    assert error["error_type"] == "TerminalEventPublicationUncertain"
+
+
+def test_preaccept_terminal_publication_uncertainty_is_not_reported_as_conflict() -> None:
+    async def uncertain_stream() -> AsyncIterator[Event]:
+        raise TerminalEventPublicationUncertain(
+            event=Event(
+                id="event_preaccept_terminal_uncertainty",
+                type=EventType.SESSION_INTERRUPTED,
+                session_id="session_preaccept_terminal_uncertainty",
+            ),
+            publication_failure=ConnectionError("terminal append acknowledgement lost"),
+            reconciliation_failure=TimeoutError("terminal reconciliation unavailable"),
+        )
+        yield  # pragma: no cover
+
+    async def exercise() -> None:
+        with pytest.raises(fastapi.HTTPException) as raised:
+            await _accepted_event_stream_response(
+                uncertain_stream(),
+                cayu_app=CayuApp(enable_logging=False),
+                session_id="session_preaccept_terminal_uncertainty",
+                conflict_error_types=(RuntimeError,),
+            )
+        assert raised.value.status_code == 500
+        assert raised.value.detail == (
+            "Terminal event publication outcome is uncertain; inspect durable session "
+            "state before retrying the mutation."
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("terminal_append_committed", [False, True])
+def test_interrupt_accepts_before_first_frame_terminal_publication_uncertainty(
+    terminal_append_committed: bool,
+) -> None:
+    class AmbiguousInterruptTerminalStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.armed = False
+            self.attempted_terminal_event_id: str | None = None
+            self.unreadable_event_id: str | None = None
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            if self.armed and event.type == EventType.SESSION_INTERRUPTED:
+                self.armed = False
+                self.attempted_terminal_event_id = event.id
+                self.unreadable_event_id = event.id
+                if terminal_append_committed:
+                    await super().append_event(session_id, event)
+                raise ConnectionError("terminal append acknowledgement lost")
+            await super().append_event(session_id, event)
+
+        async def query_events(self, query: EventQuery):
+            if self.unreadable_event_id is not None and query.event_id == self.unreadable_event_id:
+                self.unreadable_event_id = None
+                raise TimeoutError("terminal reconciliation unavailable")
+            return await super().query_events(query)
+
+    store = AmbiguousInterruptTerminalStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    session_id = "session-interrupt-terminal-publication-uncertain"
+    mutation_id = "mutation-interrupt-terminal-publication-uncertain"
+
+    async def prepare() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "create pending session")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(prepare())
+    store.armed = True
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    with client.stream(
+        "POST",
+        f"/api/sessions/{session_id}/interrupt",
+        json={"reason": "operator stop"},
+        headers={"Cayu-Mutation-ID": mutation_id},
+    ) as response:
+        assert response.status_code == 200
+        frames = _sse_frames(response)
+
+    assert len(frames) == 1
+    assert frames[0]["event"] == "error"
+    assert frames[0]["data"]["code"] == "terminal_event_publication_uncertain"
+    assert frames[0]["data"]["retryable"] is True
+
+    events = client.get(
+        f"/api/sessions/{session_id}/events",
+        params={"order_by": "sequence_asc", "limit": 100},
+    ).json()["events"]
+    interrupted = [event for event in events if event["type"] == EventType.SESSION_INTERRUPTED]
+    accepted = [event for event in events if event["type"] == EventType.SERVER_MUTATION_ACCEPTED]
+
+    assert len(interrupted) == int(terminal_append_committed)
+    assert len(accepted) == 1
+    assert accepted[0]["payload"] == {
+        "mutation_id": mutation_id,
+        "mutation_kind": "interrupt",
+        "accepted_event_id": store.attempted_terminal_event_id,
+        "accepted_event_type": EventType.SESSION_INTERRUPTED,
+        "accepted_event_publication_uncertain": True,
+    }
+    if terminal_append_committed:
+        assert events.index(interrupted[0]) < events.index(accepted[0])
+    state = client.get(f"/api/sessions/{session_id}/state").json()
+    assert state["status"] == SessionStatus.INTERRUPTED
+
+
+def test_request_cancellation_does_not_cancel_uncertain_acceptance_marker() -> None:
+    class BlockingUncertainAcceptanceStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.armed = False
+            self.unreadable_event_id: str | None = None
+            self.marker_started = asyncio.Event()
+            self.release_marker = asyncio.Event()
+
+        async def append_event(self, session_id: str, event: Event) -> None:
+            if self.armed and event.type == EventType.SESSION_INTERRUPTED:
+                self.armed = False
+                self.unreadable_event_id = event.id
+                raise ConnectionError("terminal append acknowledgement lost")
+            if event.type == EventType.SERVER_MUTATION_ACCEPTED:
+                self.marker_started.set()
+                await self.release_marker.wait()
+            await super().append_event(session_id, event)
+
+        async def query_events(self, query: EventQuery):
+            if self.unreadable_event_id is not None and query.event_id == self.unreadable_event_id:
+                self.unreadable_event_id = None
+                raise TimeoutError("terminal reconciliation unavailable")
+            return await super().query_events(query)
+
+    async def exercise() -> tuple[SessionStatus, list[Event]]:
+        store = BlockingUncertainAcceptanceStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "session-cancelled-uncertain-acceptance"
+        mutation_id = "mutation-cancelled-uncertain-acceptance"
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "create pending session")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        store.armed = True
+        server = create_server(app, config=_LOCAL_SERVER_CONFIG)
+        transport = httpx.ASGITransport(app=server)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session_id}/interrupt",
+                    json={"reason": "operator stop"},
+                    headers={"Cayu-Mutation-ID": mutation_id},
+                )
+            )
+            await asyncio.wait_for(store.marker_started.wait(), timeout=1)
+            request_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+            store.release_marker.set()
+
+            deadline = asyncio.get_running_loop().time() + 1
+            while True:
+                records = await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.SERVER_MUTATION_ACCEPTED,
+                        limit=10,
+                    )
+                )
+                if records:
+                    break
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise AssertionError(
+                        "Detached uncertainty acceptance did not persist its mutation marker."
+                    )
+                await asyncio.sleep(0.01)
+
+        state = await store.load_state(session_id)
+        assert state is not None
+        return state.status, [record.event for record in records]
+
+    status, markers = asyncio.run(exercise())
+
+    assert status is SessionStatus.INTERRUPTED
+    assert len(markers) == 1
+    assert markers[0].payload["mutation_id"] == "mutation-cancelled-uncertain-acceptance"
+    assert markers[0].payload["accepted_event_publication_uncertain"] is True
+
+
 def test_runtime_cancellation_group_becomes_structured_stream_error() -> None:
     async def grouped_failure_stream() -> AsyncIterator[Event]:
         yield Event(
@@ -10202,7 +10443,7 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
     async def recover(request):
         calls.append("recover")
         requests.append(request)
-        return []
+        return IncompleteSessionsRecoveryPage()
 
     async def recover_event_side_effects(*, limit=1000):
         calls.append("recover_event_side_effects")
@@ -10231,6 +10472,9 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
                     SessionStatus.PENDING,
                     SessionStatus.RUNNING,
                     SessionStatus.INTERRUPTING,
+                    SessionStatus.COMPLETED,
+                    SessionStatus.FAILED,
+                    SessionStatus.INTERRUPTED,
                 },
                 recovery_inactive_after_seconds=60,
             )
@@ -10260,11 +10504,132 @@ def test_create_server_startup_recovery_composes_user_lifespan() -> None:
         SessionStatus.PENDING,
         SessionStatus.RUNNING,
         SessionStatus.INTERRUPTING,
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+        SessionStatus.INTERRUPTED,
     }
     assert request.reason == "server_startup_recovery"
     assert request.metadata == {"source": "create_server"}
     assert request.inactive_before is not None
     assert request.inactive_before < datetime.now(UTC)
+
+
+def test_create_server_startup_recovery_consumes_every_cursor_page() -> None:
+    app = CayuApp()
+    requests = []
+    server_is_ready = threading.Event()
+    continuation_started = threading.Event()
+    continuation_finished = threading.Event()
+
+    async def recover(request):
+        requests.append(request)
+        if request.cursor is None:
+            return IncompleteSessionsRecoveryPage(next_cursor="startup-page-2")
+        if request.cursor == "startup-page-2":
+            continuation_started.set()
+            for _ in range(100):
+                if server_is_ready.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("Startup recovery continued before server readiness.")
+            return IncompleteSessionsRecoveryPage(next_cursor="startup-page-3")
+        assert request.cursor == "startup-page-3"
+        continuation_finished.set()
+        return IncompleteSessionsRecoveryPage()
+
+    app.recover_incomplete_sessions = recover
+    server = create_server(
+        app,
+        config=ServerConfig.local_development(
+            lifecycle=ServerLifecycleConfig(
+                startup_recovery_statuses={SessionStatus.INTERRUPTED},
+                recovery_inactive_after_seconds=60,
+            )
+        ),
+    )
+
+    with TestClient(server):
+        server_is_ready.set()
+        assert continuation_started.wait(timeout=2.0)
+        assert continuation_finished.wait(timeout=2.0)
+
+    assert [request.cursor for request in requests] == [
+        None,
+        "startup-page-2",
+        "startup-page-3",
+    ]
+    assert all(request.statuses == {SessionStatus.INTERRUPTED} for request in requests)
+    assert all(request.reason == "server_startup_recovery" for request in requests)
+    assert all(request.metadata == {"source": "create_server"} for request in requests)
+    assert len({request.inactive_before for request in requests}) == 1
+
+
+def test_create_server_stops_incomplete_recovery_continuation_on_shutdown() -> None:
+    app = CayuApp()
+    continuation_started = threading.Event()
+    continuation_cancelled = threading.Event()
+
+    async def recover(request):
+        if request.cursor is None:
+            return IncompleteSessionsRecoveryPage(next_cursor="startup-page-2")
+        continuation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            continuation_cancelled.set()
+            raise
+
+    app.recover_incomplete_sessions = recover
+    server = create_server(
+        app,
+        config=ServerConfig.local_development(
+            lifecycle=ServerLifecycleConfig(
+                startup_recovery_statuses={SessionStatus.INTERRUPTED},
+            )
+        ),
+    )
+
+    with TestClient(server):
+        assert continuation_started.wait(timeout=2.0)
+
+    assert continuation_cancelled.wait(timeout=2.0)
+
+
+def test_create_server_background_startup_recovery_rejects_cursor_cycles(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = CayuApp()
+    cursors = []
+    continuation_finished = threading.Event()
+
+    async def recover(request):
+        cursors.append(request.cursor)
+        if request.cursor is not None:
+            continuation_finished.set()
+        return IncompleteSessionsRecoveryPage(next_cursor="repeated-startup-cursor")
+
+    app.recover_incomplete_sessions = recover
+    server = create_server(
+        app,
+        config=ServerConfig.local_development(
+            lifecycle=ServerLifecycleConfig(
+                startup_recovery_statuses={SessionStatus.INTERRUPTED},
+            )
+        ),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="cayu.server"), TestClient(server):
+        assert continuation_finished.wait(timeout=2.0)
+        deadline = time.monotonic() + 2.0
+        while (
+            "startup recovery returned a repeated cursor" not in caplog.text
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+    assert cursors == [None, "repeated-startup-cursor"]
+    assert "startup recovery returned a repeated cursor" in caplog.text
 
 
 def test_create_server_drains_persisted_event_side_effect_backlog() -> None:

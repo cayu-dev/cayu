@@ -179,6 +179,7 @@ from cayu.runtime.egress import (
     VirtualEgressRunnerRequest,
     VirtualEgressWorkspaceFactory,
 )
+from cayu.runtime.errors import TerminalEventPublicationUncertain
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.event_watchers import (
     EventWatcher,
@@ -250,7 +251,10 @@ from cayu.runtime.retry_policy import (
 from cayu.runtime.sessions import (
     DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
+    MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES,
     MAX_PENDING_ACTION_RESULT_BYTES,
+    MAX_SESSION_ID_BYTES,
+    MAX_SESSION_LIST_CURSOR_BYTES,
     SESSION_RUNTIME_METADATA_KEYS,
     SESSION_RUNTIME_METADATA_PREFIX,
     ActiveModelCompletionStage,
@@ -268,6 +272,7 @@ from cayu.runtime.sessions import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InteractionTransitionResult,
@@ -437,7 +442,10 @@ __all__ = [
     "CHECK_REPORT_SCHEMA_VERSION",
     "DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES",
     "INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY",
+    "MAX_INCOMPLETE_SESSIONS_RECOVERY_CURSOR_BYTES",
     "MAX_PENDING_ACTION_RESULT_BYTES",
+    "MAX_SESSION_ID_BYTES",
+    "MAX_SESSION_LIST_CURSOR_BYTES",
     "SESSION_RUNTIME_METADATA_KEYS",
     "SESSION_RUNTIME_METADATA_PREFIX",
     "TAINT_LABELS_METADATA_KEY",
@@ -551,6 +559,7 @@ __all__ = [
     "IncompleteSessionRecoveryAction",
     "IncompleteSessionRecoveryRequest",
     "IncompleteSessionRecoveryResult",
+    "IncompleteSessionsRecoveryPage",
     "IncompleteSessionsRecoveryRequest",
     "InlineDispatcher",
     "InteractionStatus",
@@ -708,6 +717,7 @@ __all__ = [
     "TaskTopologySessionBranch",
     "TaskTopologyStoreResult",
     "TaskTopologyTraversalLimitExceeded",
+    "TerminalEventPublicationUncertain",
     "TieredApprovalPolicy",
     "TieredPricing",
     "ToolApprovalDecision",

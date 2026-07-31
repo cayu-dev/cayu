@@ -110,6 +110,7 @@ export type MutationAttemptResult =
   | { kind: "aborted"; accepted: boolean }
   | { kind: "http_failed"; accepted: false; status: number; error: Error }
   | { kind: "runtime_failed"; accepted: true; error: SseErrorEnvelope }
+  | { kind: "runtime_uncertain"; accepted: true; error: SseErrorEnvelope }
   | { kind: "observer_failed"; accepted: true; error: SseErrorEnvelope }
   | {
       kind: "protocol_failed"
@@ -628,13 +629,16 @@ export class MutationTransportController {
         continue
       }
 
-      let observerRequiresFallback = false
+      let streamRequiresFallback = false
       if (!terminalBoundaryObserved) {
         if (result.kind === "http_failed") {
           this.failure = attemptFailure("http", result.error)
+        } else if (result.kind === "runtime_uncertain") {
+          this.failure = attemptFailure("runtime", result.error, result.error)
+          streamRequiresFallback = true
         } else if (result.kind === "observer_failed") {
           this.failure = attemptFailure("observer", result.error, result.error)
-          observerRequiresFallback = !result.error.retryable
+          streamRequiresFallback = !result.error.retryable
         } else if (result.kind === "protocol_failed") {
           this.failure = attemptFailure("protocol", result.error)
         } else if (result.kind === "network_failed") {
@@ -654,7 +658,7 @@ export class MutationTransportController {
 
       if (await this.reconcileAfterStream()) return this.snapshot()
       if (terminalBoundaryObserved) return this.pollFallback()
-      if (observerRequiresFallback) return this.pollFallback()
+      if (streamRequiresFallback) return this.pollFallback()
       if (!(await this.scheduleReconnect())) return this.pollFallback()
     }
     return this.snapshot()
@@ -1196,7 +1200,9 @@ export class MutationTransportController {
       }
     }
     if (
-      (result.kind === "runtime_failed" || result.kind === "observer_failed") &&
+      (result.kind === "runtime_failed" ||
+        result.kind === "runtime_uncertain" ||
+        result.kind === "observer_failed") &&
       result.error.session_id !== this.request.sessionId
     ) {
       return {

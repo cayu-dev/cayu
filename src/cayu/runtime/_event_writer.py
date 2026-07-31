@@ -6,7 +6,7 @@ from contextlib import suppress
 from itertools import islice
 from typing import cast
 
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, copy_event
 from cayu.core.tools import _POLICY_DENIAL_TRUNCATION_MARKER
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.budgets import BudgetStore
@@ -14,6 +14,7 @@ from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.model_steps import StepClassificationType
 from cayu.runtime.sessions import (
     EventQuery,
+    EventRecord,
     PersistedEventSideEffectClaim,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
@@ -168,6 +169,22 @@ _TOOL_TERMINAL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_FAILED,
     }
 )
+
+
+def _reconcile_exact_persisted_event(
+    expected: Event,
+    records: list[EventRecord],
+    *,
+    conflict_message: str,
+) -> Event | None:
+    """Return one exact durable event, fail closed on reused identity."""
+
+    if not records:
+        return None
+    persisted = records[0].event
+    if len(records) != 1 or persisted != expected:
+        raise RuntimeError(conflict_message)
+    return copy_event(persisted)
 
 
 class RuntimeEventWriter:

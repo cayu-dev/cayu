@@ -121,6 +121,7 @@ test("browser adapter omits Last-Event-ID only for the initial mutation attempt"
 test("browser adapter preserves typed runtime and observer outcomes", async () => {
   for (const [kind, code, retryable, expectedKind] of [
     ["runtime", "runtime_failed", false, "runtime_failed"],
+    ["runtime", "terminal_event_publication_uncertain", true, "runtime_uncertain"],
     ["observer", "observer_lagged", true, "observer_failed"],
   ]) {
     const io = createMutationBrowserIO({

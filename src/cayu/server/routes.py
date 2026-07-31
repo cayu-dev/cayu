@@ -7,6 +7,7 @@ import base64
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
@@ -83,6 +84,7 @@ from cayu.runtime.costs import (
 from cayu.runtime.costs import (
     estimate_session_cost as build_session_cost_summary,
 )
+from cayu.runtime.errors import TerminalEventPublicationUncertain
 from cayu.runtime.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
@@ -364,8 +366,18 @@ _MutationAcceptanceStage = Literal[
     "empty",
     "before_first_event",
     "after_first_event",
+    "terminal_uncertainty_acceptance_failed",
     "accepted",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class _MutationAcceptanceCallbacks:
+    after_first_event: Callable[[Event], Awaitable[None]] | None
+    after_terminal_publication_uncertain: (
+        Callable[[TerminalEventPublicationUncertain], Awaitable[None]] | None
+    )
+
 
 NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 PersistableNonBlankString = Annotated[
@@ -597,6 +609,7 @@ async def _accepted_event_stream_response(
     cayu_app: Any,
     session_id: str,
     after_accept: Callable[[Event], Awaitable[None]] | None = None,
+    acceptance_callbacks: _MutationAcceptanceCallbacks | None = None,
     conflict_error_types: tuple[type[Exception], ...] = (ValueError,),
 ) -> EventSourceResponse:
     """Establish one durable event before accepting an SSE mutation response.
@@ -605,6 +618,11 @@ async def _accepted_event_stream_response(
     Advancing the runtime here also makes a new session's store insert the atomic
     identity claim before route-owned task creation or an HTTP 200 response.
     """
+    if after_accept is not None and acceptance_callbacks is not None:
+        raise TypeError("after_accept and acceptance_callbacks are mutually exclusive.")
+    first_event_callback = (
+        acceptance_callbacks.after_first_event if acceptance_callbacks is not None else after_accept
+    )
     loop = asyncio.get_running_loop()
     acceptance: asyncio.Future[tuple[BaseException | None, _MutationAcceptanceStage]] = (
         loop.create_future()
@@ -616,7 +634,12 @@ async def _accepted_event_stream_response(
         cayu_app=cayu_app,
         session_id=session_id,
         acceptance=acceptance,
-        after_first_event=after_accept,
+        after_first_event=first_event_callback,
+        after_terminal_publication_uncertain=(
+            acceptance_callbacks.after_terminal_publication_uncertain
+            if acceptance_callbacks is not None
+            else None
+        ),
         observer_started=observer_started,
     )
     try:
@@ -640,6 +663,17 @@ async def _accepted_event_stream_response(
         await pump_task
     if not isinstance(acceptance_error, Exception):
         raise acceptance_error
+    if stage == "terminal_uncertainty_acceptance_failed":
+        _log_mutation_acceptance_failure(
+            cayu_app,
+            acceptance_error,
+            session_id=session_id,
+            stage=stage,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Mutation setup failed while recording terminal publication uncertainty.",
+        ) from acceptance_error
     if stage == "empty":
         _log_mutation_acceptance_failure(
             cayu_app,
@@ -661,6 +695,20 @@ async def _accepted_event_stream_response(
         raise HTTPException(
             status_code=500,
             detail="Mutation setup failed after its durable acceptance event.",
+        ) from acceptance_error
+    if isinstance(acceptance_error, TerminalEventPublicationUncertain):
+        _log_mutation_acceptance_failure(
+            cayu_app,
+            acceptance_error,
+            session_id=session_id,
+            stage=stage,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Terminal event publication outcome is uncertain; inspect durable "
+                "session state before retrying the mutation."
+            ),
         ) from acceptance_error
     if isinstance(acceptance_error, KeyError):
         raise HTTPException(
@@ -705,6 +753,9 @@ def _start_detached_event_stream_response(
     session_id: str,
     acceptance: asyncio.Future[tuple[BaseException | None, _MutationAcceptanceStage]] | None = None,
     after_first_event: Callable[[Event], Awaitable[None]] | None = None,
+    after_terminal_publication_uncertain: (
+        Callable[[TerminalEventPublicationUncertain], Awaitable[None]] | None
+    ) = None,
     observer_started: asyncio.Event | None = None,
 ) -> tuple[EventSourceResponse, asyncio.Task[None], Callable[[], None]]:
     """Run ``event_stream`` to completion in a detached task; stream it as an observer.
@@ -827,12 +878,10 @@ def _start_detached_event_stream_response(
                     # the main loop reissues it only after resuming the iterator.
                     deferred_cancellation = exc
 
-        async def finish_after_first_event_callback(event: Event) -> None:
+        async def finish_acceptance_bookkeeping(bookkeeping: Awaitable[None]) -> None:
             """Finish acceptance bookkeeping without swallowing an interrupt."""
             nonlocal deferred_cancellation
-            if after_first_event is None:
-                return
-            callback_task = asyncio.ensure_future(after_first_event(event))
+            callback_task = asyncio.ensure_future(bookkeeping)
             while True:
                 try:
                     await asyncio.shield(callback_task)
@@ -841,10 +890,10 @@ def _start_detached_event_stream_response(
                         raise RuntimeError(
                             "Mutation acceptance bookkeeping was cancelled."
                         ) from exc
-                    # The runtime owns this task, so an operator interruption can
-                    # arrive while route-owned task bookkeeping is in progress.
-                    # Let that one-shot write finish, then redeliver cancellation
-                    # after the runtime iterator has resumed past its yield.
+                    # The detached pump owns this task, so cancellation can arrive
+                    # while route-owned bookkeeping is in progress. Let the
+                    # one-shot write finish; the caller redelivers cancellation
+                    # only after its acceptance boundary is durable.
                     deferred_cancellation = exc
                     continue
                 return
@@ -870,12 +919,32 @@ def _start_detached_event_stream_response(
                             "empty",
                         )
                     break
+                except TerminalEventPublicationUncertain as exc:
+                    if saw_first_event or after_terminal_publication_uncertain is None:
+                        raise
+                    try:
+                        await finish_acceptance_bookkeeping(
+                            after_terminal_publication_uncertain(exc)
+                        )
+                    except BaseException as callback_error:
+                        resolve_acceptance(
+                            callback_error,
+                            "terminal_uncertainty_acceptance_failed",
+                        )
+                        raise
+                    resolve_acceptance(None, "accepted")
+                    await _close_event_stream(event_stream)
+                    await enqueue("runtime_error", exc, terminal=True)
+                    if deferred_cancellation is not None:
+                        raise deferred_cancellation from None
+                    return
 
                 is_first_event = not saw_first_event
                 saw_first_event = True
                 if is_first_event and acceptance is not None:
                     try:
-                        await finish_after_first_event_callback(event)
+                        if after_first_event is not None:
+                            await finish_acceptance_bookkeeping(after_first_event(event))
                     except BaseException as exc:
                         resolve_acceptance(exc, "after_first_event")
                         await _close_event_stream(event_stream)
@@ -939,12 +1008,17 @@ def _start_detached_event_stream_response(
                     yield item
                     continue
                 if kind == "runtime_error":
+                    publication_uncertain = isinstance(item, TerminalEventPublicationUncertain)
                     yield _stream_error_sse_message(
                         cayu_app,
                         item,
                         kind="runtime",
-                        code="runtime_failed",
-                        retryable=False,
+                        code=(
+                            "terminal_event_publication_uncertain"
+                            if publication_uncertain
+                            else "runtime_failed"
+                        ),
+                        retryable=publication_uncertain,
                         session_id=session_id,
                     )
                     return
@@ -2716,47 +2790,72 @@ def create_router(
 
     optional_auth_context = Depends(_optional_auth_context)
 
-    def _mutation_acceptance_callback(
+    def _mutation_acceptance_callbacks(
         *,
         mutation_id: str | None,
         mutation_kind: str,
         session_id: str,
         after_accept: Callable[[Event], Awaitable[None]] | None = None,
-    ) -> Callable[[Event], Awaitable[None]] | None:
+    ) -> _MutationAcceptanceCallbacks:
         """Compose route bookkeeping with an exact durable mutation boundary."""
         if mutation_id is None:
-            return after_accept
+            return _MutationAcceptanceCallbacks(
+                after_first_event=after_accept,
+                after_terminal_publication_uncertain=None,
+            )
 
-        async def record_acceptance(first_event: Event) -> None:
+        async def record_acceptance(
+            accepted_event: Event,
+            *,
+            publication_uncertain: bool,
+        ) -> None:
             # Route-owned setup remains part of acceptance. The mutation marker
             # is deliberately written last so it never claims that a request was
             # accepted when prerequisite setup failed.
             if after_accept is not None:
-                await after_accept(first_event)
-            if first_event.session_id != session_id:
+                await after_accept(accepted_event)
+            if accepted_event.session_id != session_id:
                 raise RuntimeError(
                     "Mutation acceptance event belongs to a different session: "
-                    f"{first_event.session_id}"
+                    f"{accepted_event.session_id}"
                 )
+            payload: dict[str, Any] = {
+                "mutation_id": mutation_id,
+                "mutation_kind": mutation_kind,
+                "accepted_event_id": accepted_event.id,
+                "accepted_event_type": str(accepted_event.type),
+            }
+            if publication_uncertain:
+                # The terminal status is durable, but its preassigned event may
+                # have committed before this marker or may be repaired after it.
+                # Clients use this explicit exception to accept either ordering
+                # without weakening normal mutation-boundary validation.
+                payload["accepted_event_publication_uncertain"] = True
             await cayu_app.emit_event(
                 Event(
                     type=EventType.SERVER_MUTATION_ACCEPTED,
                     session_id=session_id,
-                    interaction_id=first_event.interaction_id,
-                    agent_name=first_event.agent_name,
-                    environment_name=first_event.environment_name,
-                    workflow_name=first_event.workflow_name,
-                    tool_name=first_event.tool_name,
-                    payload={
-                        "mutation_id": mutation_id,
-                        "mutation_kind": mutation_kind,
-                        "accepted_event_id": first_event.id,
-                        "accepted_event_type": str(first_event.type),
-                    },
+                    interaction_id=accepted_event.interaction_id,
+                    agent_name=accepted_event.agent_name,
+                    environment_name=accepted_event.environment_name,
+                    workflow_name=accepted_event.workflow_name,
+                    tool_name=accepted_event.tool_name,
+                    payload=payload,
                 )
             )
 
-        return record_acceptance
+        async def after_first_event(first_event: Event) -> None:
+            await record_acceptance(first_event, publication_uncertain=False)
+
+        async def after_terminal_publication_uncertain(
+            error: TerminalEventPublicationUncertain,
+        ) -> None:
+            await record_acceptance(error.event, publication_uncertain=True)
+
+        return _MutationAcceptanceCallbacks(
+            after_first_event=after_first_event,
+            after_terminal_publication_uncertain=after_terminal_publication_uncertain,
+        )
 
     @router.get(
         "/contract",
@@ -3268,7 +3367,7 @@ def create_router(
             cayu_app.run(request),
             cayu_app=cayu_app,
             session_id=session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="run",
                 session_id=session_id,
@@ -3317,7 +3416,7 @@ def create_router(
             cayu_app.resume(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="resume",
                 session_id=body.session_id,
@@ -3364,7 +3463,7 @@ def create_router(
             cayu_app.compact_session(request),
             cayu_app=cayu_app,
             session_id=session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="session.compact",
                 session_id=session_id,
@@ -3416,7 +3515,7 @@ def create_router(
             operation(),
             cayu_app=cayu_app,
             session_id=session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="session.message.enqueue",
                 session_id=session_id,
@@ -3467,7 +3566,7 @@ def create_router(
             cayu_app.interrupt_session(request),
             cayu_app=cayu_app,
             session_id=session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="interrupt",
                 session_id=session_id,
@@ -3520,7 +3619,7 @@ def create_router(
             cayu_app.resolve_tool_approval(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="tool_approval.resolve",
                 session_id=body.session_id,
@@ -3576,7 +3675,7 @@ def create_router(
             cayu_app.recover_tool_approval(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="tool_approval.recover",
                 session_id=body.session_id,
@@ -3631,7 +3730,7 @@ def create_router(
             cayu_app.recover_tool_round(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="tool_round.recover",
                 session_id=body.session_id,
@@ -3683,7 +3782,7 @@ def create_router(
             cayu_app.resolve_user_input(response),
             cayu_app=cayu_app,
             session_id=body.session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="user_input.resolve",
                 session_id=body.session_id,
@@ -3739,7 +3838,7 @@ def create_router(
             cayu_app.recover_user_input(request),
             cayu_app=cayu_app,
             session_id=body.session_id,
-            after_accept=_mutation_acceptance_callback(
+            acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="user_input.recover",
                 session_id=body.session_id,

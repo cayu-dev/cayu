@@ -188,6 +188,7 @@ from cayu.runtime.sessions import (
     ForkSessionRequest,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
@@ -1276,10 +1277,16 @@ class CayuApp:
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
-    ) -> list[IncompleteSessionRecoveryResult]:
-        """Sweep non-terminal sessions and repair each one, fault-isolated.
+    ) -> IncompleteSessionsRecoveryPage:
+        """Sweep one bounded page of requested states, fault-isolated.
 
-        Returns one result per swept session. A session whose agent is not
+        ``results`` contains one result per repaired or otherwise reportable
+        session. ``inspected_session_count`` includes healthy terminal rows
+        omitted from those results. When ``next_cursor`` is present, pass it in
+        a new request with the same statuses, inactivity boundary, reason, and
+        metadata to continue without rescanning earlier candidates.
+
+        A session whose agent is not
         registered in this process is reported as
         ``SKIPPED_UNREGISTERED_AGENT``; an unexpected per-session failure is
         reported as ``FAILED`` with the error in ``message`` — neither aborts
@@ -1288,7 +1295,13 @@ class CayuApp:
         snapshot; its ``status`` is the current stored status when the session
         can still be reloaded (a failed recovery may have progressed it),
         falling back to the snapshot when it cannot. Session listing failures
-        and cancellation still raise.
+        and cancellation still raise. Every invocation inspects at most
+        ``request.inspection_limit`` rows, using at most ten store keyset pages
+        of at most 1,000 rows each. Terminal sessions are inspected through
+        bounded event queries. They are repaired only when their current run
+        lacks matching terminal evidence or retains incomplete recovery state.
+        Healthy terminal inspection candidates are omitted from the result and
+        do not consume ``request.limit``.
         """
         request = copy_incomplete_sessions_recovery_request(request)
         return await self._session_engine.recover_incomplete_sessions(request)

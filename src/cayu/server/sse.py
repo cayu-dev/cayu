@@ -21,6 +21,7 @@ SSE_SEND_TIMEOUT_SECONDS = 30.0
 SseErrorKind = Literal["runtime", "observer"]
 SseErrorCode = Literal[
     "runtime_failed",
+    "terminal_event_publication_uncertain",
     "observer_lagged",
     "event_frame_too_large",
     "replay_idle_timeout",
@@ -30,6 +31,7 @@ _SSE_ERROR_KINDS = frozenset({"runtime", "observer"})
 _SSE_ERROR_CODES = frozenset(
     {
         "runtime_failed",
+        "terminal_event_publication_uncertain",
         "observer_lagged",
         "event_frame_too_large",
         "replay_idle_timeout",

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -2631,7 +2632,16 @@ def test_postgres_session_store_rejects_invalid_cursor(postgres_dsn):
         await store.create(_lifecycle_request("sess_only"), identity=_identity())
         with pytest.raises(ValueError, match="[Cc]ursor"):
             await store.list_sessions(SessionQuery(cursor="!!!not-a-cursor"))
-        forged = base64.urlsafe_b64encode(b'["not-a-timestamp","sess_only"]').decode("ascii")
+        forged = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sort_value": "not-a-timestamp",
+                    "session_id_b64": base64.urlsafe_b64encode(b"sess_only").decode("ascii"),
+                },
+                separators=(",", ":"),
+            ).encode()
+        ).decode("ascii")
         with pytest.raises(ValueError, match="[Cc]ursor"):
             await store.list_sessions(SessionQuery(cursor=forged))
 

@@ -295,8 +295,8 @@ def test_cors_and_lifecycle_configuration_are_finite_and_immutable() -> None:
         ServerLifecycleConfig(recovery_inactive_after_seconds=True)
     with pytest.raises(ValidationError, match="must not be empty"):
         ServerLifecycleConfig(startup_recovery_statuses=set())
-    with pytest.raises(ValidationError, match="unsupported recovery status"):
-        ServerLifecycleConfig(startup_recovery_statuses={SessionStatus.COMPLETED})
+    terminal_recovery = ServerLifecycleConfig(startup_recovery_statuses={SessionStatus.COMPLETED})
+    assert terminal_recovery.startup_recovery_statuses == frozenset({SessionStatus.COMPLETED})
     with pytest.raises(ValidationError, match="cannot be combined"):
         CorsConfig(allowed_origins=("*",), allow_credentials=True)
 

@@ -277,6 +277,65 @@ includes `runtime.max_environment_lifecycle_owners`, so deployment fingerprints
 reflect this admission policy. Generator plans use the same version marker and
 therefore also advance to version 6.
 
+### Terminal recovery restores missing event evidence
+
+Incomplete-session recovery now accepts every session status and repairs a
+`completed`, `failed`, or `interrupted` session whose status commit survived
+without its matching terminal event. Repair fences stale publishers, reuses a
+stable event identity, reconciles lost append acknowledgements, preserves
+pending interruption identity, and clears that marker only after matching
+evidence is durable. Existing matching evidence is reused, while duplicate or
+operation-bound status-conflicting terminal events fail closed.
+Normal terminal publication also reconciles its preassigned event identity
+before treating an ambiguous acknowledgement or side-effect delivery failure as
+a run failure, so durable completion evidence cannot produce a second,
+contradictory failure event.
+
+The bounded inspection reads at most two lifecycle/terminal records and scopes
+them to the latest start or resume. A terminal fork's `session.forked` event is
+treated as a complete branch baseline rather than a run that needs a fabricated
+terminal event. Resumed and continuation runs also claim a durable operation
+identity atomically with their running status; their terminal events carry
+`session_run_operation_id`, allowing repair to distinguish an old run's
+terminal event even if the new lifecycle event never committed. The temporary
+checkpoint marker is removed only after terminal evidence is durable, and
+session deletion is rejected while that publication remains incomplete. A
+later resume or continuation checks the bounded evidence even when an initial
+run has no operation marker, repairs any missing prior boundary, and only then
+atomically claims a new run. Recovery reconstructs missing approval, user-input,
+and interrupted tool-round terminal payloads from their durable checkpoints
+before reporting or repairing the pending action. When recovery fences an
+abandoned resumed or continuation run, it atomically transfers that operation
+marker to the recovery epoch so terminal publication retains the same logical
+identity without accepting writes from the crashed owner.
+Operator-supplied ordinary tool-round recovery uses the same operation
+boundary: it creates an identity for a terminal continuation or transfers the
+identity of a stale running continuation. Recovery rejects a marker that claims
+an epoch newer than the durable session instead of normalizing impossible
+state.
+
+Healthy terminal rows do not consume the batch recovery result limit. Candidate
+discovery is explicitly paginated: each call inspects no more than
+`inspection_limit` sessions through no more than ten keyset store pages of at
+most 1,000 rows each and returns
+`IncompleteSessionsRecoveryPage.next_cursor` when more candidates remain.
+Reusing that opaque cursor with the same recovery semantics reaches older
+incomplete evidence without retaining or loading the complete history. The
+cursor is bound to statuses, inactivity boundary, reason, and metadata; result
+and inspection page sizes may change between calls. Repair does not run
+providers, tools, or terminal hooks, and a recovered failure explicitly reports
+when its original error details were not durably available.
+
+Durable session identifiers are now limited to 2,048 UTF-8 bytes, ordinary
+session-list cursors to 4,096 bytes, and batch-recovery cursors to 8,192 bytes.
+The versioned built-in list cursor encodes its identifier component, and the
+recovery cursor separately encodes the complete custom-store cursor, so every
+value accepted at one layer is guaranteed to fit the next layer even when it
+contains JSON metacharacters. Custom `SessionStore` implementations must keep
+their opaque `SessionListResult.next_cursor` values within the 4,096-byte
+contract. Session-list cursors issued before this release candidate are
+ephemeral and must be restarted rather than reused after upgrade.
+
 ### Aggregate usage remains exact across every public summary
 
 Session, causal-budget, multi-session, and usage-breakdown summaries now use the

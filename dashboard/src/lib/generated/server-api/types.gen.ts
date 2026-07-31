@@ -3305,7 +3305,7 @@ export type SseErrorEnvelope = {
     /**
      * Code
      */
-    code: 'runtime_failed' | 'observer_lagged' | 'event_frame_too_large' | 'replay_idle_timeout';
+    code: 'runtime_failed' | 'terminal_event_publication_uncertain' | 'observer_lagged' | 'event_frame_too_large' | 'replay_idle_timeout';
     /**
      * Error
      */

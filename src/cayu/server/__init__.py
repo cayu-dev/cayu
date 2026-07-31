@@ -165,35 +165,46 @@ def create_server(
     user_lifespan = resolved_fastapi_options.pop("lifespan", None)
     recovery_statuses = lifecycle.startup_recovery_statuses
 
-    async def recover_startup_state() -> None:
+    async def recover_startup_state() -> IncompleteSessionsRecoveryRequest | None:
         await _recover_persisted_event_side_effects_during_startup(
             app,
             timeout_s=lifecycle.event_side_effect_startup_timeout_seconds,
         )
+        continuation_request: IncompleteSessionsRecoveryRequest | None = None
         if recovery_statuses is not None:
-            await app.recover_incomplete_sessions(
-                IncompleteSessionsRecoveryRequest(
-                    statuses=set(recovery_statuses),
-                    inactive_before=datetime.now(UTC)
-                    - timedelta(seconds=lifecycle.recovery_inactive_after_seconds),
-                    reason="server_startup_recovery",
-                    metadata={"source": "create_server"},
-                )
+            inactive_before = datetime.now(UTC) - timedelta(
+                seconds=lifecycle.recovery_inactive_after_seconds
             )
+            request = IncompleteSessionsRecoveryRequest(
+                statuses=set(recovery_statuses),
+                inactive_before=inactive_before,
+                reason="server_startup_recovery",
+                metadata={"source": "create_server"},
+            )
+            page = await app.recover_incomplete_sessions(request)
+            if page.next_cursor is not None:
+                continuation_request = request.model_copy(update={"cursor": page.next_cursor})
         await app.resume_pending_interruption_cascades(
             interrupting_inactive_before=datetime.now(UTC)
             - timedelta(seconds=lifecycle.recovery_inactive_after_seconds)
         )
+        return continuation_request
 
     @asynccontextmanager
     async def cayu_lifespan(server):
         side_effect_recovery_task: asyncio.Task[None] | None = None
+        incomplete_session_recovery_task: asyncio.Task[None] | None = None
         if user_lifespan is None:
             try:
-                await recover_startup_state()
+                continuation_request = await recover_startup_state()
+                incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
+                    app,
+                    continuation_request,
+                )
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield
             finally:
+                await _stop_incomplete_session_startup_recovery(incomplete_session_recovery_task)
                 await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(
                     app,
@@ -206,10 +217,15 @@ def create_server(
             return
         async with user_lifespan(server) as state:
             try:
-                await recover_startup_state()
+                continuation_request = await recover_startup_state()
+                incomplete_session_recovery_task = _start_incomplete_session_startup_recovery(
+                    app,
+                    continuation_request,
+                )
                 side_effect_recovery_task = _start_persisted_event_side_effect_recovery(app)
                 yield state
             finally:
+                await _stop_incomplete_session_startup_recovery(incomplete_session_recovery_task)
                 await _stop_persisted_event_side_effect_recovery(side_effect_recovery_task)
                 await _drain_background_interruptions(
                     app,
@@ -659,6 +675,57 @@ async def _recover_persisted_event_side_effects_forever(app: CayuApp) -> None:
             raise
         except Exception:
             logger.exception("Failed to recover persisted event side effects.")
+
+
+async def _continue_incomplete_session_startup_recovery(
+    app: CayuApp,
+    request: IncompleteSessionsRecoveryRequest,
+) -> None:
+    seen_cursors = {request.cursor}
+    while True:
+        page = await app.recover_incomplete_sessions(request)
+        if page.next_cursor is None:
+            return
+        if page.next_cursor in seen_cursors:
+            raise RuntimeError("Incomplete-session startup recovery returned a repeated cursor.")
+        seen_cursors.add(page.next_cursor)
+        request = request.model_copy(update={"cursor": page.next_cursor})
+        # A large durable backlog must not monopolize the server event loop.
+        await asyncio.sleep(0)
+
+
+async def _run_incomplete_session_startup_recovery(
+    app: CayuApp,
+    request: IncompleteSessionsRecoveryRequest,
+) -> None:
+    try:
+        await _continue_incomplete_session_startup_recovery(app, request)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Failed to continue incomplete-session startup recovery.")
+
+
+def _start_incomplete_session_startup_recovery(
+    app: CayuApp,
+    request: IncompleteSessionsRecoveryRequest | None,
+) -> asyncio.Task[None] | None:
+    if request is None:
+        return None
+    return asyncio.create_task(
+        _run_incomplete_session_startup_recovery(app, request),
+        name="cayu-incomplete-session-startup-recovery",
+    )
+
+
+async def _stop_incomplete_session_startup_recovery(
+    task: asyncio.Task[None] | None,
+) -> None:
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 def _start_persisted_event_side_effect_recovery(app: CayuApp) -> asyncio.Task[None]:

@@ -78,7 +78,10 @@ from cayu.runtime._environment_lifecycle import (
     exception_failure_payload,
     render_initial_system_prompt,
 )
-from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._event_writer import (
+    RuntimeEventWriter,
+    _reconcile_exact_persisted_event,
+)
 from cayu.runtime._interruption_coordinator import (
     _PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY,
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
@@ -131,7 +134,6 @@ from cayu.runtime._session_control import (
     SessionControl,
     SessionInterruptedByRequest,
     clear_current_task_cancellation,
-    interruption_request_id_from_payload,
 )
 from cayu.runtime._structured_output_tool_round import (
     _has_structured_output_tool_call,
@@ -143,6 +145,7 @@ from cayu.runtime._structured_output_tool_round import (
     _StructuredOutputToolRoundPublicationExtension,
     _validate_structured_output_tool_round,
 )
+from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolApprovalRequired,
@@ -196,6 +199,7 @@ from cayu.runtime.context import (
 from cayu.runtime.costs import (
     SessionCostSummary,
 )
+from cayu.runtime.errors import TerminalEventPublicationUncertain
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
@@ -244,6 +248,8 @@ from cayu.runtime.retry_policy import (
 )
 from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
+    _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
+    _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
@@ -253,6 +259,7 @@ from cayu.runtime.sessions import (
     ForkSessionRequest,
     IncompleteSessionRecoveryRequest,
     IncompleteSessionRecoveryResult,
+    IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
     InteractionTransitionResult,
     InterruptSessionRequest,
@@ -270,6 +277,7 @@ from cayu.runtime.sessions import (
     SessionStore,
     TranscriptQuery,
     _activate_session_interaction,
+    _checkpoint_with_session_run_operation,
     _clear_session_interaction_recovered_active_through,
     _close_session_interaction,
     _current_session_interaction_id,
@@ -277,8 +285,10 @@ from cayu.runtime.sessions import (
     _current_session_interaction_started_at,
     _current_session_invocation_interaction_ids,
     _deactivate_session_interaction,
+    _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
+    _session_run_operation_from_checkpoint,
     _set_session_interaction_recovered_active_through,
     attribute_event_to_current_interaction,
     attribute_events_to_current_interaction,
@@ -1436,6 +1446,7 @@ def _replace_checkpoint_preserving_runtime_state(
             (_PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY, "pending_session_interrupt"),
             (_PENDING_INTERRUPTION_CASCADE_CHECKPOINT_KEY, "pending_interruption_cascade"),
             (_SESSION_OPERATIONS_CHECKPOINT_KEY, "session_operations"),
+            (_SESSION_RUN_OPERATION_CHECKPOINT_KEY, "session_run_operation"),
             (
                 _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
                 "incomplete_session_recovery_claim",
@@ -2010,7 +2021,7 @@ class SessionEngine:
     async def recover_incomplete_sessions(
         self,
         request: IncompleteSessionsRecoveryRequest,
-    ) -> list[IncompleteSessionRecoveryResult]:
+    ) -> IncompleteSessionsRecoveryPage:
         request = copy_incomplete_sessions_recovery_request(request)
         active_through_by_session: dict[str, datetime] = {}
 
@@ -2029,25 +2040,25 @@ class SessionEngine:
         async def deactivate_interaction(session_id: str) -> None:
             _deactivate_session_interaction(session_id)
 
-        results = await self._recovery_coordinator.recover_incomplete_sessions(
+        async def reconcile_result(
+            result: IncompleteSessionRecoveryResult,
+        ) -> IncompleteSessionRecoveryResult:
+            # Recovery cleanup can clear task-local interaction ownership. Restore
+            # the still-open durable interaction before publishing its terminal
+            # transition; the coordinator's after hook releases this ownership.
+            await self._activate_latest_open_interaction(result.session_id)
+            return await self._reconcile_recovered_interaction(
+                result,
+                recovered_active_through=active_through_by_session.get(result.session_id),
+            )
+
+        page = await self._recovery_coordinator.recover_incomplete_sessions(
             request,
             before_recovery=activate_interaction,
             after_recovery=deactivate_interaction,
+            reconcile_result=reconcile_result,
         )
-        reconciled: list[IncompleteSessionRecoveryResult] = []
-        for result in results:
-            interaction_id = await self._activate_latest_open_interaction(result.session_id)
-            try:
-                reconciled.append(
-                    await self._reconcile_recovered_interaction(
-                        result,
-                        recovered_active_through=active_through_by_session.get(result.session_id),
-                    )
-                )
-            finally:
-                if interaction_id is not None:
-                    _deactivate_session_interaction(result.session_id)
-        return reconciled
+        return page
 
     async def _activate_latest_open_interaction(self, session_id: str) -> str | None:
         records = await self.session_store.query_events(
@@ -2801,6 +2812,8 @@ class SessionEngine:
                 ):
                     yield event
                 raise exc
+            raise
+        except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
             failure_diagnostic = exception_diagnostic(
@@ -6814,7 +6827,9 @@ class SessionEngine:
                     "and cannot be resumed."
                 ) from None
 
-        def reject_unresumable_checkpoint(
+        run_operation_id = str(uuid4())
+
+        def validate_resumable_checkpoint(
             current_session: Session,
             current_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
@@ -6891,14 +6906,40 @@ class SessionEngine:
                 )
             return updated_checkpoint
 
+        def claim_resumable_checkpoint(
+            current_session: Session,
+            current_checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            updated_checkpoint = validate_resumable_checkpoint(
+                current_session,
+                current_checkpoint,
+            )
+            return _checkpoint_with_session_run_operation(
+                checkpoint=updated_checkpoint,
+                current_session=current_session,
+                operation_id=run_operation_id,
+            )
+
         # Report deterministic checkpoint conflicts before claiming the session,
         # then repeat the same validation inside the atomic transition below so a
         # concurrent checkpoint update cannot bypass the guard.
         checkpoint = await self.session_store.load_checkpoint(loaded_session.id)
-        reject_unresumable_checkpoint(loaded_session, checkpoint)
+        validate_resumable_checkpoint(loaded_session, checkpoint)
+        # An in-flight provider dispatch has an ambiguous external outcome and
+        # must reject resume without mutating the session. Check that boundary
+        # before terminal-evidence reconciliation, which may perform a fenced
+        # repair and advance the durable run epoch.
         pending_model_completion = (
             await self._recovery_coordinator.preflight_model_completion_boundary(loaded_session)
         )
+        (
+            loaded_session,
+            checkpoint,
+        ) = await self._recovery_coordinator._reconcile_terminal_evidence_before_continuation(
+            session=loaded_session,
+            checkpoint=checkpoint,
+        )
+        validate_resumable_checkpoint(loaded_session, checkpoint)
 
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         continuing_recovery_boundary = pending_round is not None or pending_model_completion
@@ -6941,7 +6982,7 @@ class SessionEngine:
                 loaded_session.id,
                 from_statuses=_RESUMABLE_SESSION_STATUSES,
                 to_status=SessionStatus.RUNNING,
-                checkpoint_transform=reject_unresumable_checkpoint,
+                checkpoint_transform=claim_resumable_checkpoint,
                 interaction_started_event=interaction_started_event,
                 interaction_source_messages=interaction_source_messages,
                 continued_interaction_id=(interaction_id if continuing_recovery_boundary else None),
@@ -7059,7 +7100,7 @@ class SessionEngine:
                     )
                 if interaction_failed_event is not None:
                     yield interaction_failed_event
-                yield await self._event_writer.emit(
+                failure_event = await self._bind_event_to_session_run_operation(
                     Event(
                         type=EventType.SESSION_FAILED,
                         session_id=session.id,
@@ -7069,8 +7110,24 @@ class SessionEngine:
                             exc,
                             redactor=self._secret_redactor,
                         ),
-                    )
+                    ),
+                    session=session,
                 )
+                persisted_failure = await self._event_writer.emit(failure_event)
+                try:
+                    await self._clear_session_run_operation(
+                        session_id=session.id,
+                        operation_id=run_operation_id,
+                    )
+                except Exception as cleanup_failure:
+                    logger.warning(
+                        "Terminal evidence is durable but session run operation cleanup "
+                        "remains pending: session_id=%s event_id=%s error_type=%s",
+                        session.id,
+                        persisted_failure.id,
+                        type(cleanup_failure).__name__,
+                    )
+                yield persisted_failure
             finally:
                 try:
                     await self.session_store.release_run_fence(session.id)
@@ -7309,6 +7366,7 @@ class SessionEngine:
                 return None
             if fork_checkpoint is not None:
                 fork_checkpoint.pop(_SESSION_OPERATIONS_CHECKPOINT_KEY, None)
+                fork_checkpoint.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY, None)
                 # A model-step publication receipt belongs to the source session.
                 # The child inherits transcript state, not its reconstruction pointer.
                 fork_checkpoint.pop(
@@ -8967,6 +9025,8 @@ class SessionEngine:
                 )
             )
             raise
+        except TerminalEventPublicationUncertain:
+            raise
         except Exception as exc:
             failure_diagnostic = exception_diagnostic(
                 exc,
@@ -10518,6 +10578,68 @@ class SessionEngine:
             retry_request=retry_request,
         )
 
+    async def _bind_event_to_session_run_operation(
+        self,
+        event: Event,
+        *,
+        session: Session,
+    ) -> Event:
+        checkpoint = await self.session_store.load_checkpoint(session.id)
+        run_operation = _session_run_operation_from_checkpoint(checkpoint)
+        if run_operation is None:
+            return event
+        if run_operation.run_epoch != session.run_epoch:
+            raise RuntimeError(
+                "Terminal event session run operation does not match the active run epoch."
+            )
+        return _event_with_session_run_operation(event, run_operation)
+
+    async def _clear_session_run_operation(
+        self,
+        *,
+        session_id: str,
+        operation_id: str,
+    ) -> None:
+        def clear_operation(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            run_operation = _session_run_operation_from_checkpoint(checkpoint)
+            if run_operation is None:
+                return checkpoint
+            if run_operation.operation_id != operation_id:
+                raise RuntimeError(
+                    "Session run operation changed before terminal evidence cleanup."
+                )
+            updated = copy_json_value(checkpoint, "checkpoint")
+            updated.pop(_SESSION_RUN_OPERATION_CHECKPOINT_KEY)
+            return updated
+
+        await self.session_store.transform_checkpoint(
+            session_id,
+            clear_operation,
+        )
+
+    async def _reconcile_persisted_terminal_event(
+        self,
+        event: Event,
+    ) -> Event | None:
+        """Return the exact durable event after an ambiguous publication failure."""
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=event.session_id,
+                event_id=event.id,
+                limit=1,
+            )
+        )
+        return _reconcile_exact_persisted_event(
+            event,
+            records,
+            conflict_message=(
+                "Terminal event identity is already used by different durable evidence."
+            ),
+        )
+
     async def _emit_terminal_event_with_hooks(
         self,
         *,
@@ -10527,6 +10649,10 @@ class SessionEngine:
         registered_agent: runtime_records.RegisteredAgentState,
         registered_environment: runtime_records.RegisteredEnvironment | None,
     ) -> AsyncGenerator[Event, None]:
+        event = await self._bind_event_to_session_run_operation(
+            event,
+            session=session,
+        )
         finalize_result = await self._environment_lifecycle.finalize_terminal_event(
             event=event,
             session=session,
@@ -10534,7 +10660,49 @@ class SessionEngine:
         )
         for binding_event in finalize_result.events:
             yield binding_event
-        terminal_event = await self._event_writer.emit(finalize_result.event)
+        prepared_terminal_event = self._event_writer.prepare(finalize_result.event)
+        try:
+            terminal_event = await self._event_writer.emit(prepared_terminal_event)
+        except Exception as publication_failure:
+            try:
+                reconciled_terminal_event = await self._reconcile_persisted_terminal_event(
+                    prepared_terminal_event
+                )
+            except Exception as reconciliation_failure:
+                uncertainty = TerminalEventPublicationUncertain(
+                    event=prepared_terminal_event,
+                    publication_failure=publication_failure,
+                    reconciliation_failure=reconciliation_failure,
+                )
+                raise uncertainty from uncertainty.failures
+            if reconciled_terminal_event is None:
+                raise
+            terminal_event = reconciled_terminal_event
+            logger.warning(
+                "Terminal event is durable but its publication acknowledgement or "
+                "side-effect delivery failed: session_id=%s event_id=%s error_type=%s",
+                session.id,
+                terminal_event.id,
+                type(publication_failure).__name__,
+            )
+        run_operation_id = terminal_event.payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+        if run_operation_id is not None:
+            try:
+                await self._clear_session_run_operation(
+                    session_id=session.id,
+                    operation_id=require_clean_nonblank(
+                        run_operation_id,
+                        "terminal event session_run_operation_id",
+                    ),
+                )
+            except Exception as cleanup_failure:
+                logger.warning(
+                    "Terminal evidence is durable but session run operation cleanup "
+                    "remains pending: session_id=%s event_id=%s error_type=%s",
+                    session.id,
+                    terminal_event.id,
+                    type(cleanup_failure).__name__,
+                )
         yield terminal_event
         async for hook_event in self._run_runtime_hooks(
             phase=phase,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -19,11 +20,13 @@ from cayu import (
 )
 from cayu.core import Event, EventType, Message, ThinkingPart, ToolCallPart
 from cayu.runtime import (
+    ForkSessionRequest,
     InMemorySessionStore,
     RunRequest,
     Session,
     SessionDebugState,
     SessionIdentity,
+    SessionListResult,
     SessionRunFenced,
     SessionStatus,
     SessionStore,
@@ -35,8 +38,12 @@ from cayu.runtime.pending_actions import (
 from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_RESULT_BYTES,
+    MAX_SESSION_ID_BYTES,
+    MAX_SESSION_LIST_CURSOR_BYTES,
     PendingActionKind,
     PendingActionQuery,
+    decode_session_cursor,
+    encode_session_cursor,
     event_summary_from_records,
     session_outcome_from_records,
 )
@@ -2687,7 +2694,16 @@ def test_session_stores_reject_invalid_cursor(store_factory, tmp_path):
             await store.list_sessions(SessionQuery(cursor="!!!not-a-cursor"))
         # Structurally valid but the encoded sort value is not a timestamp: every
         # store must reject it rather than silently returning a wrong page.
-        forged = base64.urlsafe_b64encode(b'["not-a-timestamp","sess_only"]').decode("ascii")
+        forged = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sort_value": "not-a-timestamp",
+                    "session_id_b64": base64.urlsafe_b64encode(b"sess_only").decode("ascii"),
+                },
+                separators=(",", ":"),
+            ).encode()
+        ).decode("ascii")
         with pytest.raises(ValueError, match="[Cc]ursor"):
             await store.list_sessions(SessionQuery(cursor=forged))
         await _close_store(store)
@@ -2815,19 +2831,99 @@ def test_session_query_rejects_cursor_with_offset() -> None:
 
 
 def test_decode_session_cursor_rejects_naive_datetimes() -> None:
-    from cayu.runtime.sessions import decode_session_cursor
+    session = Session(
+        id="sess_ok",
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+    )
 
     # A UTC-aware cursor round-trips.
-    aware = base64.urlsafe_b64encode(b'["2026-01-02T03:04:05+00:00","sess_ok"]').decode("ascii")
+    aware = encode_session_cursor(session, SessionOrder.CREATED_AT_ASC)
     value, session_id = decode_session_cursor(aware)
     assert session_id == "sess_ok"
     assert value.tzinfo is not None
 
     # A hand-forged cursor with a naive sort value must be rejected up front so it
     # never reaches the timezone-aware comparisons in the keyset walk.
-    naive = base64.urlsafe_b64encode(b'["2026-01-02T03:04:05","sess_naive"]').decode("ascii")
+    material = {
+        "version": 1,
+        "sort_value": "2026-01-02T03:04:05",
+        "session_id_b64": base64.urlsafe_b64encode(b"sess_naive").decode("ascii"),
+    }
+    naive = base64.urlsafe_b64encode(json.dumps(material, separators=(",", ":")).encode()).decode(
+        "ascii"
+    )
     with pytest.raises(ValueError, match="Invalid session cursor."):
         decode_session_cursor(naive)
+
+
+def test_session_cursor_contract_wraps_maximum_valid_session_identifier() -> None:
+    # Quotes and backslashes are valid durable identifier text but would double
+    # in raw JSON. The cursor encoding must still fit at the exact byte ceiling.
+    session_id = '\\"' * (MAX_SESSION_ID_BYTES // 2)
+    session = Session(
+        id=session_id,
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+    )
+
+    cursor = encode_session_cursor(session, SessionOrder.UPDATED_AT_DESC)
+
+    assert len(cursor.encode("utf-8")) <= MAX_SESSION_LIST_CURSOR_BYTES
+    assert decode_session_cursor(cursor) == (
+        session.updated_at.astimezone(UTC),
+        session_id,
+    )
+    SessionQuery(cursor=cursor)
+    SessionListResult(sessions=[session], next_cursor=cursor)
+
+
+def test_session_creation_contract_rejects_oversized_ids_without_hiding_existing_rows() -> None:
+    oversized_session_id = "é" * (MAX_SESSION_ID_BYTES // 2 + 1)
+    with pytest.raises(ValidationError, match=f"{MAX_SESSION_ID_BYTES} UTF-8 bytes"):
+        RunRequest(
+            agent_name="assistant",
+            session_id=oversized_session_id,
+            messages=[],
+        )
+    with pytest.raises(ValidationError, match=f"{MAX_SESSION_ID_BYTES} UTF-8 bytes"):
+        ForkSessionRequest(
+            source_session_id="source",
+            session_id=oversized_session_id,
+        )
+
+    session = Session(
+        id=oversized_session_id,
+        agent_name="assistant",
+        provider_name="fake",
+        model="fake-model",
+    )
+    fork = ForkSessionRequest(source_session_id=oversized_session_id)
+
+    assert session.id == oversized_session_id
+    assert fork.source_session_id == oversized_session_id
+
+
+def test_session_cursor_contracts_reject_oversized_values() -> None:
+    oversized_session_id = "é" * (MAX_SESSION_ID_BYTES // 2 + 1)
+    with pytest.raises(ValueError, match=f"{MAX_SESSION_ID_BYTES} UTF-8 bytes"):
+        encode_session_cursor(
+            Session(
+                id=oversized_session_id,
+                agent_name="assistant",
+                provider_name="fake",
+                model="fake-model",
+            ),
+            SessionOrder.UPDATED_AT_DESC,
+        )
+
+    oversized_cursor = "c" * (MAX_SESSION_LIST_CURSOR_BYTES + 1)
+    with pytest.raises(ValidationError, match=f"{MAX_SESSION_LIST_CURSOR_BYTES} UTF-8 bytes"):
+        SessionQuery(cursor=oversized_cursor)
+    with pytest.raises(ValidationError, match=f"{MAX_SESSION_LIST_CURSOR_BYTES} UTF-8 bytes"):
+        SessionListResult(next_cursor=oversized_cursor)
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
@@ -2857,8 +2953,15 @@ def test_session_stores_delete_session_guards_in_flight_status(
         # Deleting a missing session stays an idempotent no-op.
         await store.delete_session("sess_absent")
 
-        # Once interrupted, delete succeeds.
+        # Once the interrupted status and its terminal event are durable, delete succeeds.
         await store.update_status("sess_running", SessionStatus.INTERRUPTED)
+        await store.append_event(
+            "sess_running",
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id="sess_running",
+            ),
+        )
         await store.delete_session("sess_running")
         assert await store.load("sess_running") is None
         await _close_store(store)

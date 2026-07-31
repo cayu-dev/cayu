@@ -26,6 +26,8 @@ from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.sessions import (
+    _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
+    _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
@@ -149,7 +151,9 @@ from cayu.runtime.sessions import (
     _runtime_publication_receipt_record,
     _runtime_publication_referenced_event_ids,
     _runtime_publication_storage_key,
+    _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline_json,
+    _terminal_publication_delete_block_reason,
     _tool_round_publication_identity,
     _validate_equivalent_queued_session_message,
     _validate_interaction_page,
@@ -1460,6 +1464,35 @@ class SQLiteSessionStore(SessionStore):
                     raise ValueError(
                         "Cannot delete a session while incomplete-session recovery claim "
                         f"{active_recovery_claim_id} is active: {session_id}"
+                    )
+                run_operation = _session_run_operation_from_checkpoint(checkpoint)
+                if run_operation is not None:
+                    raise ValueError(
+                        "Cannot delete a session while terminal publication "
+                        f"{run_operation.operation_id} is incomplete: {session_id}"
+                    )
+                terminal_evidence_rows = self._connection.execute(
+                    f"SELECT {', '.join(_EVENT_COLUMN_NAMES)} FROM cayu_events "
+                    "WHERE session_id = ? "
+                    f"AND event_type IN ({', '.join('?' for _ in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES)}) "
+                    "ORDER BY sequence DESC LIMIT ?",
+                    (
+                        session_id,
+                        *(
+                            str(event_type)
+                            for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES
+                        ),
+                        _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
+                    ),
+                ).fetchall()
+                terminal_publication_block = _terminal_publication_delete_block_reason(
+                    session=session,
+                    checkpoint=checkpoint,
+                    evidence_events=[_event_from_row(row) for row in terminal_evidence_rows],
+                )
+                if terminal_publication_block is not None:
+                    raise ValueError(
+                        f"Cannot delete a session while {terminal_publication_block}: {session_id}"
                     )
                 active_operation_id = _active_unexpired_session_operation_id(
                     checkpoint,

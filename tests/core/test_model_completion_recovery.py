@@ -1286,6 +1286,9 @@ def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> N
         second_recovery = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=staged.session.id)
         )
+        settled_recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+        )
         return (
             store,
             tool,
@@ -1297,6 +1300,7 @@ def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> N
             deferred_after_commit,
             receipt_after_commit,
             second_recovery,
+            settled_recovery,
         )
 
     (
@@ -1310,6 +1314,7 @@ def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> N
         deferred_after_commit,
         receipt_after_commit,
         second_recovery,
+        settled_recovery,
     ) = asyncio.run(run())
 
     assert resume_events[-1].type is EventType.SESSION_INTERRUPTED
@@ -1320,7 +1325,20 @@ def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> N
     assert deferred_after_commit.source_messages == [deferred_message]
 
     assert second_recovery.status is SessionStatus.INTERRUPTED
-    assert second_recovery.actions == (IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,)
+    assert second_recovery.actions == (
+        IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+        IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+    )
+    repaired_interrupts = [
+        event
+        for event in second_recovery.events
+        if event.type is EventType.SESSION_INTERRUPTED
+        and event.payload.get("interruption_request_id")
+        == "interrupt-before-terminal-materialization"
+    ]
+    assert len(repaired_interrupts) == 1
+    assert settled_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+    assert settled_recovery.events == ()
     transcript = asyncio.run(store.load_transcript(staged.session.id))
     assert transcript[-2:] == [transcript_after_commit[-1], deferred_message]
     assert transcript.count(deferred_message) == 1

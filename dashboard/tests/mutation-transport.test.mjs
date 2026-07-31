@@ -92,6 +92,18 @@ function runtimeError() {
   }
 }
 
+function runtimeUncertainError() {
+  return {
+    type: "stream.error",
+    kind: "runtime",
+    code: "terminal_event_publication_uncertain",
+    error: "terminal event publication outcome is uncertain",
+    error_type: "TerminalEventPublicationUncertain",
+    retryable: true,
+    session_id: SESSION_ID,
+  }
+}
+
 function observerError(retryable) {
   return {
     type: "stream.error",
@@ -1562,6 +1574,85 @@ test("runtime failure is terminal while a non-retryable observer failure uses RE
   assert.equal(fallbackSnapshot.phase, "terminal")
   assert.ok(phases.includes("polling_fallback"))
   assert.equal(eventReads, 2)
+})
+
+test("terminal publication uncertainty reconciles the durable terminal outcome", async () => {
+  let attempts = 0
+  let eventReads = 0
+  const phases = []
+  const controller = transportController({
+    request: request(),
+    onChange: (snapshot) => phases.push(snapshot.phase),
+    io: immediateIo({
+      async attempt(_request, callbacks) {
+        attempts += 1
+        callbacks.onAccepted()
+        return {
+          kind: "runtime_uncertain",
+          accepted: true,
+          error: runtimeUncertainError(),
+        }
+      },
+      async readEvents() {
+        eventReads += 1
+        if (eventReads === 1) throw new Error("event store temporarily unavailable")
+        return eventsPage(
+          [
+            record(2, "event-resumed", "session.resumed"),
+            acceptanceRecord(3, "event-accepted", "event-resumed"),
+            record(4, "event-terminal", "session.completed"),
+          ],
+          { scanThrough: 4 },
+        )
+      },
+      async readState() {
+        return state("completed")
+      },
+    }),
+  })
+
+  const snapshot = await controller.start()
+
+  assert.equal(snapshot.phase, "terminal")
+  assert.equal(snapshot.failure, null)
+  assert.equal(attempts, 1)
+  assert.equal(eventReads, 2)
+  assert.ok(phases.includes("polling_fallback"))
+  assert.ok(!phases.includes("runtime_failed"))
+})
+
+test("terminal uncertainty acceptance remains authoritative when the attempted event is absent", async () => {
+  const uncertainAcceptance = acceptanceRecord(
+    2,
+    "event-accepted",
+    "event-terminal-attempt",
+    "session.completed",
+  )
+  uncertainAcceptance.payload.accepted_event_publication_uncertain = true
+  const controller = transportController({
+    request: request(),
+    io: immediateIo({
+      async attempt(_request, callbacks) {
+        callbacks.onAccepted()
+        return {
+          kind: "runtime_uncertain",
+          accepted: true,
+          error: runtimeUncertainError(),
+        }
+      },
+      async readEvents() {
+        return eventsPage([uncertainAcceptance], { scanThrough: 2 })
+      },
+      async readState() {
+        return state("completed")
+      },
+    }),
+  })
+
+  const snapshot = await controller.start()
+
+  assert.equal(snapshot.phase, "terminal")
+  assert.equal(snapshot.failure, null)
 })
 
 test("retry exhaustion enters bounded polling fallback", async () => {

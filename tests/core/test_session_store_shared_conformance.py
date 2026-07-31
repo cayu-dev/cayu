@@ -54,6 +54,7 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
+    InterruptSessionRequest,
     McpManifestBaseline,
     ModelCompactor,
     ModelCompletionStageRequest,
@@ -124,6 +125,8 @@ from cayu.runtime.sessions import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
     BudgetReservationIdentityConflict,
     PersistedEventSideEffectDelivery,
+    _checkpoint_with_session_run_operation,
+    _deactivate_session_run_fence,
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
 )
@@ -565,6 +568,394 @@ async def _reopen_store(case, store: SessionStore) -> SessionStore:
     if store_kind == "sqlite":
         return SQLiteSessionStore(tmp_path / "sessions.sqlite")
     return _new_postgres_store(postgres_dsn)
+
+
+def test_session_store_conformance_repairs_terminal_evidence_durably(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            app = CayuApp(session_store=store, enable_logging=False)
+            expected_types = {
+                SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+                SessionStatus.FAILED: EventType.SESSION_FAILED,
+                SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+            }
+            original_epochs: dict[str, int] = {}
+            for status in expected_types:
+                session_id = f"terminal-evidence-{status.value}"
+                await store.create(
+                    RunRequest(
+                        agent_name="removed_agent",
+                        session_id=session_id,
+                        messages=[Message.text("user", "finish")],
+                    ),
+                    identity=_identity(),
+                )
+                terminal = await store.update_status(session_id, status)
+                original_epochs[session_id] = terminal.run_epoch
+                if status == SessionStatus.INTERRUPTED:
+                    await store.checkpoint(
+                        session_id,
+                        {
+                            "pending_session_interrupt": {
+                                "reason": "worker restart",
+                                "metadata": {"worker": "old"},
+                                "interruption_type": "operator_requested",
+                                "interruption_request_id": "interrupt-before-crash",
+                            }
+                        },
+                    )
+
+                repaired = await app.recover_incomplete_session(
+                    IncompleteSessionRecoveryRequest(session_id=session_id)
+                )
+                assert repaired.actions == (
+                    IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
+                )
+
+            store = await _reopen_store(session_store_case, store)
+            for status, expected_type in expected_types.items():
+                session_id = f"terminal-evidence-{status.value}"
+                session = await store.load(session_id)
+                records = await store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_types=tuple(expected_types.values()),
+                    )
+                )
+                assert session is not None
+                assert session.status == status
+                assert session.run_epoch == original_epochs[session_id] + 2
+                assert [record.event.type for record in records] == [expected_type]
+                assert await store.load_checkpoint(session_id) == {}
+
+            class CompleteThenBlockProvider(ModelProvider):
+                name = "fake"
+
+                def __init__(self) -> None:
+                    self.calls = 0
+                    self.second_started = asyncio.Event()
+
+                async def stream(self, _request: Any):
+                    self.calls += 1
+                    if self.calls == 2:
+                        self.second_started.set()
+                        await asyncio.Event().wait()
+                        raise AssertionError("unreachable")
+                    yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+            provider = CompleteThenBlockProvider()
+            resumed_app = CayuApp(session_store=store, enable_logging=False)
+            resumed_app.register_provider(provider, default=True)
+            resumed_app.register_agent(AgentSpec(name="removed_agent", model="fake-model"))
+            resumed_events = [
+                event
+                async for event in resumed_app.resume(
+                    ResumeRequest(
+                        session_id="terminal-evidence-interrupted",
+                        messages=[Message.text("user", "continue")],
+                    )
+                )
+            ]
+            assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+
+            async def collect_second_resume() -> list[Event]:
+                return [
+                    event
+                    async for event in resumed_app.resume(
+                        ResumeRequest(
+                            session_id="terminal-evidence-interrupted",
+                            messages=[Message.text("user", "continue again")],
+                        )
+                    )
+                ]
+
+            second_resume = asyncio.create_task(collect_second_resume())
+            await asyncio.wait_for(provider.second_started.wait(), timeout=5)
+            independent_interrupt = [
+                event
+                async for event in resumed_app.interrupt_session(
+                    InterruptSessionRequest(
+                        session_id="terminal-evidence-interrupted",
+                        reason="new operator request",
+                        metadata={"worker": "new"},
+                    )
+                )
+            ]
+            second_resume_events = await asyncio.wait_for(second_resume, timeout=5)
+            assert independent_interrupt[-1].type == EventType.SESSION_INTERRUPTED
+            assert second_resume_events[-1].id == independent_interrupt[-1].id
+
+            durable_interruptions = await store.query_events(
+                EventQuery(
+                    session_id="terminal-evidence-interrupted",
+                    event_type=EventType.SESSION_INTERRUPTED,
+                )
+            )
+            assert len(durable_interruptions) == 2
+            repaired_interruption, later_interruption = (
+                record.event for record in durable_interruptions
+            )
+            assert repaired_interruption.payload["reason"] == "worker restart"
+            assert repaired_interruption.payload["metadata"] == {"worker": "old"}
+            assert (
+                repaired_interruption.payload["interruption_request_id"] == "interrupt-before-crash"
+            )
+            assert later_interruption.payload["reason"] == "new operator request"
+            assert later_interruption.payload["metadata"] == {"worker": "new"}
+            assert (
+                later_interruption.payload["interruption_request_id"]
+                != repaired_interruption.payload["interruption_request_id"]
+            )
+
+            concurrent_session_id = "terminal-evidence-concurrent"
+            await store.create(
+                RunRequest(
+                    agent_name="removed_agent",
+                    session_id=concurrent_session_id,
+                    messages=[Message.text("user", "finish")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(concurrent_session_id, SessionStatus.COMPLETED)
+            request = IncompleteSessionRecoveryRequest(session_id=concurrent_session_id)
+            concurrent_results = await asyncio.gather(
+                CayuApp(session_store=store, enable_logging=False).recover_incomplete_session(
+                    request
+                ),
+                CayuApp(session_store=store, enable_logging=False).recover_incomplete_session(
+                    request
+                ),
+            )
+            assert (
+                sum(
+                    result.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
+                    for result in concurrent_results
+                )
+                == 1
+            )
+            assert all(
+                result.actions
+                in {
+                    (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,),
+                    (IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                    (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,),
+                }
+                for result in concurrent_results
+            )
+            concurrent_events = await store.query_events(
+                EventQuery(
+                    session_id=concurrent_session_id,
+                    event_type=EventType.SESSION_COMPLETED,
+                )
+            )
+            assert len(concurrent_events) == 1
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_deletes_reconciled_consecutive_interruptions(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "terminal-evidence-consecutive-interrupt-delete"
+        first_payload = {
+            "interruption_type": "tool_approval_required",
+            "approval": {"approval_id": "approval-before-operator"},
+        }
+        second_payload = {
+            "reason": "new operator request",
+            "metadata": {"worker": "new"},
+            "interruption_type": "operator_requested",
+            "interruption_request_id": "independent-interrupt",
+        }
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="removed_agent",
+                    session_id=session_id,
+                    messages=[Message.text("user", "finish")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            await store.append_event(
+                session_id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session_id,
+                    payload=first_payload,
+                ),
+            )
+
+            await store.transition_status_and_checkpoint(
+                session_id,
+                from_statuses={SessionStatus.INTERRUPTED},
+                to_status=SessionStatus.INTERRUPTING,
+                checkpoint_transform=lambda _session, _checkpoint: {
+                    "pending_session_interrupt": second_payload
+                },
+            )
+            await store.update_status(session_id, SessionStatus.INTERRUPTED)
+            app = CayuApp(session_store=store, enable_logging=False)
+            repaired = await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+            assert repaired.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
+            assert repaired.events[0].payload == second_payload
+
+            store = await _reopen_store(session_store_case, store)
+            settled = await CayuApp(
+                session_store=store,
+                enable_logging=False,
+            ).recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
+            assert settled.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+            await store.delete_session(session_id)
+            assert await store.load(session_id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_repairs_pre_boundary_resume_failure(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "terminal-evidence-pre-boundary-resume"
+        operation_id = "93f3184b-976c-4fdc-8889-c2918890581b"
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="removed_agent",
+                    session_id=session_id,
+                    messages=[Message.text("user", "finish")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(session_id, SessionStatus.COMPLETED)
+            await store.append_event(
+                session_id,
+                Event(
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                ),
+            )
+            await store.transition_status_and_checkpoint(
+                session_id,
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda current_session, checkpoint: (
+                    _checkpoint_with_session_run_operation(
+                        checkpoint=checkpoint,
+                        current_session=current_session,
+                        operation_id=operation_id,
+                    )
+                ),
+            )
+            await store.update_status(session_id, SessionStatus.FAILED)
+            await store.release_run_fence(session_id)
+
+            store = await _reopen_store(session_store_case, store)
+            repaired = await CayuApp(
+                session_store=store,
+                enable_logging=False,
+            ).recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
+            records = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_types=(
+                        EventType.SESSION_COMPLETED,
+                        EventType.SESSION_FAILED,
+                    ),
+                )
+            )
+            assert repaired.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
+            assert [record.event.type for record in records] == [
+                EventType.SESSION_COMPLETED,
+                EventType.SESSION_FAILED,
+            ]
+            assert records[-1].event.payload["session_run_operation_id"] == operation_id
+            assert await store.load_checkpoint(session_id) == {}
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_recovers_abandoned_resumed_run(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "terminal-evidence-abandoned-resumed-run"
+        operation_id = "terminal-evidence-abandoned-resumed-operation"
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "finish")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(session_id, SessionStatus.COMPLETED)
+            await store.append_event(
+                session_id,
+                Event(
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                ),
+            )
+            await store.transition_status_and_checkpoint(
+                session_id,
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda current_session, checkpoint: (
+                    _checkpoint_with_session_run_operation(
+                        checkpoint=checkpoint,
+                        current_session=current_session,
+                        operation_id=operation_id,
+                    )
+                ),
+            )
+            _deactivate_session_run_fence(session_id)
+
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+            recovered = await app.recover_incomplete_session(
+                IncompleteSessionRecoveryRequest(session_id=session_id)
+            )
+
+            store = await _reopen_store(session_store_case, store)
+            session = await store.load(session_id)
+            checkpoint = await store.load_checkpoint(session_id)
+            interrupted = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_INTERRUPTED,
+                )
+            )
+            assert recovered.actions == (IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED,)
+            assert session is not None
+            assert session.status == SessionStatus.INTERRUPTED
+            assert len(interrupted) == 1
+            assert interrupted[0].event.payload["session_run_operation_id"] == operation_id
+            assert checkpoint is not None
+            assert "session_run_operation" not in checkpoint
+            assert "pending_session_interrupt" not in checkpoint
+            assert "incomplete_session_recovery_claim" not in checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 def test_session_store_conformance_declares_usage_aggregate_support(
@@ -9918,6 +10309,13 @@ def test_session_store_conformance_blocks_delete_during_explicit_compaction(
             ]
             await store.append_transcript_messages(created.id, transcript)
             completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            await store.append_event(
+                created.id,
+                Event(
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=created.id,
+                ),
+            )
             request = CompactSessionRequest(
                 session_id=created.id,
                 idempotency_key="compact-delete-conformance",
@@ -10068,6 +10466,188 @@ def test_session_store_conformance_blocks_delete_until_budget_settlement_is_deli
     asyncio.run(run())
 
 
+def test_session_store_conformance_blocks_delete_during_terminal_publication(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_terminal_publication_delete_conformance",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            operation_id = "terminal-publication-delete-conformance"
+            running = await store.transition_status_and_checkpoint(
+                created.id,
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda current_session, checkpoint: (
+                    _checkpoint_with_session_run_operation(
+                        checkpoint=checkpoint,
+                        current_session=current_session,
+                        operation_id=operation_id,
+                    )
+                ),
+            )
+            assert running.run_epoch == completed.run_epoch + 1
+            await store.update_status(created.id, SessionStatus.INTERRUPTED)
+
+            with pytest.raises(
+                ValueError,
+                match=f"terminal publication {operation_id} is incomplete",
+            ):
+                await store.delete_session(created.id)
+            assert await store.load(created.id) is not None
+
+            await store.append_event(
+                created.id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=created.id,
+                    payload={"session_run_operation_id": operation_id},
+                ),
+            )
+            await store.checkpoint(created.id, {})
+            await store.delete_session(created.id)
+            assert await store.load(created.id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_blocks_delete_until_markerless_terminal_evidence_is_safe(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            pending_interrupt = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_pending_interrupt_terminal_delete",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(
+                pending_interrupt.id,
+                SessionStatus.INTERRUPTED,
+            )
+            await store.checkpoint(
+                pending_interrupt.id,
+                {
+                    "pending_session_interrupt": {
+                        "reason": "operator request",
+                        "interruption_type": "operator_requested",
+                        "interruption_request_id": "interrupt-delete-conformance",
+                    }
+                },
+            )
+            with pytest.raises(
+                ValueError,
+                match="pending interruption terminal publication is incomplete",
+            ):
+                await store.delete_session(pending_interrupt.id)
+            await store.append_event(
+                pending_interrupt.id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=pending_interrupt.id,
+                    payload={
+                        "reason": "operator request",
+                        "interruption_type": "operator_requested",
+                        "interruption_request_id": "interrupt-delete-conformance",
+                    },
+                ),
+            )
+            with pytest.raises(
+                ValueError,
+                match="pending interruption terminal publication is incomplete",
+            ):
+                await store.delete_session(pending_interrupt.id)
+            await store.checkpoint(pending_interrupt.id, {})
+            await store.delete_session(pending_interrupt.id)
+            assert await store.load(pending_interrupt.id) is None
+
+            pending_action = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_pending_action_terminal_delete",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(pending_action.id, SessionStatus.INTERRUPTED)
+            await store.checkpoint(
+                pending_action.id,
+                {"pending_tool_round": {"recovery_marker": True}},
+            )
+            with pytest.raises(
+                ValueError,
+                match="terminal publication evidence is incomplete",
+            ):
+                await store.delete_session(pending_action.id)
+            await store.append_event(
+                pending_action.id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=pending_action.id,
+                ),
+            )
+            await store.delete_session(pending_action.id)
+            assert await store.load(pending_action.id) is None
+
+            markerless = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_markerless_current_terminal_delete",
+                    messages=[Message.text("user", "create only")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(markerless.id, SessionStatus.INTERRUPTED)
+            await store.append_event(
+                markerless.id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=markerless.id,
+                ),
+            )
+            await store.update_status(markerless.id, SessionStatus.RUNNING)
+            await store.append_event(
+                markerless.id,
+                Event(
+                    type=EventType.SESSION_RESUMED,
+                    session_id=markerless.id,
+                ),
+            )
+            await store.update_status(markerless.id, SessionStatus.INTERRUPTED)
+            with pytest.raises(
+                ValueError,
+                match="terminal publication evidence is incomplete",
+            ):
+                await store.delete_session(markerless.id)
+            await store.append_event(
+                markerless.id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=markerless.id,
+                ),
+            )
+            await store.delete_session(markerless.id)
+            assert await store.load(markerless.id) is None
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_blocks_fork_and_delete_with_active_model_stage(
     session_store_case,
 ) -> None:
@@ -10105,6 +10685,13 @@ def test_session_store_conformance_blocks_fork_and_delete_with_active_model_stag
             interrupted = await store.update_status(
                 created.id,
                 SessionStatus.INTERRUPTED,
+            )
+            await store.append_event(
+                created.id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=created.id,
+                ),
             )
             fork = Session(
                 id="sess_active_model_stage_control_plane_fork",

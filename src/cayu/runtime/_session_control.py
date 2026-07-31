@@ -9,6 +9,7 @@ from typing import Any, Generic, TypeVar
 from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
 from cayu.runtime.sessions import EventOrder, EventQuery, SessionStatus, SessionStore
 
 INTERRUPT_REQUESTED_SESSION_STATUSES = {
@@ -57,15 +58,6 @@ def clear_current_task_cancellation() -> None:
         return
     while current_task.cancelling():
         current_task.uncancel()
-
-
-def interruption_request_id_from_payload(payload: dict[str, Any]) -> str | None:
-    request_id = payload.get("interruption_request_id")
-    if request_id is None:
-        return None
-    if type(request_id) is not str or not request_id.strip():
-        raise ValueError("Interruption request ID must be a non-blank string.")
-    return request_id
 
 
 async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:

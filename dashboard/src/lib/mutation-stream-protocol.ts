@@ -90,14 +90,17 @@ export function parseMutationSseError(raw: string): SseErrorEnvelope {
   const error = parseJsonObject(raw, "SSE error")
   const validCode =
     error.code === "runtime_failed" ||
+    error.code === "terminal_event_publication_uncertain" ||
     error.code === "observer_lagged" ||
     error.code === "event_frame_too_large" ||
     error.code === "replay_idle_timeout"
+  const runtimeCode =
+    error.code === "runtime_failed" || error.code === "terminal_event_publication_uncertain"
   if (
     error.type !== "stream.error" ||
     (error.kind !== "runtime" && error.kind !== "observer") ||
     !validCode ||
-    (error.kind === "runtime") !== (error.code === "runtime_failed") ||
+    (error.kind === "runtime") !== runtimeCode ||
     typeof error.error !== "string" ||
     error.error.length === 0 ||
     typeof error.error_type !== "string" ||

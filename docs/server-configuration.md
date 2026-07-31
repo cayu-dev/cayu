@@ -84,6 +84,13 @@ are a separate public FastAPI surface and are not wrapped in the access
 dependency, so enable `DocsConfig` only on a boundary where that exposure is
 intentional.
 
+When `lifecycle.startup_recovery_statuses` is configured, `create_server(...)`
+processes one bounded incomplete-session recovery page before readiness. A
+returned recovery cursor is continued after readiness by a managed background
+task using the same statuses and inactivity cutoff; the task is cancelled and
+awaited at shutdown. This keeps startup latency bounded without dropping older
+durable recovery candidates.
+
 The same API access policy guards `/api/contract` and
 `/api/system/diagnostics`. The latter is a bounded, probe-free snapshot of
 framework-owned deployment configuration and registrations; it is not a

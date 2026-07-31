@@ -440,8 +440,9 @@ def test_workflow_anchor_is_recovery_safe():
             IncompleteSessionsRecoveryRequest(statuses={SessionStatus.PENDING})
         )
 
-    results = asyncio.run(sweep())  # must not raise
-    assert isinstance(results, list)
+    page = asyncio.run(sweep())  # must not raise
+    assert page.results == ()
+    assert page.next_cursor is None
     records = asyncio.run(app.session_store.query_events(EventQuery(session_id="wf-anchor")))
     assert records
     assert all(str(record.event.type).startswith(("workflow.", "custom.")) for record in records)
@@ -476,8 +477,9 @@ def test_workflow_anchor_pending_crash_window_is_healed_on_append():
             IncompleteSessionsRecoveryRequest(statuses={SessionStatus.PENDING})
         )
 
-    results = asyncio.run(run())  # must not raise
-    assert isinstance(results, list)
+    page = asyncio.run(run())  # must not raise
+    assert page.results == ()
+    assert page.next_cursor is None
 
 
 def test_workflow_journal_refuses_foreign_session_without_mutating_it():
