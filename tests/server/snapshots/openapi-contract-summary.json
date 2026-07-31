@@ -7974,10 +7974,11 @@
               "type": "null"
             }
           ],
-          "description": "Optional bounded price book. The serialized value may contain at most 2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, 100 contextual requirements, and 2,000 contextual selector values. The price-input limit multiplied by the resolution candidates may not exceed 500,000."
+          "description": "Optional bounded price book. The serialized value may contain at most 2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, 100 contextual requirements, and 2,000 contextual selector values. Each currency identity may contain at most 64 UTF-8 bytes. The price-input limit multiplied by the resolution candidates may not exceed 500,000."
         },
         "pricing_input_limit": {
           "default": 1000,
+          "description": "Maximum canonical price-input groups, applied independently to the shared projection and, when session_group_limit is present, the session-aware projection.",
           "maximum": 5000.0,
           "minimum": 1.0,
           "title": "Pricing Input Limit",
@@ -7985,6 +7986,20 @@
         },
         "session_filter": {
           "$ref": "#/components/schemas/SessionAggregateFilter"
+        },
+        "session_group_limit": {
+          "anyOf": [
+            {
+              "maximum": 100.0,
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Opt-in maximum number of per-session usage groups. Omitted matching sessions are represented by an exact aggregate remainder. When omitted, stores perform no per-session breakdown or session-aware pricing work.",
+          "title": "Session Group Limit"
         },
         "start_at": {
           "format": "date-time",
@@ -8050,6 +8065,26 @@
           "title": "Scope",
           "type": "string"
         },
+        "session_breakdown": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageSessionAggregateBreakdown"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_cost_breakdown": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageSessionCostBreakdown"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "session_filter_basis": {
           "const": "current_session_attributes",
           "title": "Session Filter Basis",
@@ -8086,6 +8121,242 @@
         "cost"
       ],
       "title": "UsageRollupResponse",
+      "type": "object"
+    },
+    "UsageSessionAggregateBreakdown": {
+      "additionalProperties": false,
+      "description": "Deterministic session groups plus an exact aggregate remainder.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "groups": {
+          "items": {
+            "$ref": "#/components/schemas/UsageSessionAggregateGroup"
+          },
+          "maxItems": 100,
+          "title": "Groups",
+          "type": "array"
+        },
+        "remainder": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageSessionAggregateRemainder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "groups",
+        "remainder",
+        "accuracy"
+      ],
+      "title": "UsageSessionAggregateBreakdown",
+      "type": "object"
+    },
+    "UsageSessionAggregateGroup": {
+      "additionalProperties": false,
+      "description": "Exact usage for one retained current session inside a bounded breakdown.",
+      "properties": {
+        "active": {
+          "title": "Active",
+          "type": "boolean"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "running",
+            "interrupting",
+            "completed",
+            "failed",
+            "interrupted"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "totals": {
+          "$ref": "#/components/schemas/UsageAggregateTotals"
+        }
+      },
+      "required": [
+        "session_id",
+        "status",
+        "active",
+        "totals"
+      ],
+      "title": "UsageSessionAggregateGroup",
+      "type": "object"
+    },
+    "UsageSessionAggregateRemainder": {
+      "additionalProperties": false,
+      "description": "Exact usage represented by current sessions omitted from bounded detail.",
+      "properties": {
+        "active_session_count": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Active Session Count",
+          "type": "string"
+        },
+        "group_count": {
+          "pattern": "^[1-9]\\d*$",
+          "title": "Group Count",
+          "type": "string"
+        },
+        "totals": {
+          "$ref": "#/components/schemas/UsageAggregateTotals"
+        }
+      },
+      "required": [
+        "group_count",
+        "active_session_count",
+        "totals"
+      ],
+      "title": "UsageSessionAggregateRemainder",
+      "type": "object"
+    },
+    "UsageSessionCostBreakdown": {
+      "additionalProperties": false,
+      "description": "Bounded per-session costs plus an aggregate remainder.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "groups": {
+          "items": {
+            "$ref": "#/components/schemas/UsageSessionCostGroup"
+          },
+          "maxItems": 100,
+          "title": "Groups",
+          "type": "array"
+        },
+        "price_book_generated_at": {
+          "title": "Price Book Generated At",
+          "type": "string"
+        },
+        "price_book_version": {
+          "title": "Price Book Version",
+          "type": "string"
+        },
+        "remainder": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UsageSessionCostRemainder"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "price_book_version",
+        "price_book_generated_at",
+        "groups",
+        "remainder",
+        "accuracy"
+      ],
+      "title": "UsageSessionCostBreakdown",
+      "type": "object"
+    },
+    "UsageSessionCostGroup": {
+      "additionalProperties": false,
+      "description": "Cost accounting for one retained session.",
+      "properties": {
+        "cost": {
+          "$ref": "#/components/schemas/UsageSessionCostSummary"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "cost"
+      ],
+      "title": "UsageSessionCostGroup",
+      "type": "object"
+    },
+    "UsageSessionCostRemainder": {
+      "additionalProperties": false,
+      "description": "Exact aggregate cost for sessions omitted from bounded detail.",
+      "properties": {
+        "cost": {
+          "$ref": "#/components/schemas/UsageSessionCostSummary"
+        },
+        "group_count": {
+          "pattern": "^[1-9]\\d*$",
+          "title": "Group Count",
+          "type": "string"
+        }
+      },
+      "required": [
+        "group_count",
+        "cost"
+      ],
+      "title": "UsageSessionCostRemainder",
+      "type": "object"
+    },
+    "UsageSessionCostSummary": {
+      "additionalProperties": false,
+      "description": "Cost accounting for one session group or the exact omitted remainder.",
+      "properties": {
+        "accuracy": {
+          "$ref": "#/components/schemas/AggregateAccuracy"
+        },
+        "currencies": {
+          "items": {
+            "$ref": "#/components/schemas/UsageCurrencyCost"
+          },
+          "maxItems": 5000,
+          "title": "Currencies",
+          "type": "array"
+        },
+        "evaluated_model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Evaluated Model Steps",
+          "type": "string"
+        },
+        "priced_model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Priced Model Steps",
+          "type": "string"
+        },
+        "unevaluated_model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Unevaluated Model Steps",
+          "type": "string"
+        },
+        "unpriced_model_steps": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Unpriced Model Steps",
+          "type": "string"
+        },
+        "unpriced_reasons": {
+          "items": {
+            "$ref": "#/components/schemas/UsageUnpricedReason"
+          },
+          "maxItems": 5000,
+          "title": "Unpriced Reasons",
+          "type": "array"
+        }
+      },
+      "required": [
+        "accuracy",
+        "evaluated_model_steps",
+        "priced_model_steps",
+        "unpriced_model_steps",
+        "unevaluated_model_steps",
+        "currencies",
+        "unpriced_reasons"
+      ],
+      "title": "UsageSessionCostSummary",
       "type": "object"
     },
     "UsageUnpricedReason": {
@@ -11950,10 +12221,31 @@
               }
             }
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/HTTPValidationError"
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
               }
             }
           },

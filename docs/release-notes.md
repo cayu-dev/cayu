@@ -151,6 +151,41 @@ candidate rows, parent chains are validated under explicit depth/node bounds so
 pagination cannot hide cycles, and PostgreSQL uses locale-independent task-ID
 tie-breaking equivalent to SQLite and the in-memory store.
 
+### Usage rollups can attribute bounded work to sessions
+
+`POST /api/usage/rollup` now accepts an optional `session_group_limit`. This
+adds at most 100 deterministically ordered per-session usage groups, current
+lifecycle state, and an exact aggregate remainder for matching sessions omitted
+from detail. With a price book, the response also includes per-session cost
+summaries and an exact cost remainder. Shared workflow totals remain
+authoritative, and either pricing projection fails conservatively to an
+unevaluated state instead of publishing a partial cost as exact.
+The complete serialized rollup has an authoritative 4 MiB ceiling, so repeated
+session or pricing identities cannot amplify a bounded request into an
+unbounded response; oversized results fail clearly with `413`. Usage request
+bodies are separately limited to 3 MiB and invalid price books are never
+reflected in validation responses. The sanitized response retains the existing
+`HTTPValidationError` shape. Per-session identities are limited to 1,024 UTF-8
+bytes and are rejected before SQL stores return them across the database
+driver. Secret-bearing session authority fails closed instead of being redacted
+into an ambiguous drill-down identity. Usage-request currency identities are
+limited to 64 UTF-8 bytes before store work, preventing them from being
+multiplied into an oversized in-memory per-session cost projection. Custom
+session-store projections are bounded and canonically reconstructed before the
+server publishes or prices them, so trusted Pydantic copies cannot bypass
+nested field validation or projection invariants. The reconstructed result is
+checked against the requested window, opt-in fields, group/input limits, and
+exact shared/per-session pricing consistency. Exact session-pricing projections
+also carry an internal commitment to each retained session's complete
+price-relevant input identity. Post-construction mutation therefore cannot swap
+cost between equal-usage sessions whose model, billing identity, or effective
+pricing date differs.
+
+The extension is opt-in. Existing usage-rollup requests keep the previous store
+work and response semantics; SQLite and PostgreSQL execute the session and
+session-aware pricing projections only when callers request them, inside the
+same store-local read snapshot as the shared rollup.
+
 ### Usage and dashboard pricing advertise separate capabilities
 
 The control-plane contract now reports usage aggregation independently from the

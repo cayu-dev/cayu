@@ -18,7 +18,7 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import json_utf8_size_within_limit
+from cayu._validation import json_utf8_size_within_limit, require_unicode_scalar_text
 from cayu.core.events import EVENT_ID_MAX_CHARS
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
@@ -26,6 +26,8 @@ from cayu.runtime.aggregates import (
     UsageAggregateBreakdown,
     UsageAggregateTotals,
     UsageCostRollup,
+    UsageSessionAggregateBreakdown,
+    UsageSessionCostBreakdown,
 )
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
@@ -249,9 +251,14 @@ MAX_USAGE_ROLLUP_RESOURCE_MAPPINGS = 1000
 MAX_USAGE_ROLLUP_CONTEXT_REQUIREMENTS = 100
 MAX_USAGE_ROLLUP_CONTEXT_SELECTOR_VALUES = 2000
 MAX_USAGE_ROLLUP_PRICE_RESOLUTION_WORK = 500_000
+MAX_USAGE_ROLLUP_REQUEST_BYTES = 3 * 1024 * 1024
+MAX_USAGE_ROLLUP_RESULT_BYTES = 4 * 1024 * 1024
+MAX_USAGE_ROLLUP_CURRENCY_BYTES = 64
 
 
 class UsageRollupRequest(ApiBaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
     start_at: datetime
     end_at: datetime
     session_filter: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
@@ -264,13 +271,33 @@ class UsageRollupRequest(ApiBaseModel):
             "identity breakdowns. Omitted groups are represented by an explicit remainder."
         ),
     )
-    pricing_input_limit: StrictInt = Field(default=1000, ge=1, le=5000)
+    session_group_limit: StrictInt | None = Field(
+        default=None,
+        ge=1,
+        le=100,
+        description=(
+            "Opt-in maximum number of per-session usage groups. Omitted matching sessions "
+            "are represented by an exact aggregate remainder. When omitted, stores perform "
+            "no per-session breakdown or session-aware pricing work."
+        ),
+    )
+    pricing_input_limit: StrictInt = Field(
+        default=1000,
+        ge=1,
+        le=5000,
+        description=(
+            "Maximum canonical price-input groups, applied independently to the shared "
+            "projection and, when session_group_limit is present, the session-aware "
+            "projection."
+        ),
+    )
     pricing: PriceBook | None = Field(
         default=None,
         description=(
             "Optional bounded price book. The serialized value may contain at most "
             "2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, "
             "100 contextual requirements, and 2,000 contextual selector values. "
+            "Each currency identity may contain at most 64 UTF-8 bytes. "
             "The price-input limit multiplied by the resolution candidates may not "
             "exceed 500,000."
         ),
@@ -368,6 +395,17 @@ class UsageRollupRequest(ApiBaseModel):
             )
         if self.pricing is None:
             return self
+        for price in self.pricing.prices:
+            for schedule in price.schedules:
+                currency = require_unicode_scalar_text(
+                    schedule.pricing.currency,
+                    "pricing currency",
+                )
+                if len(currency.encode("utf-8")) > MAX_USAGE_ROLLUP_CURRENCY_BYTES:
+                    raise ValueError(
+                        "pricing currencies cannot exceed "
+                        f"{MAX_USAGE_ROLLUP_CURRENCY_BYTES} UTF-8 bytes."
+                    )
         if not json_utf8_size_within_limit(
             self.pricing.model_dump(mode="json"),
             MAX_USAGE_ROLLUP_PRICE_BOOK_BYTES,
@@ -440,9 +478,13 @@ class UsageRollupRequest(ApiBaseModel):
             + len(self.pricing.contextual_pricing_requirements)
             + schedule_work
         )
-        if self.pricing_input_limit * resolution_work > MAX_USAGE_ROLLUP_PRICE_RESOLUTION_WORK:
+        pricing_projection_count = 2 if self.session_group_limit is not None else 1
+        if (
+            self.pricing_input_limit * resolution_work * pricing_projection_count
+            > MAX_USAGE_ROLLUP_PRICE_RESOLUTION_WORK
+        ):
             raise ValueError(
-                "pricing_input_limit and pricing candidates exceed the "
+                "pricing_input_limit, requested projections, and pricing candidates exceed the "
                 f"{MAX_USAGE_ROLLUP_PRICE_RESOLUTION_WORK}-candidate resolution bound."
             )
         return self
@@ -491,6 +533,52 @@ class UsageRollupResponse(ApiBaseModel):
     provider_breakdown: UsageAggregateBreakdown
     model_breakdown: UsageAggregateBreakdown
     cost: UsageCostRollup | None
+    session_breakdown: UsageSessionAggregateBreakdown | None = None
+    session_cost_breakdown: UsageSessionCostBreakdown | None = None
+
+    @model_validator(mode="after")
+    def validate_session_breakdown_alignment(self) -> UsageRollupResponse:
+        if self.session_cost_breakdown is None:
+            return self
+        if self.session_breakdown is None or self.cost is None:
+            raise ValueError("Session costs require session usage and shared cost results.")
+        usage_ids = tuple(group.session_id for group in self.session_breakdown.groups)
+        cost_ids = tuple(group.session_id for group in self.session_cost_breakdown.groups)
+        if cost_ids != usage_ids:
+            raise ValueError("Session cost groups must match retained session usage groups.")
+        for usage_group, cost_group in zip(
+            self.session_breakdown.groups,
+            self.session_cost_breakdown.groups,
+            strict=True,
+        ):
+            represented_steps = (
+                cost_group.cost.evaluated_model_steps + cost_group.cost.unevaluated_model_steps
+            )
+            if represented_steps != usage_group.totals.model_steps:
+                raise ValueError("Session cost groups must account for session model steps.")
+        usage_remainder_count = (
+            None
+            if self.session_breakdown.remainder is None
+            else self.session_breakdown.remainder.group_count
+        )
+        cost_remainder_count = (
+            None
+            if self.session_cost_breakdown.remainder is None
+            else self.session_cost_breakdown.remainder.group_count
+        )
+        if cost_remainder_count != usage_remainder_count:
+            raise ValueError("Session cost remainder must match the session usage remainder.")
+        if (
+            self.session_breakdown.remainder is not None
+            and self.session_cost_breakdown.remainder is not None
+            and (
+                self.session_cost_breakdown.remainder.cost.evaluated_model_steps
+                + self.session_cost_breakdown.remainder.cost.unevaluated_model_steps
+                != self.session_breakdown.remainder.totals.model_steps
+            )
+        ):
+            raise ValueError("Session cost remainder must account for omitted model steps.")
+        return self
 
 
 class ApiErrorResponse(ApiBaseModel):
@@ -502,6 +590,21 @@ AGGREGATE_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
         "description": "The configured store does not implement this aggregate read.",
         "model": ApiErrorResponse,
     }
+}
+USAGE_ROLLUP_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **AGGREGATE_ENDPOINT_RESPONSES,
+    409: {
+        "description": ("A per-session identity cannot cross the configured redaction boundary."),
+        "model": ApiErrorResponse,
+    },
+    413: {
+        "description": "The usage-rollup request or serialized response exceeds its byte limit.",
+        "model": ApiErrorResponse,
+    },
+    500: {
+        "description": "The configured store returned an inconsistent usage projection.",
+        "model": ApiErrorResponse,
+    },
 }
 
 

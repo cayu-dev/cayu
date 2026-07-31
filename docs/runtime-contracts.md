@@ -1928,12 +1928,42 @@ session filters are evaluated against each session's current stored attributes;
 they are not historical attributes captured at event time. Active sessions are
 included. Provider and model detail is bounded by `group_limit`, with exact
 omitted totals in a `remainder`, so bounding detail does not understate the
-top-level totals. Windows are limited to 366 days and the SQL stores execute one
-database-side totals/breakdown aggregate over the event-type/time index rather
-than loading session histories into the server process. When pricing is
-requested, a second store-native grouped cursor runs inside the same SQLite or
-PostgreSQL read snapshot. Price-relevant JSON is stripped of unneeded evidence
-and size-classified in SQL before it crosses the database-driver boundary;
+top-level totals. `session_group_limit` is an opt-in per-session projection for
+workflow and causal-budget attribution. It orders current matching sessions by
+window token usage, then model steps and session id, and returns at most 100
+session groups plus an exact aggregate remainder for omitted sessions. Each
+retained group reports current lifecycle status separately from usage activity
+inside the requested window. With pricing, retained sessions receive bounded
+per-session cost summaries and the omitted sessions receive an exact aggregate
+cost remainder, derived from the exact canonical pricing-input occurrence
+remainder so currencies and unpriced reasons remain attributable without
+subtracting rounded monetary values. Cost remains explicitly unevaluated rather
+than partially reported if either the shared or session-aware pricing projection
+crosses its independent limit. Omitting `session_group_limit` preserves the
+original rollup path and performs no session-breakdown or session-aware pricing
+query. The complete serialized response is limited to 4 MiB and fails with
+`413` when repeated session or pricing identities would exceed that boundary;
+the server measures the JSON projection before transport serialization.
+Usage request bodies have a separate 3 MiB transport ceiling, and validation
+failures preserve the standard `HTTPValidationError` envelope but contain only
+a bounded generic location, type, and message rather than reflecting a
+submitted price book. Retained session identities are limited to 1,024 UTF-8
+bytes. The in-memory store rejects an oversized retained identity before public
+model construction, while SQLite and PostgreSQL detect it inside the aggregate
+statement and return only a small sentinel across the database-driver boundary;
+the endpoint then fails with `413` without exposing the identifier. Oversized
+identities belonging only to omitted sessions never cross the boundary and do
+not prevent their exact counters from contributing to the remainder. If
+configured secret redaction would alter a retained session identity, the
+endpoint fails closed with `409` instead of returning a redacted identity that
+could collide with another session or become an invalid drill-down target.
+
+Windows are limited to 366 days and the SQL stores execute database-side
+totals/breakdown aggregates over the event-type/time index rather than loading
+session histories into the server process. When pricing is requested,
+store-native grouped cursors run inside the same SQLite or PostgreSQL read
+snapshot. Price-relevant JSON is stripped of unneeded evidence and
+size-classified in SQL before it crosses the database-driver boundary;
 oversized candidates become a small sentinel, and PostgreSQL fetches one
 candidate row at a time. The grouped query also reports its raw candidate count
 and returns at most 5,000 rows; if raw JSON variants exceed that independent work
@@ -1943,6 +1973,23 @@ as `pricing_input_limit + 1` distinct canonical groups are known. Retained
 canonical pricing inputs have a separate 8 MiB serialized byte ceiling.
 Crossing any ceiling discards the partial pricing projection and reports
 truncated cost rather than retaining or pricing a partial result.
+The server also validates custom `SessionStore` results against the original
+query before serialization. The complete internal result has a 24 MiB preflight
+ceiling and is then canonically reconstructed through the public Pydantic model,
+which reapplies every nested field constraint and cross-projection invariant
+even when an integration used Pydantic's trusted copy/construct APIs. A store
+cannot add the opt-in session projection, exceed a requested group or
+pricing-input limit, change the requested window, omit a requested pricing
+projection, or return exact per-session pricing inputs that are not a lossless
+partition of the shared canonical pricing projection. Exact retained pricing
+inputs must also reproduce every fully valid session usage projection, and any
+known valid counters must remain within that session's reported totals, before
+cost can be attributed. For exact per-session pricing, the original validated
+projection privately commits each retained session to its complete canonical
+pricing inputs, including model and billing identity, effective date, counters,
+and occurrences. The server compares that commitment after reconstruction so a
+trusted post-construction copy cannot silently exchange otherwise equal usage
+between differently priced sessions. Violations fail closed.
 The in-memory reference store keeps a bounded 512-entry heavy-hitter candidate
 set for provider and model detail. It returns exact breakdowns while cardinality
 fits that set; above it, only the breakdown is explicitly sampled while
@@ -2067,9 +2114,11 @@ the store's totals accuracy: sampled totals produce sampled cost, while
 truncated totals are not partially priced. Request price books are bounded
 before nested validation to 2 MiB, 500 price rows, 2,000 match rules, 1,000
 resource mappings, 100 contextual requirements, and 2,000 contextual selector
-values. Selector values are included in the resolution-work calculation; the
-product of the price-input limit and resolution work is capped at 500,000. As
-with the other built-in control-plane
+values. Currency identities are limited to 64 UTF-8 bytes before store work so
+per-session cost groups cannot amplify a bounded price-book field. Selector
+values are included in the resolution-work calculation; the product of the
+price-input limit and resolution work is capped at 500,000. As with the other
+built-in control-plane
 reads, these endpoints cover the complete configured store. Authentication does
 not turn `AuthContext.tenant` into a row filter; tenant-facing applications must
 enforce their own complete storage or route boundary.

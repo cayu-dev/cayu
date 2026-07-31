@@ -2710,11 +2710,13 @@ def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
             "end_at": (start + timedelta(days=1)).isoformat(),
             "session_filter": {"labels": {"team": "red"}},
             "group_limit": 10,
+            "session_group_limit": 10,
             "pricing": _price_book_payload(),
         },
     )
 
     assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
     body = response.json()
     assert body["scope"] == "configured_session_store"
     assert body["time_basis"] == "event.timestamp"
@@ -2734,7 +2736,277 @@ def test_server_exposes_bounded_event_time_usage_rollup_and_cost() -> None:
         "remainder": None,
         "accuracy": {"kind": "exact", "limit": None, "reason": None},
     }
+    assert body["session_breakdown"] == {
+        "groups": [
+            {
+                "session_id": "aggregate-usage",
+                "status": "pending",
+                "active": True,
+                "totals": body["totals"],
+            }
+        ],
+        "remainder": None,
+        "accuracy": {"kind": "exact", "limit": None, "reason": None},
+    }
+    assert body["session_cost_breakdown"] == {
+        "price_book_version": "test",
+        "price_book_generated_at": "2026-07-13",
+        "groups": [
+            {
+                "session_id": "aggregate-usage",
+                "cost": {
+                    "accuracy": {"kind": "exact", "limit": None, "reason": None},
+                    "evaluated_model_steps": "1",
+                    "priced_model_steps": "1",
+                    "unpriced_model_steps": "0",
+                    "unevaluated_model_steps": "0",
+                    "currencies": [{"currency": "USD", "model_steps": "1", "total_cost": "1"}],
+                    "unpriced_reasons": [],
+                },
+            }
+        ],
+        "remainder": None,
+        "accuracy": {"kind": "exact", "limit": None, "reason": None},
+    }
     assert "pricing_inputs" not in body
+
+    shared_only = client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(days=1)).isoformat(),
+            "session_filter": {"labels": {"team": "red"}},
+            "group_limit": 10,
+            "pricing": _price_book_payload(),
+        },
+    ).json()
+    assert shared_only["totals"] == body["totals"]
+    assert shared_only["provider_breakdown"] == body["provider_breakdown"]
+    assert shared_only["model_breakdown"] == body["model_breakdown"]
+    assert shared_only["cost"] == body["cost"]
+    assert shared_only["session_breakdown"] is None
+    assert shared_only["session_cost_breakdown"] is None
+
+    usage_only = client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(days=1)).isoformat(),
+            "session_filter": {"labels": {"team": "red"}},
+            "group_limit": 10,
+            "session_group_limit": 10,
+        },
+    ).json()
+    assert usage_only["totals"] == body["totals"]
+    assert usage_only["session_breakdown"] == body["session_breakdown"]
+    assert usage_only["cost"] is None
+    assert usage_only["session_cost_breakdown"] is None
+
+
+def test_server_rejects_response_amplifying_usage_currency_before_store_work() -> None:
+    class StoreWorkMustNotStart(InMemorySessionStore):
+        aggregate_called = False
+
+        async def aggregate_usage(self, query):
+            self.aggregate_called = True
+            return await super().aggregate_usage(query)
+
+    store = StoreWorkMustNotStart()
+    app = CayuApp(session_store=store)
+    pricing = cast("dict[str, Any]", _price_book_payload())
+    pricing["prices"][0]["schedules"][0]["pricing"]["currency"] = "X" * 65
+    response = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+            "group_limit": 1,
+            "session_group_limit": 100,
+            "pricing": pricing,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "value_error",
+                "loc": ["body"],
+                "msg": "Invalid usage rollup request.",
+            }
+        ]
+    }
+    assert len(response.content) < 1024
+    assert store.aggregate_called is False
+
+    accepted_pricing = cast("dict[str, Any]", _price_book_payload())
+    accepted_pricing["prices"][0]["schedules"][0]["pricing"]["currency"] = ("€" * 21) + "X"
+    accepted = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+            "session_group_limit": 100,
+            "pricing": accepted_pricing,
+        },
+    )
+    assert accepted.status_code == 200
+    assert store.aggregate_called is True
+
+
+@pytest.mark.parametrize("with_pricing", [False, True])
+def test_server_rejects_secret_bearing_usage_session_authority(
+    with_pricing: bool,
+) -> None:
+    secret = "usage-session-secret-canary"
+    session_id = f"customer-{secret}"
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                id="secret-session-model",
+                type=EventType.MODEL_COMPLETED,
+                session_id=session_id,
+                timestamp=start,
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "total_tokens": 1,
+                    }
+                },
+            ),
+        )
+
+    asyncio.run(seed())
+    request: dict[str, Any] = {
+        "start_at": start.isoformat(),
+        "end_at": (start + timedelta(days=1)).isoformat(),
+        "session_group_limit": 1,
+    }
+    if with_pricing:
+        request["pricing"] = _price_book_payload()
+    response = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)).post(
+        "/api/usage/rollup",
+        json=request,
+    )
+
+    assert response.status_code == 409
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {
+        "detail": "Usage session identity cannot cross the configured redaction boundary."
+    }
+    assert secret not in response.text
+    assert REDACTED_SECRET not in response.text
+
+
+def test_server_rejects_oversized_usage_session_identity_without_reflecting_it() -> None:
+    store = InMemorySessionStore()
+    session_id = "private-" + ("s" * 1025)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(seed())
+    response = TestClient(
+        create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG)
+    ).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+            "session_group_limit": 1,
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {"detail": "Usage rollup result exceeds the server byte limit."}
+    assert session_id not in response.text
+
+
+def test_server_aggregates_oversized_omitted_session_identity_without_reflecting_it() -> None:
+    store = InMemorySessionStore()
+    retained_session_id = "retained-usage-session"
+    omitted_session_id = "private-" + ("s" * 1025)
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+
+    async def seed() -> None:
+        for session_id in (retained_session_id, omitted_session_id):
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+        await store.append_event(
+            retained_session_id,
+            Event(
+                id="retained-usage-model",
+                type=EventType.MODEL_COMPLETED,
+                session_id=retained_session_id,
+                timestamp=start,
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 1,
+                        "output_tokens": 0,
+                        "total_tokens": 1,
+                    }
+                },
+            ),
+        )
+
+    asyncio.run(seed())
+    response = TestClient(
+        create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG)
+    ).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(days=1)).isoformat(),
+            "session_group_limit": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
+    body = response.json()
+    assert [group["session_id"] for group in body["session_breakdown"]["groups"]] == [
+        retained_session_id
+    ]
+    assert body["session_breakdown"]["remainder"]["group_count"] == "1"
+    assert body["matching_session_count"] == "2"
+    assert omitted_session_id not in response.text
 
 
 def test_server_serializes_aggregate_counters_without_javascript_rounding() -> None:
@@ -2792,7 +3064,7 @@ def test_server_serializes_aggregate_counters_without_javascript_rounding() -> N
     )
 
 
-def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() -> None:
+def test_server_rejects_price_books_and_resolution_work_without_reflecting_input() -> None:
     client = TestClient(create_server(CayuApp(), config=_LOCAL_SERVER_CONFIG))
     request: dict[str, Any] = {
         "start_at": "2026-07-01T00:00:00Z",
@@ -2801,17 +3073,29 @@ def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() ->
     }
     price = cast("list[dict[str, object]]", request["pricing"]["prices"])[0]
 
+    def assert_sanitized_validation_error(response) -> None:
+        assert response.status_code == 422
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.json() == {
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["body"],
+                    "msg": "Invalid usage rollup request.",
+                }
+            ]
+        }
+        assert len(response.content) < 1024
+
     too_many_prices = json.loads(json.dumps(request))
     too_many_prices["pricing"]["prices"] = [price] * 501
     response = client.post("/api/usage/rollup", json=too_many_prices)
-    assert response.status_code == 422
-    assert "pricing.prices cannot contain more than 500 items" in response.text
+    assert_sanitized_validation_error(response)
 
     oversized_price_book = json.loads(json.dumps(request))
     oversized_price_book["pricing"]["price_book_version"] = "x" * (2 * 1024 * 1024)
     response = client.post("/api/usage/rollup", json=oversized_price_book)
-    assert response.status_code == 422
-    assert "pricing cannot exceed 2097152 JSON bytes" in response.text
+    assert_sanitized_validation_error(response)
 
     excessive_resolution_work = json.loads(json.dumps(request))
     excessive_resolution_work["pricing_input_limit"] = 1000
@@ -2819,8 +3103,7 @@ def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() ->
         f"alias-{index}" for index in range(500)
     ]
     response = client.post("/api/usage/rollup", json=excessive_resolution_work)
-    assert response.status_code == 422
-    assert "500000-candidate resolution bound" in response.text
+    assert_sanitized_validation_error(response)
 
     excessive_context_values = json.loads(json.dumps(request))
     context_price = excessive_context_values["pricing"]["prices"][0]
@@ -2832,8 +3115,7 @@ def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() ->
         }
     }
     response = client.post("/api/usage/rollup", json=excessive_context_values)
-    assert response.status_code == 422
-    assert "2000 total contextual selector values" in response.text
+    assert_sanitized_validation_error(response)
 
     excessive_context_work = json.loads(json.dumps(request))
     excessive_context_work["pricing_input_limit"] = 1000
@@ -2843,8 +3125,32 @@ def test_server_rejects_price_books_and_resolution_work_above_rollup_bounds() ->
         "dimensions": {"tier": [f"tier-{index}" for index in range(500)]}
     }
     response = client.post("/api/usage/rollup", json=excessive_context_work)
-    assert response.status_code == 422
-    assert "500000-candidate resolution bound" in response.text
+    assert_sanitized_validation_error(response)
+
+    bounded_shared_work = json.loads(json.dumps(request))
+    bounded_shared_work["pricing_input_limit"] = 5000
+    bounded_shared_work["pricing"]["prices"][0]["aliases"] = [
+        f"alias-{index}" for index in range(47)
+    ]
+    assert client.post("/api/usage/rollup", json=bounded_shared_work).status_code == 200
+    bounded_shared_work["session_group_limit"] = 10
+    reflected_secret = "WORKLOAD-SECRET-SESSION-PROJECTION"
+    bounded_shared_work["pricing"]["prices"][0]["schedules"][0]["provenance"]["url"] = (
+        f"https://private.invalid/{reflected_secret}"
+    )
+    response = client.post("/api/usage/rollup", json=bounded_shared_work)
+    assert_sanitized_validation_error(response)
+    assert reflected_secret not in response.text
+
+    oversized_body = b'{"ignored":"' + (b"x" * (3 * 1024 * 1024)) + b'"}'
+    response = client.post(
+        "/api/usage/rollup",
+        content=oversized_body,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {"detail": "Usage rollup request exceeds the server byte limit."}
 
 
 def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores() -> None:
@@ -2891,6 +3197,19 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
             "application/json"
         ]["schema"]
         assert error_schema == {"$ref": "#/components/schemas/ApiErrorResponse"}
+    oversized_schema = openapi["paths"]["/api/usage/rollup"]["post"]["responses"]["413"]["content"][
+        "application/json"
+    ]["schema"]
+    assert oversized_schema == {"$ref": "#/components/schemas/ApiErrorResponse"}
+    validation_schema = openapi["paths"]["/api/usage/rollup"]["post"]["responses"]["422"][
+        "content"
+    ]["application/json"]["schema"]
+    assert validation_schema == {"$ref": "#/components/schemas/HTTPValidationError"}
+    for status_code in ("409", "500"):
+        error_schema = openapi["paths"]["/api/usage/rollup"]["post"]["responses"][status_code][
+            "content"
+        ]["application/json"]["schema"]
+        assert error_schema == {"$ref": "#/components/schemas/ApiErrorResponse"}
 
     valid_client = TestClient(create_server(CayuApp(), config=_LOCAL_SERVER_CONFIG))
     invalid_window = valid_client.post(
@@ -2901,9 +3220,16 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
         },
     )
     assert invalid_window.status_code == 422
-    validation_errors = invalid_window.json()["detail"]
-    assert isinstance(validation_errors, list)
-    assert any("start_at must be before end_at" in error["msg"] for error in validation_errors)
+    assert invalid_window.headers["cache-control"] == "private, no-store"
+    assert invalid_window.json() == {
+        "detail": [
+            {
+                "type": "value_error",
+                "loc": ["body"],
+                "msg": "Invalid usage rollup request.",
+            }
+        ]
+    }
 
     class InvalidAggregateResultStore(InMemorySessionStore):
         async def aggregate_usage(self, query):
@@ -2925,6 +3251,358 @@ def test_server_aggregate_routes_reject_invalid_windows_and_unsupported_stores()
         },
     )
     assert invalid_store_response.status_code == 500
+    assert invalid_store_response.headers["cache-control"] == "private, no-store"
+    assert invalid_store_response.json() == {
+        "detail": "The configured session store returned an inconsistent usage projection."
+    }
+
+
+def test_server_rejects_custom_usage_store_results_that_ignore_query_bounds() -> None:
+    class IgnoringUsageQueryStore(InMemorySessionStore):
+        async def aggregate_usage(self, query):
+            return await super().aggregate_usage(
+                query.model_copy(update={"session_group_limit": 2})
+            )
+
+    store = IgnoringUsageQueryStore()
+
+    async def seed() -> None:
+        for session_id in ("custom-store-one", "custom-store-two"):
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG))
+    base_request = {
+        "start_at": "2026-07-01T00:00:00Z",
+        "end_at": "2026-07-02T00:00:00Z",
+    }
+    for body in (base_request, {**base_request, "session_group_limit": 1}):
+        response = client.post("/api/usage/rollup", json=body)
+        assert response.status_code == 500
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.json() == {
+            "detail": "The configured session store returned an inconsistent usage projection."
+        }
+
+
+def test_server_rejects_custom_usage_store_with_inconsistent_session_totals() -> None:
+    class InconsistentSessionTotalsStore(InMemorySessionStore):
+        async def aggregate_usage(self, query):
+            result = await super().aggregate_usage(query)
+            assert result.session_breakdown is not None
+            group = result.session_breakdown.groups[0]
+            inconsistent_group = group.model_copy(
+                update={
+                    "totals": group.totals.model_copy(
+                        update={"usage": group.totals.usage.model_copy(update={"total_tokens": 1})}
+                    )
+                }
+            )
+            return result.model_copy(
+                update={
+                    "session_breakdown": result.session_breakdown.model_copy(
+                        update={"groups": (inconsistent_group,)}
+                    )
+                }
+            )
+
+    store = InconsistentSessionTotalsStore()
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="custom-inconsistent-totals",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_event(
+            "custom-inconsistent-totals",
+            Event(
+                id="custom-inconsistent-totals-model",
+                type=EventType.MODEL_COMPLETED,
+                session_id="custom-inconsistent-totals",
+                timestamp=start,
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 100,
+                        "output_tokens": 0,
+                        "total_tokens": 100,
+                    }
+                },
+            ),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG))
+    response = client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(days=1)).isoformat(),
+            "session_group_limit": 1,
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {
+        "detail": "The configured session store returned an inconsistent usage projection."
+    }
+
+
+def test_server_canonically_revalidates_custom_usage_store_results() -> None:
+    class InvalidNestedUsageStore(InMemorySessionStore):
+        async def aggregate_usage(self, query):
+            result = await super().aggregate_usage(query)
+            provider_group = result.provider_breakdown.groups[0]
+            invalid_usage = provider_group.totals.usage.model_copy(update={"total_tokens": -1})
+            invalid_group = provider_group.model_copy(
+                update={"totals": provider_group.totals.model_copy(update={"usage": invalid_usage})}
+            )
+            return result.model_copy(
+                update={
+                    "provider_breakdown": result.provider_breakdown.model_copy(
+                        update={"groups": (invalid_group,)}
+                    )
+                }
+            )
+
+    store = InvalidNestedUsageStore()
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="custom-invalid-nested-usage",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.append_event(
+            "custom-invalid-nested-usage",
+            Event(
+                id="custom-invalid-nested-model",
+                type=EventType.MODEL_COMPLETED,
+                session_id="custom-invalid-nested-usage",
+                timestamp=start,
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "fake",
+                        "model": "fake-model",
+                        "input_tokens": 100,
+                        "output_tokens": 0,
+                        "total_tokens": 100,
+                    }
+                },
+            ),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG))
+    response = client.post(
+        "/api/usage/rollup",
+        json={
+            "start_at": start.isoformat(),
+            "end_at": (start + timedelta(days=1)).isoformat(),
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {
+        "detail": "The configured session store returned an inconsistent usage projection."
+    }
+
+
+def test_server_classifies_nonserializable_custom_usage_result_as_inconsistent() -> None:
+    class NonserializableUsageStore(InMemorySessionStore):
+        async def aggregate_usage(self, query):
+            result = await super().aggregate_usage(query)
+            return result.model_copy(update={"provider_breakdown": object()})
+
+    response = TestClient(
+        create_server(
+            CayuApp(session_store=NonserializableUsageStore()),
+            config=_LOCAL_SERVER_CONFIG,
+        ),
+        raise_server_exceptions=False,
+    ).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {
+        "detail": "The configured session store returned an inconsistent usage projection."
+    }
+
+
+def test_server_classifies_custom_retained_usage_identity_byte_overflow_as_413() -> None:
+    oversized_session_id = "s" * 1025
+
+    class OversizedRetainedIdentityStore(InMemorySessionStore):
+        include_invalid_counter = False
+
+        async def aggregate_usage(self, query):
+            result = await super().aggregate_usage(query)
+            assert result.session_breakdown is not None
+            group = result.session_breakdown.groups[0]
+            updates: dict[str, Any] = {"session_id": oversized_session_id}
+            if self.include_invalid_counter:
+                updates["totals"] = group.totals.model_copy(
+                    update={"usage": group.totals.usage.model_copy(update={"total_tokens": -1})}
+                )
+            oversized_group = group.model_copy(update=updates)
+            return result.model_copy(
+                update={
+                    "session_breakdown": result.session_breakdown.model_copy(
+                        update={"groups": (oversized_group,)}
+                    )
+                }
+            )
+
+    store = OversizedRetainedIdentityStore()
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="custom-retained-identity",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+
+    asyncio.run(seed())
+    response = TestClient(
+        create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG),
+        raise_server_exceptions=False,
+    ).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+            "session_group_limit": 1,
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.json() == {"detail": "Usage rollup result exceeds the server byte limit."}
+    assert oversized_session_id not in response.text
+
+    store.include_invalid_counter = True
+    mixed_failure = TestClient(
+        create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG),
+        raise_server_exceptions=False,
+    ).post(
+        "/api/usage/rollup",
+        json={
+            "start_at": "2026-07-01T00:00:00Z",
+            "end_at": "2026-07-02T00:00:00Z",
+            "session_group_limit": 1,
+        },
+    )
+    assert mixed_failure.status_code == 500
+    assert mixed_failure.headers["cache-control"] == "private, no-store"
+    assert mixed_failure.json() == {
+        "detail": "The configured session store returned an inconsistent usage projection."
+    }
+    assert oversized_session_id not in mixed_failure.text
+
+
+def test_server_rejects_custom_usage_store_with_misattributed_session_pricing() -> None:
+    class MisattributedSessionPricingStore(InMemorySessionStore):
+        async def aggregate_usage(self, query):
+            result = await super().aggregate_usage(query)
+            session_items = result.session_pricing_inputs
+            assert session_items
+            if len(session_items) == 1:
+                session_item = session_items[0]
+                assert session_item.metrics is not None
+                replacement = next(
+                    item.metrics
+                    for item in result.pricing_inputs
+                    if item.metrics is not None and item.metrics.model != session_item.metrics.model
+                )
+                misattributed = (session_item.model_copy(update={"metrics": replacement}),)
+            else:
+                first, second = session_items
+                misattributed = (
+                    first.model_copy(update={"metrics": second.metrics}),
+                    second.model_copy(update={"metrics": first.metrics}),
+                )
+            return result.model_copy(update={"session_pricing_inputs": misattributed})
+
+    store = MisattributedSessionPricingStore()
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+
+    async def seed() -> None:
+        for session_id, model in (
+            ("custom-cheap", "cheap-model"),
+            ("custom-expensive", "expensive-model"),
+        ):
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model=model),
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    id=f"{session_id}-pricing",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    timestamp=start,
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": "fake",
+                            "model": model,
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 0,
+                            "total_tokens": 1_000_000,
+                        }
+                    },
+                ),
+            )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(CayuApp(session_store=store), config=_LOCAL_SERVER_CONFIG))
+    request = {
+        "start_at": start.isoformat(),
+        "end_at": (start + timedelta(days=1)).isoformat(),
+        "pricing": _price_book_payload(),
+    }
+    for session_group_limit in (1, 2):
+        response = client.post(
+            "/api/usage/rollup",
+            json={**request, "session_group_limit": session_group_limit},
+        )
+        assert response.status_code == 500
+        assert response.headers["cache-control"] == "private, no-store"
+        assert response.json() == {
+            "detail": "The configured session store returned an inconsistent usage projection."
+        }
 
 
 def test_server_exposes_filtered_sessions_summary() -> None:

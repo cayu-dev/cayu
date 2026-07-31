@@ -56,7 +56,11 @@ from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
 from cayu.runtime.aggregates import (
+    UsageRollupInconsistent,
+    UsageRollupResultTooLarge,
+    UsageRollupStoreResult,
     estimate_usage_rollup_cost,
+    estimate_usage_session_cost_breakdown,
     summary_usage_metrics_from_event_payload,
 )
 from cayu.runtime.approvals import (
@@ -160,10 +164,13 @@ from cayu.server.contracts import (
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
     MAX_SESSION_TOPOLOGY_REQUEST_BYTES,
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
+    MAX_USAGE_ROLLUP_REQUEST_BYTES,
+    MAX_USAGE_ROLLUP_RESULT_BYTES,
     PENDING_ACTION_ENDPOINT_RESPONSES,
     SERVER_API_PREFIX,
     SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
     STREAMING_ENDPOINT_RESPONSES,
+    USAGE_ROLLUP_ENDPOINT_RESPONSES,
     AgentsResponse,
     ApiInteractionSummary,
     ApiReviewedKnowledgeEntry,
@@ -224,7 +231,7 @@ from cayu.vaults import REDACTED_SECRET
 logger = logging.getLogger(__name__)
 
 
-def _session_topology_error_response(status_code: int, detail: str) -> JSONResponse:
+def _private_no_store_error_response(status_code: int, detail: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"detail": detail},
@@ -232,11 +239,39 @@ def _session_topology_error_response(status_code: int, detail: str) -> JSONRespo
     )
 
 
-class _BoundedSessionTopologyRoute(APIRoute):
-    """Bound and sanitize topology bodies before FastAPI exposes validation input."""
+def _private_no_store_validation_error_response(detail: str) -> JSONResponse:
+    """Return a bounded validation envelope without reflecting rejected input."""
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    "type": "value_error",
+                    "loc": ["body"],
+                    "msg": detail,
+                }
+            ]
+        },
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+class _BoundedPrivateJsonBodyRoute(APIRoute):
+    """Bound and sanitize a private JSON body before validation can expose input."""
+
+    max_request_bytes: int
+    invalid_request_detail: str
+    oversized_request_detail: str
+
+    def _invalid_request_response(self) -> JSONResponse:
+        return _private_no_store_error_response(422, self.invalid_request_detail)
 
     def get_route_handler(self):
         route_handler = super().get_route_handler()
+        max_request_bytes = self.max_request_bytes
+        invalid_request_response = self._invalid_request_response
+        oversized_request_detail = self.oversized_request_detail
 
         async def bounded_route_handler(request: Request) -> Response:
             content_length = request.headers.get("content-length")
@@ -244,19 +279,13 @@ class _BoundedSessionTopologyRoute(APIRoute):
                 try:
                     declared_bytes = int(content_length)
                 except ValueError:
-                    return _session_topology_error_response(
-                        422,
-                        "Invalid session topology request.",
-                    )
+                    return invalid_request_response()
                 if declared_bytes < 0:
-                    return _session_topology_error_response(
-                        422,
-                        "Invalid session topology request.",
-                    )
-                if declared_bytes > MAX_SESSION_TOPOLOGY_REQUEST_BYTES:
-                    return _session_topology_error_response(
+                    return invalid_request_response()
+                if declared_bytes > max_request_bytes:
+                    return _private_no_store_error_response(
                         413,
-                        "Session topology request exceeds the server byte limit.",
+                        oversized_request_detail,
                     )
 
             received_bytes = 0
@@ -267,10 +296,10 @@ class _BoundedSessionTopologyRoute(APIRoute):
                 message = await original_receive()
                 if message["type"] == "http.request":
                     received_bytes += len(message.get("body", b""))
-                    if received_bytes > MAX_SESSION_TOPOLOGY_REQUEST_BYTES:
+                    if received_bytes > max_request_bytes:
                         raise HTTPException(
                             status_code=413,
-                            detail="Session topology request exceeds the server byte limit.",
+                            detail=oversized_request_detail,
                         )
                 return message
 
@@ -278,10 +307,7 @@ class _BoundedSessionTopologyRoute(APIRoute):
             try:
                 response = await route_handler(bounded_request)
             except RequestValidationError:
-                return _session_topology_error_response(
-                    422,
-                    "Invalid session topology request.",
-                )
+                return invalid_request_response()
             except HTTPException as exc:
                 headers = dict(exc.headers or {})
                 headers["Cache-Control"] = "private, no-store"
@@ -294,6 +320,25 @@ class _BoundedSessionTopologyRoute(APIRoute):
             return response
 
         return bounded_route_handler
+
+
+class _BoundedSessionTopologyRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound and sanitize topology bodies before FastAPI exposes validation input."""
+
+    max_request_bytes = MAX_SESSION_TOPOLOGY_REQUEST_BYTES
+    invalid_request_detail = "Invalid session topology request."
+    oversized_request_detail = "Session topology request exceeds the server byte limit."
+
+
+class _BoundedUsageRollupRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound and sanitize usage bodies before FastAPI exposes pricing input."""
+
+    max_request_bytes = MAX_USAGE_ROLLUP_REQUEST_BYTES
+    invalid_request_detail = "Invalid usage rollup request."
+    oversized_request_detail = "Usage rollup request exceeds the server byte limit."
+
+    def _invalid_request_response(self) -> JSONResponse:
+        return _private_no_store_validation_error_response(self.invalid_request_detail)
 
 
 class _ObserverLifecycleEventSourceResponse(EventSourceResponse):
@@ -1490,6 +1535,28 @@ def _require_safe_session_topology_authority(
                 detail=(
                     "Session topology identity cannot cross the configured redaction boundary."
                 ),
+            )
+
+
+def _require_safe_usage_session_authority(
+    cayu_app: Any,
+    result: UsageRollupStoreResult,
+) -> None:
+    """Fail closed when redaction would corrupt per-session usage identity."""
+
+    if result.session_breakdown is None:
+        return
+    for group in result.session_breakdown.groups:
+        redacted = _redact_control_plane_json(
+            cayu_app,
+            group.session_id,
+            "usage_rollup.session_id",
+        )
+        if type(redacted) is not str or redacted != group.session_id:
+            raise HTTPException(
+                status_code=409,
+                detail=("Usage session identity cannot cross the configured redaction boundary."),
+                headers={"Cache-Control": "private, no-store"},
             )
 
 
@@ -2783,36 +2850,42 @@ def create_router(
             tasks=task_snapshot,
         )
 
-    @router.post(
-        "/usage/rollup",
-        response_model=UsageRollupResponse,
-        responses=AGGREGATE_ENDPOINT_RESPONSES,
-        dependencies=protected,
-        description=(
-            "Aggregate usage-bearing events in a UTC-normalized half-open event-time "
-            "window. Session filters apply to current session attributes. Totals remain "
-            "exact when provider/model detail is bounded into an explicit remainder; "
-            "cost is omitted from evaluation rather than reported partially when its "
-            "price-input bound is exceeded. Scope is the configured session store; "
-            "authentication does not add tenant filtering."
-        ),
-    )
-    async def get_usage_rollup(body: UsageRollupRequest):
+    async def get_usage_rollup(body: UsageRollupRequest, response: Response):
+        response.headers["Cache-Control"] = "private, no-store"
         query = UsageRollupQuery(
             start_at=body.start_at,
             end_at=body.end_at,
             sessions=body.session_filter,
             group_limit=body.group_limit,
+            session_group_limit=body.session_group_limit,
             include_pricing_inputs=body.pricing is not None,
             pricing_input_limit=body.pricing_input_limit,
         )
         try:
             result = await session_store.aggregate_usage(query)
+            if type(result) is not UsageRollupStoreResult:
+                raise UsageRollupInconsistent(
+                    "Usage aggregate stores must return UsageRollupStoreResult."
+                )
+            result = result.validate_for_query(query)
         except NotImplementedError as exc:
             raise HTTPException(
                 status_code=501,
                 detail="The configured session store does not support usage aggregates.",
             ) from exc
+        except UsageRollupResultTooLarge as exc:
+            raise HTTPException(
+                status_code=413,
+                detail="Usage rollup result exceeds the server byte limit.",
+                headers={"Cache-Control": "private, no-store"},
+            ) from exc
+        except (UsageRollupInconsistent, ValidationError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="The configured session store returned an inconsistent usage projection.",
+                headers={"Cache-Control": "private, no-store"},
+            ) from exc
+        _require_safe_usage_session_authority(cayu_app, result)
         cost = (
             None
             if body.pricing is None
@@ -2822,7 +2895,12 @@ def create_router(
                 billing_group_limit=body.group_limit,
             )
         )
-        return UsageRollupResponse(
+        session_cost_breakdown = (
+            None
+            if body.pricing is None or result.session_breakdown is None
+            else estimate_usage_session_cost_breakdown(result, body.pricing)
+        )
+        response_value = UsageRollupResponse(
             scope="configured_session_store",
             time_basis="event.timestamp",
             session_filter_basis="current_session_attributes",
@@ -2837,7 +2915,42 @@ def create_router(
             provider_breakdown=result.provider_breakdown,
             model_breakdown=result.model_breakdown,
             cost=cost,
+            session_breakdown=result.session_breakdown,
+            session_cost_breakdown=session_cost_breakdown,
         )
+        if not json_utf8_size_within_limit(
+            response_value.model_dump(mode="json"),
+            MAX_USAGE_ROLLUP_RESULT_BYTES,
+        ):
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Usage rollup exceeds the 4 MiB serialized response limit. "
+                    "Reduce session_group_limit, group_limit, or pricing identity size."
+                ),
+                headers={"Cache-Control": "private, no-store"},
+            )
+        return response_value
+
+    router.add_api_route(
+        "/usage/rollup",
+        get_usage_rollup,
+        methods=["POST"],
+        response_model=UsageRollupResponse,
+        responses=USAGE_ROLLUP_ENDPOINT_RESPONSES,
+        dependencies=protected,
+        description=(
+            "Aggregate usage-bearing events in a UTC-normalized half-open event-time "
+            "window. Session filters apply to current session attributes. Totals remain "
+            "exact when provider/model detail is bounded into an explicit remainder; "
+            "callers may opt into a bounded per-session breakdown with its own exact "
+            "remainder; "
+            "cost is omitted from evaluation rather than reported partially when its "
+            "price-input bound is exceeded. Scope is the configured session store; "
+            "authentication does not add tenant filtering."
+        ),
+        route_class_override=_BoundedUsageRollupRoute,
+    )
 
     async def _marker_record(session_id: str, event_id: str) -> EventRecord:
         """Persisted event named by a ``Last-Event-ID`` marker.

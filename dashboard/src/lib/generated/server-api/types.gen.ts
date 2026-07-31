@@ -4180,14 +4180,22 @@ export type UsageRollupRequest = {
      */
     group_limit?: number;
     /**
-     * Optional bounded price book. The serialized value may contain at most 2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, 100 contextual requirements, and 2,000 contextual selector values. The price-input limit multiplied by the resolution candidates may not exceed 500,000.
+     * Optional bounded price book. The serialized value may contain at most 2 MiB, 500 prices, 2,000 price match rules, 1,000 resource mappings, 100 contextual requirements, and 2,000 contextual selector values. Each currency identity may contain at most 64 UTF-8 bytes. The price-input limit multiplied by the resolution candidates may not exceed 500,000.
      */
     pricing?: PriceBook | null;
     /**
      * Pricing Input Limit
+     *
+     * Maximum canonical price-input groups, applied independently to the shared projection and, when session_group_limit is present, the session-aware projection.
      */
     pricing_input_limit?: number;
     session_filter?: SessionAggregateFilter;
+    /**
+     * Session Group Limit
+     *
+     * Opt-in maximum number of per-session usage groups. Omitted matching sessions are represented by an exact aggregate remainder. When omitted, stores perform no per-session breakdown or session-aware pricing work.
+     */
+    session_group_limit?: number | null;
     /**
      * Start At
      */
@@ -4226,6 +4234,8 @@ export type UsageRollupResponse = {
      * Scope
      */
     scope: 'configured_session_store';
+    session_breakdown?: UsageSessionAggregateBreakdown | null;
+    session_cost_breakdown?: UsageSessionCostBreakdown | null;
     /**
      * Session Filter Basis
      */
@@ -4239,6 +4249,139 @@ export type UsageRollupResponse = {
      */
     time_basis: 'event.timestamp';
     totals: UsageAggregateTotals;
+};
+
+/**
+ * UsageSessionAggregateBreakdown
+ *
+ * Deterministic session groups plus an exact aggregate remainder.
+ */
+export type UsageSessionAggregateBreakdown = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Groups
+     */
+    groups: Array<UsageSessionAggregateGroup>;
+    remainder: UsageSessionAggregateRemainder | null;
+};
+
+/**
+ * UsageSessionAggregateGroup
+ *
+ * Exact usage for one retained current session inside a bounded breakdown.
+ */
+export type UsageSessionAggregateGroup = {
+    /**
+     * Active
+     */
+    active: boolean;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Status
+     */
+    status: 'pending' | 'running' | 'interrupting' | 'completed' | 'failed' | 'interrupted';
+    totals: UsageAggregateTotals;
+};
+
+/**
+ * UsageSessionAggregateRemainder
+ *
+ * Exact usage represented by current sessions omitted from bounded detail.
+ */
+export type UsageSessionAggregateRemainder = {
+    /**
+     * Active Session Count
+     */
+    active_session_count: string;
+    /**
+     * Group Count
+     */
+    group_count: string;
+    totals: UsageAggregateTotals;
+};
+
+/**
+ * UsageSessionCostBreakdown
+ *
+ * Bounded per-session costs plus an aggregate remainder.
+ */
+export type UsageSessionCostBreakdown = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Groups
+     */
+    groups: Array<UsageSessionCostGroup>;
+    /**
+     * Price Book Generated At
+     */
+    price_book_generated_at: string;
+    /**
+     * Price Book Version
+     */
+    price_book_version: string;
+    remainder: UsageSessionCostRemainder | null;
+};
+
+/**
+ * UsageSessionCostGroup
+ *
+ * Cost accounting for one retained session.
+ */
+export type UsageSessionCostGroup = {
+    cost: UsageSessionCostSummary;
+    /**
+     * Session Id
+     */
+    session_id: string;
+};
+
+/**
+ * UsageSessionCostRemainder
+ *
+ * Exact aggregate cost for sessions omitted from bounded detail.
+ */
+export type UsageSessionCostRemainder = {
+    cost: UsageSessionCostSummary;
+    /**
+     * Group Count
+     */
+    group_count: string;
+};
+
+/**
+ * UsageSessionCostSummary
+ *
+ * Cost accounting for one session group or the exact omitted remainder.
+ */
+export type UsageSessionCostSummary = {
+    accuracy: AggregateAccuracy;
+    /**
+     * Currencies
+     */
+    currencies: Array<UsageCurrencyCost>;
+    /**
+     * Evaluated Model Steps
+     */
+    evaluated_model_steps: string;
+    /**
+     * Priced Model Steps
+     */
+    priced_model_steps: string;
+    /**
+     * Unevaluated Model Steps
+     */
+    unevaluated_model_steps: string;
+    /**
+     * Unpriced Model Steps
+     */
+    unpriced_model_steps: string;
+    /**
+     * Unpriced Reasons
+     */
+    unpriced_reasons: Array<UsageUnpricedReason>;
 };
 
 /**
@@ -6375,9 +6518,21 @@ export type GetUsageRollupApiUsageRollupPostData = {
 
 export type GetUsageRollupApiUsageRollupPostErrors = {
     /**
+     * A per-session identity cannot cross the configured redaction boundary.
+     */
+    409: ApiErrorResponse;
+    /**
+     * The usage-rollup request or serialized response exceeds its byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
+    /**
+     * The configured store returned an inconsistent usage projection.
+     */
+    500: ApiErrorResponse;
     /**
      * The configured store does not implement this aggregate read.
      */
