@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -7,19 +8,26 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     StrictInt,
+    ValidationError,
     field_validator,
     model_validator,
 )
+from pydantic_core import PydanticSerializationError
 
-from cayu._validation import json_utf8_size_within_limit, require_clean_nonblank
+from cayu._validation import (
+    JsonUtf8SizeCounter,
+    json_utf8_size_within_limit,
+    require_clean_nonblank,
+)
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
 from cayu.runtime.usage import (
@@ -29,9 +37,12 @@ from cayu.runtime.usage import (
     CacheUsageMetrics,
     PositiveAggregateCount,
     UsageMetrics,
-    add_aggregate_usage,  # noqa: F401 - compatibility re-export
-    build_aggregate_usage_metrics,  # noqa: F401 - compatibility re-export
+    add_aggregate_usage,
+    build_aggregate_usage_metrics,
 )
+
+if TYPE_CHECKING:
+    from cayu.runtime.sessions import UsageRollupQuery
 
 
 class AggregateAccuracyKind(StrEnum):
@@ -72,6 +83,39 @@ EXACT_AGGREGATE = AggregateAccuracy(kind=AggregateAccuracyKind.EXACT)
 MAX_AGGREGATE_USAGE_COUNTER = 2**63 - 1
 MAX_USAGE_PRICING_INPUT_BYTES = 8 * 1024 * 1024
 MAX_USAGE_PRICING_RAW_CANDIDATES = 5000
+MAX_USAGE_ROLLUP_SESSION_ID_BYTES = 1024
+MAX_USAGE_ROLLUP_STORE_RESULT_BYTES = 24 * 1024 * 1024
+
+
+class UsageRollupInconsistent(ValueError):
+    """A store returned a usage projection that does not honor its query."""
+
+
+class UsageRollupResultTooLarge(ValueError):
+    """A usage projection cannot cross its bounded public contract safely."""
+
+
+def _validation_error_is_only_usage_rollup_size_limits(error: ValidationError) -> bool:
+    """Whether canonical validation failed exclusively on explicit byte ceilings."""
+
+    details = error.errors(include_url=False, include_input=False)
+    return bool(details) and all(
+        isinstance((detail.get("ctx") or {}).get("error"), UsageRollupResultTooLarge)
+        for detail in details
+    )
+
+
+def require_bounded_usage_session_id(value: str) -> str:
+    """Validate a session identity before it enters a usage projection."""
+
+    cleaned = require_clean_nonblank(value, "session_id")
+    try:
+        encoded = cleaned.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("session_id must contain portable Unicode text.") from exc
+    if len(encoded) > MAX_USAGE_ROLLUP_SESSION_ID_BYTES:
+        raise UsageRollupResultTooLarge("A session identity exceeds the usage-rollup byte limit.")
+    return cleaned
 
 
 # Python's ``str.strip`` set, written explicitly so SQLite and PostgreSQL can
@@ -102,6 +146,29 @@ class UsageAggregateTotals(BaseModel):
         if self.model_steps_with_usage > self.model_steps:
             raise ValueError("model_steps_with_usage cannot exceed model_steps.")
         return self
+
+
+def _sum_usage_aggregate_totals(
+    values: Iterable[UsageAggregateTotals],
+) -> UsageAggregateTotals:
+    session_count = 0
+    model_steps = 0
+    model_steps_with_usage = 0
+    tool_calls = 0
+    usage = build_aggregate_usage_metrics()
+    for value in values:
+        session_count += value.session_count
+        model_steps += value.model_steps
+        model_steps_with_usage += value.model_steps_with_usage
+        tool_calls += value.tool_calls
+        usage = add_aggregate_usage(usage, value.usage)
+    return UsageAggregateTotals(
+        session_count=session_count,
+        model_steps=model_steps,
+        model_steps_with_usage=model_steps_with_usage,
+        tool_calls=tool_calls,
+        usage=usage,
+    )
 
 
 def aggregate_usage_metrics_from_event_payload(
@@ -386,14 +453,113 @@ class UsageAggregateBreakdown(BaseModel):
         return self
 
 
+UsageSessionStatus = Literal[
+    "pending",
+    "running",
+    "interrupting",
+    "completed",
+    "failed",
+    "interrupted",
+]
+_ACTIVE_USAGE_SESSION_STATUSES = frozenset({"pending", "running", "interrupting"})
+
+
+class UsageSessionAggregateGroup(BaseModel):
+    """Exact usage for one retained current session inside a bounded breakdown."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    status: UsageSessionStatus
+    active: StrictBool
+    totals: UsageAggregateTotals
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return require_bounded_usage_session_id(value)
+
+    @model_validator(mode="after")
+    def validate_active_state(self) -> UsageSessionAggregateGroup:
+        if self.active is not (self.status in _ACTIVE_USAGE_SESSION_STATUSES):
+            raise ValueError("Session usage active state must match the current status.")
+        if self.totals.session_count not in {0, 1}:
+            raise ValueError("One session usage group can report at most one activity session.")
+        has_activity = bool(self.totals.model_steps or self.totals.tool_calls)
+        if self.totals.session_count != int(has_activity):
+            raise ValueError("Session usage count must match activity in the requested window.")
+        return self
+
+
+class UsageSessionAggregateRemainder(BaseModel):
+    """Exact usage represented by current sessions omitted from bounded detail."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_count: PositiveAggregateCount = Field(ge=1)
+    active_session_count: AggregateCount = Field(ge=0)
+    totals: UsageAggregateTotals
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> UsageSessionAggregateRemainder:
+        if self.active_session_count > self.group_count:
+            raise ValueError("Remainder active sessions cannot exceed omitted groups.")
+        if self.totals.session_count > self.group_count:
+            raise ValueError("Remainder activity sessions cannot exceed omitted groups.")
+        return self
+
+
+class UsageSessionAggregateBreakdown(BaseModel):
+    """Deterministic session groups plus an exact aggregate remainder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    groups: tuple[UsageSessionAggregateGroup, ...] = Field(max_length=100)
+    remainder: UsageSessionAggregateRemainder | None
+    accuracy: AggregateAccuracy
+
+    @model_validator(mode="after")
+    def validate_breakdown(self) -> UsageSessionAggregateBreakdown:
+        session_ids = [group.session_id for group in self.groups]
+        if len(set(session_ids)) != len(session_ids):
+            raise ValueError("Session usage groups must have distinct session IDs.")
+        if self.remainder is None and self.accuracy.kind is AggregateAccuracyKind.TRUNCATED:
+            raise ValueError("A truncated session breakdown must include a remainder.")
+        if self.remainder is not None and self.accuracy.kind is not AggregateAccuracyKind.TRUNCATED:
+            raise ValueError("A session breakdown remainder must report truncation.")
+        if self.groups != tuple(
+            sorted(
+                self.groups,
+                key=lambda group: (
+                    -group.totals.usage.total_tokens,
+                    -group.totals.model_steps,
+                    group.session_id,
+                ),
+            )
+        ):
+            raise ValueError("Session usage groups must use canonical usage ordering.")
+        return self
+
+
 class UsagePricingInput(BaseModel):
     """One bounded group of identical, price-relevant model-step inputs."""
 
     model_config = ConfigDict(extra="forbid")
 
+    session_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     effective_on: date
     occurrences: StrictInt = Field(ge=1)
     metrics: UsageMetrics | None = None
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_bounded_usage_session_id(value)
 
     @field_validator("metrics")
     @classmethod
@@ -406,23 +572,29 @@ def coalesce_usage_pricing_inputs(
 ) -> tuple[UsagePricingInput, ...]:
     """Merge store-native candidate groups after canonical usage validation."""
 
-    grouped: dict[tuple[date, str | None], tuple[int, UsageMetrics | None]] = {}
+    grouped: dict[
+        tuple[str | None, date, str | None],
+        tuple[int, UsageMetrics | None],
+    ] = {}
     for item in inputs:
         metrics_key = usage_pricing_metrics_key(item.metrics)
-        key = (item.effective_on, metrics_key)
+        key = (item.session_id, item.effective_on, metrics_key)
         occurrences, _ = grouped.get(key, (0, item.metrics))
         grouped[key] = (occurrences + item.occurrences, item.metrics)
     return tuple(
         sorted(
             (
                 UsagePricingInput(
+                    session_id=session_id,
                     effective_on=effective_on,
                     occurrences=occurrences,
                     metrics=metrics,
                 )
-                for (effective_on, _), (occurrences, metrics) in grouped.items()
+                for (session_id, effective_on, _), (occurrences, metrics) in grouped.items()
             ),
             key=lambda item: (
+                item.session_id is None,
+                item.session_id or "",
                 -item.occurrences,
                 item.effective_on,
                 "" if item.metrics is None else usage_pricing_metrics_key(item.metrics) or "",
@@ -437,10 +609,10 @@ class BoundedUsagePricingInputAccumulator:
 
     limit: int
     max_bytes: int = MAX_USAGE_PRICING_INPUT_BYTES
-    _groups: dict[tuple[date, str | None], tuple[int, UsageMetrics | None]] = dataclass_field(
-        default_factory=dict,
-        init=False,
-    )
+    _groups: dict[
+        tuple[str | None, date, str | None],
+        tuple[int, UsageMetrics | None],
+    ] = dataclass_field(default_factory=dict, init=False)
     _retained_bytes: int = dataclass_field(default=0, init=False)
     _truncated_group_count: int = dataclass_field(default=0, init=False)
     _truncation_reason: str | None = dataclass_field(default=None, init=False)
@@ -457,7 +629,7 @@ class BoundedUsagePricingInputAccumulator:
         if self.truncated:
             return
         metrics_key = usage_pricing_metrics_key(item.metrics)
-        key = (item.effective_on, metrics_key)
+        key = (item.session_id, item.effective_on, metrics_key)
         existing = self._groups.get(key)
         if existing is not None:
             self._groups[key] = (existing[0] + item.occurrences, existing[1])
@@ -470,7 +642,9 @@ class BoundedUsagePricingInputAccumulator:
                 limit=self.limit,
             )
             return
-        retained_bytes = 0 if metrics_key is None else len(metrics_key.encode("utf-8"))
+        retained_bytes = (
+            0 if item.session_id is None else len(item.session_id.encode("utf-8"))
+        ) + (0 if metrics_key is None else len(metrics_key.encode("utf-8")))
         if self._retained_bytes + retained_bytes > self.max_bytes:
             self._truncate(
                 group_count=observed_group_count,
@@ -484,6 +658,7 @@ class BoundedUsagePricingInputAccumulator:
     def add_payload(
         self,
         *,
+        session_id: str | None = None,
         effective_on: date,
         occurrences: int,
         payload: dict[str, object],
@@ -502,6 +677,7 @@ class BoundedUsagePricingInputAccumulator:
             return
         self.add(
             UsagePricingInput(
+                session_id=session_id,
                 effective_on=effective_on,
                 occurrences=occurrences,
                 metrics=metrics,
@@ -564,13 +740,156 @@ class BoundedUsagePricingInputAccumulator:
             )
         inputs = coalesce_usage_pricing_inputs(
             UsagePricingInput(
+                session_id=session_id,
                 effective_on=effective_on,
                 occurrences=occurrences,
                 metrics=metrics,
             )
-            for (effective_on, _), (occurrences, metrics) in self._groups.items()
+            for (session_id, effective_on, _), (occurrences, metrics) in self._groups.items()
         )
         return inputs, len(inputs), EXACT_AGGREGATE.model_copy()
+
+
+def _session_pricing_remainder_groups(
+    *,
+    shared: tuple[UsagePricingInput, ...],
+    retained: tuple[UsagePricingInput, ...],
+) -> dict[tuple[date, str | None], tuple[int, UsageMetrics | None]]:
+    """Subtract retained occurrences without allocating another input projection."""
+
+    shared_groups: dict[
+        tuple[date, str | None],
+        tuple[int, UsageMetrics | None],
+    ] = {}
+    for item in shared:
+        key = (item.effective_on, usage_pricing_metrics_key(item.metrics))
+        occurrences, _ = shared_groups.get(key, (0, item.metrics))
+        shared_groups[key] = occurrences + item.occurrences, item.metrics
+    retained_occurrences: dict[tuple[date, str | None], int] = {}
+    for item in retained:
+        key = (item.effective_on, usage_pricing_metrics_key(item.metrics))
+        retained_occurrences[key] = retained_occurrences.get(key, 0) + item.occurrences
+
+    remainder: dict[tuple[date, str | None], tuple[int, UsageMetrics | None]] = {}
+    for key, (shared_count, metrics) in shared_groups.items():
+        retained_count = retained_occurrences.pop(key, 0)
+        if retained_count > shared_count:
+            raise ValueError("Session pricing inputs exceed shared pricing occurrences.")
+        if retained_count < shared_count:
+            remainder[key] = shared_count - retained_count, metrics
+    if retained_occurrences:
+        raise ValueError("Session pricing inputs are absent from shared pricing inputs.")
+    return remainder
+
+
+def _session_pricing_input_remainder(
+    *,
+    shared: tuple[UsagePricingInput, ...],
+    retained: tuple[UsagePricingInput, ...],
+) -> tuple[UsagePricingInput, ...]:
+    """Build exact canonical inputs for sessions omitted from bounded detail."""
+
+    remainder = _session_pricing_remainder_groups(shared=shared, retained=retained)
+    return coalesce_usage_pricing_inputs(
+        UsagePricingInput(
+            effective_on=effective_on,
+            occurrences=occurrences,
+            metrics=metrics,
+        )
+        for (effective_on, _), (occurrences, metrics) in remainder.items()
+    )
+
+
+def _scaled_pricing_usage(
+    metrics: UsageMetrics,
+    occurrences: int,
+) -> AggregateUsageMetrics:
+    """Scale one valid pricing input into identity-free aggregate counters."""
+
+    return build_aggregate_usage_metrics(
+        input_tokens=metrics.input_tokens * occurrences,
+        output_tokens=metrics.output_tokens * occurrences,
+        total_tokens=metrics.total_tokens * occurrences,
+        reasoning_output_tokens=metrics.reasoning_output_tokens * occurrences,
+        cache_read_tokens=metrics.cache.read_tokens * occurrences,
+        cache_write_tokens=metrics.cache.write_tokens * occurrences,
+        cache_write_5m_tokens=metrics.cache.write_5m_tokens * occurrences,
+        cache_write_1h_tokens=metrics.cache.write_1h_tokens * occurrences,
+        cache_write_unknown_ttl_tokens=(metrics.cache.write_unknown_ttl_tokens * occurrences),
+        cached_input_tokens=metrics.cache.cached_input_tokens * occurrences,
+        uncached_input_tokens=metrics.cache.uncached_input_tokens * occurrences,
+    )
+
+
+def _aggregate_usage_counter_values(
+    usage: AggregateUsageMetrics,
+) -> tuple[int, ...]:
+    """Return counters in one stable order for component-wise validation."""
+
+    return (
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.total_tokens,
+        usage.reasoning_output_tokens,
+        usage.cache.read_tokens,
+        usage.cache.write_tokens,
+        usage.cache.write_5m_tokens,
+        usage.cache.write_1h_tokens,
+        usage.cache.write_unknown_ttl_tokens,
+        usage.cache.cached_input_tokens,
+        usage.cache.uncached_input_tokens,
+    )
+
+
+_SESSION_PRICING_ATTRIBUTION_DOMAIN = b"cayu.session-pricing-attribution.v1\x00"
+
+
+def _session_pricing_attribution_fingerprint(
+    inputs: Iterable[UsagePricingInput],
+) -> str:
+    """Commit to every price-relevant field for one retained session."""
+
+    digest = hashlib.sha256(_SESSION_PRICING_ATTRIBUTION_DOMAIN)
+    canonical_inputs: list[tuple[bytes, bytes, bytes]] = []
+    for item in inputs:
+        metrics_key = (
+            b"\x00"
+            if item.metrics is None
+            else b"\x01" + (usage_pricing_metrics_key(item.metrics) or "").encode("utf-8")
+        )
+        canonical_inputs.append(
+            (
+                item.effective_on.isoformat().encode("ascii"),
+                str(item.occurrences).encode("ascii"),
+                metrics_key,
+            )
+        )
+    for components in sorted(canonical_inputs):
+        for component in components:
+            digest.update(len(component).to_bytes(8, byteorder="big", signed=False))
+            digest.update(component)
+    return digest.hexdigest()
+
+
+def _session_pricing_attribution_commitment(
+    *,
+    session_ids: Iterable[str],
+    inputs: Iterable[UsagePricingInput],
+) -> tuple[tuple[str, str], ...]:
+    inputs_by_session: dict[str, list[UsagePricingInput]] = {}
+    for item in inputs:
+        if item.session_id is None:
+            raise ValueError("Session pricing attribution requires session identity.")
+        inputs_by_session.setdefault(item.session_id, []).append(item)
+    return tuple(
+        (
+            session_id,
+            _session_pricing_attribution_fingerprint(
+                inputs_by_session.get(session_id, ()),
+            ),
+        )
+        for session_id in session_ids
+    )
 
 
 class UsageRollupStoreResult(BaseModel):
@@ -585,6 +904,7 @@ class UsageRollupStoreResult(BaseModel):
     totals_accuracy: AggregateAccuracy = Field(default_factory=lambda: EXACT_AGGREGATE.model_copy())
     provider_breakdown: UsageAggregateBreakdown
     model_breakdown: UsageAggregateBreakdown
+    session_breakdown: UsageSessionAggregateBreakdown | None = None
     pricing_inputs: tuple[UsagePricingInput, ...] = Field(default=(), max_length=5000)
     pricing_inputs_included: StrictBool = False
     pricing_input_group_count: StrictInt = Field(
@@ -598,9 +918,19 @@ class UsageRollupStoreResult(BaseModel):
     pricing_inputs_accuracy: AggregateAccuracy = Field(
         default_factory=lambda: EXACT_AGGREGATE.model_copy()
     )
+    session_pricing_inputs: tuple[UsagePricingInput, ...] = Field(
+        default=(),
+        max_length=5000,
+    )
+    session_pricing_inputs_included: StrictBool = False
+    session_pricing_input_group_count: StrictInt = Field(default=0, ge=0)
+    session_pricing_inputs_accuracy: AggregateAccuracy = Field(
+        default_factory=lambda: EXACT_AGGREGATE.model_copy()
+    )
     active_session_count: StrictInt = Field(default=0, ge=0)
     matching_session_count: StrictInt = Field(default=0, ge=0)
     includes_active_sessions: StrictBool = True
+    _session_pricing_attribution: tuple[tuple[str, str], ...] = PrivateAttr(default=())
 
     @field_validator("as_of", "start_at", "end_at")
     @classmethod
@@ -611,6 +941,26 @@ class UsageRollupStoreResult(BaseModel):
 
     @model_validator(mode="after")
     def validate_scope(self) -> UsageRollupStoreResult:
+        self._validate_projection_invariants()
+        if not self._session_pricing_attribution:
+            self._session_pricing_attribution = self._current_session_pricing_attribution()
+        return self
+
+    def _current_session_pricing_attribution(self) -> tuple[tuple[str, str], ...]:
+        if (
+            not self.session_pricing_inputs_included
+            or self.session_pricing_inputs_accuracy.kind is not AggregateAccuracyKind.EXACT
+            or self.session_breakdown is None
+        ):
+            return ()
+        return _session_pricing_attribution_commitment(
+            session_ids=(group.session_id for group in self.session_breakdown.groups),
+            inputs=self.session_pricing_inputs,
+        )
+
+    def _validate_projection_invariants(self) -> None:
+        """Validate conservation rules across independently bounded projections."""
+
         if self.start_at >= self.end_at:
             raise ValueError("Usage rollup start_at must be before end_at.")
         if self.pricing_input_group_count < len(self.pricing_inputs):
@@ -634,12 +984,90 @@ class UsageRollupStoreResult(BaseModel):
             self.pricing_inputs or self.pricing_input_group_count
         ):
             raise ValueError("Pricing inputs cannot be returned when they were not requested.")
+        if any(item.session_id is not None for item in self.pricing_inputs):
+            raise ValueError("Shared pricing inputs cannot retain session identity.")
+        pricing_input_keys = [
+            (item.effective_on, usage_pricing_metrics_key(item.metrics))
+            for item in self.pricing_inputs
+        ]
+        if len(set(pricing_input_keys)) != len(pricing_input_keys):
+            raise ValueError("Shared pricing inputs must have distinct canonical keys.")
         if (
             self.pricing_inputs_included
             and self.pricing_inputs_accuracy.kind is AggregateAccuracyKind.EXACT
             and sum(item.occurrences for item in self.pricing_inputs) != self.totals.model_steps
         ):
             raise ValueError("Exact pricing inputs must account for every model step.")
+        if self.session_pricing_input_group_count < len(self.session_pricing_inputs):
+            raise ValueError(
+                "session_pricing_input_group_count cannot be smaller than returned groups."
+            )
+        if (
+            self.session_pricing_input_group_count == len(self.session_pricing_inputs)
+            and self.session_pricing_inputs_accuracy.kind is not AggregateAccuracyKind.EXACT
+        ):
+            raise ValueError("Complete session pricing inputs must report exact accuracy.")
+        if (
+            self.session_pricing_input_group_count > len(self.session_pricing_inputs)
+            and self.session_pricing_inputs_accuracy.kind is not AggregateAccuracyKind.TRUNCATED
+        ):
+            raise ValueError("Omitted session pricing inputs must report truncation.")
+        if (
+            self.session_pricing_inputs_accuracy.kind is AggregateAccuracyKind.TRUNCATED
+            and self.session_pricing_inputs
+        ):
+            raise ValueError("Truncated session pricing projections cannot return partial inputs.")
+        if not self.session_pricing_inputs_included and (
+            self.session_pricing_inputs or self.session_pricing_input_group_count
+        ):
+            raise ValueError(
+                "Session pricing inputs cannot be returned when they were not requested."
+            )
+        if self.session_pricing_inputs_included and self.session_breakdown is None:
+            raise ValueError("Session pricing inputs require a session breakdown.")
+        if self.session_pricing_inputs_included and not self.pricing_inputs_included:
+            raise ValueError("Session pricing inputs require the shared pricing projection.")
+        visible_session_ids = (
+            set()
+            if self.session_breakdown is None
+            else {group.session_id for group in self.session_breakdown.groups}
+        )
+        if any(
+            item.session_id is None or item.session_id not in visible_session_ids
+            for item in self.session_pricing_inputs
+        ):
+            raise ValueError("Session pricing inputs must belong to retained session groups.")
+        session_pricing_input_keys = [
+            (
+                item.session_id,
+                item.effective_on,
+                usage_pricing_metrics_key(item.metrics),
+            )
+            for item in self.session_pricing_inputs
+        ]
+        if len(set(session_pricing_input_keys)) != len(session_pricing_input_keys):
+            raise ValueError("Session pricing inputs must have distinct canonical keys.")
+        self._validate_exact_session_pricing_attribution()
+        self._validate_exact_session_pricing_projection()
+        if self.session_breakdown is not None:
+            remainder = self.session_breakdown.remainder
+            represented_group_count = len(self.session_breakdown.groups)
+            represented_active_count = sum(
+                int(group.active) for group in self.session_breakdown.groups
+            )
+            represented_totals = [group.totals for group in self.session_breakdown.groups]
+            if remainder is not None:
+                represented_group_count += remainder.group_count
+                represented_active_count += remainder.active_session_count
+                represented_totals.append(remainder.totals)
+            if represented_group_count != self.matching_session_count:
+                raise ValueError(
+                    "Session breakdown groups must account for every matching session."
+                )
+            if represented_active_count != self.active_session_count:
+                raise ValueError("Session breakdown groups must account for every active session.")
+            if _sum_usage_aggregate_totals(represented_totals) != self.totals:
+                raise ValueError("Session breakdown totals must equal shared usage totals.")
         for breakdown in (self.provider_breakdown, self.model_breakdown):
             if (
                 self.totals_accuracy.kind is AggregateAccuracyKind.SAMPLED
@@ -651,7 +1079,228 @@ class UsageRollupStoreResult(BaseModel):
                 and breakdown.accuracy.kind is not AggregateAccuracyKind.TRUNCATED
             ):
                 raise ValueError("A truncated usage rollup must report truncated breakdowns.")
-        return self
+
+    def validate_for_query(self, query: UsageRollupQuery) -> UsageRollupStoreResult:
+        """Return a bounded, canonically revalidated result for one query."""
+
+        from cayu.runtime.sessions import UsageRollupQuery
+
+        if type(query) is not UsageRollupQuery:
+            raise TypeError("Usage rollup result validation requires a UsageRollupQuery.")
+        try:
+            size_counter = JsonUtf8SizeCounter(MAX_USAGE_ROLLUP_STORE_RESULT_BYTES)
+            if not size_counter.value(self):
+                if size_counter.encountered_unsupported_value:
+                    raise UsageRollupInconsistent(
+                        "Usage rollup store result contains a non-serializable value."
+                    )
+                if size_counter.exceeded_limit:
+                    raise UsageRollupResultTooLarge(
+                        "Usage rollup store result exceeds its internal byte limit."
+                    )
+                raise UsageRollupInconsistent(
+                    "Usage rollup store result could not be size-classified."
+                )
+            payload = self.model_dump(
+                mode="python",
+                round_trip=True,
+                warnings="error",
+            )
+            try:
+                validated = UsageRollupStoreResult.model_validate(payload)
+            except ValidationError as exc:
+                if _validation_error_is_only_usage_rollup_size_limits(exc):
+                    raise UsageRollupResultTooLarge(
+                        "Usage rollup store result exceeds a nested byte limit."
+                    ) from exc
+                raise
+            validated._validate_query_contract(query)
+            if self._session_pricing_attribution != validated._session_pricing_attribution:
+                raise UsageRollupInconsistent(
+                    "Session pricing attribution changed after store projection."
+                )
+        except UsageRollupResultTooLarge:
+            raise
+        except UsageRollupInconsistent:
+            raise
+        except (
+            AssertionError,
+            AttributeError,
+            PydanticSerializationError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise UsageRollupInconsistent(
+                "Usage rollup result violates its projection invariants."
+            ) from exc
+        return validated
+
+    def _validate_query_contract(self, query: UsageRollupQuery) -> None:
+        """Check requested opt-ins and limits before publishing a store result."""
+
+        if self.start_at != query.start_at or self.end_at != query.end_at:
+            raise UsageRollupInconsistent(
+                "Usage rollup result window does not match the requested window."
+            )
+        for name, breakdown in (
+            ("provider", self.provider_breakdown),
+            ("model", self.model_breakdown),
+        ):
+            if len(breakdown.groups) > query.group_limit:
+                raise UsageRollupInconsistent(
+                    f"Usage rollup {name} groups exceed the requested limit."
+                )
+            if (
+                breakdown.accuracy.kind is AggregateAccuracyKind.TRUNCATED
+                and breakdown.accuracy.limit != query.group_limit
+            ):
+                raise UsageRollupInconsistent(
+                    f"Usage rollup {name} truncation does not match the requested limit."
+                )
+
+        session_projection_requested = query.session_group_limit is not None
+        if (self.session_breakdown is not None) is not session_projection_requested:
+            raise UsageRollupInconsistent(
+                "Usage rollup session projection does not match the query."
+            )
+        if self.session_breakdown is not None:
+            session_group_limit = query.session_group_limit
+            if session_group_limit is None:
+                raise UsageRollupInconsistent(
+                    "Usage rollup returned an unrequested session projection."
+                )
+            for group in self.session_breakdown.groups:
+                require_bounded_usage_session_id(group.session_id)
+            if len(self.session_breakdown.groups) > session_group_limit:
+                raise UsageRollupInconsistent(
+                    "Usage rollup session groups exceed the requested limit."
+                )
+            if (
+                self.session_breakdown.accuracy.kind is AggregateAccuracyKind.TRUNCATED
+                and self.session_breakdown.accuracy.limit != session_group_limit
+            ):
+                raise UsageRollupInconsistent(
+                    "Usage rollup session truncation does not match the requested limit."
+                )
+
+        if self.pricing_inputs_included is not query.include_pricing_inputs:
+            raise UsageRollupInconsistent(
+                "Usage rollup pricing projection does not match the query."
+            )
+        if len(self.pricing_inputs) > query.pricing_input_limit:
+            raise UsageRollupInconsistent("Usage rollup pricing inputs exceed the requested limit.")
+        session_pricing_requested = query.include_pricing_inputs and session_projection_requested
+        if self.session_pricing_inputs_included is not session_pricing_requested:
+            raise UsageRollupInconsistent(
+                "Usage rollup session pricing projection does not match the query."
+            )
+        if len(self.session_pricing_inputs) > query.pricing_input_limit:
+            raise UsageRollupInconsistent(
+                "Usage rollup session pricing inputs exceed the requested limit."
+            )
+        for item in self.session_pricing_inputs:
+            if item.session_id is None:
+                raise UsageRollupInconsistent(
+                    "Usage rollup session pricing inputs require session identity."
+                )
+            require_bounded_usage_session_id(item.session_id)
+
+    def _validate_exact_session_pricing_attribution(self) -> None:
+        """Reconcile exact retained pricing inputs with visible session usage."""
+
+        if (
+            not self.session_pricing_inputs_included
+            or self.session_pricing_inputs_accuracy.kind is not AggregateAccuracyKind.EXACT
+            or self.session_breakdown is None
+        ):
+            return
+
+        occurrences_by_session: dict[str, int] = {}
+        valid_usage_steps_by_session: dict[str, int] = {}
+        known_usage_by_session: dict[str, AggregateUsageMetrics] = {}
+        for item in self.session_pricing_inputs:
+            assert item.session_id is not None
+            session_id = item.session_id
+            occurrences_by_session[session_id] = (
+                occurrences_by_session.get(session_id, 0) + item.occurrences
+            )
+            if item.metrics is None:
+                continue
+            valid_usage_steps_by_session[session_id] = (
+                valid_usage_steps_by_session.get(session_id, 0) + item.occurrences
+            )
+            known_usage_by_session[session_id] = add_aggregate_usage(
+                known_usage_by_session.get(
+                    session_id,
+                    build_aggregate_usage_metrics(),
+                ),
+                _scaled_pricing_usage(item.metrics, item.occurrences),
+            )
+
+        for group in self.session_breakdown.groups:
+            session_id = group.session_id
+            if occurrences_by_session.get(session_id, 0) != group.totals.model_steps:
+                raise ValueError(
+                    "Exact session pricing inputs must account for each retained session's "
+                    "model steps."
+                )
+            valid_usage_steps = valid_usage_steps_by_session.get(session_id, 0)
+            known_usage = known_usage_by_session.get(
+                session_id,
+                build_aggregate_usage_metrics(),
+            )
+            if valid_usage_steps > group.totals.model_steps_with_usage or any(
+                known > reported
+                for known, reported in zip(
+                    _aggregate_usage_counter_values(known_usage),
+                    _aggregate_usage_counter_values(group.totals.usage),
+                    strict=True,
+                )
+            ):
+                raise ValueError(
+                    "Exact session pricing inputs exceed the retained session's usage totals."
+                )
+            if (
+                valid_usage_steps == group.totals.model_steps_with_usage
+                and known_usage != group.totals.usage
+            ):
+                raise ValueError(
+                    "Exact session pricing inputs do not reproduce the retained session's "
+                    "usage totals."
+                )
+
+    def _validate_exact_session_pricing_projection(self) -> None:
+        """Require exact session inputs to be a lossless partition of shared inputs."""
+
+        if (
+            not self.session_pricing_inputs_included
+            or self.pricing_inputs_accuracy.kind is not AggregateAccuracyKind.EXACT
+            or self.session_pricing_inputs_accuracy.kind is not AggregateAccuracyKind.EXACT
+        ):
+            return
+        if not self.pricing_inputs_included or self.session_breakdown is None:
+            raise UsageRollupInconsistent(
+                "Exact session pricing inputs require the shared usage projection."
+            )
+        try:
+            remainder_groups = _session_pricing_remainder_groups(
+                shared=self.pricing_inputs,
+                retained=self.session_pricing_inputs,
+            )
+        except ValueError as exc:
+            raise UsageRollupInconsistent(
+                "Exact session pricing inputs do not match the shared usage projection."
+            ) from exc
+        expected_remainder_steps = (
+            0
+            if self.session_breakdown.remainder is None
+            else self.session_breakdown.remainder.totals.model_steps
+        )
+        if sum(item[0] for item in remainder_groups.values()) != expected_remainder_steps:
+            raise UsageRollupInconsistent(
+                "Exact session pricing inputs do not account for the shared usage projection."
+            )
 
 
 class UsageCurrencyCost(BaseModel):
@@ -866,6 +1515,83 @@ class UsageCostRollup(BaseModel):
         return self
 
 
+class UsageSessionCostSummary(BaseModel):
+    """Cost accounting for one session group or the exact omitted remainder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accuracy: AggregateAccuracy
+    evaluated_model_steps: AggregateCount = Field(ge=0)
+    priced_model_steps: AggregateCount = Field(ge=0)
+    unpriced_model_steps: AggregateCount = Field(ge=0)
+    unevaluated_model_steps: AggregateCount = Field(ge=0)
+    currencies: tuple[UsageCurrencyCost, ...] = Field(max_length=5000)
+    unpriced_reasons: tuple[UsageUnpricedReason, ...] = Field(max_length=5000)
+
+    @model_validator(mode="after")
+    def validate_step_accounting(self) -> UsageSessionCostSummary:
+        if self.priced_model_steps + self.unpriced_model_steps != self.evaluated_model_steps:
+            raise ValueError("Priced and unpriced steps must sum to evaluated_model_steps.")
+        if sum(item.model_steps for item in self.currencies) != self.priced_model_steps:
+            raise ValueError("Currency model-step counts must sum to priced_model_steps.")
+        if sum(item.model_steps for item in self.unpriced_reasons) != self.unpriced_model_steps:
+            raise ValueError("Unpriced reasons must sum to unpriced_model_steps.")
+        if self.accuracy.kind is AggregateAccuracyKind.EXACT and self.unevaluated_model_steps:
+            raise ValueError("Exact session costs cannot contain unevaluated model steps.")
+        if self.accuracy.kind is AggregateAccuracyKind.TRUNCATED and self.evaluated_model_steps:
+            raise ValueError("Truncated session costs cannot report partial evaluated totals.")
+        return self
+
+
+class UsageSessionCostGroup(BaseModel):
+    """Cost accounting for one retained session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str
+    cost: UsageSessionCostSummary
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "session_id")
+
+
+class UsageSessionCostRemainder(BaseModel):
+    """Exact aggregate cost for sessions omitted from bounded detail."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_count: PositiveAggregateCount = Field(ge=1)
+    cost: UsageSessionCostSummary
+
+
+class UsageSessionCostBreakdown(BaseModel):
+    """Bounded per-session costs plus an aggregate remainder."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    price_book_version: str
+    price_book_generated_at: str
+    groups: tuple[UsageSessionCostGroup, ...] = Field(max_length=100)
+    remainder: UsageSessionCostRemainder | None
+    accuracy: AggregateAccuracy
+
+    @field_validator("price_book_version", "price_book_generated_at")
+    @classmethod
+    def validate_price_book_identity(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_breakdown(self) -> UsageSessionCostBreakdown:
+        session_ids = [group.session_id for group in self.groups]
+        if len(set(session_ids)) != len(session_ids):
+            raise ValueError("Session cost groups must have distinct session IDs.")
+        if self.remainder is not None and self.accuracy.kind is not AggregateAccuracyKind.TRUNCATED:
+            raise ValueError("A bounded session cost remainder must report truncation.")
+        return self
+
+
 @dataclass
 class _UsageBillingCostAccumulator:
     billing_identity: UsageBillingIdentity
@@ -886,7 +1612,7 @@ def estimate_usage_rollup_cost(
 ) -> UsageCostRollup:
     """Price an exact bounded input projection without reporting partial totals."""
 
-    from cayu.runtime.costs import PriceBook, estimate_model_step_cost
+    from cayu.runtime.costs import PriceBook
 
     if type(result) is not UsageRollupStoreResult:
         raise TypeError("result must be a UsageRollupStoreResult.")
@@ -896,13 +1622,35 @@ def estimate_usage_rollup_cost(
         raise ValueError("billing_group_limit must be between 1 and 100.")
     if not result.pricing_inputs_included:
         raise ValueError("Usage rollup did not request pricing inputs.")
+    return _estimate_usage_cost(
+        totals=result.totals,
+        totals_accuracy=result.totals_accuracy,
+        pricing_inputs=result.pricing_inputs,
+        pricing_inputs_accuracy=result.pricing_inputs_accuracy,
+        pricing=pricing,
+        billing_group_limit=billing_group_limit,
+    )
+
+
+def _estimate_usage_cost(
+    *,
+    totals: UsageAggregateTotals,
+    totals_accuracy: AggregateAccuracy,
+    pricing_inputs: tuple[UsagePricingInput, ...],
+    pricing_inputs_accuracy: AggregateAccuracy,
+    pricing,
+    billing_group_limit: int,
+    estimate_cache: dict[tuple[date, str | None], object] | None = None,
+) -> UsageCostRollup:
+    from cayu.runtime.costs import ModelStepCostEstimate, estimate_model_step_cost
+
     cost_accuracy = _combined_aggregate_accuracy(
-        result.totals_accuracy,
-        result.pricing_inputs_accuracy,
+        totals_accuracy,
+        pricing_inputs_accuracy,
     )
     if (
-        result.pricing_inputs_accuracy.kind is not AggregateAccuracyKind.EXACT
-        or result.totals_accuracy.kind is AggregateAccuracyKind.TRUNCATED
+        pricing_inputs_accuracy.kind is not AggregateAccuracyKind.EXACT
+        or totals_accuracy.kind is AggregateAccuracyKind.TRUNCATED
     ):
         return UsageCostRollup(
             price_book_version=pricing.price_book_version,
@@ -911,7 +1659,7 @@ def estimate_usage_rollup_cost(
             evaluated_model_steps=0,
             priced_model_steps=0,
             unpriced_model_steps=0,
-            unevaluated_model_steps=result.totals.model_steps,
+            unevaluated_model_steps=totals.model_steps,
             currencies=(),
             unpriced_reasons=(),
             billing_breakdown=UsageBillingCostBreakdown(
@@ -928,17 +1676,24 @@ def estimate_usage_rollup_cost(
     billing_groups: dict[str, _UsageBillingCostAccumulator] = {}
     priced_model_steps = 0
     unpriced_model_steps = 0
-    for item in result.pricing_inputs:
+    for item in pricing_inputs:
         if item.metrics is None:
             reason = "model.completed event has no valid normalized usage metrics"
             unpriced_reasons[reason] = unpriced_reasons.get(reason, 0) + item.occurrences
             unpriced_model_steps += item.occurrences
             continue
-        estimate = estimate_model_step_cost(
-            metrics=item.metrics,
-            pricing=pricing,
-            effective_on=item.effective_on,
-        )
+        estimate_key = (item.effective_on, usage_pricing_metrics_key(item.metrics))
+        estimate = None if estimate_cache is None else estimate_cache.get(estimate_key)
+        if estimate is None:
+            estimate = estimate_model_step_cost(
+                metrics=item.metrics,
+                pricing=pricing,
+                effective_on=item.effective_on,
+            )
+            if estimate_cache is not None:
+                estimate_cache[estimate_key] = estimate
+        else:
+            estimate = cast("ModelStepCostEstimate", estimate)
         pricing_identity = item.metrics.billing_identity
         if pricing_identity is not None:
             billing_identity = _billing_identity_for_breakdown(pricing_identity)
@@ -1067,6 +1822,151 @@ def estimate_usage_rollup_cost(
             remainder=billing_remainder,
             accuracy=billing_accuracy,
         ),
+    )
+
+
+def estimate_usage_session_cost_breakdown(
+    result: UsageRollupStoreResult,
+    pricing,
+) -> UsageSessionCostBreakdown:
+    """Price retained session groups without publishing partial session costs."""
+
+    from cayu.runtime.costs import PriceBook
+
+    if type(result) is not UsageRollupStoreResult:
+        raise TypeError("result must be a UsageRollupStoreResult.")
+    if type(pricing) is not PriceBook:
+        raise TypeError("pricing must be a PriceBook.")
+    if result.session_breakdown is None:
+        raise ValueError("Usage rollup did not request a session breakdown.")
+    if not result.pricing_inputs_included:
+        raise ValueError("Usage rollup did not request shared pricing inputs.")
+    if not result.session_pricing_inputs_included:
+        raise ValueError("Usage rollup did not request session pricing inputs.")
+
+    evaluation_accuracy = _combined_aggregate_accuracy(
+        _combined_aggregate_accuracy(
+            result.totals_accuracy,
+            result.pricing_inputs_accuracy,
+        ),
+        result.session_pricing_inputs_accuracy,
+    )
+    breakdown_accuracy = _combined_aggregate_accuracy(
+        result.session_breakdown.accuracy,
+        evaluation_accuracy,
+    )
+    if evaluation_accuracy.kind is not AggregateAccuracyKind.EXACT:
+        groups = tuple(
+            UsageSessionCostGroup(
+                session_id=group.session_id,
+                cost=_unevaluated_session_cost(
+                    model_steps=group.totals.model_steps,
+                    accuracy=evaluation_accuracy,
+                ),
+            )
+            for group in result.session_breakdown.groups
+        )
+        remainder = (
+            None
+            if result.session_breakdown.remainder is None
+            else UsageSessionCostRemainder(
+                group_count=result.session_breakdown.remainder.group_count,
+                cost=_unevaluated_session_cost(
+                    model_steps=result.session_breakdown.remainder.totals.model_steps,
+                    accuracy=evaluation_accuracy,
+                ),
+            )
+        )
+        return UsageSessionCostBreakdown(
+            price_book_version=pricing.price_book_version,
+            price_book_generated_at=pricing.generated_at,
+            groups=groups,
+            remainder=remainder,
+            accuracy=breakdown_accuracy,
+        )
+
+    estimate_cache: dict[tuple[date, str | None], object] = {}
+    inputs_by_session: dict[str, list[UsagePricingInput]] = {}
+    for item in result.session_pricing_inputs:
+        assert item.session_id is not None
+        inputs_by_session.setdefault(item.session_id, []).append(item)
+    groups = tuple(
+        UsageSessionCostGroup(
+            session_id=group.session_id,
+            cost=_session_cost_summary(
+                _estimate_usage_cost(
+                    totals=group.totals,
+                    totals_accuracy=EXACT_AGGREGATE,
+                    pricing_inputs=tuple(inputs_by_session.get(group.session_id, ())),
+                    pricing_inputs_accuracy=EXACT_AGGREGATE,
+                    pricing=pricing,
+                    billing_group_limit=1,
+                    estimate_cache=estimate_cache,
+                )
+            ),
+        )
+        for group in result.session_breakdown.groups
+    )
+    remainder = None
+    if result.session_breakdown.remainder is not None:
+        remainder_inputs = _session_pricing_input_remainder(
+            shared=result.pricing_inputs,
+            retained=result.session_pricing_inputs,
+        )
+        if (
+            sum(item.occurrences for item in remainder_inputs)
+            != result.session_breakdown.remainder.totals.model_steps
+        ):
+            raise ValueError("Session pricing remainder does not match omitted usage totals.")
+        remainder_cost = _session_cost_summary(
+            _estimate_usage_cost(
+                totals=result.session_breakdown.remainder.totals,
+                totals_accuracy=EXACT_AGGREGATE,
+                pricing_inputs=remainder_inputs,
+                pricing_inputs_accuracy=EXACT_AGGREGATE,
+                pricing=pricing,
+                billing_group_limit=1,
+                estimate_cache=estimate_cache,
+            )
+        )
+        remainder = UsageSessionCostRemainder(
+            group_count=result.session_breakdown.remainder.group_count,
+            cost=remainder_cost,
+        )
+    return UsageSessionCostBreakdown(
+        price_book_version=pricing.price_book_version,
+        price_book_generated_at=pricing.generated_at,
+        groups=groups,
+        remainder=remainder,
+        accuracy=breakdown_accuracy,
+    )
+
+
+def _session_cost_summary(cost: UsageCostRollup) -> UsageSessionCostSummary:
+    return UsageSessionCostSummary(
+        accuracy=cost.accuracy.model_copy(deep=True),
+        evaluated_model_steps=cost.evaluated_model_steps,
+        priced_model_steps=cost.priced_model_steps,
+        unpriced_model_steps=cost.unpriced_model_steps,
+        unevaluated_model_steps=cost.unevaluated_model_steps,
+        currencies=tuple(item.model_copy(deep=True) for item in cost.currencies),
+        unpriced_reasons=tuple(item.model_copy(deep=True) for item in cost.unpriced_reasons),
+    )
+
+
+def _unevaluated_session_cost(
+    *,
+    model_steps: int,
+    accuracy: AggregateAccuracy,
+) -> UsageSessionCostSummary:
+    return UsageSessionCostSummary(
+        accuracy=accuracy.model_copy(deep=True),
+        evaluated_model_steps=0,
+        priced_model_steps=0,
+        unpriced_model_steps=0,
+        unevaluated_model_steps=model_steps,
+        currencies=(),
+        unpriced_reasons=(),
     )
 
 

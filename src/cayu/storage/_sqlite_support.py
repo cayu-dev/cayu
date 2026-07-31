@@ -118,7 +118,7 @@ def _register_sqlite_functions(connection: sqlite3.Connection) -> None:
 
 
 class _ExactUsageSum:
-    """Sum all normalized usage counters in one SQLite aggregate callback."""
+    """Sum normalized counters and canonical outputs from a prior exact sum."""
 
     # A SQLite table has at most 2**63 - 1 rows and each accepted JSON integer is
     # at most 2**63 - 1, so every possible sum fits in 38 decimal digits.
@@ -131,6 +131,13 @@ class _ExactUsageSum:
         for index, value in enumerate(values):
             if type(value) is int and value >= 0:
                 self._totals[index] += value
+            elif (
+                type(value) is str
+                and len(value) == self._DECIMAL_WIDTH
+                and value.isascii()
+                and value.isdecimal()
+            ):
+                self._totals[index] += int(value)
 
     def finalize(self) -> str:
         return json.dumps(

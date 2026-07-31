@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from math import isfinite
 from types import MappingProxyType
@@ -518,10 +518,15 @@ class JsonUtf8SizeCounter:
             raise TypeError("ensure_ascii must be a boolean.")
         self.remaining = limit
         self.ensure_ascii = ensure_ascii
+        self.exceeded_limit = False
+        self.encountered_unsupported_value = False
 
     def _consume(self, count: int) -> bool:
         self.remaining -= count
-        return self.remaining >= 0
+        if self.remaining < 0:
+            self.exceeded_limit = True
+            return False
+        return True
 
     def _string(self, value: str) -> bool:
         if not self._consume(2):  # opening and closing quotes
@@ -559,6 +564,8 @@ class JsonUtf8SizeCounter:
             # ``+00:00`` is five bytes longer than Pydantic's UTC ``Z`` form, so
             # this intentionally provides a conservative upper bound.
             return self._string(value.isoformat())
+        if isinstance(value, date):
+            return self._string(value.isoformat())
         if type(value) in {int, float}:
             return self._consume(len(str(value).encode("utf-8")))
         if isinstance(value, BaseModel):
@@ -594,6 +601,7 @@ class JsonUtf8SizeCounter:
                 if not self.value(item):
                     return False
             return True
+        self.encountered_unsupported_value = True
         return False
 
 
@@ -606,8 +614,9 @@ def json_utf8_size_within_limit(
     """Whether compact, unescaped JSON for ``value`` fits ``max_bytes``.
 
     The walk stops as soon as the limit is exceeded and never allocates a
-    serialized copy. Pydantic models and datetimes are supported for internal
-    response-size guards; ordinary JSON containers cover transport payloads.
+    serialized copy. Pydantic models, dates, and datetimes are supported for
+    internal response-size guards; ordinary JSON containers cover transport
+    payloads.
     """
     return JsonUtf8SizeCounter(max_bytes, ensure_ascii=ensure_ascii).value(value)
 

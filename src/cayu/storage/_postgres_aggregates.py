@@ -11,6 +11,7 @@ from cayu.runtime.aggregates import (
     MAX_AGGREGATE_USAGE_COUNTER,
     MAX_USAGE_PRICING_INPUT_BYTES,
     MAX_USAGE_PRICING_RAW_CANDIDATES,
+    MAX_USAGE_ROLLUP_SESSION_ID_BYTES,
     AggregateAccuracy,
     AggregateAccuracyKind,
     BoundedUsagePricingInputAccumulator,
@@ -19,7 +20,12 @@ from cayu.runtime.aggregates import (
     UsageAggregateRemainder,
     UsageAggregateTotals,
     UsagePricingInput,
+    UsageRollupResultTooLarge,
     UsageRollupStoreResult,
+    UsageSessionAggregateBreakdown,
+    UsageSessionAggregateGroup,
+    UsageSessionAggregateRemainder,
+    UsageSessionStatus,
     aggregate_identity_value,
     build_aggregate_usage_metrics,
 )
@@ -364,6 +370,269 @@ FROM pricing_groups
 LIMIT %s
 """
 
+_SESSION_PRICING_INPUT_SQL = """
+WITH
+scope(max_input_bytes, identity_trim) AS (
+    SELECT %s::bigint, %s::text
+),
+requested_sessions(session_id) AS (
+    SELECT unnest(%s::text[])
+),
+matched_sessions AS MATERIALIZED (
+    SELECT cayu_sessions.id
+    FROM cayu_sessions
+    JOIN requested_sessions AS requested
+      ON requested.session_id = cayu_sessions.id
+    {session_where_sql}
+),
+pricing_candidates AS (
+    SELECT
+        event.session_id,
+        (event.timestamp AT TIME ZONE 'UTC')::date AS effective_on,
+        {usage_metrics_projection} AS usage_metrics,
+        {billing_identity_projection} AS billing_identity
+    FROM cayu_events AS event
+    JOIN matched_sessions AS session ON session.id = event.session_id
+    WHERE event.timestamp >= %s::timestamptz
+      AND event.timestamp < %s::timestamptz
+      AND event.event_type = 'model.completed'
+),
+measured_candidates AS (
+    SELECT
+        *,
+        octet_length(session_id)
+            + COALESCE(octet_length(usage_metrics::text), 0)
+            + COALESCE(octet_length(billing_identity::text), 0) AS input_bytes
+    FROM pricing_candidates
+),
+bounded_candidates AS (
+    SELECT
+        session_id,
+        effective_on,
+        input_bytes > (SELECT max_input_bytes FROM scope) AS input_oversized,
+        CASE
+            WHEN input_bytes <= (SELECT max_input_bytes FROM scope)
+            THEN usage_metrics
+        END AS usage_metrics,
+        CASE
+            WHEN input_bytes <= (SELECT max_input_bytes FROM scope)
+            THEN billing_identity
+        END AS billing_identity
+    FROM measured_candidates
+),
+pricing_groups AS (
+    SELECT
+        session_id,
+        effective_on,
+        usage_metrics,
+        billing_identity,
+        input_oversized,
+        COUNT(*) AS occurrences
+    FROM bounded_candidates
+    GROUP BY
+        session_id,
+        effective_on,
+        usage_metrics,
+        billing_identity,
+        input_oversized
+)
+SELECT
+    session_id,
+    effective_on,
+    usage_metrics,
+    billing_identity,
+    input_oversized,
+    occurrences,
+    COUNT(*) OVER () AS raw_group_count
+FROM pricing_groups
+LIMIT %s
+"""
+
+_SESSION_BREAKDOWN_SQL = """
+WITH
+scope(session_group_limit) AS (
+    SELECT %s::integer
+),
+matched_sessions AS MATERIALIZED (
+    SELECT id, status
+    FROM cayu_sessions
+    {session_where_sql}
+),
+usage_events AS MATERIALIZED (
+    SELECT
+        event.session_id,
+        event.event_type,
+        CASE
+            WHEN event.payload -> 'usage_normalization_failed'
+                     IS DISTINCT FROM 'true'::jsonb
+             AND jsonb_typeof(event.payload -> 'usage_metrics') = 'object'
+            THEN 1
+            ELSE 0
+        END AS has_usage,
+        {input_tokens} AS input_tokens,
+        {output_tokens} AS output_tokens,
+        {total_tokens} AS total_tokens,
+        {reasoning_tokens} AS reasoning_output_tokens,
+        {cache_read_tokens} AS cache_read_tokens,
+        {cache_write_tokens} AS cache_write_tokens,
+        {cache_write_5m_tokens} AS cache_write_5m_tokens,
+        {cache_write_1h_tokens} AS cache_write_1h_tokens,
+        {cache_write_unknown_tokens} AS cache_write_unknown_ttl_tokens,
+        {cached_input_tokens} AS cached_input_tokens,
+        {uncached_input_tokens} AS uncached_input_tokens
+    FROM cayu_events AS event
+    JOIN matched_sessions AS session ON session.id = event.session_id
+    WHERE event.timestamp >= %s::timestamptz
+      AND event.timestamp < %s::timestamptz
+      AND event.event_type IN ('model.completed', 'tool.call.started')
+),
+session_grouped AS (
+    SELECT
+        session.id AS session_id,
+        session.status,
+        session.status IN ('pending', 'running', 'interrupting') AS active,
+        CASE WHEN COUNT(event.session_id) > 0 THEN 1 ELSE 0 END AS session_count,
+        COUNT(*) FILTER (WHERE event.event_type = 'model.completed') AS model_steps,
+        COUNT(*) FILTER (
+            WHERE event.event_type = 'model.completed' AND event.has_usage = 1
+        ) AS model_steps_with_usage,
+        COUNT(*) FILTER (WHERE event.event_type = 'tool.call.started') AS tool_calls,
+        COALESCE(SUM(input_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS input_tokens,
+        COALESCE(SUM(output_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS output_tokens,
+        COALESCE(SUM(total_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS total_tokens,
+        COALESCE(SUM(reasoning_output_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS reasoning_output_tokens,
+        COALESCE(SUM(cache_read_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS cache_read_tokens,
+        COALESCE(SUM(cache_write_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS cache_write_tokens,
+        COALESCE(SUM(cache_write_5m_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS cache_write_5m_tokens,
+        COALESCE(SUM(cache_write_1h_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS cache_write_1h_tokens,
+        COALESCE(SUM(cache_write_unknown_ttl_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS cache_write_unknown_ttl_tokens,
+        COALESCE(SUM(cached_input_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS cached_input_tokens,
+        COALESCE(SUM(uncached_input_tokens) FILTER (
+            WHERE event.event_type = 'model.completed'
+        ), 0) AS uncached_input_tokens
+    FROM matched_sessions AS session
+    LEFT JOIN usage_events AS event ON event.session_id = session.id
+    GROUP BY session.id, session.status
+),
+retained_sessions AS MATERIALIZED (
+    SELECT
+        *
+    FROM session_grouped
+    ORDER BY
+        total_tokens DESC,
+        model_steps DESC,
+        session_id COLLATE "C" ASC
+    LIMIT (SELECT session_group_limit FROM scope)
+),
+session_identity_bound AS (
+    SELECT EXISTS (
+        SELECT 1
+        FROM retained_sessions
+        WHERE octet_length(session_id) > {session_id_max_bytes}
+    ) AS exceeded
+),
+session_remainder AS (
+    SELECT
+        COALESCE(SUM(session.session_count), 0) AS session_count,
+        COALESCE(SUM(session.model_steps), 0) AS model_steps,
+        COALESCE(SUM(session.model_steps_with_usage), 0) AS model_steps_with_usage,
+        COALESCE(SUM(session.tool_calls), 0) AS tool_calls,
+        COALESCE(SUM(session.input_tokens), 0) AS input_tokens,
+        COALESCE(SUM(session.output_tokens), 0) AS output_tokens,
+        COALESCE(SUM(session.total_tokens), 0) AS total_tokens,
+        COALESCE(SUM(session.reasoning_output_tokens), 0) AS reasoning_output_tokens,
+        COALESCE(SUM(session.cache_read_tokens), 0) AS cache_read_tokens,
+        COALESCE(SUM(session.cache_write_tokens), 0) AS cache_write_tokens,
+        COALESCE(SUM(session.cache_write_5m_tokens), 0) AS cache_write_5m_tokens,
+        COALESCE(SUM(session.cache_write_1h_tokens), 0) AS cache_write_1h_tokens,
+        COALESCE(SUM(session.cache_write_unknown_ttl_tokens), 0)
+            AS cache_write_unknown_ttl_tokens,
+        COALESCE(SUM(session.cached_input_tokens), 0) AS cached_input_tokens,
+        COALESCE(SUM(session.uncached_input_tokens), 0) AS uncached_input_tokens,
+        COUNT(*) AS group_count,
+        COUNT(*) FILTER (WHERE session.active) AS active_session_count
+    FROM session_grouped AS session
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM retained_sessions AS retained
+        WHERE retained.session_id = session.session_id
+    )
+    HAVING COUNT(*) > 0
+)
+SELECT
+    'session'::text AS section,
+    CASE
+        WHEN octet_length(session_id) <= {session_id_max_bytes}
+        THEN session_id
+    END AS session_id,
+    (SELECT exceeded FROM session_identity_bound) AS session_id_too_large,
+    status,
+    active,
+    session_count,
+    model_steps,
+    model_steps_with_usage,
+    tool_calls,
+    input_tokens,
+    output_tokens,
+    total_tokens,
+    reasoning_output_tokens,
+    cache_read_tokens,
+    cache_write_tokens,
+    cache_write_5m_tokens,
+    cache_write_1h_tokens,
+    cache_write_unknown_ttl_tokens,
+    cached_input_tokens,
+    uncached_input_tokens,
+    0::bigint AS group_count,
+    0::bigint AS active_session_count
+FROM retained_sessions
+UNION ALL
+SELECT
+    'session_remainder',
+    NULL,
+    (SELECT exceeded FROM session_identity_bound),
+    NULL,
+    NULL,
+    session_count,
+    model_steps,
+    model_steps_with_usage,
+    tool_calls,
+    input_tokens,
+    output_tokens,
+    total_tokens,
+    reasoning_output_tokens,
+    cache_read_tokens,
+    cache_write_tokens,
+    cache_write_5m_tokens,
+    cache_write_1h_tokens,
+    cache_write_unknown_ttl_tokens,
+    cached_input_tokens,
+    uncached_input_tokens,
+    group_count,
+    active_session_count
+FROM session_remainder
+"""
+
 
 _TOKEN_PATHS = {
     "input_tokens": "{usage_metrics,input_tokens}",
@@ -406,6 +675,30 @@ _ROW_COLUMNS = (
     "matching_session_count",
     "active_session_count",
 )
+_SESSION_ROW_COLUMNS = (
+    "section",
+    "session_id",
+    "session_id_too_large",
+    "status",
+    "active",
+    "session_count",
+    "model_steps",
+    "model_steps_with_usage",
+    "tool_calls",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "reasoning_output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "cache_write_5m_tokens",
+    "cache_write_1h_tokens",
+    "cache_write_unknown_ttl_tokens",
+    "cached_input_tokens",
+    "uncached_input_tokens",
+    "group_count",
+    "active_session_count",
+)
 
 
 async def aggregate_session_usage(
@@ -420,6 +713,19 @@ async def aggregate_session_usage(
         await cursor.execute(cast("LiteralString", sql), params)
         raw_rows = await cursor.fetchall()
     rows = [dict(zip(_ROW_COLUMNS, row, strict=True)) for row in raw_rows]
+    session_breakdown = None
+    if query.session_group_limit is not None:
+        session_sql, session_params = session_breakdown_statement(
+            session_plan=session_plan,
+            query=query,
+        )
+        async with connection.cursor() as cursor:
+            await cursor.execute(cast("LiteralString", session_sql), session_params)
+            raw_session_rows = await cursor.fetchall()
+        session_breakdown = _session_breakdown_from_rows(
+            [dict(zip(_SESSION_ROW_COLUMNS, row, strict=True)) for row in raw_session_rows],
+            limit=query.session_group_limit,
+        )
     pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
     if query.include_pricing_inputs:
         pricing_sql, pricing_params = pricing_input_statement(
@@ -433,11 +739,30 @@ async def aggregate_session_usage(
                 if row is None:
                     break
                 _add_pricing_input_from_values(pricing, row)
+    session_pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+    if query.include_pricing_inputs and session_breakdown is not None and session_breakdown.groups:
+        session_pricing_sql, session_pricing_params = session_pricing_input_statement(
+            session_plan=session_plan,
+            query=query,
+            session_ids=tuple(group.session_id for group in session_breakdown.groups),
+        )
+        async with connection.cursor(name="cayu_usage_rollup_session_pricing_inputs") as cursor:
+            await cursor.execute(
+                cast("LiteralString", session_pricing_sql),
+                session_pricing_params,
+            )
+            while not session_pricing.truncated:
+                row = await cursor.fetchone()
+                if row is None:
+                    break
+                _add_session_pricing_input_from_values(session_pricing, row)
     return _result_from_rows(
         rows,
         query=query,
         as_of=as_of,
         pricing=pricing.result(),
+        session_pricing=session_pricing.result(),
+        session_breakdown=session_breakdown,
     )
 
 
@@ -457,6 +782,28 @@ def usage_rollup_statement(
         (
             query.group_limit,
             AGGREGATE_IDENTITY_TRIM_CHARACTERS,
+            *session_plan.filter_params,
+            query.start_at,
+            query.end_at,
+        ),
+    )
+
+
+def session_breakdown_statement(
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+) -> tuple[str, tuple[object, ...]]:
+    if query.session_group_limit is None:
+        raise ValueError("session_group_limit is required for a session breakdown.")
+    return (
+        _SESSION_BREAKDOWN_SQL.format(
+            session_where_sql=session_plan.filter_where_sql,
+            session_id_max_bytes=MAX_USAGE_ROLLUP_SESSION_ID_BYTES,
+            **{name: _nonnegative_json_integer(path) for name, path in _TOKEN_PATHS.items()},
+        ),
+        (
+            query.session_group_limit,
             *session_plan.filter_params,
             query.start_at,
             query.end_at,
@@ -487,6 +834,39 @@ def pricing_input_statement(
             query.start_at,
             query.end_at,
             MAX_USAGE_PRICING_RAW_CANDIDATES,
+        ),
+    )
+
+
+def session_pricing_input_statement(
+    *,
+    session_plan: SessionQuerySqlPlan,
+    query: UsageRollupQuery,
+    session_ids: tuple[str, ...],
+    max_input_bytes: int = MAX_USAGE_PRICING_INPUT_BYTES,
+) -> tuple[str, tuple[object, ...]]:
+    if type(max_input_bytes) is not int or max_input_bytes < 1:
+        raise ValueError("max_input_bytes must be a positive integer.")
+    if not session_ids:
+        raise ValueError("session_ids cannot be empty.")
+    if len(session_ids) > 100 or len(set(session_ids)) != len(session_ids):
+        raise ValueError("session_ids must contain at most 100 distinct values.")
+    return (
+        _SESSION_PRICING_INPUT_SQL.format(
+            session_where_sql=session_plan.filter_where_sql,
+            usage_metrics_projection=_postgres_usage_metrics_projection(),
+            billing_identity_projection=_postgres_billing_identity_projection(
+                ("billing_identity",)
+            ),
+        ),
+        (
+            max_input_bytes,
+            AGGREGATE_IDENTITY_TRIM_CHARACTERS,
+            list(session_ids),
+            *session_plan.filter_params,
+            query.start_at,
+            query.end_at,
+            MAX_USAGE_PRICING_RAW_CANDIDATES + 1,
         ),
     )
 
@@ -607,6 +987,8 @@ def _result_from_rows(
     query: UsageRollupQuery,
     as_of: datetime,
     pricing: tuple[tuple[UsagePricingInput, ...], int, AggregateAccuracy],
+    session_pricing: tuple[tuple[UsagePricingInput, ...], int, AggregateAccuracy],
+    session_breakdown: UsageSessionAggregateBreakdown | None,
 ) -> UsageRollupStoreResult:
     overall = next(row for row in rows if row["section"] == "overall")
     provider_rows = _ordered_group_rows([row for row in rows if row["section"] == "provider"])
@@ -620,6 +1002,11 @@ def _result_from_rows(
         None,
     )
     pricing_inputs, pricing_group_count, pricing_accuracy = pricing
+    (
+        session_pricing_inputs,
+        session_pricing_group_count,
+        session_pricing_accuracy,
+    ) = session_pricing
 
     return UsageRollupStoreResult(
         as_of=as_of.astimezone(UTC),
@@ -638,12 +1025,70 @@ def _result_from_rows(
             limit=query.group_limit,
             dimension="model",
         ),
+        session_breakdown=session_breakdown,
         pricing_inputs=tuple(pricing_inputs),
         pricing_inputs_included=query.include_pricing_inputs,
         pricing_input_group_count=pricing_group_count,
         pricing_inputs_accuracy=pricing_accuracy,
+        session_pricing_inputs=tuple(session_pricing_inputs),
+        session_pricing_inputs_included=(
+            query.include_pricing_inputs and query.session_group_limit is not None
+        ),
+        session_pricing_input_group_count=session_pricing_group_count,
+        session_pricing_inputs_accuracy=session_pricing_accuracy,
         active_session_count=int(overall["active_session_count"]),
         matching_session_count=int(overall["matching_session_count"]),
+    )
+
+
+def _session_breakdown_from_rows(
+    rows: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> UsageSessionAggregateBreakdown:
+    if any(bool(row["session_id_too_large"]) for row in rows):
+        raise UsageRollupResultTooLarge("A session identity exceeds the usage-rollup byte limit.")
+    groups = tuple(
+        UsageSessionAggregateGroup(
+            session_id=str(row["session_id"]),
+            status=cast("UsageSessionStatus", str(row["status"])),
+            active=bool(row["active"]),
+            totals=_totals_from_row(row),
+        )
+        for row in sorted(
+            (row for row in rows if row["section"] == "session"),
+            key=lambda row: (
+                -int(row["total_tokens"]),
+                -int(row["model_steps"]),
+                str(row["session_id"]),
+            ),
+        )
+    )
+    remainder_row = next(
+        (row for row in rows if row["section"] == "session_remainder"),
+        None,
+    )
+    remainder = (
+        None
+        if remainder_row is None
+        else UsageSessionAggregateRemainder(
+            group_count=int(remainder_row["group_count"]),
+            active_session_count=int(remainder_row["active_session_count"]),
+            totals=_totals_from_row(remainder_row),
+        )
+    )
+    return UsageSessionAggregateBreakdown(
+        groups=groups,
+        remainder=remainder,
+        accuracy=(
+            EXACT_AGGREGATE.model_copy()
+            if remainder is None
+            else AggregateAccuracy(
+                kind=AggregateAccuracyKind.TRUNCATED,
+                reason="Matching sessions exceed session_group_limit.",
+                limit=limit,
+            )
+        ),
     )
 
 
@@ -721,6 +1166,8 @@ def _totals_from_row(row: dict[str, Any]) -> UsageAggregateTotals:
 def _add_pricing_input_from_row(
     pricing: BoundedUsagePricingInputAccumulator,
     row: dict[str, Any],
+    *,
+    session_id: str | None = None,
 ) -> None:
     if row["input_oversized"]:
         pricing.reject_oversized_candidate()
@@ -734,6 +1181,7 @@ def _add_pricing_input_from_row(
     if row["billing_identity"] is not None:
         payload["billing_identity"] = row["billing_identity"]
     pricing.add_payload(
+        session_id=session_id,
         effective_on=row["effective_on"],
         occurrences=int(row["occurrences"]),
         payload=payload,
@@ -762,4 +1210,31 @@ def _add_pricing_input_from_values(
             "occurrences": occurrences,
             "raw_group_count": raw_group_count,
         },
+    )
+
+
+def _add_session_pricing_input_from_values(
+    pricing: BoundedUsagePricingInputAccumulator,
+    row: tuple[object, ...],
+) -> None:
+    (
+        session_id,
+        effective_on,
+        usage_metrics,
+        billing_identity,
+        input_oversized,
+        occurrences,
+        raw_group_count,
+    ) = row
+    _add_pricing_input_from_row(
+        pricing,
+        {
+            "effective_on": effective_on,
+            "usage_metrics": usage_metrics,
+            "billing_identity": billing_identity,
+            "input_oversized": input_oversized,
+            "occurrences": occurrences,
+            "raw_group_count": raw_group_count,
+        },
+        session_id=str(session_id),
     )

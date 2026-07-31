@@ -16,6 +16,7 @@ from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.providers import bedrock_billing_identity, completed_bedrock_billing_identity
 from cayu.runtime.aggregates import (
     MAX_AGGREGATE_USAGE_COUNTER,
+    MAX_USAGE_ROLLUP_SESSION_ID_BYTES,
     AggregateAccuracy,
     AggregateAccuracyKind,
     AggregateCacheUsageMetrics,
@@ -26,9 +27,12 @@ from cayu.runtime.aggregates import (
     UsageAggregateTotals,
     UsageCurrencyCost,
     UsagePricingInput,
+    UsageRollupInconsistent,
+    UsageRollupResultTooLarge,
     UsageRollupStoreResult,
     coalesce_usage_pricing_inputs,
     estimate_usage_rollup_cost,
+    estimate_usage_session_cost_breakdown,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.sessions import (
@@ -40,6 +44,7 @@ from cayu.runtime.sessions import (
     SessionOperationalSnapshot,
     SessionStatus,
     SessionStatusCounts,
+    SessionStore,
     UsageRollupQuery,
 )
 from cayu.runtime.tasks import InMemoryTaskStore, TaskAggregateFilter, TaskCreate
@@ -334,6 +339,7 @@ def test_in_memory_usage_rollup_uses_half_open_utc_window_and_exact_remainder() 
                 end_at=end,
                 sessions=SessionAggregateFilter(labels={"scope": "included"}),
                 group_limit=1,
+                session_group_limit=2,
                 include_pricing_inputs=True,
                 pricing_input_limit=2,
             )
@@ -356,6 +362,37 @@ def test_in_memory_usage_rollup_uses_half_open_utc_window_and_exact_remainder() 
         assert result.pricing_input_group_count == 3
         assert result.pricing_inputs == ()
         assert result.pricing_inputs_accuracy.kind == "truncated"
+        assert result.session_breakdown is not None
+        assert [group.session_id for group in result.session_breakdown.groups] == [
+            "one",
+            "two",
+        ]
+        assert result.session_breakdown.groups[0].active is True
+        assert result.session_breakdown.groups[0].totals.tool_calls == 1
+        assert result.session_breakdown.remainder is not None
+        assert result.session_breakdown.remainder.group_count == 1
+        assert result.session_breakdown.remainder.totals.model_steps == 1
+        assert result.session_pricing_inputs_included is True
+        assert {item.session_id for item in result.session_pricing_inputs} == {"one", "two"}
+        assert result.session_pricing_inputs_accuracy.kind == "exact"
+        session_cost = estimate_usage_session_cost_breakdown(
+            result,
+            PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="alpha",
+                        model="large",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("1"),
+                    ),
+                )
+            ),
+        )
+        assert session_cost.accuracy.kind == "truncated"
+        assert all(group.cost.evaluated_model_steps == 0 for group in session_cost.groups)
+        assert [group.cost.unevaluated_model_steps for group in session_cost.groups] == [1, 1]
+        assert session_cost.remainder is not None
+        assert session_cost.remainder.cost.unevaluated_model_steps == 1
 
     asyncio.run(run())
 
@@ -740,37 +777,43 @@ def test_sqlite_usage_rollup_sums_past_signed_64_bit_without_overflow(tmp_path) 
         start = datetime(2026, 7, 1, tzinfo=UTC)
         maximum = 2**63 - 1
         for store_index, store in enumerate(stores):
-            session_id = f"large-sum-{store_index}"
-            await store.create(_request(session_id), identity=_identity())
-            await store.append_events(
-                session_id,
-                [
-                    _model_event(
-                        event_id=f"maximum-{index}",
-                        session_id=session_id,
-                        timestamp=start + timedelta(minutes=index),
-                        provider_name=f"provider-{index // 2}",
-                        model="model",
-                        input_tokens=maximum,
-                        output_tokens=0,
-                    )
-                    for index in range(4)
-                ],
-            )
+            for session_suffix in ("a", "b"):
+                session_id = f"large-sum-{store_index}-{session_suffix}"
+                await store.create(_request(session_id), identity=_identity())
+                await store.append_events(
+                    session_id,
+                    [
+                        _model_event(
+                            event_id=f"maximum-{session_suffix}-{index}",
+                            session_id=session_id,
+                            timestamp=start + timedelta(minutes=index),
+                            provider_name=f"provider-{index // 2}",
+                            model="model",
+                            input_tokens=maximum,
+                            output_tokens=0,
+                        )
+                        for index in range(4)
+                    ],
+                )
             result = await store.aggregate_usage(
                 UsageRollupQuery(
                     start_at=start,
                     end_at=start + timedelta(days=1),
                     group_limit=1,
+                    session_group_limit=1,
                 )
             )
-            assert result.totals.usage.input_tokens == 4 * maximum
-            assert result.provider_breakdown.groups[0].totals.usage.input_tokens == (2 * maximum)
+            assert result.totals.usage.input_tokens == 8 * maximum
+            assert result.provider_breakdown.groups[0].totals.usage.input_tokens == (4 * maximum)
             assert result.provider_breakdown.remainder is not None
-            assert result.provider_breakdown.remainder.totals.usage.input_tokens == 2 * maximum
+            assert result.provider_breakdown.remainder.totals.usage.input_tokens == 4 * maximum
+            assert result.session_breakdown is not None
+            assert result.session_breakdown.groups[0].totals.usage.input_tokens == 4 * maximum
+            assert result.session_breakdown.remainder is not None
+            assert result.session_breakdown.remainder.totals.usage.input_tokens == 4 * maximum
             serialized = result.totals.model_dump(mode="json")
-            assert serialized["model_steps"] == "4"
-            assert serialized["usage"]["input_tokens"] == str(4 * maximum)
+            assert serialized["model_steps"] == "8"
+            assert serialized["usage"]["input_tokens"] == str(8 * maximum)
         await stores[1].close()
 
     asyncio.run(run())
@@ -1246,6 +1289,7 @@ def test_usage_rollup_cost_keeps_currencies_separate_and_missing_pricing_visible
             UsageRollupQuery(
                 start_at=start,
                 end_at=start + timedelta(days=1),
+                session_group_limit=2,
                 include_pricing_inputs=True,
             )
         )
@@ -1257,6 +1301,18 @@ def test_usage_rollup_cost_keeps_currencies_separate_and_missing_pricing_visible
         assert cost.priced_model_steps == 2
         assert cost.unpriced_model_steps == 1
         assert cost.unpriced_reasons[0].reason == "no matching model pricing"
+        session_cost = estimate_usage_session_cost_breakdown(exact, pricing)
+        assert [group.session_id for group in session_cost.groups] == ["cost-0", "cost-1"]
+        assert [
+            (item.currency, item.total_cost)
+            for group in session_cost.groups
+            for item in group.cost.currencies
+        ] == [("USD", Decimal("1")), ("EUR", Decimal("2"))]
+        assert session_cost.remainder is not None
+        assert session_cost.remainder.cost.unpriced_model_steps == 1
+        assert session_cost.remainder.cost.unpriced_reasons[0].reason == (
+            "no matching model pricing"
+        )
 
         bounded = await store.aggregate_usage(
             UsageRollupQuery(
@@ -1271,6 +1327,246 @@ def test_usage_rollup_cost_keeps_currencies_separate_and_missing_pricing_visible
         assert bounded_cost.evaluated_model_steps == 0
         assert bounded_cost.unevaluated_model_steps == 3
         assert bounded_cost.currencies == ()
+
+    asyncio.run(run())
+
+
+def test_usage_rollup_store_result_rejects_duplicate_canonical_pricing_inputs() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        for session_id, event_count in (("a-retained", 2), ("z-omitted", 1)):
+            await store.create(_request(session_id), identity=_identity())
+            await store.append_events(
+                session_id,
+                [
+                    _model_event(
+                        event_id=f"{session_id}-model-{index}",
+                        session_id=session_id,
+                        timestamp=start + timedelta(minutes=index),
+                        provider_name="provider",
+                        model="model",
+                        input_tokens=1_000_000,
+                        output_tokens=0,
+                    )
+                    for index in range(event_count)
+                ],
+            )
+
+        result = await store.aggregate_usage(
+            UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                session_group_limit=1,
+                include_pricing_inputs=True,
+            )
+        )
+        assert len(result.pricing_inputs) == 1
+        assert result.pricing_inputs[0].occurrences == 3
+        assert len(result.session_pricing_inputs) == 1
+        assert result.session_pricing_inputs[0].occurrences == 2
+
+        shared_item = result.pricing_inputs[0]
+        duplicate_shared = (
+            shared_item.model_copy(update={"occurrences": 1}),
+            shared_item.model_copy(update={"occurrences": 2}),
+        )
+        invalid_shared = result.model_dump()
+        invalid_shared["pricing_inputs"] = duplicate_shared
+        invalid_shared["pricing_input_group_count"] = 2
+        with pytest.raises(
+            ValidationError,
+            match="Shared pricing inputs must have distinct canonical keys",
+        ):
+            UsageRollupStoreResult.model_validate(invalid_shared)
+
+        session_item = result.session_pricing_inputs[0]
+        duplicate_session = (
+            session_item.model_copy(update={"occurrences": 1}),
+            session_item.model_copy(update={"occurrences": 1}),
+        )
+        invalid_session = result.model_dump()
+        invalid_session["session_pricing_inputs"] = duplicate_session
+        invalid_session["session_pricing_input_group_count"] = 2
+        with pytest.raises(
+            ValidationError,
+            match="Session pricing inputs must have distinct canonical keys",
+        ):
+            UsageRollupStoreResult.model_validate(invalid_session)
+
+        # The estimator remains defensive if a custom integration bypasses model
+        # validation through Pydantic's trusted construction APIs.
+        unvalidated = result.model_copy(
+            update={
+                "pricing_inputs": duplicate_shared,
+                "pricing_input_group_count": 2,
+                "session_pricing_inputs": duplicate_session,
+                "session_pricing_input_group_count": 2,
+            }
+        )
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="provider",
+                    model="model",
+                    match="exact",
+                    currency="USD",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        )
+        cost = estimate_usage_session_cost_breakdown(unvalidated, pricing)
+        assert cost.groups[0].cost.priced_model_steps == 2
+        assert cost.remainder is not None
+        assert cost.remainder.cost.priced_model_steps == 1
+
+    asyncio.run(run())
+
+
+def test_usage_rollup_store_result_rejects_misaligned_exact_session_pricing() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        for session_id, event_count in (("a-retained", 2), ("z-omitted", 1)):
+            await store.create(_request(session_id), identity=_identity())
+            await store.append_events(
+                session_id,
+                [
+                    _model_event(
+                        event_id=f"{session_id}-alignment-{index}",
+                        session_id=session_id,
+                        timestamp=start + timedelta(minutes=index),
+                        provider_name="provider",
+                        model="shared-model",
+                        input_tokens=1,
+                        output_tokens=0,
+                    )
+                    for index in range(event_count)
+                ],
+            )
+
+        for session_group_limit in (1, 2):
+            result = await store.aggregate_usage(
+                UsageRollupQuery(
+                    start_at=start,
+                    end_at=start + timedelta(days=1),
+                    session_group_limit=session_group_limit,
+                    include_pricing_inputs=True,
+                )
+            )
+            session_item = result.session_pricing_inputs[0]
+            assert session_item.metrics is not None
+            inconsistent_item = session_item.model_copy(
+                update={
+                    "metrics": session_item.metrics.model_copy(update={"model": "different-model"})
+                }
+            )
+            invalid = result.model_dump()
+            invalid["session_pricing_inputs"] = (
+                inconsistent_item,
+                *result.session_pricing_inputs[1:],
+            )
+
+            with pytest.raises(
+                ValidationError,
+                match="Exact session pricing inputs do not match the shared usage projection",
+            ):
+                UsageRollupStoreResult.model_validate(invalid)
+
+    asyncio.run(run())
+
+
+def test_usage_rollup_store_result_rejects_swapped_session_pricing_attribution() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        for session_id, model, input_tokens in (
+            ("large-session", "large-model", 1_000_000),
+            ("small-session", "small-model", 1),
+        ):
+            await store.create(_request(session_id), identity=_identity())
+            await store.append_event(
+                session_id,
+                _model_event(
+                    event_id=f"{session_id}-attribution",
+                    session_id=session_id,
+                    timestamp=start,
+                    provider_name="provider",
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=0,
+                ),
+            )
+
+        result = await store.aggregate_usage(
+            UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                session_group_limit=2,
+                include_pricing_inputs=True,
+            )
+        )
+        first, second = result.session_pricing_inputs
+        invalid = result.model_dump()
+        invalid["session_pricing_inputs"] = (
+            first.model_copy(update={"metrics": second.metrics}),
+            second.model_copy(update={"metrics": first.metrics}),
+        )
+
+        with pytest.raises(
+            ValidationError,
+            match="do not reproduce the retained session's usage totals",
+        ):
+            UsageRollupStoreResult.model_validate(invalid)
+
+    asyncio.run(run())
+
+
+def test_usage_rollup_query_validation_rejects_equal_usage_pricing_swap() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        for session_id, model in (
+            ("cheap-session", "cheap-model"),
+            ("expensive-session", "expensive-model"),
+        ):
+            await store.create(_request(session_id), identity=_identity())
+            await store.append_event(
+                session_id,
+                _model_event(
+                    event_id=f"{session_id}-attribution",
+                    session_id=session_id,
+                    timestamp=start,
+                    provider_name="provider",
+                    model=model,
+                    input_tokens=1_000_000,
+                    output_tokens=0,
+                ),
+            )
+
+        query = UsageRollupQuery(
+            start_at=start,
+            end_at=start + timedelta(days=1),
+            session_group_limit=2,
+            include_pricing_inputs=True,
+        )
+        result = await store.aggregate_usage(query)
+        first, second = result.session_pricing_inputs
+        swapped = result.model_copy(
+            update={
+                "session_pricing_inputs": (
+                    first.model_copy(update={"metrics": second.metrics}),
+                    second.model_copy(update={"metrics": first.metrics}),
+                )
+            }
+        )
+
+        with pytest.raises(
+            UsageRollupInconsistent,
+            match="Session pricing attribution changed after store projection",
+        ):
+            swapped.validate_for_query(query)
 
     asyncio.run(run())
 
@@ -1485,6 +1781,288 @@ def test_sqlite_aggregates_match_in_memory_reference(tmp_path) -> None:
     asyncio.run(run())
 
 
+def test_sqlite_session_usage_breakdown_matches_in_memory_reference(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        sqlite = SQLiteSessionStore(tmp_path / "session-breakdown.sqlite")
+        stores = (memory, sqlite)
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+
+        async def seed(store: SessionStore) -> None:
+            for session_id in ("high", "low", "zero"):
+                await store.create(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "hello")],
+                        causal_budget_id="shared-budget",
+                    ),
+                    identity=_identity(),
+                )
+            await store.update_status("high", SessionStatus.RUNNING)
+            await store.update_status("low", SessionStatus.COMPLETED)
+            await store.update_status("zero", SessionStatus.PENDING)
+            await store.append_event(
+                "high",
+                _model_event(
+                    event_id="high-model",
+                    session_id="high",
+                    timestamp=start,
+                    provider_name="provider",
+                    model="model",
+                    input_tokens=20,
+                    output_tokens=5,
+                ),
+            )
+            await store.append_event(
+                "low",
+                _model_event(
+                    event_id="low-model",
+                    session_id="low",
+                    timestamp=start + timedelta(hours=1),
+                    provider_name="provider",
+                    model="model",
+                    input_tokens=20,
+                    output_tokens=5,
+                ),
+            )
+            await store.append_event(
+                "zero",
+                Event(
+                    id="zero-model",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="zero",
+                    timestamp=start + timedelta(hours=2),
+                    payload={},
+                ),
+            )
+
+        for store in stores:
+            await asyncio.create_task(seed(store))
+
+        query = UsageRollupQuery(
+            start_at=start,
+            end_at=start + timedelta(days=1),
+            sessions=SessionAggregateFilter(causal_budget_id="shared-budget"),
+            session_group_limit=2,
+            include_pricing_inputs=True,
+        )
+        memory_result = await memory.aggregate_usage(query)
+        sqlite_result = await sqlite.aggregate_usage(query)
+        assert sqlite_result.model_dump(exclude={"as_of"}) == memory_result.model_dump(
+            exclude={"as_of"}
+        )
+        assert sqlite_result.session_breakdown is not None
+        assert [group.session_id for group in sqlite_result.session_breakdown.groups] == [
+            "high",
+            "low",
+        ]
+        assert sqlite_result.session_breakdown.remainder is not None
+        assert sqlite_result.session_breakdown.remainder.group_count == 1
+        assert sqlite_result.session_breakdown.remainder.active_session_count == 1
+        assert sqlite_result.session_breakdown.remainder.totals.model_steps == 1
+        assert {item.session_id for item in sqlite_result.session_pricing_inputs} == {"high", "low"}
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="provider",
+                    model="model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        )
+        memory_cost = estimate_usage_session_cost_breakdown(memory_result, pricing)
+        sqlite_cost = estimate_usage_session_cost_breakdown(sqlite_result, pricing)
+        assert sqlite_cost == memory_cost
+        assert [group.session_id for group in sqlite_cost.groups] == ["high", "low"]
+        assert sqlite_cost.groups[0].cost.currencies[0].total_cost == Decimal("0.000025")
+        assert sqlite_cost.groups[1].cost.currencies[0].total_cost == Decimal("0.000025")
+        assert sqlite_cost.remainder is not None
+        assert sqlite_cost.remainder.cost.unpriced_model_steps == 1
+        assert sqlite_cost.remainder.cost.unpriced_reasons[0].reason == (
+            "model.completed event has no valid normalized usage metrics"
+        )
+
+        # Shared pricing coalesces identical high/low inputs into one occurrence
+        # group. Session pricing retains identity, so an exact bounded remainder
+        # must subtract occurrences rather than rounded monetary totals.
+        remainder_query = query.model_copy(update={"session_group_limit": 1})
+        memory_remainder_result = await memory.aggregate_usage(remainder_query)
+        sqlite_remainder_result = await sqlite.aggregate_usage(remainder_query)
+        assert sqlite_remainder_result.model_dump(
+            exclude={"as_of"}
+        ) == memory_remainder_result.model_dump(exclude={"as_of"})
+        from cayu.runtime import costs as runtime_costs
+
+        original_estimate = runtime_costs.estimate_model_step_cost
+        resolution_count = 0
+
+        def count_estimate(**kwargs):
+            nonlocal resolution_count
+            resolution_count += 1
+            return original_estimate(**kwargs)
+
+        monkeypatch.setattr(runtime_costs, "estimate_model_step_cost", count_estimate)
+        remainder_cost = estimate_usage_session_cost_breakdown(
+            sqlite_remainder_result,
+            pricing,
+        )
+        assert resolution_count == 1
+        assert [group.session_id for group in remainder_cost.groups] == ["high"]
+        assert remainder_cost.remainder is not None
+        assert remainder_cost.remainder.group_count == 2
+        assert remainder_cost.remainder.cost.priced_model_steps == 1
+        assert remainder_cost.remainder.cost.unpriced_model_steps == 1
+        assert remainder_cost.remainder.cost.currencies[0].total_cost == Decimal("0.000025")
+        assert remainder_cost.remainder.cost.unpriced_reasons[0].reason == (
+            "model.completed event has no valid normalized usage metrics"
+        )
+        await sqlite.close()
+
+    asyncio.run(run())
+
+
+def test_session_usage_breakdown_bounds_zero_activity_sessions_with_exact_remainder(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        sqlite = SQLiteSessionStore(tmp_path / "bounded-session-breakdown.sqlite")
+        session_ids = tuple(f"bounded-session-{index:03d}" for index in range(105))
+
+        async def seed(store: SessionStore) -> None:
+            for session_id in session_ids:
+                await store.create(
+                    _request(session_id, labels={"scope": "bounded-session-breakdown"}),
+                    identity=_identity(),
+                )
+
+        for store in (memory, sqlite):
+            await asyncio.create_task(seed(store))
+        query = UsageRollupQuery(
+            start_at=datetime(2026, 7, 1, tzinfo=UTC),
+            end_at=datetime(2026, 7, 2, tzinfo=UTC),
+            sessions=SessionAggregateFilter(labels={"scope": "bounded-session-breakdown"}),
+            session_group_limit=100,
+        )
+        memory_result = await memory.aggregate_usage(query)
+        sqlite_result = await sqlite.aggregate_usage(query)
+        assert sqlite_result.model_dump(exclude={"as_of"}) == memory_result.model_dump(
+            exclude={"as_of"}
+        )
+        assert sqlite_result.session_breakdown is not None
+        assert [group.session_id for group in sqlite_result.session_breakdown.groups] == list(
+            session_ids[:100]
+        )
+        assert sqlite_result.session_breakdown.remainder is not None
+        assert sqlite_result.session_breakdown.remainder.group_count == 5
+        assert sqlite_result.session_breakdown.remainder.active_session_count == 5
+        assert sqlite_result.session_breakdown.remainder.totals.session_count == 0
+        assert sqlite_result.matching_session_count == 105
+        assert sqlite_result.active_session_count == 105
+        await sqlite.close()
+
+    asyncio.run(run())
+
+    with pytest.raises(ValidationError):
+        UsageRollupQuery(
+            start_at=datetime(2026, 7, 1, tzinfo=UTC),
+            end_at=datetime(2026, 7, 2, tzinfo=UTC),
+            session_group_limit=101,
+        )
+
+
+def test_session_usage_breakdown_rejects_oversized_identity_across_local_stores(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        sqlite = SQLiteSessionStore(tmp_path / "oversized-session-identity.sqlite")
+        session_id = "s" * (MAX_USAGE_ROLLUP_SESSION_ID_BYTES + 1)
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        for store in (memory, sqlite):
+            await store.create(
+                _request(session_id, labels={"scope": "oversized-session-identity"}),
+                identity=_identity(),
+            )
+
+        shared_query = UsageRollupQuery(
+            start_at=start,
+            end_at=start + timedelta(days=1),
+            sessions=SessionAggregateFilter(labels={"scope": "oversized-session-identity"}),
+        )
+        for store in (memory, sqlite):
+            shared_result = await store.aggregate_usage(shared_query)
+            assert shared_result.matching_session_count == 1
+            assert shared_result.session_breakdown is None
+            with pytest.raises(
+                UsageRollupResultTooLarge,
+                match="session identity exceeds the usage-rollup byte limit",
+            ):
+                await store.aggregate_usage(
+                    shared_query.model_copy(update={"session_group_limit": 1})
+                )
+        await sqlite.close()
+
+    asyncio.run(run())
+
+
+def test_session_usage_breakdown_keeps_oversized_omitted_identity_in_remainder(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        sqlite = SQLiteSessionStore(tmp_path / "omitted-oversized-session-identity.sqlite")
+        retained_session_id = "retained-session-identity"
+        omitted_session_id = "o" * (MAX_USAGE_ROLLUP_SESSION_ID_BYTES + 1)
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        for store in (memory, sqlite):
+            for session_id in (retained_session_id, omitted_session_id):
+                await store.create(
+                    _request(session_id, labels={"scope": "omitted-oversized-identity"}),
+                    identity=_identity(),
+                )
+            await store.append_event(
+                retained_session_id,
+                _model_event(
+                    event_id="retained-session-model",
+                    session_id=retained_session_id,
+                    timestamp=start,
+                    provider_name="provider",
+                    model="model",
+                    input_tokens=1,
+                    output_tokens=0,
+                ),
+            )
+
+        query = UsageRollupQuery(
+            start_at=start,
+            end_at=start + timedelta(days=1),
+            sessions=SessionAggregateFilter(labels={"scope": "omitted-oversized-identity"}),
+            session_group_limit=1,
+        )
+        memory_result = await memory.aggregate_usage(query)
+        sqlite_result = await sqlite.aggregate_usage(query)
+        assert sqlite_result.model_dump(exclude={"as_of"}) == memory_result.model_dump(
+            exclude={"as_of"}
+        )
+        assert sqlite_result.session_breakdown is not None
+        assert [group.session_id for group in sqlite_result.session_breakdown.groups] == [
+            retained_session_id
+        ]
+        assert sqlite_result.session_breakdown.remainder is not None
+        assert sqlite_result.session_breakdown.remainder.group_count == 1
+        assert sqlite_result.session_breakdown.remainder.totals.model_steps == 0
+        assert sqlite_result.matching_session_count == 2
+        await sqlite.close()
+
+    asyncio.run(run())
+
+
 def test_sqlite_usage_rollup_handles_malformed_normalized_usage_like_memory(tmp_path) -> None:
     async def run() -> None:
         memory = InMemorySessionStore()
@@ -1577,6 +2155,7 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
     query = UsageRollupQuery(
         start_at=datetime(2026, 7, 1, tzinfo=UTC),
         end_at=datetime(2026, 7, 2, tzinfo=UTC),
+        session_group_limit=10,
     )
     plan = _session_store_sql.build_session_query_sql(None, dialect=_SQL_DIALECT)
     sql, params = _sqlite_aggregates.usage_rollup_statement(
@@ -1586,6 +2165,17 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
     pricing_sql, pricing_params = _sqlite_aggregates.pricing_input_statement(
         session_plan=plan,
         query=query,
+    )
+    session_sql, session_params = _sqlite_aggregates.session_breakdown_statement(
+        session_plan=plan,
+        query=query,
+    )
+    session_pricing_sql, session_pricing_params = (
+        _sqlite_aggregates.session_pricing_input_statement(
+            session_plan=plan,
+            query=query,
+            session_ids=("session-one",),
+        )
     )
     connection = _sqlite_support.connect(database_path, read_only=True)
     try:
@@ -1597,6 +2187,20 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
             for row in connection.execute(
                 f"EXPLAIN QUERY PLAN {pricing_sql}",
                 pricing_params,
+            ).fetchall()
+        ]
+        session_details = [
+            row[3]
+            for row in connection.execute(
+                f"EXPLAIN QUERY PLAN {session_sql}",
+                session_params,
+            ).fetchall()
+        ]
+        session_pricing_details = [
+            row[3]
+            for row in connection.execute(
+                f"EXPLAIN QUERY PLAN {session_pricing_sql}",
+                session_pricing_params,
             ).fetchall()
         ]
     finally:
@@ -1617,6 +2221,14 @@ def test_sqlite_usage_rollup_plan_bounds_the_index_by_type_and_time(tmp_path) ->
         and "timestamp<?" in detail
         for detail in pricing_details
     )
+    for projection_details in (session_details, session_pricing_details):
+        assert any(
+            "idx_cayu_events_type_timestamp " in detail
+            and "event_type=?" in detail
+            and "timestamp>?" in detail
+            and "timestamp<?" in detail
+            for detail in projection_details
+        )
 
 
 def test_sqlite_pricing_projection_rejects_oversized_rows_before_transfer(tmp_path) -> None:
@@ -1722,6 +2334,200 @@ def test_sqlite_pricing_projection_discards_unclean_bedrock_evidence_before_boun
     assert inputs[0].metrics is not None
     assert inputs[0].metrics.billing_identity is not None
     assert inputs[0].metrics.billing_identity.request_evidence == {}
+
+
+def test_postgres_session_usage_breakdown_matches_in_memory_reference(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def run() -> None:
+        memory = InMemorySessionStore()
+        postgres = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        suffix = uuid4().hex
+        session_ids = tuple(
+            f"session-breakdown-{suffix}-{name}" for name in ("high", "low", "zero")
+        )
+        high, low, zero = session_ids
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        label_value = f"session-breakdown-{suffix}"
+
+        async def seed(store: SessionStore) -> None:
+            for session_id in session_ids:
+                await store.create(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "hello")],
+                        labels={"test-scope": label_value},
+                        causal_budget_id="shared-budget",
+                    ),
+                    identity=_identity(),
+                )
+            await store.update_status(high, SessionStatus.RUNNING)
+            await store.update_status(low, SessionStatus.COMPLETED)
+            await store.update_status(zero, SessionStatus.PENDING)
+            await store.append_event(
+                high,
+                _model_event(
+                    event_id=f"{high}-model",
+                    session_id=high,
+                    timestamp=start,
+                    provider_name="provider",
+                    model="model",
+                    input_tokens=20,
+                    output_tokens=5,
+                ),
+            )
+            await store.append_event(
+                low,
+                _model_event(
+                    event_id=f"{low}-model",
+                    session_id=low,
+                    timestamp=start + timedelta(hours=1),
+                    provider_name="provider",
+                    model="model",
+                    input_tokens=20,
+                    output_tokens=5,
+                ),
+            )
+            await store.append_event(
+                zero,
+                Event(
+                    id=f"{zero}-model",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=zero,
+                    timestamp=start + timedelta(hours=2),
+                    payload={},
+                ),
+            )
+
+        try:
+            for store in (memory, postgres):
+                await asyncio.create_task(seed(store))
+            query = UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                sessions=SessionAggregateFilter(labels={"test-scope": label_value}),
+                session_group_limit=2,
+                include_pricing_inputs=True,
+            )
+            memory_result = await memory.aggregate_usage(query)
+            postgres_result = await postgres.aggregate_usage(query)
+            assert postgres_result.model_dump(exclude={"as_of"}) == memory_result.model_dump(
+                exclude={"as_of"}
+            )
+            assert postgres_result.session_breakdown is not None
+            assert [group.session_id for group in postgres_result.session_breakdown.groups] == [
+                high,
+                low,
+            ]
+            assert postgres_result.session_breakdown.remainder is not None
+            assert postgres_result.session_breakdown.remainder.group_count == 1
+            assert postgres_result.session_breakdown.remainder.active_session_count == 1
+            assert {item.session_id for item in postgres_result.session_pricing_inputs} == {
+                high,
+                low,
+            }
+            pricing = PriceBook(
+                prices=(
+                    ModelPrice.fixed(
+                        provider_name="provider",
+                        model="model",
+                        input_per_million=Decimal("1"),
+                        output_per_million=Decimal("1"),
+                    ),
+                )
+            )
+            assert estimate_usage_session_cost_breakdown(
+                postgres_result,
+                pricing,
+            ) == estimate_usage_session_cost_breakdown(memory_result, pricing)
+        finally:
+            await postgres.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_session_usage_breakdown_bounds_only_retained_identity(
+    postgres_dsn: str,
+) -> None:
+    from cayu.storage.migrations import SchemaMode
+    from cayu.storage.postgres import PostgresSessionStore
+
+    async def run() -> None:
+        postgres = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        unique_prefix = f"{uuid4().hex}-"
+        session_id = unique_prefix + ("s" * (MAX_USAGE_ROLLUP_SESSION_ID_BYTES + 1))
+        label_value = f"oversized-session-identity-{uuid4().hex}"
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        try:
+            await postgres.create(
+                _request(session_id, labels={"test-scope": label_value}),
+                identity=_identity(),
+            )
+            query = UsageRollupQuery(
+                start_at=start,
+                end_at=start + timedelta(days=1),
+                sessions=SessionAggregateFilter(labels={"test-scope": label_value}),
+                session_group_limit=1,
+            )
+            with pytest.raises(
+                UsageRollupResultTooLarge,
+                match="session identity exceeds the usage-rollup byte limit",
+            ):
+                await postgres.aggregate_usage(query)
+
+            retained_session_id = f"{unique_prefix}retained"
+            omitted_session_id = unique_prefix + ("o" * (MAX_USAGE_ROLLUP_SESSION_ID_BYTES + 1))
+            omitted_label = f"omitted-oversized-session-identity-{uuid4().hex}"
+            for candidate_id in (retained_session_id, omitted_session_id):
+                await postgres.create(
+                    _request(candidate_id, labels={"test-scope": omitted_label}),
+                    identity=_identity(),
+                )
+            await postgres.append_event(
+                retained_session_id,
+                _model_event(
+                    event_id=f"{unique_prefix}retained-model",
+                    session_id=retained_session_id,
+                    timestamp=start,
+                    provider_name="provider",
+                    model="model",
+                    input_tokens=1,
+                    output_tokens=0,
+                ),
+            )
+            omitted_result = await postgres.aggregate_usage(
+                UsageRollupQuery(
+                    start_at=start,
+                    end_at=start + timedelta(days=1),
+                    sessions=SessionAggregateFilter(labels={"test-scope": omitted_label}),
+                    session_group_limit=1,
+                )
+            )
+            assert omitted_result.session_breakdown is not None
+            assert [group.session_id for group in omitted_result.session_breakdown.groups] == [
+                retained_session_id
+            ]
+            assert omitted_result.session_breakdown.remainder is not None
+            assert omitted_result.session_breakdown.remainder.group_count == 1
+            assert omitted_result.session_breakdown.remainder.totals.model_steps == 0
+        finally:
+            await postgres.close()
+
+    asyncio.run(run())
 
 
 def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> None:
@@ -2031,6 +2837,29 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
             session_plan=plan,
             query=query.model_copy(update={"sessions": SessionAggregateFilter()}),
         )
+        session_query = query.model_copy(
+            update={
+                "sessions": SessionAggregateFilter(),
+                "session_group_limit": 10,
+            }
+        )
+        session_sql, session_params = _postgres_aggregates.session_breakdown_statement(
+            session_plan=plan,
+            query=session_query,
+        )
+        session_pricing_sql, session_pricing_params = (
+            _postgres_aggregates.session_pricing_input_statement(
+                session_plan=plan,
+                query=session_query,
+                session_ids=(f"postgres-{suffix}-aggregate-one",),
+            )
+        )
+        projection_statements = (
+            (sql, params, True),
+            (pricing_sql, pricing_params, True),
+            (session_sql, session_params, False),
+            (session_pricing_sql, session_pricing_params, False),
+        )
         edge_plan = _session_store_sql.build_session_query_sql(
             session_query_from_aggregate_filter(canonical_query.sessions),
             dialect=_SQL_DIALECT,
@@ -2048,30 +2877,78 @@ def test_postgres_aggregates_match_in_memory_reference(postgres_dsn: str) -> Non
         connection = await AsyncConnection.connect(postgres_dsn)
         try:
             async with connection.cursor() as cursor:
-                await cursor.execute("SET enable_seqscan = off")
-                await cursor.execute(f"EXPLAIN (COSTS OFF) {sql}", params)
-                explain_rows = await cursor.fetchall()
-                await cursor.execute(
-                    f"EXPLAIN (COSTS OFF) {pricing_sql}",
-                    pricing_params,
-                )
-                pricing_explain_rows = await cursor.fetchall()
+                await cursor.execute("SET LOCAL enable_seqscan = off")
+                projection_plans: list[tuple[object, bool]] = []
+                for (
+                    projection_sql,
+                    projection_params,
+                    require_type_time_index,
+                ) in projection_statements:
+                    await cursor.execute(
+                        f"EXPLAIN (FORMAT JSON, COSTS OFF) {projection_sql}",
+                        projection_params,
+                    )
+                    plan_row = await cursor.fetchone()
+                    assert plan_row is not None
+                    projection_plans.append((plan_row[0], require_type_time_index))
                 await cursor.execute(bounded_pricing_sql, bounded_pricing_params)
                 bounded_pricing_row = await cursor.fetchone()
                 await cursor.execute(clean_evidence_sql, clean_evidence_params)
                 clean_evidence_row = await cursor.fetchone()
         finally:
             await connection.close()
-        explanation = "\n".join(str(row[0]) for row in explain_rows)
-        assert "idx_cayu_events_type_timestamp" in explanation
-        assert "event_type = ANY" in explanation
-        assert '"timestamp" >=' in explanation
-        assert '"timestamp" <' in explanation
         assert 'COLLATE "C"' in sql
-        pricing_explanation = "\n".join(str(row[0]) for row in pricing_explain_rows)
-        assert "idx_cayu_events_type_timestamp" in pricing_explanation
-        assert '"timestamp" >=' in pricing_explanation
-        assert '"timestamp" <' in pricing_explanation
+        for projection_plan, require_type_time_index in projection_plans:
+            plan_document = (
+                json.loads(projection_plan) if isinstance(projection_plan, str) else projection_plan
+            )
+            assert isinstance(plan_document, list)
+            assert plan_document
+            root = plan_document[0]["Plan"]
+
+            plan_nodes: list[dict[str, object]] = []
+            pending = [root]
+            while pending:
+                node = pending.pop()
+                assert isinstance(node, dict)
+                plan_nodes.append(node)
+                children = node.get("Plans")
+                if children is None:
+                    continue
+                assert isinstance(children, list)
+                pending.extend(children)
+
+            indexed_event_access = []
+            for node in plan_nodes:
+                node_type = str(node.get("Node Type", ""))
+                relation_name = node.get("Relation Name")
+                index_name = str(node.get("Index Name", ""))
+                if "Index" in node_type and (
+                    relation_name == "cayu_events" or index_name.startswith("idx_cayu_events")
+                ):
+                    indexed_event_access.append(node)
+            # Preserve the shared rollups' event-type/time index contract.
+            # Session projections may instead use a per-session event index
+            # when table statistics favor it, but must retain indexed access and
+            # the half-open time and event-type predicates in the selected plan.
+            assert indexed_event_access
+            if require_type_time_index:
+                assert any(
+                    node.get("Index Name") == "idx_cayu_events_type_timestamp"
+                    and "event_type" in str(node.get("Index Cond", ""))
+                    and "timestamp" in str(node.get("Index Cond", ""))
+                    for node in indexed_event_access
+                )
+
+            plan_predicates = " ".join(
+                str(node.get(field, ""))
+                for node in plan_nodes
+                for field in ("Index Cond", "Recheck Cond", "Filter")
+            )
+            assert "timestamp" in plan_predicates
+            assert ">=" in plan_predicates
+            assert "<" in plan_predicates
+            assert "event_type" in plan_predicates
         assert bounded_pricing_row is not None
         assert bounded_pricing_row[1:4] == (None, None, True)
         assert clean_evidence_row is not None

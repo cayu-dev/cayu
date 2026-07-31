@@ -79,11 +79,15 @@ from cayu.runtime.aggregates import (
     UsageAggregateRemainder,
     UsageAggregateTotals,
     UsageRollupStoreResult,
+    UsageSessionAggregateBreakdown,
+    UsageSessionAggregateGroup,
+    UsageSessionAggregateRemainder,
     add_aggregate_usage,
     aggregate_usage_metrics_from_event_payload,
     build_aggregate_usage_metrics,
     normalize_aggregate_event_timestamp,
     project_aggregate_usage_inspection_event,
+    require_bounded_usage_session_id,
 )
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
@@ -2818,6 +2822,7 @@ class UsageRollupQuery(BaseModel):
     end_at: datetime
     sessions: SessionAggregateFilter = Field(default_factory=SessionAggregateFilter)
     group_limit: StrictInt = Field(default=20, ge=1, le=100)
+    session_group_limit: StrictInt | None = Field(default=None, ge=1, le=100)
     include_pricing_inputs: StrictBool = False
     pricing_input_limit: StrictInt = Field(default=1000, ge=1, le=5000)
 
@@ -8322,10 +8327,16 @@ class InMemorySessionStore(SessionStore):
                     SessionStatus.INTERRUPTING,
                 }
 
-            def matching_session_records() -> Iterable[tuple[str, Iterable[EventRecord]]]:
+            def matching_session_records() -> Iterable[
+                tuple[str, SessionStatus, Iterable[EventRecord]]
+            ]:
                 for session_id, session in self._sessions.items():
                     if _session_matches(session, session_query):
-                        yield session_id, self._session_event_records.get(session_id, ())
+                        yield (
+                            session_id,
+                            session.status,
+                            self._session_event_records.get(session_id, ()),
+                        )
 
             return _usage_rollup_from_session_records(
                 session_records=matching_session_records,
@@ -12772,6 +12783,12 @@ class _UsageAccumulator:
         self.model_steps_with_usage += 1
         self.usage = add_aggregate_usage(self.usage, metrics)
 
+    def merge(self, other: _UsageAccumulator) -> None:
+        self.session_count += other.session_count
+        self.model_steps += other.model_steps
+        self.model_steps_with_usage += other.model_steps_with_usage
+        self.usage = add_aggregate_usage(self.usage, other.usage)
+
     def totals(self, *, tool_calls: int = 0) -> UsageAggregateTotals:
         return UsageAggregateTotals(
             session_count=self.session_count,
@@ -12829,7 +12846,93 @@ class _SessionInspectionUsageAccumulator:
 _IN_MEMORY_USAGE_GROUP_CANDIDATE_LIMIT = 512
 _UsageGroupKey = tuple[str | None, str | None]
 _UsageGroupSortKey = tuple[bool, str, bool, str]
-_SessionRecordsFactory = Callable[[], Iterable[tuple[str, Iterable[EventRecord]]]]
+_SessionRecordsFactory = Callable[
+    [],
+    Iterable[tuple[str, SessionStatus, Iterable[EventRecord]]],
+]
+
+
+@dataclass
+class _SessionUsageAccumulator:
+    session_id: str
+    status: SessionStatus
+    usage: _UsageAccumulator = dataclass_field(default_factory=_UsageAccumulator)
+    tool_calls: int = 0
+    has_activity: bool = False
+
+    def add_event(self, event: Event) -> None:
+        if event.type == EventType.TOOL_CALL_STARTED:
+            self.tool_calls += 1
+            self.has_activity = True
+            return
+        if event.type != EventType.MODEL_COMPLETED:
+            return
+        self.has_activity = True
+        self.usage.add(aggregate_usage_metrics_from_event_payload(event.payload))
+
+    def candidate(self) -> _SessionUsageCandidate:
+        self.usage.session_count = int(self.has_activity)
+        return _SessionUsageCandidate(
+            session_id=self.session_id,
+            status=self.status,
+            active=self.status
+            in {
+                SessionStatus.PENDING,
+                SessionStatus.RUNNING,
+                SessionStatus.INTERRUPTING,
+            },
+            totals=self.usage.totals(tool_calls=self.tool_calls),
+        )
+
+
+@dataclass(frozen=True)
+class _SessionUsageCandidate:
+    """Internal group candidate whose identity may remain in the remainder."""
+
+    session_id: str
+    status: SessionStatus
+    active: bool
+    totals: UsageAggregateTotals
+
+    def retained_group(self) -> UsageSessionAggregateGroup:
+        # Only identities crossing the public retained-group contract need its
+        # independent byte bound. Omitted candidates contribute counters only.
+        require_bounded_usage_session_id(self.session_id)
+        return UsageSessionAggregateGroup(
+            session_id=self.session_id,
+            status=self.status.value,
+            active=self.active,
+            totals=self.totals,
+        )
+
+
+@dataclass
+class _SessionUsageRemainderAccumulator:
+    group_count: int = 0
+    active_session_count: int = 0
+    totals: _UsageAccumulator = dataclass_field(default_factory=_UsageAccumulator)
+    tool_calls: int = 0
+
+    def add(self, group: _SessionUsageCandidate) -> None:
+        self.group_count += 1
+        self.active_session_count += int(group.active)
+        group_totals = _UsageAccumulator(
+            session_count=group.totals.session_count,
+            model_steps=group.totals.model_steps,
+            model_steps_with_usage=group.totals.model_steps_with_usage,
+            usage=group.totals.usage,
+        )
+        self.totals.merge(group_totals)
+        self.tool_calls += group.totals.tool_calls
+
+    def result(self) -> UsageSessionAggregateRemainder | None:
+        if not self.group_count:
+            return None
+        return UsageSessionAggregateRemainder(
+            group_count=self.group_count,
+            active_session_count=self.active_session_count,
+            totals=self.totals.totals(tool_calls=self.tool_calls),
+        )
 
 
 @dataclass
@@ -12914,18 +13017,28 @@ def _usage_rollup_from_session_records(
 ) -> UsageRollupStoreResult:
     totals = _UsageAccumulator()
     pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
+    session_pricing = BoundedUsagePricingInputAccumulator(query.pricing_input_limit)
     provider_candidates = _InMemoryUsageGroupCandidates()
     model_candidates = _InMemoryUsageGroupCandidates()
+    retained_session_groups: list[_SessionUsageCandidate] = []
+    session_remainder = _SessionUsageRemainderAccumulator()
     activity_session_count = 0
     tool_calls = 0
 
-    for _, records in session_records():
+    for session_id, status, records in session_records():
         session_has_activity = False
+        session_accumulator = (
+            None
+            if query.session_group_limit is None
+            else _SessionUsageAccumulator(session_id=session_id, status=status)
+        )
         for record in records:
             event = record.event
             event_timestamp = normalize_aggregate_event_timestamp(event.timestamp)
             if event_timestamp < query.start_at or event_timestamp >= query.end_at:
                 continue
+            if session_accumulator is not None:
+                session_accumulator.add_event(event)
             if event.type == EventType.TOOL_CALL_STARTED:
                 session_has_activity = True
                 tool_calls += 1
@@ -12954,8 +13067,45 @@ def _usage_rollup_from_session_records(
             )
         if session_has_activity:
             activity_session_count += 1
+        if session_accumulator is not None:
+            assert query.session_group_limit is not None
+            _retain_bounded_session_usage_group(
+                retained_session_groups,
+                session_remainder,
+                session_accumulator.candidate(),
+                limit=query.session_group_limit,
+            )
 
     pricing_items, pricing_group_count, pricing_accuracy = pricing.result()
+    session_breakdown = _in_memory_session_usage_breakdown(
+        retained_session_groups,
+        session_remainder,
+        limit=query.session_group_limit,
+    )
+    if query.include_pricing_inputs and session_breakdown is not None and session_breakdown.groups:
+        visible_session_ids = {group.session_id for group in session_breakdown.groups}
+        for session_id, _, records in session_records():
+            if session_id not in visible_session_ids:
+                continue
+            for record in records:
+                event = record.event
+                if not _aggregate_model_event_is_in_window(event, query):
+                    continue
+                session_pricing.add_payload(
+                    session_id=session_id,
+                    effective_on=normalize_aggregate_event_timestamp(event.timestamp).date(),
+                    occurrences=1,
+                    payload=event.payload,
+                )
+                if session_pricing.truncated:
+                    break
+            if session_pricing.truncated:
+                break
+    (
+        session_pricing_items,
+        session_pricing_group_count,
+        session_pricing_accuracy,
+    ) = session_pricing.result()
 
     totals.session_count = activity_session_count
     return UsageRollupStoreResult(
@@ -12977,12 +13127,76 @@ def _usage_rollup_from_session_records(
             dimension="model",
             candidates=model_candidates,
         ),
+        session_breakdown=session_breakdown,
         pricing_inputs=pricing_items,
         pricing_inputs_included=query.include_pricing_inputs,
         pricing_input_group_count=pricing_group_count,
         pricing_inputs_accuracy=pricing_accuracy,
+        session_pricing_inputs=session_pricing_items,
+        session_pricing_inputs_included=(
+            query.include_pricing_inputs and query.session_group_limit is not None
+        ),
+        session_pricing_input_group_count=session_pricing_group_count,
+        session_pricing_inputs_accuracy=session_pricing_accuracy,
         active_session_count=active_session_count,
         matching_session_count=matching_session_count,
+    )
+
+
+def _retain_bounded_session_usage_group(
+    retained: list[_SessionUsageCandidate],
+    remainder: _SessionUsageRemainderAccumulator,
+    group: _SessionUsageCandidate,
+    *,
+    limit: int,
+) -> None:
+    if len(retained) < limit:
+        retained.append(group)
+        return
+    worst = max(retained, key=_session_usage_group_rank_key)
+    if _session_usage_group_rank_key(group) < _session_usage_group_rank_key(worst):
+        retained.remove(worst)
+        remainder.add(worst)
+        retained.append(group)
+        return
+    remainder.add(group)
+
+
+def _in_memory_session_usage_breakdown(
+    retained: list[_SessionUsageCandidate],
+    remainder: _SessionUsageRemainderAccumulator,
+    *,
+    limit: int | None,
+) -> UsageSessionAggregateBreakdown | None:
+    if limit is None:
+        return None
+    groups = tuple(
+        candidate.retained_group()
+        for candidate in sorted(retained, key=_session_usage_group_rank_key)
+    )
+    remainder_result = remainder.result()
+    return UsageSessionAggregateBreakdown(
+        groups=groups,
+        remainder=remainder_result,
+        accuracy=(
+            EXACT_AGGREGATE.model_copy()
+            if remainder_result is None
+            else AggregateAccuracy(
+                kind=AggregateAccuracyKind.TRUNCATED,
+                reason="Matching sessions exceed session_group_limit.",
+                limit=limit,
+            )
+        ),
+    )
+
+
+def _session_usage_group_rank_key(
+    group: _SessionUsageCandidate,
+) -> tuple[int, int, str]:
+    return (
+        -group.totals.usage.total_tokens,
+        -group.totals.model_steps,
+        group.session_id,
     )
 
 
@@ -13060,7 +13274,7 @@ def _accumulate_usage_group_batch(
     keys: tuple[_UsageGroupKey, ...],
 ) -> dict[_UsageGroupKey, _UsageAccumulator]:
     accumulators = {key: _UsageAccumulator() for key in keys}
-    for _, records in session_records():
+    for _, _, records in session_records():
         seen: set[_UsageGroupKey] = set()
         for record in records:
             event = record.event
@@ -13086,7 +13300,7 @@ def _accumulate_usage_remainder(
     visible_keys: set[_UsageGroupKey],
 ) -> _UsageAccumulator:
     remainder = _UsageAccumulator()
-    for _, records in session_records():
+    for _, _, records in session_records():
         session_has_remainder = False
         for record in records:
             event = record.event

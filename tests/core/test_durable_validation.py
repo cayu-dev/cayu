@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from copy import deepcopy
+from datetime import date
 from typing import Any
 
 import pytest
@@ -14,8 +15,10 @@ from cayu._validation import (
     MAX_DURABLE_JSON_NESTING,
     MIN_DURABLE_JSON_INTEGER,
     DurableValueError,
+    JsonUtf8SizeCounter,
     canonical_durable_json_bytes,
     copy_durable_json_value,
+    json_utf8_size_within_limit,
 )
 
 _SCALAR_TEXT = st.text(
@@ -42,6 +45,25 @@ _DURABLE_VALUES = st.recursive(
     ),
     max_leaves=30,
 )
+
+
+def test_json_utf8_size_counter_supports_dates() -> None:
+    value = date(2026, 7, 1)
+
+    assert json_utf8_size_within_limit(value, 12)
+    assert not json_utf8_size_within_limit(value, 11)
+
+
+def test_json_utf8_size_counter_distinguishes_overflow_from_unsupported_values() -> None:
+    overflow = JsonUtf8SizeCounter(1)
+    assert overflow.value("value") is False
+    assert overflow.exceeded_limit is True
+    assert overflow.encountered_unsupported_value is False
+
+    unsupported = JsonUtf8SizeCounter(1024)
+    assert unsupported.value(object()) is False
+    assert unsupported.exceeded_limit is False
+    assert unsupported.encountered_unsupported_value is True
 
 
 @settings(max_examples=250, deadline=None)
