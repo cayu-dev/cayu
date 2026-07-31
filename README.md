@@ -9,8 +9,9 @@ agent execution lifecycle: how context is assembled, models and tools are
 invoked, where agent code runs, how state is persisted, authority is governed,
 failures are recovered, and behavior is observed and evaluated.
 
-Workflow engines coordinate work. Cayu is the runtime that executes, governs,
-and operates the agents doing it.
+Cayu provides durable agent-runtime primitives including sessions, task
+dispatch, leased workers, resumable workflow steps, approvals, and recovery.
+Applications can use them directly without a separate workflow engine.
 
 Applications retain control of their UI, authentication, domain logic, and
 business workflows.

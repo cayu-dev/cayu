@@ -321,8 +321,9 @@ supported observer.
   narrow command policy, and human confirmation before commit/push/PR actions.
 - **Operations:** model idempotency, ambiguity, approvals, budgets, and restart
   recovery before adding autonomous effects.
-- **Durable workflows:** keep deterministic orchestration outside model prompts;
-  use model steps only where judgment is required.
+- **Durable workflows:** keep deterministic orchestration in application code
+  and durable state; use Cayu tasks and workflow helpers where needed. Use
+  model steps only where judgment is required.
 - **Multi-agent:** justify each role, bound delegation, persist lineage, and eval
   both child behavior and parent synthesis.
 

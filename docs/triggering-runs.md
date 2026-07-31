@@ -4,6 +4,9 @@ Cayu has several ways to start (or continue) an agent run. They are not
 interchangeable — each fits a different trigger. Pick by answering *what kicks
 this off?*
 
+Applications can call these entry points directly or enqueue Cayu tasks; an
+external workflow engine is optional.
+
 | Your trigger | Use | Notes |
 | --- | --- | --- |
 | A synchronous request you can await in-process | `app.run(RunRequest(...))` | The base case. Returns an async event stream. No durability beyond the session stores. |
