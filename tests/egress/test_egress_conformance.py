@@ -545,6 +545,8 @@ Defect = Literal[
 
 @dataclass
 class _ScriptedAdapter(SandboxEgressAdapter):
+    process_external_allocation = False
+
     defect: Defect
     registry: VirtualCredentialRegistry
     grant: VirtualCredentialGrant

@@ -45,6 +45,12 @@ from cayu.vaults import SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace
 
 
+class _UnsafeDirectMicrosandboxEgressAdapter(MicrosandboxEgressAdapter):
+    """Test-only bypass for reconnect mechanics after an out-of-band allocation."""
+
+    process_external_allocation = False
+
+
 class _FakeAuthority:
     def ca_cert_pem(self) -> bytes:
         return b"session-ca"
@@ -1492,7 +1498,7 @@ def test_microsandbox_post_handoff_failure_restops_resumed_allocation(
 
     async def run() -> None:
         _reset_fakes()
-        first_adapter = MicrosandboxEgressAdapter(
+        first_adapter = _UnsafeDirectMicrosandboxEgressAdapter(
             microsandbox_module=_FakeMicrosandboxModule,
             proxy_server_factory=_FakeProxyServer,
             reconnect_state_dir=tmp_path / "claims",
@@ -1516,7 +1522,7 @@ def test_microsandbox_post_handoff_failure_restops_resumed_allocation(
         sandbox_name = first.reconnect_metadata["identity"]["sandbox_name"]
         assert _FakeSandboxApi.sandboxes[sandbox_name].stopped is True
 
-        second_adapter = MicrosandboxEgressAdapter(
+        second_adapter = _UnsafeDirectMicrosandboxEgressAdapter(
             microsandbox_module=_FakeMicrosandboxModule,
             proxy_server_factory=_FakeProxyServer,
             reconnect_state_dir=tmp_path / "claims",
@@ -1578,7 +1584,7 @@ def test_microsandbox_sync_binding_interruption_reconnects_stopped_allocation(
 
     async def run() -> None:
         _reset_fakes()
-        first_adapter = MicrosandboxEgressAdapter(
+        first_adapter = _UnsafeDirectMicrosandboxEgressAdapter(
             microsandbox_module=_FakeMicrosandboxModule,
             proxy_server_factory=_FakeProxyServer,
             reconnect_state_dir=tmp_path / "claims",
@@ -1607,7 +1613,7 @@ def test_microsandbox_sync_binding_interruption_reconnects_stopped_allocation(
         assert _FakeSandboxApi.removed == []
         assert (source_root / "state.txt").read_bytes() == b"interrupted-state"
 
-        second_adapter = MicrosandboxEgressAdapter(
+        second_adapter = _UnsafeDirectMicrosandboxEgressAdapter(
             microsandbox_module=_FakeMicrosandboxModule,
             proxy_server_factory=_FakeProxyServer,
             reconnect_state_dir=tmp_path / "claims",

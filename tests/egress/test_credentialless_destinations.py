@@ -253,6 +253,7 @@ class _FakeRunner(Runner):
 
 class _RecordingAdapter(SandboxEgressAdapter):
     runner_kind = "fake"
+    process_external_allocation = False
 
     def __init__(self) -> None:
         self.prepare_calls: list[dict[str, Any]] = []

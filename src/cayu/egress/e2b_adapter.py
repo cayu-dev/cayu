@@ -71,6 +71,7 @@ class E2BEgressAdapter(SandboxEgressAdapter):
     """
 
     runner_kind = "e2b"
+    process_external_allocation = True
 
     def execution_capability_evidence(
         self,

@@ -36,6 +36,7 @@ from cayu.egress import (
 from cayu.environments import (
     EFSAccessPointBinding,
     Environment,
+    EnvironmentAllocationUnsupportedError,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
@@ -711,6 +712,8 @@ def _egress_binding(
 
 
 class _RecordingAdapter(SandboxEgressAdapter):
+    process_external_allocation = False
+
     def __init__(
         self,
         runner_kind: str = "docker",
@@ -1117,6 +1120,65 @@ def test_egress_wrapped_runner_failure_preserves_backend_identity() -> None:
         "timed_out": False,
         "cancelled": False,
     }
+
+
+def test_factory_rejects_unsupported_remote_allocation_before_adapter_mutation() -> None:
+    async def run() -> None:
+        adapter = _RecordingAdapter("remote-provider")
+        adapter.process_external_allocation = True
+        factory = _virtual_factory(adapter=adapter)
+        request = EnvironmentFactoryRequest(
+            session_id="remote-allocation",
+            agent_name="agent",
+            environment_name="egress-env",
+        )
+
+        with pytest.raises(
+            EnvironmentAllocationUnsupportedError,
+            match="does not support durable create-or-lookup recovery",
+        ):
+            factory.allocation_scope(request)
+        assert adapter.prepare_calls == []
+        assert "runner_request" not in adapter.captured
+
+        with pytest.raises(
+            EnvironmentAllocationUnsupportedError,
+            match="does not support durable create-or-lookup recovery",
+        ):
+            await factory.create(request)
+        assert adapter.prepare_calls == []
+        assert "runner_request" not in adapter.captured
+
+    asyncio.run(run())
+
+
+def test_factory_rejects_unclassified_custom_adapter_before_mutation() -> None:
+    class _UnclassifiedAdapter(_RecordingAdapter):
+        process_external_allocation = None
+
+    async def run() -> None:
+        adapter = _UnclassifiedAdapter("custom-provider")
+        factory = _virtual_factory(adapter=adapter)
+        request = EnvironmentFactoryRequest(
+            session_id="unclassified-allocation",
+            agent_name="agent",
+            environment_name="egress-env",
+        )
+
+        with pytest.raises(
+            EnvironmentAllocationUnsupportedError,
+            match="must explicitly classify",
+        ):
+            factory.allocation_scope(request)
+        with pytest.raises(
+            EnvironmentAllocationUnsupportedError,
+            match="must explicitly classify",
+        ):
+            await factory.create(request)
+        assert adapter.prepare_calls == []
+        assert "runner_request" not in adapter.captured
+
+    asyncio.run(run())
 
 
 def test_factory_requires_a_credential() -> None:
@@ -2111,6 +2173,7 @@ def test_create_tears_down_egress_when_runner_start_fails() -> None:
 def test_create_propagates_adapter_prepare_failure_without_binding_cleanup_error() -> None:
     class _FailingPrepareAdapter(SandboxEgressAdapter):
         runner_kind = "docker"
+        process_external_allocation = False
 
         async def prepare(self, *, session_id, grants, broker):  # type: ignore[no-untyped-def]
             raise RuntimeError("prepare failed")

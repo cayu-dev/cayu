@@ -74,6 +74,7 @@ def test_adapter_without_reconnect_contract_fails_closed() -> None:
 
 class _FakeEnforcedAdapter(SandboxEgressAdapter):
     runner_kind = "fake"
+    process_external_allocation = False
 
     def __init__(self) -> None:
         self.torn_down = 0

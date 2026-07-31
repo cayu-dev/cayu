@@ -608,6 +608,44 @@ Custom `SessionStore` implementations must also implement the interaction-admiss
 
 An app can register either a concrete `Environment` or an `EnvironmentFactory` under an `EnvironmentSpec` name. A factory receives durable session context (`session_id`, `agent_name`, `environment_name`, explicit `operation`, parent session id, causal budget id, labels, metadata, and previous reconnect metadata for that session/environment) and returns a concrete `Environment` for that session. `operation=CREATE` is used for new sessions, a retry whose earlier setup never committed an allocation, and a fork's first child allocation; `operation=RECONNECT` is used once that session owns a durable allocation and requires the factory to fail closed rather than allocate a replacement when durable identity is missing. The returned environment must keep the registered environment name so resume/fork/dispatch do not silently switch identity. Factory-backed environments are resolved before workspace binding, MCP setup, tool execution, and, for new sessions, workspace-instruction loading. The runtime emits `environment.factory.started`, `environment.factory.completed`, and `environment.factory.failed` with JSON-safe diagnostics and never serializes live workspace, runner, or vault objects. `EnvironmentFactoryResult.reconnect_metadata` is non-secret durable state such as a sandbox id, region, image, or attach handle. Cayu admits a runner returned directly by the factory before atomically checkpointing reconnect metadata with runtime-owned allocation provenance under the registered environment name and emitting `environment.factory.completed`; a runner created or replaced by binding is admitted immediately after binding instead. Cayu passes the durable metadata back on later resume, approval continuation, or recovery. This provenance closes the checkpoint-to-event crash window: recovery reconnects an already-checkpointed child allocation even if its completion event was never written. A result that owns live reconnectable resources provides an explicit `release` callback: an uncheckpointed new allocation is released with `DISCARD`, while a reconnect or an already-checkpointed new allocation is released with `PRESERVE` so host handles are detached without deleting the durable resource. Cancellation after a checkpoint write begins also selects `PRESERVE`, because cancellation of a threaded or remote store await cannot prove that its durable commit stopped. Release runs to its result-level `release_timeout_s` bound despite caller cancellation (15 seconds by default), after which pending caller cancellation is re-raised. If a durable result omits that callback, Cayu leaves the allocation untouched rather than terminally closing an identity it has already committed, and records that limitation on the failure. Until workspace binding returns successfully, the factory result remains unadopted: the binding rolls back only state created by its own bind attempt, while the result's release callback exclusively owns factory-created runner and allocation cleanup. Bind failure or cancellation invokes that callback once with `PRESERVE` because reconnect identity is already checkpointed. After binding succeeds, ownership transfers to the binding and the factory release callback is no longer invoked. Forks that copy checkpoint state also copy reconnect metadata as context, but the first child factory request is an explicit create operation; later child resumes reconnect the child's own allocation. Factory failure fails a new session before `session.started`; for pending approval continuation or manual approval recovery, factory failure is emitted before `session.resumed` and the session returns to `interrupted` with the approval still recoverable. Static environments admit the session and interaction before workspace-instruction validation; validation failure materializes the deferred source and terminally fails the admitted interaction and session.
 
+A factory that mutates a process-external provider during `CREATE` declares an
+`EnvironmentAllocationScope` and implements `create_recoverable(...)` against
+the runtime-owned `EnvironmentAllocationContext`. Cayu persists a portable,
+bounded, secret-free intent before provider dispatch. The intent binds one
+stable allocation id to its provider, adapter generation, session,
+environment, operation, and adapter-owned exact-resource metadata.
+`PREPARED` authorizes the first provider call; `DISPATCHED` means its outcome
+may be ambiguous; `ACKNOWLEDGED` carries the exact reconnect identity;
+`REAPING` durably fences exact-resource cleanup against publication; and
+`REAPED` is terminal. A recovery implementation may adopt the exact owned
+resource, retry the same provider-idempotency key, or reap that resource. It
+must never allocate a replacement and describe that as recovery.
+
+Acknowledgement and final reconnect publication reconcile lost store
+acknowledgements by exact durable readback. Final publication atomically
+installs reconnect identity, allocation owner, and an immutable receipt while
+removing the pending intent. Forked sessions replace copied parent allocation
+state only with a fresh child-owned intent. Provider metadata and reconnect
+identity use Cayu's durable JSON contract, are byte bounded, and may not contain
+registered workload secrets. A provider without idempotent create-or-lookup,
+exact ownership evidence, and bounded race-safe cleanup is unsupported and
+must fail before provider mutation.
+
+Cleanup and publication are mutually exclusive durable transitions. Before a
+recoverable result receives `DISCARD`, Cayu advances the pending intent to
+`REAPING`; if an exact receipt was published first, the fence reports that loss
+and Cayu invokes `PRESERVE` instead. A worker recovering `REAPING` retries only
+idempotent, exact-owner cleanup and advances to `REAPED` after provider-proven
+completion. Process death before deletion or between deletion and the final
+checkpoint therefore cannot restore publication authority or strand an
+acknowledged resource behind an ambiguous cleanup attempt.
+
+The published receipt is immutable. A later `RECONNECT` must return the same
+non-secret reconnect identity; Cayu validates it against the receipt before
+updating the checkpoint. A changed endpoint or attach identity needs its own
+explicit durable transition contract and cannot be smuggled through ordinary
+reconnect.
+
 A factory that delegates runner creation to its binding necessarily commits the
 allocation before final runner admission. When that admission fails, the
 factory result has already been adopted: Cayu records the session as failed and
@@ -645,6 +683,21 @@ a fresh isolated sandbox and its own reconnect envelope. An adapter without a
 durable attach contract returns an unsupported capability marker on initial
 creation; replaying that checkpoint raises before a replacement runner can be
 created.
+
+New `CREATE` operations through the built-in E2B, Microsandbox, and Lambda
+MicroVM virtual-egress adapters currently fail with
+`EnvironmentAllocationUnsupportedError` before adapter preparation or provider
+creation. Their provider APIs do not yet expose every primitive required for
+exact create-or-lookup recovery and race-safe cleanup. Existing durable
+`RECONNECT` operations remain supported where the adapter already has a
+same-resource attach contract. Docker allocation is process-local and does not
+cross this remote-allocation boundary. Custom `SandboxEgressAdapter`
+implementations must explicitly classify `process_external_allocation` as
+`True` or `False`; an undeclared value fails new creation before mutation.
+Allocation scope provider and adapter-generation values are checked against the
+active workload-secret redactor both before persistence and on durable
+readback. A copied parent receipt also prevents a fork from falling back to
+ordinary create without an explicit recoverable allocation transition.
 
 When an environment has a `WorkspaceBinding`, the runtime emits durable binding lifecycle events around the session execution boundary. `environment.binding.started` and `environment.binding.completed` are emitted before `session.started` or before approved tool-continuation work resumes. `environment.binding.failed` is emitted before the terminal failure when binding cannot be created. If binding rollback or its runtime-owned retry carries cancellation alongside an ordinary bind failure, Cayu first preserves the ordinary failure and structured cleanup status in `environment.binding.failed`, then re-raises a cancellation-containing aggregate instead of replacing either signal. Terminal session events are preceded by `environment.binding.finalize_started` and either `environment.binding.finalize_completed` or `environment.binding.finalize_failed`. Finalize failures are also copied onto the terminal event payload as `binding_finalize_error` so session outcome and cleanup outcome can be inspected together. Both diagnostic surfaces retain the compatibility fields `error`, `error_type`, and `outcome` and add an ordered `failures` array. Each failure contains only `phase`, `error`, and `error_type`; generic binding failures use `workspace_finalize`, while virtual-egress bindings distinguish `workspace_finalize` from `managed_resource_cleanup`. Before persistence, exception text is scrubbed with the app's configured `SecretRedactor` and any binding-owned supplemental redactor, normalized to valid UTF-8, and capped at 512 UTF-8 bytes. Virtual-egress bindings include their exact minted presented values in that private supplemental redactor without adding those values to events. The original in-process exception objects and messages are unchanged. These fields never serialize exception attributes, tracebacks, request data, or live workspace and runner objects. `BoundWorkspace.source_workspace` is the durable workspace originally provided by the environment. `BoundWorkspace.workspace` is the workspace visible to tools during the run; for native bindings they can be the same object, while copy/mount bindings may expose a different sandbox workspace.
 
@@ -2767,6 +2820,12 @@ unmanaged raw provider runner is not part of the contract. Workspace-factory
 failure or cancellation is still environment setup failure and triggers the
 same bounded, idempotent grant, runner, proxy/network, and CA cleanup.
 
+The built-in E2B and Microsandbox adapters are not yet valid for new
+`VirtualEgressEnvironmentFactory` allocations: Cayu rejects those creates
+before provider mutation as described in the environment-factory contract.
+Provider-specific examples that call an adapter or runner directly are trusted
+driver examples and own their allocation durability obligations.
+
 `VirtualCredentialSpec.credential_kind` is a closed authorization-shape
 contract. `stripe_bearer` accepts `Authorization: Bearer` and Stripe-style
 Basic username presentation, then forwards the resolved secret as Bearer;
@@ -3554,9 +3613,11 @@ workspace adapter. The first-party sidecar image guarantees `python3` and `/work
 `RunnerWorkspace(LambdaMicroVMRunner(...))` keeps file and command operations in the same
 MicroVM while retaining the common path-safety and bounded-list/read behavior. The recipe in
 `examples/aws/environments/lambda_microvm.py` composes that pair with an `EnvironmentFactory` and a
-lifecycle binding: resume reattaches from non-secret MicroVM id/endpoint/region/image metadata,
-forks allocate a fresh MicroVM, interrupted finalization suspends, and completed/failed
-finalization terminates.
+lifecycle binding for trusted direct driver code: resume reattaches from non-secret MicroVM
+id/endpoint/region/image metadata, interrupted finalization suspends, and completed/failed
+finalization terminates. `CayuApp` creation through that example fails before the provider call
+until Lambda MicroVM exposes an idempotent create-or-lookup allocation contract; direct calls own
+their allocation durability and cleanup obligations.
 
 ## Workspace
 

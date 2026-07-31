@@ -158,6 +158,48 @@ Notes:
   `workspace_factory=MicrosandboxWorkspace` produces a first-party workspace
   in the enforced microVM without exposing the raw `MicrosandboxRunner`.
 
+### Process-external allocation
+
+A factory whose `CREATE` path mutates a remote provider must not use ordinary
+`create(...)` unless an application-owned transaction already makes that
+mutation crash-safe. Override `allocation_scope(...)` with a stable provider
+and adapter-generation identity, then implement `create_recoverable(...)`
+against the supplied `EnvironmentAllocationContext`. Prepare deterministic,
+non-secret exact-resource metadata before dispatch; mark the intent dispatched
+before the provider call; and acknowledge the exact reconnect identity before
+returning the result.
+
+Recovery receives the same allocation intent and its durable state. It may
+look up or adopt only the resource owned by that intent, replay a true provider
+idempotency key, or perform bounded race-safe cleanup. Cleanup must first call
+`mark_reaping()`: `True` means the durable cleanup fence was acquired, while
+`False` means another worker already published the allocation and the resource
+must be preserved. After acquiring the fence, cleanup is idempotently retried
+from `REAPING` and calls `mark_reaped()` only after exact deletion is positively
+complete. It must not create a new incarnation under a reusable name and
+describe that as recovery. Cayu acquires the same fence before invoking a
+result's `DISCARD` release path, so a losing validation worker cannot delete an
+allocation concurrently published by another worker.
+
+Once Cayu publishes an allocation receipt, reconnect must return the same
+non-secret reconnect identity. A provider whose attach identity changes needs
+an explicit durable transition of its own; ordinary reconnect cannot overwrite
+the immutable allocation receipt. A fork that inherits such a receipt cannot
+downgrade to an ordinary factory create; the factory must retain its recoverable
+scope and atomically replace only the fork's copied ownership state.
+
+Every custom `SandboxEgressAdapter` must explicitly set
+`process_external_allocation` to `True` or `False`. Leaving it undeclared fails
+`CREATE` before adapter preparation. This is intentional: Cayu cannot safely
+infer whether third-party runner creation mutates a process-external provider.
+
+The bundled Microsandbox, E2B, and Lambda MicroVM virtual-egress adapters do
+not currently satisfy every exact-recovery and conditional-cleanup requirement,
+so new creates through them fail before adapter setup or provider mutation.
+Docker remains available because its allocation is process-local. See
+[Runtime contracts](runtime-contracts.md) for the complete state and atomic
+publication contract.
+
 ## Execution admission for custom integrations
 
 Applications attach provider-neutral workload requirements to the agent, not

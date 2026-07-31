@@ -397,6 +397,14 @@ but fails closed for credentialless destinations. A custom Microsandbox
 sets `credentialless_isolated=True` and the endpoint is unreachable from other
 sandboxes and untrusted peers.
 
+> **Allocation status:** the stock Microsandbox SDK does not expose a
+> conditional delete for an immutable sandbox incarnation. Cayu therefore
+> rejects new Microsandbox virtual-egress allocations before adapter setup or
+> provider mutation. The configuration below illustrates the intended adapter
+> composition, but attempts to use it for a new `CayuApp` session currently
+> fail with `EnvironmentAllocationUnsupportedError`. Existing durable
+> Microsandbox identities can still use the reconnect contract below.
+
 ```python
 from cayu import (
     CayuApp,
@@ -539,6 +547,14 @@ Reconnect support is explicit by adapter:
 | Docker | Unsupported; raises `UnsupportedEgressReconnectError`. Rebuild explicitly. |
 | E2B | Unsupported; raises `UnsupportedEgressReconnectError`. Rebuild explicitly. |
 
+Reconnect capability is distinct from crash-safe creation. New remote
+virtual-egress allocation is currently unsupported for Microsandbox, E2B, and
+Lambda MicroVM; each fails with `EnvironmentAllocationUnsupportedError` before
+provider mutation. Docker creation remains available because it is
+process-local rather than a remote allocation boundary. Custom adapters must
+set `process_external_allocation` explicitly; leaving the classification
+undeclared also fails new creation before adapter preparation.
+
 Unsupported adapters never interpret reconnect metadata as a request to create
 a replacement sandbox. Their initial factory result contains a versioned
 `"capability": "unsupported"` marker and a non-secret reason instead of a fake
@@ -557,6 +573,13 @@ an `ExposedProxy`. The advertised endpoint must be a dedicated IPv4 literal; E2B
 hostname-aware filtering inspects the tunneled `CONNECT` destination, so a
 hostname allowlist cannot act as a transparent raw proxy relay. The adapter
 fails closed on hostname and IPv6 exposures and permits only the IPv4 endpoint.
+
+The E2B adapter currently has no runtime-owned exact-resource allocation
+protocol, so `VirtualEgressEnvironmentFactory` rejects new E2B sessions before
+opening the proxy exposure or calling E2B. The example below describes the
+intended adapter wiring, but attempts to run it fail with
+`EnvironmentAllocationUnsupportedError`; it is not a crash-recoverable
+`CayuApp` allocation path yet.
 
 ```python
 from cayu import E2BWorkspace

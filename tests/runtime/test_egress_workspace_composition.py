@@ -121,6 +121,8 @@ class _LocalE2BSandbox:
 
 
 class _WorkspaceAdapter(SandboxEgressAdapter):
+    process_external_allocation = False
+
     def __init__(self, runner_kind: str, runner: Runner, order: list[str]) -> None:
         self.runner_kind = runner_kind
         self.runner = runner

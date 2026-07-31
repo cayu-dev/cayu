@@ -43,6 +43,28 @@ guard.
 
 ## v0.1.0 (unreleased)
 
+### Remote environment allocation fails closed without exact recovery
+
+Custom remote `EnvironmentFactory` implementations can now declare a stable
+provider and adapter-generation scope and use Cayu's durable allocation context
+to persist intent before provider dispatch, reconstruct lost acknowledgements,
+and atomically publish exact reconnect identity. A durable `REAPING` fence now
+makes cleanup mutually exclusive with publication, so a losing concurrent
+worker preserves an allocation another worker already published and cleanup
+crashes resume idempotently. Pending allocation state is portable, bounded,
+secret-free, fork-isolated, and conformance-tested across the in-memory,
+SQLite, and PostgreSQL session stores.
+
+The bundled Microsandbox, E2B, and Lambda MicroVM virtual-egress adapters do
+not yet expose all primitives required for exact create-or-lookup recovery and
+race-safe cleanup. New `CREATE` operations through those adapters now fail
+before adapter setup or provider mutation instead of retaining a crash window.
+Existing same-resource reconnect remains available where supported, and Docker
+creation is unchanged because its allocation is process-local.
+Custom `SandboxEgressAdapter` implementations must now explicitly classify
+`process_external_allocation`; an undeclared classification fails new creation
+before adapter preparation rather than assuming process-local behavior.
+
 ### Interaction durability advances the server and storage contracts
 
 First-interaction admission, queued delivery, and lifecycle closure now retain

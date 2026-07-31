@@ -64,6 +64,7 @@ class LambdaMicroVMEgressAdapter(SandboxEgressAdapter):
     """
 
     runner_kind = "lambda-microvm"
+    process_external_allocation = True
 
     def execution_capability_evidence(
         self,

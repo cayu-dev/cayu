@@ -209,6 +209,7 @@ class DockerEgressAdapter(SandboxEgressAdapter):
     """
 
     runner_kind = "docker"
+    process_external_allocation = False
 
     def execution_capability_evidence(
         self,

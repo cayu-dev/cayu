@@ -428,6 +428,12 @@ class SandboxEgressAdapter(ABC):
 
     #: Identifier of the runner family this adapter enforces.
     runner_kind: str
+    #: Whether runner creation mutates a process-external provider.
+    #:
+    #: Concrete adapters must classify this explicitly. ``None`` fails closed
+    #: before CREATE so an older or custom remote adapter cannot silently retain
+    #: an orphan-allocation crash window.
+    process_external_allocation: bool | None = None
     #: True only when same-sandbox reconnect has durable single-owner semantics.
     supports_reconnect: bool = False
 
@@ -534,6 +540,8 @@ class UnsupportedEgressAdapter(SandboxEgressAdapter):
     absence of a real adapter safe: virtual egress can never proceed without
     enforcement.
     """
+
+    process_external_allocation = False
 
     def __init__(self, runner_kind: str, *, reason: str | None = None) -> None:
         self.runner_kind = runner_kind

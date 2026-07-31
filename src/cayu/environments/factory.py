@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from math import isfinite
@@ -11,7 +12,14 @@ from typing import Any
 from cayu._exception_groups import iter_exception_tree
 from cayu._exception_state import exception_state, set_exception_state
 from cayu._task_wait import await_shielded_task_outcome
-from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_durable_json_object,
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     ExecutionRequirements,
@@ -19,6 +27,12 @@ from cayu.environments.admission import (
 from cayu.environments.base import Environment, copy_environment
 
 DEFAULT_ENVIRONMENT_FACTORY_RELEASE_TIMEOUT_SECONDS = 15.0
+ENVIRONMENT_ALLOCATION_INTENT_SCHEMA_VERSION = 1
+ENVIRONMENT_ALLOCATION_PROVIDER_METADATA_MAX_BYTES = 16 * 1024
+ENVIRONMENT_ALLOCATION_ID_MAX_BYTES = 72
+ENVIRONMENT_ALLOCATION_SCOPE_FIELD_MAX_BYTES = 128
+ENVIRONMENT_ALLOCATION_OWNER_FIELD_MAX_BYTES = 2048
+_ENVIRONMENT_ALLOCATION_ID_PATTERN = re.compile(r"ealloc_[0-9a-f]{32}\Z")
 _ENVIRONMENT_FACTORY_CLEANUP_SETTLEMENT_TASK_ATTRIBUTE = (
     "_cayu_environment_factory_cleanup_settlement_task"
 )
@@ -281,6 +295,246 @@ class EnvironmentFactoryReleaseAction(StrEnum):
 EnvironmentFactoryRelease = Callable[[EnvironmentFactoryReleaseAction], Awaitable[None]]
 
 
+class EnvironmentAllocationState(StrEnum):
+    """Durable progress of one remote allocation intent."""
+
+    UNPREPARED = "unprepared"
+    PREPARED = "prepared"
+    DISPATCHED = "dispatched"
+    ACKNOWLEDGED = "acknowledged"
+    REAPING = "reaping"
+    REAPED = "reaped"
+
+
+class EnvironmentAllocationUnsupportedError(RuntimeError):
+    """Raised before provider mutation when crash-safe allocation is unavailable."""
+
+
+@dataclass(frozen=True)
+class EnvironmentAllocationScope:
+    """Stable provider and adapter generation that own one allocation."""
+
+    provider: str
+    adapter_generation: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "provider",
+            _bounded_allocation_text(
+                self.provider,
+                "provider",
+                max_bytes=ENVIRONMENT_ALLOCATION_SCOPE_FIELD_MAX_BYTES,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "adapter_generation",
+            _bounded_allocation_text(
+                self.adapter_generation,
+                "adapter_generation",
+                max_bytes=ENVIRONMENT_ALLOCATION_SCOPE_FIELD_MAX_BYTES,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class EnvironmentAllocationIntent:
+    """Portable identity prepared before one remote provider mutation."""
+
+    allocation_id: str
+    provider: str
+    adapter_generation: str
+    session_id: str
+    environment_name: str
+    requested_operation: EnvironmentFactoryOperation
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
+    schema_version: int = ENVIRONMENT_ALLOCATION_INTENT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != ENVIRONMENT_ALLOCATION_INTENT_SCHEMA_VERSION
+        ):
+            raise ValueError("Environment allocation intent schema version is unsupported.")
+        allocation_id = _bounded_allocation_text(
+            self.allocation_id,
+            "allocation_id",
+            max_bytes=ENVIRONMENT_ALLOCATION_ID_MAX_BYTES,
+        )
+        if _ENVIRONMENT_ALLOCATION_ID_PATTERN.fullmatch(allocation_id) is None:
+            raise ValueError("allocation_id must be a canonical Cayu allocation identifier.")
+        if not isinstance(self.requested_operation, EnvironmentFactoryOperation):
+            raise TypeError("requested_operation must be an EnvironmentFactoryOperation.")
+        if self.requested_operation is not EnvironmentFactoryOperation.CREATE:
+            raise ValueError("Remote allocation intents may only authorize create operations.")
+        metadata = copy_durable_json_object(self.provider_metadata, "provider_metadata")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    metadata,
+                    "provider_metadata",
+                )
+            )
+            > ENVIRONMENT_ALLOCATION_PROVIDER_METADATA_MAX_BYTES
+        ):
+            raise ValueError(
+                "Environment allocation provider metadata exceeds the durable byte limit."
+            )
+        object.__setattr__(self, "allocation_id", allocation_id)
+        object.__setattr__(
+            self,
+            "provider",
+            _bounded_allocation_text(
+                self.provider,
+                "provider",
+                max_bytes=ENVIRONMENT_ALLOCATION_SCOPE_FIELD_MAX_BYTES,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "adapter_generation",
+            _bounded_allocation_text(
+                self.adapter_generation,
+                "adapter_generation",
+                max_bytes=ENVIRONMENT_ALLOCATION_SCOPE_FIELD_MAX_BYTES,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "session_id",
+            _bounded_allocation_text(
+                self.session_id,
+                "session_id",
+                max_bytes=ENVIRONMENT_ALLOCATION_OWNER_FIELD_MAX_BYTES,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "environment_name",
+            _bounded_allocation_text(
+                self.environment_name,
+                "environment_name",
+                max_bytes=ENVIRONMENT_ALLOCATION_OWNER_FIELD_MAX_BYTES,
+            ),
+        )
+        object.__setattr__(self, "provider_metadata", metadata)
+
+    @property
+    def scope(self) -> EnvironmentAllocationScope:
+        return EnvironmentAllocationScope(
+            provider=self.provider,
+            adapter_generation=self.adapter_generation,
+        )
+
+    def with_provider_metadata(
+        self,
+        provider_metadata: Mapping[str, Any],
+    ) -> EnvironmentAllocationIntent:
+        if not isinstance(provider_metadata, Mapping):
+            raise TypeError("provider_metadata must be a mapping.")
+        return EnvironmentAllocationIntent(
+            allocation_id=self.allocation_id,
+            provider=self.provider,
+            adapter_generation=self.adapter_generation,
+            session_id=self.session_id,
+            environment_name=self.environment_name,
+            requested_operation=self.requested_operation,
+            provider_metadata=dict(provider_metadata),
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "allocation_id": self.allocation_id,
+            "provider": self.provider,
+            "adapter_generation": self.adapter_generation,
+            "session_id": self.session_id,
+            "environment_name": self.environment_name,
+            "requested_operation": self.requested_operation.value,
+            "provider_metadata": copy_durable_json_object(
+                self.provider_metadata,
+                "provider_metadata",
+            ),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> EnvironmentAllocationIntent:
+        if not isinstance(payload, Mapping):
+            raise TypeError("Environment allocation intent payload must be a mapping.")
+        copied = copy_durable_json_object(dict(payload), "allocation_intent")
+        expected = {
+            "schema_version",
+            "allocation_id",
+            "provider",
+            "adapter_generation",
+            "session_id",
+            "environment_name",
+            "requested_operation",
+            "provider_metadata",
+        }
+        if set(copied) != expected:
+            raise ValueError("Environment allocation intent has an invalid schema.")
+        try:
+            operation = EnvironmentFactoryOperation(copied["requested_operation"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Environment allocation intent requested_operation is invalid."
+            ) from exc
+        return cls(
+            schema_version=copied["schema_version"],
+            allocation_id=copied["allocation_id"],
+            provider=copied["provider"],
+            adapter_generation=copied["adapter_generation"],
+            session_id=copied["session_id"],
+            environment_name=copied["environment_name"],
+            requested_operation=operation,
+            provider_metadata=copied["provider_metadata"],
+        )
+
+
+class EnvironmentAllocationContext(ABC):
+    """Runtime-owned durable coordinator passed to recoverable factories."""
+
+    @property
+    @abstractmethod
+    def intent(self) -> EnvironmentAllocationIntent:
+        """Return the current detached allocation intent."""
+
+    @property
+    @abstractmethod
+    def state(self) -> EnvironmentAllocationState:
+        """Return the last reconciled durable state."""
+
+    @property
+    @abstractmethod
+    def acknowledged_reconnect_metadata(self) -> dict[str, Any] | None:
+        """Return detached provider acknowledgement, when known."""
+
+    @abstractmethod
+    async def prepare(
+        self,
+        provider_metadata: Mapping[str, Any],
+    ) -> EnvironmentAllocationIntent:
+        """Persist the final intent before provider dispatch."""
+
+    @abstractmethod
+    async def mark_dispatched(self) -> None:
+        """Fence recovery before the irreversible provider call."""
+
+    @abstractmethod
+    async def acknowledge(self, reconnect_metadata: Mapping[str, Any]) -> None:
+        """Persist the exact provider result before returning it."""
+
+    @abstractmethod
+    async def mark_reaping(self) -> bool:
+        """Fence cleanup against publication; false means publication already won."""
+
+    @abstractmethod
+    async def mark_reaped(self) -> None:
+        """Record positively completed cleanup after the durable cleanup fence."""
+
+
 @dataclass(frozen=True)
 class EnvironmentFactoryRequest:
     """Durable session context used to create or attach an environment."""
@@ -394,6 +648,34 @@ class EnvironmentFactory(ABC):
         del request
         return None
 
+    def allocation_scope(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> EnvironmentAllocationScope | None:
+        """Declare one crash-recoverable remote allocation boundary.
+
+        Returning ``None`` means the factory does not allocate a process-external
+        resource through this seam. Implementations that return a scope must also
+        override :meth:`create_recoverable`; Cayu will never fall back to
+        ``create`` after accepting a recoverable scope.
+        """
+
+        del request
+        return None
+
+    async def create_recoverable(
+        self,
+        request: EnvironmentFactoryRequest,
+        allocation: EnvironmentAllocationContext,
+    ) -> EnvironmentFactoryResult:
+        """Create or recover exactly one intent-owned remote allocation."""
+
+        del request, allocation
+        raise EnvironmentAllocationUnsupportedError(
+            "Environment factory declared remote allocation without implementing "
+            "crash-safe creation and recovery."
+        )
+
     @abstractmethod
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         """Return a concrete environment for the requested session."""
@@ -428,3 +710,15 @@ def copy_environment_factory_result(result: EnvironmentFactoryResult) -> Environ
         release=result.release,
         release_timeout_s=result.release_timeout_s,
     )
+
+
+def _bounded_allocation_text(
+    value: str,
+    field_name: str,
+    *,
+    max_bytes: int,
+) -> str:
+    copied = require_durable_clean_nonblank(value, field_name)
+    if len(copied.encode("utf-8")) > max_bytes:
+        raise ValueError(f"{field_name} exceeds the durable byte limit.")
+    return copied

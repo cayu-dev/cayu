@@ -9,6 +9,8 @@ from typing import Any
 from cayu import (
     BoundWorkspace,
     Environment,
+    EnvironmentAllocationScope,
+    EnvironmentAllocationUnsupportedError,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryRequest,
@@ -105,6 +107,18 @@ class LambdaMicroVMEnvironmentFactory(EnvironmentFactory):
         overlap = sorted(self.create_options.keys() & self.runner_options.keys())
         if overlap:
             raise ValueError(f"create_options and runner_options overlap: {', '.join(overlap)}")
+
+    def allocation_scope(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> EnvironmentAllocationScope | None:
+        if request.operation is EnvironmentFactoryOperation.RECONNECT:
+            return None
+        raise EnvironmentAllocationUnsupportedError(
+            "The Lambda MicroVM example cannot allocate through CayuApp until the "
+            "provider exposes idempotent create-or-lookup recovery. Direct trusted "
+            "driver code remains responsible for its own allocation protocol."
+        )
 
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         if not isinstance(request, EnvironmentFactoryRequest):

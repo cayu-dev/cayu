@@ -37,7 +37,9 @@ from cayu.runtime import (
 )
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime._environment_lifecycle import (
+    ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+    ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
     EnvironmentLifecycle,
     render_initial_system_prompt,
@@ -159,6 +161,12 @@ def test_checkpoint_preserves_factory_reconnect_state_and_current_control_state(
                     "sandbox": {"sandbox_id": "sandbox-1"}
                 },
                 ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY: {"sandbox": session_id},
+                ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY: {
+                    "pending": {"state": "dispatched"}
+                },
+                ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY: {
+                    "published": {"allocation_id": "ealloc"}
+                },
                 "pending_session_interrupt": {"reason": "current"},
                 "stale_context": True,
             },
@@ -177,6 +185,10 @@ def test_checkpoint_preserves_factory_reconnect_state_and_current_control_state(
         ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY: {"sandbox": {"sandbox_id": "sandbox-1"}},
         ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY: {
             "sandbox": "environment_checkpoint_preservation"
+        },
+        ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY: {"pending": {"state": "dispatched"}},
+        ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY: {
+            "published": {"allocation_id": "ealloc"}
         },
         "context_compaction": {"summary": "bounded"},
         "pending_session_interrupt": {"reason": "current"},

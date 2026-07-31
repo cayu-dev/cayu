@@ -173,6 +173,7 @@ class MicrosandboxEgressAdapter(SandboxEgressAdapter):
     """Enforced virtual egress for local Microsandbox microVMs."""
 
     runner_kind = "microsandbox"
+    process_external_allocation = True
     supports_reconnect = True
 
     def execution_capability_evidence(

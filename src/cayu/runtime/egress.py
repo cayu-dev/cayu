@@ -80,6 +80,8 @@ from cayu.environments.bindings import (
     copy_workspace_snapshot,
 )
 from cayu.environments.factory import (
+    EnvironmentAllocationScope,
+    EnvironmentAllocationUnsupportedError,
     EnvironmentFactory,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
@@ -427,10 +429,38 @@ class VirtualEgressEnvironmentFactory(EnvironmentFactory):
             evidence=adapter.execution_capability_evidence(),
         )
 
+    def allocation_scope(
+        self,
+        request: EnvironmentFactoryRequest,
+    ) -> EnvironmentAllocationScope | None:
+        adapter = self._adapter or self._resolve_adapter(asyncio.get_running_loop())
+        self._require_remote_allocation_supported(request, adapter)
+        return None
+
+    @staticmethod
+    def _require_remote_allocation_supported(
+        request: EnvironmentFactoryRequest,
+        adapter: SandboxEgressAdapter,
+    ) -> None:
+        if request.operation is not EnvironmentFactoryOperation.CREATE:
+            return
+        process_external_allocation = adapter.process_external_allocation
+        if type(process_external_allocation) is not bool:
+            raise EnvironmentAllocationUnsupportedError(
+                f"Runner {adapter.runner_kind!r} must explicitly classify whether "
+                "creation allocates a process-external provider resource."
+            )
+        if process_external_allocation:
+            raise EnvironmentAllocationUnsupportedError(
+                f"Runner {adapter.runner_kind!r} cannot allocate safely because its "
+                "provider adapter does not support durable create-or-lookup recovery."
+            )
+
     async def create(self, request: EnvironmentFactoryRequest) -> EnvironmentFactoryResult:
         loop = asyncio.get_running_loop()
         adapter = self._adapter or self._resolve_adapter(loop)
         runner_kind = adapter.runner_kind
+        self._require_remote_allocation_supported(request, adapter)
         admission_evidence = adapter.execution_capability_evidence()
         evaluate_execution_admission(
             candidate=runner_kind,

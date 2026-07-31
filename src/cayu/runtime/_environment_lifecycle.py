@@ -20,11 +20,17 @@ from cayu._exception_groups import (
     iter_exception_tree,
 )
 from cayu._task_wait import await_shielded_task_outcome
-from cayu._validation import copy_durable_json_object, copy_json_value, copy_label_map
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_json_value,
+    copy_label_map,
+)
 from cayu.core.events import Event, EventType
 from cayu.environments import (
     BoundWorkspace,
     Environment,
+    EnvironmentAllocationScope,
+    EnvironmentAllocationState,
     EnvironmentFactoryOperation,
     EnvironmentFactoryReleaseAction,
     EnvironmentFactoryRequest,
@@ -69,16 +75,28 @@ from cayu.runtime._diagnostics import (
     bound_diagnostic_text,
     exception_diagnostic,
 )
+from cayu.runtime._environment_allocation import (
+    ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
+    ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+    ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
+    ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
+    DurableEnvironmentAllocationContext,
+    EnvironmentAllocationCoordinator,
+)
+from cayu.runtime._environment_allocation import (
+    environment_factory_checkpoint_may_be_committed as _environment_factory_checkpoint_may_be_committed,
+)
+from cayu.runtime._environment_allocation import (
+    mark_environment_factory_checkpoint_may_be_committed as _mark_environment_factory_checkpoint_may_be_committed,
+)
+from cayu.runtime._environment_allocation import (
+    require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
+)
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.sessions import CheckpointTransform, Session, SessionStore
 from cayu.vaults import SecretRedactor
 
-ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY = "environment_factory_reconnect"
-ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY = "environment_factory_allocation_owner"
 FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES = 4096
-_ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE = (
-    "_cayu_environment_factory_checkpoint_may_be_committed"
-)
 _ENVIRONMENT_FACTORY_RELEASE_ERROR_ATTRIBUTE = "_cayu_environment_factory_release"
 _MAX_LAZY_ENVIRONMENT_CLEANUP_SETTLEMENTS = 16
 _LAZY_ENVIRONMENT_CLEANUP_ADMISSION_BUDGET_SECONDS = 0.01
@@ -150,6 +168,11 @@ class EnvironmentLifecycle:
         self._event_writer = event_writer
         self._checkpoint_transform = checkpoint_transform
         self._secret_redactor = secret_redactor or SecretRedactor()
+        self._allocation_coordinator = EnvironmentAllocationCoordinator(
+            session_store=session_store,
+            checkpoint_transform=checkpoint_transform,
+            secret_redactor=self._secret_redactor,
+        )
         if (
             type(max_environment_lifecycle_owners) is not int
             or max_environment_lifecycle_owners <= 0
@@ -505,14 +528,37 @@ class EnvironmentLifecycle:
         events: list[Event] = []
         result: EnvironmentFactoryResult | None = None
         environment: Environment | None = None
+        allocation_context: DurableEnvironmentAllocationContext | None = None
         allocation_checkpointed = False
         allocation_checkpoint_may_be_committed = False
         effective_operation = operation
         try:
-            reconnect_metadata, allocation_owner = await self._load_factory_reconnect_state(
-                session_id=session.id,
+            checkpoint = await self._session_store.load_checkpoint(session.id)
+            reconnect_metadata, allocation_owner = _factory_reconnect_state_from_checkpoint(
+                checkpoint,
                 environment_name=environment_name,
             )
+            allocation_record = self._allocation_coordinator.record_from_checkpoint(
+                checkpoint,
+                environment_name=environment_name,
+            )
+            allocation_receipt = self._allocation_coordinator.receipt_from_checkpoint(
+                checkpoint,
+                environment_name=environment_name,
+            )
+            if allocation_record is not None and allocation_receipt is not None:
+                raise ValueError(
+                    "Environment allocation checkpoint contains both a pending intent "
+                    "and a published receipt."
+                )
+            if allocation_receipt is not None and (
+                allocation_receipt.intent.environment_name != environment_name
+                or allocation_receipt.intent.session_id != allocation_owner
+                or allocation_receipt.reconnect_metadata != reconnect_metadata
+            ):
+                raise ValueError(
+                    "Environment allocation receipt conflicts with durable reconnect state."
+                )
             if (
                 operation is EnvironmentFactoryOperation.RECONNECT
                 and allocation_owner != session.id
@@ -553,11 +599,55 @@ class EnvironmentLifecycle:
                 evidence=None if admission_candidate is None else admission_candidate.evidence,
                 stage="pre_create",
             ).require_admitted()
-            result = await environment_operation_boundary.await_environment_operation(
-                lambda: factory.create(request),
-                operation_name="Environment factory creation",
-                redactor=self._secret_redactor,
-            )
+            if effective_operation is EnvironmentFactoryOperation.CREATE:
+                allocation_scope = factory.allocation_scope(request)
+                if allocation_scope is not None and type(allocation_scope) is not (
+                    EnvironmentAllocationScope
+                ):
+                    raise TypeError(
+                        "EnvironmentFactory.allocation_scope must return "
+                        "EnvironmentAllocationScope or None."
+                    )
+                if allocation_scope is None:
+                    if allocation_record is not None:
+                        raise RuntimeError(
+                            "Environment factory has an incomplete remote allocation "
+                            "but no longer declares its durable allocation scope."
+                        )
+                    if allocation_receipt is not None:
+                        raise RuntimeError(
+                            "Environment factory has a published remote allocation receipt "
+                            "but no longer declares its durable allocation scope."
+                        )
+                    result = await environment_operation_boundary.await_environment_operation(
+                        lambda: factory.create(request),
+                        operation_name="Environment factory creation",
+                        redactor=self._secret_redactor,
+                    )
+                else:
+                    allocation_context = self._allocation_coordinator.context(
+                        session_id=session.id,
+                        parent_session_id=session.parent_session_id,
+                        environment_name=environment_name,
+                        scope=allocation_scope,
+                        existing=allocation_record,
+                    )
+                    result = await environment_operation_boundary.await_environment_operation(
+                        lambda: factory.create_recoverable(request, allocation_context),
+                        operation_name="Recoverable environment factory creation",
+                        redactor=self._secret_redactor,
+                    )
+            else:
+                if allocation_record is not None:
+                    raise RuntimeError(
+                        "Environment factory reconnect state conflicts with an incomplete "
+                        "remote allocation intent."
+                    )
+                result = await environment_operation_boundary.await_environment_operation(
+                    lambda: factory.create(request),
+                    operation_name="Environment factory reconnect",
+                    redactor=self._secret_redactor,
+                )
             if type(result) is not EnvironmentFactoryResult:
                 raise TypeError("EnvironmentFactory.create must return EnvironmentFactoryResult.")
             environment = copy_environment(result.environment)
@@ -589,12 +679,35 @@ class EnvironmentLifecycle:
                     "EnvironmentFactoryResult.reconnect_metadata contains a workload "
                     "secret and cannot be checkpointed without changing reconnect semantics."
                 )
-            try:
-                await self._checkpoint_factory_reconnect_metadata(
-                    session_id=session.id,
-                    environment_name=environment_name,
-                    reconnect_metadata=reconnect_metadata,
+            _require_bounded_reconnect_metadata(reconnect_metadata)
+            if (
+                effective_operation is EnvironmentFactoryOperation.RECONNECT
+                and allocation_receipt is not None
+                and reconnect_metadata != allocation_receipt.reconnect_metadata
+            ):
+                raise RuntimeError(
+                    "Recoverable environment factory changed its immutable reconnect "
+                    "identity during reconnect."
                 )
+            try:
+                if allocation_context is None:
+                    await self._checkpoint_factory_reconnect_metadata(
+                        session_id=session.id,
+                        environment_name=environment_name,
+                        reconnect_metadata=reconnect_metadata,
+                    )
+                else:
+                    if allocation_context.state is not EnvironmentAllocationState.ACKNOWLEDGED:
+                        raise RuntimeError(
+                            "Recoverable environment factory returned before provider "
+                            "acknowledgement was durable."
+                        )
+                    if allocation_context.acknowledged_reconnect_metadata != reconnect_metadata:
+                        raise RuntimeError(
+                            "Recoverable environment factory result changed the acknowledged "
+                            "reconnect identity."
+                        )
+                    await allocation_context.publish()
             except BaseException as exc:
                 # The checkpoint helper reconciles any failure after the
                 # transactional write begins. Only a durable read proving the
@@ -620,6 +733,11 @@ class EnvironmentLifecycle:
                                 "result_metadata",
                             ),
                             "reconnect_metadata": reconnect_metadata,
+                            **(
+                                {}
+                                if allocation_context is None
+                                else {"allocation_id": (allocation_context.intent.allocation_id)}
+                            ),
                         },
                     )
                 )
@@ -646,16 +764,38 @@ class EnvironmentLifecycle:
                 error=exc,
             )
             if result is not None:
+                release_action = (
+                    EnvironmentFactoryReleaseAction.PRESERVE
+                    if allocation_checkpointed
+                    or allocation_checkpoint_may_be_committed
+                    or effective_operation is EnvironmentFactoryOperation.RECONNECT
+                    else EnvironmentFactoryReleaseAction.DISCARD
+                )
+                discard_fence_acquired: bool | None = None
+                discard_fence_error: BaseException | None = None
+                if (
+                    release_action is EnvironmentFactoryReleaseAction.DISCARD
+                    and allocation_context is not None
+                ):
+                    try:
+                        discard_fence_acquired = await allocation_context.mark_reaping()
+                    except BaseException as fence_error:
+                        # Without a durable cleanup fence, provider deletion is
+                        # never safe. Preserve the exact allocation and report
+                        # the fence failure alongside the original setup error.
+                        discard_fence_error = fence_error
+                        release_action = EnvironmentFactoryReleaseAction.PRESERVE
+                    else:
+                        if not discard_fence_acquired:
+                            # Another worker atomically published the same
+                            # acknowledged allocation before this worker could
+                            # claim cleanup. Detach local handles without
+                            # deleting the now-durable provider resource.
+                            release_action = EnvironmentFactoryReleaseAction.PRESERVE
                 try:
                     release_payload = await _release_unclaimed_factory_result(
                         result,
-                        action=(
-                            EnvironmentFactoryReleaseAction.PRESERVE
-                            if allocation_checkpointed
-                            or allocation_checkpoint_may_be_committed
-                            or effective_operation is EnvironmentFactoryOperation.RECONNECT
-                            else EnvironmentFactoryReleaseAction.DISCARD
-                        ),
+                        action=release_action,
                         original_error=exc,
                         redactor=self._secret_redactor,
                     )
@@ -664,7 +804,37 @@ class EnvironmentLifecycle:
                         session_id=session.id,
                         error=exc,
                     )
+                if discard_fence_acquired is not None:
+                    release_payload["discard_fence_acquired"] = discard_fence_acquired
+                if discard_fence_error is not None:
+                    diagnostic = exception_diagnostic(
+                        discard_fence_error,
+                        empty_message="environment allocation cleanup fence failed",
+                        nonportable_message=(
+                            "Environment allocation cleanup fence failed with a "
+                            "non-portable diagnostic."
+                        ),
+                        redactor=self._secret_redactor,
+                    )
+                    release_payload.update(
+                        {
+                            "discard_fence_acquired": False,
+                            "discard_fence_error": diagnostic.message,
+                            "discard_fence_error_type": diagnostic.error_type,
+                        }
+                    )
+                    _add_exception_note_safely(
+                        exc,
+                        "Environment allocation cleanup was preserved because its durable "
+                        f"fence failed: {diagnostic.error_type}: {diagnostic.message}.",
+                    )
                 _attach_environment_factory_release_payload(exc, release_payload)
+                if discard_fence_error is not None:
+                    fatal_signal = binding_finalize_fatal_signal(discard_fence_error)
+                    if fatal_signal is not None:
+                        raise fatal_signal from exc
+                    if binding_finalize_explicit_cancellation(discard_fence_error) is not None:
+                        raise discard_fence_error from exc
             ordinary_failure = isinstance(exc, Exception) or exception_tree_contains(exc, Exception)
             fatal_signal = binding_finalize_fatal_signal(exc)
             if fatal_signal is not None and not ordinary_failure:
@@ -680,6 +850,15 @@ class EnvironmentLifecycle:
                                 environment_name=environment_name,
                                 payload={
                                     **base_payload,
+                                    **(
+                                        {}
+                                        if allocation_context is None
+                                        else {
+                                            "allocation_id": (
+                                                allocation_context.intent.allocation_id
+                                            )
+                                        }
+                                    ),
                                     **exception_failure_payload(
                                         exc,
                                         redactor=self._secret_redactor,
@@ -730,6 +909,8 @@ class EnvironmentLifecycle:
         runtime_keys = (
             ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
             ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_INTENTS_CHECKPOINT_KEY,
+            ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
         )
 
         def transform(session: Session, current: dict[str, Any] | None) -> dict[str, Any]:
@@ -1829,32 +2010,10 @@ class EnvironmentLifecycle:
         environment_name: str,
     ) -> tuple[dict[str, Any], str | None]:
         checkpoint = await self._session_store.load_checkpoint(session_id)
-        if checkpoint is None:
-            return {}, None
-        state = checkpoint.get(ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
-        if state is None:
-            metadata: dict[str, Any] = {}
-        else:
-            if type(state) is not dict:
-                raise ValueError("Environment factory reconnect checkpoint must be an object.")
-            candidate_metadata = state.get(environment_name)
-            if candidate_metadata is None:
-                metadata = {}
-            elif type(candidate_metadata) is not dict:
-                raise ValueError("Environment factory reconnect metadata must be an object.")
-            else:
-                metadata = copy_json_value(candidate_metadata, "reconnect_metadata")
-        owners = checkpoint.get(ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
-        if owners is None:
-            return metadata, None
-        if type(owners) is not dict:
-            raise ValueError("Environment factory allocation owners must be an object.")
-        owner = owners.get(environment_name)
-        if owner is None:
-            return metadata, None
-        if not isinstance(owner, str) or not owner:
-            raise ValueError("Environment factory allocation owner must be a nonblank string.")
-        return metadata, owner
+        return _factory_reconnect_state_from_checkpoint(
+            checkpoint,
+            environment_name=environment_name,
+        )
 
     async def _checkpoint_factory_reconnect_metadata(
         self,
@@ -2036,25 +2195,6 @@ def exception_failure_payload(
         portable,
         redactor=resolved_redactor,
     )
-
-
-def _mark_environment_factory_checkpoint_may_be_committed(
-    error: BaseException,
-) -> None:
-    _attach_runtime_exception_payload(
-        error,
-        attribute_name=_ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
-        payload={"checkpoint_may_be_committed": True},
-    )
-
-
-def _environment_factory_checkpoint_may_be_committed(
-    error: BaseException,
-) -> bool:
-    return _runtime_exception_payload(
-        error,
-        attribute_name=_ENVIRONMENT_FACTORY_CHECKPOINT_MAY_BE_COMMITTED_ATTRIBUTE,
-    ) == {"checkpoint_may_be_committed": True}
 
 
 def _attach_environment_factory_release_payload(
@@ -2314,6 +2454,39 @@ def _binding_outcome_for_terminal_event(event_type: EventType | str) -> str:
     if event_type == EventType.SESSION_INTERRUPTED:
         return "interrupted"
     return str(event_type)
+
+
+def _factory_reconnect_state_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    environment_name: str,
+) -> tuple[dict[str, Any], str | None]:
+    if checkpoint is None:
+        return {}, None
+    state = checkpoint.get(ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY)
+    if state is None:
+        metadata: dict[str, Any] = {}
+    else:
+        if type(state) is not dict:
+            raise ValueError("Environment factory reconnect checkpoint must be an object.")
+        candidate_metadata = state.get(environment_name)
+        if candidate_metadata is None:
+            metadata = {}
+        elif type(candidate_metadata) is not dict:
+            raise ValueError("Environment factory reconnect metadata must be an object.")
+        else:
+            metadata = copy_json_value(candidate_metadata, "reconnect_metadata")
+    owners = checkpoint.get(ENVIRONMENT_FACTORY_ALLOCATION_OWNER_CHECKPOINT_KEY)
+    if owners is None:
+        return metadata, None
+    if type(owners) is not dict:
+        raise ValueError("Environment factory allocation owners must be an object.")
+    owner = owners.get(environment_name)
+    if owner is None:
+        return metadata, None
+    if not isinstance(owner, str) or not owner:
+        raise ValueError("Environment factory allocation owner must be a nonblank string.")
+    return metadata, owner
 
 
 def _environment_name(

@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from cayu import EnvironmentFactoryOperation, EnvironmentFactoryRequest, RunnerWorkspace
+from cayu import (
+    EnvironmentAllocationUnsupportedError,
+    EnvironmentFactoryOperation,
+    EnvironmentFactoryRequest,
+    RunnerWorkspace,
+)
 from cayu.runners import LambdaMicroVMProtocolError
 
 _EXAMPLE = (
@@ -68,6 +73,25 @@ class FailOnceTerminateControlClient(FakeControlClient):
 class HealthyTransport:
     async def health(self, *, endpoint: str, token: str, timeout_s: float) -> dict[str, str]:
         return {"status": "ok", "protocol_version": "2"}
+
+
+def test_lambda_microvm_factory_reports_unsupported_recoverable_allocation_before_create() -> None:
+    client = FakeControlClient()
+    factory = LambdaMicroVMEnvironmentFactory(
+        image_identifier="arn:aws:lambda:us-west-2:123:microvm-image:cayu",
+        region_name="us-west-2",
+        client=client,
+        endpoint_transport_factory=HealthyTransport,
+    )
+    request = EnvironmentFactoryRequest(
+        session_id="session-1",
+        agent_name="assistant",
+        environment_name="aws-sandbox",
+    )
+
+    with pytest.raises(EnvironmentAllocationUnsupportedError, match="idempotent create-or-lookup"):
+        factory.allocation_scope(request)
+    assert client.run_calls == 0
 
 
 @pytest.mark.anyio

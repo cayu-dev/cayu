@@ -58,6 +58,7 @@ class CapturingEgressAdapter(SandboxEgressAdapter):
     def __init__(self, inner: SandboxEgressAdapter) -> None:
         self._inner = inner
         self.runner_kind = inner.runner_kind
+        self.process_external_allocation = inner.process_external_allocation
         self.supports_reconnect = inner.supports_reconnect
         self._broker: TransparentEgressBroker | None = None
         self._grants: tuple[VirtualCredentialGrant, ...] = ()
