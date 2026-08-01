@@ -90,6 +90,15 @@ Incomplete-session startup recovery remains off unless bounded statuses and an
 inactivity threshold are both configured. Autoreload and multi-process server
 workers remain out of scope.
 
+### Configured projects can start worker processes
+
+Projects can declare multiple `[tool.cayu.workers]` targets and run one
+with `cayu worker <name>`. Entrypoints receive the fresh app and a cooperative
+stop event, while the CLI owns SIGINT/SIGTERM handling and a bounded shutdown
+grace period. The entrypoint still chooses `TaskStoreDispatcher.run_worker`,
+`run_task_worker`, or another supported loop; the CLI does not infer task or
+recovery policy.
+
 ### Interaction durability advances the server and storage contracts
 
 First-interaction admission, queued delivery, and lifecycle closure now retain

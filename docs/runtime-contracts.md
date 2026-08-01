@@ -119,6 +119,13 @@ local-development profile or a resolved authentication target; incomplete-
 session startup recovery remains disabled unless bounded statuses and an
 inactivity threshold are configured. See [project server](project-server.md).
 
+`cayu worker <name>` is a process-role adapter over this same factory contract.
+It discovers the nearest configured project, enters its import context, and
+builds the app exactly once. The named worker receives only the app and a
+cooperative stop event. The CLI owns signals and a bounded shutdown wait but
+does not infer task queries, handlers, recovery policy, or abandoned-session
+boundaries. See [project workers](project-workers.md).
+
 `CayuApp.describe()` emits a structural, redacted manifest. Agent entries expose
 `has_system_prompt`, but prompt text and implementation bodies never enter the
 manifest. The application fingerprint therefore changes when prompt presence

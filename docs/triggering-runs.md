@@ -30,6 +30,12 @@ Both claim durable work with leases, but they cover different shapes:
   cron tick) enqueues a job. This is what the
   [PR-reviewer recipe](recipes/pr-reviewer.md) uses.
 
+A project can expose either loop as a thin named entrypoint and let
+`cayu worker <name>` own project discovery, one-time application construction,
+signals, and bounded cooperative shutdown. The CLI does not choose between the
+two loops or add recovery policy; see
+[project workers](project-workers.md).
+
 Minimal `run_task_worker` usage:
 
 ```python

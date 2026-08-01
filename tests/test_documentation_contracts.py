@@ -214,6 +214,22 @@ def test_project_server_command_is_release_visible_and_fail_closed() -> None:
     assert "Incomplete-session startup recovery is off by default" in guide
 
 
+def test_project_worker_command_is_release_visible() -> None:
+    guide = " ".join(
+        (_REPO_ROOT / "docs" / "project-workers.md").read_text(encoding="utf-8").split()
+    )
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    runtime_contract = (_REPO_ROOT / "docs" / "runtime-contracts.md").read_text(encoding="utf-8")
+
+    assert "docs/project-workers.md" in readme
+    assert "`cayu worker <name>` is a process-role adapter" in runtime_contract
+    assert "performs no implicit incomplete-session recovery" in guide
+    assert "TaskStoreDispatcher.run_worker" in guide
+    assert "run_task_worker(" in guide
+    for exit_code in ("`130`", "`143`", "`124`"):
+        assert exit_code in guide
+
+
 def test_server_auth_tenant_isolation_boundary_is_documented() -> None:
     readme = " ".join((_REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
     runtime_contract = " ".join(
