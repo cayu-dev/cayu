@@ -27,6 +27,7 @@ import type {
   GetSessionSummaryApiSessionsSessionIdSummaryGetResponse,
   GetSessionsSummaryApiSessionsSummaryPostData,
   GetSessionsSummaryApiSessionsSummaryPostResponse,
+  GetSessionTopologyApiSessionsSessionIdTopologyPostResponse,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetData,
   GetSessionTranscriptApiSessionsSessionIdTranscriptGetResponse,
   GetSystemDiagnosticsApiSystemDiagnosticsGetResponse,
@@ -48,6 +49,7 @@ import type {
   RejectKnowledgeApiKnowledgeEntryIdRejectPostResponse,
   ResumeTaskApiTasksTaskIdResumePostResponse,
   SessionsSummaryBody,
+  SessionTopologyRequest,
   SseEventEnvelope,
   TaskHoldBody,
   ToolApprovalDecision,
@@ -100,6 +102,8 @@ export type TranscriptMessage = ApiTranscriptMessage
 export type SessionDetail = GetSessionApiSessionsSessionIdGetResponse
 export type SessionState = GetSessionStateApiSessionsSessionIdStateGetResponse
 export type SessionSummary = GetSessionSummaryApiSessionsSessionIdSummaryGetResponse
+export type SessionTopology = GetSessionTopologyApiSessionsSessionIdTopologyPostResponse
+export type SessionTopologyBody = SessionTopologyRequest
 export type SessionEventsPage = ListSessionEventsApiSessionsSessionIdEventsGetResponse
 export type SessionEventsQuery = NonNullable<
   ListSessionEventsApiSessionsSessionIdEventsGetData["query"]
@@ -318,6 +322,18 @@ export async function fetchUsageRollup(
   signal?: AbortSignal,
 ): Promise<UsageRollup> {
   return requestJson<UsageRollup>("/usage/rollup", {
+    method: "POST",
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export async function fetchSessionTopology(
+  id: string,
+  body: SessionTopologyBody = {},
+  signal?: AbortSignal,
+): Promise<SessionTopology> {
+  return requestJson<SessionTopology>(`/sessions/${encodeURIComponent(id)}/topology`, {
     method: "POST",
     body: JSON.stringify(body),
     signal,
