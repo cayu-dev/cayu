@@ -447,15 +447,18 @@ When a `ResumeRequest` discovers an interrupted raw round and must first publish
 
 If a tool has `tool.call.started` for that approval without a terminal event, Cayu leaves the session `interrupted` with `manual_recovery_required` instead of re-running a side-effecting tool whose outcome is unknown. The caller can then use `CayuApp.recover_tool_approval(ToolApprovalRecoveryRequest(...))` to mark the externally verified outcome as `completed` or `failed` and provide the exact message the model should see. Recovery performs the same atomic approval and intent claim and persists the caller-supplied message as the terminal tool result. It closes the exact approval pair and continues only when every call in the round now has a terminal outcome and the claimed modern intent supplies the original request digest. Recovery never treats its own reason, metadata, or actor as authority to run a remaining sibling; when any call remains unresolved, the verified result stays durable, the approval remains interrupted, and an exact retry of the original `ToolApprovalRequest` is required before pending work can execute. Cayu does not infer domain facts for recovery. Normal `ResumeRequest` rejects sessions with pending tool approvals because provider histories require the assistant tool-call round to be followed by matching tool results before any later conversation.
 
-The `tool.call.approval_requested` event nests the complete approval under
-`event.payload["approval"]` and repeats `approval_id`, `tool_call_id`,
-`model_step_id`, `model_attempt_id`, and `tool_round_id` at the payload root.
-Those representations must agree. Parse that contract with
-`PendingToolApproval.from_event(event)`, then use the returned `approval_id`,
-`tool_round_id`, and `tool_call_id` to construct the resolution or recovery
-request. The parser
-validates both the event type and payload representations instead of making
-consumers duplicate the wire-format checks.
+The private durable `tool.call.approval_requested` event nests the complete
+approval under `event.payload["approval"]` and repeats `approval_id`,
+`tool_call_id`, `model_step_id`, `model_attempt_id`, and `tool_round_id` at the
+payload root. Those representations must agree. Trusted runtime/store code may
+parse that private contract with `PendingToolApproval.from_event(event)`; the
+parser validates both representations and is intentionally not a parser for a
+public projected event. Public application streams expose field-scoped aliases
+for the actionable `approval_id`, `tool_round_id`, and `tool_call_id`. Pass
+those aliases directly to the resolution or recovery request: the public
+`CayuApp` method resolves each one against the exact durable event and session
+before any coordination decision. Non-actionable execution identities remain
+private markers.
 
 `ToolApprovalRequest.decision` uses `ToolApprovalDecision`; manual recovery uses
 `ToolApprovalRecoveryOutcome`. These enums are the public typed values for the
@@ -535,6 +538,21 @@ A session contains many durable interactions. One interaction starts with the us
 Initial run messages and ordinary resume messages start new interactions. Tool approval and required user input pause the current interaction and later resolutions retain its identity. Queued input that is already eligible before the first provider step joins the not-yet-dispatched interaction. Once an interaction has produced model or tool work, a delivered `next_turn` or `on_idle` batch waits for that interaction's terminal assistant response and starts a new interaction, even when delivery and the next response happen inside the same public runtime invocation. Parallel tool calls keep their own `tool_call_id` and `tool_round_id` while sharing the interaction ID. Explicit idle operations such as application-requested compaction remain intentionally unassociated.
 
 Runtime events and provider-neutral transcript records expose nullable first-class `interaction_id` fields. Built-in stores persist and index those fields; null is reserved for intentionally unassociated framework evidence and is never inferred from timestamps or adjacency. The explicit runtime-event allow-list is the invocation-scoped `turn.completed` event and the session-scoped terminal events `session.completed`, `session.failed`, and `session.interrupted`; their interaction set or outcome is already represented by interaction lifecycle evidence and, for an invocation, `turn.completed.interaction_ids`. Event and transcript queries accept an interaction filter and preserve durable event sequences and absolute transcript indexes. Live SSE and REST replay project the same identity.
+
+Raw session and interaction identities remain private when they collide with a configured workload secret. Public runtime-event views replace them with versioned, field-scoped `cayu_authority_v1.<key-id>...` aliases authenticated by an installation keyring. Interaction aliases are additionally bound to their private session. Built-in persistent stores maintain a durable reverse index before an alias can be exposed, so resolution is an indexed lookup rather than a bounded history scan; one private identity has the same active-key alias across live events, durable reads, workers, and restarts. Retained rotation keys keep previously issued aliases resolvable. SQLite and Postgres persist the authoritative active key, exact key-set fingerprint, and a monotonic rotation generation after every newly configured key's complete backfill. Workers whose active key or key set is stale are fenced from reads and identity-producing writes; a retired active key cannot be reactivated under the same key ID. SQLite and Postgres deployments must configure the same explicit `PublicAuthorityAliasKeyring`/`PublicAuthorityAliasCodec` on every worker and store; startup rejects a missing keyring after keyed initialization or a reused key ID with different material. In-memory stores generate a store-lifetime key because they have no cross-process or restart boundary. The interaction list, detail, event-filter, and transcript-filter routes resolve aliases only inside the selected private session and reject malformed, missing, cross-session, or ambiguous aliases without using the public value as durable authority. The complete `cayu_authority_` namespace is reserved for every new caller-selected session ID, including fork destinations.
+
+CLI commands and generated server scaffolds load that deployment keyring from
+`CAYU_PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID` and
+`CAYU_PUBLIC_AUTHORITY_ALIAS_KEYS`. The latter is a JSON object from key ID to a
+canonical unpadded base64url encoding of exactly 32 random bytes. Keep the
+active key and every retained verification key in the deployment secret
+manager, inject the same values into all workers and administrative commands,
+and do not reuse a key ID with different material.
+Activate a newly added key only after deploying a keyring that retains the old
+key. The first writable store opener backfills the new aliases and advances the
+durable generation; stale workers then fail closed and must be restarted with
+the new active-key configuration. Rollback uses a fresh key ID rather than
+reactivating a retired active key.
 
 `interaction.started`, its exact source batch, and the run-epoch claim are one store transaction, committed before workspace-instruction loading, environment provisioning, binding, provider dispatch, or other fallible setup. New-session creation uses that same atomic boundary. A new session keeps the source batch in a private deferred-admission row until the environment-derived system prefix is known, then atomically materializes the final ordered transcript; readers never observe a temporary source-only transcript whose absolute indices later shift. The admission transaction also writes an `initial_transcript_pending` authority marker, and successful final transcript publication removes it in the same commit. Ordinary resume input is appended directly in the claim transaction. A resume that must first repair an incomplete tool round continues the latest open interaction and keeps the newly supplied input private until the recovered tool result has been committed ahead of it. Setup failure or abandoned-stream recovery materializes any deferred source before making the interaction or session terminal but retains the authority marker; inspection can observe the failure, while resume, fork, and compaction fail closed rather than dispatching a provider without the intended system or workspace instructions. `interaction.paused` records a durable wait boundary, and `interaction.resumed` records each later execution segment under the same identity. `interaction.completed`, `interaction.failed`, and `interaction.interrupted` close the interaction exactly once. Every lifecycle event carries the same validated bounded summary: event and transcript cursors, active and wall durations, model/tool counts, provider-neutral token usage, providers/models, and any pending-action kind. `model_step_count` counts durable provider attempts from `model.started`, including failed attempts and structured-output retries; token usage remains derived from usage-bearing completion events. Active duration accumulates known execution segments and excludes time waiting for approval or user input. `wall_duration_ms` remains null while an interaction is active or paused, then is finalized on its terminal lifecycle event and includes human wait time. After process loss, recovery carries forward the last durable attributed activity timestamp; offline time and time spent waiting for the recovery request are not fabricated as agent execution. Recovery selects only typed interaction lifecycle evidence, never event adjacency, activates it before writing repair evidence, and reconciles an open interaction to a terminal state when it finalizes abandoned work. A successful interaction completes only after its assistant transcript result is durable. Queued-input delivery atomically commits the new `interaction.started` event, delivery events, and attributed user transcript batch, so a crash cannot consume input into an undiscoverable interaction.
 
@@ -1087,6 +1105,42 @@ sequence. Single-session reads use the per-session ordering invariant and should
 not be delayed by unrelated open transactions. SQLite and in-memory stores
 serialize writes, so allocation order and visibility order are already aligned.
 
+Runtime event exposure is schema-aware and owned by the event domain. New
+writes validate payload keys and fixed controls against the exact built-in
+`EventType`; a key owned by one event type grants no trust to a custom or
+unrelated type. Caller-supplied event and linkage authority containing a known
+workload secret is rejected before append. Runtime-generated event IDs carry
+positive in-process provenance through preparation, so incidental collisions
+with supported one-character secrets do not make UUID publication random or
+impossible.
+
+Durable stores, accounting, side-effect claims, watcher cursors, retry, replay
+lineage, and duplicate suppression retain the original private event. External
+consumers receive one canonical projection instead: event IDs become stable
+global-sequence aliases of the form `cayu_event_<sequence>`, private linkage
+becomes a non-authoritative marker unless the exact schema defines a public
+alias, and actionable approval/user-input/tool linkage becomes a field-scoped
+alias of the form `cayu_event_<sequence>:<field_name>`. Descriptive values are
+redacted, and a secret-bearing legacy custom event type
+becomes `custom.redacted`. Unknown legacy events remain observable through that
+safe projection; malformed legacy structure cannot become trusted protocol
+authority. REST, SSE, event watchers, persisted sink recovery, logging, and
+OpenTelemetry all use this same projection. The raw durable record must never
+be reconstructed from, replaced by, or queried internally through its public
+projection.
+
+The same boundary applies to direct application consumers: public
+`CayuApp` event streams, emission methods, and recovery results return the
+canonical projected event. Runtime coordination uses private internal seams
+and the session store continues to return private durable records; callers must
+not feed a projected event back into store, accounting, claim, or replay APIs.
+
+Approval, user-input, and manual-recovery application methods and HTTP routes
+accept these field-scoped aliases and resolve them only against the exact
+durable event sequence inside the request session. A mismatched field,
+sequence, or session fails closed. Previously exposed raw linkage remains
+accepted only as transition compatibility; new responses never disclose it.
+
 The runtime's usage accounting depends on `event_types`: it reads all
 usage-bearing types in one query sharing one sequence watermark, so per-type
 reads cannot skip events appended between them. Out-of-tree stores should
@@ -1103,8 +1157,16 @@ records with `sequence`, `has_more`, `order_by`, `next_sequence`, and
 store before the page limit; the plural `event_types` and
 `exclude_event_types` fields remain runtime/store-level query fields. For
 exact lookup, `event_id` is matched within the path's session because event IDs
-are session-scoped; an existing session with no matching event returns an empty
-page. For ascending pages, continue with
+are session-scoped; the endpoint also accepts a returned
+`cayu_event_<sequence>` alias and resolves it to the private record within the
+path session. Responses always contain the public alias, never the raw durable
+event ID. Read-only exact lookup by a previously exposed raw ID remains
+available during the contract-version transition, but does not cause that ID to
+be returned. No new runtime event ID can use the reserved `cayu_event_`
+namespace. If an imported legacy raw ID and a sequence alias name different
+records, exact lookup fails with `409` rather than guessing which identity the
+caller intended. An existing session with no matching event returns an empty page.
+For ascending pages, continue with
 `after_sequence=next_sequence`; for descending pages, continue with
 `before_sequence=next_sequence`. Clients should use this endpoint for timelines,
 logs, replay panes, and polling instead of fetching the full session when they
@@ -1119,11 +1181,18 @@ skip matching records.
 
 The server's streaming mutation endpoints treat `Last-Event-ID` as a replay
 request and do not execute the mutation body again. A received event supplies a
-`session_id:event_id` marker. A caller that selects `/run`'s optional,
+`session_id:cayu_event_<sequence>` marker. The server resolves the alias inside
+the named session and continues lineage and cursor decisions with the private
+durable record. It accepts an old `session_id:event_id` marker only as read-only
+reconnect compatibility; newly emitted frames never disclose raw event IDs. A
+caller that selects `/run`'s optional,
 replay-safe `session_id` can use the collision-free `session_id:` marker to
 recover after HTTP acceptance but before the first event. Event markers must
 name a durable event in that session; an unknown event returns `409` instead of
-silently widening to full-history replay. For mutations of an existing session,
+silently widening to full-history replay, and an ambiguous legacy raw/public
+alias collision also returns `409`. A supplied `Cayu-Mutation-ID` is checked
+against configured workload secrets before the mutation stream starts; an
+unsafe identity returns `422` before any durable side effect. For mutations of an existing session,
 clients capture the latest unfiltered durable event before sending the command
 and retain it as the pre-mutation replay baseline. Replay remains bounded in
 memory and reads complete durable history in fixed-size pages. The server
@@ -1478,27 +1547,34 @@ its own failure events.
 
 Delivery across this handoff is at-least-once. A crash after an external sink or
 budget store accepts an event but before Cayu records delivery can replay the
-same immutable event. `BudgetStore.append_event(...)` implementations must be
-idempotent by `(event.session_id, event.id)` and reject conflicting reuse of
-that identity; the built-in stores follow this contract. If a recovery worker
-wins the handoff claim immediately after the event commit, the live writer also
-forwards `model.completed` to the idempotent budget store so strict shared
-budget accounting cannot miss the committed cost event. Durable event sinks
-should use the same identity as their external idempotency key. Recovery can
-interleave events from different workers, so sinks that require event order
-should order by durable event sequence rather than callback arrival. The
-`InMemoryEventSink` also deduplicates retries by this identity. The built-in
-`OpenTelemetryEventSink` suppresses recent in-process replays with a bounded
-identity cache so a transient sibling-sink failure does not create duplicate or
-incomplete spans. Only events successfully applied to the telemetry state enter
-that cache, so an out-of-order event whose prerequisite span has not arrived
-remains retryable. External durable telemetry pipelines still need the same
-identity for cross-process idempotency. Cayu attempts all configured sinks even
-when one fails, persists one `runtime.sink.failed` event per failed attempt, and
-retains the originating handoff for retry. If every external effect succeeds
-but the final delivery acknowledgement fails, Cayu logs the bookkeeping error,
-leaves the claim leased for recovery, and does not turn the completed runtime
-operation into a failure.
+same immutable event. `BudgetStore.append_event(...)` receives the private event
+and must be idempotent by `(event.session_id, event.id)`, rejecting conflicting
+reuse; the built-in stores follow this contract. If a recovery worker wins the
+handoff claim immediately after commit, the live writer still forwards
+`model.completed` to that idempotent budget store so strict shared accounting
+cannot miss cost.
+
+Event sinks receive only the canonical public event. Its sequence-backed
+`event.id` is stable across retries and can be used as an external idempotency
+key, but it is presentation identity and Cayu never feeds it back into claims,
+accounting, retry, or replay authority. Recovery can interleave events from
+different workers, so consumers needing order should use durable event
+sequences from the event API rather than callback arrival. Built-in
+`InMemoryEventSink` and `OpenTelemetryEventSink` receive an additional private
+in-process delivery identity solely for genuine duplicate suppression and
+correlation; they never export it. This capability is selected by exact
+built-in type through a runtime-owned adapter. Subclasses and out-of-tree sinks
+always receive only `emit(public_event)` and cannot override a private-delivery
+hook. OpenTelemetry's bounded identity cache
+therefore cannot collapse distinct private events whose public fields redact to
+the same marker, while an actual retry remains idempotent. Only events
+successfully applied to telemetry state enter the cache, so out-of-order events
+whose prerequisite span has not arrived remain retryable. Cayu attempts all
+configured sinks even when one fails, persists one `runtime.sink.failed` event
+per failed attempt, and retains the originating handoff for retry. If every
+external effect succeeds but final acknowledgement fails, Cayu logs the
+bookkeeping error, leaves the claim leased for recovery, and does not turn the
+completed operation into a failure.
 
 `CayuApp.recover_persisted_event_side_effects(limit=...)` claims a bounded set of
 pending, failed, or expired-lease handoffs after a restart. `create_server(...)`
@@ -1612,7 +1688,11 @@ They are deliberately separate from runtime hooks and event sinks:
 
 Watchers are trusted application code. The model cannot install arbitrary
 watchers or scripts. A watcher has a stable name, an `EventQuery` filter, and a
-handler that receives an `EventWatcherContext`.
+handler that receives an `EventWatcherContext`. Filtering, claiming, cursor
+advancement, retry, and dead-letter state use the original private durable
+record. The context record passed to the handler uses the canonical public event
+projection, so raw event and linkage authority is not exposed to application
+callbacks.
 `CayuApp.run_event_watchers([...])` processes matching events with
 ordered at-least-once delivery. The watcher cursor advances only after the
 handler succeeds or the event reaches `max_attempts` and is dead-lettered. If a
@@ -1634,7 +1714,8 @@ apps and uses transactional row locks to serialize claims for the same watcher.
 A live lease prevents two workers with the same watcher name from handling the
 same event at the same time; an expired lease can be claimed again, so handlers
 must be idempotent. Use a stable idempotency key such as
-`(watcher_name, event.id)` when calling external systems.
+`(watcher_name, context.record.event.id)` when calling external systems; that
+ID is the stable public global-sequence alias, not the private store identity.
 
 Changing a watcher filter while reusing the same watcher name changes the
 meaning of its cursor. Use a new watcher name when the event selection changes

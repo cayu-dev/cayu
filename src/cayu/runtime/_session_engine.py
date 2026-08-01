@@ -28,7 +28,6 @@ from cayu._validation import (
     MIN_DURABLE_JSON_INTEGER,
     copy_durable_json_value,
     copy_json_value,
-    copy_label_map,
     require_clean_nonblank,
 )
 from cayu.core.billing import (
@@ -38,7 +37,15 @@ from cayu.core.billing import (
     ResolvedBillingIdentity,
     resolved_billing_identity,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_nested_payload_authority,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import (
     Message,
     MessageRole,
@@ -171,7 +178,6 @@ from cayu.runtime.budgets import (
     budget_check_payload,
     budget_limits_for_session,
     budget_reservation_payload,
-    copy_request_budget_limits,
     has_deferred_contextual_price,
     request_budget_limits_for_session,
 )
@@ -338,6 +344,7 @@ from cayu.runtime.usage import (
     session_usage_summary_payload,
 )
 from cayu.runtime.user_input import (
+    event_with_pending_user_input_authority,
     pending_user_input_from_checkpoint,
 )
 from cayu.vaults import (
@@ -1279,27 +1286,10 @@ def _runtime_version() -> str | None:
 
 
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
-    return RunRequest(
-        agent_name=request.agent_name,
-        messages=[message.model_copy(deep=True) for message in request.messages],
-        session_id=request.session_id,
-        parent_session_id=request.parent_session_id,
-        causal_budget_id=request.causal_budget_id,
-        task_id=request.task_id,
-        task_worker_id=request.task_worker_id,
-        provider_name=request.provider_name,
-        model=request.model,
-        environment_name=environment_name,
-        labels=copy_label_map(request.labels, "labels"),
-        metadata=copy_json_value(request.metadata, "metadata"),
-        max_steps=request.max_steps,
-        limits=copy_run_limits(request.limits),
-        budget_limits=copy_request_budget_limits(request.budget_limits),
-        retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
-        structured_output=copy_structured_output_spec(request.structured_output),
-        thinking=request.thinking,
-        loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
-    )
+    # ``copy_run_request`` deliberately preserves the request's private runtime
+    # authority provenance. Reconstructing a fresh model here would silently
+    # downgrade trusted subagent/session lineage back to caller input.
+    return copy_run_request(request).model_copy(update={"environment_name": environment_name})
 
 
 def _environment_name(
@@ -1429,6 +1419,17 @@ def _checkpoint_with_pending_session_interrupt(
         return copied_checkpoint
 
     return transform
+
+
+def _runtime_interruption_event(event: Event) -> Event:
+    """Attest runtime-owned interruption identities copied through checkpoints."""
+
+    fields = tuple(
+        field_name
+        for field_name in ("interruption_request_id", "retry_request_id", "attempt_id")
+        if type(event.payload.get(field_name)) is str
+    )
+    return event_with_runtime_payload_authority(event, *fields)
 
 
 def _replace_checkpoint_preserving_runtime_state(
@@ -1614,7 +1615,7 @@ def _task_event(
     registered_agent: runtime_records.RegisteredAgentState,
     registered_environment: runtime_records.RegisteredEnvironment | None,
 ) -> Event:
-    return Event(
+    event = Event(
         type=event_type,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
@@ -1627,6 +1628,14 @@ def _task_event(
             "assigned_agent_name": task.assigned_agent_name,
             "parent_task_id": task.parent_task_id,
         },
+    )
+    return event_with_runtime_payload_authority(
+        event,
+        *(
+            field_name
+            for field_name in ("task_id", "task_session_id", "parent_task_id")
+            if event.payload.get(field_name) is not None
+        ),
     )
 
 
@@ -2179,15 +2188,24 @@ class SessionEngine:
             start_event_id=event_id,
             started_at=started_at,
         )
-        return Event(
-            id=event_id,
-            type=EventType.INTERACTION_STARTED,
-            session_id=session_id,
-            interaction_id=interaction_id,
-            timestamp=started_at,
-            agent_name=agent_name,
-            environment_name=environment_name,
-            payload=evidence.model_dump(mode="json"),
+        return event_with_runtime_payload_authority(
+            event_with_runtime_envelope_authority(
+                event_with_runtime_generated_id(
+                    Event(
+                        id=event_id,
+                        type=EventType.INTERACTION_STARTED,
+                        session_id=session_id,
+                        interaction_id=interaction_id,
+                        timestamp=started_at,
+                        agent_name=agent_name,
+                        environment_name=environment_name,
+                        payload=evidence.model_dump(mode="json"),
+                    )
+                ),
+                "session_id",
+                "interaction_id",
+            ),
+            "start_event_id",
         )
 
     async def _emit_interaction_started_if_needed(
@@ -2385,14 +2403,17 @@ class SessionEngine:
             models=usage_summary.models,
             pending_action_kind=pending_action_kind,
         )
-        event = Event(
-            type=event_type,
-            session_id=session.id,
-            interaction_id=interaction_id,
-            timestamp=observed_at,
-            agent_name=registered_agent.spec.name,
-            environment_name=environment_name,
-            payload=evidence.model_dump(mode="json"),
+        event = event_with_runtime_payload_authority(
+            Event(
+                type=event_type,
+                session_id=session.id,
+                interaction_id=interaction_id,
+                timestamp=observed_at,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload=evidence.model_dump(mode="json"),
+            ),
+            "start_event_id",
         )
         if event_type == EventType.INTERACTION_RESUMED:
             _clear_session_interaction_recovered_active_through(session.id)
@@ -3075,10 +3096,16 @@ class SessionEngine:
                     yield event
             raise propagated_cancellation_group
 
-    async def resume(self, request: ResumeRequest) -> AsyncGenerator[Event, None]:
+    async def resume(
+        self,
+        request: ResumeRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_resume_request(
             request,
             redactor=self._secret_redactor,
+            store_resolved_session_id=store_resolved_session_id,
         )
         task_id = await self._linked_running_task_id(request.session_id)
         session_stream = self._resume_session(
@@ -3115,10 +3142,13 @@ class SessionEngine:
     async def compact_session(
         self,
         request: CompactSessionRequest,
+        *,
+        store_resolved_session_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_compact_session_request(
             request,
             redactor=self._secret_redactor,
+            store_resolved_session_id=store_resolved_session_id,
         )
         operation_stream = self._compact_session(request)
         forwarded_stream = self._session_control.stream_with_out_of_band_events(
@@ -3149,12 +3179,15 @@ class SessionEngine:
     async def enqueue_session_message(
         self,
         request: EnqueueSessionMessageRequest,
+        *,
+        store_resolved_session_id: str | None = None,
     ) -> EnqueueSessionMessageResult:
         """Durably queue user steering for delivery by the active controller."""
 
         redacted_request = session_request_boundary.prepare_enqueue_message_request(
             request,
             redactor=self._secret_redactor,
+            store_resolved_session_id=store_resolved_session_id,
         )
         result = await self.session_store.enqueue_session_message(redacted_request)
         if not result.replayed:
@@ -6389,7 +6422,7 @@ class SessionEngine:
             model=model,
             model_attempt_identity=model_attempt_identity,
             environment_name=environment_name,
-            settlement_event_payload=self._event_writer.prepare(
+            settlement_event_payload=self._event_writer.prepare_budget_settlement_template(
                 Event(
                     type=EventType.BUDGET_RECONCILED,
                     session_id=session.id,
@@ -6499,11 +6532,15 @@ class SessionEngine:
             yield await self._run_limit_controller.budget_settlement_event(reconciliation)
 
     async def interrupt_session(
-        self, request: InterruptSessionRequest
+        self,
+        request: InterruptSessionRequest,
+        *,
+        store_resolved_session_id: str | None = None,
     ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_interrupt_session_request(
             request,
             redactor=self._secret_redactor,
+            store_resolved_session_id=store_resolved_session_id,
         )
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
@@ -6539,19 +6576,23 @@ class SessionEngine:
                             "requested_by": resolution_actor_payload(request.requested_by),
                         }
                         retry_event = await self._event_writer.emit(
-                            Event(
-                                type=EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED,
-                                session_id=loaded_session.id,
-                                agent_name=loaded_session.agent_name,
-                                environment_name=loaded_session.environment_name,
-                                payload={
-                                    "interruption_type": (_INTERRUPTION_TYPE_OPERATOR_REQUESTED),
-                                    "attempt_id": marker["attempt_id"],
-                                    "previous_generation": marker.get("generation", 0),
-                                    **_interruption_cascade_retry_event_payload(
-                                        _copy_interruption_cascade_retry_request(retry_request)
-                                    ),
-                                },
+                            _runtime_interruption_event(
+                                Event(
+                                    type=EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED,
+                                    session_id=loaded_session.id,
+                                    agent_name=loaded_session.agent_name,
+                                    environment_name=loaded_session.environment_name,
+                                    payload={
+                                        "interruption_type": (
+                                            _INTERRUPTION_TYPE_OPERATOR_REQUESTED
+                                        ),
+                                        "attempt_id": marker["attempt_id"],
+                                        "previous_generation": marker.get("generation", 0),
+                                        **_interruption_cascade_retry_event_payload(
+                                            _copy_interruption_cascade_retry_request(retry_request)
+                                        ),
+                                    },
+                                )
                             )
                         )
                     self._schedule_background_interruption_cascade(
@@ -6737,12 +6778,14 @@ class SessionEngine:
                 status=SessionStatus.INTERRUPTED,
             )
             terminal_event_stream = self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=_environment_name(registered_environment),
-                    payload=payload,
+                event=_runtime_interruption_event(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload=payload,
+                    )
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=session,
@@ -7191,10 +7234,16 @@ class SessionEngine:
         finally:
             _deactivate_session_interaction(session.id)
 
-    async def fork_session(self, request: ForkSessionRequest) -> AsyncGenerator[Event, None]:
+    async def fork_session(
+        self,
+        request: ForkSessionRequest,
+        *,
+        store_resolved_source_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
         request = session_request_boundary.prepare_fork_session_request(
             request,
             redactor=self._secret_redactor,
+            store_resolved_source_session_id=store_resolved_source_session_id,
         )
         source_session = await self.session_store.load(request.source_session_id)
         if source_session is None:
@@ -7212,6 +7261,13 @@ class SessionEngine:
             "environment_name",
         ):
             value = getattr(source_session, field_name)
+            if (
+                store_resolved_source_session_id == source_session.id
+                and field_name in {"id", "parent_session_id", "causal_budget_id"}
+                and type(value) is str
+                and not self._secret_redactor.is_exact_secret(value)
+            ):
+                continue
             if type(value) is str and self._secret_redactor.redact_text(value) != value:
                 source_authority_error = (
                     f"source_session.{field_name} contains a workload secret and "
@@ -7420,6 +7476,38 @@ class SessionEngine:
             labels=source_session.labels,
             metadata=copy_json_value(fork_metadata, "metadata"),
         )
+        # Validate the complete evidence before the child-creation mutation. In
+        # particular, a store-resolved legacy source may still exactly equal a
+        # registered secret; that must fail before create_fork can commit a child.
+        fork_event = self._event_writer.prepare(
+            event_with_runtime_payload_authority(
+                event_with_runtime_envelope_authority(
+                    Event(
+                        type=EventType.SESSION_FORKED,
+                        session_id=fork_session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        payload={
+                            "source_session_id": source_session.id,
+                            "source_status": source_session.status.value,
+                            "parent_session_id": fork_session.parent_session_id,
+                            "causal_budget_id": fork_session.causal_budget_id,
+                            "transcript_cursor": request.transcript_cursor,
+                            "copy_checkpoint": request.copy_checkpoint,
+                            "agent_name": fork_session.agent_name,
+                            "provider_name": fork_session.provider_name,
+                            "model": fork_session.model,
+                            "environment_name": fork_session.environment_name,
+                            "inherited_taint_labels": sorted(inherited_taint_labels),
+                        },
+                    ),
+                    "session_id",
+                ),
+                "source_session_id",
+                "parent_session_id",
+                "causal_budget_id",
+            )
+        )
         try:
             if self._secret_redactor.has_values:
                 created = await self.session_store.create_fork_with_transcript_validation(
@@ -7455,27 +7543,13 @@ class SessionEngine:
                 "Session fork fenced an expired incomplete-session recovery owner; retry "
                 "with current session state."
             ) from None
-        yield await self._event_writer.emit(
-            Event(
-                type=EventType.SESSION_FORKED,
-                session_id=created.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                payload={
-                    "source_session_id": source_session.id,
-                    "source_status": source_session.status.value,
-                    "parent_session_id": created.parent_session_id,
-                    "causal_budget_id": created.causal_budget_id,
-                    "transcript_cursor": request.transcript_cursor,
-                    "copy_checkpoint": request.copy_checkpoint,
-                    "agent_name": created.agent_name,
-                    "provider_name": created.provider_name,
-                    "model": created.model,
-                    "environment_name": created.environment_name,
-                    "inherited_taint_labels": sorted(inherited_taint_labels),
-                },
-            )
-        )
+        if (
+            created.id != fork_session.id
+            or created.parent_session_id != fork_session.parent_session_id
+            or created.causal_budget_id != fork_session.causal_budget_id
+        ):
+            raise RuntimeError("Session store changed prepared fork identity authority.")
+        yield await self._event_writer.emit(fork_event)
 
     async def _publish_assistant_model_completion(
         self,
@@ -7892,18 +7966,30 @@ class SessionEngine:
                 )
                 if interaction_started_event is not None:
                     yield interaction_started_event
-                yield await self._event_writer.emit(
-                    Event(
-                        type=start_event_type,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            **start_event_payload,
-                            **_session_trace_event_fields(session, request_metadata),
-                        },
-                    )
+                start_event = Event(
+                    type=start_event_type,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        **start_event_payload,
+                        **_session_trace_event_fields(session, request_metadata),
+                    },
                 )
+                lineage_fields = tuple(
+                    field_name
+                    for field_name, expected in (
+                        ("parent_session_id", session.parent_session_id),
+                        ("causal_budget_id", session.causal_budget_id),
+                    )
+                    if expected is not None and start_event.payload.get(field_name) == expected
+                )
+                if lineage_fields:
+                    start_event = event_with_runtime_payload_authority(
+                        start_event,
+                        *lineage_fields,
+                    )
+                yield await self._event_writer.emit(start_event)
             recovered_structured_outcome: Event | None = None
             recovered_structured_retry = False
             recovery_tail_message_count = len(messages_to_append)
@@ -8853,21 +8939,24 @@ class SessionEngine:
             ):
                 yield event
             async for event in self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
-                        "model_step_id": exc.approval.model_step_id,
-                        "model_attempt_id": exc.approval.model_attempt_id,
-                        "tool_round_id": exc.approval.tool_round_id,
-                        **approval_support.bounded_pending_approval_event_payload(
-                            exc.approval,
-                            redactor=self._secret_redactor,
-                        ),
-                    },
+                event=approval_support.event_with_pending_approval_authority(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED,
+                            "model_step_id": exc.approval.model_step_id,
+                            "model_attempt_id": exc.approval.model_attempt_id,
+                            "tool_round_id": exc.approval.tool_round_id,
+                            **approval_support.bounded_pending_approval_event_payload(
+                                exc.approval,
+                                redactor=self._secret_redactor,
+                            ),
+                        },
+                    ),
+                    exc.approval,
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=session,
@@ -8900,18 +8989,21 @@ class SessionEngine:
             ):
                 yield event
             async for event in self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                        "model_step_id": exc.pending.model_step_id,
-                        "model_attempt_id": exc.pending.model_attempt_id,
-                        "tool_round_id": exc.pending.tool_round_id,
-                        "user_input": exc.pending.model_dump(mode="json"),
-                    },
+                event=event_with_pending_user_input_authority(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                            "model_step_id": exc.pending.model_step_id,
+                            "model_attempt_id": exc.pending.model_attempt_id,
+                            "tool_round_id": exc.pending.tool_round_id,
+                            "user_input": exc.pending.model_dump(mode="json"),
+                        },
+                    ),
+                    exc.pending,
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=session,
@@ -9170,7 +9262,7 @@ class SessionEngine:
         summary = session_usage_summary(session.id, usage_events)
         duration_ms = max(0, int((time.monotonic() - run_started_at) * 1000))
         interaction_ids = _current_session_invocation_interaction_ids(session.id)
-        turn_completed_event = await self._event_writer.emit(
+        turn_completed = event_with_runtime_nested_payload_authority(
             Event(
                 type=EventType.TURN_COMPLETED,
                 session_id=session.id,
@@ -9187,8 +9279,10 @@ class SessionEngine:
                     "models": summary.models,
                     "interaction_ids": list(interaction_ids),
                 },
-            )
+            ),
+            ("interaction_ids", "*"),
         )
+        turn_completed_event = await self._event_writer.emit(turn_completed)
         if interaction_event is None:
             return (turn_completed_event,)
         return (interaction_event, turn_completed_event)
@@ -10497,12 +10591,14 @@ class SessionEngine:
                 ):
                     yield event
             terminal_event_stream = self._emit_terminal_event_with_hooks(
-                event=Event(
-                    type=EventType.SESSION_INTERRUPTED,
-                    session_id=loaded_interrupted.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload=payload,
+                event=_runtime_interruption_event(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTED,
+                        session_id=loaded_interrupted.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload=payload,
+                    )
                 ),
                 phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                 session=loaded_interrupted,

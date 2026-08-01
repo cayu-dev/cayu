@@ -122,6 +122,43 @@ envelopes, API event records, and transcript records now require
 OpenAPI surface. Regenerate clients and deploy independently hosted dashboards
 with the matching server version.
 
+### Runtime events now expose schema-aware public identities
+
+The server contract advances from version 5 to version 6. REST event records and
+SSE frames now expose stable `cayu_event_<sequence>` aliases instead of raw
+durable event IDs; `Last-Event-ID` uses
+`session_id:cayu_event_<sequence>`. The server accepts previously issued raw
+markers and raw exact-event filters as read-only transition compatibility, but
+never returns those private IDs. All new runtime event IDs reserve the `cayu_event_`
+namespace, and ambiguous imported raw/public aliases fail with `409` rather
+than selecting the wrong durable record. Regenerate clients and deploy the
+matching dashboard with the server.
+
+Actionable approval, user-input, and tool linkage uses field-scoped aliases
+such as `cayu_event_<sequence>:input_id`. Resolution routes bind those aliases
+back to private authority only within the exact request session; previously
+issued raw linkage remains transitionally accepted but is no longer returned.
+
+Secret-colliding session and interaction identities use versioned HMAC aliases
+backed by a durable store index. Persistent deployments must provision the same
+explicit alias keyring on every worker; key rotation retains old keys until their
+issued aliases can be retired. Persistent stores durably select the active key,
+backfill before cutover, and fence stale workers; retired active key IDs cannot be
+reactivated. The reserved `cayu_authority_` namespace cannot be used for newly
+caller-selected session IDs, including fork destinations.
+
+Built-in event payload keys and fixed controls are now trusted only under their
+exact owning `EventType`. New secret-bearing linkage authority fails before
+persistence, while legacy and custom events remain observable through a
+fail-closed public projection. Durable accounting, claims, watcher cursors,
+retry, replay lineage, and genuine duplicate suppression continue to use the
+original private event identity.
+
+Mutation correlation IDs that contain configured workload secrets now fail
+before dispatch. Custom event sinks receive only the canonical public event;
+private deduplication and trace correlation remain restricted to exact built-in
+sink adapters.
+
 ### Tool-approval resolution identities are mandatory
 
 The same version-5 protected control-plane contract requires approval and

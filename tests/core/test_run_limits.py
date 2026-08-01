@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import cayu.runtime._run_limits as run_limits_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import (
     AgentSpec,
@@ -32,6 +33,7 @@ from cayu.providers import (
     bedrock_billing_identity,
 )
 from cayu.runtime import AlwaysRequireApprovalToolPolicy, CayuApp
+from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._run_limits import (
     BudgetedOperationFailed,
@@ -48,6 +50,7 @@ from cayu.runtime.budgets import (
     BudgetLimit,
     BudgetPolicy,
     BudgetReservation,
+    BudgetReservationIdentityConflict,
     BudgetReservationResult,
     BudgetSettlementFallback,
     InMemoryBudgetLedger,
@@ -66,6 +69,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionIdentity,
+    SessionRunFenced,
     SessionStatus,
 )
 from cayu.runtime.stop_policy import RunLimits, StopLimit
@@ -482,8 +486,10 @@ def test_session_run_limit_publishes_usage_beyond_int64_without_provider_call() 
     assert limit_event.payload["usage_summary"]["usage"]["total_tokens"] == str(expected)
     turn = next(event for event in events if event.type == EventType.TURN_COMPLETED)
     assert turn.payload["token_usage"]["total_tokens"] == 0
+    limit_sequence = public_event_sequence(limit_event.id)
+    assert limit_sequence is not None
     assert any(
-        record.event.id == limit_event.id and record.event.payload == limit_event.payload
+        record.sequence == limit_sequence and record.event.payload == limit_event.payload
         for record in records
     )
 
@@ -986,6 +992,129 @@ def test_controller_returns_uniquely_accepted_reservation_when_identity_claim_fa
     assert reservations == []
     assert len(releases) == 1
     assert releases[0].status == "released"
+
+
+def test_controller_returns_accepted_reservation_when_event_factory_fails():
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger()
+    controller = _controller(store, ledger=ledger)
+
+    def failing_event_factory(result: BudgetReservationResult) -> Event:
+        assert result.accepted
+        raise RuntimeError("reservation event construction failed")
+
+    async def scenario():
+        await _running_session(store, "sess_operation_event_factory_failure")
+        setup = await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("3"),),
+            session_id="sess_operation_event_factory_failure",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+            reservation_event_factory=failing_event_factory,
+        )
+        active = list(setup.reservations)
+        releases = [
+            reconciliation
+            async for reconciliation in controller.release_operation_reservations(
+                active,
+                reason="event construction failed before publication",
+            )
+        ]
+        return setup, active, releases
+
+    setup, active, releases = asyncio.run(scenario())
+
+    assert isinstance(setup.error, RuntimeError)
+    assert str(setup.error) == "reservation event construction failed"
+    assert setup.results == ()
+    assert len(setup.reservations) == 1
+    assert active == []
+    assert len(releases) == 1
+    assert releases[0].status == "released"
+
+
+@pytest.mark.parametrize(
+    "conflict_type",
+    [BudgetReservationIdentityConflict, SessionRunFenced],
+)
+def test_controller_does_not_return_reservation_after_proven_identity_conflict(
+    conflict_type,
+):
+    class ConflictingIdentityGuard:
+        async def claim(self, *args, **kwargs):
+            del args, kwargs
+            raise conflict_type("reservation ownership rejected")
+
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger()
+    controller = _controller(store, ledger=ledger)
+
+    async def scenario():
+        await _running_session(store, "sess_operation_proven_identity_conflict")
+        return await controller.reserve_operation_budgets(
+            budget_limits=(_reserved_limit("3"),),
+            session_id="sess_operation_proven_identity_conflict",
+            agent_name="assistant",
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            rejection_release_reason="reservation rejected",
+            accepted_record_error="accepted reservation missing record",
+            reservation_identity_guard=ConflictingIdentityGuard(),
+        )
+
+    setup = asyncio.run(scenario())
+
+    assert isinstance(setup.error, conflict_type)
+    assert setup.reservations == ()
+    assert setup.results == ()
+    assert setup.events == ()
+
+
+def test_controller_releases_model_reservation_when_event_attestation_fails(monkeypatch):
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger()
+    controller = _controller(store, ledger=ledger)
+    original = run_limits_module._event_with_budget_authority
+
+    def failing_attestation(event: Event, **kwargs) -> Event:
+        if event.type == EventType.BUDGET_RESERVED:
+            raise RuntimeError("reservation event attestation failed")
+        return original(event, **kwargs)
+
+    monkeypatch.setattr(
+        run_limits_module,
+        "_event_with_budget_authority",
+        failing_attestation,
+    )
+
+    async def scenario():
+        session = await _running_session(store, "sess_model_event_attestation_failure")
+        setup = await controller.reserve_for_model_step(
+            session=session,
+            agent_name="assistant",
+            provider_name="fake",
+            environment_name=None,
+            model_attempt_identity=_model_attempt_identity(),
+            budget_policy=BudgetPolicy(limits=(_reserved_limit("3"),)),
+        )
+        record = next(iter(ledger._records.values()))
+        active = await ledger.heartbeat(reservation_id=record.reservation_id)
+        events = await store.query_events(EventQuery(session_id=session.id, limit=100))
+        return setup, active, [item.event.type for item in events]
+
+    setup, active, event_types = asyncio.run(scenario())
+
+    assert isinstance(setup.error, RuntimeError)
+    assert str(setup.error) == "reservation event attestation failed"
+    assert setup.reservations == ()
+    assert active is False
+    assert EventType.BUDGET_RESERVED not in event_types
+    assert EventType.BUDGET_RESERVATION_RELEASED in event_types
 
 
 @pytest.mark.parametrize("failure_type", [ConnectionError, asyncio.CancelledError])

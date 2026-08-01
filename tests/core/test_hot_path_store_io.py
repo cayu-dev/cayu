@@ -15,6 +15,7 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
 )
+from cayu.runtime import _session_control as session_control
 from cayu.runtime._run_limits import SessionUsageTracker
 from cayu.runtime.usage import session_usage_summary
 
@@ -75,32 +76,36 @@ async def _create_running_session(store: InMemorySessionStore, session_id: str) 
     await store.update_status(session_id, SessionStatus.RUNNING)
 
 
-def test_streaming_does_not_load_session_per_delta():
-    delta_count = 200
-    store = _CountingSessionStore()
-    app = _register_streaming_agent(store, delta_count)
+def test_streaming_does_not_load_session_per_delta(monkeypatch):
+    monkeypatch.setattr(session_control, "STREAM_INTERRUPT_POLL_INTERVAL_S", float("inf"))
 
-    async def run() -> list[Event]:
-        return [
+    async def run(delta_count: int, session_id: str) -> tuple[list[Event], int]:
+        store = _CountingSessionStore()
+        app = _register_streaming_agent(store, delta_count)
+        events = [
             event
             async for event in app.run(
                 RunRequest(
                     agent_name="assistant",
-                    session_id="sess_stream_poll",
+                    session_id=session_id,
                     messages=[Message.text("user", "hello")],
                 )
             )
         ]
+        return events, store.load_calls
 
-    events = asyncio.run(run())
+    baseline_events, baseline_load_calls = asyncio.run(run(1, "sess_stream_poll_baseline"))
+    delta_count = 200
+    events, load_calls = asyncio.run(run(delta_count, "sess_stream_poll_many"))
 
+    assert baseline_events[-1].type == EventType.SESSION_COMPLETED
     assert events[-1].type == EventType.SESSION_COMPLETED
     delta_events = [event for event in events if event.type == EventType.MODEL_TEXT_DELTA]
     assert len(delta_events) == delta_count
-    # Per-delta interrupt checks are throttled; only the phase-boundary checks
-    # (and at most a couple of interval expiries on a slow machine) load the
-    # session, instead of one load per streamed delta.
-    assert store.load_calls <= 20
+    # Freeze interval expiry rather than relying on machine speed. Adding 199
+    # deltas must not add any durable session reads while the poll window stays
+    # open; a per-delta load would make the second count grow by 199.
+    assert load_calls == baseline_load_calls
 
 
 def test_run_with_limits_does_not_load_full_event_log():

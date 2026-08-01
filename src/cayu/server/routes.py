@@ -52,10 +52,22 @@ from cayu.artifacts import (
     InvalidArtifactIdError,
     copy_artifact_read_result,
 )
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
+from cayu.core.events import (
+    Event,
+    EventType,
+    event_durable_sequence,
+    event_id_is_runtime_generated,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
+from cayu.runtime._event_projection import (
+    PUBLIC_EVENT_ID_PREFIX,
+    public_event_id,
+    public_event_linkage_id,
+    public_event_sequence,
+)
 from cayu.runtime.aggregates import (
     UsageRollupInconsistent,
     UsageRollupResultTooLarge,
@@ -105,6 +117,7 @@ from cayu.runtime.sessions import (
     LabelSelectorRequirement,
     PendingActionKind,
     PendingActionQuery,
+    PendingActionRecord,
     PendingActionResultTooLarge,
     PendingActionSession,
     ResumeRequest,
@@ -126,6 +139,7 @@ from cayu.runtime.sessions import (
     decode_session_cursor,
     decode_session_topology_cursor,
     event_summary_from_records,
+    run_request_with_runtime_generated_authority,
     session_outcome_from_records,
 )
 from cayu.runtime.stop_policy import RunLimits
@@ -556,7 +570,7 @@ def _stream_error_sse_message(
         kind=kind,
         code=code,
         retryable=retryable,
-        session_id=session_id,
+        session_id=cayu_app.project_session_id_for_exposure(session_id),
         error_text=_redacted_stream_error_text(cayu_app, error),
     )
 
@@ -598,7 +612,7 @@ def _log_mutation_acceptance_failure(
         logger.error(
             "SSE mutation acceptance failed: stage=%s session_id=%r error_type=%s error=%r",
             stage,
-            session_id,
+            cayu_app.project_session_id_for_exposure(session_id),
             type(error).__name__,
             _preaccept_error_detail(cayu_app, error),
         )
@@ -853,7 +867,27 @@ def _start_detached_event_stream_response(
         if not observer_accepting or observer_terminal:
             return
         try:
-            message = event_to_sse_message(event)
+            sequence = event_durable_sequence(event)
+            if sequence is not None and event.id == public_event_id(sequence):
+                public_event = event
+            elif sequence is None:
+                records = await cayu_app.session_store.query_events(
+                    EventQuery(
+                        session_id=event.session_id,
+                        event_id=event.id,
+                        limit=2,
+                    )
+                )
+                if len(records) != 1:
+                    raise RuntimeError(
+                        "Live event has no unique durable record for public projection."
+                    )
+                record = records[0]
+                public_event = cayu_app.project_event_record_for_exposure(record).event
+            else:
+                record = EventRecord(sequence=sequence, event=event)
+                public_event = cayu_app.project_event_record_for_exposure(record).event
+            message = event_to_sse_message(public_event)
         except SseEventFrameTooLargeError as exc:
             await enqueue("observer_error", exc, terminal=True)
             return
@@ -1422,11 +1456,14 @@ def _request_interruption_actor(
 
 
 def _serialize_event_record(cayu_app: Any, record: EventRecord) -> dict[str, Any]:
-    event = record.event
-    serialized = _redact_control_plane_values(
-        cayu_app,
+    public_record = cayu_app.project_event_record_for_exposure(record)
+    event = public_record.event
+    # The event-domain projector is authoritative. A second generic redaction
+    # pass would corrupt validated controls and sequence aliases under short
+    # secret collisions.
+    return copy_json_value(
         {
-            "sequence": record.sequence,
+            "sequence": public_record.sequence,
             "id": event.id,
             "type": str(event.type),
             "session_id": event.session_id,
@@ -1439,46 +1476,78 @@ def _serialize_event_record(cayu_app: Any, record: EventRecord) -> dict[str, Any
             "timestamp": event.timestamp.isoformat(),
         },
         "event",
-        preserve_string_fields={"timestamp", "type"},
-        untrusted_container_fields={"payload"},
     )
-    event_id = serialized.get("id")
-    if type(event_id) is str and len(event_id) > EVENT_ID_MAX_CHARS:
-        serialized["id"] = event_id[:EVENT_ID_MAX_CHARS]
-    return serialized
+
+
+def _serialize_pending_action(
+    cayu_app: Any,
+    action: PendingActionRecord,
+) -> dict[str, Any]:
+    """Project an event-derived action without publishing its private discriminator."""
+
+    payload = _redact_control_plane_values(
+        cayu_app,
+        action.model_dump(
+            mode="json",
+            exclude={"session", "event"},
+        ),
+        "pending_action",
+        preserve_string_fields={"kind", "policy_evidence"},
+        untrusted_container_fields={"arguments"},
+    )
+    payload["id"] = f"{public_event_id(action.event.sequence)}:{action.kind.value}"
+    for response_field, event_field in (
+        ("approval_id", "approval_id"),
+        ("input_id", "input_id"),
+        ("round_id", "tool_round_id"),
+        ("tool_call_id", "tool_call_id"),
+    ):
+        private_value = getattr(action, response_field)
+        if private_value is None:
+            payload[response_field] = None
+            continue
+        durable_value = action.source_linkage.get(event_field)
+        if durable_value is None:
+            # Checkpoint-derived recovery state can lack schema-owned linkage in
+            # its bounded source event. It remains visible for diagnosis, but is
+            # intentionally non-actionable rather than exposing private linkage.
+            payload[response_field] = None
+            continue
+        if durable_value != private_value:
+            raise RuntimeError(
+                f"Pending action {response_field} disagrees with its durable event authority."
+            )
+        payload[response_field] = public_event_linkage_id(action.event.sequence, event_field)
+    payload["session"] = _serialize_session_base(cayu_app, action.session)
+    payload["event"] = _serialize_event_record(cayu_app, action.event)
+    return payload
 
 
 def _serialize_interaction_record(cayu_app: Any, record: EventRecord) -> dict[str, Any]:
-    event = record.event
+    public_record = cayu_app.project_event_record_for_exposure(record)
+    event = public_record.event
     interaction_id = event.interaction_id
     if interaction_id is None:
         raise RuntimeError("Interaction lifecycle event has no interaction identity.")
     evidence = InteractionSummaryEvidence.model_validate(event.payload)
     terminal = event.type in INTERACTION_TERMINAL_EVENT_TYPES
-    return _redact_control_plane_values(
-        cayu_app,
+    return copy_json_value(
         {
             "interaction_id": interaction_id,
             "session_id": event.session_id,
             **evidence.model_dump(mode="json"),
-            "start_event_sequence": evidence.start_event_sequence or record.sequence,
+            "start_event_sequence": evidence.start_event_sequence or public_record.sequence,
             "terminal_event_id": event.id if terminal else None,
-            "terminal_event_sequence": record.sequence if terminal else None,
+            "terminal_event_sequence": public_record.sequence if terminal else None,
             "updated_at": event.timestamp.isoformat(),
         },
         "interaction",
-        preserve_string_fields={"completed_at", "started_at", "status", "updated_at"},
-        untrusted_container_fields={"models", "provider_names", "token_usage"},
     )
 
 
 def _serialize_session_outcome(cayu_app: Any, outcome: SessionOutcome) -> dict[str, Any]:
     return {
-        "session_id": _redact_control_plane_json(
-            cayu_app,
-            outcome.session_id,
-            "session_outcome.session_id",
-        ),
+        "session_id": cayu_app.project_session_id_for_exposure(outcome.session_id),
         "status": outcome.status.value,
         "reason": _redact_control_plane_json(
             cayu_app,
@@ -1514,7 +1583,7 @@ def _serialize_session_base(
 ) -> dict[str, Any]:
     # Shared list-view fields. The list endpoint omits the (potentially large,
     # unbounded) per-session metadata; callers fetch a single session to get it.
-    return _redact_control_plane_values(
+    payload = _redact_control_plane_values(
         cayu_app,
         {
             "id": session.id,
@@ -1535,6 +1604,78 @@ def _serialize_session_base(
         preserve_string_fields={"created_at", "status", "updated_at"},
         untrusted_container_fields={"labels"},
     )
+    payload["id"] = cayu_app.project_session_id_for_exposure(session.id)
+    payload["parent_session_id"] = (
+        None
+        if session.parent_session_id is None
+        else cayu_app.project_session_id_for_exposure(session.parent_session_id)
+    )
+    payload["causal_budget_id"] = cayu_app.project_causal_budget_id_for_exposure(
+        session.causal_budget_id,
+        session_ids=(
+            session.id,
+            *(() if session.parent_session_id is None else (session.parent_session_id,)),
+        ),
+    )
+    return payload
+
+
+def _serialize_causal_budget_usage_summary(
+    cayu_app: Any,
+    summary: CausalBudgetUsageSummary,
+) -> dict[str, Any]:
+    payload = summary.model_dump()
+    payload["causal_budget_id"] = cayu_app.project_causal_budget_id_for_exposure(
+        summary.causal_budget_id,
+        session_ids=summary.session_ids,
+    )
+    payload["session_ids"] = [
+        cayu_app.project_session_id_for_exposure(session_id) for session_id in summary.session_ids
+    ]
+    payload["session_summaries"] = [
+        _serialize_session_usage_summary(cayu_app, session_summary)
+        for session_summary in summary.session_summaries
+    ]
+    return payload
+
+
+def _serialize_session_usage_summary(
+    cayu_app: Any,
+    summary: SessionUsageSummary,
+) -> dict[str, Any]:
+    return {
+        **summary.model_dump(),
+        "session_id": cayu_app.project_session_id_for_exposure(summary.session_id),
+    }
+
+
+def _serialize_causal_budget_cost_summary(
+    cayu_app: Any,
+    summary: CausalBudgetCostSummary,
+) -> dict[str, Any]:
+    payload = summary.model_dump(mode="json")
+    payload["causal_budget_id"] = cayu_app.project_causal_budget_id_for_exposure(
+        summary.causal_budget_id,
+        session_ids=summary.session_ids,
+    )
+    payload["session_ids"] = [
+        cayu_app.project_session_id_for_exposure(session_id) for session_id in summary.session_ids
+    ]
+    payload["session_costs"] = [
+        _serialize_session_cost_summary(cayu_app, session_cost)
+        for session_cost in summary.session_costs
+    ]
+    return payload
+
+
+def _serialize_session_cost_summary(
+    cayu_app: Any,
+    summary: SessionCostSummary,
+) -> dict[str, Any]:
+    return {
+        **summary.model_dump(mode="json"),
+        "session_id": cayu_app.project_session_id_for_exposure(summary.session_id),
+    }
 
 
 def _serialize_session(cayu_app: Any, session: Session) -> dict[str, Any]:
@@ -2516,13 +2657,21 @@ def _serialize_message_part(cayu_app: Any, part: Any) -> dict[str, Any]:
 
 def _serialize_transcript_message(
     cayu_app: Any,
+    session_id: str,
     index: int,
     message: Message,
     interaction_id: str | None,
 ) -> dict[str, Any]:
     return {
         "index": index,
-        "interaction_id": interaction_id,
+        "interaction_id": (
+            None
+            if interaction_id is None
+            else cayu_app.project_interaction_id_for_exposure(
+                interaction_id,
+                session_id=session_id,
+            )
+        ),
         "role": str(message.role),
         "content": [_serialize_message_part(cayu_app, part) for part in message.content],
     }
@@ -2791,6 +2940,132 @@ def create_router(
 
     optional_auth_context = Depends(_optional_auth_context)
 
+    async def _resolve_public_session_id(value: str) -> str:
+        try:
+            return await cayu_app._resolve_public_session_id(value)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def _resolve_session_query_authority_filters(
+        *,
+        parent_session_id: str | None,
+        causal_budget_id: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Resolve public list filters before they reach private store queries."""
+
+        try:
+            private_parent_session_id = _clean_optional_query_value(
+                parent_session_id,
+                "parent_session_id",
+            )
+            private_causal_budget_id = _clean_optional_query_value(
+                causal_budget_id,
+                "causal_budget_id",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if private_parent_session_id is not None:
+            try:
+                private_parent_session_id = await cayu_app._resolve_public_parent_session_id(
+                    private_parent_session_id
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if private_causal_budget_id is not None:
+            try:
+                private_causal_budget_id = await cayu_app._resolve_public_causal_budget_id(
+                    private_causal_budget_id
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return private_parent_session_id, private_causal_budget_id
+
+    async def _resolve_public_interaction_id(
+        *,
+        session_id: str,
+        value: str,
+    ) -> str:
+        try:
+            return await cayu_app._resolve_public_interaction_id(
+                session_id=session_id,
+                value=value,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def _resolve_public_linkage(
+        *,
+        session_id: str,
+        value: str,
+        field_name: str,
+    ) -> str:
+        """Resolve public and transitional raw linkage through the app boundary."""
+
+        try:
+            return await cayu_app._resolve_public_action_linkage(
+                session_id=session_id,
+                value=value,
+                field_name=field_name,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=str(exc),
+            ) from exc
+
+    async def _private_accepted_event(
+        accepted_event: Event,
+        *,
+        session_id: str,
+        publication_uncertain: bool,
+    ) -> tuple[Event, int | None]:
+        """Resolve one streamed or uncertain terminal event to durable authority."""
+
+        public_session_id = cayu_app.project_session_id_for_exposure(session_id)
+        if accepted_event.session_id not in {session_id, public_session_id}:
+            raise RuntimeError(
+                "Mutation acceptance event belongs to a different session: "
+                f"{accepted_event.session_id}"
+            )
+        sequence = event_durable_sequence(accepted_event)
+        try:
+            if sequence is not None:
+                records = await session_store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        after_sequence=sequence - 1,
+                        limit=1,
+                    )
+                )
+                if len(records) != 1 or records[0].sequence != sequence:
+                    records = []
+            else:
+                records = await session_store.query_events(
+                    EventQuery(
+                        session_id=session_id,
+                        event_id=accepted_event.id,
+                        limit=1,
+                    )
+                )
+        except Exception:
+            if not publication_uncertain:
+                raise
+            records = []
+        if records:
+            private_event = records[0].event
+            if private_event.session_id != session_id:
+                raise RuntimeError(
+                    "Mutation acceptance event belongs to a different session: "
+                    f"{private_event.session_id}"
+                )
+            return private_event, records[0].sequence
+        if not publication_uncertain or not event_id_is_runtime_generated(accepted_event):
+            raise RuntimeError("Mutation acceptance boundary has no unique durable sequence.")
+        # The terminal append may not have committed, so no public sequence alias
+        # exists. Preserve its positively runtime-generated identity only inside
+        # the private marker; public projection replaces it with a fixed sentinel.
+        return accepted_event, None
+
     def _mutation_acceptance_callbacks(
         *,
         mutation_id: str | None,
@@ -2799,11 +3074,18 @@ def create_router(
         after_accept: Callable[[Event], Awaitable[None]] | None = None,
     ) -> _MutationAcceptanceCallbacks:
         """Compose route bookkeeping with an exact durable mutation boundary."""
-        if mutation_id is None:
-            return _MutationAcceptanceCallbacks(
-                after_first_event=after_accept,
-                after_terminal_publication_uncertain=None,
-            )
+        if mutation_id is not None:
+            projected_mutation_id = cayu_app.redact_json(mutation_id)
+            if type(projected_mutation_id) is not str:
+                raise RuntimeError("Mutation-id projection returned a non-string value.")
+            if projected_mutation_id != mutation_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Cayu-Mutation-ID contains a configured workload secret and "
+                        "cannot be used as durable mutation authority."
+                    ),
+                )
 
         async def record_acceptance(
             accepted_event: Event,
@@ -2813,37 +3095,43 @@ def create_router(
             # Route-owned setup remains part of acceptance. The mutation marker
             # is deliberately written last so it never claims that a request was
             # accepted when prerequisite setup failed.
+            private_accepted_event, accepted_event_sequence = await _private_accepted_event(
+                accepted_event,
+                session_id=session_id,
+                publication_uncertain=publication_uncertain,
+            )
             if after_accept is not None:
-                await after_accept(accepted_event)
-            if accepted_event.session_id != session_id:
-                raise RuntimeError(
-                    "Mutation acceptance event belongs to a different session: "
-                    f"{accepted_event.session_id}"
-                )
+                await after_accept(private_accepted_event)
+            if mutation_id is None:
+                return
             payload: dict[str, Any] = {
                 "mutation_id": mutation_id,
                 "mutation_kind": mutation_kind,
-                "accepted_event_id": accepted_event.id,
-                "accepted_event_type": str(accepted_event.type),
+                "accepted_event_type": str(private_accepted_event.type),
             }
+            if accepted_event_sequence is None:
+                payload["accepted_event_id"] = private_accepted_event.id
+            else:
+                payload["accepted_event_sequence"] = accepted_event_sequence
             if publication_uncertain:
                 # The terminal status is durable, but its preassigned event may
                 # have committed before this marker or may be repaired after it.
                 # Clients use this explicit exception to accept either ordering
                 # without weakening normal mutation-boundary validation.
                 payload["accepted_event_publication_uncertain"] = True
-            await cayu_app.emit_event(
-                Event(
-                    type=EventType.SERVER_MUTATION_ACCEPTED,
-                    session_id=session_id,
-                    interaction_id=accepted_event.interaction_id,
-                    agent_name=accepted_event.agent_name,
-                    environment_name=accepted_event.environment_name,
-                    workflow_name=accepted_event.workflow_name,
-                    tool_name=accepted_event.tool_name,
-                    payload=payload,
-                )
+            marker = Event(
+                type=EventType.SERVER_MUTATION_ACCEPTED,
+                session_id=session_id,
+                interaction_id=private_accepted_event.interaction_id,
+                agent_name=private_accepted_event.agent_name,
+                environment_name=private_accepted_event.environment_name,
+                workflow_name=private_accepted_event.workflow_name,
+                tool_name=private_accepted_event.tool_name,
+                payload=payload,
             )
+            if accepted_event_sequence is None:
+                marker = event_with_runtime_payload_authority(marker, "accepted_event_id")
+            await cayu_app._emit_event_private(marker)
 
         async def after_first_event(first_event: Event) -> None:
             await record_acceptance(first_event, publication_uncertain=False)
@@ -2853,6 +3141,11 @@ def create_router(
         ) -> None:
             await record_acceptance(error.event, publication_uncertain=True)
 
+        if mutation_id is None:
+            return _MutationAcceptanceCallbacks(
+                after_first_event=after_first_event if after_accept is not None else None,
+                after_terminal_publication_uncertain=None,
+            )
         return _MutationAcceptanceCallbacks(
             after_first_event=after_first_event,
             after_terminal_publication_uncertain=after_terminal_publication_uncertain,
@@ -3052,16 +3345,63 @@ def create_router(
         route_class_override=_BoundedUsageRollupRoute,
     )
 
+    async def _public_or_legacy_event_record(
+        session_id: str,
+        event_id: str,
+    ) -> tuple[EventRecord | None, bool]:
+        """Resolve a public alias without shadowing a legacy raw event ID."""
+
+        if not event_id.startswith(PUBLIC_EVENT_ID_PREFIX):
+            return None, False
+        raw_records = await session_store.query_events(
+            EventQuery(session_id=session_id, event_id=event_id, limit=1)
+        )
+        raw_record = raw_records[0] if raw_records else None
+        sequence = public_event_sequence(event_id)
+        if sequence is None:
+            if raw_record is not None:
+                return raw_record, True
+            raise HTTPException(
+                status_code=422,
+                detail="Event reference contains a malformed Cayu public event alias.",
+            )
+        alias_records = await session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                after_sequence=sequence - 1,
+                limit=1,
+            )
+        )
+        alias_record = (
+            alias_records[0] if alias_records and alias_records[0].sequence == sequence else None
+        )
+        if (
+            raw_record is not None
+            and alias_record is not None
+            and raw_record.sequence != alias_record.sequence
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Event reference is ambiguous between a legacy raw ID and "
+                    "a Cayu public event alias."
+                ),
+            )
+        return raw_record or alias_record, True
+
     async def _marker_record(session_id: str, event_id: str) -> EventRecord:
         """Persisted event named by a ``Last-Event-ID`` marker.
 
         Unknown event markers are rejected rather than silently widening the replay
         to full history. The explicit ``session_id:`` marker owns replay-from-start.
         """
-        records = await session_store.query_events(
-            EventQuery(session_id=session_id, event_id=event_id, limit=1)
-        )
-        if not records:
+        resolved, handled = await _public_or_legacy_event_record(session_id, event_id)
+        if not handled:
+            records = await session_store.query_events(
+                EventQuery(session_id=session_id, event_id=event_id, limit=1)
+            )
+            resolved = records[0] if records else None
+        if resolved is None:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -3070,7 +3410,7 @@ def create_router(
                     "replay from the beginning."
                 ),
             )
-        return records[0]
+        return resolved
 
     async def _marker_terminal_boundary_id(marker_record: EventRecord) -> str | None:
         """Resolve terminal lineage represented by a durable replay marker.
@@ -3152,35 +3492,49 @@ def create_router(
         last_event_id = http_request.headers.get("last-event-id")
         if last_event_id is None:
             return None
+        marker_record: EventRecord | None = None
+        public_expected_session_id: str | None = None
+        if expected_session_id is not None:
+            expected_session_id = await _resolve_public_session_id(expected_session_id)
+            public_expected_session_id = cayu_app.project_session_id_for_exposure(
+                expected_session_id
+            )
         marker = parse_last_event_id(
             last_event_id,
             expected_session_id=expected_session_id,
+            public_session_id=public_expected_session_id,
         )
         if marker is None:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    "Last-Event-ID must use `session_id:event_id` or the explicit "
-                    f"`{SSE_REPLAY_START_MARKER_FORMAT}` start marker."
+                    "Last-Event-ID must use a session-bound Cayu public event id "
+                    f"or the explicit `{SSE_REPLAY_START_MARKER_FORMAT}` start marker."
                 ),
             )
         session_id, last_seen_event_id = marker
-        if expected_session_id is not None and session_id != expected_session_id:
-            raise HTTPException(
-                status_code=422,
-                detail="Last-Event-ID session does not match the request session_id.",
-            )
+        if expected_session_id is not None:
+            if session_id == public_expected_session_id:
+                # A legacy/imported secret-bearing session has a safe marker on
+                # the wire. The request's private session identity scopes this
+                # otherwise non-unique presentation value before any query.
+                session_id = expected_session_id
+            elif session_id != expected_session_id:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Last-Event-ID session does not match the request session_id.",
+                )
         state = await session_store.load_state(session_id)
         if state is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"Session not found: {session_id}",
+                detail=(
+                    f"Session not found: {cayu_app.project_session_id_for_exposure(session_id)}"
+                ),
             )
-        marker_record = (
-            None
-            if last_seen_event_id is None
-            else await _marker_record(session_id, last_seen_event_id)
-        )
+        if last_seen_event_id is not None:
+            # Public aliases and legacy raw IDs share one disambiguating lookup.
+            marker_record = await _marker_record(session_id, last_seen_event_id)
         after_sequence = None if marker_record is None else marker_record.sequence
 
         async def replay() -> AsyncIterator[dict[str, str]]:
@@ -3205,7 +3559,9 @@ def create_router(
                 )
                 for record in page:
                     try:
-                        message = event_to_sse_message(record.event)
+                        message = event_to_sse_message(
+                            cayu_app.project_event_record_for_exposure(record).event
+                        )
                     except SseEventFrameTooLargeError as exc:
                         yield _stream_error_sse_message(
                             cayu_app,
@@ -3307,13 +3663,19 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session_id = body.session_id or f"session-{uuid4().hex}"
+        runtime_generated_session_id = f"session-{uuid4().hex}" if body.session_id is None else None
+        session_id = body.session_id or runtime_generated_session_id
+        if session_id is None:
+            raise AssertionError("Run route did not assign a session identity.")
 
         if task_store is not None:
             task_id = str(uuid4())
 
             async def create_run_task(first_event: Event) -> None:
-                if first_event.session_id != session_id:
+                if first_event.session_id not in {
+                    session_id,
+                    cayu_app.project_session_id_for_exposure(session_id),
+                }:
                     raise RuntimeError(
                         "Run acceptance event belongs to a different session: "
                         f"{first_event.session_id}"
@@ -3363,7 +3725,19 @@ def create_router(
             metadata=trace_metadata,
             thinking=body.thinking,
         )
-
+        runtime_authority_fields = tuple(
+            field_name
+            for field_name, generated in (
+                ("session_id", runtime_generated_session_id is not None),
+                ("task_id", task_id is not None),
+            )
+            if generated
+        )
+        if runtime_authority_fields:
+            request = run_request_with_runtime_generated_authority(
+                request,
+                *runtime_authority_fields,
+            )
         return await _accepted_event_stream_response(
             cayu_app.run(request),
             cayu_app=cayu_app,
@@ -3394,7 +3768,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(body.session_id)
+        session_id = await _resolve_public_session_id(body.session_id)
+        session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3416,11 +3791,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.resume(request),
             cayu_app=cayu_app,
-            session_id=body.session_id,
+            session_id=session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="resume",
-                session_id=body.session_id,
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3443,7 +3818,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(session_id)
+        private_session_id = await _resolve_public_session_id(session_id)
+        session = await session_store.load(private_session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3463,11 +3839,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.compact_session(request),
             cayu_app=cayu_app,
-            session_id=session_id,
+            session_id=private_session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="session.compact",
-                session_id=session_id,
+                session_id=private_session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3490,7 +3866,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(session_id)
+        private_session_id = await _resolve_public_session_id(session_id)
+        session = await session_store.load(private_session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3515,11 +3892,11 @@ def create_router(
         return await _accepted_event_stream_response(
             operation(),
             cayu_app=cayu_app,
-            session_id=session_id,
+            session_id=private_session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="session.message.enqueue",
-                session_id=session_id,
+                session_id=private_session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3542,7 +3919,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(session_id)
+        private_session_id = await _resolve_public_session_id(session_id)
+        session = await session_store.load(private_session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3566,11 +3944,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.interrupt_session(request),
             cayu_app=cayu_app,
-            session_id=session_id,
+            session_id=private_session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="interrupt",
-                session_id=session_id,
+                session_id=private_session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3592,7 +3970,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(body.session_id)
+        session_id = await _resolve_public_session_id(body.session_id)
+        session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3601,9 +3980,21 @@ def create_router(
 
         request = ToolApprovalRequest(
             session_id=body.session_id,
-            approval_id=body.approval_id,
-            tool_round_id=body.tool_round_id,
-            tool_call_id=body.tool_call_id,
+            approval_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.approval_id,
+                field_name="approval_id",
+            ),
+            tool_round_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.tool_round_id,
+                field_name="tool_round_id",
+            ),
+            tool_call_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.tool_call_id,
+                field_name="tool_call_id",
+            ),
             decision=body.decision,
             reason=body.reason,
             metadata=body.metadata,
@@ -3619,11 +4010,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.resolve_tool_approval(request),
             cayu_app=cayu_app,
-            session_id=body.session_id,
+            session_id=session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="tool_approval.resolve",
-                session_id=body.session_id,
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3645,7 +4036,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(body.session_id)
+        session_id = await _resolve_public_session_id(body.session_id)
+        session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3654,9 +4046,21 @@ def create_router(
 
         request = ToolApprovalRecoveryRequest(
             session_id=body.session_id,
-            approval_id=body.approval_id,
-            tool_round_id=body.tool_round_id,
-            tool_call_id=body.tool_call_id,
+            approval_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.approval_id,
+                field_name="approval_id",
+            ),
+            tool_round_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.tool_round_id,
+                field_name="tool_round_id",
+            ),
+            tool_call_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.tool_call_id,
+                field_name="tool_call_id",
+            ),
             outcome=body.outcome,
             message=body.message,
             structured=body.structured,
@@ -3675,11 +4079,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.recover_tool_approval(request),
             cayu_app=cayu_app,
-            session_id=body.session_id,
+            session_id=session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="tool_approval.recover",
-                session_id=body.session_id,
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3701,7 +4105,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(body.session_id)
+        session_id = await _resolve_public_session_id(body.session_id)
+        session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3710,8 +4115,16 @@ def create_router(
 
         request = ToolRoundRecoveryRequest(
             session_id=body.session_id,
-            round_id=body.round_id,
-            tool_call_id=body.tool_call_id,
+            round_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.round_id,
+                field_name="tool_round_id",
+            ),
+            tool_call_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.tool_call_id,
+                field_name="tool_call_id",
+            ),
             outcome=body.outcome,
             message=body.message,
             structured=body.structured,
@@ -3730,11 +4143,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.recover_tool_round(request),
             cayu_app=cayu_app,
-            session_id=body.session_id,
+            session_id=session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="tool_round.recover",
-                session_id=body.session_id,
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3756,7 +4169,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(body.session_id)
+        session_id = await _resolve_public_session_id(body.session_id)
+        session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3765,7 +4179,11 @@ def create_router(
 
         response = UserInputResponse(
             session_id=body.session_id,
-            input_id=body.input_id,
+            input_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.input_id,
+                field_name="input_id",
+            ),
             answer=body.answer,
             structured=body.structured,
             artifacts=body.artifacts,
@@ -3782,11 +4200,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.resolve_user_input(response),
             cayu_app=cayu_app,
-            session_id=body.session_id,
+            session_id=session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="user_input.resolve",
-                session_id=body.session_id,
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -3808,7 +4226,8 @@ def create_router(
         )
         if replay is not None:
             return replay
-        session = await session_store.load(body.session_id)
+        session_id = await _resolve_public_session_id(body.session_id)
+        session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(
                 status_code=404,
@@ -3817,9 +4236,17 @@ def create_router(
 
         request = UserInputRecoveryRequest(
             session_id=body.session_id,
-            input_id=body.input_id,
+            input_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.input_id,
+                field_name="input_id",
+            ),
             answer=body.answer,
-            tool_call_id=body.tool_call_id,
+            tool_call_id=await _resolve_public_linkage(
+                session_id=session_id,
+                value=body.tool_call_id,
+                field_name="tool_call_id",
+            ),
             outcome=body.outcome,
             message=body.message,
             structured=body.structured,
@@ -3838,11 +4265,11 @@ def create_router(
         return await _accepted_event_stream_response(
             cayu_app.recover_user_input(request),
             cayu_app=cayu_app,
-            session_id=body.session_id,
+            session_id=session_id,
             acceptance_callbacks=_mutation_acceptance_callbacks(
                 mutation_id=mutation_id,
                 mutation_kind="user_input.recover",
-                session_id=body.session_id,
+                session_id=session_id,
             ),
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
@@ -4156,6 +4583,8 @@ def create_router(
         cursor: Annotated[str | None, Query()] = None,
     ):
         requested_session_id = _clean_optional_query_value(session_id, "session_id")
+        if requested_session_id is not None:
+            requested_session_id = await _resolve_public_session_id(requested_session_id)
         search = _clean_optional_query_value(q, "q")
         requested_agent_name = _clean_optional_query_value(agent_name, "agent_name")
         requested_environment_name = _clean_optional_query_value(
@@ -4187,23 +4616,7 @@ def create_router(
         except PendingActionResultTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         return {
-            "actions": [
-                {
-                    **_redact_control_plane_values(
-                        cayu_app,
-                        action.model_dump(
-                            mode="json",
-                            exclude={"session", "event"},
-                        ),
-                        "pending_action",
-                        preserve_string_fields={"kind", "policy_evidence"},
-                        untrusted_container_fields={"arguments"},
-                    ),
-                    "session": _serialize_session_base(cayu_app, action.session),
-                    "event": _serialize_event_record(cayu_app, action.event),
-                }
-                for action in result.actions
-            ],
+            "actions": [_serialize_pending_action(cayu_app, action) for action in result.actions],
             "issues": [
                 _redact_control_plane_values(
                     cayu_app,
@@ -4239,6 +4652,13 @@ def create_router(
     ):
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
+        (
+            private_parent_session_id,
+            private_causal_budget_id,
+        ) = await _resolve_session_query_authority_filters(
+            parent_session_id=parent_session_id,
+            causal_budget_id=causal_budget_id,
+        )
         try:
             result = await session_store.list_sessions(
                 SessionQuery(
@@ -4252,14 +4672,8 @@ def create_router(
                         environment_name,
                         "environment_name",
                     ),
-                    parent_session_id=_clean_optional_query_value(
-                        parent_session_id,
-                        "parent_session_id",
-                    ),
-                    causal_budget_id=_clean_optional_query_value(
-                        causal_budget_id,
-                        "causal_budget_id",
-                    ),
+                    parent_session_id=private_parent_session_id,
+                    causal_budget_id=private_causal_budget_id,
                     labels=labels,
                     label_selectors=label_selectors,
                     limit=limit,
@@ -4551,6 +4965,13 @@ def create_router(
         body = body or SessionsSummaryBody()
         labels = _parse_session_label_filters(label)
         label_selectors = _parse_session_label_selectors(label_selector)
+        (
+            private_parent_session_id,
+            private_causal_budget_id,
+        ) = await _resolve_session_query_authority_filters(
+            parent_session_id=parent_session_id,
+            causal_budget_id=causal_budget_id,
+        )
         try:
             result = await session_store.list_sessions(
                 SessionQuery(
@@ -4564,14 +4985,8 @@ def create_router(
                         environment_name,
                         "environment_name",
                     ),
-                    parent_session_id=_clean_optional_query_value(
-                        parent_session_id,
-                        "parent_session_id",
-                    ),
-                    causal_budget_id=_clean_optional_query_value(
-                        causal_budget_id,
-                        "causal_budget_id",
-                    ),
+                    parent_session_id=private_parent_session_id,
+                    causal_budget_id=private_causal_budget_id,
                     labels=labels,
                     label_selectors=label_selectors,
                     limit=limit,
@@ -4601,11 +5016,14 @@ def create_router(
             record.event
             for record in sorted(usage_event_records, key=lambda record: record.sequence)
         ]
-        usage_summary = causal_budget_usage_summary(
-            causal_budget_id="session-query",
-            session_ids=session_ids,
-            events=usage_events,
-        ).model_dump()
+        usage_summary = _serialize_causal_budget_usage_summary(
+            cayu_app,
+            causal_budget_usage_summary(
+                causal_budget_id="session-query",
+                session_ids=session_ids,
+                events=usage_events,
+            ),
+        )
         usage_summary.pop("causal_budget_id", None)
         model_events = [
             record.event
@@ -4630,19 +5048,24 @@ def create_router(
                 currency=body.currency,
             ).model_dump(mode="json")
             aggregate_cost.pop("session_id", None)
-            aggregate_cost["session_ids"] = session_ids
+            aggregate_cost["session_ids"] = [
+                cayu_app.project_session_id_for_exposure(session_id) for session_id in session_ids
+            ]
             aggregate_cost["session_count"] = len(session_ids)
             aggregate_cost["session_costs"] = [
-                build_session_cost_summary(
-                    session_id=session.id,
-                    events=[
-                        record.event
-                        for record in session_event_records_by_id[session.id]
-                        if record.event.type == EventType.MODEL_COMPLETED
-                    ],
-                    pricing=body.pricing,
-                    currency=body.currency,
-                ).model_dump(mode="json")
+                _serialize_session_cost_summary(
+                    cayu_app,
+                    build_session_cost_summary(
+                        session_id=session.id,
+                        events=[
+                            record.event
+                            for record in session_event_records_by_id[session.id]
+                            if record.event.type == EventType.MODEL_COMPLETED
+                        ],
+                        pricing=body.pricing,
+                        currency=body.currency,
+                    ),
+                )
                 for session in sessions
             ]
             cost_summary = aggregate_cost
@@ -4689,7 +5112,7 @@ def create_router(
             summary = await cayu_app.get_session_usage(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
-        return summary.model_dump()
+        return summary
 
     @router.post(
         "/sessions/{session_id}/cost",
@@ -4705,7 +5128,7 @@ def create_router(
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Session not found") from exc
-        return summary.model_dump(mode="json")
+        return summary
 
     @router.get(
         "/causal-budgets/{causal_budget_id}/usage",
@@ -4717,7 +5140,9 @@ def create_router(
             summary = await cayu_app.get_causal_budget_usage(causal_budget_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Causal budget not found") from exc
-        return summary.model_dump()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return summary
 
     @router.post(
         "/causal-budgets/{causal_budget_id}/cost",
@@ -4736,7 +5161,9 @@ def create_router(
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Causal budget not found") from exc
-        return summary.model_dump(mode="json")
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return summary
 
     @router.post(
         "/causal-budgets/{causal_budget_id}/summary",
@@ -4748,8 +5175,14 @@ def create_router(
         causal_budget_id: NonBlankString,
         body: SessionCostBody,
     ):
+        try:
+            private_causal_budget_id = await cayu_app._resolve_public_causal_budget_id(
+                causal_budget_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         sessions = await _list_all_causal_sessions(
-            causal_budget_id,
+            private_causal_budget_id,
             max_sessions=_CAUSAL_BUDGET_SUMMARY_MAX_SESSIONS,
         )
         if not sessions:
@@ -4757,7 +5190,7 @@ def create_router(
 
         session_ids = [session.id for session in sessions]
         causal_event_records = await _query_all_causal_event_records(
-            causal_budget_id,
+            private_causal_budget_id,
             max_events=_CAUSAL_BUDGET_SUMMARY_MAX_EVENTS,
             max_bytes=_CAUSAL_BUDGET_SUMMARY_MAX_EVENT_INPUT_BYTES,
         )
@@ -4784,12 +5217,12 @@ def create_router(
             )
         ]
         usage_summary = causal_budget_usage_summary(
-            causal_budget_id=causal_budget_id,
+            causal_budget_id=private_causal_budget_id,
             session_ids=session_ids,
             events=usage_events,
         )
         cost_summary = build_causal_budget_cost_summary(
-            causal_budget_id=causal_budget_id,
+            causal_budget_id=private_causal_budget_id,
             session_ids=session_ids,
             events=[record.event for record in usage_event_records],
             pricing=body.pricing,
@@ -4823,11 +5256,14 @@ def create_router(
             )
 
         response_value = {
-            "causal_budget_id": causal_budget_id,
+            "causal_budget_id": cayu_app.project_causal_budget_id_for_exposure(
+                private_causal_budget_id,
+                session_ids=(session.id for session in sessions),
+            ),
             "session_count": len(sessions),
             "sessions": session_items,
-            "usage": usage_summary.model_dump(),
-            "cost": cost_summary.model_dump(mode="json"),
+            "usage": _serialize_causal_budget_usage_summary(cayu_app, usage_summary),
+            "cost": _serialize_causal_budget_cost_summary(cayu_app, cost_summary),
         }
         if not json_utf8_size_within_limit(
             response_value,
@@ -4848,12 +5284,13 @@ def create_router(
         dependencies=protected,
     )
     async def get_session_state(session_id: NonBlankString):
+        session_id = await _resolve_public_session_id(session_id)
         state = await session_store.load_state(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
         interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
         return {
-            "session_id": state.id,
+            "session_id": cayu_app.project_session_id_for_exposure(state.id),
             "status": state.status,
             "updated_at": state.updated_at.isoformat(),
             "last_activity_at": state.last_activity_at.isoformat(),
@@ -4866,6 +5303,7 @@ def create_router(
         dependencies=protected,
     )
     async def get_session_summary(session_id: NonBlankString):
+        session_id = await _resolve_public_session_id(session_id)
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -4892,7 +5330,7 @@ def create_router(
                 "total_messages": transcript_page.total_records,
             },
             "outcome": _serialize_session_outcome(cayu_app, outcome),
-            "usage": usage_summary.model_dump(),
+            "usage": usage_summary,
         }
 
     async def _list_all_causal_sessions(
@@ -5032,6 +5470,8 @@ def create_router(
         before_sequence: int | None = Query(default=None, ge=1),
         limit: int = Query(default=50, ge=1, le=100),
     ):
+        session_id = await _resolve_public_session_id(session_id)
+        public_session_id = cayu_app.project_session_id_for_exposure(session_id)
         state = await session_store.load_state(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -5042,7 +5482,7 @@ def create_router(
         )
         page = records[:limit]
         return {
-            "session_id": session_id,
+            "session_id": public_session_id,
             "interactions": [_serialize_interaction_record(cayu_app, record) for record in page],
             "next_sequence": page[-1].sequence if page else before_sequence,
             "has_more": len(records) > limit,
@@ -5057,9 +5497,14 @@ def create_router(
         session_id: NonBlankString,
         interaction_id: NonBlankString,
     ):
+        session_id = await _resolve_public_session_id(session_id)
         state = await session_store.load_state(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
+        interaction_id = await _resolve_public_interaction_id(
+            session_id=session_id,
+            value=interaction_id,
+        )
         records = await session_store.query_events(
             EventQuery(
                 session_id=session_id,
@@ -5113,9 +5558,31 @@ def create_router(
         ] = EventOrder.SEQUENCE_ASC,
         limit: int = Query(default=100, ge=1, le=_EVENT_PAGE_LIMIT_MAX),
     ):
+        session_id = await _resolve_public_session_id(session_id)
+        public_session_id = cayu_app.project_session_id_for_exposure(session_id)
         state = await session_store.load_state(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        if interaction_id is not None:
+            interaction_id = await _resolve_public_interaction_id(
+                session_id=session_id,
+                value=interaction_id,
+            )
+
+        private_event_id = event_id
+        unresolved_public_event_id = False
+        if event_id is not None:
+            resolved_record, handled = await _public_or_legacy_event_record(
+                session_id,
+                event_id,
+            )
+            if handled:
+                if resolved_record is None:
+                    private_event_id = None
+                    unresolved_public_event_id = True
+                else:
+                    private_event_id = resolved_record.event.id
 
         has_event_filters = any(
             value is not None
@@ -5133,7 +5600,7 @@ def create_router(
         try:
             query = EventQuery(
                 session_id=session_id,
-                event_id=event_id,
+                event_id=private_event_id,
                 event_type=event_type,
                 interaction_id=interaction_id,
                 exclude_event_types=(exclude_event_type,) if exclude_event_type is not None else (),
@@ -5168,7 +5635,7 @@ def create_router(
             if latest_records:
                 raw_scan_sequence = latest_records[0].sequence
 
-        records = await session_store.query_events(query)
+        records = [] if unresolved_public_event_id else await session_store.query_events(query)
         page = records[:limit]
         has_more = len(records) > limit
         cursor = after_sequence if order_by == EventOrder.SEQUENCE_ASC else before_sequence
@@ -5190,7 +5657,7 @@ def create_router(
                 scan_through_sequence = max(scan_candidates)
 
         return {
-            "session_id": session_id,
+            "session_id": public_session_id,
             "events": [_serialize_event_record(cayu_app, record) for record in page],
             "order_by": order_by,
             "next_sequence": next_sequence,
@@ -5214,9 +5681,17 @@ def create_router(
         limit: int = Query(default=100, ge=1, le=_TRANSCRIPT_PAGE_LIMIT_MAX),
         include_thinking: bool = Query(default=True),
     ):
+        session_id = await _resolve_public_session_id(session_id)
+        public_session_id = cayu_app.project_session_id_for_exposure(session_id)
         state = await session_store.load_state(session_id)
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        if interaction_id is not None:
+            interaction_id = await _resolve_public_interaction_id(
+                session_id=session_id,
+                value=interaction_id,
+            )
 
         transcript_page = await session_store.query_transcript(
             TranscriptQuery(
@@ -5235,10 +5710,11 @@ def create_router(
         next_offset = offset + consumed
 
         return {
-            "session_id": session_id,
+            "session_id": public_session_id,
             "messages": [
                 _serialize_transcript_message(
                     cayu_app,
+                    session_id,
                     record.index,
                     record.message,
                     record.interaction_id,
@@ -5257,6 +5733,7 @@ def create_router(
         dependencies=protected,
     )
     async def get_session(session_id: NonBlankString):
+        session_id = await _resolve_public_session_id(session_id)
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
@@ -5264,6 +5741,7 @@ def create_router(
 
     @router.delete("/sessions/{session_id}", status_code=204, dependencies=protected)
     async def delete_session(session_id: NonBlankString):
+        session_id = await _resolve_public_session_id(session_id)
         try:
             await session_store.delete_session(session_id)
         except ValueError as exc:
@@ -5279,6 +5757,7 @@ def create_router(
         session_id: NonBlankString,
         body: UpdateSessionLabelsBody,
     ):
+        session_id = await _resolve_public_session_id(session_id)
         try:
             require_durable_json_text(body.labels, "labels")
             session = await session_store.update_labels(session_id, body.labels)
@@ -5297,6 +5776,7 @@ def create_router(
         session_id: NonBlankString,
         body: UpdateSessionMetadataBody,
     ):
+        session_id = await _resolve_public_session_id(session_id)
         try:
             require_durable_json_text(body.metadata, "metadata")
             session = await session_store.update_metadata(session_id, body.metadata)

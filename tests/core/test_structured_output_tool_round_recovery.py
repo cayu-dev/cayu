@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
+from tests.core._event_projection_support import private_events_for_public_events
 
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.messages import ToolCallPart, ToolResultPart
@@ -463,8 +464,12 @@ def test_incomplete_recovery_atomically_finalizes_valid_structured_output_round(
         }
         assert staged.model_receipt.intent == staged.model_intent
         assert staged.model_receipt.appended_event_ids == (staged.completion_event.id,)
+        private_recovery_events = await private_events_for_public_events(
+            store,
+            list(recovery.events),
+        )
         assert {event.id for event in round_events}.issubset(
-            {event.id for event in recovery.events}
+            {event.id for event in private_recovery_events}
         )
         _assert_unique_event_ids(events)
 

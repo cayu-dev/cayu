@@ -14,7 +14,8 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid5
 
 from cayu._validation import require_clean_nonblank
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, event_with_runtime_generated_id
+from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime import (
     EventQuery,
     EventRecord,
@@ -29,10 +30,6 @@ from cayu.runtime import (
 # journal so ``append_events`` / ``load_events`` have a home to write to.
 WORKFLOW_JOURNAL_PROVIDER = "cayu.workflow"
 WORKFLOW_JOURNAL_MODEL = "cayu.workflow"
-# Journaled once per WorkflowContext, lazily before its first step. The newest
-# marker fences out older in-flight attempts on the same run id (see
-# ``WorkflowContext._check_fence``).
-WORKFLOW_ATTEMPT_EVENT_TYPE = "custom.cayu.workflow.attempt"
 _EVENT_QUERY_PAGE_LIMIT = 5000  # EventQuery.limit hard cap
 _WORKFLOW_STEP_STARTED_EVENT_NAMESPACE = UUID("f6c3b09d-f866-42fd-8508-cf50894c4b97")
 EventEmitter = Callable[[list[Event]], Awaitable[list[Event]]]
@@ -177,15 +174,17 @@ class EventStoreJournal:
             async for existing in self._iter_workflow_events(EventType.WORKFLOW_STEP_STARTED):
                 if existing.payload.get("step_id") == step_id:
                     attempt += 1
-            reserved = event.model_copy(
-                update={
-                    "id": _step_started_event_id(
-                        session_id=self._session_id,
-                        workflow_name=self._workflow_name,
-                        step_id=step_id,
-                        attempt=attempt,
-                    )
-                }
+            reserved = event_with_runtime_generated_id(
+                event.model_copy(
+                    update={
+                        "id": _step_started_event_id(
+                            session_id=self._session_id,
+                            workflow_name=self._workflow_name,
+                            step_id=step_id,
+                            attempt=attempt,
+                        )
+                    }
+                )
             )
             try:
                 await self._append_events([reserved])

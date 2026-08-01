@@ -25,7 +25,48 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
 )
+from cayu.runtime._session_engine import _with_environment_name
+from cayu.runtime._session_request_boundary import (
+    prepare_fork_session_request,
+    prepare_run_request,
+)
+from cayu.runtime.sessions import run_request_with_runtime_generated_authority
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
+
+
+def test_runtime_attested_subagent_lineage_survives_short_secret_collision() -> None:
+    request = RunRequest(
+        agent_name="assistant",
+        session_id="root-id_subagent_child",
+        parent_session_id="root-id",
+        causal_budget_id="root-id",
+        messages=[Message.text("user", "review")],
+    )
+    request = run_request_with_runtime_generated_authority(
+        request,
+        "session_id",
+        "parent_session_id",
+        "causal_budget_id",
+    )
+
+    rewritten = _with_environment_name(request, "sandbox")
+    prepared = prepare_run_request(rewritten, redactor=SecretRedactor("-"))
+
+    assert prepared.session_id == request.session_id
+    assert prepared.parent_session_id == request.parent_session_id
+    assert prepared.causal_budget_id == request.causal_budget_id
+
+
+def test_fork_destination_rejects_reserved_public_authority_namespace() -> None:
+    with pytest.raises(ValueError, match="reserved public-authority alias namespace"):
+        prepare_fork_session_request(
+            ForkSessionRequest(
+                source_session_id="source",
+                session_id="cayu_authority_v1.key.session_id." + "A" * 43,
+            ),
+            redactor=SecretRedactor(),
+            store_resolved_source_session_id="source",
+        )
 
 
 def test_cayu_app_redacts_workload_secrets_at_final_model_request_boundary() -> None:

@@ -42,7 +42,14 @@ from cayu.core.billing import (
     completed_billing_identity,
     copy_billing_identity,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.runtime.costs import (
     CostLineItem,
     PriceBook,
@@ -3646,6 +3653,26 @@ def _budget_settlement_record(
         agent_name=reservation.agent_name,
         environment_name=reservation.environment_name,
         payload=payload,
+    )
+    envelope_fields = ["session_id"]
+    payload_fields = [
+        "reservation_id",
+        "settlement_id",
+        "budget_limit_id",
+        "model_step_id",
+        "model_attempt_id",
+    ]
+    if event.interaction_id is not None:
+        if event.payload.get("interaction_id") != event.interaction_id:
+            raise RuntimeError("Budget settlement event changed its interaction identity.")
+        envelope_fields.append("interaction_id")
+        payload_fields.append("interaction_id")
+    event = event_with_runtime_payload_authority(
+        event_with_runtime_envelope_authority(
+            event_with_runtime_generated_id(event),
+            *envelope_fields,
+        ),
+        *payload_fields,
     )
     return BudgetSettlementRecord(
         settlement_id=reconciliation.settlement_id,

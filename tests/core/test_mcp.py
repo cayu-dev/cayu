@@ -65,6 +65,7 @@ from cayu.runtime import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
+from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.sessions import (
     _mcp_authoritative_manifest_hash,
     _mcp_manifest_session_ref,
@@ -3281,7 +3282,7 @@ def test_runtime_requires_explicit_identity_after_schema_upgrade(tmp_path: Path)
     assert len(blocked) == 1
     assert blocked[0].payload["status"] == "history_conflict"
     assert blocked[0].payload["reason"] == "connection_identity_required"
-    assert [record.event.id for record in durable_blocked] == [blocked[0].id]
+    assert [record.sequence for record in durable_blocked] == [public_event_sequence(blocked[0].id)]
 
 
 def test_concurrent_manifest_checks_serialize_different_first_baselines() -> None:

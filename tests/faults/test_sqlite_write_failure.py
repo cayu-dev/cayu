@@ -199,9 +199,15 @@ async def test_sqlite_terminal_write_failure_requires_manual_recovery_without_re
         await reopened.close()
 
     assert _effect_count(effect_path) == 1
-    manual_terminal = next(
+    assert any(
         event
         for event in recovery_events
+        if event.type == EventType.TOOL_CALL_COMPLETED
+        and event.payload.get("manual_recovery") is True
+    )
+    manual_terminal = next(
+        event
+        for event in durable_events
         if event.type == EventType.TOOL_CALL_COMPLETED
         and event.payload.get("manual_recovery") is True
     )

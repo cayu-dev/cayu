@@ -19,6 +19,7 @@ from typing import Any, TextIO
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from cayu.cli._output import add_output_options
+from cayu.runtime.public_authority import public_authority_alias_codec_from_environment
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import jsonl_export
 from cayu.storage import migrations as schema
@@ -68,7 +69,7 @@ def run_storage(args: argparse.Namespace) -> int:
             return _migrate(args)
         if args.storage_command == "export":
             return _export(args)
-    except (schema.SchemaError, OSError) as exc:
+    except (schema.SchemaError, OSError, RuntimeError, ValueError) as exc:
         _render_error(args, str(exc))
         return 1
     return 1
@@ -306,7 +307,11 @@ def _migrate(args: argparse.Namespace) -> int:
 
         # Constructing in migrate mode applies pending forward revisions (the
         # baseline DDL creates every cayu_ table, so one store covers both stores).
-        store = SQLiteSessionStore(args.sqlite, schema_mode=schema.SchemaMode.MIGRATE)
+        store = SQLiteSessionStore(
+            args.sqlite,
+            schema_mode=schema.SchemaMode.MIGRATE,
+            public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+        )
 
         async def close_sqlite() -> None:
             await store.close()
@@ -329,7 +334,11 @@ def _migrate(args: argparse.Namespace) -> int:
     async def run() -> schema.SchemaState:
         from cayu import PostgresSessionStore
 
-        store = PostgresSessionStore(args.postgres, schema_mode=schema.SchemaMode.MIGRATE)
+        store = PostgresSessionStore(
+            args.postgres,
+            schema_mode=schema.SchemaMode.MIGRATE,
+            public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+        )
         try:
             await store.ensure_schema()
         finally:
@@ -488,10 +497,18 @@ def _session_store(args: argparse.Namespace) -> Any:
     if args.sqlite is not None:
         from cayu import SQLiteSessionStore
 
-        return SQLiteSessionStore(args.sqlite, schema_mode=schema.SchemaMode.VALIDATE)
+        return SQLiteSessionStore(
+            args.sqlite,
+            schema_mode=schema.SchemaMode.VALIDATE,
+            public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+        )
     from cayu import PostgresSessionStore
 
-    return PostgresSessionStore(args.postgres, schema_mode=schema.SchemaMode.VALIDATE)
+    return PostgresSessionStore(
+        args.postgres,
+        schema_mode=schema.SchemaMode.VALIDATE,
+        public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+    )
 
 
 def _task_store(args: argparse.Namespace) -> Any:

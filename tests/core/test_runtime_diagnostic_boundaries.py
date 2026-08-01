@@ -67,6 +67,7 @@ from cayu.runtime._environment_lifecycle import (
     _release_unclaimed_factory_result,
     exception_failure_payload,
 )
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY
 from cayu.runtime._tool_round_executor import _parallel_tool_round_exception
 from cayu.runtime.egress import _contains_timeout, _split_cleanup_cancellation
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -1328,9 +1329,7 @@ def test_terminal_hook_nonportable_failure_is_recorded_without_rewriting_session
         "hook_name": "FailingHook",
         "scope": "app",
         "phase": "after_session_completed",
-        "terminal_event_id": next(
-            event.id for event in events if event.type == EventType.SESSION_COMPLETED
-        ),
+        "terminal_event_id": PRIVATE_EVENT_AUTHORITY,
         "terminal_event_type": "session.completed",
         "error": "Runtime hook failed with a non-portable diagnostic.",
         "error_type": "RuntimeError",

@@ -23,6 +23,7 @@ from cayu import (
     EnvironmentFactoryResult,
     EnvironmentSpec,
     Event,
+    EventQuery,
     EventType,
     InMemorySessionStore,
     Message,
@@ -43,6 +44,7 @@ from cayu.runtime._environment_lifecycle import (
     ENVIRONMENT_FACTORY_ALLOCATION_RECEIPTS_CHECKPOINT_KEY,
     ENVIRONMENT_FACTORY_RECONNECT_CHECKPOINT_KEY,
 )
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, project_runtime_event
 from cayu.runtime.sessions import CheckpointTransform, Session
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import SecretRedactor
@@ -627,6 +629,58 @@ def test_failed_prepublication_validation_reaps_exact_acknowledged_allocation() 
         assert isinstance(recovered.error, RuntimeError)
         assert "reaped fake allocation cannot be replaced" in str(recovered.error)
         assert len(provider.create_calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    ("result_environment_name", "event_type"),
+    [
+        pytest.param(None, EventType.ENVIRONMENT_FACTORY_COMPLETED, id="completed"),
+        pytest.param("wrong-environment", EventType.ENVIRONMENT_FACTORY_FAILED, id="failed"),
+    ],
+)
+def test_generated_allocation_id_survives_secret_collision_as_private_authority(
+    result_environment_name: str | None,
+    event_type: EventType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _FakeResource,
+        "reconnect_metadata",
+        lambda _self: {"schema_version": 1, "resource_name": "opaque-safe-resource"},
+    )
+
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session = await _create_session(store)
+        provider = _FakeRemoteProvider()
+        redactor = SecretRedactor("ealloc_")
+
+        resolution = await _resolve(
+            store,
+            session,
+            _FakeRemoteFactory(
+                provider,
+                provider_metadata={"resource_name": "resource-safe"},
+                result_environment_name=result_environment_name,
+            ),
+            operation=EnvironmentFactoryOperation.CREATE,
+            secret_redactor=redactor,
+        )
+        assert (resolution.error is None) is (result_environment_name is None)
+        assert len(provider.create_calls) == 1
+
+        records = await store.query_events(EventQuery(session_id=session.id, event_type=event_type))
+        assert len(records) == 1
+        allocation_id = records[0].event.payload["allocation_id"]
+        assert allocation_id.startswith("ealloc_")
+        public = project_runtime_event(
+            records[0].event,
+            sequence=records[0].sequence,
+            redactor=redactor,
+        )
+        assert public.payload["allocation_id"] == PRIVATE_EVENT_AUTHORITY
 
     asyncio.run(run())
 

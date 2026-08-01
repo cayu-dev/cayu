@@ -23,6 +23,7 @@ from cayu.runtime import (
     ModelCompactor,
     RunRequest,
 )
+from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.budgets import (
     MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY,
     PUBLICATION_FALLBACK_BUDGET_REASON,
@@ -459,9 +460,80 @@ def test_secret_colliding_actual_amount_uses_prevalidated_conservative_settlemen
         assert record.status == "reconciled"
         assert record.actual_amount == Decimal("24691356")
         settlement = next(iter(ledger._settlements.values()))
-        assert settlement.event == reconciled
+        durable = await store.query_events(
+            EventQuery(session_id=session_id, event_id=settlement.event.id, limit=1)
+        )
+        assert len(durable) == 1 and durable[0].event == settlement.event
+        assert durable[0].sequence == public_event_sequence(reconciled.id)
         assert settlement.event_published is True
         assert all(secret not in event.model_dump_json() for event in events)
+
+    asyncio.run(scenario())
+
+
+def test_short_secret_collision_publishes_interaction_bound_settlement() -> None:
+    async def scenario() -> None:
+        session_id = "sess_budget_interaction_authority_collision"
+        store = InMemorySessionStore()
+        ledger = InMemoryBudgetLedger()
+        provider = _CompletedProvider()
+        policy = BudgetPolicy(
+            limits=(
+                _budget_policy()
+                .limits[0]
+                .model_copy(
+                    update={
+                        "pricing": PriceBook(
+                            prices=(
+                                ModelPrice.fixed(
+                                    provider_name="fake",
+                                    model="fakemodel",
+                                    input_per_million=Decimal("1"),
+                                    output_per_million=Decimal("10"),
+                                ),
+                            )
+                        )
+                    },
+                    deep=True,
+                ),
+            )
+        )
+        app = CayuApp(
+            session_store=store,
+            budget_ledger=ledger,
+            budget_policy=policy,
+            secret_redactor=SecretRedactor("-"),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "publish the settlement")],
+                )
+            )
+        ]
+
+        assert events[-1].type == EventType.SESSION_COMPLETED
+        public_settlement = next(
+            event for event in events if event.type == EventType.BUDGET_RECONCILED
+        )
+        assert public_settlement.interaction_id is not None
+        assert "interaction_id" in public_settlement.payload
+
+        settlement = next(iter(ledger._settlements.values()))
+        assert settlement.event.interaction_id is not None
+        assert settlement.event.payload["interaction_id"] == settlement.event.interaction_id
+        assert settlement.event_published is True
+        durable = await store.query_events(
+            EventQuery(session_id=session_id, event_id=settlement.event.id, limit=1)
+        )
+        assert len(durable) == 1
+        assert durable[0].event == settlement.event
 
     asyncio.run(scenario())
 
@@ -755,7 +827,11 @@ def test_model_settlement_redacts_dynamic_pricing_before_ledger_commit() -> None
         reconciled = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)
         assert reconciled.payload["pricing"]["provenance"]["source"] == REDACTED_SECRET
         committed = next(iter(ledger._settlements.values()))
-        assert committed.event == reconciled
+        durable = await store.query_events(
+            EventQuery(session_id=session_id, event_id=committed.event.id, limit=1)
+        )
+        assert len(durable) == 1 and durable[0].event == committed.event
+        assert durable[0].sequence == public_event_sequence(reconciled.id)
         assert committed.event_published is True
 
     asyncio.run(scenario())

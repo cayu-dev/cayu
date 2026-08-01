@@ -35,6 +35,7 @@ from cayu.runtime import (
     ToolRoundIdentity,
     TranscriptQuery,
     TranscriptRecord,
+    public_authority_alias_codec_from_environment,
     session_usage_summary,
     usage_metrics_from_event_payload,
 )
@@ -295,6 +296,7 @@ def _open_read_only_store(target: SessionStoreTarget) -> SessionStore:
             target.sqlite_path,
             schema_mode=schema.SchemaMode.VALIDATE,
             read_only=True,
+            public_authority_alias_codec=public_authority_alias_codec_from_environment(),
         )
     if target.postgres_dsn is None:
         raise AssertionError("Resolved Postgres target has no DSN.")
@@ -304,6 +306,7 @@ def _open_read_only_store(target: SessionStoreTarget) -> SessionStore:
         target.postgres_dsn,
         schema_mode=schema.SchemaMode.VALIDATE,
         read_only=True,
+        public_authority_alias_codec=public_authority_alias_codec_from_environment(),
     )
 
 

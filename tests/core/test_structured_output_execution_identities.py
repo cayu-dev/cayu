@@ -42,7 +42,7 @@ def _collect_events(
     app.register_agent(AgentSpec(name="assistant", model="identity-model"))
 
     async def collect() -> list[Event]:
-        return [
+        _ = [
             event
             async for event in app.run(
                 RunRequest(
@@ -54,6 +54,7 @@ def _collect_events(
                 )
             )
         ]
+        return await app.session_store.load_events(session_id)
 
     return asyncio.run(collect())
 

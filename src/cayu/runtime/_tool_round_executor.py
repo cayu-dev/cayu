@@ -40,7 +40,13 @@ from cayu._validation import (
     require_unicode_scalar_text,
 )
 from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import (
@@ -169,6 +175,27 @@ from cayu.tools._runner import (
     sanitize_runner_failure_group,
 )
 from cayu.vaults import SecretRedactor
+
+
+def _event_with_tool_round_authority(
+    event: Event,
+    identity: ToolRoundIdentity,
+    *additional_fields: str,
+) -> Event:
+    """Attest only runtime-owned linkage carried by a typed tool-round identity."""
+
+    identity = copy_tool_round_identity(identity)
+    fields = [
+        field_name
+        for field_name, value in identity.payload().items()
+        if event.payload.get(field_name) == value
+    ]
+    for field_name in additional_fields:
+        if field_name in event.payload:
+            fields.append(field_name)
+    event = event_with_runtime_envelope_authority(event, "session_id")
+    return event_with_runtime_payload_authority(event, *fields) if fields else event
+
 
 CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
@@ -812,17 +839,21 @@ class ToolRoundExecutor:
             return copy_durable_json_object(current, "checkpoint")
 
         checkpoint_event = _redact_event_for_invocation(
-            Event(
-                type=EventType.SESSION_CHECKPOINTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                payload={
-                    "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
-                    "approval_id": approval.approval_id,
-                    "tool_call_id": approval.tool_call_id,
-                    **tool_round_identity.payload(),
-                },
+            _event_with_tool_round_authority(
+                Event(
+                    type=EventType.SESSION_CHECKPOINTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload={
+                        "checkpoint": approval_support.PENDING_TOOL_APPROVAL_CHECKPOINT_KEY,
+                        "approval_id": approval.approval_id,
+                        "tool_call_id": approval.tool_call_id,
+                        **tool_round_identity.payload(),
+                    },
+                ),
+                tool_round_identity,
+                "approval_id",
             ),
             redactor=redactor,
         )
@@ -838,13 +869,20 @@ class ToolRoundExecutor:
         if recovered:
             requested_payload["recovered"] = True
         requested_event = _redact_event_for_invocation(
-            Event(
-                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                tool_name=approval.tool_name,
-                payload=requested_payload,
+            approval_support.event_with_pending_approval_authority(
+                _event_with_tool_round_authority(
+                    Event(
+                        type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=_environment_name(registered_environment),
+                        tool_name=approval.tool_name,
+                        payload=requested_payload,
+                    ),
+                    tool_round_identity,
+                    "approval_id",
+                ),
+                approval,
             ),
             redactor=redactor,
         )
@@ -1068,17 +1106,21 @@ class ToolRoundExecutor:
         )
         return (
             pending,
-            Event(
-                type=EventType.SESSION_CHECKPOINTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=_environment_name(registered_environment),
-                payload={
-                    "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
-                    "input_id": pending.input_id,
-                    "tool_call_id": pending.tool_call_id,
-                    **tool_round_identity.payload(),
-                },
+            _event_with_tool_round_authority(
+                Event(
+                    type=EventType.SESSION_CHECKPOINTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=_environment_name(registered_environment),
+                    payload={
+                        "checkpoint": PENDING_USER_INPUT_CHECKPOINT_KEY,
+                        "input_id": pending.input_id,
+                        "tool_call_id": pending.tool_call_id,
+                        **tool_round_identity.payload(),
+                    },
+                ),
+                tool_round_identity,
+                "input_id",
             ),
         )
 
@@ -1271,7 +1313,11 @@ class ToolRoundExecutor:
             )
             started_event = await self._event_writer.emit(
                 prepare_runtime_event(
-                    started,
+                    _event_with_tool_round_authority(
+                        started,
+                        tool_round_identity,
+                        *(field for field in ("approval_id", "input_id") if field in payload),
+                    ),
                     redactor=invocation_redactor,
                 )
             )
@@ -2131,13 +2177,21 @@ class ToolRoundExecutor:
                 payload["input_id"] = input_id
             yield await self._event_writer.emit(
                 prepare_runtime_event(
-                    Event(
-                        type=EventType.CREDENTIAL_PROXY_CHECKED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=_environment_name(registered_environment),
-                        tool_name=tool_call.name,
-                        payload=payload,
+                    _event_with_tool_round_authority(
+                        Event(
+                            type=EventType.CREDENTIAL_PROXY_CHECKED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=_environment_name(registered_environment),
+                            tool_name=tool_call.name,
+                            payload=payload,
+                        ),
+                        tool_round_identity,
+                        *(
+                            field_name
+                            for field_name in ("approval_id", "input_id")
+                            if field_name in payload
+                        ),
                     ),
                     redactor=redactor,
                 )
@@ -2314,6 +2368,21 @@ class ToolRoundExecutor:
         if publish_before_hooks and "terminal_outcome" not in event.payload:
             raise ValueError("Pre-hook tool-result publication requires terminal controls.")
         resolved_redactor = redactor if redactor is not None else self._secret_redactor
+        event_identity_values = {
+            field_name: event.payload.get(field_name)
+            for field_name in ("model_step_id", "model_attempt_id", "tool_round_id")
+        }
+        if all(type(value) is str for value in event_identity_values.values()):
+            event_identity = ToolRoundIdentity.model_validate(event_identity_values)
+            event = _event_with_tool_round_authority(
+                event,
+                event_identity,
+                *(
+                    field_name
+                    for field_name in ("approval_id", "input_id")
+                    if field_name in event.payload
+                ),
+            )
         event, result = _prepare_tool_result_event(
             event=event,
             result=result,
@@ -2718,22 +2787,26 @@ class ToolRoundRun:
             )
             yield await executor._event_writer.emit(checkpoint_event)
             yield await executor._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_AWAITING_USER_INPUT,
-                    session_id=session.id,
-                    agent_name=self._registered_agent.spec.name,
-                    environment_name=self._environment_name,
-                    tool_name=user_input_call.name,
-                    payload={
-                        **tool_round_identity.payload(),
-                        "input_id": pending_input.input_id,
-                        "tool_call_id": pending_input.tool_call_id,
-                        "question": pending_input.question,
-                        "options": list(pending_input.options),
-                        "tool_calls": [
-                            call.model_dump(mode="json") for call in pending_input.tool_calls
-                        ],
-                    },
+                _event_with_tool_round_authority(
+                    Event(
+                        type=EventType.SESSION_AWAITING_USER_INPUT,
+                        session_id=session.id,
+                        agent_name=self._registered_agent.spec.name,
+                        environment_name=self._environment_name,
+                        tool_name=user_input_call.name,
+                        payload={
+                            **tool_round_identity.payload(),
+                            "input_id": pending_input.input_id,
+                            "tool_call_id": pending_input.tool_call_id,
+                            "question": pending_input.question,
+                            "options": list(pending_input.options),
+                            "tool_calls": [
+                                call.model_dump(mode="json") for call in pending_input.tool_calls
+                            ],
+                        },
+                    ),
+                    tool_round_identity,
+                    "input_id",
                 )
             )
             raise UserInputRequired(pending_input)

@@ -10,8 +10,12 @@ import cayu.runtime.sessions as sessions_module
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
     CayuApp,
+    EventOrder,
     EventQuery,
+    EventRecord,
     IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     RunRequest,
@@ -20,6 +24,94 @@ from cayu.runtime import (
     SessionQuery,
     SessionStatus,
 )
+
+
+def test_committed_recovery_survives_bounded_public_linkage_lookup_miss() -> None:
+    class BoundedHistoryStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linkage_queries: list[EventQuery] = []
+
+        async def query_events(self, query: EventQuery) -> list[EventRecord]:
+            if query.order_by is EventOrder.SEQUENCE_DESC and query.limit == 5000:
+                self.linkage_queries.append(query)
+                return [
+                    EventRecord(
+                        sequence=index + 2,
+                        event=Event(
+                            type=EventType.HOOK_STARTED,
+                            session_id="recovered-session",
+                            payload={"index": index},
+                        ),
+                    )
+                    for index in range(5000)
+                ]
+            return await super().query_events(query)
+
+    async def scenario() -> None:
+        store = BoundedHistoryStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+
+        async def committed_recovery(
+            request: IncompleteSessionRecoveryRequest,
+        ) -> IncompleteSessionRecoveryResult:
+            assert request.session_id == "recovered-session"
+            return IncompleteSessionRecoveryResult(
+                session_id="recovered-session",
+                previous_status=SessionStatus.RUNNING,
+                status=SessionStatus.INTERRUPTED,
+                actions=(IncompleteSessionRecoveryAction.PENDING_APPROVAL,),
+                pending_approval_id="private-approval-before-bounded-window",
+                message="Recovered incomplete session.",
+            )
+
+        app._recover_incomplete_session_private = committed_recovery  # type: ignore[method-assign]
+        result = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="recovered-session")
+        )
+
+        assert result.status is SessionStatus.INTERRUPTED
+        assert result.actions == (IncompleteSessionRecoveryAction.PENDING_APPROVAL,)
+        assert result.pending_approval_id is None
+        assert "Public linkage unavailable for: pending_approval_id" in result.message
+        assert len(store.linkage_queries) == 1
+
+    asyncio.run(scenario())
+
+
+def test_committed_recovery_survives_public_linkage_lookup_failure() -> None:
+    class FailingHistoryStore(InMemorySessionStore):
+        async def query_events(self, query: EventQuery) -> list[EventRecord]:
+            if query.order_by is EventOrder.SEQUENCE_DESC and query.limit == 5000:
+                raise OSError("history unavailable")
+            return await super().query_events(query)
+
+    async def scenario() -> None:
+        store = FailingHistoryStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+
+        async def committed_recovery(
+            request: IncompleteSessionRecoveryRequest,
+        ) -> IncompleteSessionRecoveryResult:
+            return IncompleteSessionRecoveryResult(
+                session_id=request.session_id,
+                previous_status=SessionStatus.RUNNING,
+                status=SessionStatus.INTERRUPTED,
+                actions=(IncompleteSessionRecoveryAction.PENDING_APPROVAL,),
+                pending_approval_id="private-approval",
+                message="Recovered incomplete session.",
+            )
+
+        app._recover_incomplete_session_private = committed_recovery  # type: ignore[method-assign]
+        result = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id="recovered-session")
+        )
+
+        assert result.status is SessionStatus.INTERRUPTED
+        assert result.pending_approval_id is None
+        assert "Public linkage unavailable for: pending_approval_id" in result.message
+
+    asyncio.run(scenario())
 
 
 def test_incomplete_sessions_recovery_request_rejects_empty_statuses():

@@ -55,6 +55,11 @@ from cayu.runtime import (
     SessionRunFenced,
     SessionStatus,
 )
+from cayu.runtime._event_projection import (
+    PRIVATE_EVENT_AUTHORITY,
+    public_event_id,
+    public_event_sequence,
+)
 from cayu.runtime._run_limits import BudgetReservationLeaseLost
 from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.runtime.context import ContextBuildError
@@ -84,6 +89,28 @@ class RecordingCompactor(ContextCompactor):
             ),
             metadata={"compactor": type(self).__name__, "mode": "deterministic"},
         )
+
+
+async def _public_ids_for_private_event_ids(
+    store: Any,
+    session_id: str,
+    event_ids: list[str],
+) -> list[str]:
+    records = await store.query_events(EventQuery(session_id=session_id, limit=5000))
+    sequence_by_id = {record.event.id: record.sequence for record in records}
+    return [public_event_id(sequence_by_id[event_id]) for event_id in event_ids]
+
+
+async def _private_events_for_public_events(
+    store: Any,
+    session_id: str,
+    events: list[Event],
+) -> list[Event]:
+    sequences = [public_event_sequence(event.id) for event in events]
+    assert all(sequence is not None for sequence in sequences)
+    records = await store.query_events(EventQuery(session_id=session_id, limit=5000))
+    event_by_sequence = {record.sequence: record.event for record in records}
+    return [event_by_sequence[sequence] for sequence in sequences]
 
 
 class NoFullHistoryReplayStore(InMemorySessionStore):
@@ -286,7 +313,11 @@ def test_compact_session_lost_terminal_ack_keeps_completed_state_unambiguous() -
         assert operation["status"] == "completed"
 
         replay = [event async for event in app.compact_session(request)]
-        assert [event.id for event in replay] == operation["event_ids"]
+        assert [event.id for event in replay] == await _public_ids_for_private_event_ids(
+            store,
+            created.id,
+            operation["event_ids"],
+        )
         assert len(compactor.requests) == 1
 
     asyncio.run(run())
@@ -537,13 +568,15 @@ def test_compact_session_cancellation_does_not_wait_forever_for_stalled_publicat
             assert EventType.CONTEXT_COMPACTION_FAILED in {event.type for event in durable}
             assert operation["status"] == "failed"
             durable_budget_checks = [
-                event for event in durable if event.type == EventType.BUDGET_CHECKED
+                record
+                for record in await store.query_events(EventQuery(session_id=created.id))
+                if record.event.type == EventType.BUDGET_CHECKED
             ]
             sink_budget_checks = [
                 event for event in sink.events if event.type == EventType.BUDGET_CHECKED
             ]
             assert [event.id for event in sink_budget_checks] == [
-                event.id for event in durable_budget_checks
+                public_event_id(record.sequence) for record in durable_budget_checks
             ]
 
     asyncio.run(run())
@@ -672,7 +705,12 @@ def test_compact_session_cancellation_does_not_wait_for_stalled_completion_sink(
             if delivered and operation is not None and operation["status"] == "failed":
                 break
             await asyncio.sleep(0.01)
-        assert [event.id for event in delivered] == [completions[0].id]
+        completion_record = next(
+            record
+            for record in await store.query_events(EventQuery(session_id=created.id))
+            if record.event.id == completions[0].id
+        )
+        assert [event.id for event in delivered] == [public_event_id(completion_record.sequence)]
         assert sink.completion_delivery_calls == 1
         assert operation is not None
         assert operation["status"] == "failed"
@@ -839,9 +877,9 @@ def test_compact_session_late_completion_commit_is_not_republished(
         assert len(completions) == 1
         assert len({event.id for event in observed}) == len(observed)
         assert any(event.type == EventType.BUDGET_CHECKED for event in observed)
-        assert [event.id for event in observed if event.type == EventType.MODEL_COMPLETED] == [
-            completions[0].id
-        ]
+        assert [
+            event.id for event in observed if event.type == EventType.MODEL_COMPLETED
+        ] == await _public_ids_for_private_event_ids(store, created.id, [completions[0].id])
         assert operation is not None
         assert operation["status"] == "failed"
         assert EventType.CONTEXT_COMPACTION_FAILED in {event.type for event in durable}
@@ -1173,16 +1211,16 @@ def test_compact_session_attempt_ack_expiry_blocks_first_provider_dispatch() -> 
 
         assert provider.calls == 0
         durable_reservations = [
-            event
-            for event in await store.load_events(created.id)
-            if event.type == EventType.BUDGET_RESERVED
+            record
+            for record in await store.query_events(EventQuery(session_id=created.id))
+            if record.event.type == EventType.BUDGET_RESERVED
         ]
         sink_reservations = [
             event for event in sink.events if event.type == EventType.BUDGET_RESERVED
         ]
         assert len(durable_reservations) == 1
         assert [event.id for event in sink_reservations] == [
-            event.id for event in durable_reservations
+            public_event_id(record.sequence) for record in durable_reservations
         ]
 
     asyncio.run(run())
@@ -1670,17 +1708,14 @@ def test_unfinished_explicit_compaction_fails_closed_after_restart() -> None:
 
         assert len(provider.requests) == 1
         assert any(event.type == EventType.BUDGET_LIMIT_REACHED for event in restart_events)
-        durable = [
-            record.event
-            for record in await store.query_events(EventQuery(session_id=created.id, limit=100))
-        ]
+        durable = await store.query_events(EventQuery(session_id=created.id, limit=100))
         completions = [
-            event
-            for event in durable
-            if event.type == EventType.MODEL_COMPLETED
-            and event.payload.get("purpose") == "context_compaction"
+            record
+            for record in durable
+            if record.event.type == EventType.MODEL_COMPLETED
+            and record.event.payload.get("purpose") == "context_compaction"
         ]
-        assert [event.id for event in completions] == [uncertain.id]
+        assert [record.sequence for record in completions] == [public_event_sequence(uncertain.id)]
 
     asyncio.run(run())
 
@@ -2163,7 +2198,11 @@ def test_compact_session_preserves_transcript_and_replays_original_outcome() -> 
             EventType.SESSION_CHECKPOINTED,
         ]
         assert [event.id for event in replay] == [event.id for event in first]
-        assert [event.id for event in durable_events] == [event.id for event in first]
+        assert [event.id for event in first] == await _public_ids_for_private_event_ids(
+            store,
+            created.id,
+            [event.id for event in durable_events],
+        )
         assert len({event.payload["model_step_id"] for event in first}) == 1
         assert all("model_attempt_id" not in event.payload for event in first)
         assert len(compactor.requests) == 1
@@ -2716,15 +2755,19 @@ def test_compact_session_replays_original_outcome_after_session_advances() -> No
         assert EventType.SESSION_COMPLETED in [event.type for event in resume_events]
 
         replay = [event async for event in app.compact_session(request)]
-        operation_id = first[0].payload["operation_id"]
+        operation_sequences = {public_event_sequence(event.id) for event in first}
         durable_operation_events = [
             record.event
             for record in await store.query_events(EventQuery(session_id=created.id, limit=100))
-            if record.event.payload.get("operation_id") == operation_id
+            if record.sequence in operation_sequences
         ]
 
         assert [event.id for event in replay] == [event.id for event in first]
-        assert [event.id for event in durable_operation_events] == [event.id for event in first]
+        assert [event.id for event in first] == await _public_ids_for_private_event_ids(
+            store,
+            created.id,
+            [event.id for event in durable_operation_events],
+        )
         assert len(compactor.requests) == 1
 
     asyncio.run(run())
@@ -2805,7 +2848,11 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
 
         replay = [event async for event in app.compact_session(request)]
 
-        assert [event.id for event in replay] == [event.id for event in replay_events]
+        assert [event.id for event in replay] == await _public_ids_for_private_event_ids(
+            store,
+            created.id,
+            [event.id for event in replay_events],
+        )
 
     asyncio.run(run())
 
@@ -6119,7 +6166,11 @@ def test_compact_session_recovery_fences_a_late_attempt_and_preserves_its_usage(
         assert first_events[-1].type == EventType.CONTEXT_COMPACTION_FAILED
         assert first_events[-1].payload["error_type"] == "ContextBuildError"
         assert recovered_events[-1].type == EventType.SESSION_CHECKPOINTED
-        assert [event.id for event in replay] == [event.id for event in durable_events]
+        assert [event.id for event in replay] == await _public_ids_for_private_event_ids(
+            store,
+            created.id,
+            [event.id for event in durable_events],
+        )
         assert len({event.payload["operation_id"] for event in durable_events}) == 1
         assert len({event.payload["attempt_id"] for event in durable_events}) == 2
         model_step_ids = {
@@ -6698,7 +6749,21 @@ def test_compact_session_attributes_provider_usage_and_honors_run_limits() -> No
                 EventType.SESSION_CHECKPOINTED,
             }
         ]
-        assert usage_event.payload["model_attempt_id"].startswith("matt_")
+        assert usage_event.payload["model_attempt_id"] == PRIVATE_EVENT_AUTHORITY
+        usage_sequence = public_event_sequence(usage_event.id)
+        assert usage_sequence is not None
+        private_usage_record = next(
+            record
+            for record in await store.query_events(
+                EventQuery(
+                    session_id=created.id,
+                    after_sequence=usage_sequence - 1,
+                    limit=1,
+                )
+            )
+            if record.sequence == usage_sequence
+        )
+        assert private_usage_record.event.payload["model_attempt_id"].startswith("matt_")
         assert all(
             event.payload["model_step_id"] == usage_event.payload["model_step_id"]
             for event in terminal_context_events
@@ -7023,7 +7088,11 @@ def test_compact_session_preserves_usage_for_durably_invalid_summary() -> None:
         operation = await store.load_session_operation(created.id, request.idempotency_key)
         assert operation is not None
         assert operation["status"] == "failed"
-        assert operation["event_ids"] == [event.id for event in first]
+        assert [event.id for event in first] == await _public_ids_for_private_event_ids(
+            store,
+            created.id,
+            operation["event_ids"],
+        )
 
     asyncio.run(run())
 
@@ -8132,8 +8201,19 @@ def test_compact_session_preserves_bedrock_identity_without_usage_metrics() -> N
         completion = next(event for event in first if event.type == EventType.MODEL_COMPLETED)
         assert completion.payload["billing_identity"] == completed_identity.model_dump(mode="json")
         assert "usage_metrics" not in completion.payload
-        stored = await store.load_events(created.id)
-        stored_completion = next(event for event in stored if event.id == completion.id)
+        completion_sequence = public_event_sequence(completion.id)
+        assert completion_sequence is not None
+        stored_completion = next(
+            record.event
+            for record in await store.query_events(
+                EventQuery(
+                    session_id=created.id,
+                    after_sequence=completion_sequence - 1,
+                    limit=1,
+                )
+            )
+            if record.sequence == completion_sequence
+        )
         assert (
             stored_completion.payload["billing_identity"] == completion.payload["billing_identity"]
         )
@@ -8236,8 +8316,16 @@ def test_compact_session_rejects_completion_billing_identity_rewrite() -> None:
         assert "Model provider billing identity resolution failed" in str(exc_info.value)
         assert "Model provider billing identity resolution failed" in str(exc_info.value.cause)
         assert await store.load_transcript(created.id) == transcript
-        stored = await store.load_events(created.id)
-        assert [event.id for event in stored if event.id == completion.id] == [completion.id]
+        completion_sequence = public_event_sequence(completion.id)
+        assert completion_sequence is not None
+        stored_completion = await store.query_events(
+            EventQuery(
+                session_id=created.id,
+                after_sequence=completion_sequence - 1,
+                limit=1,
+            )
+        )
+        assert [record.sequence for record in stored_completion] == [completion_sequence]
         usage = await app.get_session_usage(created.id)
         assert usage.model_steps == 1
         assert usage.usage.input_tokens == 8
@@ -8585,7 +8673,20 @@ def test_compact_session_releases_partial_reservations_when_later_acquisition_fa
             EventType.BUDGET_RESERVATION_RELEASED,
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
-        reservation_id = events[2].payload["reservation_id"]
+        reservation_sequence = public_event_sequence(events[2].id)
+        assert reservation_sequence is not None
+        reservation_record = next(
+            record
+            for record in await store.query_events(
+                EventQuery(
+                    session_id=created.id,
+                    after_sequence=reservation_sequence - 1,
+                    limit=1,
+                )
+            )
+            if record.sequence == reservation_sequence
+        )
+        reservation_id = reservation_record.event.payload["reservation_id"]
         assert ledger.reserve_calls == 2
         assert ledger.release_calls == 1
         assert not await ledger.heartbeat(reservation_id=reservation_id)
@@ -8699,7 +8800,12 @@ def test_compact_session_preserves_partial_cleanup_and_releases_remaining_reserv
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
         assert len(ledger.reservation_ids) == 3
-        assert {event.payload["reservation_id"] for event in events[8:11]} == set(
+        private_releases = await _private_events_for_public_events(
+            store,
+            created.id,
+            events[8:11],
+        )
+        assert {event.payload["reservation_id"] for event in private_releases} == set(
             ledger.reservation_ids
         )
         assert ledger.release_calls == 4
@@ -9674,11 +9780,13 @@ def test_compact_session_persists_reservation_lifecycle_before_provider_work() -
             EventType.BUDGET_CHECKED,
             EventType.BUDGET_RESERVED,
         ]
-        durable_before_close = [
-            record.event
-            for record in await store.query_events(EventQuery(session_id=created.id, limit=100))
-        ]
-        assert [event.id for event in durable_before_close[:3]] == [
+        durable_records_before_close = await store.query_events(
+            EventQuery(session_id=created.id, limit=100)
+        )
+        durable_before_close = [record.event for record in durable_records_before_close]
+        assert [
+            public_event_id(record.sequence) for record in durable_records_before_close[:3]
+        ] == [
             started.id,
             checked.id,
             reserved.id,

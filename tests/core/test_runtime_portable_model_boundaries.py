@@ -43,11 +43,13 @@ from cayu.runtime import (
     ContextCompactor,
     ContextCountingConfig,
     ContextCountingMode,
+    EventQuery,
     InMemoryBudgetStore,
     InMemorySessionStore,
     RetryPolicy,
     RunRequest,
 )
+from cayu.runtime._event_projection import public_event_sequence
 
 
 def test_context_counting_oversized_result_fails_at_boundary_without_blocking_model():
@@ -253,7 +255,17 @@ def test_cayu_app_terminalizes_non_portable_completion_with_fail_closed_usage(
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    sequence = public_event_sequence(completed.id)
+    assert sequence is not None
+    durable_records = asyncio.run(
+        app.session_store.query_events(
+            EventQuery(session_id=f"sess_invalid_model_completion_{invalid_location}")
+        )
+    )
+    durable_completed = next(
+        record.event for record in durable_records if record.sequence == sequence
+    )
+    assert [event.id for event in budget_events] == [durable_completed.id]
     assert events[-1].type == EventType.SESSION_FAILED
 
 

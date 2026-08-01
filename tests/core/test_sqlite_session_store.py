@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import SecretStr
+from tests.core._event_projection_support import private_events_for_public_events
 
 from cayu import CHECKPOINT_SCHEMA_VERSION_KEY, SQLiteSessionStore, SQLiteTaskStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
@@ -20,6 +23,8 @@ from cayu.runtime import (
     CayuApp,
     EnqueueSessionMessageRequest,
     ForkSessionRequest,
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
     ResumeRequest,
     RunRequest,
     Session,
@@ -516,6 +521,547 @@ async def _collect_app_events(events) -> list[Event]:
 
 def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
+
+
+def _public_authority_codec(
+    *, active_key_id: str = "primary", retained: bool = False, primary_key_byte: int = 1
+) -> PublicAuthorityAliasCodec:
+    keys = {
+        "primary": SecretStr(
+            base64.urlsafe_b64encode(bytes([primary_key_byte]) * 32).decode("ascii").rstrip("=")
+        )
+    }
+    if retained:
+        keys["rotated"] = SecretStr(
+            base64.urlsafe_b64encode(bytes([2]) * 32).decode("ascii").rstrip("=")
+        )
+    return PublicAuthorityAliasCodec(
+        PublicAuthorityAliasKeyring(active_key_id=active_key_id, keys=keys)
+    )
+
+
+def test_sqlite_public_authority_aliases_are_authenticated_scoped_and_durable(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "public-authority.sqlite"
+    codec = _public_authority_codec(retained=True)
+    store = SQLiteSessionStore(db_path, public_authority_alias_codec=codec)
+    session_alias = codec.encode("private-session", field_name="session_id")
+    interaction_alias = codec.encode(
+        "private-interaction",
+        field_name="interaction_id",
+        session_id="private-session",
+    )
+
+    async def register() -> None:
+        await store.register_public_authority_alias(
+            session_alias,
+            field_name="session_id",
+            private_value="private-session",
+        )
+        # Registration is idempotent and interaction identities are scoped to
+        # their private session rather than a process-local public alias.
+        await store.register_public_authority_alias(
+            session_alias,
+            field_name="session_id",
+            private_value="private-session",
+        )
+        await store.register_public_authority_alias(
+            interaction_alias,
+            field_name="interaction_id",
+            private_value="private-interaction",
+            scope_session_id="private-session",
+        )
+        assert (
+            await store.resolve_public_authority_alias(
+                interaction_alias,
+                field_name="interaction_id",
+                scope_session_id="different-session",
+            )
+            is None
+        )
+        await store.close()
+
+    asyncio.run(register())
+
+    reopened = SQLiteSessionStore(db_path, public_authority_alias_codec=codec)
+
+    async def resolve_after_restart() -> None:
+        assert (
+            await reopened.resolve_public_authority_alias(
+                session_alias,
+                field_name="session_id",
+            )
+            == "private-session"
+        )
+        assert (
+            await reopened.resolve_public_authority_alias(
+                interaction_alias,
+                field_name="interaction_id",
+                scope_session_id="private-session",
+            )
+            == "private-interaction"
+        )
+        await reopened.close()
+
+    asyncio.run(resolve_after_restart())
+
+
+def test_sqlite_public_authority_alias_registration_fails_closed(tmp_path) -> None:
+    db_path = tmp_path / "public-authority-invalid.sqlite"
+    codec = _public_authority_codec()
+    alias = codec.encode("private-session", field_name="session_id")
+    unconfigured = SQLiteSessionStore(db_path)
+
+    async def assert_unconfigured() -> None:
+        with pytest.raises(ValueError, match="store-configured provenance"):
+            await unconfigured.register_public_authority_alias(
+                alias,
+                field_name="session_id",
+                private_value="private-session",
+            )
+        await unconfigured.close()
+
+    asyncio.run(assert_unconfigured())
+
+    store = SQLiteSessionStore(db_path, public_authority_alias_codec=codec)
+
+    async def assert_invalid() -> None:
+        with pytest.raises(ValueError, match="store-configured provenance"):
+            await store.register_public_authority_alias(
+                alias,
+                field_name="session_id",
+                private_value="different-private-session",
+            )
+        with pytest.raises(ValueError, match="field-mismatched"):
+            await store.resolve_public_authority_alias(
+                alias,
+                field_name="interaction_id",
+                scope_session_id="private-session",
+            )
+        with pytest.raises(ValueError, match="must not have a session scope"):
+            await store.resolve_public_authority_alias(
+                alias,
+                field_name="session_id",
+                scope_session_id="private-session",
+            )
+        with pytest.raises(ValueError, match="require a private session scope"):
+            await store.resolve_public_authority_alias(
+                codec.encode("interaction", field_name="interaction_id", session_id="session"),
+                field_name="interaction_id",
+            )
+        await store.close()
+
+    asyncio.run(assert_invalid())
+
+
+def test_sqlite_public_authority_aliases_allow_key_rotation_and_reject_conflicts(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "public-authority-rotation.sqlite"
+    first_codec = _public_authority_codec()
+    rotated_codec = _public_authority_codec(active_key_id="rotated", retained=True)
+    first_alias = first_codec.encode("private-session", field_name="session_id")
+    rotated_alias = rotated_codec.encode("private-session", field_name="session_id")
+    store = SQLiteSessionStore(db_path, public_authority_alias_codec=rotated_codec)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            ) VALUES (?, ?, ?, ?)
+            """,
+            ("session_id", "", first_alias, "conflicting-private-session"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match="conflicts with existing private authority"):
+            await store.register_public_authority_alias(
+                first_alias,
+                field_name="session_id",
+                private_value="private-session",
+            )
+        await store.register_public_authority_alias(
+            rotated_alias,
+            field_name="session_id",
+            private_value="private-session",
+        )
+        assert (
+            await store.resolve_public_authority_alias(
+                rotated_alias,
+                field_name="session_id",
+            )
+            == "private-session"
+        )
+        await store.close()
+
+    asyncio.run(run())
+
+    with pytest.raises(ValueError, match="codec is required"):
+        SQLiteSessionStore(db_path)
+    with pytest.raises(ValueError, match="key material conflicts"):
+        SQLiteSessionStore(
+            db_path,
+            public_authority_alias_codec=_public_authority_codec(primary_key_byte=9),
+        )
+
+
+def test_sqlite_public_authority_aliases_reject_retired_keys(tmp_path) -> None:
+    db_path = tmp_path / "public-authority-retirement.sqlite"
+    first_codec = _public_authority_codec()
+    retained_codec = _public_authority_codec(active_key_id="rotated", retained=True)
+    rotated_key = SecretStr(base64.urlsafe_b64encode(bytes([2]) * 32).decode("ascii").rstrip("="))
+    retired_codec = retained_codec.rotated(
+        active_key_id="rotated",
+        key=rotated_key,
+        retire_key_ids=("primary",),
+    )
+    private_session_id = "private-session"
+    old_alias = first_codec.encode(private_session_id, field_name="session_id")
+    active_alias = retained_codec.encode(private_session_id, field_name="session_id")
+
+    first_store = SQLiteSessionStore(
+        db_path,
+        public_authority_alias_codec=first_codec,
+    )
+
+    async def seed() -> None:
+        await first_store.register_public_authority_alias(
+            old_alias,
+            field_name="session_id",
+            private_value=private_session_id,
+        )
+        await first_store.close()
+
+    asyncio.run(seed())
+
+    retained_store = SQLiteSessionStore(
+        db_path,
+        public_authority_alias_codec=retained_codec,
+    )
+
+    async def retain() -> None:
+        await retained_store.register_public_authority_alias(
+            active_alias,
+            field_name="session_id",
+            private_value=private_session_id,
+        )
+        assert (
+            await retained_store.resolve_public_authority_alias(
+                old_alias,
+                field_name="session_id",
+            )
+            == private_session_id
+        )
+        await retained_store.close()
+
+    asyncio.run(retain())
+
+    retired_store = SQLiteSessionStore(
+        db_path,
+        public_authority_alias_codec=retired_codec,
+    )
+
+    async def reject_retired() -> None:
+        assert (
+            await retired_store.resolve_public_authority_alias(
+                old_alias,
+                field_name="session_id",
+            )
+            is None
+        )
+        assert (
+            await retired_store.resolve_public_authority_alias(
+                active_alias,
+                field_name="session_id",
+            )
+            == private_session_id
+        )
+        await retired_store.close()
+
+    asyncio.run(reject_retired())
+
+
+def test_sqlite_public_authority_rotation_fences_stale_workers(tmp_path) -> None:
+    db_path = tmp_path / "public-authority-stale-worker.sqlite"
+    first_codec = _public_authority_codec()
+    rotated_codec = _public_authority_codec(active_key_id="rotated", retained=True)
+    stale_store = SQLiteSessionStore(db_path, public_authority_alias_codec=first_codec)
+
+    async def seed() -> None:
+        await stale_store.create(
+            RunRequest(agent_name="assistant", session_id="before-rotation", messages=[]),
+            identity=_identity(),
+        )
+        await stale_store.append_transcript_messages(
+            "before-rotation",
+            [Message.text("user", "before rotation")],
+        )
+        await stale_store.append_event(
+            "before-rotation",
+            Event(
+                id="before-rotation-completed",
+                type=EventType.SESSION_COMPLETED,
+                session_id="before-rotation",
+            ),
+        )
+        await stale_store.update_status("before-rotation", SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    staged_codec = _public_authority_codec(active_key_id="primary", retained=True)
+    staged_store = SQLiteSessionStore(db_path, public_authority_alias_codec=staged_codec)
+
+    async def stage() -> None:
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.create(
+                RunRequest(agent_name="assistant", session_id="stale-staged-write", messages=[]),
+                identity=_identity(),
+            )
+        await staged_store.create(
+            RunRequest(agent_name="assistant", session_id="during-staging", messages=[]),
+            identity=_identity(),
+        )
+
+    asyncio.run(stage())
+    rotated_store = SQLiteSessionStore(db_path, public_authority_alias_codec=rotated_codec)
+
+    async def assert_fenced() -> None:
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.create(
+                RunRequest(agent_name="assistant", session_id="stale-write", messages=[]),
+                identity=_identity(),
+            )
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.load("before-rotation")
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.list_sessions()
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.list_sessions_with_pending_interruption_cascade()
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.query_transcript(
+                TranscriptQuery(session_id="before-rotation", limit=10)
+            )
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.summarize_events("before-rotation")
+        with pytest.raises(RuntimeError, match="configuration is stale"):
+            await stale_store.summarize_outcome("before-rotation")
+
+        rotated_alias = rotated_codec.encode("before-rotation", field_name="session_id")
+        assert (
+            await rotated_store.resolve_public_authority_alias(
+                rotated_alias,
+                field_name="session_id",
+            )
+            == "before-rotation"
+        )
+        staged_write_rotated_alias = rotated_codec.encode(
+            "during-staging",
+            field_name="session_id",
+        )
+        assert (
+            await rotated_store.resolve_public_authority_alias(
+                staged_write_rotated_alias,
+                field_name="session_id",
+            )
+            == "during-staging"
+        )
+        await stale_store.close()
+        await staged_store.close()
+        await rotated_store.close()
+
+    asyncio.run(assert_fenced())
+
+    with pytest.raises(ValueError, match="retired.*cannot become active"):
+        SQLiteSessionStore(db_path, public_authority_alias_codec=first_codec)
+
+
+def test_sqlite_rotation_fence_is_atomic_with_identity_write_transaction(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "public-authority-atomic-fence.sqlite"
+    first_codec = _public_authority_codec()
+    rotated_codec = _public_authority_codec(active_key_id="rotated", retained=True)
+    stale_store = SQLiteSessionStore(db_path, public_authority_alias_codec=first_codec)
+    precheck_completed = threading.Event()
+    allow_write = threading.Event()
+
+    async def scenario() -> None:
+        await stale_store.create(
+            RunRequest(agent_name="assistant", session_id="session", messages=[]),
+            identity=_identity(),
+        )
+        original_check = stale_store._require_current_public_authority_configuration
+
+        def pause_after_precheck(connection: sqlite3.Connection) -> None:
+            original_check(connection)
+            precheck_completed.set()
+            if not allow_write.wait(timeout=5):
+                raise AssertionError("rotation race was not released")
+
+        monkeypatch.setattr(
+            stale_store,
+            "_require_current_public_authority_configuration",
+            pause_after_precheck,
+        )
+        append_task = asyncio.create_task(
+            stale_store.append_event(
+                "session",
+                Event(
+                    id="must-not-commit",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="session",
+                ),
+            )
+        )
+        assert await asyncio.to_thread(precheck_completed.wait, 5)
+        rotated_store = SQLiteSessionStore(
+            db_path,
+            public_authority_alias_codec=rotated_codec,
+        )
+        allow_write.set()
+        with pytest.raises(sqlite3.IntegrityError, match="stale public authority"):
+            await append_task
+        assert await rotated_store.load_events("session") == []
+        await rotated_store.close()
+        await stale_store.close()
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_public_authority_aliases_follow_writes_and_backfill_all_sources(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "public-authority-backfill.sqlite"
+    unconfigured = SQLiteSessionStore(db_path)
+
+    async def write_legacy_sources() -> None:
+        await unconfigured.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="legacy-private-session",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await unconfigured.append_event(
+            "legacy-private-session",
+            Event(
+                id="legacy-event-only",
+                type=EventType.INTERACTION_COMPLETED,
+                session_id="legacy-private-session",
+                interaction_id="legacy-event-interaction",
+            ),
+        )
+        await unconfigured.append_transcript_messages(
+            "legacy-private-session",
+            [Message.text("user", "legacy")],
+            interaction_id="legacy-transcript-interaction",
+        )
+        await unconfigured.append_event(
+            "legacy-private-session",
+            Event(
+                id="legacy-turn-only",
+                type=EventType.TURN_COMPLETED,
+                session_id="legacy-private-session",
+                payload={"interaction_ids": ["legacy-nested-interaction"]},
+            ),
+        )
+        await unconfigured.close()
+
+    asyncio.run(write_legacy_sources())
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.create_function(
+            "cayu_public_authority_alias",
+            3,
+            lambda _value, _field, _scope: None,
+        )
+        connection.create_function("cayu_public_authority_active_key_id", 0, lambda: None)
+        connection.create_function("cayu_public_authority_keyring_fingerprint", 0, lambda: None)
+        connection.create_function(
+            "cayu_public_authority_aliases",
+            3,
+            lambda _value, _field, _scope: "[]",
+        )
+        connection.execute(
+            """
+            INSERT INTO cayu_events (
+                session_id, event_id, event_type, timestamp, payload_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-private-session",
+                "legacy-malformed-nested-turn",
+                str(EventType.TURN_COMPLETED),
+                datetime.now(UTC).isoformat(),
+                '{"interaction_ids":["","   "]}',
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    codec = _public_authority_codec(active_key_id="rotated", retained=True)
+    configured = SQLiteSessionStore(db_path, public_authority_alias_codec=codec)
+
+    async def assert_backfill_and_new_write() -> None:
+        for session_alias in codec.aliases(
+            "legacy-private-session",
+            field_name="session_id",
+        ):
+            assert (
+                await configured.resolve_public_authority_alias(
+                    session_alias,
+                    field_name="session_id",
+                )
+                == "legacy-private-session"
+            )
+        for private_interaction in (
+            "legacy-event-interaction",
+            "legacy-transcript-interaction",
+            "legacy-nested-interaction",
+        ):
+            aliases = codec.aliases(
+                private_interaction,
+                field_name="interaction_id",
+                session_id="legacy-private-session",
+            )
+            for alias in aliases:
+                assert (
+                    await configured.resolve_public_authority_alias(
+                        alias,
+                        field_name="interaction_id",
+                        scope_session_id="legacy-private-session",
+                    )
+                    == private_interaction
+                )
+
+        await configured.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="new-private-session",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        new_alias = codec.encode("new-private-session", field_name="session_id")
+        assert (
+            await configured.resolve_public_authority_alias(
+                new_alias,
+                field_name="session_id",
+            )
+            == "new-private-session"
+        )
+        await configured.close()
+
+    asyncio.run(assert_backfill_and_new_write())
 
 
 def test_sqlite_session_store_persists_sessions_events_and_checkpoints(tmp_path):
@@ -1293,7 +1839,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 26"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 27"):
@@ -1344,6 +1890,17 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
         task_topology_revision = connection.execute(
             "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 27"
         ).fetchone()
+        public_authority_revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 28"
+        ).fetchone()
+        public_authority_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_public_authority_aliases'"
+        ).fetchone()
+        public_authority_keys_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_public_authority_alias_keys'"
+        ).fetchone()
         task_session_topology_index = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_cayu_tasks_session_created_id'"
@@ -1372,6 +1929,9 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     assert topology_revision == ("additive", 23)
     assert topology_index == ("idx_cayu_sessions_parent_created_id",)
     assert task_topology_revision == ("additive", 26)
+    assert public_authority_revision == ("breaking", 28)
+    assert public_authority_table == ("cayu_public_authority_aliases",)
+    assert public_authority_keys_table == ("cayu_public_authority_alias_keys",)
     assert task_session_topology_index == ("idx_cayu_tasks_session_created_id",)
     assert task_parent_topology_index == ("idx_cayu_tasks_parent_created_id",)
     assert legacy_writer_trigger is None
@@ -1405,7 +1965,7 @@ def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 26"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -1451,7 +2011,7 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 26"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -1490,7 +2050,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 26"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -1944,6 +2504,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (25, 25),
         (26, 26),
         (27, 26),
+        (28, 28),
     ]
     assert version == schema_migrations.LATEST_REVISION
 
@@ -2158,6 +2719,7 @@ def test_cayu_app_can_use_sqlite_session_store(tmp_path):
             )
         ]
         persisted_events = await store.load_events("sess_runtime_sqlite")
+        private_events = await private_events_for_public_events(store, events)
         session = await store.load("sess_runtime_sqlite")
 
         assert [event.type for event in events] == [
@@ -2170,7 +2732,7 @@ def test_cayu_app_can_use_sqlite_session_store(tmp_path):
             EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
         ]
-        assert persisted_events == events
+        assert persisted_events == private_events
         assert session is not None
         assert session.status == SessionStatus.COMPLETED
         assert session.provider_name == "fake"

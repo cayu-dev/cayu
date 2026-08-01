@@ -7,6 +7,7 @@ import hashlib
 import heapq
 import json
 import math
+import secrets
 import time
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
@@ -29,6 +30,8 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
+    SecretStr,
     StrictBool,
     StrictInt,
     field_validator,
@@ -53,7 +56,14 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType, copy_event
+from cayu.core.events import (
+    EVENT_ID_MAX_CHARS,
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import (
     Message,
     MessageRole,
@@ -124,6 +134,11 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
 )
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+    parse_public_authority_alias,
+)
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import (
@@ -349,6 +364,13 @@ def attribute_event_to_current_interaction(event: Event) -> Event:
         interaction_id = _current_session_interaction_id(copied.session_id)
         if interaction_id is not None:
             copied = copied.model_copy(update={"interaction_id": interaction_id})
+    active_interaction_id = _current_session_interaction_id(copied.session_id)
+    invocation_interaction_ids = _current_session_invocation_interaction_ids(copied.session_id)
+    if active_interaction_id is not None or invocation_interaction_ids:
+        fields = ["session_id"]
+        if active_interaction_id is not None and copied.interaction_id == active_interaction_id:
+            fields.append("interaction_id")
+        copied = event_with_runtime_envelope_authority(copied, *fields)
     return copied
 
 
@@ -613,6 +635,10 @@ class SessionDebugState(StrEnum):
     INTERRUPTION = "interruption"
 
 
+def _empty_run_request_authority() -> frozenset[tuple[str, str]]:
+    return frozenset()
+
+
 class RunRequest(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -649,6 +675,9 @@ class RunRequest(BaseModel):
     loop_policies: SkipJsonSchema[tuple[LoopPolicy, ...]] = Field(
         default_factory=tuple,
         exclude=True,
+    )
+    _runtime_generated_authority: frozenset[tuple[str, str]] = PrivateAttr(
+        default_factory=_empty_run_request_authority
     )
 
     @field_validator("messages")
@@ -3224,6 +3253,7 @@ class PendingActionRecord(BaseModel):
     input_id: str | None = None
     round_id: str | None = None
     tool_call_id: str | None = None
+    source_linkage: dict[str, str] = Field(default_factory=dict, exclude=True, repr=False)
     policy_evidence: ToolPolicyEvidence | None = None
     question: str | None = None
     options: list[str] = Field(default_factory=list)
@@ -3258,6 +3288,21 @@ class PendingActionRecord(BaseModel):
     @classmethod
     def copy_event_record(cls, value: EventRecord) -> EventRecord:
         return value.model_copy(deep=True)
+
+    @field_validator("source_linkage", mode="before")
+    @classmethod
+    def copy_source_linkage(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return {}
+        if type(value) is not dict:
+            raise TypeError("source_linkage must be a mapping of event fields to strings.")
+        allowed = {"approval_id", "input_id", "tool_round_id", "tool_call_id"}
+        if not set(value) <= allowed:
+            raise ValueError("source_linkage contains an unsupported event field.")
+        return {
+            field_name: require_nonblank(field_value, f"source_linkage.{field_name}")
+            for field_name, field_value in value.items()
+        }
 
     @field_validator("options", mode="before")
     @classmethod
@@ -4322,6 +4367,57 @@ def filter_transcript_records(
     return filtered
 
 
+def _public_authority_alias_store_key(
+    public_alias: str,
+    *,
+    field_name: str,
+    private_value: str | None,
+    scope_session_id: str | None,
+) -> tuple[str, str, str]:
+    parsed = parse_public_authority_alias(public_alias)
+    if parsed is None or parsed.field_name != field_name:
+        raise ValueError("Public authority alias is malformed or field-mismatched.")
+    if field_name == "session_id":
+        if scope_session_id is not None:
+            raise ValueError("Session aliases must not have a session scope.")
+        scope_key = ""
+    elif field_name == "interaction_id":
+        if scope_session_id is None:
+            raise ValueError("Interaction aliases require a private session scope.")
+        scope_key = require_nonblank(scope_session_id, "scope_session_id")
+    else:
+        raise ValueError("field_name must be session_id or interaction_id.")
+    if private_value is not None:
+        require_nonblank(private_value, "private_value")
+    return field_name, scope_key, public_alias
+
+
+def _authenticated_public_authority_alias_private_value(
+    codec: PublicAuthorityAliasCodec | None,
+    public_alias: str,
+    private_value: str | None,
+    *,
+    field_name: str,
+    scope_session_id: str | None,
+) -> str | None:
+    """Return a registry value only while its signing key remains accepted."""
+
+    if private_value is None or codec is None:
+        return None
+    try:
+        authenticated = codec.matches(
+            public_alias,
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        )
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Public authority alias registry contains invalid private authority."
+        ) from None
+    return private_value if authenticated else None
+
+
 class SessionStore(ABC):
     """Persistent store for sessions and append-only events.
 
@@ -4337,6 +4433,58 @@ class SessionStore(ABC):
     supports_usage_aggregates: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False
     supports_session_topology: ClassVar[bool] = False
+    supports_public_authority_aliases: ClassVar[bool] = False
+
+    @property
+    def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
+        """Return the immutable codec bound to this store, when supported."""
+
+        return None
+
+    async def register_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        private_value: str,
+        scope_session_id: str | None = None,
+    ) -> None:
+        """Persist one public-to-private authority mapping before exposure.
+
+        This optional capability is deliberately explicit. A runtime must not
+        publish a one-way public alias unless its store can resolve that alias
+        after restart and from another worker.
+        """
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable public authority aliases."
+        )
+
+    async def resolve_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> str | None:
+        """Resolve one exact indexed alias within its authority scope."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable public authority aliases."
+        )
+
+    async def public_authority_private_value_exists(
+        self,
+        private_value: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> bool:
+        """Return positive indexed evidence that private authority exists."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support durable public authority aliases."
+        )
 
     @abstractmethod
     async def create(
@@ -5519,10 +5667,35 @@ class InMemorySessionStore(SessionStore):
     supports_usage_aggregates: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
+    supports_public_authority_aliases: ClassVar[bool] = True
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+    ) -> None:
+        if public_authority_alias_codec is not None and not isinstance(
+            public_authority_alias_codec,
+            PublicAuthorityAliasCodec,
+        ):
+            raise TypeError("public_authority_alias_codec must be a PublicAuthorityAliasCodec.")
+        if public_authority_alias_codec is None:
+            # In-memory stores have no restart or multi-worker key-distribution
+            # boundary. Give each store lifetime a cryptographically random key;
+            # persistent stores require explicit deployment provisioning.
+            encoded_key = (
+                base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("=")
+            )
+            public_authority_alias_codec = PublicAuthorityAliasCodec(
+                PublicAuthorityAliasKeyring(
+                    active_key_id="memory",
+                    keys={"memory": SecretStr(encoded_key)},
+                )
+            )
+        self._public_authority_alias_codec = public_authority_alias_codec
         self._lock = asyncio.Lock()
         self._sessions: dict[str, Session] = {}
+        self._public_authority_aliases: dict[tuple[str, str, str], str] = {}
         # Stable direct-child keys maintained with session lifecycle writes. Topology
         # pages can therefore seek one parent branch without scanning the complete
         # in-memory session registry.
@@ -5593,6 +5766,10 @@ class InMemorySessionStore(SessionStore):
         ] = {}
         self._session_message_delivery_records: dict[str, _InMemoryMessageDeliveryRecord] = {}
         self._next_session_message_ordering_key = 1
+
+    @property
+    def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec:
+        return self._public_authority_alias_codec
 
     def _index_session_parent_unlocked(self, session: Session) -> None:
         parent_session_id = session.parent_session_id
@@ -5794,6 +5971,113 @@ class InMemorySessionStore(SessionStore):
         self._transcript_indices_by_interaction[session_id] = projection
         return projection
 
+    async def register_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        private_value: str,
+        scope_session_id: str | None = None,
+    ) -> None:
+        key = _public_authority_alias_store_key(
+            public_alias,
+            field_name=field_name,
+            private_value=private_value,
+            scope_session_id=scope_session_id,
+        )
+        codec = self.public_authority_alias_codec
+        if codec is None or not codec.matches(
+            public_alias,
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        ):
+            raise ValueError("Public authority alias lacks valid store-configured provenance.")
+        async with self._lock:
+            self._register_public_authority_alias_unlocked(key, private_value)
+
+    def _register_public_authority_alias_unlocked(
+        self,
+        key: tuple[str, str, str],
+        private_value: str,
+    ) -> None:
+        existing = self._public_authority_aliases.get(key)
+        if existing is not None and existing != private_value:
+            raise ValueError("Public authority alias conflicts with existing private authority.")
+        self._public_authority_aliases[key] = private_value
+
+    def _register_private_authority_alias_unlocked(
+        self,
+        private_value: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> None:
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            return
+        for public_alias in codec.aliases(
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        ):
+            key = _public_authority_alias_store_key(
+                public_alias,
+                field_name=field_name,
+                private_value=private_value,
+                scope_session_id=scope_session_id,
+            )
+            self._register_public_authority_alias_unlocked(key, private_value)
+
+    async def resolve_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> str | None:
+        key = _public_authority_alias_store_key(
+            public_alias,
+            field_name=field_name,
+            private_value=None,
+            scope_session_id=scope_session_id,
+        )
+        async with self._lock:
+            return _authenticated_public_authority_alias_private_value(
+                self.public_authority_alias_codec,
+                public_alias,
+                self._public_authority_aliases.get(key),
+                field_name=field_name,
+                scope_session_id=scope_session_id,
+            )
+
+    async def public_authority_private_value_exists(
+        self,
+        private_value: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> bool:
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Public authority alias codec is unavailable.")
+        probe = codec.encode(
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        )
+        field_name, scope_key, _probe = _public_authority_alias_store_key(
+            probe,
+            field_name=field_name,
+            private_value=private_value,
+            scope_session_id=scope_session_id,
+        )
+        async with self._lock:
+            return any(
+                key_field == field_name and key_scope == scope_key and stored == private_value
+                for (key_field, key_scope, _alias), stored in self._public_authority_aliases.items()
+            )
+
     async def create(
         self,
         request: RunRequest,
@@ -5842,6 +6126,10 @@ class InMemorySessionStore(SessionStore):
                 labels=request.labels,
                 metadata=deepcopy(request.metadata),
                 run_epoch=1 if admission is not None else 0,
+            )
+            self._register_private_authority_alias_unlocked(
+                session.id,
+                field_name="session_id",
             )
             self._sessions[session.id] = session
             self._index_session_parent_unlocked(session)
@@ -5994,6 +6282,10 @@ class InMemorySessionStore(SessionStore):
                         "checkpoint",
                     )
 
+            self._register_private_authority_alias_unlocked(
+                fork.id,
+                field_name="session_id",
+            )
             self._sessions[fork.id] = fork.model_copy(deep=True)
             self._index_session_parent_unlocked(fork)
             self._events[fork.id] = []
@@ -6010,6 +6302,14 @@ class InMemorySessionStore(SessionStore):
             # Historical attribution remains tied to the source session's
             # interactions; new child work receives new child interaction IDs.
             self._transcript_interaction_ids[fork.id] = list(source_interaction_ids[:copied_count])
+            for interaction_id in set(self._transcript_interaction_ids[fork.id]):
+                if interaction_id is None:
+                    continue
+                self._register_private_authority_alias_unlocked(
+                    interaction_id,
+                    field_name="interaction_id",
+                    scope_session_id=fork.id,
+                )
             if copied_checkpoint is not None:
                 self._store_checkpoint_unlocked(fork.id, copied_checkpoint)
             return fork.model_copy(deep=True)
@@ -6819,10 +7119,28 @@ class InMemorySessionStore(SessionStore):
             session_records.append(record)
             interaction_id = stored_event.interaction_id
             if interaction_id is not None:
+                self._register_private_authority_alias_unlocked(
+                    interaction_id,
+                    field_name="interaction_id",
+                    scope_session_id=session_id,
+                )
                 self._interaction_event_records.setdefault(session_id, {}).setdefault(
                     interaction_id,
                     [],
                 ).append(record)
+            if stored_event.type == EventType.TURN_COMPLETED:
+                nested_interaction_ids = stored_event.payload.get("interaction_ids")
+                if type(nested_interaction_ids) is list:
+                    for nested_interaction_id in dict.fromkeys(
+                        value
+                        for value in nested_interaction_ids
+                        if type(value) is str and value.strip()
+                    ):
+                        self._register_private_authority_alias_unlocked(
+                            nested_interaction_id,
+                            field_name="interaction_id",
+                            scope_session_id=session_id,
+                        )
             if interaction_id is not None and event_type in lifecycle_types:
                 latest_by_id = self._latest_interaction_event_records.setdefault(session_id, {})
                 latest_by_sequence = self._latest_interaction_event_records_by_sequence.setdefault(
@@ -8929,6 +9247,12 @@ class InMemorySessionStore(SessionStore):
             _assert_session_run_epoch(session_id, session)
             if not copied_messages:
                 return
+            if interaction_id is not None:
+                self._register_private_authority_alias_unlocked(
+                    interaction_id,
+                    field_name="interaction_id",
+                    scope_session_id=session_id,
+                )
             self._transcripts[session_id].extend(copied_messages)
             self._extend_transcript_attribution_unlocked(
                 session_id, [interaction_id] * len(copied_messages)
@@ -8960,6 +9284,11 @@ class InMemorySessionStore(SessionStore):
             deferred = self._deferred_interaction_inputs.get(session_id)
             if deferred != (interaction_id, expected):
                 raise RuntimeError("Deferred interaction input changed before finalization.")
+            self._register_private_authority_alias_unlocked(
+                interaction_id,
+                field_name="interaction_id",
+                scope_session_id=session_id,
+            )
             if self._transcripts.get(session_id):
                 raise RuntimeError("Initial transcript changed before finalization.")
             if len(replacement) < len(expected) or (
@@ -9070,6 +9399,12 @@ class InMemorySessionStore(SessionStore):
                 raise ValueError("Checkpoint transform must return a checkpoint.")
             copied_checkpoint = copy_durable_json_object(transformed, "checkpoint")
             if copied_messages:
+                if interaction_id is not None:
+                    self._register_private_authority_alias_unlocked(
+                        interaction_id,
+                        field_name="interaction_id",
+                        scope_session_id=session_id,
+                    )
                 self._transcripts[session_id].extend(copied_messages)
                 self._extend_transcript_attribution_unlocked(
                     session_id, [interaction_id] * len(copied_messages)
@@ -9422,7 +9757,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
     messages = getattr(request, "messages", None)
     if type(messages) is not list:
         raise ValueError("RunRequest messages must be a list.")
-    return RunRequest(
+    copied = RunRequest(
         agent_name=request.agent_name,
         messages=[detach_message(message) for message in messages],
         session_id=request.session_id,
@@ -9442,6 +9777,53 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         structured_output=copy_structured_output_spec(request.structured_output),
         thinking=request.thinking,
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
+    )
+    copied._runtime_generated_authority = request._runtime_generated_authority
+    return copied
+
+
+def run_request_with_runtime_generated_authority(
+    request: RunRequest,
+    *field_names: str,
+) -> RunRequest:
+    """Attest exact run authority selected by a trusted runtime boundary."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("Runtime authority requires a RunRequest.")
+    authority = set(request._runtime_generated_authority)
+    for field_name in field_names:
+        if field_name not in {
+            "session_id",
+            "task_id",
+            "parent_session_id",
+            "causal_budget_id",
+        }:
+            raise ValueError("Unsupported runtime-generated run authority field.")
+        value = getattr(request, field_name)
+        if type(value) is not str or not value.strip():
+            raise ValueError(
+                f"RunRequest.{field_name} must be a non-empty string before attestation."
+            )
+        authority.add((field_name, value))
+    copied = copy_run_request(request)
+    copied._runtime_generated_authority = frozenset(authority)
+    return copied
+
+
+def run_request_authority_is_runtime_generated(
+    request: RunRequest,
+    *,
+    field_name: str,
+    value: str,
+) -> bool:
+    """Return positive in-process provenance for exact generated run authority."""
+
+    return (
+        type(request) is RunRequest
+        and type(field_name) is str
+        and type(value) is str
+        and getattr(request, field_name, None) == value
+        and (field_name, value) in request._runtime_generated_authority
     )
 
 
@@ -13970,7 +14352,11 @@ def _event_with_session_run_operation(
     if existing_operation_id not in {None, operation.operation_id}:
         raise ValueError("Terminal event carries a conflicting session run operation identity.")
     payload[_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY] = operation.operation_id
-    return event.model_copy(update={"payload": payload}, deep=True)
+    bound = event.model_copy(update={"payload": payload}, deep=True)
+    return event_with_runtime_payload_authority(
+        bound,
+        _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    )
 
 
 def _incomplete_recovery_claim_from_checkpoint(

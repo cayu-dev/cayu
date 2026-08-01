@@ -473,17 +473,15 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
     )
     approval_id = approval_event.payload["approval"]["approval_id"]
     assert approval_event.payload["approval_id"] == approval_id
-    assert approval_event.payload["tool_call_id"] == "call_1"
+    assert approval_event.payload["tool_call_id"] == "cayu_event_6:tool_call_id"
     completed_event = next(
         event for event in pause_events if event.type == EventType.MODEL_COMPLETED
     )
-    assert {
-        key: approval_event.payload[key]
-        for key in ("model_step_id", "model_attempt_id", "tool_round_id")
-    } == {
-        key: completed_event.payload[key]
-        for key in ("model_step_id", "model_attempt_id", "tool_round_id")
+    assert {key: approval_event.payload[key] for key in ("model_step_id", "model_attempt_id")} == {
+        key: completed_event.payload[key] for key in ("model_step_id", "model_attempt_id")
     }
+    assert approval_event.payload["tool_round_id"] == "cayu_event_6:tool_round_id"
+    assert completed_event.payload["tool_round_id"] == "[PRIVATE_EVENT_AUTHORITY]"
 
     resume_events = asyncio.run(
         _collect(

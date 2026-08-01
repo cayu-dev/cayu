@@ -27,7 +27,14 @@ from cayu.core.billing import (
     copy_billing_identity,
     resolved_billing_identity,
 )
-from cayu.core.events import Event, EventType
+from cayu.core.events import (
+    Event,
+    EventType,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_nested_payload_authority,
+    event_with_runtime_payload_authority,
+)
 from cayu.providers import ModelProviderError
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._session_queries import query_all_event_records
@@ -99,6 +106,32 @@ from cayu.runtime.usage import (
     build_aggregate_usage_metrics,
     session_usage_summary,
 )
+
+
+def _event_with_budget_authority(
+    event: Event,
+    *,
+    execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
+    additional_fields: Collection[str] = (),
+) -> Event:
+    """Attest runtime-owned accounting linkage at the budget control boundary."""
+
+    fields = [field_name for field_name in additional_fields if field_name in event.payload]
+    if type(execution_identity) is ModelAttemptIdentity:
+        identity_payload = copy_model_attempt_identity(execution_identity).payload()
+    elif type(execution_identity) is ModelStepIdentity:
+        identity_payload = copy_model_step_identity(execution_identity).payload()
+    elif execution_identity is None:
+        identity_payload = {}
+    else:
+        raise TypeError("Budget execution identity has an unsupported type.")
+    fields.extend(
+        field_name
+        for field_name, value in identity_payload.items()
+        if event.payload.get(field_name) == value
+    )
+    return event_with_runtime_payload_authority(event, *dict.fromkeys(fields)) if fields else event
+
 
 UNKNOWN_POST_DISPATCH_BUDGET_REASON = (
     "provider usage unknown after dispatch; charged reserved amount"
@@ -260,7 +293,7 @@ def _interaction_bound_settlement_event_payload(
     """Bind future ledger-owned settlement evidence to its current interaction."""
 
     copied = copy_durable_json_object(payload or {}, "settlement_event_payload")
-    attribution_probe = event_writer.prepare(
+    attribution_probe = event_writer.prepare_budget_settlement_template(
         Event(
             type=EventType.BUDGET_RECONCILED,
             session_id=session_id,
@@ -366,7 +399,33 @@ def _validate_ledger_settlement_record(
         )
     if type(settlement.event) is not Event:
         raise TypeError("Budget ledger settlement events must be Event instances.")
-    return BudgetSettlementRecord.model_validate(settlement.model_dump(mode="python"))
+    validated = BudgetSettlementRecord.model_validate(settlement.model_dump(mode="python"))
+    # Deserialization deliberately strips in-process provenance. The record's
+    # model validator has now positively bound the deterministic event and its
+    # accounting identities to the settlement record. Re-attest only that
+    # validated copy before handing it to the event writer.
+    event = event_with_runtime_generated_id(validated.event)
+    envelope_fields = ["session_id"]
+    payload_fields = [
+        "reservation_id",
+        "settlement_id",
+        "budget_limit_id",
+        "model_step_id",
+        "model_attempt_id",
+    ]
+    if event.interaction_id is not None:
+        if event.payload.get("interaction_id") != event.interaction_id:
+            raise RuntimeError("Budget ledger settlement event changed its interaction identity.")
+        envelope_fields.append("interaction_id")
+        payload_fields.append("interaction_id")
+    event = event_with_runtime_payload_authority(
+        event_with_runtime_envelope_authority(event, *envelope_fields),
+        *payload_fields,
+    )
+    return validated.model_copy(
+        update={"event": event},
+        deep=True,
+    )
 
 
 def _validate_ledger_settlement_page(
@@ -791,7 +850,15 @@ def _model_completion_with_budget_settlement_evidence(
     payload[MODEL_COMPLETION_BUDGET_SETTLEMENTS_KEY] = [
         budget_reconciliation_payload(reconciliation) for reconciliation in reconciliations
     ]
-    completion = prepare_event(prepared_event.model_copy(update={"payload": payload}, deep=True))
+    completion = event_with_runtime_nested_payload_authority(
+        prepared_event.model_copy(update={"payload": payload}, deep=True),
+        ("budget_settlements", "*", "reservation_id"),
+        ("budget_settlements", "*", "settlement_id"),
+        ("budget_settlements", "*", "budget_limit_id"),
+        ("budget_settlements", "*", "model_step_id"),
+        ("budget_settlements", "*", "model_attempt_id"),
+    )
+    completion = prepare_event(completion)
     if type(completion) is not Event:
         raise TypeError("Model completion preparation must return an Event.")
     parsed = model_completion_budget_settlements(
@@ -1305,15 +1372,19 @@ class RunLimitController:
             if not deferred_contextual_check:
                 emitted_events.append(
                     await self._event_writer.emit(
-                        Event(
-                            type=EventType.BUDGET_CHECKED,
-                            session_id=session.id,
-                            agent_name=agent_name,
-                            environment_name=environment_name,
-                            payload={
-                                **budget_check_payload(check),
-                                **_execution_identity_payload(execution_identity),
-                            },
+                        _event_with_budget_authority(
+                            Event(
+                                type=EventType.BUDGET_CHECKED,
+                                session_id=session.id,
+                                agent_name=agent_name,
+                                environment_name=environment_name,
+                                payload={
+                                    **budget_check_payload(check),
+                                    **_execution_identity_payload(execution_identity),
+                                },
+                            ),
+                            execution_identity=execution_identity,
+                            additional_fields=("budget_limit_id",),
                         )
                     )
                 )
@@ -1383,15 +1454,19 @@ class RunLimitController:
         execution_identity: ModelStepIdentity | ModelAttemptIdentity | None = None,
     ) -> Event:
         return await self._event_writer.emit(
-            Event(
-                type=EventType.BUDGET_LIMIT_REACHED,
-                session_id=session.id,
-                agent_name=agent_name,
-                environment_name=environment_name,
-                payload={
-                    **budget_limit_reached_payload(check),
-                    **_execution_identity_payload(execution_identity),
-                },
+            _event_with_budget_authority(
+                Event(
+                    type=EventType.BUDGET_LIMIT_REACHED,
+                    session_id=session.id,
+                    agent_name=agent_name,
+                    environment_name=environment_name,
+                    payload={
+                        **budget_limit_reached_payload(check),
+                        **_execution_identity_payload(execution_identity),
+                    },
+                ),
+                execution_identity=execution_identity,
+                additional_fields=("budget_limit_id",),
             )
         )
 
@@ -1518,6 +1593,24 @@ class RunLimitController:
                     billing_identity=authority.billing_identity,
                     expected_requested_amount=expected_requested_amount,
                 )
+                reservation: BudgetStepReservation | None = None
+                if result.accepted:
+                    accepted_record = result.record
+                    if accepted_record is None:  # pragma: no cover - validated above
+                        raise RuntimeError("Accepted budget reservation has no record.")
+                    if accepted_record.reservation_id in reservation_ids:
+                        raise RuntimeError("Budget ledger reused a reservation identity.")
+                    reservation = BudgetStepReservation(
+                        limit=expected_limit,
+                        record=accepted_record,
+                        request_billing_identity=copy_billing_identity(expected_billing_identity),
+                    )
+                    # Once the ledger has accepted a fully validated record,
+                    # retain it for pre-dispatch cleanup before constructing or
+                    # attesting any event that can still fail. A proven identity
+                    # conflict below removes it because this run must not settle
+                    # the winning reservation.
+                    reservations.append(reservation)
                 reservation_event = Event(
                     type=(
                         EventType.BUDGET_RESERVED
@@ -1529,30 +1622,27 @@ class RunLimitController:
                     environment_name=environment_name,
                     payload=budget_reservation_payload(result),
                 )
+                reservation_event = _event_with_budget_authority(
+                    reservation_event,
+                    execution_identity=model_attempt_identity,
+                    additional_fields=(
+                        "budget_limit_id",
+                        "reservation_id",
+                        "session_id",
+                    ),
+                )
                 if result.accepted:
-                    assert result.record is not None
-                    if result.record.reservation_id in reservation_ids:
-                        raise RuntimeError("Budget ledger reused a reservation identity.")
-                    reservation = BudgetStepReservation(
-                        limit=expected_limit,
-                        record=result.record,
-                        request_billing_identity=copy_billing_identity(expected_billing_identity),
-                    )
-                    # Stage the accepted record for cleanup before either durable
-                    # ownership claim can fail or lose its acknowledgement.
-                    # Exclude known ownership rejection: a collision could
-                    # settle the winner, and a fenced run has no release authority.
-                    reservations.append(reservation)
+                    assert reservation is not None
                     try:
                         await identity_guard.claim(
-                            result.record.reservation_id,
+                            accepted_record.reservation_id,
                             publication_session_id=reservation_event.session_id,
                             publication_id=reservation_event.id,
                         )
                     except (BudgetReservationIdentityConflict, SessionRunFenced):
                         _remove_reservation(reservations, reservation)
                         raise
-                    reservation_ids.add(result.record.reservation_id)
+                    reservation_ids.add(accepted_record.reservation_id)
                 emitted_events.append(await self._event_writer.emit(reservation_event))
                 await self.recover_pending_budget_settlements()
                 if not result.accepted:
@@ -2569,12 +2659,16 @@ class RunLimitController:
                     message=resolved.check.message,
                 )
                 event = await self._event_writer.emit(
-                    Event(
-                        type=EventType.BUDGET_RESERVATION_FAILED,
-                        session_id=session.id,
-                        agent_name=agent_name,
-                        environment_name=environment_name,
-                        payload=budget_reservation_payload(failure),
+                    _event_with_budget_authority(
+                        Event(
+                            type=EventType.BUDGET_RESERVATION_FAILED,
+                            session_id=session.id,
+                            agent_name=agent_name,
+                            environment_name=environment_name,
+                            payload=budget_reservation_payload(failure),
+                        ),
+                        execution_identity=model_attempt_identity,
+                        additional_fields=("budget_limit_id",),
                     )
                 )
                 return BudgetedOperationRejected(failure=failure, events=(event,))
@@ -3051,6 +3145,22 @@ class RunLimitController:
                     billing_identity=authority.billing_identity,
                     expected_requested_amount=expected_requested_amount,
                 )
+                reservation: BudgetStepReservation | None = None
+                if result.accepted:
+                    accepted_record = result.record
+                    if accepted_record is None:  # pragma: no cover - validated above
+                        raise RuntimeError(accepted_record_error)
+                    if accepted_record.reservation_id in reservation_ids:
+                        raise RuntimeError("Budget ledger reused a reservation identity.")
+                    reservation = BudgetStepReservation(
+                        limit=expected_limit,
+                        record=accepted_record,
+                        request_billing_identity=copy_billing_identity(expected_billing_identity),
+                    )
+                    # An accepted, validated record must remain reachable by
+                    # caller-owned cleanup even if custom event construction or
+                    # authority attestation fails before publication.
+                    reservations.append(reservation)
                 reservation_event = event_factory(result)
                 if type(reservation_event) is not Event:
                     raise TypeError("Reservation event factory must return an Event.")
@@ -3074,6 +3184,15 @@ class RunLimitController:
                     raise ValueError(
                         "Reservation event factory changed runtime-owned budget evidence."
                     )
+                reservation_event = _event_with_budget_authority(
+                    reservation_event,
+                    execution_identity=model_attempt_identity,
+                    additional_fields=(
+                        "budget_limit_id",
+                        "reservation_id",
+                        "session_id",
+                    ),
+                )
                 if not result.accepted:
                     results.append(result)
                     events.append(reservation_event)
@@ -3091,31 +3210,17 @@ class RunLimitController:
                         failure=result,
                         error=None,
                     )
-                if result.record is None:  # pragma: no cover - validated above
-                    raise RuntimeError(accepted_record_error)
-                if result.record.reservation_id in reservation_ids:
-                    raise RuntimeError("Budget ledger reused a reservation identity.")
-                reservation = BudgetStepReservation(
-                    limit=expected_limit,
-                    record=result.record,
-                    request_billing_identity=copy_billing_identity(expected_billing_identity),
-                )
-                # Keep an accepted, uniquely identified reservation reachable by
-                # the caller's pre-dispatch cleanup if either ownership domain
-                # fails or loses its acknowledgement. Exclude known ownership
-                # rejection: a collision could settle the winner, and a fenced
-                # run has no release authority.
-                reservations.append(reservation)
+                assert reservation is not None
                 try:
                     await identity_guard.claim(
-                        result.record.reservation_id,
+                        accepted_record.reservation_id,
                         publication_session_id=reservation_event.session_id,
                         publication_id=reservation_event.id,
                     )
                 except (BudgetReservationIdentityConflict, SessionRunFenced):
                     _remove_reservation(reservations, reservation)
                     raise
-                reservation_ids.add(result.record.reservation_id)
+                reservation_ids.add(accepted_record.reservation_id)
                 results.append(result)
                 events.append(reservation_event)
                 await self.recover_pending_budget_settlements()

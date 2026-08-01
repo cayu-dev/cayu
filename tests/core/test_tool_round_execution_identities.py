@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from typing import cast
 
 import pytest
+from tests.core._event_projection_support import private_events_for_public_events
 
 from cayu.core import AgentSpec, EventType, Message, ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
@@ -152,7 +153,10 @@ def test_runtime_links_reused_provider_call_ids_to_distinct_tool_rounds() -> Non
                 )
             )
         ]
-        return events, await store.load_transcript("sess_reused_tool_call_id")
+        return (
+            await private_events_for_public_events(store, events),
+            await store.load_transcript("sess_reused_tool_call_id"),
+        )
 
     events, transcript = asyncio.run(scenario())
 
@@ -254,7 +258,10 @@ def test_runtime_rejects_duplicate_call_ids_within_one_tool_round() -> None:
                 )
             )
         ]
-        return events, await store.load_transcript("sess_duplicate_tool_call_id")
+        return (
+            await private_events_for_public_events(store, events),
+            await store.load_transcript("sess_duplicate_tool_call_id"),
+        )
 
     events, transcript = asyncio.run(scenario())
 

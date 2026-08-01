@@ -6,8 +6,16 @@ from collections.abc import AsyncIterator
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest, SessionStatus
+from cayu.runtime import (
+    CayuApp,
+    EventQuery,
+    EventRecord,
+    InMemorySessionStore,
+    RunRequest,
+    SessionStatus,
+)
 from cayu.runtime import _model_completion_publication as model_completion_publication
+from cayu.runtime._event_projection import public_event_sequence
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
@@ -65,6 +73,19 @@ async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
 
+async def _model_completion_records(
+    store: InMemorySessionStore,
+    session_id: str,
+) -> list[EventRecord]:
+    return await store.query_events(
+        EventQuery(
+            session_id=session_id,
+            event_type=EventType.MODEL_COMPLETED,
+            limit=100,
+        )
+    )
+
+
 def _completed_payload() -> dict:
     return {
         "finish_reason": "stop",
@@ -101,8 +122,8 @@ def test_session_engine_publishes_one_authoritative_assistant_turn() -> None:
         )
     )
 
-    completed_event = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
-    logical_step_id = completed_event.payload["model_step_id"]
+    completion_records = asyncio.run(_model_completion_records(store, "model-publication-no-tools"))
+    logical_step_id = completion_records[0].event.payload["model_step_id"]
     receipt = asyncio.run(
         store.load_runtime_publication_receipt(
             "model-publication-no-tools",
@@ -171,7 +192,11 @@ def test_model_publication_redacts_provider_metadata_before_durable_commit() -> 
     returned = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
     durable = next(event for event in durable_events if event.type == EventType.MODEL_COMPLETED)
 
-    assert returned == durable
+    completion_record = asyncio.run(
+        _model_completion_records(store, "model-publication-redacted-metadata")
+    )[0]
+    assert completion_record.event == durable
+    assert completion_record.sequence == public_event_sequence(returned.id)
     assert durable.payload["provider_debug"] == {"credential": REDACTED_SECRET}
     assert secret not in durable.model_dump_json()
 
@@ -280,7 +305,7 @@ def test_session_engine_links_model_and_tool_round_publications() -> None:
         tools=[tool],
     )
 
-    events = asyncio.run(
+    asyncio.run(
         _collect(
             app,
             RunRequest(
@@ -291,10 +316,10 @@ def test_session_engine_links_model_and_tool_round_publications() -> None:
         )
     )
 
-    completed_events = [event for event in events if event.type == EventType.MODEL_COMPLETED]
-    first_step_id = completed_events[0].payload["model_step_id"]
-    second_step_id = completed_events[1].payload["model_step_id"]
-    tool_round_id = completed_events[0].payload["tool_round_id"]
+    completed_records = asyncio.run(_model_completion_records(store, "model-publication-tools"))
+    first_step_id = completed_records[0].event.payload["model_step_id"]
+    second_step_id = completed_records[1].event.payload["model_step_id"]
+    tool_round_id = completed_records[0].event.payload["tool_round_id"]
     first_receipt = asyncio.run(
         store.load_runtime_publication_receipt(
             "model-publication-tools",
@@ -355,7 +380,7 @@ def test_model_promotion_acknowledgement_loss_replays_without_duplication() -> N
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    events = asyncio.run(
+    asyncio.run(
         _collect(
             app,
             RunRequest(
@@ -366,14 +391,14 @@ def test_model_promotion_acknowledgement_loss_replays_without_duplication() -> N
         )
     )
 
-    logical_step_id = next(
-        event.payload["model_step_id"]
-        for event in events
-        if event.type == EventType.MODEL_COMPLETED
-    )
     session = asyncio.run(store.load("model-promotion-ack-loss"))
     transcript = asyncio.run(store.load_transcript("model-promotion-ack-loss"))
     durable_events = asyncio.run(store.load_events("model-promotion-ack-loss"))
+    logical_step_id = next(
+        event.payload["model_step_id"]
+        for event in durable_events
+        if event.type == EventType.MODEL_COMPLETED
+    )
     receipt = asyncio.run(
         store.load_runtime_publication_receipt(
             "model-promotion-ack-loss",

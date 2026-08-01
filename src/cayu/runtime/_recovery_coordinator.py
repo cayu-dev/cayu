@@ -41,7 +41,14 @@ from cayu._validation import (
     copy_json_value,
     require_clean_nonblank,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPart, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
@@ -2636,18 +2643,24 @@ class RecoveryCoordinator:
                 raise factory_resolution.error
             if emit_resume_event:
                 yield await self._event_writer.emit(
-                    Event(
-                        type=EventType.SESSION_RESUMED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            **tool_round_identity.payload(),
-                            "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                            "input_id": pending.input_id,
-                            "tool_call_id": pending.tool_call_id,
-                            "resolved_by": resolution_actor_payload(response.resolved_by),
-                        },
+                    event_with_runtime_payload_authority(
+                        Event(
+                            type=EventType.SESSION_RESUMED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload={
+                                **tool_round_identity.payload(),
+                                "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
+                                "input_id": pending.input_id,
+                                "tool_call_id": pending.tool_call_id,
+                                "resolved_by": resolution_actor_payload(response.resolved_by),
+                            },
+                        ),
+                        "model_step_id",
+                        "model_attempt_id",
+                        "tool_round_id",
+                        "input_id",
                     )
                 )
             binding_started_event = await self._environment_lifecycle.emit_binding_started(
@@ -2730,13 +2743,19 @@ class RecoveryCoordinator:
                     if registered_tool is not None:
                         started_payload["effect"] = registered_tool.effect.value
                     yield await self._event_writer.emit(
-                        Event(
-                            type=EventType.TOOL_CALL_STARTED,
-                            session_id=session.id,
-                            agent_name=registered_agent.spec.name,
-                            environment_name=environment_name,
-                            tool_name=tool_call.name,
-                            payload=started_payload,
+                        event_with_runtime_payload_authority(
+                            Event(
+                                type=EventType.TOOL_CALL_STARTED,
+                                session_id=session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                tool_name=tool_call.name,
+                                payload=started_payload,
+                            ),
+                            "model_step_id",
+                            "model_attempt_id",
+                            "tool_round_id",
+                            "input_id",
                         )
                     )
                     async for (
@@ -3278,21 +3297,27 @@ class RecoveryCoordinator:
                 )
             if expired:
                 yield await self._event_writer.emit(
-                    Event(
-                        type=EventType.TOOL_CALL_APPROVAL_EXPIRED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        tool_name=pending_approval.tool_name,
-                        payload={
-                            **tool_round_identity.payload(),
-                            "approval_id": pending_approval.approval_id,
-                            "tool_call_id": pending_approval.tool_call_id,
-                            "expires_at": expired_at_iso,
-                            "requested_decision": requested_decision.value,
-                            "resolved_by": resolved_by_payload,
-                            "triggered_by": resolution_actor_payload(triggered_by),
-                        },
+                    event_with_runtime_payload_authority(
+                        Event(
+                            type=EventType.TOOL_CALL_APPROVAL_EXPIRED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            tool_name=pending_approval.tool_name,
+                            payload={
+                                **tool_round_identity.payload(),
+                                "approval_id": pending_approval.approval_id,
+                                "tool_call_id": pending_approval.tool_call_id,
+                                "expires_at": expired_at_iso,
+                                "requested_decision": requested_decision.value,
+                                "resolved_by": resolved_by_payload,
+                                "triggered_by": resolution_actor_payload(triggered_by),
+                            },
+                        ),
+                        "model_step_id",
+                        "model_attempt_id",
+                        "tool_round_id",
+                        "approval_id",
                     )
                 )
 
@@ -3983,23 +4008,29 @@ class RecoveryCoordinator:
             persisted = existing[0]
         else:
             intended = self._event_writer.prepare(
-                Event(
-                    type=EventType.TOOL_CALL_APPROVED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    tool_name=tool_call.name,
-                    payload={
-                        **tool_round_identity.payload(),
-                        "approval_id": pending_approval.approval_id,
-                        "tool_call_id": tool_call.id,
-                        "reason": reason,
-                        **approval_support.bounded_resolution_metadata_payload(
-                            metadata,
-                            redactor=self._secret_redactor,
-                        ),
-                        "resolved_by": resolved_by_payload,
-                    },
+                event_with_runtime_payload_authority(
+                    Event(
+                        type=EventType.TOOL_CALL_APPROVED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        tool_name=tool_call.name,
+                        payload={
+                            **tool_round_identity.payload(),
+                            "approval_id": pending_approval.approval_id,
+                            "tool_call_id": tool_call.id,
+                            "reason": reason,
+                            **approval_support.bounded_resolution_metadata_payload(
+                                metadata,
+                                redactor=self._secret_redactor,
+                            ),
+                            "resolved_by": resolved_by_payload,
+                        },
+                    ),
+                    "model_step_id",
+                    "model_attempt_id",
+                    "tool_round_id",
+                    "approval_id",
                 )
             )
             persisted = await self._event_writer.persist_exact_replay(intended)
@@ -7634,15 +7665,25 @@ class RecoveryCoordinator:
                 "recovered": True,
                 "terminal_evidence_repaired": True,
             }
-        event = Event(
-            id=event_id,
-            type=event_type,
-            session_id=session.id,
-            timestamp=terminal_timestamp,
-            agent_name=session.agent_name,
-            environment_name=session.environment_name,
-            payload=payload,
+        event = event_with_runtime_envelope_authority(
+            event_with_runtime_generated_id(
+                Event(
+                    id=event_id,
+                    type=event_type,
+                    session_id=session.id,
+                    timestamp=terminal_timestamp,
+                    agent_name=session.agent_name,
+                    environment_name=session.environment_name,
+                    payload=payload,
+                )
+            ),
+            "session_id",
         )
+        if type(payload.get("interruption_request_id")) is str:
+            event = event_with_runtime_payload_authority(
+                event,
+                "interruption_request_id",
+            )
         return (
             event
             if run_operation is None

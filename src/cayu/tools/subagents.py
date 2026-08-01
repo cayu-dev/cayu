@@ -31,6 +31,7 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStore,
     TranscriptQuery,
+    run_request_with_runtime_generated_authority,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.tool_policy import metadata_with_taint_labels, taint_labels_from_metadata
@@ -379,6 +380,12 @@ class SubagentTool(Tool):
             metadata=child_metadata,
             max_steps=spec.max_steps,
             limits=spec.limits,
+        )
+        request = run_request_with_runtime_generated_authority(
+            request,
+            "session_id",
+            "parent_session_id",
+            "causal_budget_id",
         )
         structured = _subagent_result_payload(
             agent_alias=agent_alias,

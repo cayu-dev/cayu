@@ -5,6 +5,10 @@ from collections.abc import AsyncIterator
 from copy import deepcopy
 
 import pytest
+from tests.core._event_projection_support import (
+    private_event_for_public_event,
+    private_events_for_public_events,
+)
 
 from cayu.core import (
     AgentSpec,
@@ -18,6 +22,7 @@ from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
+    EventQuery,
     ForkSessionRequest,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
@@ -41,6 +46,7 @@ from cayu.runtime import (
     UserInputResponse,
 )
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime._event_projection import public_event_sequence
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CheckpointCompatibilityError,
@@ -369,10 +375,11 @@ def test_ask_user_pauses_the_session() -> None:
 
     assert events[-1].type == EventType.SESSION_INTERRUPTED
     awaiting = next(e for e in events if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    private_awaiting = asyncio.run(private_event_for_public_event(store, awaiting))
     assert awaiting.payload["question"] == "Which env?"
     assert awaiting.payload["options"] == ["dev", "prod"]
     assert awaiting.payload["input_id"]
-    assert [call["tool_call_id"] for call in awaiting.payload["tool_calls"]] == ["call_1"]
+    assert [call["tool_call_id"] for call in private_awaiting.payload["tool_calls"]] == ["call_1"]
     interrupted = next(e for e in events if e.type == EventType.SESSION_INTERRUPTED)
     assert interrupted.payload["interruption_type"] == "user_input_required"
     assert asyncio.run(store.load("s_pause")).status == SessionStatus.INTERRUPTED
@@ -401,9 +408,11 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
             ),
         )
     )
-    input_id = next(
-        e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT
-    ).payload["input_id"]
+    awaiting = next(e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    input_id = awaiting.payload["input_id"]
+    private_input_id = asyncio.run(private_event_for_public_event(store, awaiting)).payload[
+        "input_id"
+    ]
     app.register_environment(
         Environment(EnvironmentSpec(name="later-default")),
         default=True,
@@ -422,16 +431,17 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     session = asyncio.run(store.load("s_resume"))
     assert session is not None
     assert session.environment_name == "optional"
+    private_resume_events = asyncio.run(private_events_for_public_events(store, resume_events))
     started = next(
         event
-        for event in resume_events
+        for event in private_resume_events
         if event.type == EventType.TOOL_CALL_STARTED
         and event.payload.get("tool_call_id") == "call_1"
     )
     assert started.payload["effect"] == ToolEffect.EXTERNAL.value
     completed = next(
         event
-        for event in resume_events
+        for event in private_resume_events
         if event.type == EventType.TOOL_CALL_COMPLETED
         and event.payload.get("tool_call_id") == "call_1"
     )
@@ -439,7 +449,7 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
         session_id="s_resume",
         tool_round_id=completed.payload["tool_round_id"],
         tool_call_id="call_1",
-        pause_id=input_id,
+        pause_id=private_input_id,
     )
     assert asyncio.run(store.load("s_resume")).status == SessionStatus.COMPLETED
     parts = _tool_result_parts(asyncio.run(store.load_transcript("s_resume")))
@@ -565,9 +575,10 @@ def test_resolve_user_input_releases_run_fence_once_after_handoff() -> None:
                 messages=[Message.text("user", "go")],
             ),
         )
-        input_id = next(
+        awaiting = next(
             event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
-        ).payload["input_id"]
+        )
+        input_id = awaiting.payload["input_id"]
 
         releases_before_resolution = store.release_calls[session_id]
         stream = app.resolve_user_input(
@@ -623,9 +634,13 @@ def test_resolve_user_input_task_cancellation_finalizes_and_preserves_pending_st
                 messages=[Message.text("user", "go")],
             ),
         )
-        input_id = next(
+        awaiting = next(
             event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
-        ).payload["input_id"]
+        )
+        input_id = awaiting.payload["input_id"]
+        private_input_id = (await private_event_for_public_event(store, awaiting)).payload[
+            "input_id"
+        ]
 
         releases_before = store.release_calls[session_id]
         store.fail_next_release = True
@@ -657,7 +672,7 @@ def test_resolve_user_input_task_cancellation_finalizes_and_preserves_pending_st
         assert session.status == SessionStatus.INTERRUPTED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        assert checkpoint["pending_user_input"]["input_id"] == input_id
+        assert checkpoint["pending_user_input"]["input_id"] == private_input_id
         events = await store.load_events(session_id)
         assert events[-1].type == EventType.SESSION_INTERRUPTED
         assert events[-1].payload["abandoned"] is True
@@ -683,9 +698,13 @@ def test_resolve_user_input_cancellation_after_running_transition_finalizes_clai
                 messages=[Message.text("user", "go")],
             ),
         )
-        input_id = next(
+        awaiting = next(
             event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
-        ).payload["input_id"]
+        )
+        input_id = awaiting.payload["input_id"]
+        private_input_id = (await private_event_for_public_event(store, awaiting)).payload[
+            "input_id"
+        ]
 
         releases_before = store.release_calls[session_id]
         store.transition_committed = asyncio.Event()
@@ -715,7 +734,7 @@ def test_resolve_user_input_cancellation_after_running_transition_finalizes_clai
         assert session.status == SessionStatus.INTERRUPTED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        assert checkpoint["pending_user_input"]["input_id"] == input_id
+        assert checkpoint["pending_user_input"]["input_id"] == private_input_id
         assert store.release_calls[session_id] - releases_before == 1
         assert app._session_control.has_active_tasks(session_id) is False
 
@@ -745,9 +764,13 @@ def test_resolve_user_input_repeated_cancellation_cannot_interrupt_finalization(
                 messages=[Message.text("user", "go")],
             ),
         )
-        input_id = next(
+        awaiting = next(
             event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
-        ).payload["input_id"]
+        )
+        input_id = awaiting.payload["input_id"]
+        private_input_id = (await private_event_for_public_event(store, awaiting)).payload[
+            "input_id"
+        ]
 
         releases_before = store.release_calls[session_id]
         store.finalization_started = asyncio.Event()
@@ -776,7 +799,7 @@ def test_resolve_user_input_repeated_cancellation_cannot_interrupt_finalization(
         assert session.status == SessionStatus.INTERRUPTED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        assert checkpoint["pending_user_input"]["input_id"] == input_id
+        assert checkpoint["pending_user_input"]["input_id"] == private_input_id
         assert store.release_calls[session_id] - releases_before == 1
         assert app._session_control.has_active_tasks(session_id) is False
 
@@ -888,9 +911,10 @@ def test_resolve_user_input_events_carry_resolved_by_actor() -> None:
     }
     resumed = next(e for e in resume_events if e.type == EventType.SESSION_RESUMED)
     assert resumed.payload["resolved_by"] == expected_actor
+    private_resume_events = asyncio.run(private_events_for_public_events(store, resume_events))
     answered = next(
         e
-        for e in resume_events
+        for e in private_resume_events
         if e.type == EventType.TOOL_CALL_COMPLETED and e.payload.get("tool_call_id") == "call_1"
     )
     assert answered.payload["resolved_by"] == expected_actor
@@ -1021,7 +1045,9 @@ def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
         e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT
     ).payload["input_id"]
     awaiting = next(e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT)
-    assert [call["tool_call_id"] for call in awaiting.payload["tool_calls"]] == [
+    private_awaiting = asyncio.run(private_event_for_public_event(store, awaiting))
+    private_input_id = private_awaiting.payload["input_id"]
+    assert [call["tool_call_id"] for call in private_awaiting.payload["tool_calls"]] == [
         "call_1",
         "call_2",
         "call_3",
@@ -1035,24 +1061,25 @@ def test_mixed_round_executes_other_tools_and_keeps_model_order() -> None:
         )
     )
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
+    private_resume_events = asyncio.run(private_events_for_public_events(store, resume_events))
     sibling_events = [
         event
-        for event in resume_events
+        for event in private_resume_events
         if event.type in {EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED}
         and event.payload.get("tool_call_id") in {"call_1", "call_3"}
     ]
     assert sibling_events
     for event in sibling_events:
         call_id = event.payload["tool_call_id"]
-        assert event.payload["input_id"] == input_id
+        assert event.payload["input_id"] == private_input_id
         assert event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
             session_id="s_mixed",
             tool_round_id=event.payload["tool_round_id"],
             tool_call_id=call_id,
-            pause_id=input_id,
+            pause_id=private_input_id,
         )
-    assert echo.metadata_by_text["first"]["input_id"] == input_id
-    assert echo.metadata_by_text["third"]["input_id"] == input_id
+    assert echo.metadata_by_text["first"]["input_id"] == private_input_id
+    assert echo.metadata_by_text["third"]["input_id"] == private_input_id
 
     parts = _tool_result_parts(asyncio.run(store.load_transcript("s_mixed")))
     assert [part.tool_call_id for part in parts] == ["call_1", "call_2", "call_3"]
@@ -1133,9 +1160,10 @@ def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() 
     )
 
     assert echo.metadata_by_text == {}
+    private_events = asyncio.run(private_events_for_public_events(store, events))
     failed = next(
         event
-        for event in events
+        for event in private_events
         if event.type is EventType.TOOL_CALL_FAILED
         and event.payload.get("tool_call_id") == "call_late"
     )
@@ -1143,7 +1171,7 @@ def test_user_input_resume_does_not_execute_tool_registered_after_policy_plan() 
     assert not any(
         event.type is EventType.TOOL_CALL_STARTED
         and event.payload.get("tool_call_id") == "call_late"
-        for event in events
+        for event in private_events
     )
     assert events[-1].type is EventType.SESSION_COMPLETED
 
@@ -1299,7 +1327,8 @@ def test_denied_ask_user_does_not_starve_a_later_allowed_one() -> None:
         )
     )
     awaiting = next(e for e in events if e.type == EventType.SESSION_AWAITING_USER_INPUT)
-    assert awaiting.payload["tool_call_id"] == "call_2"  # paused on the allowed ask_user
+    private_awaiting = asyncio.run(private_event_for_public_event(store, awaiting))
+    assert private_awaiting.payload["tool_call_id"] == "call_2"
     assert awaiting.payload["question"] == "allowed-q"
 
 
@@ -1361,9 +1390,11 @@ def test_denied_sibling_is_blocked_not_executed_on_resume() -> None:
             ),
         )
     )
-    input_id = next(
-        e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT
-    ).payload["input_id"]
+    awaiting = next(e for e in pause_events if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    input_id = awaiting.payload["input_id"]
+    private_input_id = asyncio.run(private_event_for_public_event(store, awaiting)).payload[
+        "input_id"
+    ]
 
     resume_events = asyncio.run(
         _drain(
@@ -1374,7 +1405,8 @@ def test_denied_sibling_is_blocked_not_executed_on_resume() -> None:
     )
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
     blocked = next(e for e in resume_events if e.type == EventType.TOOL_CALL_BLOCKED)
-    assert blocked.payload["input_id"] == input_id
+    private_blocked = asyncio.run(private_event_for_public_event(store, blocked))
+    assert private_blocked.payload["input_id"] == private_input_id
     parts = {
         p.tool_call_id: p for p in _tool_result_parts(asyncio.run(store.load_transcript("s_deny")))
     }
@@ -1401,9 +1433,8 @@ def test_resolve_user_input_rejects_structured_output_swap() -> None:
             ),
         )
     )
-    input_id = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT).payload[
-        "input_id"
-    ]
+    awaiting = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    input_id = awaiting.payload["input_id"]
     with pytest.raises(ValueError, match="does not match the paused run contract"):
         asyncio.run(
             _drain(
@@ -1479,9 +1510,8 @@ def test_resolve_user_input_rejects_native_structured_output_for_unsupported_pro
             ),
         )
     )
-    input_id = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT).payload[
-        "input_id"
-    ]
+    awaiting = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    input_id = awaiting.payload["input_id"]
 
     with pytest.raises(NativeStructuredOutputUnsupported):
         asyncio.run(
@@ -1665,7 +1695,7 @@ def test_retry_after_crashed_sibling_flags_manual_recovery_not_re_execute() -> N
         store.append_events(
             "s_crash",
             _crashed_user_input_resume_events(
-                pause,
+                asyncio.run(private_events_for_public_events(store, pause)),
                 session_id="s_crash",
                 tool_call_id="call_1",
             ),
@@ -1681,7 +1711,8 @@ def test_retry_after_crashed_sibling_flags_manual_recovery_not_re_execute() -> N
     )
     assert events[-1].type == EventType.SESSION_INTERRUPTED
     assert events[-1].payload.get("manual_recovery_required") is True
-    assert events[-1].payload.get("tool_call_id") == "call_1"
+    private_terminal = asyncio.run(private_event_for_public_event(store, events[-1]))
+    assert private_terminal.payload.get("tool_call_id") == "call_1"
     assert counting.calls == 0  # guard fired before execution — no double-run
     reloaded = asyncio.run(store.load("s_crash"))
     assert reloaded is not None and reloaded.status == SessionStatus.INTERRUPTED
@@ -1715,14 +1746,13 @@ def test_recover_user_input_rejects_native_structured_output_for_unsupported_pro
             ),
         )
     )
-    input_id = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT).payload[
-        "input_id"
-    ]
+    awaiting = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    input_id = awaiting.payload["input_id"]
     asyncio.run(
         store.append_events(
             "s_rec_native",
             _crashed_user_input_resume_events(
-                pause,
+                asyncio.run(private_events_for_public_events(store, pause)),
                 session_id="s_rec_native",
                 tool_call_id="call_1",
             ),
@@ -1799,7 +1829,7 @@ def test_recover_user_input_rejects_secret_structured_output_before_transition()
         store.append_events(
             session_id,
             _crashed_user_input_resume_events(
-                pause,
+                asyncio.run(private_events_for_public_events(store, pause)),
                 session_id=session_id,
                 tool_call_id="call_1",
             ),
@@ -1864,7 +1894,9 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
             ),
         )
     )
-    input_id = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT).payload[
+    awaiting = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    input_id = awaiting.payload["input_id"]
+    private_input_id = asyncio.run(private_event_for_public_event(store, awaiting)).payload[
         "input_id"
     ]
     # Simulate a prior resume that started `count` but crashed before a terminal event.
@@ -1872,7 +1904,7 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
         store.append_events(
             "s_rec",
             _crashed_user_input_resume_events(
-                pause,
+                asyncio.run(private_events_for_public_events(store, pause)),
                 session_id="s_rec",
                 tool_call_id="call_1",
             ),
@@ -1907,11 +1939,16 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
         if event.type == EventType.TOOL_CALL_COMPLETED
         and event.payload.get("manual_recovery") is True
     )
-    assert recovered_tool_event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+    private_recovered_tool_event = asyncio.run(
+        private_event_for_public_event(store, recovered_tool_event)
+    )
+    assert private_recovered_tool_event.payload[
+        "idempotency_key"
+    ] == tool_execution.tool_idempotency_key(
         session_id="s_rec",
-        tool_round_id=recovered_tool_event.payload["tool_round_id"],
+        tool_round_id=private_recovered_tool_event.payload["tool_round_id"],
         tool_call_id="call_1",
-        pause_id=input_id,
+        pause_id=private_input_id,
     )
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert counting.calls == 0  # the recovered tool was never re-executed
@@ -1967,7 +2004,7 @@ def test_recover_user_input_reconciles_ambiguous_append_acknowledgement() -> Non
         await store.append_events(
             session_id,
             _crashed_user_input_resume_events(
-                paused,
+                await private_events_for_public_events(store, paused),
                 session_id=session_id,
                 tool_call_id="call_1",
             ),
@@ -2054,7 +2091,7 @@ def test_recover_user_input_post_persist_fanout_failure_stays_resumable(
         await store.append_events(
             session_id,
             _crashed_user_input_resume_events(
-                paused,
+                await private_events_for_public_events(store, paused),
                 session_id=session_id,
                 tool_call_id="call_1",
             ),
@@ -2107,7 +2144,14 @@ def test_recover_user_input_post_persist_fanout_failure_stays_resumable(
         if grouped_cancellation:
             assert terminal.payload.get("abandoned") is not True
         else:
-            assert recovery[-1].id == terminal.id
+            sequence = public_event_sequence(recovery[-1].id)
+            assert sequence is not None
+            records = await store.query_events(
+                EventQuery(session_id=session_id, after_sequence=sequence - 1, limit=1)
+            )
+            assert len(records) == 1
+            assert records[0].sequence == sequence
+            assert records[0].event.id == terminal.id
             assert terminal.payload["manual_recovery_persisted"] is True
         assert (
             len(
@@ -2163,7 +2207,7 @@ def test_recover_user_input_post_persist_cleanup_failure_is_not_suppressed() -> 
         await store.append_events(
             session_id,
             _crashed_user_input_resume_events(
-                paused,
+                await private_events_for_public_events(store, paused),
                 session_id=session_id,
                 tool_call_id="call_1",
             ),
@@ -2244,7 +2288,7 @@ def test_recover_user_input_closes_continuation_before_aclose_returns() -> None:
         await store.append_events(
             session_id,
             _crashed_user_input_resume_events(
-                pause,
+                await private_events_for_public_events(store, pause),
                 session_id=session_id,
                 tool_call_id="call_1",
             ),
@@ -2316,7 +2360,7 @@ def test_recover_user_input_task_cancellation_finalizes_continuation() -> None:
         await store.append_events(
             session_id,
             _crashed_user_input_resume_events(
-                pause,
+                await private_events_for_public_events(store, pause),
                 session_id=session_id,
                 tool_call_id="call_count",
             ),
@@ -2484,7 +2528,8 @@ def test_worker_recovery_preserves_pending_user_input() -> None:
             ),
         )
     )
-    input_id = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT).payload[
+    awaiting = next(e for e in pause if e.type == EventType.SESSION_AWAITING_USER_INPUT)
+    private_input_id = asyncio.run(private_event_for_public_event(store, awaiting)).payload[
         "input_id"
     ]
     # Simulate the crash window: status flipped back to RUNNING with the checkpoint intact.
@@ -2493,7 +2538,17 @@ def test_worker_recovery_preserves_pending_user_input() -> None:
         app.recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id="s_crashrec"))
     )
     assert IncompleteSessionRecoveryAction.PENDING_USER_INPUT in result.actions
-    assert result.pending_user_input_id == input_id
+    assert result.pending_user_input_id is not None
+    assert (
+        asyncio.run(
+            app._resolve_public_action_linkage(
+                session_id="s_crashrec",
+                value=result.pending_user_input_id,
+                field_name="input_id",
+            )
+        )
+        == private_input_id
+    )
     interrupted = [e for e in result.events if e.type == EventType.SESSION_INTERRUPTED]
     assert interrupted and interrupted[-1].payload["interruption_type"] == "user_input_required"
     assert interrupted[-1].payload["user_input"]["question"] == "which env?"
@@ -2595,7 +2650,7 @@ def test_recover_after_reused_id_prior_round_is_not_wrongly_rejected() -> None:
         store.append_events(
             "s_reuse_rec",
             _crashed_user_input_resume_events(
-                pause,
+                asyncio.run(private_events_for_public_events(store, pause)),
                 session_id="s_reuse_rec",
                 tool_call_id="call_1",
             ),
@@ -2609,7 +2664,8 @@ def test_recover_after_reused_id_prior_round_is_not_wrongly_rejected() -> None:
         )
     )
     assert stuck[-1].payload.get("manual_recovery_required") is True
-    assert stuck[-1].payload.get("tool_call_id") == "call_1"
+    private_terminal = asyncio.run(private_event_for_public_event(store, stuck[-1]))
+    assert private_terminal.payload.get("tool_call_id") == "call_1"
 
     # recover must not be blocked by round 1's stale call_1 terminal event.
     recovered = asyncio.run(

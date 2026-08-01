@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2184,6 +2185,63 @@ def test_step_structured_output_returns_unredacted_typed_edge():
     assert validated[-1].payload["output"] == {"token": REDACTED_SECRET}
     transcript = asyncio.run(app.session_store.load_transcript(result.session_id))
     assert secret not in str([message.model_dump(mode="json") for message in transcript])
+
+
+def test_runtime_owned_workflow_linkage_survives_short_secret_collisions(monkeypatch):
+    app = CayuApp(
+        secret_redactor=SecretRedactor(("8", "-")),
+        enable_logging=False,
+    )
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({}),
+            ]
+        ],
+        name="scripted",
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="bot", model="model"))
+    monkeypatch.setattr(
+        "cayu.workflows.workflow.uuid4",
+        lambda: SimpleNamespace(hex="8" * 32),
+    )
+    ctx = TinyWorkflow(app).context("workflow")
+
+    result = asyncio.run(step(ctx, agent="bot", step_id="step", prompt="go"))
+
+    assert result.session_id == f"workflow:step:{'8' * 8}"
+    records = asyncio.run(app.session_store.query_events(EventQuery(session_id="workflow")))
+    workflow_events = [record.event for record in records]
+    assert any(event.type == WORKFLOW_ATTEMPT_EVENT_TYPE for event in workflow_events)
+    assert any(event.type == EventType.WORKFLOW_STEP_STARTED for event in workflow_events)
+    assert any(event.type == EventType.WORKFLOW_STEP_COMPLETED for event in workflow_events)
+    assert len(provider.requests) == 1
+
+
+def test_caller_owned_workflow_child_linkage_remains_secret_rejected():
+    app = CayuApp(
+        secret_redactor=SecretRedactor("secret"),
+        enable_logging=False,
+    )
+    provider = ScriptedModelProvider([], name="scripted")
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="bot", model="model"))
+    ctx = TinyWorkflow(app).context("workflow")
+
+    with pytest.raises(ValueError, match="child_session_id contains a workload secret"):
+        asyncio.run(
+            step(
+                ctx,
+                agent="bot",
+                step_id="step",
+                prompt="go",
+                session_id="caller-secret-child",
+            )
+        )
+
+    assert provider.requests == []
 
 
 def test_workflow_structured_output_handoff_preserves_json_null_and_lifecycle():

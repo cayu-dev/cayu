@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import importlib
 from collections import OrderedDict
+from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
-from cayu.core.events import Event, EventType
-from cayu.runtime._event_writer import prepare_runtime_event
-from cayu.runtime.event_sinks import EventSink
+from cayu.core.events import Event, EventType, copy_event, event_durable_sequence
+from cayu.runtime._event_projection import project_runtime_event, public_event_sequence
+from cayu.runtime.event_sinks import EventSink, _EventSinkDelivery
 from cayu.vaults.redaction import SecretRedactor
 
 # GenAI attribute names, mirrored as plain strings from the OpenTelemetry GenAI
@@ -121,6 +122,16 @@ class _SessionSpans:
         self.last_activity_ns = last_activity_ns
 
 
+@dataclass(frozen=True, slots=True)
+class _OtelCorrelation:
+    """Private span-routing identity kept outside the public event payload."""
+
+    private_session_id: str
+    public_session_id: str
+    private_tool_call_id: str | None = None
+    private_parent_session_id: str | None = None
+
+
 class OpenTelemetryEventSink(EventSink):
     """Convert cayu runtime events into OpenTelemetry spans.
 
@@ -186,34 +197,77 @@ class OpenTelemetryEventSink(EventSink):
     async def emit(self, event: Event) -> None:
         if type(event) is not Event:
             raise TypeError("OpenTelemetryEventSink requires Event instances.")
-        event = _redact_event_for_export(event, redactor=self._redactor)
+        durable_sequence = event_durable_sequence(event)
+        public_sequence = public_event_sequence(event.id)
+        if durable_sequence is not None and not self._redactor.has_values:
+            public_event = project_runtime_event(
+                event,
+                sequence=durable_sequence,
+                redactor=self._redactor,
+            )
+        elif durable_sequence is not None:
+            # A standalone sink has no deployment keyring or reverse-index
+            # owner. Content-only redaction is safe; fabricating an unresolvable
+            # authority alias is not.
+            public_event = _redact_event_for_otel(event, redactor=self._redactor)
+        elif public_sequence is not None:
+            # Runtime delivery has already assigned the record's public identity.
+            # Applying project_runtime_event() again can reinterpret redaction
+            # markers or aliases as private authority. A sink may still have a
+            # stricter redactor than the runtime, so apply content-only redaction.
+            public_event = _redact_event_for_otel(event, redactor=self._redactor)
+        else:
+            # Direct sink use has no durable record identity from which to derive
+            # public authority aliases. Keep private correlation out-of-band and
+            # redact only exported content instead of fabricating sequence 1.
+            public_event = _redact_event_for_otel(event, redactor=self._redactor)
+        correlation = _OtelCorrelation(
+            private_session_id=event.session_id,
+            public_session_id=public_event.session_id,
+            private_tool_call_id=_payload_string(event, "tool_call_id"),
+            private_parent_session_id=_payload_string(event, "parent_session_id"),
+        )
+        await self._emit_correlated(
+            public_event,
+            identity=(event.session_id, event.id),
+            correlation=correlation,
+        )
+
+    async def _emit_correlated(
+        self,
+        event: Event,
+        *,
+        identity: tuple[str, str],
+        correlation: _OtelCorrelation,
+    ) -> None:
         event_type = event.type
         if event_type not in _TRACED_EVENT_TYPES:
             return
-        identity = (event.session_id, event.id)
         if identity in self._recent_event_identities:
             self._recent_event_identities.move_to_end(identity)
             return
         applied = False
         if event_type in _SESSION_START_EVENTS:
-            applied = self._start_session_span(event)
+            applied = self._start_session_span(event, correlation=correlation)
         elif event_type in _SESSION_END_EVENTS:
             # Only an outright failure marks the span ERROR; an interrupt is a pause
             # (approval wait / user stop), not a failure, so it stays UNSET.
             error = _error_text(event) if event_type == EventType.SESSION_FAILED else None
-            applied = self._end_session_span(event, error=error)
+            applied = self._end_session_span(event, correlation=correlation, error=error)
         elif event_type == EventType.MODEL_STARTED:
-            applied = self._start_model_span(event)
+            applied = self._start_model_span(event, correlation=correlation)
         elif event_type == EventType.MODEL_COMPLETED:
-            applied = self._end_model_span(event, error=None)
+            applied = self._end_model_span(event, correlation=correlation, error=None)
         elif event_type == EventType.MODEL_ERROR:
-            applied = self._end_model_span(event, error=_error_text(event))
+            applied = self._end_model_span(event, correlation=correlation, error=_error_text(event))
         elif event_type == EventType.TOOL_CALL_STARTED:
-            applied = self._start_tool_span(event)
+            applied = self._start_tool_span(event, correlation=correlation)
         elif event_type == EventType.TOOL_CALL_COMPLETED:
-            applied = self._end_tool_span(event, error=None)
+            applied = self._end_tool_span(event, correlation=correlation, error=None)
         elif event_type in _TOOL_CALL_ERROR_EVENTS:
-            applied = self._end_tool_span(event, error=_tool_error_text(event))
+            applied = self._end_tool_span(
+                event, correlation=correlation, error=_tool_error_text(event)
+            )
         if applied:
             self._recent_event_identities[identity] = None
             if len(self._recent_event_identities) > _MAX_RECENT_EVENT_IDENTITIES:
@@ -234,8 +288,8 @@ class OpenTelemetryEventSink(EventSink):
         self._propagator().inject(carrier, context=context)
         return carrier.get("traceparent")
 
-    def _start_session_span(self, event: Event) -> bool:
-        session_id = event.session_id
+    def _start_session_span(self, event: Event, *, correlation: _OtelCorrelation) -> bool:
+        session_id = correlation.private_session_id
         if session_id in self._sessions:
             # Idempotent: a RESUMED after STARTED, or a duplicate, keeps the first span.
             return True
@@ -255,16 +309,24 @@ class OpenTelemetryEventSink(EventSink):
             )
         name = _span_name("cayu.session", event.agent_name)
         span = self._tracer.start_span(
-            name, context=self._resolve_parent_context(event), start_time=event_ns
+            name,
+            context=self._resolve_parent_context(event, correlation=correlation),
+            start_time=event_ns,
         )
-        span.set_attribute(CAYU_SESSION_ID, self._redactor.redact_text(session_id))
+        span.set_attribute(CAYU_SESSION_ID, correlation.public_session_id)
         _set_str(span, CAYU_AGENT_NAME, event.agent_name)
         _set_str(span, CAYU_ENVIRONMENT_NAME, event.environment_name)
         self._sessions[session_id] = _SessionSpans(span, event_ns)
         return True
 
-    def _end_session_span(self, event: Event, *, error: str | None) -> bool:
-        state = self._sessions.pop(event.session_id, None)
+    def _end_session_span(
+        self,
+        event: Event,
+        *,
+        correlation: _OtelCorrelation,
+        error: str | None,
+    ) -> bool:
+        state = self._sessions.pop(correlation.private_session_id, None)
         if state is None:
             return False
         self._close_session_state(state, error=error, end_time=_event_time_ns(event))
@@ -290,8 +352,8 @@ class OpenTelemetryEventSink(EventSink):
             self._finish(tool_span, error=None, incomplete=True, end_time=end_time)
         self._finish(state.root, error=error, incomplete=root_incomplete, end_time=end_time)
 
-    def _start_model_span(self, event: Event) -> bool:
-        state = self._sessions.get(event.session_id)
+    def _start_model_span(self, event: Event, *, correlation: _OtelCorrelation) -> bool:
+        state = self._sessions.get(correlation.private_session_id)
         if state is None:
             return False
         event_ns = _event_time_ns(event)
@@ -320,8 +382,14 @@ class OpenTelemetryEventSink(EventSink):
         state.model = span
         return True
 
-    def _end_model_span(self, event: Event, *, error: str | None) -> bool:
-        state = self._sessions.get(event.session_id)
+    def _end_model_span(
+        self,
+        event: Event,
+        *,
+        correlation: _OtelCorrelation,
+        error: str | None,
+    ) -> bool:
+        state = self._sessions.get(correlation.private_session_id)
         if state is None or state.model is None:
             return False
         event_ns = _event_time_ns(event)
@@ -353,13 +421,13 @@ class OpenTelemetryEventSink(EventSink):
         self._finish(span, error=error, end_time=event_ns)
         return True
 
-    def _start_tool_span(self, event: Event) -> bool:
-        state = self._sessions.get(event.session_id)
+    def _start_tool_span(self, event: Event, *, correlation: _OtelCorrelation) -> bool:
+        state = self._sessions.get(correlation.private_session_id)
         if state is None:
             return False
         event_ns = _event_time_ns(event)
         state.last_activity_ns = event_ns
-        tool_call_id = _tool_call_id(event)
+        tool_call_id = correlation.private_tool_call_id or ""
         if tool_call_id in state.tools:
             self._finish(
                 state.tools.pop(tool_call_id), error=None, incomplete=True, end_time=event_ns
@@ -388,17 +456,23 @@ class OpenTelemetryEventSink(EventSink):
         _set_str(
             span,
             GEN_AI_TOOL_CALL_ID,
-            self._redactor.redact_text(_tool_call_id(event)),
+            _public_tool_call_id(event),
         )
         return span
 
-    def _end_tool_span(self, event: Event, *, error: str | None) -> bool:
-        state = self._sessions.get(event.session_id)
+    def _end_tool_span(
+        self,
+        event: Event,
+        *,
+        correlation: _OtelCorrelation,
+        error: str | None,
+    ) -> bool:
+        state = self._sessions.get(correlation.private_session_id)
         if state is None:
             return False
         event_ns = _event_time_ns(event)
         state.last_activity_ns = event_ns
-        tool_call_id = _tool_call_id(event)
+        tool_call_id = correlation.private_tool_call_id or ""
         span = state.tools.pop(tool_call_id, None)
         denied_by = event.payload.get("denied_by")
         if (
@@ -421,10 +495,10 @@ class OpenTelemetryEventSink(EventSink):
         self._finish(span, error=error, end_time=event_ns)
         return True
 
-    def _resolve_parent_context(self, event: Event) -> Any:
+    def _resolve_parent_context(self, event: Event, *, correlation: _OtelCorrelation) -> Any:
         payload = event.payload
-        parent_session_id = payload.get("parent_session_id")
-        if type(parent_session_id) is str and parent_session_id:
+        parent_session_id = correlation.private_parent_session_id
+        if parent_session_id is not None:
             parent_state = self._sessions.get(parent_session_id)
             if parent_state is not None:
                 return self._trace.set_span_in_context(parent_state.root)
@@ -462,6 +536,31 @@ class OpenTelemetryEventSink(EventSink):
         return self._propagator_instance
 
 
+async def _emit_opentelemetry_delivery(
+    sink: OpenTelemetryEventSink,
+    delivery: _EventSinkDelivery,
+) -> None:
+    """Use private correlation only for the exact built-in telemetry sink."""
+
+    if type(sink) is not OpenTelemetryEventSink or type(delivery) is not _EventSinkDelivery:
+        raise TypeError("OpenTelemetry private delivery requires exact built-in types.")
+    # RuntimeEventWriter already supplies the canonical public projection. Only
+    # apply the sink's optional stricter content redactor; never project aliases
+    # or marker-bearing authority a second time.
+    public_event = _redact_event_for_otel(delivery.event, redactor=sink._redactor)
+    correlation = _OtelCorrelation(
+        private_session_id=delivery.private_session_id,
+        public_session_id=public_event.session_id,
+        private_tool_call_id=delivery.private_tool_call_id,
+        private_parent_session_id=delivery.private_parent_session_id,
+    )
+    await sink._emit_correlated(
+        public_event,
+        identity=(delivery.private_session_id, delivery.private_event_id),
+        correlation=correlation,
+    )
+
+
 def _event_time_ns(event: Event) -> int:
     """Convert an event's timestamp to epoch nanoseconds for OTel span timing.
 
@@ -473,38 +572,53 @@ def _event_time_ns(event: Event) -> int:
     return int(event.timestamp.timestamp() * 1_000_000_000)
 
 
-def _redact_event_for_export(event: Event, *, redactor: SecretRedactor) -> Event:
-    """Redact exported data while retaining raw in-process correlation keys."""
+def _redact_event_for_otel(event: Event, *, redactor: SecretRedactor) -> Event:
+    """Redact exported span inputs without changing public authority semantics."""
 
-    redacted = prepare_runtime_event(
-        event,
-        redactor=redactor,
-        reject_authority_secrets=False,
-    )
-    payload = dict(redacted.payload)
-    parent_session_id = event.payload.get("parent_session_id")
-    if type(parent_session_id) is str:
-        payload["parent_session_id"] = parent_session_id
-    return redacted.model_copy(
+    if type(event) is not Event:
+        raise TypeError("OpenTelemetry redaction requires an Event.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    copied = copy_event(event)
+    return copied.model_copy(
         update={
-            "session_id": event.session_id,
-            "payload": payload,
+            "id": redactor.redact_text(copied.id),
+            "session_id": redactor.redact_text(copied.session_id),
+            "interaction_id": (
+                None
+                if copied.interaction_id is None
+                else redactor.redact_text(copied.interaction_id)
+            ),
+            "agent_name": (
+                None if copied.agent_name is None else redactor.redact_text(copied.agent_name)
+            ),
+            "environment_name": (
+                None
+                if copied.environment_name is None
+                else redactor.redact_text(copied.environment_name)
+            ),
+            "workflow_name": (
+                None if copied.workflow_name is None else redactor.redact_text(copied.workflow_name)
+            ),
+            "tool_name": (
+                None if copied.tool_name is None else redactor.redact_text(copied.tool_name)
+            ),
+            "payload": redactor.redact_json(copied.payload),
         },
         deep=True,
     )
-
-
-def _redact_optional_text(value: str | None, *, redactor: SecretRedactor) -> str | None:
-    if value is None:
-        return None
-    return redactor.redact_text(value)
 
 
 def _span_name(base: str, suffix: Any) -> str:
     return f"{base} {suffix}" if suffix else base
 
 
-def _tool_call_id(event: Event) -> str:
+def _payload_string(event: Event, key: str) -> str | None:
+    value = event.payload.get(key)
+    return value if type(value) is str and value else None
+
+
+def _public_tool_call_id(event: Event) -> str:
     tool_call_id = event.payload.get("tool_call_id")
     return tool_call_id if type(tool_call_id) is str else ""
 

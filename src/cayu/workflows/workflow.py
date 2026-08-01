@@ -16,7 +16,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.core.messages import Message, MessageRole, TextPart, ToolCallPart
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.workflows import Workflow, WorkflowSpec
@@ -33,6 +33,7 @@ from cayu.runtime import (
 )
 from cayu.runtime.budgets import copy_request_budget_limits
 from cayu.runtime.retry_policy import copy_retry_policy
+from cayu.runtime.sessions import run_request_with_runtime_generated_authority
 from cayu.runtime.stop_policy import copy_run_limits
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -310,12 +311,15 @@ class WorkflowContext:
     ) -> Event:
         """Build a workflow/custom event stamped with this context's attempt id."""
         validate_workflow_journal_event_type(event_type)
-        return Event(
-            type=event_type,
-            session_id=self.session_id,
-            workflow_name=self.workflow_name,
-            agent_name=agent_name,
-            payload={**(payload or {}), "attempt_id": self.attempt_id},
+        return event_with_runtime_payload_authority(
+            Event(
+                type=event_type,
+                session_id=self.session_id,
+                workflow_name=self.workflow_name,
+                agent_name=agent_name,
+                payload={**(payload or {}), "attempt_id": self.attempt_id},
+            ),
+            "attempt_id",
         )
 
     async def _claim_step_id(self, step_id: str) -> None:
@@ -611,6 +615,7 @@ async def _run_step(
             )
 
     child_session_id = session_id
+    child_session_has_runtime_authority = False
     if child_session_id is None and started_child_session_id is not None:
         started_child = await ctx.app.session_store.load(started_child_session_id)
         if started_child is None or started_child.status != SessionStatus.FAILED:
@@ -623,8 +628,12 @@ async def _run_step(
                     )
                 )
             child_session_id = started_child_session_id
+            # The durable workflow journal, rather than this invocation's
+            # caller, selected the replay identity.
+            child_session_has_runtime_authority = True
     if child_session_id is None:
         child_session_id = f"{ctx.session_id}:{step_id}:{uuid4().hex[:8]}"
+        child_session_has_runtime_authority = True
 
     # Resume onto an already-started child reuses its journaled STARTED record;
     # appending a second one would leave unpaired started/completed events.
@@ -638,6 +647,11 @@ async def _run_step(
                 "child_session_id": child_session_id,
             },
         )
+        if child_session_has_runtime_authority:
+            started_event = event_with_runtime_payload_authority(
+                started_event,
+                "child_session_id",
+            )
         if not await ctx.journal.append_step_started(
             started_event,
             attempt_id=ctx.attempt_id,
@@ -692,6 +706,18 @@ async def _run_step(
         parent_session_id=parent_session_id,
         causal_budget_id=causal_budget_id,
     )
+    request_authority: list[str] = []
+    if child_session_has_runtime_authority:
+        request_authority.append("session_id")
+    if parent_session_id is not None:
+        # A parent is returned only when the journal anchor was positively
+        # loaded and identified as this workflow's runtime-owned session.
+        request_authority.extend(("parent_session_id", "causal_budget_id"))
+    if request_authority:
+        request = run_request_with_runtime_generated_authority(
+            request,
+            *request_authority,
+        )
 
     existing_child = await ctx.app.session_store.load(child_session_id)
     if existing_child is not None:
@@ -813,7 +839,7 @@ async def _append_step_completed(
     agent: str,
     result: StepResult,
 ) -> None:
-    if not await ctx.journal.append_current_attempt(
+    completed_event = event_with_runtime_payload_authority(
         ctx.event(
             EventType.WORKFLOW_STEP_COMPLETED,
             agent_name=agent,
@@ -823,6 +849,10 @@ async def _append_step_completed(
                 "has_output": result.has_output,
             },
         ),
+        "child_session_id",
+    )
+    if not await ctx.journal.append_current_attempt(
+        completed_event,
         attempt_id=ctx.attempt_id,
     ):
         latest = await ctx.journal.latest_attempt_id()

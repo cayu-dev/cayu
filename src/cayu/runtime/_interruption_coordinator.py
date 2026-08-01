@@ -12,7 +12,7 @@ from math import isfinite
 from typing import Any, Protocol
 
 from cayu._validation import copy_json_value
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._session_control import clear_current_task_cancellation
 from cayu.runtime._terminal_evidence import interruption_request_id_from_payload
@@ -57,6 +57,17 @@ def interruption_cascade_suppressed() -> bool:
 
 def interruption_cascade_lease_seconds() -> float:
     return _BACKGROUND_INTERRUPTION_LEASE_SECONDS
+
+
+def _runtime_interruption_cascade_event(event: Event) -> Event:
+    """Attest the durable runtime identities carried by cascade evidence."""
+
+    fields = tuple(
+        field_name
+        for field_name in ("attempt_id", "retry_request_id")
+        if type(event.payload.get(field_name)) is str
+    )
+    return event_with_runtime_payload_authority(event, *fields)
 
 
 @contextmanager
@@ -726,20 +737,23 @@ class BackgroundInterruptionCoordinator:
                 if parent is None:
                     return
                 await self._event_writer.emit(
-                    Event(
-                        type=EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
-                        session_id=parent.id,
-                        agent_name=parent.agent_name,
-                        environment_name=parent.environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-                            "attempt_id": state.attempt_id,
-                            "generation": state.generation,
-                            "failure_count": state.failure_count,
-                            "failures": state.failure_details,
-                            "failures_truncated": state.failure_count > len(state.failure_details),
-                            **_interruption_cascade_retry_event_payload(state.retry_request),
-                        },
+                    _runtime_interruption_cascade_event(
+                        Event(
+                            type=EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
+                            session_id=parent.id,
+                            agent_name=parent.agent_name,
+                            environment_name=parent.environment_name,
+                            payload={
+                                "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+                                "attempt_id": state.attempt_id,
+                                "generation": state.generation,
+                                "failure_count": state.failure_count,
+                                "failures": state.failure_details,
+                                "failures_truncated": state.failure_count
+                                > len(state.failure_details),
+                                **_interruption_cascade_retry_event_payload(state.retry_request),
+                            },
+                        )
                     )
                 )
             except Exception as exc:
@@ -765,18 +779,20 @@ class BackgroundInterruptionCoordinator:
             failure_recorded = marker.get("failure_recorded", False)
             if failure_recorded:
                 await self._event_writer.emit(
-                    Event(
-                        type=EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
-                        session_id=parent.id,
-                        agent_name=parent.agent_name,
-                        environment_name=parent.environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-                            "attempt_id": state.attempt_id,
-                            "generation": state.generation,
-                            "descendant_count": len(state.cascade_session_ids) - 1,
-                            **_interruption_cascade_retry_event_payload(state.retry_request),
-                        },
+                    _runtime_interruption_cascade_event(
+                        Event(
+                            type=EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED,
+                            session_id=parent.id,
+                            agent_name=parent.agent_name,
+                            environment_name=parent.environment_name,
+                            payload={
+                                "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+                                "attempt_id": state.attempt_id,
+                                "generation": state.generation,
+                                "descendant_count": len(state.cascade_session_ids) - 1,
+                                **_interruption_cascade_retry_event_payload(state.retry_request),
+                            },
+                        )
                     )
                 )
             try:
@@ -815,27 +831,29 @@ class BackgroundInterruptionCoordinator:
             if not recorded:
                 return
             await self._event_writer.emit(
-                Event(
-                    type=EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
-                    session_id=parent.id,
-                    agent_name=parent.agent_name,
-                    environment_name=parent.environment_name,
-                    payload={
-                        "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
-                        "attempt_id": state.attempt_id,
-                        "generation": state.generation,
-                        "failure_count": 1,
-                        "failures": [
-                            {
-                                "scope": "parent",
-                                "session_id": parent.id,
-                                "reason": "completion_checkpoint_clear_failed",
-                                "error_type": type(exc).__name__,
-                            }
-                        ],
-                        "failures_truncated": False,
-                        **_interruption_cascade_retry_event_payload(state.retry_request),
-                    },
+                _runtime_interruption_cascade_event(
+                    Event(
+                        type=EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
+                        session_id=parent.id,
+                        agent_name=parent.agent_name,
+                        environment_name=parent.environment_name,
+                        payload={
+                            "interruption_type": _INTERRUPTION_TYPE_OPERATOR_REQUESTED,
+                            "attempt_id": state.attempt_id,
+                            "generation": state.generation,
+                            "failure_count": 1,
+                            "failures": [
+                                {
+                                    "scope": "parent",
+                                    "session_id": parent.id,
+                                    "reason": "completion_checkpoint_clear_failed",
+                                    "error_type": type(exc).__name__,
+                                }
+                            ],
+                            "failures_truncated": False,
+                            **_interruption_cascade_retry_event_payload(state.retry_request),
+                        },
+                    )
                 )
             )
         except Exception as record_exc:

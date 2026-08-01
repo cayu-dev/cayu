@@ -109,6 +109,35 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS cayu_public_authority_aliases (
+        field_name TEXT NOT NULL,
+        scope_session_id TEXT NOT NULL,
+        public_alias TEXT NOT NULL,
+        private_value TEXT NOT NULL,
+        PRIMARY KEY (field_name, scope_session_id, public_alias)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_private_value
+        ON cayu_public_authority_aliases(field_name, scope_session_id, private_value)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_keys (
+        key_id TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL,
+        backfill_completed BOOLEAN NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_config (
+        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+        active_key_id TEXT NOT NULL REFERENCES cayu_public_authority_alias_keys(key_id),
+        keyring_fingerprint TEXT NOT NULL,
+        generation BIGINT NOT NULL CHECK (generation >= 1),
+        retired_key_ids JSONB NOT NULL CHECK (jsonb_typeof(retired_key_ids) = 'array')
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS cayu_checkpoints (
         session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         state JSONB NOT NULL,

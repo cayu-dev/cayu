@@ -8,7 +8,12 @@ from typing import Any, NamedTuple
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import copy_durable_json_value, require_durable_clean_nonblank
-from cayu.core.events import Event, EventType
+from cayu.core.events import (
+    Event,
+    EventType,
+    event_with_runtime_nested_payload_authority,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
@@ -75,6 +80,39 @@ _APPROVAL_HISTORY_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_BLOCKED,
     }
 )
+
+_RUNTIME_APPROVAL_IDENTITY_FIELDS = (
+    "approval_id",
+    "model_step_id",
+    "model_attempt_id",
+    "tool_round_id",
+)
+
+
+def event_with_pending_approval_authority(
+    event: Event,
+    approval: PendingToolApproval,
+) -> Event:
+    """Attest approval identities from one validated runtime checkpoint model."""
+
+    if type(approval) is not PendingToolApproval:
+        raise TypeError("approval must be a PendingToolApproval.")
+    top_level_fields = tuple(
+        field_name
+        for field_name in _RUNTIME_APPROVAL_IDENTITY_FIELDS
+        if event.payload.get(field_name) == getattr(approval, field_name)
+    )
+    if top_level_fields:
+        event = event_with_runtime_payload_authority(event, *top_level_fields)
+    nested = event.payload.get("approval")
+    nested_paths = tuple(
+        ("approval", field_name)
+        for field_name in _RUNTIME_APPROVAL_IDENTITY_FIELDS
+        if type(nested) is dict and nested.get(field_name) == getattr(approval, field_name)
+    )
+    if nested_paths:
+        event = event_with_runtime_nested_payload_authority(event, *nested_paths)
+    return event
 
 
 class ApprovalResolutionIntent(BaseModel):
@@ -493,7 +531,7 @@ def resumed_event(
     resolved_by: ResolutionActor | None = None,
     expired: bool = False,
 ) -> Event:
-    return Event(
+    event = Event(
         type=EventType.SESSION_RESUMED,
         session_id=session.id,
         agent_name=agent_name,
@@ -510,6 +548,13 @@ def resumed_event(
             "expired": expired,
         },
     )
+    return event_with_runtime_payload_authority(
+        event,
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "approval_id",
+    )
 
 
 def cleared_event(
@@ -519,7 +564,7 @@ def cleared_event(
     environment_name: str | None,
     approval: PendingToolApproval,
 ) -> Event:
-    return Event(
+    event = Event(
         type=EventType.SESSION_CHECKPOINTED,
         session_id=session.id,
         agent_name=agent_name,
@@ -533,6 +578,13 @@ def cleared_event(
             "tool_call_id": approval.tool_call_id,
             "cleared": True,
         },
+    )
+    return event_with_runtime_payload_authority(
+        event,
+        "model_step_id",
+        "model_attempt_id",
+        "tool_round_id",
+        "approval_id",
     )
 
 

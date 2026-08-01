@@ -29,12 +29,14 @@ from cayu import (
     SubagentTool,
 )
 from cayu.core import Event, EventType
+from cayu.core.events import event_with_durable_sequence
 from cayu.observability import otel
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, UsageDialect
 from cayu.runtime import InMemorySessionStore, SessionIdentity
-from cayu.runtime._event_writer import RuntimeEventWriter
+from cayu.runtime._event_projection import public_event_id
+from cayu.runtime._event_writer import RuntimeEventWriter, _emit_event_sink
 from cayu.runtime.budgets import InMemoryBudgetStore
-from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.event_sinks import EventSink, _EventSinkDelivery
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 REMOTE_TRACE_ID = "11111111111111111111111111111111"
@@ -49,6 +51,331 @@ class _FailModelStartOnceSink(EventSink):
         if event.type == EventType.MODEL_STARTED and not self._failed:
             self._failed = True
             raise RuntimeError("transient sibling sink failure")
+
+
+def test_private_sink_identity_prevents_public_redaction_collision_and_deduplicates() -> None:
+    exporter, sink = _make_sink()
+    public_session = REDACTED_SECRET
+    public_start = Event(
+        id="cayu_event_1",
+        type=EventType.SESSION_STARTED,
+        session_id=public_session,
+        payload={},
+    )
+    public_end = Event(
+        id="cayu_event_2",
+        type=EventType.SESSION_COMPLETED,
+        session_id=public_session,
+        payload={},
+    )
+
+    async def scenario() -> None:
+        for private_session in ("private-session-a", "private-session-b"):
+            start = _EventSinkDelivery(
+                event=public_start,
+                event_sequence=1,
+                private_session_id=private_session,
+                private_event_id=f"{private_session}-start",
+            )
+            end = _EventSinkDelivery(
+                event=public_end,
+                event_sequence=2,
+                private_session_id=private_session,
+                private_event_id=f"{private_session}-end",
+            )
+            await otel._emit_opentelemetry_delivery(sink, start)
+            await otel._emit_opentelemetry_delivery(sink, start)
+            await otel._emit_opentelemetry_delivery(sink, end)
+            await otel._emit_opentelemetry_delivery(sink, end)
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 2
+    assert {span.attributes[otel.CAYU_SESSION_ID] for span in spans} == {REDACTED_SECRET}
+
+
+def test_runtime_delivery_applies_the_otel_sink_specific_redactor() -> None:
+    secret = "sink-only-export-secret"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    sink = OpenTelemetryEventSink(
+        tracer=provider.get_tracer("sink-specific-redaction-test"),
+        redactor=SecretRedactor(secret),
+    )
+
+    async def scenario() -> None:
+        await otel._emit_opentelemetry_delivery(
+            sink,
+            _EventSinkDelivery(
+                event=Event(
+                    id=public_event_id(1),
+                    type=EventType.SESSION_STARTED,
+                    session_id="public-session",
+                    agent_name=f"agent-{secret}",
+                    payload={"agent_name": f"agent-{secret}"},
+                ),
+                event_sequence=1,
+                private_session_id="private-session",
+                private_event_id="private-start",
+            ),
+        )
+        await otel._emit_opentelemetry_delivery(
+            sink,
+            _EventSinkDelivery(
+                event=Event(
+                    id=public_event_id(2),
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="public-session",
+                ),
+                event_sequence=2,
+                private_session_id="private-session",
+                private_event_id="private-end",
+            ),
+        )
+
+    asyncio.run(scenario())
+
+    exported = repr(
+        [
+            {
+                "name": span.name,
+                "attributes": dict(span.attributes),
+            }
+            for span in exporter.get_finished_spans()
+        ]
+    )
+    assert secret not in exported
+    assert REDACTED_SECRET in exported
+
+
+def test_runtime_delivery_does_not_reproject_the_canonical_public_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter, sink = _make_sink()
+
+    def fail_projection(*args: Any, **kwargs: Any) -> Event:
+        raise AssertionError("runtime OTel delivery must not project a public event twice")
+
+    monkeypatch.setattr(otel, "project_runtime_event", fail_projection)
+
+    async def scenario() -> None:
+        await otel._emit_opentelemetry_delivery(
+            sink,
+            _EventSinkDelivery(
+                event=Event(
+                    id=public_event_id(41),
+                    type=EventType.SESSION_STARTED,
+                    session_id="public-session",
+                    payload={"diagnostic": REDACTED_SECRET},
+                ),
+                event_sequence=41,
+                private_session_id="private-session",
+                private_event_id="private-start",
+            ),
+        )
+        await otel._emit_opentelemetry_delivery(
+            sink,
+            _EventSinkDelivery(
+                event=Event(
+                    id=public_event_id(42),
+                    type=EventType.SESSION_COMPLETED,
+                    session_id="public-session",
+                    payload={"diagnostic": REDACTED_SECRET},
+                ),
+                event_sequence=42,
+                private_session_id="private-session",
+                private_event_id="private-end",
+            ),
+        )
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].attributes[otel.CAYU_SESSION_ID] == "public-session"
+
+
+def test_direct_private_delivery_uses_attached_durable_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exporter, sink = _make_sink()
+    observed_sequences: list[int] = []
+    real_project = otel.project_runtime_event
+
+    def record_projection(event: Event, *, sequence: int, redactor: SecretRedactor) -> Event:
+        observed_sequences.append(sequence)
+        return real_project(event, sequence=sequence, redactor=redactor)
+
+    monkeypatch.setattr(otel, "project_runtime_event", record_projection)
+
+    asyncio.run(
+        sink.emit(
+            event_with_durable_sequence(
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="private-session",
+                    payload={},
+                ),
+                37,
+            )
+        )
+    )
+
+    assert observed_sequences == [37]
+    assert sink.traceparent_for("private-session") is not None
+    assert exporter.get_finished_spans() == ()
+
+
+def test_otel_subclass_receives_public_delivery_without_reprojection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DerivedOpenTelemetryEventSink(OpenTelemetryEventSink):
+        pass
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    sink = DerivedOpenTelemetryEventSink(tracer=provider.get_tracer("derived-sink"))
+
+    def fail_projection(*args: Any, **kwargs: Any) -> Event:
+        raise AssertionError("derived OTel sinks receive an already-public event")
+
+    monkeypatch.setattr(otel, "project_runtime_event", fail_projection)
+
+    async def scenario() -> None:
+        for sequence, event_type in (
+            (51, EventType.SESSION_STARTED),
+            (52, EventType.SESSION_COMPLETED),
+        ):
+            await _emit_event_sink(
+                sink,
+                _EventSinkDelivery(
+                    event=Event(
+                        id=public_event_id(sequence),
+                        type=event_type,
+                        session_id="public-derived-session",
+                        payload={},
+                    ),
+                    event_sequence=sequence,
+                    private_session_id="private-derived-session",
+                    private_event_id=f"private-{sequence}",
+                ),
+            )
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].attributes[otel.CAYU_SESSION_ID] == "public-derived-session"
+
+
+def test_public_payload_cannot_forge_private_otel_span_correlation() -> None:
+    exporter, sink = _make_sink()
+
+    async def deliver(
+        event: Event,
+        *,
+        sequence: int,
+        private_session_id: str,
+        private_tool_call_id: str | None = None,
+        private_parent_session_id: str | None = None,
+    ) -> None:
+        await otel._emit_opentelemetry_delivery(
+            sink,
+            _EventSinkDelivery(
+                event=event,
+                event_sequence=sequence,
+                private_session_id=private_session_id,
+                private_event_id=f"private-event-{sequence}",
+                private_tool_call_id=private_tool_call_id,
+                private_parent_session_id=private_parent_session_id,
+            ),
+        )
+
+    async def scenario() -> None:
+        await deliver(
+            Event(
+                id=public_event_id(1),
+                type=EventType.SESSION_STARTED,
+                session_id="public-parent",
+            ),
+            sequence=1,
+            private_session_id="private-parent",
+        )
+        await deliver(
+            Event(
+                id=public_event_id(2),
+                type=EventType.SESSION_STARTED,
+                session_id="public-child",
+                payload={"__cayu_private_parent_session_id": "private-parent"},
+            ),
+            sequence=2,
+            private_session_id="private-child",
+            # Absence of trusted parent evidence must win over the forged payload.
+            private_parent_session_id=None,
+        )
+        await deliver(
+            Event(
+                id=public_event_id(3),
+                type=EventType.TOOL_CALL_STARTED,
+                session_id="public-child",
+                tool_name="demo",
+                payload={
+                    "tool_call_id": "public-call",
+                    "__cayu_private_tool_call_id": "forged-start",
+                },
+            ),
+            sequence=3,
+            private_session_id="private-child",
+            private_tool_call_id="private-real-call",
+        )
+        await deliver(
+            Event(
+                id=public_event_id(4),
+                type=EventType.TOOL_CALL_COMPLETED,
+                session_id="public-child",
+                tool_name="demo",
+                payload={
+                    "tool_call_id": "public-call",
+                    "__cayu_private_tool_call_id": "forged-end",
+                },
+            ),
+            sequence=4,
+            private_session_id="private-child",
+            private_tool_call_id="private-real-call",
+        )
+        await deliver(
+            Event(
+                id=public_event_id(5),
+                type=EventType.SESSION_COMPLETED,
+                session_id="public-child",
+            ),
+            sequence=5,
+            private_session_id="private-child",
+        )
+        await deliver(
+            Event(
+                id=public_event_id(6),
+                type=EventType.SESSION_COMPLETED,
+                session_id="public-parent",
+            ),
+            sequence=6,
+            private_session_id="private-parent",
+        )
+
+    asyncio.run(scenario())
+
+    spans = exporter.get_finished_spans()
+    child = next(
+        span for span in spans if span.attributes.get(otel.CAYU_SESSION_ID) == "public-child"
+    )
+    tool = next(span for span in spans if span.attributes.get(otel.GEN_AI_TOOL_NAME) == "demo")
+    assert child.parent is None
+    assert tool.parent is not None
+    assert tool.parent.span_id == child.context.span_id
+    assert otel.CAYU_INCOMPLETE not in tool.attributes
 
 
 class FakeProvider(ModelProvider):
@@ -231,6 +558,9 @@ def test_tool_span_carries_genai_tool_attributes() -> None:
     attrs = _spans_by_name(exporter)["execute_tool exec_command"].attributes
     assert attrs["gen_ai.operation.name"] == "execute_tool"
     assert attrs["gen_ai.tool.name"] == "exec_command"
+    # Direct, unpersisted sink use has no durable sequence from which to derive a
+    # record-owned linkage alias. The non-secret identifier remains useful while
+    # private span correlation stays out-of-band.
     assert attrs["gen_ai.tool.call.id"] == "call_1"
 
 
@@ -412,6 +742,8 @@ def test_sink_redacts_exported_session_ids_without_changing_internal_correlation
 
     session_spans = [span for span in exporter.get_finished_spans() if span.name == "cayu.session"]
     assert len(session_spans) == 2
+    # Unpersisted direct delivery cannot mint durable public aliases. Exported
+    # attributes fail closed while the private correlation above remains distinct.
     assert {span.attributes[otel.CAYU_SESSION_ID] for span in session_spans} == {REDACTED_SECRET}
 
 
@@ -760,7 +1092,7 @@ def test_aggregate_sink_retry_does_not_duplicate_model_span(
         await writer.emit(
             Event(type=EventType.SESSION_STARTED, session_id="sess_retry", payload={})
         )
-        started = await writer.emit(
+        await writer.emit(
             Event(
                 type=EventType.MODEL_STARTED,
                 session_id="sess_retry",
@@ -768,7 +1100,7 @@ def test_aggregate_sink_retry_does_not_duplicate_model_span(
             )
         )
         recovered = await writer.recover_persisted_side_effects()
-        assert [event.id for event in recovered] == [started.id]
+        assert [event.id for event in recovered] == [public_event_id(2)]
         await writer.emit(
             Event(type=EventType.MODEL_COMPLETED, session_id="sess_retry", payload={})
         )

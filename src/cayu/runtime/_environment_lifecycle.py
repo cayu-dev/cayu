@@ -25,7 +25,7 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
 )
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
 from cayu.environments import (
     BoundWorkspace,
     Environment,
@@ -718,30 +718,32 @@ class EnvironmentLifecycle:
                 )
                 raise
             allocation_checkpointed = True
-            events.append(
-                await self._event_writer.emit(
-                    Event(
-                        type=EventType.ENVIRONMENT_FACTORY_COMPLETED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=environment_name,
-                        payload={
-                            **base_payload,
-                            "environment_name": environment.spec.name,
-                            "result_metadata": copy_json_value(
-                                result.metadata,
-                                "result_metadata",
-                            ),
-                            "reconnect_metadata": reconnect_metadata,
-                            **(
-                                {}
-                                if allocation_context is None
-                                else {"allocation_id": (allocation_context.intent.allocation_id)}
-                            ),
-                        },
-                    )
-                )
+            completed_event = Event(
+                type=EventType.ENVIRONMENT_FACTORY_COMPLETED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                payload={
+                    **base_payload,
+                    "environment_name": environment.spec.name,
+                    "result_metadata": copy_json_value(
+                        result.metadata,
+                        "result_metadata",
+                    ),
+                    "reconnect_metadata": reconnect_metadata,
+                    **(
+                        {}
+                        if allocation_context is None
+                        else {"allocation_id": (allocation_context.intent.allocation_id)}
+                    ),
+                },
             )
+            if allocation_context is not None:
+                completed_event = event_with_runtime_payload_authority(
+                    completed_event,
+                    "allocation_id",
+                )
+            events.append(await self._event_writer.emit(completed_event))
             if result is None:
                 raise RuntimeError("Environment factory did not return an owned result.")
             if environment is None:
@@ -841,32 +843,30 @@ class EnvironmentLifecycle:
                 raise
             if ordinary_failure:
                 try:
-                    events.append(
-                        await self._event_writer.emit(
-                            Event(
-                                type=EventType.ENVIRONMENT_FACTORY_FAILED,
-                                session_id=session.id,
-                                agent_name=registered_agent.spec.name,
-                                environment_name=environment_name,
-                                payload={
-                                    **base_payload,
-                                    **(
-                                        {}
-                                        if allocation_context is None
-                                        else {
-                                            "allocation_id": (
-                                                allocation_context.intent.allocation_id
-                                            )
-                                        }
-                                    ),
-                                    **exception_failure_payload(
-                                        exc,
-                                        redactor=self._secret_redactor,
-                                    ),
-                                },
-                            )
-                        )
+                    failed_event = Event(
+                        type=EventType.ENVIRONMENT_FACTORY_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            **base_payload,
+                            **(
+                                {}
+                                if allocation_context is None
+                                else {"allocation_id": (allocation_context.intent.allocation_id)}
+                            ),
+                            **exception_failure_payload(
+                                exc,
+                                redactor=self._secret_redactor,
+                            ),
+                        },
                     )
+                    if allocation_context is not None:
+                        failed_event = event_with_runtime_payload_authority(
+                            failed_event,
+                            "allocation_id",
+                        )
+                    events.append(await self._event_writer.emit(failed_event))
                 except BaseException as publication_error:
                     raise BaseExceptionGroup(
                         "Environment factory failure publication also failed.",
@@ -1638,16 +1638,9 @@ class EnvironmentLifecycle:
             terminal_payload = copy_json_value(event.payload, "payload")
             terminal_payload["binding_finalize_error"] = finalize_error_payload
             return EnvironmentBindingFinalizeResult(
-                event=Event(
-                    type=event.type,
-                    session_id=event.session_id,
-                    id=event.id,
-                    timestamp=event.timestamp,
-                    agent_name=event.agent_name,
-                    environment_name=event.environment_name,
-                    workflow_name=event.workflow_name,
-                    tool_name=event.tool_name,
-                    payload=terminal_payload,
+                event=copy_event(event).model_copy(
+                    update={"payload": terminal_payload},
+                    deep=True,
                 ),
                 events=events,
             )
@@ -2250,17 +2243,7 @@ def _redact_and_bound_failure_payload(
 
 
 def _copy_event_with_payload(event: Event, payload: dict[str, Any]) -> Event:
-    return Event(
-        type=event.type,
-        session_id=event.session_id,
-        id=event.id,
-        timestamp=event.timestamp,
-        agent_name=event.agent_name,
-        environment_name=event.environment_name,
-        workflow_name=event.workflow_name,
-        tool_name=event.tool_name,
-        payload=payload,
-    )
+    return copy_event(event).model_copy(update={"payload": payload}, deep=True)
 
 
 async def _reconcile_binding_finalize_failure_event(

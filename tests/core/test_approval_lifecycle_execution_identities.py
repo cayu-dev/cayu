@@ -160,7 +160,9 @@ def test_conflicting_approval_descriptor_cannot_execute_external_tool(
             )
         ]
         request_event = next(
-            event for event in paused_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+            event
+            for event in await store.load_events("session-approval-descriptor-conflict")
+            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         pending = PendingToolApproval.from_event(request_event)
         conflicting_payload: dict[str, object] = {
@@ -416,7 +418,7 @@ def test_expired_pre_digest_approval_grant_retry_fails_closed_without_coercion()
 
     async def scenario() -> list[Event]:
         session_id = "sess_expiry_retry"
-        interrupt_events = [
+        _ = [
             event
             async for event in app.run(
                 RunRequest(
@@ -428,7 +430,7 @@ def test_expired_pre_digest_approval_grant_retry_fails_closed_without_coercion()
         ]
         approval_event = next(
             event
-            for event in interrupt_events
+            for event in await store.load_events(session_id)
             if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         approval = PendingToolApproval.from_event(approval_event)
@@ -511,7 +513,7 @@ def test_tool_approval_recovery_does_not_authorize_unstarted_sibling() -> None:
             tools=[tool],
             tool_policy=_RequireApprovalPolicy(),
         )
-        paused = [
+        _ = [
             event
             async for event in app.run(
                 RunRequest(
@@ -522,7 +524,9 @@ def test_tool_approval_recovery_does_not_authorize_unstarted_sibling() -> None:
             )
         ]
         approval_event = next(
-            event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+            event
+            for event in await store.load_events(session_id)
+            if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         approval = PendingToolApproval.from_event(approval_event)
         request = ToolApprovalRequest(

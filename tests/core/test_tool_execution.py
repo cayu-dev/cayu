@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 
+from tests.core._event_projection_support import private_events_for_public_events
+
 from cayu.core import AgentSpec, Event, EventType, Message, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
@@ -241,9 +243,12 @@ def test_tool_context_receives_stable_idempotency_key_from_round_identity() -> N
             ),
         )
     )
+    private_events = asyncio.run(private_events_for_public_events(app.session_store, events))
 
-    started = next(event for event in events if event.type == EventType.TOOL_CALL_STARTED)
-    completed = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    started = next(event for event in private_events if event.type == EventType.TOOL_CALL_STARTED)
+    completed = next(
+        event for event in private_events if event.type == EventType.TOOL_CALL_COMPLETED
+    )
 
     key = started.payload["idempotency_key"]
     assert key.startswith("cayu-tool:v1:")
@@ -526,7 +531,7 @@ def test_parallel_spontaneous_cancel_does_not_brick_the_round() -> None:
     assert results["call_1"].is_error is True  # synthesized abnormal-termination error
     abnormal_event = next(
         event
-        for event in events
+        for event in asyncio.run(private_events_for_public_events(app.session_store, events))
         if event.type == EventType.TOOL_CALL_FAILED
         and event.payload.get("abnormal_termination") is True
     )
@@ -536,7 +541,7 @@ def test_parallel_spontaneous_cancel_does_not_brick_the_round() -> None:
         tool_call_id="call_1",
     )
     durable_events = asyncio.run(app.session_store.load_events("s_cancel"))
-    assert any(event == abnormal_event for event in durable_events)
+    assert abnormal_event in durable_events
 
 
 def test_max_parallel_one_runs_sequentially() -> None:

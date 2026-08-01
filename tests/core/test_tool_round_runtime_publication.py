@@ -5,6 +5,7 @@ from copy import deepcopy
 from typing import Any
 
 import pytest
+from tests.core._event_projection_support import private_events_for_public_events
 from tests.core._workload_secret_support import (
     FakeProvider,
     RequireApprovalPolicy,
@@ -904,7 +905,9 @@ def test_closing_run_after_first_recovered_tool_event_cannot_strand_interrupting
         event for event in stored_at_tool_event if event.type == EventType.SESSION_INTERRUPTED
     ]
     assert len(interrupted_events) == 1
-    assert interrupt_events == interrupted_events
+    assert asyncio.run(private_events_for_public_events(store, interrupt_events)) == (
+        interrupted_events
+    )
     recovered_tool_events = [
         event
         for event in stored_at_tool_event

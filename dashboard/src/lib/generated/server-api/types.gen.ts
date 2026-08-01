@@ -3301,7 +3301,7 @@ export type SseContract = {
     /**
      * Event Id Format
      */
-    event_id_format?: 'session_id:event_id';
+    event_id_format?: 'session_id:cayu_event_<sequence>';
     examples?: SseFrameExamples;
     /**
      * Max Error Text Bytes

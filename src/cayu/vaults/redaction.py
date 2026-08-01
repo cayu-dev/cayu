@@ -112,6 +112,13 @@ class SecretRedactor:
             raise TypeError("other must be a SecretRedactor.")
         return self._values == other._values
 
+    def is_exact_secret(self, value: str) -> bool:
+        """Return whether *value* exactly equals one registered secret."""
+
+        if type(value) is not str:
+            raise TypeError("SecretRedactor.is_exact_secret expects a string.")
+        return value in self._values
+
     def redact_text(self, value: str) -> str:
         if type(value) is not str:
             raise TypeError("SecretRedactor.redact_text expects a string.")

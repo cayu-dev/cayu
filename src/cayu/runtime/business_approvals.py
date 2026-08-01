@@ -323,7 +323,13 @@ async def resolve_business_approval(
     ``expired=True`` next to the asserted outcome.
     """
     session_id = require_durable_clean_nonblank(session_id, "session_id")
+    session_id = await app._resolve_public_session_id(session_id)
     approval_id = require_durable_clean_nonblank(approval_id, "approval_id")
+    approval_id = await app._resolve_public_action_linkage(
+        session_id=session_id,
+        value=approval_id,
+        field_name="approval_id",
+    )
     approver_id = require_durable_clean_nonblank(approver_id, "approver_id")
     approver_tier = require_durable_clean_nonblank(approver_tier, "approver_tier")
     outcome = BusinessApprovalOutcome(outcome)

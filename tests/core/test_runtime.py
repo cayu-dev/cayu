@@ -28,8 +28,11 @@ import cayu.runtime._recovery_coordinator as recovery_coordinator_module
 import cayu.runtime._run_limits as run_limits_module
 import cayu.runtime._session_control as session_control_module
 import cayu.runtime._session_engine as session_engine_module
+import cayu.runtime._tool_round_executor as tool_round_executor_module
 import cayu.runtime.app as runtime_app_module
+import cayu.runtime.budgets as budgets_module
 import cayu.runtime.context as runtime_context_module
+import cayu.runtime.execution_units as execution_units_module
 import cayu.runtime.sessions as sessions_module
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
@@ -210,6 +213,12 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime._binding_cleanup import (
     binding_cleanup_status,
     record_binding_cleanup_failure,
+)
+from cayu.runtime._event_projection import (
+    PRIVATE_EVENT_AUTHORITY,
+    public_event_id,
+    public_event_linkage_id,
+    public_event_sequence,
 )
 from cayu.runtime._model_errors import (
     _BillingIdentityResolutionCancelled,
@@ -1298,6 +1307,42 @@ async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
     return _without_interaction_lifecycle(events)
 
 
+def _private_record_for_public_event(
+    records: list[EventRecord],
+    event: Event,
+) -> EventRecord:
+    """Resolve one public app event to its private record without comparing raw IDs."""
+
+    sequence = public_event_sequence(event.id)
+    assert sequence is not None
+    matches = [record for record in records if record.sequence == sequence]
+    assert len(matches) == 1
+    return matches[0]
+
+
+async def _private_events_for_public_events(
+    store: InMemorySessionStore,
+    session_id: str,
+    events: list[Event],
+) -> list[Event]:
+    records = await store.query_events(EventQuery(session_id=session_id))
+    return [_private_record_for_public_event(records, event).event for event in events]
+
+
+async def _pending_tool_approval_from_public_event(
+    store: InMemorySessionStore,
+    event: Event,
+) -> PendingToolApproval:
+    private_event = (
+        await _private_events_for_public_events(
+            store,
+            event.session_id,
+            [event],
+        )
+    )[0]
+    return PendingToolApproval.from_event(private_event)
+
+
 def tool_round_identity_payload(event: Event) -> dict[str, str]:
     return {
         key: event.payload[key] for key in ("model_step_id", "model_attempt_id", "tool_round_id")
@@ -1395,7 +1440,9 @@ def checkpoint_without_model_step_publication(
 
 def interruption_payload_without_request_id(payload: dict[str, Any]) -> dict[str, Any]:
     copied = dict(payload)
-    assert UUID(copied.pop("interruption_request_id"))
+    request_id = copied.pop("interruption_request_id")
+    if request_id != PRIVATE_EVENT_AUTHORITY:
+        assert UUID(request_id)
     return copied
 
 
@@ -1425,7 +1472,6 @@ def test_context_counting_is_off_by_default() -> None:
             ),
         )
     )
-
     assert provider.count_requests == []
     assert EventType.CONTEXT_COUNTED not in {event.type for event in events}
     assert EventType.CONTEXT_COUNT_RECONCILED not in {event.type for event in events}
@@ -1643,6 +1689,223 @@ def test_context_pressure_estimate_reconciles_against_actual_input_usage() -> No
     assert reconciled.payload["reconciled"] is True
 
 
+@pytest.mark.parametrize(
+    "secret_values",
+    [
+        ("_",),
+        ("0",),
+    ],
+)
+def test_complete_run_preserves_all_runtime_generated_identity_authority(
+    secret_values: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CollisionProvider(FakeProvider):
+        name = "xyz"
+
+    monkeypatch.setattr(execution_units_module, "uuid4", lambda: UUID(int=0))
+    provider = CollisionProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(
+        secret_redactor=SecretRedactor(secret_values),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="xyz", model="xyz"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="xyz",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert len(provider.requests) == 1, [(event.type, event.payload) for event in events]
+    assert events[-1].type == EventType.SESSION_COMPLETED, [
+        (event.type, event.payload) for event in events
+    ]
+    assert EventType.MODEL_STARTED in {event.type for event in events}
+    assert EventType.MODEL_COMPLETED in {event.type for event in events}
+
+
+def test_budget_flow_preserves_runtime_generated_identity_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CollisionProvider(FakeProvider):
+        name = "xyz"
+
+    monkeypatch.setattr(execution_units_module, "uuid4", lambda: UUID(int=0))
+    monkeypatch.setattr(budgets_module, "uuid4", lambda: UUID(int=0))
+    limit = BudgetLimit(
+        scope="app",
+        max_estimated_cost=Decimal("1"),
+        pricing=PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="xyz",
+                    model="xyz",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        ),
+        reservation=BudgetReservation(
+            max_input_tokens=10,
+            max_output_tokens=10,
+        ),
+    )
+    policy = BudgetPolicy(limits=(limit,))
+    effective_limit = budgets_module.budget_limits_for_session(
+        policy=policy,
+        agent_name="xyz",
+        causal_budget_id="causal",
+    )[0]
+    provider = CollisionProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "finish_reason": "stop",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            )
+        ]
+    )
+    app = CayuApp(
+        budget_policy=policy,
+        budget_ledger=InMemoryBudgetLedger(),
+        secret_redactor=SecretRedactor(
+            (
+                "0000000000000000",
+                effective_limit.budget_limit_id[-16:],
+            )
+        ),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="xyz", model="xyz"))
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="xyz",
+                session_id="session",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    event_types = {event.type for event in events}
+    assert len(provider.requests) == 1, [(event.type, event.payload) for event in events]
+    assert events[-1].type == EventType.SESSION_COMPLETED, [
+        (events[-1].type, events[-1].payload),
+        [event.type for event in events],
+    ]
+    assert EventType.BUDGET_CHECKED in event_types
+    assert EventType.BUDGET_RESERVED in event_types
+    assert EventType.BUDGET_RECONCILED in event_types
+
+
+def test_approval_flow_preserves_runtime_generated_approval_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tool_round_executor_module, "uuid4", lambda: UUID(int=0))
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call",
+                name="side_effect",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(
+        secret_redactor=SecretRedactor("0000000000000000"),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[SideEffectTool()],
+        tool_policy=RequireApprovalPolicy(),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session",
+                messages=[Message.text("user", "run tool")],
+            ),
+        )
+    )
+
+    event_types = {event.type for event in events}
+    assert len(provider.requests) == 1
+    assert EventType.TOOL_CALL_APPROVAL_REQUESTED in event_types
+    assert events[-1].type == EventType.SESSION_INTERRUPTED, [
+        (events[-1].type, events[-1].payload),
+        [event.type for event in events],
+    ]
+
+
+def test_user_input_flow_preserves_runtime_generated_input_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tool_round_executor_module, "uuid4", lambda: UUID(int=0))
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call",
+                name="ask_user",
+                arguments={"question": "Continue?"},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    app = CayuApp(
+        secret_redactor=SecretRedactor("0000000000000000"),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[UserInputTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="session",
+                messages=[Message.text("user", "ask me")],
+            ),
+        )
+    )
+
+    event_types = {event.type for event in events}
+    assert len(provider.requests) == 1
+    assert EventType.SESSION_AWAITING_USER_INPUT in event_types
+    assert events[-1].type == EventType.SESSION_INTERRUPTED, [
+        (events[-1].type, events[-1].payload),
+        [event.type for event in events],
+    ]
+
+
 def test_context_counting_observe_emits_count_and_reconciliation_events() -> None:
     user_text = "secret phrase should not be in context count event payload"
     provider = CountingProvider(
@@ -1651,7 +1914,7 @@ def test_context_counting_observe_emits_count_and_reconciliation_events() -> Non
             ModelStreamEvent.completed(
                 {
                     "finish_reason": "stop",
-                    "model": "fake-model",
+                    "model": "fakemodel",
                     "usage": {
                         "input_tokens": 15,
                         "output_tokens": 2,
@@ -1669,10 +1932,11 @@ def test_context_counting_observe_emits_count_and_reconciliation_events() -> Non
     )
     app = CayuApp(
         context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+        secret_redactor=SecretRedactor("-"),
         enable_logging=False,
     )
     app.register_provider(provider, default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
 
     events = asyncio.run(
         collect_events(
@@ -1695,7 +1959,7 @@ def test_context_counting_observe_emits_count_and_reconciliation_events() -> Non
 
     counted = events[counted_index]
     assert counted.payload["provider"] == "fake"
-    assert counted.payload["model"] == "fake-model"
+    assert counted.payload["model"] == "fakemodel"
     assert isinstance(counted.payload["observation_id"], str)
     assert counted.payload["observation_id"]
     assert counted.payload["messages"] == {"count": 1, "roles": ["user"]}
@@ -1716,6 +1980,36 @@ def test_context_counting_observe_emits_count_and_reconciliation_events() -> Non
     assert reconciled.payload["delta_tokens"] == 3
     assert reconciled.payload["relative_error"] == 0.2
     assert reconciled.payload["reconciled"] is True
+
+    private_records = asyncio.run(
+        app.session_store.query_events(
+            EventQuery(
+                session_id="sess_context_counting_observe",
+                event_types=(
+                    EventType.CONTEXT_PRESSURE_ESTIMATED,
+                    EventType.CONTEXT_PRESSURE_RECONCILED,
+                    EventType.CONTEXT_COUNTED,
+                    EventType.CONTEXT_COUNT_RECONCILED,
+                ),
+            )
+        )
+    )
+    private_observation_ids = {record.event.payload["observation_id"] for record in private_records}
+    assert len(private_observation_ids) == 2
+    assert all(
+        str(UUID(observation_id)) == observation_id for observation_id in private_observation_ids
+    )
+    assert all(
+        event.payload["observation_id"] == PRIVATE_EVENT_AUTHORITY
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_PRESSURE_ESTIMATED,
+            EventType.CONTEXT_PRESSURE_RECONCILED,
+            EventType.CONTEXT_COUNTED,
+            EventType.CONTEXT_COUNT_RECONCILED,
+        }
+    )
 
 
 def test_context_counting_uses_defensive_request_copy_for_provider_counter() -> None:
@@ -1971,7 +2265,12 @@ def test_cayu_app_knowledge_injection_adds_model_context_without_rewriting_trans
 
     injected_event = next(event for event in events if event.type == EventType.KNOWLEDGE_INJECTED)
     assert injected_event.payload["hit_count"] == 1
-    assert injected_event.payload["tool_call_id"] == "cayu_knowledge_step_1"
+    assert injected_event.payload["tool_call_id"] == PRIVATE_EVENT_AUTHORITY
+    durable_records = asyncio.run(
+        store.query_events(EventQuery(session_id="sess_knowledge_injection"))
+    )
+    durable_injected = _private_record_for_public_event(durable_records, injected_event).event
+    assert durable_injected.payload["tool_call_id"] == "cayu_knowledge_step_1"
     source = injected_event.payload["sources"][0]
     assert source["entry_id"] == "git_policy"
     assert source["namespace"] == "project:cayu"
@@ -2426,7 +2725,6 @@ def test_cayu_app_knowledge_injection_fails_closed_by_default_and_emits_failure_
             ),
         )
     )
-
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.KNOWLEDGE_SEARCH_STARTED,
@@ -2909,7 +3207,17 @@ def test_cayu_app_emits_redacted_proxy_authorization_events() -> None:
 
     allowed_event = proxy_events[0]
     assert allowed_event.tool_name == "proxy_auth"
-    assert allowed_event.payload["tool_call_id"] == "call_proxy_auth"
+    assert [event.payload["tool_call_id"] for event in proxy_events] == [
+        PRIVATE_EVENT_AUTHORITY,
+        PRIVATE_EVENT_AUTHORITY,
+    ]
+    durable_records = asyncio.run(
+        store.query_events(EventQuery(session_id="sess_proxy_authorization_events"))
+    )
+    assert [
+        _private_record_for_public_event(durable_records, event).event.payload["tool_call_id"]
+        for event in proxy_events
+    ] == ["call_proxy_auth", "call_proxy_auth"]
     assert allowed_event.payload["destination"] == "https://api.sendgrid.com/v3/mail/send"
     assert allowed_event.payload["credential"] == "sendgrid_api_key"
     assert allowed_event.payload["action"] == "send_email"
@@ -3571,9 +3879,18 @@ def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() 
         "reason": expected_reason,
         "metadata": expected_metadata,
     }
+    durable_records = asyncio.run(
+        store.query_events(EventQuery(session_id="sess_protocol_collision"))
+    )
+    durable_blocked = _private_record_for_public_event(durable_records, blocked).event
     observed_payload = dict(observed["payload"])
-    observed_payload["tool_name"] = blocked.payload["tool_name"]
-    assert observed_payload == blocked.payload
+    observed_payload["tool_name"] = durable_blocked.payload["tool_name"]
+    assert observed_payload == durable_blocked.payload
+    assert blocked.payload["tool_call_id"] == f"{blocked.id}:tool_call_id"
+    assert blocked.payload["tool_round_id"] == f"{blocked.id}:tool_round_id"
+    assert blocked.payload["model_step_id"] == PRIVATE_EVENT_AUTHORITY
+    assert blocked.payload["model_attempt_id"] == PRIVATE_EVENT_AUTHORITY
+    assert blocked.payload["idempotency_key"] == PRIVATE_EVENT_AUTHORITY
     assert observed["structured"] == blocked.payload["result"]["structured"]
     assert len(expected_reason.encode("utf-8")) <= _POLICY_DENIAL_TEXT_MAX_BYTES
 
@@ -3970,9 +4287,9 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
             ),
         )
         session = await store.load("sess_factory")
-        return events, session, factory, workspace
+        return events, session, factory, workspace, store
 
-    events, session, factory, workspace = asyncio.run(run())
+    events, session, factory, workspace, store = asyncio.run(run())
 
     assert session is not None
     assert session.environment_name == "dynamic"
@@ -3985,19 +4302,24 @@ def test_cayu_app_environment_factory_creates_environment_for_session(tmp_path):
         "factory_type": "RecordingEnvironmentFactory",
         "requested_environment_name": "dynamic",
         "parent_session_id": None,
-        "causal_budget_id": "sess_factory",
+        "causal_budget_id": PRIVATE_EVENT_AUTHORITY,
         "labels": {"project": "alpha"},
     }
     assert events[1].payload == {
         "factory_type": "RecordingEnvironmentFactory",
         "requested_environment_name": "dynamic",
         "parent_session_id": None,
-        "causal_budget_id": "sess_factory",
+        "causal_budget_id": PRIVATE_EVENT_AUTHORITY,
         "labels": {"project": "alpha"},
         "environment_name": "dynamic",
         "result_metadata": {"sandbox_id": "sandbox_123"},
         "reconnect_metadata": {},
     }
+    durable_records = asyncio.run(store.query_events(EventQuery(session_id="sess_factory")))
+    assert [
+        _private_record_for_public_event(durable_records, event).event.payload["causal_budget_id"]
+        for event in events[:2]
+    ] == ["sess_factory", "sess_factory"]
     assert len(factory.requests) == 1
     assert factory.requests[0].session_id == "sess_factory"
     assert factory.requests[0].agent_name == "assistant"
@@ -4244,7 +4566,7 @@ def test_cayu_app_streams_out_of_band_events_from_environment_factory(tmp_path):
         )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        return await collect_events(
+        events = await collect_events(
             app,
             RunRequest(
                 agent_name="assistant",
@@ -4252,8 +4574,9 @@ def test_cayu_app_streams_out_of_band_events_from_environment_factory(tmp_path):
                 messages=[Message.text("user", "run")],
             ),
         )
+        return events, store
 
-    events = asyncio.run(run())
+    events, store = asyncio.run(run())
     event_types = [event.type for event in events]
 
     assert EventType.EGRESS_GRANT_MINTED in event_types
@@ -4263,7 +4586,9 @@ def test_cayu_app_streams_out_of_band_events_from_environment_factory(tmp_path):
     event = next(event for event in events if event.type == EventType.EGRESS_GRANT_MINTED)
     assert event.agent_name == "assistant"
     assert event.environment_name == "dynamic"
-    assert event.payload == {"grant_id": "grant_1"}
+    assert event.payload == {"grant_id": PRIVATE_EVENT_AUTHORITY}
+    records = asyncio.run(store.query_events(EventQuery(session_id="sess_factory_oob")))
+    assert _private_record_for_public_event(records, event).event.payload == {"grant_id": "grant_1"}
 
 
 def test_cayu_app_scoped_event_emitter_rejects_unlisted_event_types():
@@ -4294,12 +4619,14 @@ def test_cayu_app_scoped_event_emitter_rejects_unlisted_event_types():
                     session_id="sess_scoped",
                 )
             )
-        return emitted, await store.load_events("sess_scoped")
+        return emitted, await store.query_events(EventQuery(session_id="sess_scoped"))
 
-    emitted, events = asyncio.run(run())
+    emitted, records = asyncio.run(run())
 
     assert emitted.type == EventType.EGRESS_GRANT_MINTED
-    assert [event.type for event in events] == [EventType.EGRESS_GRANT_MINTED]
+    assert emitted.id == public_event_id(records[0].sequence)
+    assert emitted.id != records[0].event.id
+    assert [record.event.type for record in records] == [EventType.EGRESS_GRANT_MINTED]
 
 
 def test_cayu_app_streams_out_of_band_events_from_binding_finalize():
@@ -4352,7 +4679,7 @@ def test_cayu_app_streams_out_of_band_events_from_binding_finalize():
         )
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-        return await collect_events(
+        events = await collect_events(
             app,
             RunRequest(
                 agent_name="assistant",
@@ -4360,8 +4687,9 @@ def test_cayu_app_streams_out_of_band_events_from_binding_finalize():
                 messages=[Message.text("user", "run")],
             ),
         )
+        return events, store
 
-    events = asyncio.run(run())
+    events, store = asyncio.run(run())
     event_types = [event.type for event in events]
 
     assert EventType.EGRESS_GRANT_REVOKED in event_types
@@ -4372,7 +4700,15 @@ def test_cayu_app_streams_out_of_band_events_from_binding_finalize():
         EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED
     )
     event = next(event for event in events if event.type == EventType.EGRESS_GRANT_REVOKED)
-    assert event.payload == {"grant_id": "grant_1", "outcome": "completed"}
+    assert event.payload == {
+        "grant_id": PRIVATE_EVENT_AUTHORITY,
+        "outcome": "completed",
+    }
+    records = asyncio.run(store.query_events(EventQuery(session_id="sess_finalize_oob")))
+    assert _private_record_for_public_event(records, event).event.payload == {
+        "grant_id": "grant_1",
+        "outcome": "completed",
+    }
 
 
 def test_cayu_app_environment_factory_failure_fails_session_before_start_event(tmp_path):
@@ -6379,21 +6715,25 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
                 messages=[Message.text("user", "run tool")],
             ),
         )
-        return events, binding, configured_workspace, bound_workspace
+        records = await store.query_events(EventQuery(session_id="sess_binding"))
+        private_events = [
+            _private_record_for_public_event(records, event).event for event in events
+        ]
+        return events, private_events, binding, configured_workspace, bound_workspace
 
-    events, binding, configured_workspace, bound_workspace = asyncio.run(run())
+    events, private_events, binding, configured_workspace, bound_workspace = asyncio.run(run())
 
     assert [event.type for event in events[:3]] == [
         EventType.ENVIRONMENT_BINDING_STARTED,
         EventType.ENVIRONMENT_BINDING_COMPLETED,
         EventType.SESSION_STARTED,
     ]
-    assert events[0].payload == {
+    assert private_events[0].payload == {
         "binding_type": "RecordingWorkspaceBinding",
         "configured_workspace_id": configured_workspace.id,
         "has_configured_runner": False,
     }
-    assert events[1].payload == {
+    assert private_events[1].payload == {
         "binding_type": "RecordingWorkspaceBinding",
         "configured_workspace_id": configured_workspace.id,
         "has_configured_runner": False,
@@ -6409,13 +6749,13 @@ def test_cayu_app_binds_environment_for_session_tools_and_finalize(tmp_path):
         EventType.ENVIRONMENT_BINDING_FINALIZE_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[-3].payload["configured_workspace_id"] == configured_workspace.id
-    assert events[-3].payload["source_workspace_id"] == configured_workspace.id
-    assert events[-3].payload["bound_workspace_id"] == bound_workspace.id
-    assert events[-3].payload["outcome"] == "completed"
-    assert events[-3].payload["bound_snapshot"] is None
-    assert events[-2].payload["outcome"] == "completed"
-    assert events[-2].payload["final_snapshot"] is None
+    assert private_events[-3].payload["configured_workspace_id"] == configured_workspace.id
+    assert private_events[-3].payload["source_workspace_id"] == configured_workspace.id
+    assert private_events[-3].payload["bound_workspace_id"] == bound_workspace.id
+    assert private_events[-3].payload["outcome"] == "completed"
+    assert private_events[-3].payload["bound_snapshot"] is None
+    assert private_events[-2].payload["outcome"] == "completed"
+    assert private_events[-2].payload["final_snapshot"] is None
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(binding.bind_calls) == 1
     assert binding.bind_calls[0]["workspace"] is configured_workspace
@@ -7329,7 +7669,12 @@ def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
         approval_event = next(
             event for event in first_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval_id = approval_event.payload["approval"]["approval_id"]
+        public_approval_id = approval_event.payload["approval"]["approval_id"]
+        private_approval = _private_record_for_public_event(
+            await store.query_events(EventQuery(session_id="sess_binding_invalid_approval_retry")),
+            approval_event,
+        ).event
+        private_approval_id = private_approval.payload["approval"]["approval_id"]
         bind_calls_after_interrupt = len(binding.bind_calls)
         finalize_calls_after_interrupt = len(binding.finalize_calls)
 
@@ -7342,9 +7687,9 @@ def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
                 environment_name="local",
                 tool_name="workspace_id",
                 payload={
-                    **tool_round_identity_payload(approval_event),
-                    "approval_id": approval_id,
-                    "tool_call_id": "call_1",
+                    **tool_round_identity_payload(private_approval),
+                    "approval_id": private_approval_id,
+                    "tool_call_id": private_approval.payload["tool_call_id"],
                     "result": ToolResult(content="denied").model_dump(),
                 },
             ),
@@ -7355,7 +7700,7 @@ def test_cayu_app_validates_tool_approval_retry_before_binding(tmp_path):
             async for event in app.resolve_tool_approval(
                 ToolApprovalRequest(
                     session_id="sess_binding_invalid_approval_retry",
-                    approval_id=approval_id,
+                    approval_id=public_approval_id,
                     tool_round_id=approval_event.payload["tool_round_id"],
                     tool_call_id=approval_event.payload["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
@@ -7437,7 +7782,12 @@ def test_cayu_app_validates_tool_approval_retry_before_factory_resolution(tmp_pa
         approval_event = next(
             event for event in first_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval_id = approval_event.payload["approval"]["approval_id"]
+        public_approval_id = approval_event.payload["approval"]["approval_id"]
+        private_approval = _private_record_for_public_event(
+            await store.query_events(EventQuery(session_id="sess_factory_invalid_approval_retry")),
+            approval_event,
+        ).event
+        private_approval_id = private_approval.payload["approval"]["approval_id"]
         factory_calls_after_interrupt = len(factory.requests)
 
         await store.append_event(
@@ -7449,9 +7799,9 @@ def test_cayu_app_validates_tool_approval_retry_before_factory_resolution(tmp_pa
                 environment_name="dynamic",
                 tool_name="workspace_id",
                 payload={
-                    **tool_round_identity_payload(approval_event),
-                    "approval_id": approval_id,
-                    "tool_call_id": "call_1",
+                    **tool_round_identity_payload(private_approval),
+                    "approval_id": private_approval_id,
+                    "tool_call_id": private_approval.payload["tool_call_id"],
                     "result": ToolResult(content="denied").model_dump(),
                 },
             ),
@@ -7462,7 +7812,7 @@ def test_cayu_app_validates_tool_approval_retry_before_factory_resolution(tmp_pa
             async for event in app.resolve_tool_approval(
                 ToolApprovalRequest(
                     session_id="sess_factory_invalid_approval_retry",
-                    approval_id=approval_id,
+                    approval_id=public_approval_id,
                     tool_round_id=approval_event.payload["tool_round_id"],
                     tool_call_id=approval_event.payload["tool_call_id"],
                     decision=ToolApprovalDecision.APPROVE,
@@ -7816,12 +8166,13 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert provider.requests[0].model == "fake-model"
     assert provider.requests[0].messages[0].content[0].text == "hi"
     assert provider.requests[0].tools == []
-    assert _without_interaction_lifecycle(sink.events) == events
 
-    persisted = asyncio.run(store.load_events("sess_text"))
+    records = asyncio.run(store.query_events(EventQuery(session_id="sess_text")))
+    projected = [app.project_event_record_for_exposure(record).event for record in records]
+    assert _without_interaction_lifecycle(sink.events) == _without_interaction_lifecycle(projected)
     session = asyncio.run(store.load("sess_text"))
 
-    assert _without_interaction_lifecycle(persisted) == events
+    assert _without_interaction_lifecycle(projected) == events
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert session.provider_name == "fake"
@@ -8506,12 +8857,8 @@ def test_cayu_app_tool_call_limit_allows_existing_result_then_blocks_next_tool()
     assert tool.calls == [{"step": 1}]
     assert events[7].payload["limit"] == "tool_calls"
     assert events[7].payload["actual"] == 2
-    assert events[8].payload["tool_call_id"] == "call_2"
-    assert events[8].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
-        session_id="sess_tool_limit",
-        tool_round_id=events[8].payload["tool_round_id"],
-        tool_call_id="call_2",
-    )
+    assert events[8].payload["tool_call_id"] == f"{events[8].id}:tool_call_id"
+    assert events[8].payload["idempotency_key"] == PRIVATE_EVENT_AUTHORITY
 
     transcript = asyncio.run(store.load_transcript("sess_tool_limit"))
     assert [message.role for message in transcript] == [
@@ -8588,7 +8935,7 @@ def test_cayu_app_elapsed_limit_stops_between_tool_calls(monkeypatch):
     ]
     assert tool.calls == [{"step": 1}]
     assert events[5].payload["limit"] == "elapsed_seconds"
-    assert events[6].payload["tool_call_id"] == "call_2"
+    assert events[6].payload["tool_call_id"] == f"{events[6].id}:tool_call_id"
 
     transcript = asyncio.run(store.load_transcript("sess_elapsed_limit_between_tools"))
     assert [message.role for message in transcript] == ["user", "assistant", "tool"]
@@ -10328,7 +10675,9 @@ def test_cayu_app_causal_budget_is_shared_by_forked_sessions():
 
     assert parent_events[-1].type == EventType.SESSION_COMPLETED
     assert fork_events[0].type == EventType.SESSION_FORKED
-    assert fork_events[0].payload["causal_budget_id"] == "job_shared"
+    assert fork_events[0].payload["causal_budget_id"] == PRIVATE_EVENT_AUTHORITY
+    assert child_session is not None
+    assert child_session.causal_budget_id == "job_shared"
     assert [event.type for event in child_events] == [
         EventType.SESSION_RESUMED,
         EventType.BUDGET_CHECKED,
@@ -10921,12 +11270,13 @@ def test_cayu_app_releases_partial_retry_reservations_when_later_reserve_raises(
         )
         return (
             events,
-            await store.load_events(session_id),
+            await store.query_events(EventQuery(session_id=session_id, limit=100)),
             tuple(ledger._records.values()),
             provider,
         )
 
-    events, stored_events, records, provider = asyncio.run(run())
+    events, stored_records, records, provider = asyncio.run(run())
+    stored_events = [record.event for record in stored_records]
 
     assert len(provider.requests) == 1
     assert [record.status for record in records] == ["reconciled", "reconciled", "released"]
@@ -10940,7 +11290,9 @@ def test_cayu_app_releases_partial_retry_reservations_when_later_reserve_raises(
     assert len(released) == 1
     assert len(streamed_releases) == 1
     assert released[0].payload["reservation_id"] == records[-1].reservation_id
-    assert streamed_releases[0].id == released[0].id
+    assert (
+        _private_record_for_public_event(stored_records, streamed_releases[0]).event == released[0]
+    )
     assert events[-1].type == EventType.SESSION_FAILED
     assert events[-1].payload["error"] == "authoritative provider timeout"
 
@@ -13099,9 +13451,14 @@ def test_cayu_app_persists_successful_reconciliation_before_later_limit_fails() 
                 messages=[Message.text("user", "hello")],
             ),
         )
-        return events, await store.load_events(session_id), tuple(ledger._records.values())
+        return (
+            events,
+            await store.query_events(EventQuery(session_id=session_id, limit=100)),
+            tuple(ledger._records.values()),
+        )
 
-    events, stored_events, records = asyncio.run(run())
+    events, stored_records, records = asyncio.run(run())
+    stored_events = [record.event for record in stored_records]
 
     reconciliations = [
         event for event in stored_events if event.type == EventType.BUDGET_RECONCILED
@@ -13112,7 +13469,10 @@ def test_cayu_app_persists_successful_reconciliation_before_later_limit_fails() 
     streamed_reconciliations = [
         event for event in events if event.type == EventType.BUDGET_RECONCILED
     ]
-    assert [event.id for event in streamed_reconciliations] == [reconciliations[0].id]
+    assert [
+        _private_record_for_public_event(stored_records, event).event.id
+        for event in streamed_reconciliations
+    ] == [reconciliations[0].id]
     assert events[-1].type == EventType.SESSION_FAILED
     assert events[-1].payload["error"] == "authoritative provider failure"
 
@@ -13182,13 +13542,14 @@ def test_cayu_app_retries_only_unsettled_limit_after_partial_reconciliation() ->
         )
         return (
             events,
-            await store.load_events(session_id),
+            await store.query_events(EventQuery(session_id=session_id, limit=100)),
             tuple(ledger._records.values()),
             provider.requests,
             ledger.reconcile_calls,
         )
 
-    events, stored_events, records, provider_requests, reconcile_calls = asyncio.run(run())
+    events, stored_records, records, provider_requests, reconcile_calls = asyncio.run(run())
+    stored_events = [record.event for record in stored_records]
 
     reconciliations = [
         event for event in stored_events if event.type == EventType.BUDGET_RECONCILED
@@ -13203,9 +13564,10 @@ def test_cayu_app_retries_only_unsettled_limit_after_partial_reconciliation() ->
     streamed_reconciliations = [
         event for event in events if event.type == EventType.BUDGET_RECONCILED
     ]
-    assert [event.id for event in streamed_reconciliations] == [
-        event.id for event in reconciliations
-    ]
+    assert [
+        _private_record_for_public_event(stored_records, event).event.id
+        for event in streamed_reconciliations
+    ] == [event.id for event in reconciliations]
     assert events[-1].type == EventType.SESSION_FAILED
     assert events[-1].payload["error"] == "authoritative provider timeout"
 
@@ -14018,7 +14380,7 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
 
     assert [event.type for event in fork_events] == [EventType.SESSION_FORKED]
     assert fork_events[0].session_id == "sess_fork_child"
-    assert fork_events[0].payload["source_session_id"] == "sess_fork_source"
+    assert fork_events[0].payload["source_session_id"] == PRIVATE_EVENT_AUTHORITY
     fork = asyncio.run(store.load("sess_fork_child"))
     source = asyncio.run(store.load("sess_fork_source"))
     assert fork is not None
@@ -14490,7 +14852,7 @@ def test_cayu_app_dispatches_existing_session_inline():
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert dispatch_events[0].payload["dispatch_id"] == "dispatch_1"
+    assert dispatch_events[0].payload["dispatch_id"] == PRIVATE_EVENT_AUTHORITY
     assert dispatch_events[0].payload["appended_messages"] == 1
     assert [message.content[0].text for message in provider.requests[1].messages] == [
         "first request",
@@ -15619,11 +15981,15 @@ def test_interrupting_parent_interrupts_running_background_subagents(
 def test_retried_parent_interruption_cascades_original_durable_provenance():
     async def run():
         store = InMemorySessionStore()
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor("-"),
+            enable_logging=False,
+        )
         app.register_provider(FakeProvider([]), default=True)
-        app.register_agent(AgentSpec(name="parent", model="fake-model"))
-        app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
-        identity = SessionIdentity(provider_name="fake", model="fake-model")
+        app.register_agent(AgentSpec(name="parent", model="fakemodel"))
+        app.register_agent(AgentSpec(name="reviewer", model="fakemodel"))
+        identity = SessionIdentity(provider_name="fake", model="fakemodel")
 
         await store.create(
             RunRequest(
@@ -15695,37 +16061,47 @@ def test_retried_parent_interruption_cascades_original_durable_provenance():
         ]
         assert await app.drain_background_interruptions(timeout_s=1) is True
         child_events = await store.load_events("sess_interrupted_parent_retry_child")
-        parent_events = await store.load_events("sess_interrupted_parent_retry")
-        return repeated_events, child_events, parent_events
+        parent_records = await store.query_events(
+            EventQuery(session_id="sess_interrupted_parent_retry")
+        )
+        return repeated_events, child_events, parent_records
 
-    repeated_events, child_events, parent_events = asyncio.run(run())
+    repeated_events, child_events, parent_records = asyncio.run(run())
 
-    assert repeated_events[0].payload["requested_by"]["subject"] == "operator-a"
+    assert repeated_events[0].payload["requested_by"]["subject"] == (f"operator{REDACTED_SECRET}a")
     assert repeated_events[1].type == EventType.SESSION_INTERRUPTION_CASCADE_RETRY_REQUESTED
-    retry_request_id = repeated_events[1].payload["retry_request_id"]
+    assert repeated_events[1].payload["retry_request_id"] == PRIVATE_EVENT_AUTHORITY
+    retry_request_id = _private_record_for_public_event(
+        parent_records,
+        repeated_events[1],
+    ).event.payload["retry_request_id"]
     assert UUID(retry_request_id)
     assert repeated_events[1].payload["retry_reason"] == "retry from another operator"
-    assert repeated_events[1].payload["retry_metadata"] == {"ticket": "incident-b"}
-    assert repeated_events[1].payload["retry_requested_by"]["subject"] == "operator-b"
+    assert repeated_events[1].payload["retry_metadata"] == {"ticket": f"incident{REDACTED_SECRET}b"}
+    assert repeated_events[1].payload["retry_requested_by"]["subject"] == (
+        f"operator{REDACTED_SECRET}b"
+    )
     child_interrupted = [
         event for event in child_events if event.type == EventType.SESSION_INTERRUPTED
     ]
     assert len(child_interrupted) == 1
     assert child_interrupted[0].payload["reason"] == "original operator stop"
-    assert child_interrupted[0].payload["metadata"]["parent_metadata"] == {"ticket": "incident-a"}
+    assert child_interrupted[0].payload["metadata"]["parent_metadata"] == {
+        "ticket": f"incident{REDACTED_SECRET}a"
+    }
     assert child_interrupted[0].payload["requested_by"] == {
-        "subject": "operator-a",
-        "tenant": "tenant-7",
+        "subject": f"operator{REDACTED_SECRET}a",
+        "tenant": f"tenant{REDACTED_SECRET}7",
         "source": "http_auth",
     }
     completed = next(
-        event
-        for event in parent_events
-        if event.type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED
+        record.event
+        for record in parent_records
+        if record.event.type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED
     )
     assert completed.payload["retry_request_id"] == retry_request_id
     assert completed.payload["retry_reason"] == "retry from another operator"
-    assert completed.payload["retry_requested_by"]["subject"] == "operator-b"
+    assert completed.payload["retry_requested_by"]["subject"] == (f"operator{REDACTED_SECRET}b")
 
 
 def test_interrupted_session_cascade_retry_uses_durable_identity_when_agent_is_unregistered():
@@ -15780,9 +16156,9 @@ def test_interrupted_session_cascade_retry_uses_durable_identity_when_agent_is_u
             )
         ]
         assert await app.drain_background_interruptions(timeout_s=1) is True
-        return retry_events, await store.load_events(session_id)
+        return retry_events, await store.query_events(EventQuery(session_id=session_id))
 
-    retry_events, stored_events = asyncio.run(run())
+    retry_events, stored_records = asyncio.run(run())
 
     assert [event.type for event in retry_events] == [
         EventType.SESSION_INTERRUPTED,
@@ -15790,13 +16166,15 @@ def test_interrupted_session_cascade_retry_uses_durable_identity_when_agent_is_u
     ]
     assert retry_events[1].agent_name == "removed-agent"
     assert retry_events[1].payload["retry_requested_by"]["subject"] == "operator-b"
+    assert retry_events[1].payload["retry_request_id"] == PRIVATE_EVENT_AUTHORITY
+    durable_retry = _private_record_for_public_event(stored_records, retry_events[1]).event
     completed = next(
-        event
-        for event in stored_events
-        if event.type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED
+        record.event
+        for record in stored_records
+        if record.event.type == EventType.SESSION_INTERRUPTION_CASCADE_COMPLETED
     )
     assert completed.agent_name == "removed-agent"
-    assert completed.payload["retry_request_id"] == retry_events[1].payload["retry_request_id"]
+    assert completed.payload["retry_request_id"] == durable_retry.payload["retry_request_id"]
 
 
 def test_finalizing_background_child_does_not_fail_parent_cascade(monkeypatch):
@@ -18862,9 +19240,9 @@ def test_cayu_app_dispatches_forked_session_with_task_linkage():
     assert dispatch_events[0].payload == {
         "agent_name": "assistant",
         "appended_messages": 1,
-        "dispatch_id": "dispatch_fork_1",
-        "task_id": task.id,
-        "parent_session_id": "sess_dispatch_fork_source",
+        "dispatch_id": PRIVATE_EVENT_AUTHORITY,
+        "task_id": PRIVATE_EVENT_AUTHORITY,
+        "parent_session_id": PRIVATE_EVENT_AUTHORITY,
     }
     completed_task = asyncio.run(tasks.load_task(task.id))
     assert completed_task is not None
@@ -19443,7 +19821,7 @@ def test_cayu_app_after_tool_call_hook_failure_does_not_stop_tool_round():
     hook_failed = next(event for event in events if event.type == EventType.HOOK_FAILED)
     assert hook_failed.payload["phase"] == "after_tool_call"
     assert hook_failed.payload["tool_name"] == "echo"
-    assert hook_failed.payload["tool_call_id"] == "call_echo"
+    assert hook_failed.payload["tool_call_id"] == PRIVATE_EVENT_AUTHORITY
     assert hook_failed.payload["error"] == "tool hook broke"
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert len(provider.requests) == 2
@@ -20523,11 +20901,17 @@ def test_cayu_app_runtime_hook_can_emit_custom_events():
         EventType.HOOK_COMPLETED,
     ]
     assert stored_events[-2].payload == {"session_id": "sess_hook_custom_event"}
+    stored_records = asyncio.run(
+        store.query_events(EventQuery(session_id="sess_hook_custom_event"))
+    )
+    custom_record = next(
+        record for record in stored_records if record.event.type == "custom.knowledge.extracted"
+    )
     assert events[-1].payload["actions"] == [
         {
             "type": "emit_custom_event",
             "payload": {
-                "event_id": stored_events[-2].id,
+                "event_id": public_event_id(custom_record.sequence),
                 "event_type": "custom.knowledge.extracted",
                 "session_id": "sess_hook_custom_event",
             },
@@ -20937,14 +21321,24 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
 
     assert provider.requests == []
     assert [event.type for event in events] == [EventType.SESSION_FAILED]
-    operation_id = events[0].payload["session_run_operation_id"]
-    assert str(UUID(operation_id)) == operation_id
+    assert events[0].payload["session_run_operation_id"] == PRIVATE_EVENT_AUTHORITY
     assert {
         key: value for key, value in events[0].payload.items() if key != "session_run_operation_id"
     } == {
         "error": "transcript unavailable",
         "error_type": "RuntimeError",
     }
+    failed_records = asyncio.run(
+        store.query_events(
+            EventQuery(
+                session_id="sess_broken_transcript",
+                event_type=EventType.SESSION_FAILED,
+            )
+        )
+    )
+    assert len(failed_records) == 1
+    operation_id = failed_records[0].event.payload["session_run_operation_id"]
+    assert str(UUID(operation_id)) == operation_id
     session = asyncio.run(store.load("sess_broken_transcript"))
     assert session is not None
     assert session.status == SessionStatus.FAILED
@@ -21150,7 +21544,7 @@ def test_cayu_app_links_successful_run_to_task():
         "agent_name": "assistant",
         "environment_name": None,
     }
-    assert events[1].payload["task_id"] == "task_runtime_success"
+    assert events[1].payload["task_id"] == PRIVATE_EVENT_AUTHORITY
     assert events[1].payload["task_status"] == "running"
     assert events[5].payload["task_status"] == "completed"
     assert events[-1].type == EventType.SESSION_COMPLETED
@@ -21213,7 +21607,7 @@ def test_cayu_app_links_claimed_task_to_successful_run():
     assert task.session_id == "sess_task_claimed_success"
     assert task.worker_id is None
     assert task.lease_expires_at is None
-    assert events[1].payload["task_id"] == "task_runtime_claimed_success"
+    assert events[1].payload["task_id"] == PRIVATE_EVENT_AUTHORITY
 
 
 def test_cayu_app_fails_task_when_run_fails():
@@ -21275,7 +21669,7 @@ def test_cayu_app_live_stream_includes_failed_interaction_terminal_before_turn_c
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    async def run() -> tuple[list[Event], list[Event]]:
+    async def run() -> tuple[list[Event], list[EventRecord]]:
         live = [
             event
             async for event in app.run(
@@ -21286,13 +21680,17 @@ def test_cayu_app_live_stream_includes_failed_interaction_terminal_before_turn_c
                 )
             )
         ]
-        return live, await store.load_events(session_id)
+        return live, await store.query_events(EventQuery(session_id=session_id))
 
-    live, durable = asyncio.run(run())
+    live, durable_records = asyncio.run(run())
     live_failed = [event for event in live if event.type == EventType.INTERACTION_FAILED]
-    durable_failed = [event for event in durable if event.type == EventType.INTERACTION_FAILED]
+    projected_failed = [
+        app.project_event_record_for_exposure(record).event
+        for record in durable_records
+        if record.event.type == EventType.INTERACTION_FAILED
+    ]
 
-    assert live_failed == durable_failed
+    assert live_failed == projected_failed
     assert len(live_failed) == 1
     live_types = [event.type for event in live]
     assert live_types.index(EventType.INTERACTION_FAILED) < live_types.index(
@@ -21375,7 +21773,7 @@ def test_cayu_app_retries_retryable_model_error_before_tool_side_effects():
     assert events[4].payload["attempt"] == 1
     assert events[4].payload["next_attempt"] == 2
     assert events[4].payload["status_code"] == 429
-    assert events[7].payload["tool_call_id"] == "call_successful_attempt"
+    assert events[7].payload["tool_call_id"] == f"{events[7].id}:tool_call_id"
     assert [message.role for message in transcript] == [
         "user",
         "assistant",
@@ -21597,6 +21995,9 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
         )
     )
     transcript = asyncio.run(store.load_transcript("sess_retry_sse_idle"))
+    private_events = asyncio.run(
+        _private_events_for_public_events(store, "sess_retry_sse_idle", events)
+    )
 
     assert FlakyHttpClient.calls == 2
     assert [event.type for event in events] == [
@@ -21636,8 +22037,11 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
         "model_step_id": events[6].payload["model_step_id"],
         "model_attempt_id": events[6].payload["model_attempt_id"],
     }
-    assert events[1].payload["model_step_id"] == events[6].payload["model_step_id"]
-    assert events[1].payload["model_attempt_id"] != events[6].payload["model_attempt_id"]
+    assert private_events[1].payload["model_step_id"] == private_events[6].payload["model_step_id"]
+    assert (
+        private_events[1].payload["model_attempt_id"]
+        != private_events[6].payload["model_attempt_id"]
+    )
     assert [message.role for message in transcript] == ["user", "assistant"]
     assert transcript[1].content[0].text == "ok"
 
@@ -21672,6 +22076,13 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         )
     )
     transcript = asyncio.run(store.load_transcript("sess_retry_stream_attempt_metadata"))
+    private_events = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_retry_stream_attempt_metadata",
+            events,
+        )
+    )
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -21707,8 +22118,11 @@ def test_cayu_app_tags_failed_attempt_stream_events_and_keeps_transcript_clean()
         "model_step_id": events[6].payload["model_step_id"],
         "model_attempt_id": events[6].payload["model_attempt_id"],
     }
-    assert events[1].payload["model_step_id"] == events[6].payload["model_step_id"]
-    assert events[1].payload["model_attempt_id"] != events[6].payload["model_attempt_id"]
+    assert private_events[1].payload["model_step_id"] == private_events[6].payload["model_step_id"]
+    assert (
+        private_events[1].payload["model_attempt_id"]
+        != private_events[6].payload["model_attempt_id"]
+    )
     assert events[8].payload["attempt"] == 2
     assert events[8].payload["max_attempts"] == 2
     assert [message.role for message in transcript] == ["user", "assistant"]
@@ -21744,6 +22158,13 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
             ),
         )
     )
+    private_events = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "sess_retry_final_exception_error",
+            events,
+        )
+    )
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -21777,8 +22198,11 @@ def test_cayu_app_emits_model_error_for_final_failed_exception_attempt():
         "model_step_id": events[5].payload["model_step_id"],
         "model_attempt_id": events[5].payload["model_attempt_id"],
     }
-    assert events[1].payload["model_step_id"] == events[5].payload["model_step_id"]
-    assert events[1].payload["model_attempt_id"] != events[5].payload["model_attempt_id"]
+    assert private_events[1].payload["model_step_id"] == private_events[5].payload["model_step_id"]
+    assert (
+        private_events[1].payload["model_attempt_id"]
+        != private_events[5].payload["model_attempt_id"]
+    )
 
 
 def test_cayu_app_retries_using_typed_provider_status_code_without_http_text():
@@ -22045,6 +22469,7 @@ def test_cayu_app_executes_tool_call_and_records_result():
             ),
         )
     )
+    private_events = asyncio.run(_private_events_for_public_events(store, "sess_tool", events))
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -22066,15 +22491,15 @@ def test_cayu_app_executes_tool_call_and_records_result():
             "input_schema": EchoTool.spec.input_schema,
         }
     ]
-    assert events[3].tool_name == "echo"
-    assert events[3].payload == {
+    assert private_events[3].tool_name == "echo"
+    assert private_events[3].payload == {
         "tool_call_id": "call_1",
-        "idempotency_key": events[3].payload["idempotency_key"],
+        "idempotency_key": private_events[3].payload["idempotency_key"],
         "effect": "external",
         "arguments": {"text": "from tool"},
-        **tool_round_identity_payload(events[3]),
+        **tool_round_identity_payload(private_events[3]),
     }
-    assert events[4].payload["tool_round_id"] == events[3].payload["tool_round_id"]
+    assert private_events[4].payload["tool_round_id"] == private_events[3].payload["tool_round_id"]
     assert events[4].payload["result"]["content"] == "from tool"
     assert events[4].payload["result"]["structured"] == {
         "agent": "assistant",
@@ -22407,7 +22832,14 @@ def test_cayu_app_resume_gates_pending_round_without_policy_outcome():
         and event.payload.get("recovered") is True
     ]
     assert len(approval_events) == 1
-    approval = PendingToolApproval.from_event(approval_events[0])
+    durable_approval = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_tool_round_recover_not_started",
+            approval_events,
+        )
+    )[0]
+    approval = PendingToolApproval.from_event(durable_approval)
     assert approval.tool_round_id == checkpoint["pending_tool_round"]["tool_round_id"]
     assert approval.tool_call_id == "call_1"
     assert approval.tool_calls[0].policy_evidence == "ambiguous"
@@ -22487,12 +22919,20 @@ def test_cayu_app_recovers_pending_tool_round_with_unknown_tool_outcome():
         if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
     ]
     assert len(recovered_failures) == 1
-    assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+    assert recovered_failures[0].payload["idempotency_key"] == PRIVATE_EVENT_AUTHORITY
+    durable_failure = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_tool_round_recover_unknown",
+            recovered_failures,
+        )
+    )[0]
+    assert durable_failure.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_tool_round_recover_unknown",
         tool_round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
     )
-    assert recovered_failures[0].payload["result"]["structured"] == {
+    assert durable_failure.payload["result"]["structured"] == {
         "recovered": True,
         "recovery_reason": "pending_tool_round_missing_terminal_event",
         "model_step_id": checkpoint["pending_tool_round"]["model_step_id"],
@@ -22503,7 +22943,7 @@ def test_cayu_app_recovers_pending_tool_round_with_unknown_tool_outcome():
         "started": True,
         "outcome_unknown": True,
     }
-    assert "outcome is unknown" in recovered_failures[0].payload["result"]["content"]
+    assert "outcome is unknown" in durable_failure.payload["result"]["content"]
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
     assert_only_model_step_publication_checkpoint(
         asyncio.run(store.load_checkpoint("sess_tool_round_recover_unknown"))
@@ -22984,12 +23424,19 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
     checkpoint = asyncio.run(store.load_checkpoint("sess_tool_round_recover_reused_id"))
     assert checkpoint is not None
     assert "pending_tool_round" in checkpoint
+    private_initial_events = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_tool_round_recover_reused_id",
+            initial_events,
+        )
+    )
     assert [
         event.payload["tool_round_id"]
-        for event in initial_events
+        for event in private_initial_events
         if event.type == EventType.TOOL_CALL_STARTED
     ] == [
-        initial_events[3].payload["tool_round_id"],
+        private_initial_events[3].payload["tool_round_id"],
         checkpoint["pending_tool_round"]["tool_round_id"],
     ]
     assert any(event.type == EventType.TOOL_CALL_COMPLETED for event in initial_events)
@@ -23013,16 +23460,23 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
         if event.type == EventType.TOOL_CALL_FAILED and event.payload.get("recovered") is True
     ]
     assert len(recovered_failures) == 1
+    durable_failure = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_tool_round_recover_reused_id",
+            recovered_failures,
+        )
+    )[0]
     assert (
-        recovered_failures[0].payload["tool_round_id"]
+        durable_failure.payload["tool_round_id"]
         == checkpoint["pending_tool_round"]["tool_round_id"]
     )
-    assert recovered_failures[0].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+    assert durable_failure.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_tool_round_recover_reused_id",
         tool_round_id=checkpoint["pending_tool_round"]["tool_round_id"],
         tool_call_id="call_1",
     )
-    assert recovered_failures[0].payload["result"]["structured"] == {
+    assert durable_failure.payload["result"]["structured"] == {
         "recovered": True,
         "recovery_reason": "pending_tool_round_missing_terminal_event",
         "model_step_id": checkpoint["pending_tool_round"]["model_step_id"],
@@ -23033,7 +23487,7 @@ def test_cayu_app_recovers_pending_tool_round_without_reusing_old_tool_call_id()
         "started": True,
         "outcome_unknown": True,
     }
-    assert "outcome is unknown" in recovered_failures[0].payload["result"]["content"]
+    assert "outcome is unknown" in durable_failure.payload["result"]["content"]
     assert resume_events[-1].type == EventType.SESSION_COMPLETED
 
     transcript = asyncio.run(store.load_transcript("sess_tool_round_recover_reused_id"))
@@ -23311,7 +23765,19 @@ def test_approved_tool_policy_then_command_policy_denial_emits_one_command_block
     assert blocked[0].payload["denied_by"] == "command_policy"
     assert blocked[0].payload["decision"] == "deny"
     assert blocked[0].payload["metadata"] == {}
-    assert blocked[0].payload["approval_id"] == approval["approval_id"]
+    private_initial = asyncio.run(
+        _private_events_for_public_events(app.session_store, session_id, initial_events)
+    )
+    private_resolution = asyncio.run(
+        _private_events_for_public_events(app.session_store, session_id, resolution_events)
+    )
+    private_approval_event = next(
+        event for event in private_initial if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    private_blocked = next(
+        event for event in private_resolution if event.type == EventType.TOOL_CALL_BLOCKED
+    )
+    assert private_blocked.payload["approval_id"] == private_approval_event.payload["approval_id"]
     assert all(event.type != EventType.TOOL_CALL_FAILED for event in resolution_events)
     assert all(event.type != EventType.TOOL_CALL_APPROVAL_DENIED for event in resolution_events)
     assert resolution_events[-1].type == EventType.SESSION_COMPLETED
@@ -23351,18 +23817,21 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown()
         if event.type == EventType.TOOL_CALL_COMPLETED
         and event.payload.get("manual_recovery") is True
     )
-    assert recovered.payload["tool_round_id"] == round_id
-    assert recovered.payload["tool_call_id"] == "call_1"
+    durable_recovered = asyncio.run(
+        _private_events_for_public_events(store, session_id, [recovered])
+    )[0]
+    assert durable_recovered.payload["tool_round_id"] == round_id
+    assert durable_recovered.payload["tool_call_id"] == "call_1"
     # The manual terminal event carries the same idempotency key as the crashed
     # execution's started event, and the same tool_round_id the auto-close ledger
     # reads — the continuation reuses this exact event instead of synthesizing.
-    assert recovered.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+    assert durable_recovered.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id=session_id,
         tool_round_id=round_id,
         tool_call_id="call_1",
     )
-    assert recovered.payload["result"]["content"] == "side effect verified externally"
-    assert recovered.payload["result"]["is_error"] is False
+    assert durable_recovered.payload["result"]["content"] == "side effect verified externally"
+    assert durable_recovered.payload["result"]["is_error"] is False
     assert recovered.payload["resolved_by"] == {
         "subject": "operator@example.com",
         "tenant": "tenant-a",
@@ -23443,7 +23912,16 @@ def test_manual_tool_round_recovery_rebases_stale_running_operation() -> None:
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert recovery_events[-1].type == EventType.SESSION_COMPLETED
-    assert recovery_events[-1].payload["session_run_operation_id"] == operation_id
+    assert recovery_events[-1].payload["session_run_operation_id"] == PRIVATE_EVENT_AUTHORITY
+    completed_records = asyncio.run(
+        store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_COMPLETED,
+            )
+        )
+    )
+    assert completed_records[-1].event.payload["session_run_operation_id"] == operation_id
     assert_only_model_step_publication_checkpoint(asyncio.run(store.load_checkpoint(session_id)))
     assert tool.calls == [{}]
 
@@ -23748,7 +24226,10 @@ def test_tool_round_recovery_post_persist_fanout_failure_stays_resumable(
     if grouped_cancellation:
         assert terminal.payload.get("abandoned") is not True
     else:
-        assert recovery_events[-1].id == terminal.id
+        records = asyncio.run(store.query_events(EventQuery(session_id=session_id, limit=100)))
+        assert (
+            _private_record_for_public_event(records, recovery_events[-1]).event.id == terminal.id
+        )
         assert terminal.payload["manual_recovery_persisted"] is True
     recovered = [
         event
@@ -24044,7 +24525,11 @@ def test_cayu_app_recover_tool_round_operator_interrupts_blocked_continuation() 
             if event.type == EventType.SESSION_INTERRUPTED
         ]
         assert len(terminal_interruptions) == 1
-        assert terminal_interruptions[0].id == interruption_events[-1].id
+        records = await store.query_events(EventQuery(session_id=session_id, limit=100))
+        assert (
+            _private_record_for_public_event(records, interruption_events[-1]).event.id
+            == terminal_interruptions[0].id
+        )
         assert await app.drain_background_interruptions(timeout_s=1) is True
         assert_only_model_step_publication_checkpoint(await store.load_checkpoint(session_id))
         assert tool.calls == [{}]
@@ -25499,8 +25984,9 @@ def test_manual_tool_round_recovery_finalizes_pending_operator_interrupt_before_
             interruption_events = await collect_tool_round_recovery_events(app, request)
             assert interruption_events[-1].type == EventType.SESSION_INTERRUPTED
             assert interruption_events[-1].payload["interruption_type"] == "operator_requested"
-            assert interruption_events[-1].payload["interruption_request_id"] == (
-                interruption_request_id
+            assert (
+                interruption_events[-1].payload["interruption_request_id"]
+                == PRIVATE_EVENT_AUTHORITY
             )
             assert interruption_events[-1].payload["reason"] == interrupt_payload["reason"]
             assert interruption_events[-1].payload["metadata"] == interrupt_payload["metadata"]
@@ -25624,8 +26110,11 @@ def test_cayu_app_recover_tool_round_post_persist_failure_closes_to_interrupted(
     # INTERRUPTED with the failure recorded on the terminal event.
     interrupted = recovery_events[-1]
     assert interrupted.type == EventType.SESSION_INTERRUPTED
-    assert interrupted.payload["tool_round_id"] == round_id
-    assert interrupted.payload["tool_call_id"] == "call_1"
+    durable_interrupted = asyncio.run(
+        _private_events_for_public_events(store, session_id, [interrupted])
+    )[0]
+    assert durable_interrupted.payload["tool_round_id"] == round_id
+    assert durable_interrupted.payload["tool_call_id"] == "call_1"
     assert interrupted.payload["error_type"] == "RuntimeError"
     assert "events unavailable" in interrupted.payload["error"]
     session = asyncio.run(store.load(session_id))
@@ -25936,8 +26425,11 @@ def test_cayu_app_recover_tool_round_multi_call_recovers_iteratively():
     # the session stops INTERRUPTED naming it instead of closing the round.
     assert first_recovery[-1].type == EventType.SESSION_INTERRUPTED
     assert first_recovery[-1].payload["manual_recovery_required"] is True
-    assert first_recovery[-1].payload["tool_round_id"] == round_id
-    assert first_recovery[-1].payload["tool_call_id"] == "call_2"
+    durable_first_terminal = asyncio.run(
+        _private_events_for_public_events(store, session_id, [first_recovery[-1]])
+    )[0]
+    assert durable_first_terminal.payload["tool_round_id"] == round_id
+    assert durable_first_terminal.payload["tool_call_id"] == "call_2"
     assert first_recovery[-1].payload["tool_name"] == "side_effect"
     session = asyncio.run(store.load(session_id))
     assert session is not None and session.status == SessionStatus.INTERRUPTED
@@ -26079,14 +26571,20 @@ def test_cayu_app_recovery_watcher_ignores_its_owned_interrupted_transition(
         assert recovery_events[-1].type == EventType.SESSION_INTERRUPTED
         assert recovery_events[-1].payload["interruption_type"] == "runtime_interrupted"
         assert recovery_events[-1].payload["manual_recovery_required"] is True
-        assert recovery_events[-1].payload["tool_call_id"] == "call_2"
+        assert recovery_events[-1].payload["tool_call_id"] == (
+            f"{recovery_events[-1].id}:tool_call_id"
+        )
         terminal_interruptions = [
             event
             for event in await store.load_events(session_id)
             if event.type == EventType.SESSION_INTERRUPTED
         ]
         assert len(terminal_interruptions) == 1
-        assert terminal_interruptions[0].id == recovery_events[-1].id
+        records = await store.query_events(EventQuery(session_id=session_id, limit=100))
+        assert (
+            _private_record_for_public_event(records, recovery_events[-1]).event.id
+            == terminal_interruptions[0].id
+        )
         assert len(tool.calls) == 2
         assert app._session_control.has_active_tasks(session_id) is False
 
@@ -26157,7 +26655,7 @@ def test_cayu_app_recover_tool_round_taints_follow_up_rounds():
     assert recovery_events[-1].type == EventType.SESSION_COMPLETED
     blocked = [event for event in recovery_events if event.type == EventType.TOOL_CALL_BLOCKED]
     assert len(blocked) == 1
-    assert blocked[0].payload["tool_call_id"] == "call_send_email"
+    assert blocked[0].payload["tool_call_id"] == f"{blocked[0].id}:tool_call_id"
     assert email_tool.calls == []
 
 
@@ -26460,7 +26958,7 @@ def test_interaction_summary_pages_more_than_5000_usage_events_without_failing()
 
 def test_cayu_app_repairs_terminal_evidence_without_registered_agent():
     store = InMemorySessionStore()
-    app = CayuApp(session_store=store)
+    app = CayuApp(session_store=store, secret_redactor=SecretRedactor("-"))
 
     async def setup_and_recover():
         await store.create(
@@ -26487,6 +26985,16 @@ def test_cayu_app_repairs_terminal_evidence_without_registered_agent():
         "terminal_evidence_repaired": True,
     }
     assert result.message == "Repaired durable terminal event evidence."
+    terminal_records = asyncio.run(
+        store.query_events(
+            EventQuery(
+                session_id="sess_recover_terminal_missing_agent",
+                event_type=EventType.SESSION_COMPLETED,
+            )
+        )
+    )
+    assert len(terminal_records) == 1
+    assert str(UUID(terminal_records[0].event.id)) == terminal_records[0].event.id
 
 
 def test_cayu_app_resume_repairs_missing_initial_run_terminal_evidence() -> None:
@@ -26697,9 +27205,19 @@ def test_cayu_app_recovery_repairs_missing_pending_approval_terminal_evidence() 
             IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
             IncompleteSessionRecoveryAction.PENDING_APPROVAL,
         )
-        assert recovered.pending_approval_id == approval_id
-        assert recovered.events == (terminal_records[0].event,)
         assert len(terminal_records) == 1
+        assert recovered.pending_approval_id is not None
+        assert (
+            await app._resolve_public_action_linkage(
+                session_id=session_id,
+                value=recovered.pending_approval_id,
+                field_name="approval_id",
+            )
+            == approval_id
+        )
+        assert recovered.events == (
+            app.project_event_record_for_exposure(terminal_records[0]).event,
+        )
         assert terminal_records[0].event.payload["interruption_type"] == ("tool_approval_required")
         assert terminal_records[0].event.payload["approval"]["approval_id"] == approval_id
         assert checkpoint_after is not None
@@ -26770,11 +27288,15 @@ def test_cayu_app_recovery_repairs_missing_user_input_terminal_evidence() -> Non
             IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
             IncompleteSessionRecoveryAction.PENDING_USER_INPUT,
         )
-        assert recovered.pending_user_input_id == input_id
-        assert recovered.events == (terminal_records[0].event,)
+        public_input_id = public_event_linkage_id(terminal_records[0].sequence, "input_id")
+        assert recovered.pending_user_input_id == public_input_id
+        assert recovered.events == (
+            app.project_event_record_for_exposure(terminal_records[0]).event,
+        )
         assert len(terminal_records) == 1
         assert terminal_records[0].event.payload["interruption_type"] == "user_input_required"
         assert terminal_records[0].event.payload["user_input"]["input_id"] == input_id
+        assert recovered.events[0].payload["user_input"]["input_id"] == public_input_id
         assert checkpoint_after is not None
         assert checkpoint_after["pending_user_input"]["input_id"] == input_id
         assert "incomplete_session_recovery_claim" not in checkpoint_after
@@ -26951,7 +27473,9 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
             EventType.SESSION_COMPLETED,
             EventType.SESSION_FAILED,
         ]
-        assert repaired.events == (terminal_records[-1].event,)
+        assert repaired.events == (
+            app.project_event_record_for_exposure(terminal_records[-1]).event,
+        )
         assert terminal_records[-1].event.payload["terminal_evidence_repaired"] is True
         assert (
             str(UUID(terminal_records[-1].event.payload["session_run_operation_id"]))
@@ -27212,7 +27736,18 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
         checkpoint = await store.load_checkpoint(session_id)
-        assert repaired.events[0].payload == pending_payload
+        terminal_records = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_INTERRUPTED,
+            )
+        )
+        assert len(terminal_records) == 1
+        assert terminal_records[0].event.payload == pending_payload
+        assert repaired.events[0].payload == {
+            **pending_payload,
+            "interruption_request_id": PRIVATE_EVENT_AUTHORITY,
+        }
         assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
         resumed = await collect_resume_events(
@@ -27295,7 +27830,12 @@ def test_cayu_app_recover_incomplete_session_finalizes_pending_interrupt():
     assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
     assert result.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
-    assert interruption_payload_without_request_id(result.events[0].payload) == {
+    assert result.events[0].payload["interruption_request_id"] == PRIVATE_EVENT_AUTHORITY
+    durable_result_event = _private_record_for_public_event(
+        asyncio.run(store.query_events(EventQuery(session_id="sess_stale_interrupting"))),
+        result.events[0],
+    ).event
+    assert interruption_payload_without_request_id(durable_result_event.payload) == {
         "reason": "deploy",
         "metadata": {"worker": "old"},
         "interruption_type": "operator_requested",
@@ -27474,7 +28014,17 @@ def test_cayu_app_recover_incomplete_session_restores_required_approval_before_c
     approval = PendingToolApproval.model_validate(checkpoint["pending_tool_approval"])
     assert checkpoint["pending_tool_round"]["policy_state"] == "planned"
     assert checkpoint["pending_tool_round"]["tool_round_id"] == approval.tool_round_id
-    assert result.pending_approval_id == approval.approval_id
+    assert result.pending_approval_id is not None
+    assert (
+        asyncio.run(
+            app._resolve_public_action_linkage(
+                session_id="sess_recover_required_approval_plan",
+                value=result.pending_approval_id,
+                field_name="approval_id",
+            )
+        )
+        == approval.approval_id
+    )
     assert any(
         event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         and event.payload["approval_id"] == approval.approval_id
@@ -27577,7 +28127,8 @@ def test_legacy_ambiguous_policy_recovery_preserves_authoritative_denial():
         assert tool.calls == []
         assert events[-1].type is EventType.SESSION_COMPLETED
         blocked = [event for event in events if event.type is EventType.TOOL_CALL_BLOCKED]
-        assert [event.payload["tool_call_id"] for event in blocked] == [
+        private_blocked = await _private_events_for_public_events(store, session_id, blocked)
+        assert [event.payload["tool_call_id"] for event in private_blocked] == [
             "call_denied",
             "call_ambiguous",
         ]
@@ -27675,17 +28226,18 @@ def test_legacy_mixed_policy_recovery_prefers_authoritative_approval_gate():
                 decision=ToolApprovalDecision.APPROVE,
             ),
         )
+        private_events = await _private_events_for_public_events(store, session_id, events)
         assert tool.calls == [{"value": "explicitly approved"}]
         assert any(
             event.type is EventType.TOOL_CALL_BLOCKED
             and event.payload.get("tool_call_id") == "call_ambiguous"
             and event.payload.get("blocked_by") == "policy_evaluation_ambiguous"
-            for event in events
+            for event in private_events
         )
         assert any(
             event.type is EventType.TOOL_CALL_APPROVED
             and event.payload.get("tool_call_id") == "call_authoritative_approval"
-            for event in events
+            for event in private_events
         )
 
     asyncio.run(run())
@@ -28310,7 +28862,6 @@ def test_cayu_app_recover_incomplete_session_preserves_pending_tool_approval():
     approval_event = next(
         event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
-    approval_id = approval_event.payload["approval"]["approval_id"]
     asyncio.run(
         store.update_status(
             "sess_recover_incomplete_pending_approval",
@@ -28329,11 +28880,20 @@ def test_cayu_app_recover_incomplete_session_preserves_pending_tool_approval():
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
     assert result.actions == (IncompleteSessionRecoveryAction.PENDING_APPROVAL,)
-    assert result.pending_approval_id == approval_id
+    assert result.pending_approval_id == f"{result.events[0].id}:approval_id"
     assert result.status == SessionStatus.INTERRUPTED
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
     assert checkpoint is not None
-    assert checkpoint["pending_tool_approval"]["approval_id"] == approval_id
+    private_approval = _private_record_for_public_event(
+        asyncio.run(
+            store.query_events(EventQuery(session_id="sess_recover_incomplete_pending_approval"))
+        ),
+        approval_event,
+    ).event
+    assert (
+        checkpoint["pending_tool_approval"]["approval_id"]
+        == private_approval.payload["approval_id"]
+    )
     assert "pending_session_interrupt" not in checkpoint
     assert tool.calls == []
 
@@ -28831,11 +29391,15 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
     assert tool.calls == []
     blocked_event = events[4]
     assert blocked_event.tool_name == "side_effect"
-    assert blocked_event.payload["tool_round_id"] == events[3].payload["tool_round_id"]
-    assert blocked_event.payload == {
+    private_events = asyncio.run(
+        _private_events_for_public_events(store, "sess_blocked_tool", events)
+    )
+    private_blocked = private_events[4]
+    assert private_blocked.payload["tool_round_id"] == private_events[3].payload["tool_round_id"]
+    assert private_blocked.payload == {
         "tool_call_id": "call_1",
-        "idempotency_key": blocked_event.payload["idempotency_key"],
-        **tool_round_identity_payload(blocked_event),
+        "idempotency_key": private_blocked.payload["idempotency_key"],
+        **tool_round_identity_payload(private_blocked),
         "tool_name": "side_effect",
         "denied_by": "tool_policy",
         "decision": "deny",
@@ -29067,7 +29631,17 @@ def test_cayu_app_required_allowlist_can_request_durable_approval():
     assert events[-1].payload["interruption_type"] == "tool_approval_required"
     checkpoint = asyncio.run(store.load_checkpoint("sess_required_allowlist_approval"))
     assert checkpoint is not None
-    assert checkpoint["pending_tool_approval"]["approval_id"] == approval["approval_id"]
+    private_approval_event = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_required_allowlist_approval",
+            [approval_event],
+        )
+    )[0]
+    assert (
+        checkpoint["pending_tool_approval"]["approval_id"]
+        == private_approval_event.payload["approval_id"]
+    )
 
 
 def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
@@ -29115,9 +29689,12 @@ def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
     ]
     assert tool.calls == []
 
-    approval = events[4].payload["approval"]
+    private_events = asyncio.run(
+        _private_events_for_public_events(store, "sess_tool_approval", events)
+    )
+    approval = private_events[4].payload["approval"]
     assert events[-1].payload["interruption_type"] == "tool_approval_required"
-    assert events[-1].payload["approval"]["approval_id"] == approval["approval_id"]
+    assert private_events[-1].payload["approval"]["approval_id"] == approval["approval_id"]
     assert approval["tool_call_id"] == "call_1"
     assert approval["tool_name"] == "side_effect"
     assert approval["arguments"] == {"value": "secret"}
@@ -29270,7 +29847,7 @@ def test_stale_tool_approval_resolver_cannot_claim_repaused_session():
         approval_event = next(
             event for event in interrupted if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval_a = PendingToolApproval.from_event(approval_event)
+        approval_a = await _pending_tool_approval_from_public_event(store, approval_event)
         checkpoint_a = await store.load_checkpoint(session_id)
         assert checkpoint_a is not None
         round_a = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint_a)
@@ -29386,7 +29963,7 @@ def test_tool_approval_resolution_rejects_partial_identity_without_mutation():
         approval_event = next(
             event for event in interrupted if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval = PendingToolApproval.from_event(approval_event)
+        approval = await _pending_tool_approval_from_public_event(store, approval_event)
         checkpoint_before = await store.load_checkpoint(session_id)
         session_before = await store.load(session_id)
         assert session_before is not None
@@ -29481,7 +30058,7 @@ def test_concurrent_approval_and_denial_have_exactly_one_durable_winner():
         approval_event = next(
             event for event in interrupted if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval = PendingToolApproval.from_event(approval_event)
+        approval = await _pending_tool_approval_from_public_event(store, approval_event)
         store.block_claims = True
 
         async def resolve(decision: ToolApprovalDecision):
@@ -29557,7 +30134,7 @@ def test_tool_approval_claim_acknowledgement_loss_fails_closed_and_recovers():
         approval_event = next(
             event for event in interrupted if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval = PendingToolApproval.from_event(approval_event)
+        approval = await _pending_tool_approval_from_public_event(store, approval_event)
         store.lose_next_claim_ack = True
 
         with pytest.raises(
@@ -29586,7 +30163,15 @@ def test_tool_approval_claim_acknowledgement_loss_fails_closed_and_recovers():
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
         assert recovered.actions == (IncompleteSessionRecoveryAction.PENDING_APPROVAL,)
-        assert recovered.pending_approval_id == approval.approval_id
+        assert recovered.pending_approval_id is not None
+        assert (
+            await app._resolve_public_action_linkage(
+                session_id=session_id,
+                value=recovered.pending_approval_id,
+                field_name="approval_id",
+            )
+            == approval.approval_id
+        )
         after = await store.load(session_id)
         assert after is not None
         assert after.status is SessionStatus.INTERRUPTED
@@ -29659,10 +30244,18 @@ def test_tool_approval_publication_acknowledgement_loss_preserves_atomic_pair():
             IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,
             IncompleteSessionRecoveryAction.PENDING_APPROVAL,
         )
-        assert recovered.pending_approval_id == approval.approval_id
+        assert recovered.pending_approval_id is not None
+        assert (
+            await app._resolve_public_action_linkage(
+                session_id=session_id,
+                value=recovered.pending_approval_id,
+                field_name="approval_id",
+            )
+            == approval.approval_id
+        )
         repaired_interrupts = [
             event
-            for event in recovered.events
+            for event in await store.load_events(session_id)
             if event.type is EventType.SESSION_INTERRUPTED
             and event.payload.get("approval", {}).get("approval_id") == approval.approval_id
         ]
@@ -29746,25 +30339,23 @@ def test_tool_approval_requested_audit_metadata_is_bounded_and_redacted():
     assert (
         approval_event.payload["approval_id"] == approval_event.payload["approval"]["approval_id"]
     )
-    assert approval_event.payload["tool_call_id"] == "call_1"
+    assert approval_event.payload["tool_call_id"] == f"{approval_event.id}:tool_call_id"
     assert tool.calls == []
     interrupted_event = next(
         event for event in events if event.type is EventType.SESSION_INTERRUPTED
     )
     assert interrupted_event.payload["approval_metadata_truncated"] is True
     assert interrupted_event.payload["tool_call_metadata_truncated"] == ["call_1"]
-    assert (
-        interrupted_event.payload["approval"]["approval_id"]
-        == approval_event.payload["approval_id"]
+    assert interrupted_event.payload["approval"]["approval_id"] == (
+        f"{interrupted_event.id}:approval_id"
     )
     pending_actions = asyncio.run(
         store.query_pending_actions(PendingActionQuery(session_id="sess_bounded_approval_audit"))
     )
     assert len(pending_actions.actions) == 1
     assert pending_actions.actions[0].kind is PendingActionKind.TOOL_APPROVAL
-    assert pending_actions.actions[0].approval_id == approval_event.payload["approval_id"]
-
-    approval = PendingToolApproval.from_event(approval_event)
+    approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
+    assert pending_actions.actions[0].approval_id == approval.approval_id
     secret_call = PendingToolCallApproval(
         **{
             **approval.tool_calls[0].model_dump(mode="json"),
@@ -30134,6 +30725,7 @@ def test_tool_approval_resolution_task_cancellation_finalizes_and_preserves_pend
             event for event in interrupted if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
         approval_id = approval_event.payload["approval"]["approval_id"]
+        private_approval = await _pending_tool_approval_from_public_event(store, approval_event)
 
         releases_before = store.release_calls
         resolution_task = asyncio.create_task(
@@ -30166,7 +30758,7 @@ def test_tool_approval_resolution_task_cancellation_finalizes_and_preserves_pend
         assert session.status == SessionStatus.INTERRUPTED
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
-        assert checkpoint["pending_tool_approval"]["approval_id"] == approval_id
+        assert checkpoint["pending_tool_approval"]["approval_id"] == private_approval.approval_id
         events = await store.load_events(session_id)
         assert events[-1].type == EventType.SESSION_INTERRUPTED
         assert events[-1].payload["abandoned"] is True
@@ -30258,7 +30850,7 @@ def test_expired_tool_approval_resolves_as_deterministic_denial():
     approval_event = next(
         event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
     assert pending.expires_at == datetime(2026, 7, 9, 12, 1, tzinfo=UTC)
 
     clock["now"] = datetime(2026, 7, 9, 12, 2, tzinfo=UTC)
@@ -30286,7 +30878,11 @@ def test_expired_tool_approval_resolves_as_deterministic_denial():
     expired_event = next(
         event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED
     )
-    assert expired_event.payload["approval_id"] == pending.approval_id
+    assert expired_event.payload["approval_id"] == f"{expired_event.id}:approval_id"
+    private_expired_event = asyncio.run(
+        _private_events_for_public_events(store, "sess_approval_expiry", [expired_event])
+    )[0]
+    assert private_expired_event.payload["approval_id"] == pending.approval_id
     assert expired_event.payload["expires_at"] == "2026-07-09T12:01:00+00:00"
     assert expired_event.payload["requested_decision"] == "approve"
     assert expired_event.payload["resolved_by"]["subject"] == "cayu:approval-expiry"
@@ -30397,7 +30993,7 @@ def test_multi_call_approval_round_uses_minimum_ttl():
     approval_event = next(
         event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
     # The gating call (side_effect, 300s) does not win: echo's 60s bound does.
     assert pending.expires_at == datetime(2026, 7, 9, 12, 1, tzinfo=UTC)
 
@@ -30430,7 +31026,10 @@ def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
     approval_event = next(
         event for event in interrupt_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
-    approval = PendingToolApproval.from_event(approval_event)
+    approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
+    private_approval_event = asyncio.run(
+        _private_events_for_public_events(store, "sess_expiry_retry", [approval_event])
+    )[0]
     request = ToolApprovalRequest(
         session_id="sess_expiry_retry",
         approval_id=approval.approval_id,
@@ -30465,7 +31064,7 @@ def test_expired_approval_retry_after_recorded_grant_is_not_coerced():
                 agent_name="assistant",
                 tool_name="side_effect",
                 payload={
-                    **tool_round_identity_payload(approval_event),
+                    **tool_round_identity_payload(private_approval_event),
                     "approval_id": approval.approval_id,
                     "tool_call_id": "call_1",
                     "requested_decision": request.decision.value,
@@ -30712,7 +31311,14 @@ def test_automatic_compaction_cancellation_does_not_wait_for_stalled_completion_
             if delivered:
                 break
             await asyncio.sleep(0.01)
-        assert [event.id for event in delivered] == [completions[0].id]
+        completion_record = next(
+            record
+            for record in await store.query_events(
+                EventQuery(session_id="sess_automatic_stalled_completion_sink")
+            )
+            if record.event.id == completions[0].id
+        )
+        assert [event.id for event in delivered] == [public_event_id(completion_record.sequence)]
         assert sink.completion_delivery_calls == 1
 
     asyncio.run(run())
@@ -30820,7 +31426,16 @@ def test_automatic_compaction_late_completion_commit_keeps_one_accounting_event(
             if event.type == EventType.MODEL_COMPLETED
             and event.payload.get("purpose") == "context_compaction"
         ]
-        assert [event.id for event in sink_completions] == [completions[0].id]
+        completion_records = [
+            record
+            for record in await store.query_events(
+                EventQuery(session_id="sess_automatic_late_completion_commit")
+            )
+            if record.event.id == completions[0].id
+        ]
+        assert [event.id for event in sink_completions] == [
+            public_event_id(completion_records[0].sequence)
+        ]
 
     asyncio.run(run())
 
@@ -30936,7 +31551,14 @@ def test_automatic_compaction_late_start_commit_reuses_original_event(
         sink_starts = [
             event for event in sink.events if event.type == EventType.CONTEXT_COMPACTION_STARTED
         ]
-        assert [event.id for event in sink_starts] == [store.original_event_id]
+        start_records = [
+            record
+            for record in await store.query_events(
+                EventQuery(session_id="sess_automatic_late_start_commit")
+            )
+            if record.event.id == store.original_event_id
+        ]
+        assert [event.id for event in sink_starts] == [public_event_id(start_records[0].sequence)]
 
     asyncio.run(run())
 
@@ -31416,7 +32038,8 @@ def test_tool_approval_recovery_post_persist_fanout_failure_stays_resumable(
         elif failure_mode == "active-cancellation":
             assert terminal.payload["abandoned"] is True
         else:
-            assert recovery[-1].id == terminal.id
+            records = await store.query_events(EventQuery(session_id=session_id, limit=100))
+            assert _private_record_for_public_event(records, recovery[-1]).event.id == terminal.id
             assert terminal.payload["manual_recovery_persisted"] is True
         assert (
             len(
@@ -32112,8 +32735,16 @@ def test_cayu_app_resolves_approved_multi_tool_round_in_order():
             ),
         )
     )
+    private_approval_event = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_multi_tool_approval",
+            [interrupt_events[4]],
+        )
+    )[0]
     approval = interrupt_events[4].payload["approval"]
-    assert [call["tool_call_id"] for call in approval["tool_calls"]] == [
+    private_approval = private_approval_event.payload["approval"]
+    assert [call["tool_call_id"] for call in private_approval["tool_calls"]] == [
         "call_1",
         "call_2",
     ]
@@ -32200,6 +32831,7 @@ def test_cayu_app_resolves_denied_tool_call_and_continues_session():
     )
     approval_event = interrupt_events[4]
     approval_id = approval_event.payload["approval"]["approval_id"]
+    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
 
     events = asyncio.run(
         collect_tool_approval_events(
@@ -32225,11 +32857,17 @@ def test_cayu_app_resolves_denied_tool_call_and_continues_session():
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[1].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+    private_resolution_events = asyncio.run(
+        _private_events_for_public_events(store, "sess_tool_approval_deny", events)
+    )
+    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
+    assert private_resolution_events[1].payload[
+        "idempotency_key"
+    ] == tool_execution.tool_idempotency_key(
         session_id="sess_tool_approval_deny",
-        tool_round_id=events[1].payload["tool_round_id"],
+        tool_round_id=private_resolution_events[1].payload["tool_round_id"],
         tool_call_id="call_1",
-        approval_id=approval_id,
+        approval_id=private_approval.approval_id,
     )
     assert tool.calls == []
     assert provider.requests[1].messages[-1].role == "tool"
@@ -32482,7 +33120,7 @@ def test_cayu_app_keeps_pending_approval_if_atomic_resolution_close_fails():
         EventType.SESSION_INTERRUPTED,
     ]
     assert events[-1].payload["interruption_type"] == "tool_approval_required"
-    assert events[-1].payload["approval"]["approval_id"] == approval_id
+    assert events[-1].payload["approval"]["approval_id"] == f"{events[-1].id}:approval_id"
     assert events[-1].payload["error"] == "approval close unavailable"
 
     session = asyncio.run(store.load("sess_approval_atomic_close_failure"))
@@ -32490,7 +33128,8 @@ def test_cayu_app_keeps_pending_approval_if_atomic_resolution_close_fails():
     assert session.status == SessionStatus.INTERRUPTED
     checkpoint = asyncio.run(store.load_checkpoint("sess_approval_atomic_close_failure"))
     assert checkpoint is not None
-    assert checkpoint["pending_tool_approval"]["approval_id"] == approval_id
+    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
+    assert checkpoint["pending_tool_approval"]["approval_id"] == private_approval.approval_id
 
     transcript = asyncio.run(store.load_transcript("sess_approval_atomic_close_failure"))
     assert [message.role for message in transcript] == ["user", "assistant"]
@@ -32654,13 +33293,10 @@ def test_tool_approval_close_acknowledgement_loss_replays_exact_receipt():
                 messages=[Message.text("user", "use the tool")],
             ),
         )
-        approval = PendingToolApproval.from_event(
-            next(
-                event
-                for event in interrupted
-                if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
-            )
+        approval_event = next(
+            event for event in interrupted if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
+        approval = await _pending_tool_approval_from_public_event(store, approval_event)
         request = ToolApprovalRequest(
             session_id=session_id,
             approval_id=approval.approval_id,
@@ -32685,7 +33321,11 @@ def test_tool_approval_close_acknowledgement_loss_replays_exact_receipt():
 
         replayed = await collect_tool_approval_events(app, request)
         assert [event.type for event in replayed] == [EventType.SESSION_CHECKPOINTED]
-        assert replayed[0].id == receipt.appended_event_ids[0]
+        records = await store.query_events(EventQuery(session_id=session_id))
+        assert (
+            _private_record_for_public_event(records, replayed[0]).event.id
+            == (receipt.appended_event_ids[0])
+        )
         assert tool.calls == [{"value": "secret"}]
 
         with pytest.raises(RuntimeError, match="conflicting identity or decision"):
@@ -32882,7 +33522,7 @@ def test_cayu_app_rejects_denial_retry_after_approved_tool_executed():
         asyncio.run(store.load_checkpoint("sess_approval_reject_conflicting_deny"))[
             "pending_tool_approval"
         ]["approval_id"]
-        == approval_id
+        == asyncio.run(_pending_tool_approval_from_public_event(store, approval_event)).approval_id
     )
 
 
@@ -32966,8 +33606,12 @@ def test_cayu_app_approval_recovery_ignores_unrelated_terminal_tool_events():
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert events[2].payload["approval_id"] == approval_id
-    assert events[3].payload["approval_id"] == approval_id
+    private_resolution = asyncio.run(
+        _private_events_for_public_events(store, "sess_approval_scoped_recovery", events)
+    )
+    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
+    assert private_resolution[2].payload["approval_id"] == private_approval.approval_id
+    assert private_resolution[3].payload["approval_id"] == private_approval.approval_id
     assert tool.calls == [{"value": "secret"}]
     assert provider.requests[1].messages[-1].content[0].content == "recorded"
 
@@ -33011,6 +33655,7 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
     )
     approval_event = interrupt_events[4]
     approval_id = approval_event.payload["approval"]["approval_id"]
+    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
 
     events = asyncio.run(
         collect_tool_approval_events(
@@ -33049,7 +33694,7 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
     assert [event.type for event in retry_events] == [EventType.SESSION_INTERRUPTED]
     assert retry_events[-1].payload["interruption_type"] == "tool_approval_required"
     assert retry_events[-1].payload["manual_recovery_required"] is True
-    assert retry_events[-1].payload["tool_call_id"] == "call_1"
+    assert retry_events[-1].payload["tool_call_id"] == (f"{retry_events[-1].id}:tool_call_id")
     assert tool.calls == [{"value": "secret"}]
     session = asyncio.run(store.load("sess_approval_started_without_terminal"))
     assert session is not None
@@ -33081,12 +33726,19 @@ def test_cayu_app_requires_manual_recovery_for_started_tool_without_terminal_eve
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
     ]
-    assert recovery_events[1].payload["approval_id"] == approval_id
-    assert recovery_events[1].payload["idempotency_key"] == tool_execution.tool_idempotency_key(
+    private_recovery_event = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_approval_started_without_terminal",
+            [recovery_events[1]],
+        )
+    )[0]
+    assert private_recovery_event.payload["approval_id"] == private_approval.approval_id
+    assert private_recovery_event.payload["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_approval_started_without_terminal",
-        tool_round_id=recovery_events[1].payload["tool_round_id"],
+        tool_round_id=private_recovery_event.payload["tool_round_id"],
         tool_call_id="call_1",
-        approval_id=approval_id,
+        approval_id=private_approval.approval_id,
     )
     assert recovery_events[1].payload["manual_recovery"] is True
     assert recovery_events[1].payload["result"]["content"] == ("side effect completed externally")
@@ -33168,20 +33820,34 @@ def test_tool_approval_recovery_can_target_non_gating_call_in_same_round():
         return paused, interrupted, recovered
 
     _paused, interrupted, recovered = asyncio.run(run())
+    private_interrupted = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_recover_non_gating_approval_call",
+            interrupted,
+        )
+    )
+    private_recovered = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_recover_non_gating_approval_call",
+            recovered,
+        )
+    )
 
     assert interrupted[-1].type is EventType.SESSION_INTERRUPTED
     assert any(
         event.type is EventType.TOOL_CALL_STARTED
         and event.payload["tool_call_id"] == "call_recovery"
-        for event in interrupted
+        for event in private_interrupted
     )
     assert not any(
         event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
         and event.payload["tool_call_id"] == "call_recovery"
-        for event in interrupted
+        for event in private_interrupted
     )
     recovered_call = next(
-        event for event in recovered if event.payload.get("manual_recovery") is True
+        event for event in private_recovered if event.payload.get("manual_recovery") is True
     )
     assert recovered_call.payload["tool_call_id"] == "call_recovery"
     assert recovered[-1].type is EventType.SESSION_COMPLETED
@@ -34013,9 +34679,16 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert policy.requests[0].metadata == {"tenant": {"id": "mutated"}}
+    private_tool_started = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "sess_policy_run_metadata",
+            [events[3]],
+        )
+    )[0]
     assert tool.contexts[0].metadata["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_policy_run_metadata",
-        tool_round_id=events[3].payload["tool_round_id"],
+        tool_round_id=private_tool_started.payload["tool_round_id"],
         tool_call_id="call_1",
     )
     assert tool.contexts[0].metadata == {
@@ -34226,9 +34899,16 @@ def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert policy.requests[0].metadata == {"resume": {"id": "mutated"}}
+    private_tool_started = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_policy_resume_metadata",
+            [events[3]],
+        )
+    )[0]
     assert tool.contexts[0].metadata["idempotency_key"] == tool_execution.tool_idempotency_key(
         session_id="sess_policy_resume_metadata",
-        tool_round_id=events[3].payload["tool_round_id"],
+        tool_round_id=private_tool_started.payload["tool_round_id"],
         tool_call_id="call_1",
     )
     assert tool.contexts[0].metadata == {
@@ -34998,9 +35678,16 @@ def test_runtime_compaction_outer_ledger_does_not_duplicate_retry_completions():
             window=BudgetWindow.all_time(),
         )
     )
+    session_records = asyncio.run(
+        app.session_store.query_events(
+            EventQuery(session_id="sess_compaction_completed_retry", limit=100)
+        )
+    )
     assert [
         event.id for event in budget_events if event.payload.get("purpose") == "context_compaction"
-    ] == [event.id for event in completions]
+    ] == [
+        _private_record_for_public_event(session_records, event).event.id for event in completions
+    ]
 
 
 def test_model_compactor_does_not_retry_by_default():
@@ -37249,9 +37936,23 @@ def test_context_overflow_policy_fails_cleanly_when_recovery_overflows():
     assert len(provider.requests) == 2
     model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
     assert len(model_errors) == 2
-    assert model_errors[0].payload["model_step_id"] == model_errors[1].payload["model_step_id"]
+    private_events = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "context_overflow_recovery_failed",
+            events,
+        )
+    )
+    private_model_errors = [
+        event for event in private_events if event.type == EventType.MODEL_ERROR
+    ]
     assert (
-        model_errors[0].payload["model_attempt_id"] != model_errors[1].payload["model_attempt_id"]
+        private_model_errors[0].payload["model_step_id"]
+        == private_model_errors[1].payload["model_step_id"]
+    )
+    assert (
+        private_model_errors[0].payload["model_attempt_id"]
+        != private_model_errors[1].payload["model_attempt_id"]
     )
     assert [
         event.type
@@ -37267,8 +37968,12 @@ def test_context_overflow_policy_fails_cleanly_when_recovery_overflows():
         EventType.CONTEXT_OVERFLOW_RECOVERING,
         EventType.CONTEXT_OVERFLOW_FAILED,
     ]
-    recovery_started = [event for event in events if event.type == EventType.MODEL_STARTED][-1]
-    failed = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_FAILED)
+    recovery_started = [event for event in private_events if event.type == EventType.MODEL_STARTED][
+        -1
+    ]
+    failed = next(
+        event for event in private_events if event.type == EventType.CONTEXT_OVERFLOW_FAILED
+    )
     assert failed.payload == {
         "step": 1,
         "phase": "recovery",
@@ -41564,7 +42269,16 @@ def test_prompt_cache_compactor_records_exact_overflow_when_bounded_attempt_fail
     assert "error" not in failed_compaction.payload
     assert failed_compaction.payload["error_type"] == "RuntimeError"
     assert resume_events[-1].type == EventType.SESSION_FAILED
-    terminal_operation_id = resume_events[-1].payload["session_run_operation_id"]
+    assert resume_events[-1].payload["session_run_operation_id"] == PRIVATE_EVENT_AUTHORITY
+    terminal_records = asyncio.run(
+        app.session_store.query_events(
+            EventQuery(
+                session_id="sess_prompt_cache_failed_fallback_telemetry",
+                event_type=EventType.SESSION_FAILED,
+            )
+        )
+    )
+    terminal_operation_id = terminal_records[-1].event.payload["session_run_operation_id"]
     assert str(UUID(terminal_operation_id)) == terminal_operation_id
     assert {
         key: value
@@ -42156,6 +42870,9 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
     assert provider_context[1].content[0].text == "current"
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_model_compaction"))
+    private_compaction_completion = asyncio.run(
+        _private_events_for_public_events(store, "sess_model_compaction", [events[2]])
+    )[0]
     assert checkpoint_without_model_step_publication(checkpoint) == {
         CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "context_compaction": {
@@ -42170,8 +42887,8 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
                 "max_input_chars": 120000,
                 "completed": {
                     "finish_reason": "stop",
-                    "model_step_id": events[2].payload["model_step_id"],
-                    "model_attempt_id": events[2].payload["model_attempt_id"],
+                    "model_step_id": private_compaction_completion.payload["model_step_id"],
+                    "model_attempt_id": private_compaction_completion.payload["model_attempt_id"],
                 },
             },
         },
@@ -43474,7 +44191,10 @@ def test_automatic_compaction_settles_other_limits_after_one_reconciliation_fail
     assert ledger.reconcile_calls == 3
     assert [record.status for record in records] == ["reconciled", "active", "reconciled"]
     reconciled = [event for event in events if event.type == EventType.BUDGET_RECONCILED]
-    assert [event.payload["reservation_id"] for event in reconciled] == [
+    private_reconciled = asyncio.run(
+        _private_events_for_public_events(app.session_store, session_id, reconciled)
+    )
+    assert [event.payload["reservation_id"] for event in private_reconciled] == [
         records[0].reservation_id,
         records[2].reservation_id,
     ]
@@ -44659,7 +45379,14 @@ def test_cayu_app_keeps_successful_inner_compaction_spend_when_wrapper_fails():
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    private_completed = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "sess_failed_compaction_wrapper",
+            [completed],
+        )
+    )[0]
+    assert [event.id for event in budget_events] == [private_completed.id]
 
 
 def test_cayu_app_keeps_compaction_completion_when_stream_fails_after_completed():
@@ -44728,7 +45455,14 @@ def test_cayu_app_keeps_compaction_completion_when_stream_fails_after_completed(
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    private_completed = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "sess_compaction_stream_teardown_failure",
+            [completed],
+        )
+    )[0]
+    assert [event.id for event in budget_events] == [private_completed.id]
 
 
 def test_cayu_app_preserves_provider_order_when_wrapper_recovers_earlier_draft():
@@ -44826,7 +45560,14 @@ def test_cayu_app_preserves_provider_order_when_wrapper_recovers_earlier_draft()
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [event.id for event in completed_events]
+    private_completed_events = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "sess_recovered_compaction_draft",
+            completed_events,
+        )
+    )
+    assert [event.id for event in budget_events] == [event.id for event in private_completed_events]
 
 
 def test_cayu_app_rejects_returned_only_completion_and_keeps_anchored_inner_call():
@@ -45077,7 +45818,14 @@ def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_n
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    private_completed = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_unsafe_compaction_metadata",
+            [completed],
+        )
+    )[0]
+    assert [event.id for event in budget_events] == [private_completed.id]
 
 
 @pytest.mark.parametrize(
@@ -45253,7 +46001,14 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    private_completed = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_invalid_compaction_summary",
+            [completed],
+        )
+    )[0]
+    assert [event.id for event in budget_events] == [private_completed.id]
 
 
 def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
@@ -45366,7 +46121,14 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    private_completed = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_rejected_compaction_tool_call",
+            [completed],
+        )
+    )[0]
+    assert [event.id for event in budget_events] == [private_completed.id]
 
 
 @pytest.mark.parametrize(
@@ -45465,7 +46227,14 @@ def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [uncertain.id]
+    private_uncertain = asyncio.run(
+        _private_events_for_public_events(
+            store,
+            "sess_unfinished_compaction",
+            [uncertain],
+        )
+    )[0]
+    assert [event.id for event in budget_events] == [private_uncertain.id]
 
 
 def test_unfinished_automatic_compaction_fails_closed_after_restart() -> None:
@@ -45570,7 +46339,14 @@ def test_unfinished_automatic_compaction_fails_closed_after_restart() -> None:
             key=None,
             window=BudgetWindow.all_time(),
         )
-        assert [event.id for event in durable_budget_events] == [uncertain.id]
+        private_uncertain = (
+            await _private_events_for_public_events(
+                store,
+                "sess_unfinished_compaction_first_process",
+                [uncertain],
+            )
+        )[0]
+        assert [event.id for event in durable_budget_events] == [private_uncertain.id]
 
     asyncio.run(run())
 
@@ -50857,9 +51633,9 @@ def test_cayu_app_freezes_tool_declarations_at_registration():
 
 def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
     store = InMemorySessionStore()
-    app = CayuApp(session_store=store)
+    app = CayuApp(session_store=store, secret_redactor=SecretRedactor("-"))
     app.register_provider(FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})]))
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
 
     async def run():
         await store.create(
@@ -50868,7 +51644,7 @@ def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
                 session_id="sess_interrupt_direct",
                 messages=[Message.text("user", "hello")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=SessionIdentity(provider_name="fake", model="fakemodel"),
         )
         events = [
             event
@@ -50878,17 +51654,23 @@ def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
                     reason="operator requested stop",
                     metadata={"actor": "operator"},
                     requested_by=ResolutionActor(
-                        subject="operator-42",
-                        tenant="tenant-7",
+                        subject="operator42",
+                        tenant="tenant7",
                         source=ResolutionActorSource.REQUEST,
                         claims={"role": "operator"},
                     ),
                 )
             )
         ]
-        return events, await store.load("sess_interrupt_direct")
+        records = await store.query_events(
+            EventQuery(
+                session_id="sess_interrupt_direct",
+                event_type=EventType.SESSION_INTERRUPTED,
+            )
+        )
+        return events, await store.load("sess_interrupt_direct"), records
 
-    events, session = asyncio.run(run())
+    events, session, records = asyncio.run(run())
 
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
@@ -50897,12 +51679,17 @@ def test_interrupt_session_marks_pending_session_interrupted_and_emits_event():
         "reason": "operator requested stop",
         "metadata": {"actor": "operator"},
         "requested_by": {
-            "subject": "operator-42",
-            "tenant": "tenant-7",
+            "subject": "operator42",
+            "tenant": "tenant7",
             "source": "request",
         },
         "interruption_type": "operator_requested",
     }
+    assert len(records) == 1
+    assert (
+        str(UUID(records[0].event.payload["interruption_request_id"]))
+        == records[0].event.payload["interruption_request_id"]
+    )
 
 
 def test_interrupt_session_race_returns_existing_interrupt_event_without_duplicate():
@@ -50984,9 +51771,19 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
     assert [event.type for event in third_events] == [EventType.SESSION_INTERRUPTED]
     assert first_events[0].id == second_events[0].id == third_events[0].id
     assert first_events[0].payload["reason"] == "first request"
-    assert [event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED] == [
-        first_events[0]
+    stored_interrupt_events = [
+        event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED
     ]
+    assert len(stored_interrupt_events) == 1
+    assert (
+        _private_record_for_public_event(
+            asyncio.run(
+                store.query_events(EventQuery(session_id="sess_interrupt_race_idempotent"))
+            ),
+            first_events[0],
+        ).event
+        == stored_interrupt_events[0]
+    )
     assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
 
@@ -51331,10 +52128,13 @@ def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
         store.allow_transition_return.set()
 
         run_events, interrupt_events = await asyncio.gather(run_task, interrupt_task)
-        stored_events = await store.load_events("sess_run_interrupt_race")
-        return run_events, interrupt_events, stored_events
+        stored_records = await store.query_events(
+            EventQuery(session_id="sess_run_interrupt_race", limit=100)
+        )
+        return run_events, interrupt_events, stored_records
 
-    run_events, interrupt_events, stored_events = asyncio.run(run())
+    run_events, interrupt_events, stored_records = asyncio.run(run())
+    stored_events = [record.event for record in stored_records]
 
     stored_interrupt_events = [
         event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED
@@ -51346,7 +52146,11 @@ def test_run_interrupt_race_reuses_external_interrupt_event_without_duplicate():
         EventType.SESSION_INTERRUPTED,
     ]
     assert run_events[-2].payload["status"] == "interrupted"
-    assert run_events[-1].id == interrupt_events[0].id == stored_interrupt_events[0].id
+    assert run_events[-1].id == interrupt_events[0].id
+    assert (
+        _private_record_for_public_event(stored_records, interrupt_events[0]).event.id
+        == stored_interrupt_events[0].id
+    )
     assert stored_interrupt_events[0].payload["reason"] == "external interrupt"
     stored_event_types = [event.type for event in stored_events]
     assert stored_event_types.count(EventType.TURN_COMPLETED) == 1
@@ -52895,7 +53699,18 @@ def test_concurrent_interrupt_transition_loser_waits_for_terminal_event():
     stored_interrupt_events = [
         event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED
     ]
-    assert stored_interrupt_events == [run_events[-1]]
+    assert len(stored_interrupt_events) == 1
+    assert (
+        _private_record_for_public_event(
+            asyncio.run(
+                store.query_events(
+                    EventQuery(session_id="sess_concurrent_interrupt_transition_loser")
+                )
+            ),
+            run_events[-1],
+        ).event
+        == stored_interrupt_events[0]
+    )
 
 
 def test_interrupt_session_preserves_completed_tool_results_in_interrupted_round():
@@ -54004,9 +54819,12 @@ def test_parallel_tool_round_executes_calls_concurrently_by_default():
     )
 
     assert events[-1].type == EventType.SESSION_COMPLETED
+    private_events = asyncio.run(
+        _private_events_for_public_events(store, "sess_parallel_round", events)
+    )
     tool_events = [
         (event.type, event.payload["tool_call_id"])
-        for event in events
+        for event in private_events
         if event.type in {EventType.TOOL_CALL_STARTED, EventType.TOOL_CALL_COMPLETED}
     ]
     # Buffered parallel execution preserves the model's tool-call order.
@@ -54087,7 +54905,13 @@ def test_parallel_tool_policy_denials_emit_one_canonical_block_per_call():
     assert probe.max_concurrent == 2
     assert tool.calls == []
     blocked = [event for event in events if event.type == EventType.TOOL_CALL_BLOCKED]
-    assert [event.payload["tool_call_id"] for event in blocked] == ["call_a", "call_b"]
+    private_blocked = asyncio.run(
+        _private_events_for_public_events(store, "sess_parallel_policy_denials", blocked)
+    )
+    assert [event.payload["tool_call_id"] for event in private_blocked] == [
+        "call_a",
+        "call_b",
+    ]
     assert all(event.payload["denied_by"] == "tool_policy" for event in blocked)
     assert all(event.payload["decision"] == "deny" for event in blocked)
     bounded_reason = _bound_policy_denial_text(reason)
@@ -54098,7 +54922,7 @@ def test_parallel_tool_policy_denials_emit_one_canonical_block_per_call():
     )
     assert len(bounded_reason.encode("utf-8")) <= _POLICY_DENIAL_TEXT_MAX_BYTES
     assert bounded_reason.endswith(_POLICY_DENIAL_TRUNCATION_MARKER)
-    assert len({event.payload["idempotency_key"] for event in blocked}) == 2
+    assert len({event.payload["idempotency_key"] for event in private_blocked}) == 2
     assert all(event.type != EventType.TOOL_CALL_FAILED for event in events)
 
     transcript = asyncio.run(store.load_transcript("sess_parallel_policy_denials"))
@@ -54182,9 +55006,12 @@ def test_parallel_tool_round_composes_with_tool_call_limit_and_usage_counting():
 
     # Round 1 (2 parallel calls) fits the limit and genuinely ran concurrently.
     assert tool.arrivals == 2
+    private_events = asyncio.run(
+        _private_events_for_public_events(store, "sess_parallel_limit", events)
+    )
     started_ids = [
         event.payload["tool_call_id"]
-        for event in events
+        for event in private_events
         if event.type == EventType.TOOL_CALL_STARTED
     ]
     assert started_ids == ["call_a", "call_b"]
@@ -54196,7 +55023,7 @@ def test_parallel_tool_round_composes_with_tool_call_limit_and_usage_counting():
     assert limit_event.payload["actual"] == 4
     failed_ids = {
         event.payload["tool_call_id"]
-        for event in events
+        for event in private_events
         if event.type == EventType.TOOL_CALL_FAILED
     }
     assert failed_ids == {"call_c", "call_d"}
@@ -54342,9 +55169,16 @@ def test_parallel_tool_round_concurrency_is_capped_by_semaphore():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert probe.max_concurrent == 2
+    private_events = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "sess_parallel_capped",
+            events,
+        )
+    )
     completed_ids = [
         event.payload["tool_call_id"]
-        for event in events
+        for event in private_events
         if event.type == EventType.TOOL_CALL_COMPLETED
     ]
     assert completed_ids == ["call_1", "call_2", "call_3"]
@@ -54397,7 +55231,17 @@ def test_parallel_tool_call_timeouts_do_not_serialize_the_round():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     failed_events = [event for event in events if event.type == EventType.TOOL_CALL_FAILED]
-    assert [event.payload["tool_call_id"] for event in failed_events] == ["call_1", "call_2"]
+    private_failed_events = asyncio.run(
+        _private_events_for_public_events(
+            app.session_store,
+            "sess_parallel_timeouts",
+            failed_events,
+        )
+    )
+    assert [event.payload["tool_call_id"] for event in private_failed_events] == [
+        "call_1",
+        "call_2",
+    ]
     for event in failed_events:
         assert event.payload["result"]["content"] == "Tool call timed out after 0.05 seconds."
     # Both timeouts elapse concurrently; well under two sequential timeouts

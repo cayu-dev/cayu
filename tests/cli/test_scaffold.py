@@ -81,7 +81,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
     assert '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"' in pyproject
-    assert 'SQLiteSessionStore("data/cayu.db")' in app_source
+    assert 'SQLiteSessionStore(\n            "data/cayu.db",' in app_source
+    assert "public_authority_alias_codec_from_environment()" in app_source
     assert 'SQLiteTaskStore("data/cayu.db")' in app_source
     assert "sessions.sqlite" not in app_source
     readme = (proj / "README.md").read_text(encoding="utf-8")

@@ -13,6 +13,7 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     CayuApp,
+    EventQuery,
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
@@ -34,6 +35,7 @@ from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.approvals import (
     PendingToolApproval,
@@ -227,6 +229,18 @@ def _register_runtime(
         tools=[] if tool is None else [tool],
     )
     return app
+
+
+async def _private_pending_approval(
+    store: InMemorySessionStore,
+    session_id: str,
+) -> PendingToolApproval:
+    event = next(
+        event
+        for event in await store.load_events(session_id)
+        if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+    )
+    return PendingToolApproval.from_event(event)
 
 
 async def _stage_completed_model_boundary(
@@ -727,7 +741,12 @@ def test_incomplete_recovery_promotes_completed_model_boundary_without_redispatc
         == staged.pointer
     )
     assert asyncio.run(store.load_active_model_completion_stage(session_id)) is None
-    assert staged.completion_event in recovery.events
+    completion_record = next(
+        record
+        for record in asyncio.run(store.query_events(EventQuery(session_id=session_id, limit=100)))
+        if record.event.id == staged.completion_event.id
+    )
+    assert public_event_id(completion_record.sequence) in {event.id for event in recovery.events}
 
 
 def test_resume_rejects_in_flight_model_boundary_before_status_change() -> None:
@@ -798,10 +817,7 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
         ]
         assert provider.requests == []
         assert tool.calls == 0
-        approval_event = next(
-            event for event in resume_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
-        )
-        pending = PendingToolApproval.from_event(approval_event)
+        pending = await _private_pending_approval(store, staged.session.id)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             await store.load_checkpoint(staged.session.id)
         )
@@ -869,7 +885,12 @@ def test_resume_promotes_tool_completion_and_recovers_round_before_next_provider
         )
         is None
     )
-    assert [event.id for event in events].index(staged.completion_event.id) < next(
+    staged_record = next(
+        record
+        for record in asyncio.run(store.query_events(EventQuery(session_id=session_id, limit=100)))
+        if record.event.id == staged.completion_event.id
+    )
+    assert [event.id for event in events].index(public_event_id(staged_record.sequence)) < next(
         index for index, event in enumerate(events) if event.type == EventType.MODEL_STARTED
     )
     assert sum(event.type == EventType.MODEL_COMPLETED for event in durable_events) == 2
@@ -1333,10 +1354,23 @@ def test_terminal_restart_materializes_tail_after_tool_publication_commit() -> N
         event
         for event in second_recovery.events
         if event.type is EventType.SESSION_INTERRUPTED
-        and event.payload.get("interruption_request_id")
-        == "interrupt-before-terminal-materialization"
+        and event.payload.get("interruption_request_id") == PRIVATE_EVENT_AUTHORITY
     ]
     assert len(repaired_interrupts) == 1
+    durable_repaired_interrupts = [
+        record.event
+        for record in asyncio.run(
+            store.query_events(
+                EventQuery(
+                    session_id=staged.session.id,
+                    event_type=EventType.SESSION_INTERRUPTED,
+                )
+            )
+        )
+        if record.event.payload.get("interruption_request_id")
+        == "interrupt-before-terminal-materialization"
+    ]
+    assert len(durable_repaired_interrupts) == 1
     assert settled_recovery.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
     assert settled_recovery.events == ()
     transcript = asyncio.run(store.load_transcript(staged.session.id))
@@ -1362,7 +1396,7 @@ def test_approval_close_failure_stays_closed_and_exact_retry_survives_recovery_f
         app = _register_runtime(store, provider, tool=tool)
         deferred_message = Message.text("user", "continue after exact approval retry")
 
-        paused = [
+        _ = [
             event
             async for event in app.resume(
                 ResumeRequest(
@@ -1371,9 +1405,7 @@ def test_approval_close_failure_stays_closed_and_exact_retry_survives_recovery_f
                 )
             )
         ]
-        approval = PendingToolApproval.from_event(
-            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
-        )
+        approval = await _private_pending_approval(store, staged.session.id)
         request = ToolApprovalRequest(
             session_id=staged.session.id,
             approval_id=approval.approval_id,
@@ -1437,7 +1469,11 @@ def test_approval_close_failure_stays_closed_and_exact_retry_survives_recovery_f
     assert deferred_after_close.source_messages == [deferred_message]
     assert session_after_recovery_fence is not None
     assert session_after_recovery_fence.run_epoch > session_after_close.run_epoch
-    assert tuple(event.id for event in replayed) == receipt.appended_event_ids
+    records = asyncio.run(store.query_events(EventQuery(session_id=staged.session.id, limit=100)))
+    sequence_by_id = {record.event.id: record.sequence for record in records}
+    assert tuple(event.id for event in replayed) == tuple(
+        public_event_id(sequence_by_id[event_id]) for event_id in receipt.appended_event_ids
+    )
     transcript = asyncio.run(store.load_transcript(staged.session.id))
     assert transcript[-1] == deferred_message
     assert transcript.count(deferred_message) == 1
@@ -1463,7 +1499,7 @@ def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence()
         app = _register_runtime(store, provider, tool=tool)
         deferred_message = Message.text("user", "continue after precommit limit retry")
 
-        paused = [
+        _ = [
             event
             async for event in app.resume(
                 ResumeRequest(
@@ -1472,9 +1508,7 @@ def test_limit_approval_close_precommit_failure_reuses_bound_terminal_evidence()
                 )
             )
         ]
-        approval = PendingToolApproval.from_event(
-            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
-        )
+        approval = await _private_pending_approval(store, staged.session.id)
         request = ToolApprovalRequest(
             session_id=staged.session.id,
             approval_id=approval.approval_id,
@@ -1573,7 +1607,7 @@ def test_approval_close_cancellation_materializes_deferred_input_before_propagat
         app = _register_runtime(store, provider, tool=tool)
         deferred_message = Message.text("user", "materialize before cancellation propagates")
 
-        paused = [
+        _ = [
             event
             async for event in app.resume(
                 ResumeRequest(
@@ -1582,9 +1616,7 @@ def test_approval_close_cancellation_materializes_deferred_input_before_propagat
                 )
             )
         ]
-        approval = PendingToolApproval.from_event(
-            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
-        )
+        approval = await _private_pending_approval(store, staged.session.id)
 
         async def resolve() -> list[Event]:
             return [
@@ -1662,7 +1694,7 @@ def test_limit_approval_close_materialization_failure_stays_closed() -> None:
         app = _register_runtime(store, provider, tool=tool)
         deferred_message = Message.text("user", "continue after limit approval retry")
 
-        paused = [
+        _ = [
             event
             async for event in app.resume(
                 ResumeRequest(
@@ -1671,9 +1703,7 @@ def test_limit_approval_close_materialization_failure_stays_closed() -> None:
                 )
             )
         ]
-        approval = PendingToolApproval.from_event(
-            next(event for event in paused if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED)
-        )
+        approval = await _private_pending_approval(store, staged.session.id)
         request = ToolApprovalRequest(
             session_id=staged.session.id,
             approval_id=approval.approval_id,
@@ -1730,7 +1760,11 @@ def test_limit_approval_close_materialization_failure_stays_closed() -> None:
     assert session_after_close.status is SessionStatus.FAILED
     assert deferred_after_close is not None
     assert deferred_after_close.source_messages == [deferred_message]
-    assert tuple(event.id for event in replayed) == receipt.appended_event_ids
+    records = asyncio.run(store.query_events(EventQuery(session_id=staged.session.id, limit=100)))
+    sequence_by_id = {record.event.id: record.sequence for record in records}
+    assert tuple(event.id for event in replayed) == tuple(
+        public_event_id(sequence_by_id[event_id]) for event_id in receipt.appended_event_ids
+    )
     transcript = asyncio.run(store.load_transcript(staged.session.id))
     assert transcript[-1] == deferred_message
     assert transcript.count(deferred_message) == 1

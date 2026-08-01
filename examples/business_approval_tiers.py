@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 
 from cayu import (
+    BUSINESS_APPROVAL_ROUTING_METADATA_KEY,
     AgentSpec,
     BusinessApprovalOutcome,
     BusinessApprovalRouting,
@@ -26,7 +27,6 @@ from cayu import (
     CayuApp,
     Message,
     ModelStreamEvent,
-    PendingToolApproval,
     RunRequest,
     TieredApprovalPolicy,
     Tool,
@@ -35,7 +35,6 @@ from cayu import (
     ToolResult,
     ToolSpec,
     business_approval_audit,
-    business_approval_routing,
     resolve_business_approval,
 )
 from cayu.core.events import EventType
@@ -124,8 +123,11 @@ async def main() -> None:
         if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
             approval_event = event
     assert approval_event is not None
-    pending = PendingToolApproval.from_event(approval_event)
-    routing = business_approval_routing(pending)
+    approval = approval_event.payload["approval"]
+    routing = BusinessApprovalRouting.model_validate(
+        approval["metadata"][BUSINESS_APPROVAL_ROUTING_METADATA_KEY]
+    )
+    approval_id = approval_event.payload["approval_id"]
     print(f"paused for approval: required_tier={routing.required_tier} chain={routing.chain}")
     print(f"routing metadata for the approval UI: {routing.metadata}")
 
@@ -134,7 +136,7 @@ async def main() -> None:
         await resolve_business_approval(
             app,
             session_id=session_id,
-            approval_id=pending.approval_id,
+            approval_id=approval_id,
             approver_id="sam.lee",
             approver_tier="area",
             outcome=BusinessApprovalOutcome.APPROVED,
@@ -146,7 +148,7 @@ async def main() -> None:
     events = await resolve_business_approval(
         app,
         session_id=session_id,
-        approval_id=pending.approval_id,
+        approval_id=approval_id,
         approver_id="maria.k",
         approver_tier="national",
         outcome=BusinessApprovalOutcome.CONDITIONED,

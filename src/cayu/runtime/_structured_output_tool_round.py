@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu._validation import canonical_durable_json_bytes, copy_json_value
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.tools import ToolResult
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _tool_execution as tool_execution
@@ -172,24 +178,29 @@ def _structured_output_tool_terminal_event(
             )
         ).hexdigest()
     )
-    return Event(
-        id=event_id,
-        type=event_type,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        tool_name=outcome.call.name,
-        payload={
-            **tool_round_identity.payload(),
-            "tool_call_id": outcome.call.id,
-            "idempotency_key": tool_execution.tool_idempotency_key(
+    return event_with_runtime_generated_id(
+        event_with_runtime_payload_authority(
+            Event(
+                id=event_id,
+                type=event_type,
                 session_id=session.id,
-                tool_round_id=tool_round_id,
-                tool_call_id=outcome.call.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                tool_name=outcome.call.name,
+                payload={
+                    **tool_round_identity.payload(),
+                    "tool_call_id": outcome.call.id,
+                    "idempotency_key": tool_execution.tool_idempotency_key(
+                        session_id=session.id,
+                        tool_round_id=tool_round_id,
+                        tool_call_id=outcome.call.id,
+                    ),
+                    "structured_output_validation": True,
+                    "result": result,
+                },
             ),
-            "structured_output_validation": True,
-            "result": result,
-        },
+            *tool_round_identity.payload(),
+        )
     )
 
 
@@ -268,7 +279,7 @@ def _structured_output_event(
             step=step,
             attempt=attempt,
         )
-    return Event(
+    event = Event(
         **event_fields,
         type=event_type,
         session_id=session.id,
@@ -276,6 +287,9 @@ def _structured_output_event(
         environment_name=environment_name,
         payload=payload,
     )
+    if identity is not None:
+        event = event_with_runtime_payload_authority(event, *identity.payload())
+    return event_with_runtime_generated_id(event) if tool_round_id is not None else event
 
 
 def _structured_output_validating_event(
@@ -319,7 +333,7 @@ def _structured_output_validating_event(
             step=step,
             attempt=attempt,
         )
-    return Event(
+    event = Event(
         **event_fields,
         type=EventType.STRUCTURED_OUTPUT_VALIDATING,
         session_id=session.id,
@@ -327,6 +341,9 @@ def _structured_output_validating_event(
         environment_name=environment_name,
         payload=payload,
     )
+    if identity is not None:
+        event = event_with_runtime_payload_authority(event, *identity.payload())
+    return event_with_runtime_generated_id(event) if tool_round_id is not None else event
 
 
 def _structured_output_round_event_id(

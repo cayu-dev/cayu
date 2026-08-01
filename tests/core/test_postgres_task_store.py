@@ -37,6 +37,8 @@ _TABLES = (
     "cayu_event_watcher_state",
     "cayu_budget_reservation_identities",
     "cayu_events",
+    "cayu_public_authority_aliases",
+    "cayu_public_authority_alias_keys",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",

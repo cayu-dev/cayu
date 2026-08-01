@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from tests.core._event_projection_support import private_event_for_public_event
 from tests.core.test_runtime import (
     FailingOrdinaryToolResultCloseStore,
     FakeProvider,
@@ -733,7 +734,8 @@ def test_cayu_app_prioritizes_usage_overflow_over_completion_hook_failure():
         for event in asyncio.run(store.load_events(session_id))
         if event.type == EventType.MODEL_COMPLETED
     ]
-    assert [event.id for event in stored_completions] == [completion.id]
+    private_completion = asyncio.run(private_event_for_public_event(store, completion))
+    assert [event.id for event in stored_completions] == [private_completion.id]
     usage = asyncio.run(app.get_session_usage(session_id))
     assert usage.model_steps == 1
 
@@ -1093,7 +1095,8 @@ def test_cayu_app_does_not_redispatch_after_valid_completion_billing_hook_fails(
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    private_completed = asyncio.run(private_event_for_public_event(app.session_store, completed))
+    assert [event.id for event in budget_events] == [private_completed.id]
 
 
 def test_cayu_app_does_not_retry_invalid_completion_when_billing_hook_fails():
@@ -1204,7 +1207,8 @@ def test_cayu_app_does_not_retry_invalid_completion_when_billing_hook_fails():
             window=BudgetWindow.all_time(),
         )
     )
-    assert [event.id for event in budget_events] == [completed.id]
+    private_completed = asyncio.run(private_event_for_public_event(app.session_store, completed))
+    assert [event.id for event in budget_events] == [private_completed.id]
     assert budget_events[0].payload["billing_identity"] == requested_identity.model_dump(
         mode="json"
     )

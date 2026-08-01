@@ -30,6 +30,7 @@ from cayu import (
 )
 from cayu.providers import ModelRequest, build_openai_payload
 from cayu.runners import LocalRunner, RunnerUnavailableError
+from cayu.runtime._event_projection import project_runtime_event
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -1378,7 +1379,11 @@ def test_search_text_durable_event_and_transcript_payloads_remain_bounded(tmp_pa
     emitted, records, transcript = asyncio.run(run_and_read())
     emitted_tool = next(event for event in emitted if event.type == EventType.TOOL_CALL_COMPLETED)
     persisted_tool = records[0].event
-    assert emitted_tool.payload == persisted_tool.payload
+    assert emitted_tool == project_runtime_event(
+        persisted_tool,
+        sequence=records[0].sequence,
+        redactor=SecretRedactor(),
+    )
     result_payload = persisted_tool.payload["result"]
     assert result_payload["structured"]["projected_content_bytes"] <= 2_000
     assert result_payload["structured"]["projected_matches_bytes"] <= 2_000

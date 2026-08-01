@@ -7,7 +7,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import cayu.runtime._event_writer as event_writer_module
+import cayu.runtime.sessions as sessions_module
 from cayu.core import Event, EventType, Message
+from cayu.core.events import (
+    event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
+)
 from cayu.runtime import (
     CayuApp,
     InMemorySessionStore,
@@ -16,6 +21,7 @@ from cayu.runtime import (
     RunRequest,
     SessionIdentity,
 )
+from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime.budgets import BudgetWindow, InMemoryBudgetStore
 from cayu.runtime.event_sinks import EventSink
@@ -33,6 +39,18 @@ class _RecordingSink(EventSink):
 
     async def emit(self, event: Event) -> None:
         self.events.append(event)
+
+
+class _PrivateDeliveryProbeSink(EventSink):
+    def __init__(self) -> None:
+        self.events: list[Event] = []
+        self.private_delivery: object | None = None
+
+    async def emit(self, event: Event) -> None:
+        self.events.append(event.model_copy(deep=True))
+
+    async def _emit_delivery(self, delivery: object) -> None:
+        self.private_delivery = delivery
 
 
 class _FailingSink(EventSink):
@@ -204,6 +222,43 @@ async def _session_store(session_id: str) -> InMemorySessionStore:
     return store
 
 
+def test_event_writer_requires_the_session_store_alias_codec() -> None:
+    store = InMemorySessionStore()
+    matching_codec = store.public_authority_alias_codec
+    other_codec = InMemorySessionStore().public_authority_alias_codec
+
+    writer = RuntimeEventWriter(
+        session_store=store,
+        budget_store=InMemoryBudgetStore(),
+        event_sinks=[],
+        public_authority_alias_codec=matching_codec,
+    )
+    assert writer is not None
+
+    with pytest.raises(ValueError, match="same public authority alias keyring"):
+        RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            public_authority_alias_codec=other_codec,
+        )
+
+    class StoreWithoutCodec(InMemorySessionStore):
+        supports_public_authority_aliases = False
+
+        @property
+        def public_authority_alias_codec(self) -> None:
+            return None
+
+    with pytest.raises(ValueError, match="same public authority alias keyring"):
+        RuntimeEventWriter(
+            session_store=StoreWithoutCodec(),
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[],
+            public_authority_alias_codec=matching_codec,
+        )
+
+
 def test_emit_persists_forwards_cost_event_and_fans_out() -> None:
     async def scenario() -> tuple[list[Event], list[Event], list[Event], Event]:
         store = await _session_store("writer_single")
@@ -229,7 +284,7 @@ def test_emit_persists_forwards_cost_event_and_fans_out() -> None:
 
     assert [event.id for event in persisted] == [emitted.id]
     assert [event.id for event in budget_events] == [emitted.id]
-    assert [event.id for event in sink_events] == [emitted.id]
+    assert [event.id for event in sink_events] == [public_event_id(1)]
 
 
 def test_emit_redacts_workload_secrets_before_durable_and_external_boundaries() -> None:
@@ -445,6 +500,7 @@ def test_emit_defensively_redacts_canonical_policy_denial_payload() -> None:
                 session_id="writer_policy_denial",
                 payload={
                     "denied_by": "command_policy",
+                    "decision": "deny",
                     "reason": f"blocked {secret}",
                     "result": {
                         "content": f"blocked {secret}",
@@ -494,7 +550,7 @@ def test_recovery_redacts_legacy_persisted_event_before_side_effect_fan_out() ->
         assert REDACTED_SECRET in serialized
 
 
-def test_recovery_marks_unpreparable_legacy_event_failed() -> None:
+def test_recovery_safely_projects_legacy_unknown_keys_without_stranding_delivery() -> None:
     secret = "writer-legacy-key-canary"
 
     async def scenario():
@@ -521,11 +577,11 @@ def test_recovery_marks_unpreparable_legacy_event_failed() -> None:
 
     recovered, delivery = asyncio.run(scenario())
 
-    assert recovered == []
+    assert [event.id for event in recovered] == [public_event_id(1)]
+    assert recovered[0].payload == {REDACTED_SECRET: "value"}
     assert delivery is not None
-    assert delivery.status is PersistedEventSideEffectStatus.FAILED
-    assert delivery.last_error is not None
-    assert "ValueError" in delivery.last_error
+    assert delivery.status is PersistedEventSideEffectStatus.DELIVERED
+    assert delivery.last_error is None
 
 
 def test_persist_leaves_side_effect_delivery_for_recovery() -> None:
@@ -550,7 +606,8 @@ def test_persist_leaves_side_effect_delivery_for_recovery() -> None:
     persisted, before_recovery, recovered = asyncio.run(scenario())
 
     assert before_recovery == []
-    assert [event.id for event in recovered] == [persisted[0].id]
+    assert [event.id for event in recovered] == [public_event_id(1)]
+    assert recovered[0].id != persisted[0].id
 
 
 def test_is_persisted_uses_bounded_event_id_query() -> None:
@@ -629,7 +686,7 @@ def test_recover_persisted_side_effects_delivers_once_without_replaying_origin()
 
     assert [event.type for event in first] == [EventType.MODEL_COMPLETED]
     assert second == []
-    assert [event.id for event in budget_events] == [first[0].id]
+    assert [event.id for event in budget_events] != [first[0].id]
     assert [event.id for event in sink_events] == [first[0].id]
 
 
@@ -659,7 +716,7 @@ def test_emit_closes_its_durable_side_effect_handoff() -> None:
 
     assert len(observed) == 1
     assert [event.id for event in budget_events] == [observed[0].id]
-    assert [event.id for event in sink_events] == [observed[0].id]
+    assert [event.id for event in sink_events] == [public_event_id(1)]
 
 
 def test_emit_does_not_fail_when_recovery_worker_wins_the_claim_race() -> None:
@@ -776,11 +833,11 @@ def test_emit_tolerates_pending_snapshot_and_leaves_sink_delivery_recoverable() 
 
     assert pending is not None
     assert pending.status is PersistedEventSideEffectStatus.PENDING
-    assert [event.id for event in recovered] == [emitted.id]
+    assert [event.id for event in recovered] == [public_event_id(1)]
     assert delivered is not None
     assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
     assert [event.id for event in budget_events] == [emitted.id]
-    assert [event.id for event in sink_events] == [emitted.id]
+    assert [event.id for event in sink_events] == [public_event_id(1)]
 
 
 def test_fan_out_does_not_resurrect_ineligible_budget_deliveries() -> None:
@@ -861,9 +918,9 @@ def test_emit_tolerates_acknowledgement_after_claim_is_replaced() -> None:
         )
         return emitted, sink.events
 
-    emitted, sink_events = asyncio.run(scenario())
+    _emitted, sink_events = asyncio.run(scenario())
 
-    assert [event.id for event in sink_events] == [emitted.id]
+    assert [event.id for event in sink_events] == [public_event_id(1)]
 
 
 def test_emit_tolerates_delivery_acknowledgement_failure(
@@ -902,12 +959,15 @@ def test_emit_tolerates_delivery_acknowledgement_failure(
         return emitted, delivery, recovered, delivered, sink.events
 
     with caplog.at_level(logging.ERROR, logger="cayu.runtime._event_writer"):
-        emitted, leased, recovered, delivered, sink_events = asyncio.run(scenario())
+        _emitted, leased, recovered, delivered, sink_events = asyncio.run(scenario())
 
-    assert [event.id for event in sink_events] == [emitted.id, emitted.id]
+    assert [event.id for event in sink_events] == [
+        public_event_id(1),
+        public_event_id(1),
+    ]
     assert leased is not None
     assert leased.status is PersistedEventSideEffectStatus.LEASED
-    assert [event.id for event in recovered] == [emitted.id]
+    assert [event.id for event in recovered] == [public_event_id(1)]
     assert delivered is not None
     assert delivered.status is PersistedEventSideEffectStatus.DELIVERED
     assert "delivery acknowledgement failed" in caplog.text
@@ -1061,9 +1121,9 @@ def test_sink_diagnostic_failure_does_not_skip_later_sinks_or_failure_state() ->
         deliveries = await store.list_persisted_event_side_effect_deliveries()
         return emitted, recorder.events, deliveries
 
-    emitted, recorded, deliveries = asyncio.run(scenario())
+    _emitted, recorded, deliveries = asyncio.run(scenario())
 
-    assert [event.id for event in recorded] == [emitted.id]
+    assert [event.id for event in recorded] == [public_event_id(1)]
     assert len(deliveries) == 1
     assert deliveries[0].status is PersistedEventSideEffectStatus.FAILED
     assert deliveries[0].last_error == (
@@ -1207,10 +1267,104 @@ def test_sink_failure_is_durable_and_does_not_block_later_sink() -> None:
         "sink": "_FailingSink",
         "error": "sink unavailable",
         "error_type": "RuntimeError",
-        "event_id": persisted[0].id,
+        "event_sequence": 1,
         "event_type": EventType.SESSION_STARTED,
     }
     assert [event.type for event in recorded] == [EventType.SESSION_STARTED]
+
+
+def test_sink_failure_preserves_durable_generated_envelope_authority() -> None:
+    private_session_id = "00000000-0000-0000-0000-000000000000"
+
+    async def scenario() -> list[Event]:
+        store = await _session_store(private_session_id)
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[_FailingSink()],
+            secret_redactor=SecretRedactor("-"),
+        )
+        source = event_with_runtime_generated_id(
+            event_with_runtime_envelope_authority(
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id=private_session_id,
+                ),
+                "session_id",
+            )
+        )
+
+        await writer.emit(source)
+        return await store.load_events(private_session_id)
+
+    persisted = asyncio.run(scenario())
+
+    assert [event.type for event in persisted] == [
+        EventType.SESSION_STARTED,
+        EventType.RUNTIME_SINK_FAILED,
+    ]
+    assert persisted[1].session_id == private_session_id
+
+
+def test_custom_sink_cannot_override_the_private_delivery_boundary() -> None:
+    secret = "private-event-secret"
+
+    async def scenario():
+        store = await _session_store("writer-public-sink-boundary")
+        private_event = Event(
+            id=secret,
+            type=EventType.SESSION_STARTED,
+            session_id="writer-public-sink-boundary",
+        )
+        await store.append_event(private_event.session_id, private_event)
+        sink = _PrivateDeliveryProbeSink()
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[sink],
+            secret_redactor=SecretRedactor(secret),
+        )
+
+        await writer.fan_out_persisted([private_event])
+        return sink
+
+    sink = asyncio.run(scenario())
+
+    assert sink.private_delivery is None
+    assert [event.id for event in sink.events] == [public_event_id(1)]
+    assert secret not in repr(sink.events)
+
+
+def test_sink_failure_omits_unpublishable_legacy_interaction_authority() -> None:
+    secret = "legacy-interaction-secret"
+
+    async def scenario() -> list[Event]:
+        store = await _session_store("writer-private-interaction-diagnostic")
+        legacy = Event(
+            type=EventType.SESSION_STARTED,
+            session_id="writer-private-interaction-diagnostic",
+            interaction_id=secret,
+        )
+        await store.append_event(legacy.session_id, legacy)
+        writer = RuntimeEventWriter(
+            session_store=store,
+            budget_store=InMemoryBudgetStore(),
+            event_sinks=[_FailingSink()],
+            secret_redactor=SecretRedactor(secret),
+        )
+
+        sessions_module._activate_session_interaction(legacy.session_id, secret)
+        try:
+            await writer.fan_out_persisted([legacy])
+        finally:
+            sessions_module._deactivate_session_interaction(legacy.session_id)
+        return await store.load_events(legacy.session_id)
+
+    events = asyncio.run(scenario())
+
+    diagnostic = next(event for event in events if event.type == EventType.RUNTIME_SINK_FAILED)
+    assert diagnostic.interaction_id is None
+    assert REDACTED_SECRET not in repr(diagnostic.model_dump(mode="json"))
 
 
 @pytest.mark.parametrize("message", ["sink\x00secret", "sink \ud800 secret"])
@@ -1378,16 +1532,16 @@ def test_failed_sink_delivery_is_recovered_and_closed(monkeypatch) -> None:
         closed = await store.list_persisted_event_side_effect_deliveries()
         return emitted, failed, recovered, closed, sink.events
 
-    emitted, failed, recovered, closed, sink_events = asyncio.run(scenario())
+    _emitted, failed, recovered, closed, sink_events = asyncio.run(scenario())
 
     assert [(state.status, state.attempts) for state in failed] == [
         (PersistedEventSideEffectStatus.FAILED, 1)
     ]
-    assert [event.id for event in recovered] == [emitted.id]
+    assert [event.id for event in recovered] == [public_event_id(1)]
     assert [(state.status, state.attempts) for state in closed] == [
         (PersistedEventSideEffectStatus.DELIVERED, 2)
     ]
-    assert [event.id for event in sink_events] == [emitted.id]
+    assert [event.id for event in sink_events] == [public_event_id(1)]
 
 
 def test_repeated_sink_failure_dead_letters_without_recursive_handoffs(monkeypatch) -> None:
@@ -1455,7 +1609,8 @@ def test_budget_retry_after_crash_is_idempotent_by_event_identity() -> None:
     recovered, budget_events = asyncio.run(scenario())
 
     assert len(recovered) == 1
-    assert [event.id for event in budget_events] == [recovered[0].id]
+    assert [event.id for event in budget_events] != [recovered[0].id]
+    assert [event.id for event in recovered] == [public_event_id(1)]
 
 
 def test_recovery_continues_after_one_poison_budget_delivery() -> None:
@@ -1477,8 +1632,8 @@ def test_recovery_continues_after_one_poison_budget_delivery() -> None:
 
     poison, healthy, recovered, states, sink_events = asyncio.run(scenario())
 
-    assert [event.id for event in recovered] == [healthy.id]
-    assert [event.id for event in sink_events] == [healthy.id]
+    assert [event.id for event in recovered] == [public_event_id(2)]
+    assert [event.id for event in sink_events] == [public_event_id(2)]
     assert [(state.event_id, state.status) for state in states] == [
         (poison.id, PersistedEventSideEffectStatus.FAILED),
         (healthy.id, PersistedEventSideEffectStatus.DELIVERED),

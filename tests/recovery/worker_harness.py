@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import signal
@@ -15,6 +16,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from pydantic import SecretStr
 
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -38,6 +41,10 @@ from cayu.runtime import (
     ToolApprovalRequest,
     ToolRoundRecoveryRequest,
 )
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+)
 from cayu.storage import SQLiteSessionStore, SQLiteTaskStore
 from cayu.tools import SubagentExecutionMode, SubagentSpec, SubagentTool
 
@@ -45,6 +52,16 @@ _WORKER_TIMEOUT_S = 20.0
 _POLL_INTERVAL_S = 0.02
 _PROVIDER_NAME = "recovery-harness"
 _AGENT_NAME = "recovery-agent"
+
+
+def _public_authority_alias_codec() -> PublicAuthorityAliasCodec:
+    encoded_key = base64.urlsafe_b64encode(bytes([31]) * 32).decode("ascii").rstrip("=")
+    return PublicAuthorityAliasCodec(
+        PublicAuthorityAliasKeyring(
+            active_key_id="recovery",
+            keys={"recovery": SecretStr(encoded_key)},
+        )
+    )
 
 
 class RecoveryScenario(StrEnum):
@@ -229,6 +246,10 @@ class RecoveryHarness:
         self._task_ids: set[str] = set()
 
     def __enter__(self) -> RecoveryHarness:
+        if self.backend.kind == "postgres":
+            if self.backend.dsn is None:
+                raise ValueError("Postgres backend requires dsn")
+            asyncio.run(_reset_postgres_public_authority_registry(self.backend.dsn))
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -560,18 +581,46 @@ class _KillpointSink(EventSink):
 
 
 def _session_store(backend: BackendConfig):
+    public_authority_alias_codec = _public_authority_alias_codec()
     if backend.kind == "sqlite":
         if backend.session_path is None:
             raise ValueError("SQLite backend requires session_path")
-        return SQLiteSessionStore(backend.session_path)
+        return SQLiteSessionStore(
+            backend.session_path,
+            public_authority_alias_codec=public_authority_alias_codec,
+        )
     if backend.kind == "postgres":
         if backend.dsn is None:
             raise ValueError("Postgres backend requires dsn")
         from cayu.storage import PostgresSessionStore
         from cayu.storage.migrations import SchemaMode
 
-        return PostgresSessionStore(backend.dsn, schema_mode=SchemaMode.CREATE)
+        return PostgresSessionStore(
+            backend.dsn,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=public_authority_alias_codec,
+        )
     raise ValueError(f"Unknown backend: {backend.kind}")
+
+
+async def _reset_postgres_public_authority_registry(dsn: str) -> None:
+    """Isolate subprocess recovery tests from keyrings left by earlier modules."""
+
+    import psycopg
+
+    tables = (
+        "cayu_public_authority_aliases",
+        "cayu_public_authority_alias_config",
+        "cayu_public_authority_alias_keys",
+    )
+    async with await psycopg.AsyncConnection.connect(dsn) as connection:
+        async with connection.cursor() as cursor:
+            for table in tables:
+                await cursor.execute("SELECT to_regclass(%s)", (table,))
+                registered = await cursor.fetchone()
+                if registered is not None and registered[0] is not None:
+                    await cursor.execute(f"DELETE FROM {table}")
+        await connection.commit()
 
 
 def _task_store(backend: BackendConfig):

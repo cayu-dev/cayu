@@ -55,7 +55,7 @@ from cayu.core.billing import (
     BillingIdentity,
     resolved_billing_identity,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -585,17 +585,7 @@ def _non_turn_model_completion_event(
         "reason": reason,
     }
     payload["transcript_cursor"] = transcript_cursor
-    return Event(
-        type=event.type,
-        session_id=event.session_id,
-        id=event.id,
-        timestamp=event.timestamp,
-        agent_name=event.agent_name,
-        environment_name=event.environment_name,
-        workflow_name=event.workflow_name,
-        tool_name=event.tool_name,
-        payload=payload,
-    )
+    return copy_event(event).model_copy(update={"payload": payload}, deep=True)
 
 
 def _validate_model_completion_publication_result(
@@ -837,6 +827,37 @@ class _ModelStreamBoundaryValue:
 class _ContextPressureObservation:
     estimate: ContextPressureEstimate
     observation_id: str
+
+
+def _context_observation_event(event: Event) -> Event:
+    """Attest the runtime identities shared by context-observation events."""
+
+    return event_with_runtime_payload_authority(
+        event,
+        "observation_id",
+        "model_step_id",
+        "model_attempt_id",
+    )
+
+
+def _event_with_model_identity_authority(
+    event: Event,
+    identity: ModelStepIdentity | ModelAttemptIdentity,
+) -> Event:
+    """Attest model execution linkage supplied by a typed runtime identity."""
+
+    if type(identity) is ModelAttemptIdentity:
+        payload = copy_model_attempt_identity(identity).payload()
+    elif type(identity) is ModelStepIdentity:
+        payload = copy_model_step_identity(identity).payload()
+    else:
+        raise TypeError("Model event identity has an unsupported type.")
+    fields = [
+        field_name
+        for field_name, value in payload.items()
+        if event.payload.get(field_name) == value
+    ]
+    return event_with_runtime_payload_authority(event, *fields) if fields else event
 
 
 @dataclass
@@ -1428,19 +1449,22 @@ class ModelStepExecutor:
                 yield context_count_event, None
             yield (
                 await self._event_writer.emit(
-                    Event(
-                        type=EventType.MODEL_STARTED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        payload={
-                            "model": session.model,
-                            "provider": registered_provider.name,
-                            "step": step,
-                            "attempt": attempt,
-                            "max_attempts": retry_policy.max_attempts,
-                            **model_attempt_identity.payload(),
-                        },
-                        environment_name=environment_name,
+                    _event_with_model_identity_authority(
+                        Event(
+                            type=EventType.MODEL_STARTED,
+                            session_id=session.id,
+                            agent_name=registered_agent.spec.name,
+                            payload={
+                                "model": session.model,
+                                "provider": registered_provider.name,
+                                "step": step,
+                                "attempt": attempt,
+                                "max_attempts": retry_policy.max_attempts,
+                                **model_attempt_identity.payload(),
+                            },
+                            environment_name=environment_name,
+                        ),
+                        model_attempt_identity,
                     )
                 ),
                 None,
@@ -1616,23 +1640,25 @@ class ModelStepExecutor:
             observation_id=observation_id,
         )
         event = await self._event_writer.emit(
-            Event(
-                type=EventType.CONTEXT_PRESSURE_ESTIMATED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    **_context_count_base_payload(
-                        model_request=model_request,
-                        provider_name=registered_provider.name,
-                        step=step,
-                        attempt=attempt,
-                        max_attempts=max_attempts,
-                        observation_id=observation_id,
-                        model_attempt_identity=model_attempt_identity,
-                    ),
-                    "estimate": estimate.model_dump(mode="json"),
-                },
+            _context_observation_event(
+                Event(
+                    type=EventType.CONTEXT_PRESSURE_ESTIMATED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        **_context_count_base_payload(
+                            model_request=model_request,
+                            provider_name=registered_provider.name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            observation_id=observation_id,
+                            model_attempt_identity=model_attempt_identity,
+                        ),
+                        "estimate": estimate.model_dump(mode="json"),
+                    },
+                )
             )
         )
         return observation, event
@@ -1698,17 +1724,19 @@ class ModelStepExecutor:
                 error_message = provider_failure.message
                 error_type = provider_failure.error_type
             event = await self._event_writer.emit(
-                Event(
-                    type=EventType.CONTEXT_COUNT_FAILED,
-                    session_id=session.id,
-                    agent_name=registered_agent.spec.name,
-                    environment_name=environment_name,
-                    payload={
-                        **base_payload,
-                        "error": error_message,
-                        "error_type": error_type,
-                        **durable_diagnostics,
-                    },
+                _context_observation_event(
+                    Event(
+                        type=EventType.CONTEXT_COUNT_FAILED,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            **base_payload,
+                            "error": error_message,
+                            "error_type": error_type,
+                            **durable_diagnostics,
+                        },
+                    )
                 )
             )
             return None, event
@@ -1718,15 +1746,17 @@ class ModelStepExecutor:
             observation_id=observation_id,
         )
         event = await self._event_writer.emit(
-            Event(
-                type=EventType.CONTEXT_COUNTED,
-                session_id=session.id,
-                agent_name=registered_agent.spec.name,
-                environment_name=environment_name,
-                payload={
-                    **base_payload,
-                    "count": result.model_dump(mode="json"),
-                },
+            _context_observation_event(
+                Event(
+                    type=EventType.CONTEXT_COUNTED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        **base_payload,
+                        "count": result.model_dump(mode="json"),
+                    },
+                )
             )
         )
         return observation, event
@@ -3216,19 +3246,22 @@ class ModelStepRun:
                     raise
                 yield (
                     await self._executor._event_writer.emit(
-                        Event(
-                            type=EventType.CONTEXT_OVERFLOW_DETECTED,
-                            session_id=self._session.id,
-                            agent_name=self._registered_agent.spec.name,
-                            environment_name=self._environment_name,
-                            payload=_context_overflow_event_payload(
-                                exc,
-                                step=step,
-                                phase="initial",
-                                original_message_count=len(model_request.messages),
-                                model_step_identity=model_step_identity,
-                                model_attempt_identity=latest_model_attempt_identity,
+                        _event_with_model_identity_authority(
+                            Event(
+                                type=EventType.CONTEXT_OVERFLOW_DETECTED,
+                                session_id=self._session.id,
+                                agent_name=self._registered_agent.spec.name,
+                                environment_name=self._environment_name,
+                                payload=_context_overflow_event_payload(
+                                    exc,
+                                    step=step,
+                                    phase="initial",
+                                    original_message_count=len(model_request.messages),
+                                    model_step_identity=model_step_identity,
+                                    model_attempt_identity=latest_model_attempt_identity,
+                                ),
                             ),
+                            latest_model_attempt_identity or model_step_identity,
                         )
                     ),
                     None,
@@ -3367,19 +3400,22 @@ class ModelStepRun:
                 return
             yield (
                 await self._executor._event_writer.emit(
-                    Event(
-                        type=EventType.CONTEXT_OVERFLOW_FAILED,
-                        session_id=self._session.id,
-                        agent_name=self._registered_agent.spec.name,
-                        environment_name=self._environment_name,
-                        payload={
-                            "step": step,
-                            "phase": "context_build",
-                            "error": str(exc.cause),
-                            "error_type": type(exc.cause).__name__,
-                            "policy": type(overflow_policy).__name__,
-                            **model_step_identity.payload(),
-                        },
+                    _event_with_model_identity_authority(
+                        Event(
+                            type=EventType.CONTEXT_OVERFLOW_FAILED,
+                            session_id=self._session.id,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            payload={
+                                "step": step,
+                                "phase": "context_build",
+                                "error": str(exc.cause),
+                                "error_type": type(exc.cause).__name__,
+                                "policy": type(overflow_policy).__name__,
+                                **model_step_identity.payload(),
+                            },
+                        ),
+                        model_step_identity,
                     )
                 ),
                 None,
@@ -3463,23 +3499,26 @@ class ModelStepRun:
         )
         yield (
             await self._executor._event_writer.emit(
-                Event(
-                    type=EventType.CONTEXT_OVERFLOW_RECOVERING,
-                    session_id=self._session.id,
-                    agent_name=self._registered_agent.spec.name,
-                    environment_name=self._environment_name,
-                    payload={
-                        "step": step,
-                        "original_message_count": len(model_request.messages),
-                        "recovery_message_count": len(recovery_request.messages),
-                        "policy": type(overflow_policy).__name__,
-                        **model_step_identity.payload(),
-                        **(
-                            {}
-                            if latest_model_attempt_identity is None
-                            else latest_model_attempt_identity.payload()
-                        ),
-                    },
+                _event_with_model_identity_authority(
+                    Event(
+                        type=EventType.CONTEXT_OVERFLOW_RECOVERING,
+                        session_id=self._session.id,
+                        agent_name=self._registered_agent.spec.name,
+                        environment_name=self._environment_name,
+                        payload={
+                            "step": step,
+                            "original_message_count": len(model_request.messages),
+                            "recovery_message_count": len(recovery_request.messages),
+                            "policy": type(overflow_policy).__name__,
+                            **model_step_identity.payload(),
+                            **(
+                                {}
+                                if latest_model_attempt_identity is None
+                                else latest_model_attempt_identity.payload()
+                            ),
+                        },
+                    ),
+                    latest_model_attempt_identity or model_step_identity,
                 )
             ),
             None,
@@ -3497,20 +3536,23 @@ class ModelStepRun:
             except ModelContextOverflowError as exc:
                 yield (
                     await self._executor._event_writer.emit(
-                        Event(
-                            type=EventType.CONTEXT_OVERFLOW_FAILED,
-                            session_id=self._session.id,
-                            agent_name=self._registered_agent.spec.name,
-                            environment_name=self._environment_name,
-                            payload=_context_overflow_event_payload(
-                                exc,
-                                step=step,
-                                phase="recovery",
-                                original_message_count=len(model_request.messages),
-                                recovery_message_count=len(recovery_request.messages),
-                                model_step_identity=model_step_identity,
-                                model_attempt_identity=latest_model_attempt_identity,
+                        _event_with_model_identity_authority(
+                            Event(
+                                type=EventType.CONTEXT_OVERFLOW_FAILED,
+                                session_id=self._session.id,
+                                agent_name=self._registered_agent.spec.name,
+                                environment_name=self._environment_name,
+                                payload=_context_overflow_event_payload(
+                                    exc,
+                                    step=step,
+                                    phase="recovery",
+                                    original_message_count=len(model_request.messages),
+                                    recovery_message_count=len(recovery_request.messages),
+                                    model_step_identity=model_step_identity,
+                                    model_attempt_identity=latest_model_attempt_identity,
+                                ),
                             ),
+                            latest_model_attempt_identity or model_step_identity,
                         )
                     ),
                     None,
@@ -5092,12 +5134,17 @@ def _context_compaction_telemetry_event(
         payload.update(copy_model_step_identity(execution_identity).payload())
     elif execution_identity is not None:
         raise TypeError("Context compaction execution identity has an unsupported type.")
-    return Event(
+    event = Event(
         type=sanitized.event_type,
         session_id=session.id,
         agent_name=registered_agent.spec.name,
         environment_name=environment_name,
         payload=payload,
+    )
+    return (
+        event
+        if execution_identity is None
+        else _event_with_model_identity_authority(event, execution_identity)
     )
 
 
@@ -5525,25 +5572,28 @@ def _context_count_reconciled_event(
         if delta_tokens is None or actual_input_tokens is None or actual_input_tokens <= 0
         else delta_tokens / actual_input_tokens
     )
-    return Event(
-        type=EventType.CONTEXT_COUNT_RECONCILED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload={
-            "model": session.model,
-            "provider": registered_provider.name,
-            "step": step,
-            "attempt": attempt,
-            "max_attempts": max_attempts,
-            "observation_id": observation.observation_id,
-            "pre_call_count": observation.result.model_dump(mode="json"),
-            "actual_input_tokens": actual_input_tokens,
-            "delta_tokens": delta_tokens,
-            "relative_error": relative_error,
-            "reconciled": actual_input_tokens is not None and estimated_input_tokens is not None,
-            **copy_model_attempt_identity(model_attempt_identity).payload(),
-        },
+    return _context_observation_event(
+        Event(
+            type=EventType.CONTEXT_COUNT_RECONCILED,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload={
+                "model": session.model,
+                "provider": registered_provider.name,
+                "step": step,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "observation_id": observation.observation_id,
+                "pre_call_count": observation.result.model_dump(mode="json"),
+                "actual_input_tokens": actual_input_tokens,
+                "delta_tokens": delta_tokens,
+                "relative_error": relative_error,
+                "reconciled": actual_input_tokens is not None
+                and estimated_input_tokens is not None,
+                **copy_model_attempt_identity(model_attempt_identity).payload(),
+            },
+        )
     )
 
 
@@ -5572,25 +5622,27 @@ def _context_pressure_reconciled_event(
         if delta_tokens is None or actual_input_tokens is None or actual_input_tokens <= 0
         else delta_tokens / actual_input_tokens
     )
-    return Event(
-        type=EventType.CONTEXT_PRESSURE_RECONCILED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload={
-            "model": session.model,
-            "provider": registered_provider.name,
-            "step": step,
-            "attempt": attempt,
-            "max_attempts": max_attempts,
-            "observation_id": observation.observation_id,
-            "pre_call_estimate": observation.estimate.model_dump(mode="json"),
-            "actual_input_tokens": actual_input_tokens,
-            "delta_tokens": delta_tokens,
-            "relative_error": relative_error,
-            "reconciled": actual_input_tokens is not None,
-            **copy_model_attempt_identity(model_attempt_identity).payload(),
-        },
+    return _context_observation_event(
+        Event(
+            type=EventType.CONTEXT_PRESSURE_RECONCILED,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload={
+                "model": session.model,
+                "provider": registered_provider.name,
+                "step": step,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "observation_id": observation.observation_id,
+                "pre_call_estimate": observation.estimate.model_dump(mode="json"),
+                "actual_input_tokens": actual_input_tokens,
+                "delta_tokens": delta_tokens,
+                "relative_error": relative_error,
+                "reconciled": actual_input_tokens is not None,
+                **copy_model_attempt_identity(model_attempt_identity).payload(),
+            },
+        )
     )
 
 
@@ -5761,13 +5813,21 @@ def _model_stream_event_to_runtime_event(
             },
             unavailable_reason="invalid model completion usage telemetry",
         )
-    return Event(
-        type=event_type,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload=payload,
+    event = _event_with_model_identity_authority(
+        Event(
+            type=event_type,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=payload,
+        ),
+        model_attempt_identity,
     )
+    if tool_round_identity is not None and (
+        event.payload.get("tool_round_id") == tool_round_identity.tool_round_id
+    ):
+        event = event_with_runtime_payload_authority(event, "tool_round_id")
+    return event
 
 
 def _with_structured_output_tool_instruction(
@@ -5878,12 +5938,15 @@ def _model_retry_event(
         error=error,
     )
     payload.update(model_attempt_identity.payload())
-    return Event(
-        type=EventType.MODEL_RETRY,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload=payload,
+    return _event_with_model_identity_authority(
+        Event(
+            type=EventType.MODEL_RETRY,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload=payload,
+        ),
+        model_attempt_identity,
     )
 
 
@@ -5897,22 +5960,25 @@ def _model_attempt_discarded_event(
     decision: RetryDecision,
     model_attempt_identity: ModelAttemptIdentity,
 ) -> Event:
-    return Event(
-        type=EventType.MODEL_ATTEMPT_DISCARDED,
-        session_id=session.id,
-        agent_name=registered_agent.spec.name,
-        environment_name=environment_name,
-        payload={
-            "provider": registered_provider.name,
-            "model": session.model,
-            "step": step,
-            "attempt": decision.attempt,
-            "next_attempt": decision.next_attempt,
-            "max_attempts": decision.max_attempts,
-            "reason": None if decision.reason is None else decision.reason.value,
-            "status_code": decision.status_code,
-            **copy_model_attempt_identity(model_attempt_identity).payload(),
-        },
+    return _event_with_model_identity_authority(
+        Event(
+            type=EventType.MODEL_ATTEMPT_DISCARDED,
+            session_id=session.id,
+            agent_name=registered_agent.spec.name,
+            environment_name=environment_name,
+            payload={
+                "provider": registered_provider.name,
+                "model": session.model,
+                "step": step,
+                "attempt": decision.attempt,
+                "next_attempt": decision.next_attempt,
+                "max_attempts": decision.max_attempts,
+                "reason": None if decision.reason is None else decision.reason.value,
+                "status_code": decision.status_code,
+                **copy_model_attempt_identity(model_attempt_identity).payload(),
+            },
+        ),
+        model_attempt_identity,
     )
 
 

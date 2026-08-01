@@ -81,6 +81,7 @@ from cayu.runtime.usage import (
 )
 from cayu.storage import SQLiteBudgetLedger, SQLiteSessionStore
 from cayu.storage import migrations as schema_migrations
+from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 
 class MutableClock:
@@ -3177,6 +3178,164 @@ def test_cayu_app_exposes_causal_budget_usage_and_cost() -> None:
     ]
     assert cost.session_costs[0].total_cost == Decimal("0.0028")
     assert cost.session_costs[1].total_cost == Decimal("0.0018")
+
+
+def test_default_session_causal_budget_alias_round_trips_through_public_app_api() -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=session_store,
+            secret_redactor=SecretRedactor("private"),
+            enable_logging=False,
+        )
+        private_session_id = "generated-private-session"
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id=private_session_id,
+                causal_budget_id=private_session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        public_session_id = app.project_session_id_for_exposure(private_session_id)
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        )
+        return (
+            private_session_id,
+            public_session_id,
+            await app.get_causal_budget_usage(public_session_id),
+            await app.get_causal_budget_cost(public_session_id, pricing),
+        )
+
+    private_session_id, public_session_id, usage, cost = asyncio.run(run())
+    assert public_session_id != private_session_id
+    assert usage.causal_budget_id == public_session_id
+    assert usage.session_ids == [public_session_id]
+    assert [item.session_id for item in usage.session_summaries] == [public_session_id]
+    assert cost.causal_budget_id == public_session_id
+    assert cost.session_ids == [public_session_id]
+    assert [item.session_id for item in cost.session_costs] == [public_session_id]
+
+
+def test_alias_shaped_raw_causal_budget_id_keeps_legacy_authority() -> None:
+    async def run():
+        session_store = InMemorySessionStore()
+        codec = session_store.public_authority_alias_codec
+        raw_causal_budget_id = codec.encode(
+            "not-a-session",
+            field_name="session_id",
+        )
+        app = CayuApp(session_store=session_store, enable_logging=False)
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="raw-causal-budget-session",
+                causal_budget_id=raw_causal_budget_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        )
+        return (
+            raw_causal_budget_id,
+            await app.get_causal_budget_usage(raw_causal_budget_id),
+            await app.get_causal_budget_cost(raw_causal_budget_id, pricing),
+        )
+
+    raw_causal_budget_id, usage, cost = asyncio.run(run())
+    assert usage.causal_budget_id == raw_causal_budget_id
+    assert cost.causal_budget_id == raw_causal_budget_id
+    assert usage.session_ids == ["raw-causal-budget-session"]
+    assert cost.session_ids == ["raw-causal-budget-session"]
+
+
+def test_causal_budget_id_rejects_raw_and_public_alias_ambiguity() -> None:
+    async def run() -> None:
+        session_store = InMemorySessionStore()
+        codec = session_store.public_authority_alias_codec
+        aliased_session_id = "alias-target-session"
+        ambiguous_id = codec.encode(aliased_session_id, field_name="session_id")
+        app = CayuApp(session_store=session_store, enable_logging=False)
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id=aliased_session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="raw-budget-owner",
+                causal_budget_id=ambiguous_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        with pytest.raises(ValueError, match="ambiguous"):
+            await app.get_causal_budget_usage(ambiguous_id)
+
+    asyncio.run(run())
+
+
+def test_non_session_causal_budget_secret_is_redacted_from_public_app_summaries() -> None:
+    private_causal_budget_id = "legacy-secret-budget"
+
+    async def run():
+        session_store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=session_store,
+            secret_redactor=SecretRedactor("secret"),
+            enable_logging=False,
+        )
+        await session_store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="session-one",
+                causal_budget_id=private_causal_budget_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        pricing = PriceBook(
+            prices=(
+                ModelPrice.fixed(
+                    provider_name="fake",
+                    model="fake-model",
+                    input_per_million=Decimal("1"),
+                    output_per_million=Decimal("1"),
+                ),
+            )
+        )
+        return (
+            await app.get_causal_budget_usage(private_causal_budget_id),
+            await app.get_causal_budget_cost(private_causal_budget_id, pricing),
+        )
+
+    usage, cost = asyncio.run(run())
+    public_causal_budget_id = f"legacy-{REDACTED_SECRET}-budget"
+    assert usage.causal_budget_id == public_causal_budget_id
+    assert cost.causal_budget_id == public_causal_budget_id
+    assert private_causal_budget_id not in repr((usage, cost))
 
 
 def test_budget_check_fails_closed_for_unpriced_model_steps() -> None:

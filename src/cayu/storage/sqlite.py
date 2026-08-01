@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hmac
 import json
 import math
 import sqlite3
@@ -25,6 +26,7 @@ from cayu.core.messages import Message, MessageRole
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.sessions import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
@@ -109,6 +111,7 @@ from cayu.runtime.sessions import (
     _apply_runtime_publication_checkpoint_mutation,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
+    _authenticated_public_authority_alias_private_value,
     _build_runtime_publication_receipt,
     _checkpoint_after_initial_transcript_publication,
     _copy_mcp_manifest_publication,
@@ -139,6 +142,7 @@ from cayu.runtime.sessions import (
     _PreparedModelCompletionStageTerminal,
     _PreparedRuntimePublication,
     _project_interruption_cascade_marker_fields,
+    _public_authority_alias_store_key,
     _queued_session_message_event_payload,
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
@@ -248,7 +252,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 26
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 28
 _SQLITE_TASK_TOPOLOGY_MIN_REQUIRED_REVISION = 27
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -256,6 +260,16 @@ _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     datetime_param=sqlite_support.format_datetime,
 )
 _T = TypeVar("_T")
+
+
+def _alias_key_fingerprint_matches(value: object, expected: str) -> bool:
+    if type(value) is not str:
+        return False
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(encoded, expected.encode("ascii"))
 
 
 async def _run_off_thread_with_connection_ownership(
@@ -921,6 +935,7 @@ class SQLiteSessionStore(SessionStore):
 
     supports_usage_aggregates: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
+    supports_public_authority_aliases: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
 
     def __init__(
@@ -929,6 +944,7 @@ class SQLiteSessionStore(SessionStore):
         *,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
         read_only: bool = False,
+        public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     ) -> None:
         if isinstance(path, Path):
             db_path = path
@@ -940,15 +956,27 @@ class SQLiteSessionStore(SessionStore):
             raise TypeError("schema_mode must be a SchemaMode.")
         if not isinstance(read_only, bool):
             raise TypeError("read_only must be a bool.")
+        if public_authority_alias_codec is not None and not isinstance(
+            public_authority_alias_codec,
+            PublicAuthorityAliasCodec,
+        ):
+            raise TypeError("public_authority_alias_codec must be a PublicAuthorityAliasCodec.")
         if read_only and schema_mode is not schema.SchemaMode.VALIDATE:
             raise ValueError("read_only SQLite stores require schema_mode=validate.")
 
         self.path = db_path
         self._schema_mode = schema_mode
         self._read_only = read_only
+        self._public_authority_alias_codec = public_authority_alias_codec
         self._lock = asyncio.Lock()
         self._connection = self._connect_read_only(db_path) if read_only else self._connect(db_path)
-        self._initialize_schema()
+        try:
+            self._register_public_authority_alias_sql_function(self._connection)
+            self._initialize_schema()
+            self._initialize_public_authority_alias_registry()
+        except BaseException:
+            self._connection.close()
+            raise
         # Hot-path queries run on a dedicated read-only connection in worker
         # threads so the event loop never blocks on SQLite I/O and reads never
         # queue behind the writer connection's transactions. In-memory
@@ -961,21 +989,496 @@ class SQLiteSessionStore(SessionStore):
             self._read_connection = self._connect_read_only(db_path)
             self._read_lock = asyncio.Lock()
 
+    @property
+    def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
+        """Return the immutable codec bound to this store's durable alias registry."""
+
+        return self._public_authority_alias_codec
+
+    def _register_public_authority_alias_sql_function(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        codec = self._public_authority_alias_codec
+
+        def public_authority_alias(
+            private_value: object,
+            field_name: object,
+            scope_session_id: object,
+        ) -> str | None:
+            if codec is None:
+                return None
+            if type(private_value) is not str or type(field_name) is not str:
+                raise ValueError("Public authority alias source must be text.")
+            if scope_session_id is not None and type(scope_session_id) is not str:
+                raise ValueError("Public authority alias scope must be text or null.")
+            return codec.encode(
+                private_value,
+                field_name=field_name,
+                session_id=scope_session_id,
+            )
+
+        connection.create_function(
+            "cayu_public_authority_alias",
+            3,
+            public_authority_alias,
+            deterministic=True,
+        )
+
+        def public_authority_aliases(
+            private_value: object,
+            field_name: object,
+            scope_session_id: object,
+        ) -> str:
+            if codec is None:
+                return "[]"
+            if type(private_value) is not str or type(field_name) is not str:
+                raise ValueError("Public authority alias source must be text.")
+            if scope_session_id is not None and type(scope_session_id) is not str:
+                raise ValueError("Public authority alias scope must be text or null.")
+            return json.dumps(
+                codec.aliases(
+                    private_value,
+                    field_name=field_name,
+                    session_id=scope_session_id,
+                ),
+                separators=(",", ":"),
+            )
+
+        connection.create_function(
+            "cayu_public_authority_aliases",
+            3,
+            public_authority_aliases,
+            deterministic=True,
+        )
+        connection.create_function(
+            "cayu_public_authority_active_key_id",
+            0,
+            lambda: None if codec is None else codec.keyring.active_key_id,
+            deterministic=True,
+        )
+        connection.create_function(
+            "cayu_public_authority_keyring_fingerprint",
+            0,
+            lambda: None if codec is None else codec.keyring_fingerprint(),
+            deterministic=True,
+        )
+
+    def _initialize_public_authority_alias_registry(self) -> None:
+        """Validate key continuity and backfill each newly configured signing key."""
+
+        codec = self._public_authority_alias_codec
+        if codec is None:
+            initialized = self._connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_config)"
+            ).fetchone()[0]
+            if initialized:
+                raise ValueError(
+                    "A public authority alias codec is required for this initialized store."
+                )
+            return
+
+        configured = tuple(
+            (key_id, codec.key_fingerprint(key_id)) for key_id in codec.keyring.key_ids
+        )
+        if self._read_only:
+            rows: dict[str, tuple[object, object]] = {}
+            for row in self._connection.execute(
+                "SELECT key_id, fingerprint, backfill_completed "
+                "FROM cayu_public_authority_alias_keys"
+            ):
+                if type(row["key_id"]) is str:
+                    rows[row["key_id"]] = (row["fingerprint"], row["backfill_completed"])
+            for key_id, fingerprint in configured:
+                existing = rows.get(key_id)
+                if existing is None or existing[1] != 1:
+                    raise ValueError(
+                        "Read-only store has not completed the configured alias-key backfill."
+                    )
+                if not _alias_key_fingerprint_matches(existing[0], fingerprint):
+                    raise ValueError(
+                        "Public authority alias key material conflicts with durable state."
+                    )
+            config = self._connection.execute(
+                "SELECT active_key_id, keyring_fingerprint "
+                "FROM cayu_public_authority_alias_config "
+                "WHERE singleton = 1"
+            ).fetchone()
+            if (
+                config is None
+                or config["active_key_id"] != codec.keyring.active_key_id
+                or config["keyring_fingerprint"] != codec.keyring_fingerprint()
+            ):
+                raise ValueError("Read-only store public authority alias active key is stale.")
+            return
+
+        try:
+            with self._connection:
+                for key_id, fingerprint in configured:
+                    self._connection.execute(
+                        """
+                        INSERT INTO cayu_public_authority_alias_keys (
+                            key_id, fingerprint, backfill_completed
+                        ) VALUES (?, ?, 0)
+                        ON CONFLICT(key_id) DO NOTHING
+                        """,
+                        (key_id, fingerprint),
+                    )
+                    row = self._connection.execute(
+                        """
+                        SELECT fingerprint, backfill_completed
+                        FROM cayu_public_authority_alias_keys
+                        WHERE key_id = ?
+                        """,
+                        (key_id,),
+                    ).fetchone()
+                    if row is None:  # pragma: no cover - guarded by the insert above
+                        raise RuntimeError("Public authority alias key state was not persisted.")
+                    if not _alias_key_fingerprint_matches(row["fingerprint"], fingerprint):
+                        raise ValueError(
+                            "Public authority alias key material conflicts with durable state."
+                        )
+
+                pending = self._connection.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM cayu_public_authority_alias_keys
+                        WHERE key_id IN ({}) AND backfill_completed = 0
+                    )
+                    """.format(", ".join("?" for _ in configured)),
+                    tuple(key_id for key_id, _fingerprint in configured),
+                ).fetchone()[0]
+                if pending:
+                    self._backfill_public_authority_aliases()
+                    self._connection.executemany(
+                        """
+                        UPDATE cayu_public_authority_alias_keys
+                        SET backfill_completed = 1
+                        WHERE key_id = ?
+                        """,
+                        ((key_id,) for key_id, _fingerprint in configured),
+                    )
+                config = self._connection.execute(
+                    "SELECT active_key_id, keyring_fingerprint, generation, "
+                    "retired_key_ids_json "
+                    "FROM cayu_public_authority_alias_config WHERE singleton = 1"
+                ).fetchone()
+                desired_active = codec.keyring.active_key_id
+                desired_keyring_fingerprint = codec.keyring_fingerprint()
+                if config is None:
+                    self._connection.execute(
+                        "INSERT INTO cayu_public_authority_alias_config "
+                        "(singleton, active_key_id, keyring_fingerprint, generation, "
+                        "retired_key_ids_json) VALUES (1, ?, ?, 1, '[]')",
+                        (desired_active, desired_keyring_fingerprint),
+                    )
+                elif (
+                    config["active_key_id"] != desired_active
+                    or config["keyring_fingerprint"] != desired_keyring_fingerprint
+                ):
+                    retired = json.loads(config["retired_key_ids_json"])
+                    if type(retired) is not list or not all(
+                        type(value) is str for value in retired
+                    ):
+                        raise ValueError("Public authority alias rotation state is malformed.")
+                    if config["active_key_id"] != desired_active and desired_active in retired:
+                        raise ValueError(
+                            "A retired public authority alias key cannot become active again."
+                        )
+                    if config["active_key_id"] != desired_active:
+                        retired.append(str(config["active_key_id"]))
+                    self._connection.execute(
+                        "UPDATE cayu_public_authority_alias_config "
+                        "SET active_key_id = ?, keyring_fingerprint = ?, generation = ?, "
+                        "retired_key_ids_json = ? "
+                        "WHERE singleton = 1",
+                        (
+                            desired_active,
+                            desired_keyring_fingerprint,
+                            int(config["generation"]) + 1,
+                            json.dumps(list(dict.fromkeys(retired)), separators=(",", ":")),
+                        ),
+                    )
+        except sqlite3.IntegrityError:
+            raise ValueError(
+                "Public authority alias registry conflicts with durable authority."
+            ) from None
+
+    def _backfill_public_authority_aliases(self) -> None:
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT
+                'session_id',
+                '',
+                alias.value,
+                session.id
+            FROM cayu_sessions AS session,
+                 json_each(
+                     cayu_public_authority_aliases(session.id, 'session_id', NULL)
+                 ) AS alias
+            """
+        )
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT DISTINCT
+                'interaction_id',
+                event.session_id,
+                alias.value,
+                event.interaction_id
+            FROM cayu_events AS event,
+                 json_each(cayu_public_authority_aliases(
+                     event.interaction_id, 'interaction_id', event.session_id
+                 )) AS alias
+            WHERE event.interaction_id IS NOT NULL
+            """
+        )
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT DISTINCT
+                'interaction_id',
+                transcript.session_id,
+                alias.value,
+                transcript.interaction_id
+            FROM cayu_transcript_messages AS transcript,
+                 json_each(cayu_public_authority_aliases(
+                     transcript.interaction_id, 'interaction_id', transcript.session_id
+                 )) AS alias
+            WHERE transcript.interaction_id IS NOT NULL
+            """
+        )
+        self._connection.execute(
+            """
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT DISTINCT
+                'interaction_id',
+                event.session_id,
+                alias.value,
+                interaction.value
+            FROM cayu_events AS event,
+                 json_each(event.payload_json, '$.interaction_ids') AS interaction,
+                 json_each(cayu_public_authority_aliases(
+                     interaction.value, 'interaction_id', event.session_id
+                 )) AS alias
+            WHERE event.event_type = 'turn.completed'
+              AND json_valid(event.payload_json)
+              AND json_type(event.payload_json, '$.interaction_ids') = 'array'
+              AND interaction.type = 'text'
+              AND trim(interaction.value) <> ''
+            """
+        )
+
     async def _run_read(self, query: Callable[[sqlite3.Connection], _T]) -> _T:
         """Run a read-only query off the event loop on the read connection."""
+
+        def guarded(connection: sqlite3.Connection) -> _T:
+            self._require_current_public_authority_configuration(connection)
+            return query(connection)
+
         return await _run_off_thread_with_connection_ownership(
             self._read_lock,
             self._read_connection,
-            query,
+            guarded,
         )
 
     async def _run_write(self, statement: Callable[[sqlite3.Connection], _T]) -> _T:
         """Run a write statement off the event loop on the writer connection."""
+
+        def guarded(connection: sqlite3.Connection) -> _T:
+            # This is the fail-fast check. The session/event/transcript BEFORE
+            # INSERT triggers repeat it after SQLite has acquired the writer
+            # transaction, closing the cross-process key-rotation race between
+            # this check and an identity-producing statement.
+            self._require_current_public_authority_configuration(connection)
+            return statement(connection)
+
         return await _run_off_thread_with_connection_ownership(
             self._lock,
             self._connection,
-            statement,
+            guarded,
         )
+
+    def _require_current_public_authority_configuration(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        codec = self.public_authority_alias_codec
+        row = connection.execute(
+            "SELECT active_key_id, keyring_fingerprint "
+            "FROM cayu_public_authority_alias_config WHERE singleton = 1"
+        ).fetchone()
+        if codec is None:
+            if row is not None:
+                raise RuntimeError(
+                    "SQLite public authority aliases require the deployment keyring."
+                )
+            return
+        if (
+            row is None
+            or row["active_key_id"] != codec.keyring.active_key_id
+            or row["keyring_fingerprint"] != codec.keyring_fingerprint()
+        ):
+            raise RuntimeError(
+                "SQLite public authority alias key configuration is stale; reopen the store."
+            )
+
+    async def register_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        private_value: str,
+        scope_session_id: str | None = None,
+    ) -> None:
+        """Atomically register one codec-authenticated public authority alias."""
+
+        field_name, scope_key, public_alias = _public_authority_alias_store_key(
+            public_alias,
+            field_name=field_name,
+            private_value=private_value,
+            scope_session_id=scope_session_id,
+        )
+        codec = self.public_authority_alias_codec
+        if codec is None or not codec.matches(
+            public_alias,
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        ):
+            raise ValueError("Public authority alias lacks valid store-configured provenance.")
+
+        def statement(connection: sqlite3.Connection) -> None:
+            with connection:
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO cayu_public_authority_aliases (
+                            field_name,
+                            scope_session_id,
+                            public_alias,
+                            private_value
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(field_name, scope_session_id, public_alias) DO NOTHING
+                        """,
+                        (field_name, scope_key, public_alias, private_value),
+                    )
+                except sqlite3.IntegrityError:
+                    raise ValueError(
+                        "Public authority alias conflicts with existing private authority."
+                    ) from None
+                row = connection.execute(
+                    """
+                    SELECT private_value
+                    FROM cayu_public_authority_aliases
+                    WHERE field_name = ?
+                      AND scope_session_id = ?
+                      AND public_alias = ?
+                    """,
+                    (field_name, scope_key, public_alias),
+                ).fetchone()
+                if row is None:  # pragma: no cover - guarded by the insert above
+                    raise RuntimeError("Public authority alias registration was not persisted.")
+                stored = str(row["private_value"])
+                if not hmac.compare_digest(
+                    stored.encode("utf-8"),
+                    private_value.encode("utf-8"),
+                ):
+                    raise ValueError(
+                        "Public authority alias conflicts with existing private authority."
+                    )
+
+        await self._run_write(statement)
+
+    async def resolve_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> str | None:
+        """Resolve one exact alias through its indexed authority scope."""
+
+        field_name, scope_key, public_alias = _public_authority_alias_store_key(
+            public_alias,
+            field_name=field_name,
+            private_value=None,
+            scope_session_id=scope_session_id,
+        )
+
+        def query(connection: sqlite3.Connection) -> str | None:
+            row = connection.execute(
+                """
+                SELECT private_value
+                FROM cayu_public_authority_aliases
+                WHERE field_name = ?
+                  AND scope_session_id = ?
+                  AND public_alias = ?
+                """,
+                (field_name, scope_key, public_alias),
+            ).fetchone()
+            if row is None:
+                return None
+            return _authenticated_public_authority_alias_private_value(
+                self.public_authority_alias_codec,
+                public_alias,
+                row["private_value"],
+                field_name=field_name,
+                scope_session_id=scope_session_id,
+            )
+
+        return await self._run_read(query)
+
+    async def public_authority_private_value_exists(
+        self,
+        private_value: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> bool:
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Public authority alias codec is unavailable.")
+        probe = codec.encode(
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        )
+        field_name, scope_key, _probe = _public_authority_alias_store_key(
+            probe,
+            field_name=field_name,
+            private_value=private_value,
+            scope_session_id=scope_session_id,
+        )
+
+        def query(connection: sqlite3.Connection) -> bool:
+            return (
+                connection.execute(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                        FROM cayu_public_authority_aliases
+                        WHERE field_name = ?
+                          AND scope_session_id = ?
+                          AND private_value = ?
+                    )
+                    """,
+                    (field_name, scope_key, private_value),
+                ).fetchone()[0]
+                == 1
+            )
+
+        return await self._run_read(query)
 
     async def create(
         self,
@@ -990,6 +1493,7 @@ class SQLiteSessionStore(SessionStore):
         request = copy_run_request(request)
         identity = copy_session_identity(identity)
         async with self._lock:
+            self._require_current_public_authority_configuration(self._connection)
             session = sqlite_support.session_from_request(request, identity=identity)
             admission = _copy_optional_interaction_admission(
                 session.id,
@@ -1195,6 +1699,7 @@ class SQLiteSessionStore(SessionStore):
         )
 
         async with self._lock:
+            self._require_current_public_authority_configuration(self._connection)
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 source_session = _validate_session_fork_source(
@@ -5076,11 +5581,12 @@ class SQLiteSessionStore(SessionStore):
 
     async def summarize_events(self, session_id: str) -> EventSummary:
         session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            if not self._session_exists_unlocked(session_id):
+
+        def query(connection: sqlite3.Connection) -> EventSummary:
+            if not _session_exists(connection, session_id):
                 raise KeyError(f"Session not found: {session_id}")
 
-            total_row = self._connection.execute(
+            total_row = connection.execute(
                 """
                 SELECT COUNT(*) AS total_events
                 FROM cayu_events
@@ -5088,7 +5594,7 @@ class SQLiteSessionStore(SessionStore):
                 """,
                 (session_id,),
             ).fetchone()
-            count_rows = self._connection.execute(
+            count_rows = connection.execute(
                 """
                 SELECT event_type, COUNT(*) AS count
                 FROM cayu_events
@@ -5098,7 +5604,7 @@ class SQLiteSessionStore(SessionStore):
                 """,
                 (session_id,),
             ).fetchall()
-            latest_row = self._connection.execute(
+            latest_row = connection.execute(
                 f"""
                 SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
                 FROM cayu_events
@@ -5116,14 +5622,17 @@ class SQLiteSessionStore(SessionStore):
                 latest_event=_event_record_from_row(latest_row),
             )
 
+        return await self._run_read(query)
+
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
         session_id = require_clean_nonblank(session_id, "session_id")
-        async with self._lock:
-            session = self._load_unlocked(session_id)
+
+        def query(connection: sqlite3.Connection) -> SessionOutcome:
+            session = _load_session(connection, session_id)
             if session is None:
                 raise KeyError(f"Session not found: {session_id}")
 
-            terminal_row = self._connection.execute(
+            terminal_row = connection.execute(
                 f"""
                 SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
                 FROM cayu_events
@@ -5143,7 +5652,7 @@ class SQLiteSessionStore(SessionStore):
                 """,
                 (session_id, session_id),
             ).fetchone()
-            retry_row = self._connection.execute(
+            retry_row = connection.execute(
                 f"""
                 SELECT sequence, {", ".join(_EVENT_COLUMN_NAMES)}
                 FROM cayu_events
@@ -5169,6 +5678,8 @@ class SQLiteSessionStore(SessionStore):
                 terminal_event=_event_record_from_row(terminal_row),
                 latest_retry_event=_event_record_from_row(retry_row),
             )
+
+        return await self._run_read(query)
 
     async def prune_events(
         self,
@@ -6520,14 +7031,14 @@ class SQLiteSessionStore(SessionStore):
         )
         plan = session_store_sql.build_session_query_sql(query, dialect=_SQL_DIALECT)
 
-        async with self._lock:
+        def run_query(connection: sqlite3.Connection) -> SessionListResult:
             total_count: int | None = None
             if query.include_total_count:
-                total_count = self._connection.execute(
+                total_count = connection.execute(
                     f"SELECT COUNT(*) FROM {session_source_sql} {plan.filter_where_sql}",
                     plan.filter_params,
                 ).fetchone()[0]
-            rows = self._connection.execute(
+            rows = connection.execute(
                 f"""
                 SELECT id, agent_name, provider_name, model, parent_session_id,
                        causal_budget_id, runtime_name, runtime_version, environment_name,
@@ -6543,7 +7054,8 @@ class SQLiteSessionStore(SessionStore):
             has_more = len(rows) > query.limit
             rows = rows[: query.limit]
             labels_by_session_id = self._load_labels_for_sessions_unlocked(
-                [row["id"] for row in rows]
+                [row["id"] for row in rows],
+                connection=connection,
             )
             sessions = [
                 sqlite_support.session_from_row(
@@ -6552,10 +7064,14 @@ class SQLiteSessionStore(SessionStore):
                 )
                 for row in rows
             ]
-        next_cursor = session_next_cursor(sessions, has_more, query.order_by)
-        return SessionListResult(
-            sessions=sessions, next_cursor=next_cursor, total_count=total_count
-        )
+            next_cursor = session_next_cursor(sessions, has_more, query.order_by)
+            return SessionListResult(
+                sessions=sessions,
+                next_cursor=next_cursor,
+                total_count=total_count,
+            )
+
+        return await self._run_read(run_query)
 
     async def append_transcript_messages(
         self,
@@ -6910,11 +7426,11 @@ class SQLiteSessionStore(SessionStore):
             filter_params.append(query.interaction_id)
         filter_clause = " AND " + " AND ".join(filters) if filters else ""
 
-        async with self._lock:
-            if not self._session_exists_unlocked(query.session_id):
+        def run_query(connection: sqlite3.Connection) -> TranscriptPage:
+            if not _session_exists(connection, query.session_id):
                 raise KeyError(f"Session not found: {query.session_id}")
 
-            total_row = self._connection.execute(
+            total_row = connection.execute(
                 f"""
                 SELECT COUNT(*) AS total_records
                 FROM cayu_transcript_messages
@@ -6931,7 +7447,7 @@ class SQLiteSessionStore(SessionStore):
                 query.limit,
                 query.offset,
             ]
-            rows = self._connection.execute(
+            rows = connection.execute(
                 f"""
                 SELECT session_order - 1 AS transcript_index, interaction_id, message_json
                 FROM cayu_transcript_messages
@@ -6954,6 +7470,8 @@ class SQLiteSessionStore(SessionStore):
                 records=filter_transcript_records(records, include_thinking=query.include_thinking),
                 total_records=total_records,
             )
+
+        return await self._run_read(run_query)
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")

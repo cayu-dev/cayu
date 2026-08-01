@@ -245,6 +245,31 @@ _BASELINE_DDL = """
         PRIMARY KEY (session_id, key)
     );
 
+    CREATE TABLE IF NOT EXISTS cayu_public_authority_aliases (
+        field_name TEXT NOT NULL,
+        scope_session_id TEXT NOT NULL,
+        public_alias TEXT NOT NULL,
+        private_value TEXT NOT NULL,
+        PRIMARY KEY (field_name, scope_session_id, public_alias)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_private_value
+        ON cayu_public_authority_aliases(field_name, scope_session_id, private_value);
+
+    CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_keys (
+        key_id TEXT PRIMARY KEY,
+        fingerprint TEXT NOT NULL,
+        backfill_completed INTEGER NOT NULL CHECK (backfill_completed IN (0, 1))
+    );
+
+    CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_config (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        active_key_id TEXT NOT NULL REFERENCES cayu_public_authority_alias_keys(key_id),
+        keyring_fingerprint TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        retired_key_ids_json TEXT NOT NULL CHECK (json_valid(retired_key_ids_json))
+    );
+
     CREATE TABLE IF NOT EXISTS cayu_checkpoints (
         session_id TEXT PRIMARY KEY REFERENCES cayu_sessions(id) ON DELETE CASCADE,
         state_json TEXT NOT NULL,
@@ -1028,6 +1053,183 @@ _MIGRATION_STEPS: dict[int, str] = {
             ON cayu_tasks(session_id, created_at, id);
         CREATE INDEX IF NOT EXISTS idx_cayu_tasks_parent_created_id
             ON cayu_tasks(parent_task_id, created_at, id);
+    """,
+    28: """
+        CREATE TABLE IF NOT EXISTS cayu_public_authority_aliases (
+            field_name TEXT NOT NULL,
+            scope_session_id TEXT NOT NULL,
+            public_alias TEXT NOT NULL,
+            private_value TEXT NOT NULL,
+            PRIMARY KEY (field_name, scope_session_id, public_alias)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_private_value
+            ON cayu_public_authority_aliases(field_name, scope_session_id, private_value);
+
+        CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_keys (
+            key_id TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            backfill_completed INTEGER NOT NULL CHECK (backfill_completed IN (0, 1))
+        );
+
+        CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_config (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            active_key_id TEXT NOT NULL REFERENCES cayu_public_authority_alias_keys(key_id),
+            keyring_fingerprint TEXT NOT NULL,
+            generation INTEGER NOT NULL CHECK (generation >= 1),
+            retired_key_ids_json TEXT NOT NULL CHECK (json_valid(retired_key_ids_json))
+        );
+
+        CREATE TRIGGER IF NOT EXISTS cayu_fence_stale_alias_session_writer
+        BEFORE INSERT ON cayu_sessions
+        FOR EACH ROW
+        WHEN (SELECT active_key_id FROM cayu_public_authority_alias_config WHERE singleton = 1)
+             IS NOT cayu_public_authority_active_key_id()
+          OR (SELECT keyring_fingerprint FROM cayu_public_authority_alias_config WHERE singleton = 1)
+             IS NOT cayu_public_authority_keyring_fingerprint()
+        BEGIN
+            SELECT RAISE(ABORT, 'stale public authority alias key configuration');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_fence_stale_alias_event_writer
+        BEFORE INSERT ON cayu_events
+        FOR EACH ROW
+        WHEN (SELECT active_key_id FROM cayu_public_authority_alias_config WHERE singleton = 1)
+             IS NOT cayu_public_authority_active_key_id()
+          OR (SELECT keyring_fingerprint FROM cayu_public_authority_alias_config WHERE singleton = 1)
+             IS NOT cayu_public_authority_keyring_fingerprint()
+        BEGIN
+            SELECT RAISE(ABORT, 'stale public authority alias key configuration');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_fence_stale_alias_transcript_writer
+        BEFORE INSERT ON cayu_transcript_messages
+        FOR EACH ROW
+        WHEN (SELECT active_key_id FROM cayu_public_authority_alias_config WHERE singleton = 1)
+             IS NOT cayu_public_authority_active_key_id()
+          OR (SELECT keyring_fingerprint FROM cayu_public_authority_alias_config WHERE singleton = 1)
+             IS NOT cayu_public_authority_keyring_fingerprint()
+        BEGIN
+            SELECT RAISE(ABORT, 'stale public authority alias key configuration');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_reject_public_authority_alias_conflict
+        BEFORE INSERT ON cayu_public_authority_aliases
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1
+            FROM cayu_public_authority_aliases AS existing
+            WHERE existing.field_name = NEW.field_name
+              AND existing.scope_session_id = NEW.scope_session_id
+              AND existing.public_alias = NEW.public_alias
+              AND existing.private_value <> NEW.private_value
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'public authority alias conflicts with existing authority');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_require_session_public_authority_codec
+        BEFORE INSERT ON cayu_sessions
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM cayu_public_authority_alias_keys WHERE backfill_completed = 1
+        )
+         AND cayu_public_authority_alias(NEW.id, 'session_id', NULL) IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'public authority alias codec is required');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_require_event_public_authority_codec
+        BEFORE INSERT ON cayu_events
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM cayu_public_authority_alias_keys WHERE backfill_completed = 1
+        )
+         AND cayu_public_authority_alias(NEW.session_id, 'session_id', NULL) IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'public authority alias codec is required');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_require_transcript_public_authority_codec
+        BEFORE INSERT ON cayu_transcript_messages
+        FOR EACH ROW
+        WHEN EXISTS (
+            SELECT 1 FROM cayu_public_authority_alias_keys WHERE backfill_completed = 1
+        )
+         AND cayu_public_authority_alias(NEW.session_id, 'session_id', NULL) IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'public authority alias codec is required');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_register_session_public_authority_alias
+        AFTER INSERT ON cayu_sessions
+        FOR EACH ROW
+        WHEN cayu_public_authority_alias(NEW.id, 'session_id', NULL) IS NOT NULL
+        BEGIN
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT 'session_id', '', alias.value, NEW.id
+            FROM json_each(
+                cayu_public_authority_aliases(NEW.id, 'session_id', NULL)
+            ) AS alias;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_register_event_interaction_public_authority_alias
+        AFTER INSERT ON cayu_events
+        FOR EACH ROW
+        WHEN NEW.interaction_id IS NOT NULL
+         AND cayu_public_authority_alias(
+             NEW.interaction_id, 'interaction_id', NEW.session_id
+         ) IS NOT NULL
+        BEGIN
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT 'interaction_id', NEW.session_id, alias.value, NEW.interaction_id
+            FROM json_each(cayu_public_authority_aliases(
+                NEW.interaction_id, 'interaction_id', NEW.session_id
+            )) AS alias;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_register_transcript_interaction_public_authority_alias
+        AFTER INSERT ON cayu_transcript_messages
+        FOR EACH ROW
+        WHEN NEW.interaction_id IS NOT NULL
+         AND cayu_public_authority_alias(
+             NEW.interaction_id, 'interaction_id', NEW.session_id
+         ) IS NOT NULL
+        BEGIN
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT 'interaction_id', NEW.session_id, alias.value, NEW.interaction_id
+            FROM json_each(cayu_public_authority_aliases(
+                NEW.interaction_id, 'interaction_id', NEW.session_id
+            )) AS alias;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS cayu_register_turn_interaction_public_authority_aliases
+        AFTER INSERT ON cayu_events
+        FOR EACH ROW
+        WHEN NEW.event_type = 'turn.completed'
+         AND json_valid(NEW.payload_json)
+         AND json_type(NEW.payload_json, '$.interaction_ids') = 'array'
+        BEGIN
+            INSERT OR IGNORE INTO cayu_public_authority_aliases (
+                field_name, scope_session_id, public_alias, private_value
+            )
+            SELECT
+                'interaction_id', NEW.session_id,
+                alias.value,
+                interaction.value
+            FROM json_each(NEW.payload_json, '$.interaction_ids') AS interaction,
+                 json_each(cayu_public_authority_aliases(
+                     interaction.value, 'interaction_id', NEW.session_id
+                 )) AS alias
+            WHERE interaction.type = 'text'
+              AND trim(interaction.value) <> '';
+        END;
     """,
 }
 

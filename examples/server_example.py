@@ -39,6 +39,7 @@ from cayu import (
     SQLiteSessionStore,
     SQLiteTaskStore,
     WriteFileTool,
+    public_authority_alias_codec_from_environment,
     trim_context_turns,
 )
 from cayu.server import BasicAuth, ServerConfig, create_server
@@ -57,7 +58,10 @@ def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
 
     database = DATA_DIR / "cayu.db"
-    session_store = SQLiteSessionStore(database)
+    session_store = SQLiteSessionStore(
+        database,
+        public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+    )
     task_store = SQLiteTaskStore(database)
 
     app = CayuApp(session_store=session_store, task_store=task_store)

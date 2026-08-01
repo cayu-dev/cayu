@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import math
@@ -97,6 +98,7 @@ from cayu.runtime.execution_units import (
     copy_model_attempt_identity,
     copy_tool_round_identity,
 )
+from cayu.runtime.public_authority import PublicAuthorityAliasCodec
 from cayu.runtime.sessions import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
@@ -180,6 +182,7 @@ from cayu.runtime.sessions import (
     _apply_runtime_publication_checkpoint_mutation,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
+    _authenticated_public_authority_alias_private_value,
     _build_runtime_publication_receipt,
     _checkpoint_after_initial_transcript_publication,
     _copy_mcp_manifest_publication,
@@ -210,6 +213,7 @@ from cayu.runtime.sessions import (
     _PreparedModelCompletionStageTerminal,
     _PreparedRuntimePublication,
     _project_interruption_cascade_marker_fields,
+    _public_authority_alias_store_key,
     _queued_session_message_event_payload,
     _reconstruct_active_model_completion_stage,
     _reconstruct_active_model_completion_stage_record,
@@ -356,7 +360,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 26
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 28
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -1016,6 +1020,37 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "(event_published, settled_at, settlement_id)",
         "CREATE INDEX IF NOT EXISTS idx_cayu_budget_reservation_identities_session "
         "ON cayu_budget_reservation_identities(publication_session_id, reservation_id)",
+    ),
+    28: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_public_authority_aliases (
+            field_name TEXT NOT NULL,
+            scope_session_id TEXT NOT NULL,
+            public_alias TEXT NOT NULL,
+            private_value TEXT NOT NULL,
+            PRIMARY KEY (field_name, scope_session_id, public_alias)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS idx_cayu_public_authority_private_value
+            ON cayu_public_authority_aliases(field_name, scope_session_id, private_value)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_keys (
+            key_id TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            backfill_completed BOOLEAN NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_public_authority_alias_config (
+            singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            active_key_id TEXT NOT NULL REFERENCES cayu_public_authority_alias_keys(key_id),
+            keyring_fingerprint TEXT NOT NULL,
+            generation BIGINT NOT NULL CHECK (generation >= 1),
+            retired_key_ids JSONB NOT NULL CHECK (jsonb_typeof(retired_key_ids) = 'array')
+        )
+        """,
     ),
 }
 
@@ -2002,6 +2037,8 @@ class _PostgresStoreBase:
                                 cur,
                                 require=True,
                             )
+                        if current_state.revision >= 28:
+                            await self._validate_public_authority_alias_registry(cur)
                         recorded_indexes = _required_concurrent_indexes(current_state.revision)
                     else:
                         revision = pending[0]
@@ -2137,6 +2174,8 @@ class _PostgresStoreBase:
                 cur,
                 require=True,
             )
+        if state.revision >= 28:
+            await self._validate_public_authority_alias_registry(cur)
         for index in _required_concurrent_indexes(state.revision):
             existing = await self._concurrent_index_state(cur, index)
             if existing is None:
@@ -2232,6 +2271,133 @@ class _PostgresStoreBase:
                 "reservation ownership registry."
             )
         return True
+
+    async def _validate_public_authority_alias_registry(self, cur: Any) -> None:
+        table_name = "cayu_public_authority_aliases"
+        await cur.execute("SELECT to_regclass(%s)", (table_name,))
+        registered = await cur.fetchone()
+        if registered is None or registered[0] is None:
+            raise RuntimeError(
+                f"Required Cayu Postgres table is missing: {table_name}. "
+                "Run `cayu storage migrate` to restore the public authority index."
+            )
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        )
+        columns = tuple(await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = %s
+              AND constraint_record.contype = 'p'
+            """,
+            (table_name,),
+        )
+        primary_keys = tuple(row[0] for row in await cur.fetchall())
+        expected_columns = (
+            ("field_name", "text", "NO"),
+            ("scope_session_id", "text", "NO"),
+            ("public_alias", "text", "NO"),
+            ("private_value", "text", "NO"),
+        )
+        if columns != expected_columns or primary_keys != (
+            "PRIMARY KEY (field_name, scope_session_id, public_alias)",
+        ):
+            raise RuntimeError(
+                f"Postgres schema object {table_name!r} conflicts with Cayu's "
+                "public authority alias contract. Run `cayu storage migrate` "
+                "after repairing the conflicting object."
+            )
+
+        key_table_name = "cayu_public_authority_alias_keys"
+        await cur.execute("SELECT to_regclass(%s)", (key_table_name,))
+        registered = await cur.fetchone()
+        if registered is None or registered[0] is None:
+            raise RuntimeError(
+                f"Required Cayu Postgres table is missing: {key_table_name}. "
+                "Run `cayu storage migrate` to restore the alias key registry."
+            )
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (key_table_name,),
+        )
+        key_columns = tuple(await cur.fetchall())
+        await cur.execute(
+            """
+            SELECT pg_get_constraintdef(constraint_record.oid)
+            FROM pg_catalog.pg_constraint AS constraint_record
+            JOIN pg_catalog.pg_class AS table_record
+              ON table_record.oid = constraint_record.conrelid
+            JOIN pg_catalog.pg_namespace AS namespace
+              ON namespace.oid = table_record.relnamespace
+            WHERE namespace.nspname = current_schema()
+              AND table_record.relname = %s
+              AND constraint_record.contype = 'p'
+            """,
+            (key_table_name,),
+        )
+        key_primary_keys = tuple(row[0] for row in await cur.fetchall())
+        if key_columns != (
+            ("key_id", "text", "NO"),
+            ("fingerprint", "text", "NO"),
+            ("backfill_completed", "boolean", "NO"),
+        ) or key_primary_keys != ("PRIMARY KEY (key_id)",):
+            raise RuntimeError(
+                f"Postgres schema object {key_table_name!r} conflicts with Cayu's "
+                "public authority key-state contract. Run `cayu storage migrate` "
+                "after repairing the conflicting object."
+            )
+
+        config_table_name = "cayu_public_authority_alias_config"
+        await cur.execute("SELECT to_regclass(%s)", (config_table_name,))
+        registered = await cur.fetchone()
+        if registered is None or registered[0] is None:
+            raise RuntimeError(
+                f"Required Cayu Postgres table is missing: {config_table_name}. "
+                "Run `cayu storage migrate` to restore the alias deployment registry."
+            )
+        await cur.execute(
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (config_table_name,),
+        )
+        config_columns = tuple(await cur.fetchall())
+        if config_columns != (
+            ("singleton", "boolean", "NO"),
+            ("active_key_id", "text", "NO"),
+            ("keyring_fingerprint", "text", "NO"),
+            ("generation", "bigint", "NO"),
+            ("retired_key_ids", "jsonb", "NO"),
+        ):
+            raise RuntimeError(
+                f"Postgres schema object {config_table_name!r} conflicts with Cayu's "
+                "public authority deployment contract. Run `cayu storage migrate` "
+                "after repairing the conflicting object."
+            )
 
     async def _read_schema_state(self, cur: Any) -> schema.SchemaState:
         return await read_schema_state(cur)
@@ -5419,9 +5585,523 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
     supports_usage_aggregates: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
+    supports_public_authority_aliases: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
+
+    def __init__(
+        self,
+        conninfo: str | None = None,
+        *,
+        pool: AsyncConnectionPool | None = None,
+        min_size: int = 1,
+        max_size: int = 8,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
+        read_only: bool = False,
+        public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+    ) -> None:
+        if public_authority_alias_codec is not None and not isinstance(
+            public_authority_alias_codec,
+            PublicAuthorityAliasCodec,
+        ):
+            raise TypeError("public_authority_alias_codec must be a PublicAuthorityAliasCodec.")
+        super().__init__(
+            conninfo,
+            pool=pool,
+            min_size=min_size,
+            max_size=max_size,
+            schema_mode=schema_mode,
+            read_only=read_only,
+        )
+        self._public_authority_alias_codec = public_authority_alias_codec
+        self._public_authority_alias_backfill_lock = asyncio.Lock()
+        self._public_authority_aliases_reconciled = False
+
+    @property
+    def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
+        """Return the immutable codec configured for durable alias registration."""
+
+        return self._public_authority_alias_codec
+
+    async def register_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        private_value: str,
+        scope_session_id: str | None = None,
+    ) -> None:
+        """Atomically register one codec-authenticated public authority alias."""
+
+        field_name, scope_key, public_alias = _public_authority_alias_store_key(
+            public_alias,
+            field_name=field_name,
+            private_value=private_value,
+            scope_session_id=scope_session_id,
+        )
+        codec = self.public_authority_alias_codec
+        if codec is None or not codec.matches(
+            public_alias,
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        ):
+            raise ValueError("Public authority alias lacks valid store-configured provenance.")
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await self._register_public_authority_alias_row(
+                        cur,
+                        field_name=field_name,
+                        scope_key=scope_key,
+                        public_alias=public_alias,
+                        private_value=private_value,
+                    )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def resolve_public_authority_alias(
+        self,
+        public_alias: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> str | None:
+        """Resolve one exact alias through its indexed authority scope."""
+
+        field_name, scope_key, public_alias = _public_authority_alias_store_key(
+            public_alias,
+            field_name=field_name,
+            private_value=None,
+            scope_session_id=scope_session_id,
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT private_value
+                FROM cayu_public_authority_aliases
+                WHERE field_name = %s
+                  AND scope_session_id = %s
+                  AND public_alias = %s
+                """,
+                (field_name, scope_key, public_alias),
+            )
+            row = await cur.fetchone()
+            return _authenticated_public_authority_alias_private_value(
+                self.public_authority_alias_codec,
+                public_alias,
+                None if row is None else str(row[0]),
+                field_name=field_name,
+                scope_session_id=scope_session_id,
+            )
+
+    async def public_authority_private_value_exists(
+        self,
+        private_value: str,
+        *,
+        field_name: str,
+        scope_session_id: str | None = None,
+    ) -> bool:
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError("Public authority alias codec is unavailable.")
+        probe = codec.encode(
+            private_value,
+            field_name=field_name,
+            session_id=scope_session_id,
+        )
+        field_name, scope_key, _probe = _public_authority_alias_store_key(
+            probe,
+            field_name=field_name,
+            private_value=private_value,
+            scope_session_id=scope_session_id,
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM cayu_public_authority_aliases
+                    WHERE field_name = %s
+                      AND scope_session_id = %s
+                      AND private_value = %s
+                )
+                """,
+                (field_name, scope_key, private_value),
+            )
+            row = await cur.fetchone()
+            return bool(row is not None and row[0])
+
+    async def _register_public_authority_alias_row(
+        self,
+        cur: Any,
+        *,
+        field_name: str,
+        scope_key: str,
+        public_alias: str,
+        private_value: str,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_public_authority_aliases (
+                field_name,
+                scope_session_id,
+                public_alias,
+                private_value
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (field_name, scope_session_id, public_alias)
+            DO UPDATE SET private_value = cayu_public_authority_aliases.private_value
+            RETURNING private_value
+            """,
+            (field_name, scope_key, public_alias, private_value),
+        )
+        row = await cur.fetchone()
+        if row is None:  # pragma: no cover - RETURNING is unconditional above
+            raise RuntimeError("Public authority alias registration was not persisted.")
+        stored = str(row[0])
+        if not hmac.compare_digest(
+            stored.encode("utf-8"),
+            private_value.encode("utf-8"),
+        ):
+            raise ValueError("Public authority alias conflicts with existing private authority.")
+
+    async def _ensure_ready(self) -> None:
+        await super()._ensure_ready()
+        if not self._public_authority_aliases_reconciled:
+            async with self._public_authority_alias_backfill_lock:
+                if not self._public_authority_aliases_reconciled:
+                    await self._reconcile_public_authority_alias_keys()
+                    self._public_authority_aliases_reconciled = True
+        await self._assert_current_public_authority_configuration()
+
+    async def _assert_current_public_authority_configuration(self) -> None:
+        codec = self.public_authority_alias_codec
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT active_key_id, keyring_fingerprint "
+                "FROM cayu_public_authority_alias_config "
+                "WHERE singleton = TRUE"
+            )
+            row = await cur.fetchone()
+        if codec is None:
+            if row is not None:
+                raise RuntimeError(
+                    "Postgres public authority aliases require the deployment keyring."
+                )
+            return
+        if (
+            row is None
+            or str(row[0]) != codec.keyring.active_key_id
+            or str(row[1]) != codec.keyring_fingerprint()
+        ):
+            raise RuntimeError(
+                "Postgres public authority alias key configuration is stale; reopen the store."
+            )
+
+    async def _reconcile_public_authority_alias_keys(self) -> None:
+        codec = self.public_authority_alias_codec
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await _acquire_schema_transaction_lock(
+                        conn,
+                        cur,
+                        read_only=self._read_only,
+                    )
+                    await cur.execute(
+                        "SELECT key_id, fingerprint, backfill_completed "
+                        "FROM cayu_public_authority_alias_keys ORDER BY key_id"
+                    )
+                    durable = {
+                        str(row[0]): (str(row[1]), bool(row[2])) for row in await cur.fetchall()
+                    }
+                    if codec is None:
+                        await cur.execute(
+                            "SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_config)"
+                        )
+                        config_exists = await cur.fetchone()
+                        if durable or (config_exists is not None and bool(config_exists[0])):
+                            raise RuntimeError(
+                                "Postgres public authority aliases are initialized; "
+                                "configure the deployment's alias keyring before opening "
+                                "this session store."
+                            )
+                        await conn.commit()
+                        return
+
+                    configured = {
+                        key_id: codec.key_fingerprint(key_id) for key_id in codec.keyring.key_ids
+                    }
+                    unavailable_incomplete = [
+                        key_id
+                        for key_id, (_fingerprint, completed) in durable.items()
+                        if key_id not in configured and not completed
+                    ]
+                    if unavailable_incomplete:
+                        raise RuntimeError(
+                            "Public authority alias backfill is incomplete for an "
+                            "unavailable historical key; restore that key before startup."
+                        )
+                    for key_id, fingerprint in configured.items():
+                        existing = durable.get(key_id)
+                        if existing is not None and not hmac.compare_digest(
+                            existing[0].encode("utf-8"),
+                            fingerprint.encode("utf-8"),
+                        ):
+                            raise RuntimeError(
+                                "Public authority alias key ID is already bound to "
+                                "different key material."
+                            )
+                    missing = [key_id for key_id in configured if key_id not in durable]
+                    incomplete = [
+                        key_id
+                        for key_id in configured
+                        if key_id in durable and not durable[key_id][1]
+                    ]
+                    if self._read_only and (missing or incomplete):
+                        raise RuntimeError(
+                            "Read-only Postgres stores require a completed writable "
+                            "public authority alias backfill for every configured key."
+                        )
+                    if missing or incomplete:
+                        # Fence every identity producer while the new key's reverse
+                        # index is backfilled. Writers that started first commit
+                        # before this lock; writers that start later observe the key
+                        # marker and must register aliases in their own transaction.
+                        await cur.execute(
+                            "LOCK TABLE cayu_sessions, cayu_events, "
+                            "cayu_transcript_messages IN SHARE ROW EXCLUSIVE MODE"
+                        )
+                    for key_id in missing:
+                        await cur.execute(
+                            "INSERT INTO cayu_public_authority_alias_keys "
+                            "(key_id, fingerprint, backfill_completed) "
+                            "VALUES (%s, %s, FALSE)",
+                            (key_id, configured[key_id]),
+                        )
+
+                if missing or incomplete:
+                    await self._backfill_public_authority_aliases(conn)
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "UPDATE cayu_public_authority_alias_keys "
+                            "SET backfill_completed = TRUE WHERE key_id = ANY(%s)",
+                            (list(configured),),
+                        )
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT active_key_id, keyring_fingerprint, generation, "
+                        "retired_key_ids "
+                        "FROM cayu_public_authority_alias_config WHERE singleton = TRUE"
+                        + ("" if self._read_only else " FOR UPDATE")
+                    )
+                    config = await cur.fetchone()
+                    desired_active = codec.keyring.active_key_id
+                    desired_keyring_fingerprint = codec.keyring_fingerprint()
+                    if config is None:
+                        if self._read_only:
+                            raise RuntimeError(
+                                "Read-only Postgres store has no active alias-key state."
+                            )
+                        await cur.execute(
+                            "INSERT INTO cayu_public_authority_alias_config "
+                            "(singleton, active_key_id, keyring_fingerprint, generation, "
+                            "retired_key_ids) VALUES (TRUE, %s, %s, 1, '[]'::jsonb)",
+                            (desired_active, desired_keyring_fingerprint),
+                        )
+                    elif (
+                        str(config[0]) != desired_active
+                        or str(config[1]) != desired_keyring_fingerprint
+                    ):
+                        if self._read_only:
+                            raise RuntimeError(
+                                "Read-only Postgres public authority alias active key is stale."
+                            )
+                        retired_value = config[3]
+                        retired = (
+                            retired_value
+                            if type(retired_value) is list
+                            else json.loads(str(retired_value))
+                        )
+                        if type(retired) is not list or not all(
+                            type(value) is str for value in retired
+                        ):
+                            raise RuntimeError(
+                                "Postgres public authority alias rotation state is malformed."
+                            )
+                        if str(config[0]) != desired_active and desired_active in retired:
+                            raise RuntimeError(
+                                "A retired public authority alias key cannot become active again."
+                            )
+                        if str(config[0]) != desired_active:
+                            retired.append(str(config[0]))
+                        await cur.execute(
+                            "UPDATE cayu_public_authority_alias_config "
+                            "SET active_key_id = %s, keyring_fingerprint = %s, "
+                            "generation = %s, retired_key_ids = %s::jsonb "
+                            "WHERE singleton = TRUE",
+                            (
+                                desired_active,
+                                desired_keyring_fingerprint,
+                                int(config[2]) + 1,
+                                json.dumps(list(dict.fromkeys(retired))),
+                            ),
+                        )
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+
+    async def _backfill_public_authority_aliases(self, conn: Any) -> None:
+        codec = self.public_authority_alias_codec
+        if codec is None:  # pragma: no cover - guarded by reconciliation
+            raise AssertionError("Public authority alias backfill requires a codec.")
+        cursor_name = f"cayu_public_authority_backfill_{uuid4().hex}"
+        async with conn.cursor(name=cursor_name) as source, conn.cursor() as target:
+            await source.execute("SELECT id FROM cayu_sessions ORDER BY id")
+            while rows := await source.fetchmany(500):
+                for (session_id,) in rows:
+                    private_session_id = str(session_id)
+                    for public_alias in codec.aliases(
+                        private_session_id,
+                        field_name="session_id",
+                    ):
+                        await self._register_public_authority_alias_row(
+                            target,
+                            field_name="session_id",
+                            scope_key="",
+                            public_alias=public_alias,
+                            private_value=private_session_id,
+                        )
+
+        interaction_cursor_name = f"{cursor_name}_interactions"
+        async with (
+            conn.cursor(name=interaction_cursor_name) as source,
+            conn.cursor() as target,
+        ):
+            await source.execute(
+                """
+                        SELECT DISTINCT authority.session_id, authority.interaction_id
+                        FROM (
+                            SELECT session_id, interaction_id
+                            FROM cayu_events
+                            WHERE interaction_id IS NOT NULL
+                            UNION
+                            SELECT session_id, interaction_id
+                            FROM cayu_transcript_messages
+                            WHERE interaction_id IS NOT NULL
+                            UNION
+                            SELECT event.session_id, nested.value #>> '{}' AS interaction_id
+                            FROM cayu_events AS event
+                            CROSS JOIN LATERAL jsonb_array_elements(
+                                CASE
+                                    WHEN jsonb_typeof(event.payload -> 'interaction_ids') = 'array'
+                                    THEN event.payload -> 'interaction_ids'
+                                    ELSE '[]'::jsonb
+                                END
+                            ) AS nested(value)
+                            WHERE event.event_type = 'turn.completed'
+                              AND jsonb_typeof(nested.value) = 'string'
+                              AND btrim(nested.value #>> '{}') <> ''
+                        ) AS authority
+                        ORDER BY authority.session_id, authority.interaction_id
+                        """
+            )
+            while rows := await source.fetchmany(500):
+                for session_id, interaction_id in rows:
+                    private_session_id = str(session_id)
+                    private_interaction_id = str(interaction_id)
+                    for public_alias in codec.aliases(
+                        private_interaction_id,
+                        field_name="interaction_id",
+                        session_id=private_session_id,
+                    ):
+                        await self._register_public_authority_alias_row(
+                            target,
+                            field_name="interaction_id",
+                            scope_key=private_session_id,
+                            public_alias=public_alias,
+                            private_value=private_interaction_id,
+                        )
+
+    async def _register_public_authorities(
+        self,
+        cur: Any,
+        session_id: str,
+        *,
+        interaction_ids: tuple[str, ...] = (),
+    ) -> None:
+        codec = self.public_authority_alias_codec
+        if codec is None:
+            await cur.execute("SELECT EXISTS(SELECT 1 FROM cayu_public_authority_alias_keys)")
+            row = await cur.fetchone()
+            if row is not None and row[0] is True:
+                raise RuntimeError(
+                    "Postgres public authority aliases are initialized; this writer "
+                    "must configure the deployment's alias keyring."
+                )
+            return
+        await cur.execute(
+            "SELECT active_key_id, keyring_fingerprint "
+            "FROM cayu_public_authority_alias_config "
+            "WHERE singleton = TRUE"
+        )
+        active = await cur.fetchone()
+        if (
+            active is None
+            or str(active[0]) != codec.keyring.active_key_id
+            or str(active[1]) != codec.keyring_fingerprint()
+        ):
+            raise RuntimeError("Postgres public authority alias writer uses a stale active key.")
+        for public_alias in codec.aliases(session_id, field_name="session_id"):
+            await self._register_public_authority_alias_row(
+                cur,
+                field_name="session_id",
+                scope_key="",
+                public_alias=public_alias,
+                private_value=session_id,
+            )
+        for interaction_id in dict.fromkeys(interaction_ids):
+            for public_alias in codec.aliases(
+                interaction_id,
+                field_name="interaction_id",
+                session_id=session_id,
+            ):
+                await self._register_public_authority_alias_row(
+                    cur,
+                    field_name="interaction_id",
+                    scope_key=session_id,
+                    public_alias=public_alias,
+                    private_value=interaction_id,
+                )
+
+    async def _register_event_public_authorities(
+        self,
+        cur: Any,
+        session_id: str,
+        events: list[Event] | tuple[Event, ...],
+    ) -> None:
+        interaction_ids: list[str] = []
+        for event in events:
+            if event.interaction_id is not None:
+                interaction_ids.append(event.interaction_id)
+            if event.type == EventType.TURN_COMPLETED:
+                nested = event.payload.get("interaction_ids")
+                if type(nested) is list:
+                    interaction_ids.extend(
+                        value for value in nested if type(value) is str and value
+                    )
+        await self._register_public_authorities(
+            cur,
+            session_id,
+            interaction_ids=tuple(interaction_ids),
+        )
 
     async def create(
         self,
@@ -5474,6 +6154,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(session),
+                    )
+                    await self._register_event_public_authorities(
+                        cur,
+                        session.id,
+                        [] if admission is None else [admission[0]],
                     )
                     if session.labels:
                         await cur.executemany(
@@ -5710,6 +6395,13 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         pg_support.session_insert_values(fork),
+                    )
+                    await self._register_public_authorities(
+                        cur,
+                        fork.id,
+                        interaction_ids=tuple(
+                            value for value in copied_interaction_ids if value is not None
+                        ),
                     )
                     if fork.labels:
                         await cur.executemany(
@@ -6215,6 +6907,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     if admission is not None:
                         started_event, interaction_id, source_messages, defer_source = admission
+                        await self._register_public_authorities(
+                            cur,
+                            session_id,
+                            interaction_ids=(interaction_id,),
+                        )
                         await cur.execute(
                             "SELECT interaction_id FROM cayu_deferred_interaction_inputs "
                             "WHERE session_id = %s FOR UPDATE",
@@ -6497,6 +7194,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
                     lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                         copied_event
+                    )
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        [copied_event],
                     )
                     await cur.execute(
                         """
@@ -6867,6 +7569,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await conn.commit()
                         return
 
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        copied_events,
+                    )
                     await self._publish_budget_reservation_identities(cur, copied_events)
                     # RETURNING yields the post-increment counter, i.e. the order
                     # of the last event in this batch; walk back to the first.
@@ -7054,6 +7761,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise KeyError(f"Session not found: {session_id}")
 
                     next_order = order_row[0] - len(copied_events)
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        copied_events,
+                    )
                     event_rows = []
                     for event in copied_events:
                         next_order += 1
@@ -7541,6 +8253,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     lookup_key, projection, projection_bytes = pending_action_event_storage_values(
                         accepted_event
                     )
+                    await self._register_event_public_authorities(
+                        cur,
+                        request.session_id,
+                        [accepted_event],
+                    )
                     await cur.execute(
                         """
                         INSERT INTO cayu_events (
@@ -7817,6 +8534,16 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             )
                             for message in transcript_messages
                         ],
+                    )
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        delivery_events,
+                    )
+                    await self._register_public_authorities(
+                        cur,
+                        session_id,
+                        interaction_ids=(() if interaction_id is None else (interaction_id,)),
                     )
                     for updated in updated_messages:
                         await cur.execute(
@@ -9066,6 +9793,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     receipt_record = _runtime_publication_receipt_record(receipt)
                     receipt_json = _dumps(receipt_record)
 
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        request.events,
+                    )
+                    await self._register_public_authorities(
+                        cur,
+                        session_id,
+                        interaction_ids=(
+                            () if request.interaction_id is None else (request.interaction_id,)
+                        ),
+                    )
                     await cur.execute(
                         """
                         UPDATE cayu_sessions
@@ -9367,6 +10106,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             raise ValueError("Checkpoint transform must return a checkpoint.")
                         transformed = copy_durable_json_object(transformed, "checkpoint")
 
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        copied_events,
+                    )
                     await self._publish_budget_reservation_identities(cur, copied_events)
                     await cur.execute(
                         """
@@ -10949,6 +11693,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 if await cur.fetchone() is None:
                     raise KeyError(f"Session not found: {session_id}")
                 if copied_messages:
+                    await self._register_public_authorities(
+                        cur,
+                        session_id,
+                        interaction_ids=(() if interaction_id is None else (interaction_id,)),
+                    )
                     await _touch_session_activity(cur, session_id, datetime.now(UTC))
                     await cur.executemany(
                         """
@@ -11035,6 +11784,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         current_checkpoint,
                         interaction_id=interaction_id,
                     )
+                    await self._register_public_authorities(
+                        cur,
+                        session_id,
+                        interaction_ids=(interaction_id,),
+                    )
                     await cur.executemany(
                         "INSERT INTO cayu_transcript_messages "
                         "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
@@ -11095,6 +11849,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             "Deferred interaction input belongs to another interaction."
                         )
                     messages = [Message(**item) for item in _json_list(row[1])]
+                    if interaction_id is not None:
+                        await self._register_public_authorities(
+                            cur,
+                            session_id,
+                            interaction_ids=(interaction_id,),
+                        )
                     await cur.executemany(
                         "INSERT INTO cayu_transcript_messages "
                         "(session_id, interaction_id, message) VALUES (%s, %s, %s)",
@@ -11171,6 +11931,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     transformed = copy_durable_json_object(transformed, "checkpoint")
                     await _touch_session_activity(cur, session_id, updated_at)
                     if copied_messages:
+                        await self._register_public_authorities(
+                            cur,
+                            session_id,
+                            interaction_ids=(() if interaction_id is None else (interaction_id,)),
+                        )
                         await cur.executemany(
                             """
                             INSERT INTO cayu_transcript_messages

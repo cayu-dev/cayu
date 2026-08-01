@@ -16,6 +16,7 @@ from cayu.core.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
     PendingToolApproval,
@@ -80,7 +81,13 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "tool.call.approval_denied": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "session.resumed": _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
     "session.completed": frozenset(),
-    "session.failed": frozenset({resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY}),
+    "session.failed": frozenset(
+        {
+            "tool_call_id",
+            resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY,
+        }
+    )
+    | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
 }
 _OVERSIZED_EVENT_PROJECTION_BYTES_KEY = "__cayu_pending_action_projection_bytes__"
 _OVERSIZED_EVENT_PROJECTION_REFERENCE = "cayu_oversized_pending_action_projection"
@@ -584,6 +591,17 @@ def _pending_action_source_reference(record: EventRecord) -> EventRecord:
     )
 
 
+def _pending_action_source_linkage(record: EventRecord) -> dict[str, str]:
+    """Retain only schema-proven linkage before bounding the source event."""
+
+    linkage: dict[str, str] = {}
+    for field_name in ("approval_id", "input_id", "tool_round_id", "tool_call_id"):
+        value = private_event_linkage_value(record.event, field_name=field_name)
+        if value is not None:
+            linkage[field_name] = value
+    return linkage
+
+
 def select_pending_action_indexed_records(
     checkpoint: dict[str, Any] | None,
     records_by_lookup_key: Mapping[str, Mapping[str, EventRecord]],
@@ -693,6 +711,7 @@ def _action_from_record(
         input_id=input_id,
         round_id=round_id,
         tool_call_id=tool_call_id,
+        source_linkage=_pending_action_source_linkage(record),
         policy_evidence=policy_evidence,
         question=question,
         options=options or [],

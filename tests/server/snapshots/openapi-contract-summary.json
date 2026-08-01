@@ -5546,7 +5546,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "5",
+          "default": "6",
           "title": "Contract Version",
           "type": "string"
         },
@@ -6326,8 +6326,8 @@
           "type": "string"
         },
         "event_id_format": {
-          "const": "session_id:event_id",
-          "default": "session_id:event_id",
+          "const": "session_id:cayu_event_<sequence>",
+          "default": "session_id:cayu_event_<sequence>",
           "title": "Event Id Format",
           "type": "string"
         },
@@ -8815,7 +8815,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "5",
+          "default": "6",
           "title": "Contract Version",
           "type": "string"
         }

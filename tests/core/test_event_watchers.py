@@ -20,7 +20,9 @@ from cayu import (
     SQLiteEventWatcherStore,
 )
 from cayu._validation import MAX_DURABLE_JSON_INTEGER, DurableValueError
+from cayu.core.events import event_durable_sequence, event_with_durable_sequence
 from cayu.runtime import InMemoryEventWatcherStore, InMemorySessionStore
+from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_event_id
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
     EventWatcherDelivery,
@@ -104,6 +106,51 @@ def test_event_watcher_store_dead_letter_methods_are_optional_for_existing_store
         asyncio.run(store.resolve_dead_letter("watcher", 1))
 
 
+def test_event_watcher_uses_public_projection_while_claim_keeps_private_identity() -> None:
+    async def scenario():
+        store = InMemorySessionStore()
+        await _create_session(store, "watcherprojection")
+        secret = "watcherlegacycanary"
+        legacy = Event(
+            id=f"private-{secret}-event",
+            type="custom.watcherlegacycanary",
+            session_id="watcherprojection",
+            payload={
+                "watcherlegacycanary": secret,
+                "safe": "visible",
+            },
+        )
+        await store.append_event(legacy.session_id, legacy)
+        records = await store.query_events(EventQuery(session_id=legacy.session_id))
+        observed: list[EventWatcherContext] = []
+        watcher_store = InMemoryEventWatcherStore()
+        app = CayuApp(
+            session_store=store,
+            event_watcher_store=watcher_store,
+            enable_logging=False,
+            secret_redactor=SecretRedactor(secret),
+        )
+        watcher = EventWatcher(
+            name="projection-watcher",
+            query=EventQuery(session_id=legacy.session_id),
+            handler=observed.append,
+        )
+
+        results = await app.run_event_watchers([watcher])
+        state = await watcher_store.load_state(watcher.name)
+        return legacy, records[0], observed[0], results[0], state
+
+    legacy, raw_record, context, result, state = asyncio.run(scenario())
+
+    assert raw_record.event.id == legacy.id
+    assert context.record.sequence == raw_record.sequence
+    assert context.record.event.id == public_event_id(raw_record.sequence)
+    assert context.record.event.type == REDACTED_CUSTOM_EVENT_TYPE
+    assert "watcherlegacycanary" not in repr(context.record.event.model_dump(mode="json"))
+    assert result.deliveries[0].event_id == public_event_id(raw_record.sequence)
+    assert state.cursor_sequence == raw_record.sequence
+
+
 async def _create_session(store: InMemorySessionStore, session_id: str = "sess_1") -> None:
     await store.create(
         RunRequest(
@@ -132,7 +179,20 @@ async def _append_event(
         payload={} if payload is None else payload,
     )
     await store.append_event(session_id, event)
-    return event
+    query = EventQuery(session_id=session_id, event_id=event.id, limit=1)
+    records = (
+        await InMemorySessionStore.query_events(store, query)
+        if isinstance(store, InMemorySessionStore)
+        else await store.query_events(query)
+    )
+    assert len(records) == 1
+    return event_with_durable_sequence(event, records[0].sequence)
+
+
+def _public_id(event: Event) -> str:
+    sequence = event_durable_sequence(event)
+    assert sequence is not None
+    return public_event_id(sequence)
 
 
 async def _assert_portable_event_watcher_store_text(store: EventWatcherStore) -> None:
@@ -233,9 +293,9 @@ def test_event_watcher_handles_matching_events_once() -> None:
         return first, handled, first_results, second_results
 
     event, handled, first_results, second_results = asyncio.run(run())
-    assert handled == [event.id]
+    assert handled == [_public_id(event)]
     assert first_results[0].deliveries[0].status is EventWatcherDeliveryStatus.SUCCEEDED
-    assert first_results[0].deliveries[0].event_id == event.id
+    assert first_results[0].deliveries[0].event_id == _public_id(event)
     assert second_results[0].deliveries == []
 
 
@@ -267,10 +327,10 @@ def test_event_watcher_fetches_matching_events_in_batches() -> None:
         return events, handled, session_store.query_event_limits, results
 
     events, handled, query_limits, results = asyncio.run(run())
-    assert handled == [event.id for event in events]
+    assert handled == [_public_id(event) for event in events]
     assert query_limits == [3]
     assert [delivery.event_id for delivery in results[0].deliveries] == [
-        event.id for event in events
+        _public_id(event) for event in events
     ]
 
 
@@ -302,10 +362,10 @@ def test_event_watcher_large_batch_uses_capped_event_query_pages() -> None:
         return events, handled, session_store.query_event_limits, results
 
     events, handled, query_limits, results = asyncio.run(run())
-    assert handled == [event.id for event in events]
+    assert handled == [_public_id(event) for event in events]
     assert query_limits == [5000, 1]
     assert [delivery.event_id for delivery in results[0].deliveries] == [
-        event.id for event in events
+        _public_id(event) for event in events
     ]
 
 
@@ -319,7 +379,7 @@ def test_event_watcher_retries_failed_event_before_later_events() -> None:
 
         async def handler(context: EventWatcherContext) -> None:
             seen.append(context.record.event.id)
-            if context.record.event.id == first.id and context.attempt == 1:
+            if context.record.event.id == _public_id(first) and context.attempt == 1:
                 raise RuntimeError("temporary email failure")
 
         app = CayuApp(
@@ -338,14 +398,17 @@ def test_event_watcher_retries_failed_event_before_later_events() -> None:
         return first, second, seen, failed, retried
 
     first, second, seen, failed, retried = asyncio.run(run())
-    assert seen == [first.id, first.id, second.id]
+    assert seen == [_public_id(first), _public_id(first), _public_id(second)]
     assert failed[0].deliveries[0].status is EventWatcherDeliveryStatus.FAILED
     assert failed[0].deliveries[0].attempt == 1
     assert [delivery.status for delivery in retried[0].deliveries] == [
         EventWatcherDeliveryStatus.SUCCEEDED,
         EventWatcherDeliveryStatus.SUCCEEDED,
     ]
-    assert [delivery.event_id for delivery in retried[0].deliveries] == [first.id, second.id]
+    assert [delivery.event_id for delivery in retried[0].deliveries] == [
+        _public_id(first),
+        _public_id(second),
+    ]
 
 
 def test_event_watcher_dead_letters_after_max_attempts_and_unblocks_cursor() -> None:
@@ -358,7 +421,7 @@ def test_event_watcher_dead_letters_after_max_attempts_and_unblocks_cursor() -> 
 
         async def handler(context: EventWatcherContext) -> None:
             handled.append(context.record.event.id)
-            if context.record.event.id == first.id:
+            if context.record.event.id == _public_id(first):
                 raise RuntimeError("permanent webhook failure")
 
         app = CayuApp(
@@ -379,13 +442,16 @@ def test_event_watcher_dead_letters_after_max_attempts_and_unblocks_cursor() -> 
         return first, second, handled, first_failure, dead_letter_then_success, state
 
     first, second, handled, first_failure, second_run, state = asyncio.run(run())
-    assert handled == [first.id, first.id, second.id]
+    assert handled == [_public_id(first), _public_id(first), _public_id(second)]
     assert first_failure[0].deliveries[0].status is EventWatcherDeliveryStatus.FAILED
     assert [delivery.status for delivery in second_run[0].deliveries] == [
         EventWatcherDeliveryStatus.DEAD_LETTERED,
         EventWatcherDeliveryStatus.SUCCEEDED,
     ]
-    assert [delivery.event_id for delivery in second_run[0].deliveries] == [first.id, second.id]
+    assert [delivery.event_id for delivery in second_run[0].deliveries] == [
+        _public_id(first),
+        _public_id(second),
+    ]
     assert state.cursor_sequence == second_run[0].deliveries[-1].event_sequence
     assert state.dead_lettered_count == 1
 
@@ -410,7 +476,7 @@ def test_sqlite_watcher_recovers_nonportable_failure_and_unblocks_later_events(
 
         async def handler(context: EventWatcherContext) -> None:
             handled.append(context.record.event.id)
-            if context.record.event.id == first.id:
+            if context.record.event.id == _public_id(first):
                 raise RuntimeError(rejected_text)
 
         watcher = EventWatcher(
@@ -463,7 +529,7 @@ def test_sqlite_watcher_recovers_nonportable_failure_and_unblocks_later_events(
     ) = asyncio.run(run())
 
     safe_error = "Event watcher failed with a non-portable diagnostic."
-    assert handled == [first.id, first.id, second.id]
+    assert handled == [_public_id(first), _public_id(first), _public_id(second)]
     assert first_result[0].deliveries[0].status is EventWatcherDeliveryStatus.FAILED
     assert first_result[0].deliveries[0].error == safe_error
     assert failed_state.delivery_status is EventWatcherDeliveryStatus.FAILED
@@ -474,8 +540,8 @@ def test_sqlite_watcher_recovers_nonportable_failure_and_unblocks_later_events(
         EventWatcherDeliveryStatus.SUCCEEDED,
     ]
     assert [delivery.event_id for delivery in recovered_result[0].deliveries] == [
-        first.id,
-        second.id,
+        _public_id(first),
+        _public_id(second),
     ]
     assert recovered_state.cursor_sequence == recovered_result[0].deliveries[-1].event_sequence
     assert recovered_state.dead_lettered_count == 1
@@ -493,7 +559,15 @@ def test_event_watcher_redacts_failure_before_all_durable_representations(
     async def run():
         session_store = InMemorySessionStore()
         await _create_session(session_store)
-        await _append_event(session_store, payload={"number": 1})
+        event = Event(
+            id=f"legacy-{secret}-event",
+            type=EventType.BUDGET_LIMIT_REACHED,
+            session_id="sess_1",
+            payload={"number": 1},
+        )
+        await session_store.append_event(event.session_id, event)
+        records = await session_store.query_events(EventQuery(session_id=event.session_id))
+        assert len(records) == 1
         watcher_store = (
             InMemoryEventWatcherStore()
             if store_kind == "memory"
@@ -513,20 +587,28 @@ def test_event_watcher_redacts_failure_before_all_durable_representations(
             name="redacted-watcher",
             query=EventQuery(event_type=EventType.BUDGET_LIMIT_REACHED),
             handler=handler,
-            max_attempts=1,
+            max_attempts=2,
         )
-        results = await app.run_event_watchers([watcher])
+        failed_results = await app.run_event_watchers([watcher])
+        dead_letter_results = await app.run_event_watchers([watcher])
         state = await watcher_store.load_state(watcher.name)
         dead_letters = await watcher_store.list_dead_letters(watcher.name)
         if isinstance(watcher_store, SQLiteEventWatcherStore):
             await watcher_store.close()
-        return results, state, dead_letters
+        return records[0], failed_results, dead_letter_results, state, dead_letters
 
-    results, state, dead_letters = asyncio.run(run())
-    rendered = repr((results, state, dead_letters))
+    raw_record, failed_results, dead_letter_results, state, dead_letters = asyncio.run(run())
+    public_id = public_event_id(raw_record.sequence)
 
-    assert secret not in rendered
-    assert REDACTED_SECRET in rendered
+    assert failed_results[0].deliveries[0].event_id == public_id
+    assert failed_results[0].deliveries[0].status is EventWatcherDeliveryStatus.FAILED
+    assert dead_letter_results[0].deliveries[0].event_id == public_id
+    assert dead_letter_results[0].deliveries[0].status is EventWatcherDeliveryStatus.DEAD_LETTERED
+    assert secret not in repr((failed_results, dead_letter_results, state))
+    assert REDACTED_SECRET in repr((failed_results, dead_letter_results, state))
+    assert len(dead_letters) == 1
+    assert dead_letters[0].event_id == raw_record.event.id
+    assert secret not in dead_letters[0].error
 
 
 def test_event_watcher_records_handler_error_with_broken_stringification() -> None:
@@ -750,9 +832,9 @@ def test_sqlite_event_watcher_store_persists_cursor(tmp_path: Path) -> None:
         return first, second, handled, first_result, second_result, state
 
     first, second, handled, first_result, second_result, state = asyncio.run(run())
-    assert handled == [first.id, second.id]
-    assert [delivery.event_id for delivery in first_result[0].deliveries] == [first.id]
-    assert [delivery.event_id for delivery in second_result[0].deliveries] == [second.id]
+    assert handled == [_public_id(first), _public_id(second)]
+    assert [delivery.event_id for delivery in first_result[0].deliveries] == [_public_id(first)]
+    assert [delivery.event_id for delivery in second_result[0].deliveries] == [_public_id(second)]
     assert state.cursor_sequence == second_result[0].deliveries[-1].event_sequence
 
 
@@ -839,9 +921,9 @@ def test_postgres_event_watcher_store_persists_cursor(postgres_dsn: str) -> None
         return first, second, handled, first_result, second_result, state
 
     first, second, handled, first_result, second_result, state = asyncio.run(run())
-    assert handled == [first.id, second.id]
-    assert [delivery.event_id for delivery in first_result[0].deliveries] == [first.id]
-    assert [delivery.event_id for delivery in second_result[0].deliveries] == [second.id]
+    assert handled == [_public_id(first), _public_id(second)]
+    assert [delivery.event_id for delivery in first_result[0].deliveries] == [_public_id(first)]
+    assert [delivery.event_id for delivery in second_result[0].deliveries] == [_public_id(second)]
     assert state.cursor_sequence == second_result[0].deliveries[-1].event_sequence
 
 
@@ -916,7 +998,7 @@ async def _dead_letter_first_event(app: CayuApp) -> tuple[Event, Event]:
     second = await _append_event(session_store, payload={"number": 2})
 
     async def handler(context: EventWatcherContext) -> None:
-        if context.record.event.id == first.id:
+        if context.record.event.id == _public_id(first):
             raise RuntimeError("permanent webhook failure")
 
     watcher = EventWatcher(

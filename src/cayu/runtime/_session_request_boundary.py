@@ -7,6 +7,7 @@ from typing import Any
 from cayu.core.messages import Message
 from cayu.runtime._message_redaction import redact_message_for_boundary
 from cayu.runtime.approvals import ResolutionActor
+from cayu.runtime.public_authority import public_authority_alias_is_reserved
 from cayu.runtime.sessions import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
@@ -20,6 +21,7 @@ from cayu.runtime.sessions import (
     copy_interrupt_session_request,
     copy_resume_request,
     copy_run_request,
+    run_request_authority_is_runtime_generated,
 )
 from cayu.runtime.structured_output import require_secret_free_structured_output_spec
 from cayu.vaults import SecretRedactor
@@ -33,6 +35,16 @@ def prepare_run_request(
     """Return a request safe to use as the source of a durable session."""
 
     request = copy_run_request(request)
+    if (
+        request.session_id is not None
+        and public_authority_alias_is_reserved(request.session_id)
+        and not run_request_authority_is_runtime_generated(
+            request,
+            field_name="session_id",
+            value=request.session_id,
+        )
+    ):
+        raise ValueError("session_id uses the reserved public-authority alias namespace.")
     require_secret_free_structured_output_spec(
         request.structured_output,
         redactor=redactor,
@@ -40,10 +52,6 @@ def prepare_run_request(
     )
     for field_name in (
         "agent_name",
-        "session_id",
-        "parent_session_id",
-        "causal_budget_id",
-        "task_id",
         "task_worker_id",
         "provider_name",
         "model",
@@ -51,6 +59,26 @@ def prepare_run_request(
     ):
         require_secret_free_session_authority(
             getattr(request, field_name),
+            field_name=field_name,
+            redactor=redactor,
+        )
+    for field_name in (
+        "session_id",
+        "task_id",
+        "parent_session_id",
+        "causal_budget_id",
+    ):
+        value = getattr(request, field_name)
+        require_runtime_generated_or_secret_free_session_authority(
+            value,
+            runtime_generated=bool(
+                value is not None
+                and run_request_authority_is_runtime_generated(
+                    request,
+                    field_name=field_name,
+                    value=value,
+                )
+            ),
             field_name=field_name,
             redactor=redactor,
         )
@@ -79,6 +107,7 @@ def prepare_resume_request(
     request: ResumeRequest,
     *,
     redactor: SecretRedactor,
+    store_resolved_session_id: str | None = None,
 ) -> ResumeRequest:
     request = copy_resume_request(request)
     require_secret_free_structured_output_spec(
@@ -86,7 +115,13 @@ def prepare_resume_request(
         redactor=redactor,
         field_name="ResumeRequest.structured_output",
     )
-    for field_name in ("session_id", "model"):
+    require_store_resolved_or_secret_free_session_authority(
+        request.session_id,
+        store_resolved_value=store_resolved_session_id,
+        field_name="session_id",
+        redactor=redactor,
+    )
+    for field_name in ("model",):
         require_secret_free_session_authority(
             getattr(request, field_name),
             field_name=field_name,
@@ -112,9 +147,16 @@ def prepare_compact_session_request(
     request: CompactSessionRequest,
     *,
     redactor: SecretRedactor,
+    store_resolved_session_id: str | None = None,
 ) -> CompactSessionRequest:
     request = copy_compact_session_request(request)
-    for field_name in ("session_id", "idempotency_key"):
+    require_store_resolved_or_secret_free_session_authority(
+        request.session_id,
+        store_resolved_value=store_resolved_session_id,
+        field_name="session_id",
+        redactor=redactor,
+    )
+    for field_name in ("idempotency_key",):
         require_secret_free_session_authority(
             getattr(request, field_name),
             field_name=field_name,
@@ -150,10 +192,12 @@ def prepare_interrupt_session_request(
     request: InterruptSessionRequest,
     *,
     redactor: SecretRedactor,
+    store_resolved_session_id: str | None = None,
 ) -> InterruptSessionRequest:
     request = copy_interrupt_session_request(request)
-    require_secret_free_session_authority(
+    require_store_resolved_or_secret_free_session_authority(
         request.session_id,
+        store_resolved_value=store_resolved_session_id,
         field_name="session_id",
         redactor=redactor,
     )
@@ -178,15 +222,18 @@ def prepare_fork_session_request(
     request: ForkSessionRequest,
     *,
     redactor: SecretRedactor,
+    store_resolved_source_session_id: str | None = None,
 ) -> ForkSessionRequest:
     request = copy_fork_session_request(request)
-    for field_name in (
-        "source_session_id",
-        "session_id",
-        "agent_name",
-        "model",
-        "environment_name",
-    ):
+    if public_authority_alias_is_reserved(request.session_id):
+        raise ValueError("session_id uses the reserved public-authority alias namespace.")
+    require_store_resolved_or_secret_free_session_authority(
+        request.source_session_id,
+        store_resolved_value=store_resolved_source_session_id,
+        field_name="source_session_id",
+        redactor=redactor,
+    )
+    for field_name in ("session_id", "agent_name", "model", "environment_name"):
         require_secret_free_session_authority(
             getattr(request, field_name),
             field_name=field_name,
@@ -207,9 +254,17 @@ def prepare_enqueue_message_request(
     request: EnqueueSessionMessageRequest,
     *,
     redactor: SecretRedactor,
+    store_resolved_session_id: str | None = None,
 ) -> EnqueueSessionMessageRequest:
     request = copy_enqueue_session_message_request(request)
-    for field_name in ("session_id", "idempotency_key"):
+    require_store_resolved_or_secret_free_session_authority(
+        request.session_id,
+        store_resolved_value=store_resolved_session_id,
+        field_name="session_id",
+        redactor=redactor,
+        authority_kind="durable queued-message authority",
+    )
+    for field_name in ("idempotency_key",):
         require_secret_free_session_authority(
             getattr(request, field_name),
             field_name=field_name,
@@ -240,6 +295,57 @@ def require_secret_free_session_authority(
         raise ValueError(
             f"{field_name} contains a workload secret and cannot be used as {authority_kind}."
         )
+
+
+def require_store_resolved_or_secret_free_session_authority(
+    value: str,
+    *,
+    store_resolved_value: str | None,
+    field_name: str,
+    redactor: SecretRedactor,
+    authority_kind: str = "durable session authority",
+) -> None:
+    """Accept exact store-resolved authority or validate ordinary caller authority."""
+
+    if store_resolved_value is not None:
+        if value != store_resolved_value:
+            raise ValueError(f"{field_name} does not match store-resolved session authority.")
+        if redactor.is_exact_secret(value):
+            raise ValueError(
+                f"{field_name} contains a workload secret and cannot be used as {authority_kind}."
+            )
+        return
+    require_secret_free_session_authority(
+        value,
+        field_name=field_name,
+        redactor=redactor,
+        authority_kind=authority_kind,
+    )
+
+
+def require_runtime_generated_or_secret_free_session_authority(
+    value: str | None,
+    *,
+    runtime_generated: bool,
+    field_name: str,
+    redactor: SecretRedactor,
+) -> None:
+    """Accept exact runtime-generated authority without trusting caller input."""
+
+    if runtime_generated:
+        if type(value) is not str:
+            raise ValueError(f"{field_name} does not match runtime-generated authority.")
+        if redactor.is_exact_secret(value):
+            raise ValueError(
+                f"{field_name} contains a workload secret and cannot be used as "
+                "durable session authority."
+            )
+        return
+    require_secret_free_session_authority(
+        value,
+        field_name=field_name,
+        redactor=redactor,
+    )
 
 
 def redact_json_object(

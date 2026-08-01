@@ -13,7 +13,11 @@ from examples.aws.lambda_microvm_agent.runtime import (
     build_runtime,
 )
 
-from cayu import PostgresSessionStore, PostgresTaskStore
+from cayu import (
+    PostgresSessionStore,
+    PostgresTaskStore,
+    public_authority_alias_codec_from_environment,
+)
 from cayu.server import BasicAuth, ServerConfig, create_server
 from cayu.storage.migrations import SchemaMode
 
@@ -24,7 +28,11 @@ def create_application() -> Any:
     runtime = build_runtime(config)
     cayu_app = build_app(
         runtime,
-        session_store=PostgresSessionStore(conninfo, schema_mode=SchemaMode.MIGRATE),
+        session_store=PostgresSessionStore(
+            conninfo,
+            schema_mode=SchemaMode.MIGRATE,
+            public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+        ),
         task_store=PostgresTaskStore(conninfo, schema_mode=SchemaMode.MIGRATE),
     )
     auth = BasicAuth(

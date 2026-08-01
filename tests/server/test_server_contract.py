@@ -153,8 +153,8 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert response.status_code == 200
     body = response.json()
     assert body["api_prefix"] == "/api"
-    assert body["contract_version"] == "5"
-    assert body["versioning"]["contract_version"] == "5"
+    assert body["contract_version"] == "6"
+    assert body["versioning"]["contract_version"] == "6"
     assert body["versioning"]["breaking_change_requires"] == [
         "openapi_snapshot_update",
         "client_regeneration",
@@ -355,7 +355,7 @@ def test_system_diagnostics_reports_bounded_protected_framework_state(tmp_path) 
         "dashboard_enabled": True,
         "docs_enabled": False,
     }
-    assert body["versions"]["server_contract"] == "5"
+    assert body["versions"]["server_contract"] == "6"
     assert body["versions"]["cayu"] == body["capabilities"]["cayu_version"]
     assert body["capabilities"]["actor"] == {
         "subject": "operator-a",
@@ -767,6 +767,11 @@ def test_sse_replay_markers_distinguish_events_from_explicit_start() -> None:
         "tenant:session_1:",
         expected_session_id="tenant:session_1",
     ) == ("tenant:session_1", None)
+    assert parse_last_event_id(
+        "legacy-[REDACTED_SECRET]:session:cayu_event_1",
+        expected_session_id="legacy-private:session",
+        public_session_id="legacy-[REDACTED_SECRET]:session",
+    ) == ("legacy-[REDACTED_SECRET]:session", "cayu_event_1")
     assert parse_last_event_id(":event_1") is None
     assert parse_last_event_id(" session_1:event_1") is None
     assert parse_last_event_id("session_1:event_1\n") is None

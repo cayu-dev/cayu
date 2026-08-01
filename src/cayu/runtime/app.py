@@ -36,7 +36,12 @@ from cayu.artifacts import (
     validate_file_attachment_content_type,
 )
 from cayu.core.agents import AgentSpec
-from cayu.core.events import Event, EventType
+from cayu.core.events import (
+    Event,
+    EventType,
+    event_durable_sequence,
+    event_with_durable_sequence,
+)
 from cayu.core.messages import (
     FilePart,
     Message,
@@ -60,11 +65,21 @@ from cayu.providers import (
 )
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _session_request_boundary as session_request_boundary
 from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._environment_lifecycle import (
     DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
     EnvironmentLifecycle,
+)
+from cayu.runtime._event_projection import (
+    PUBLIC_EVENT_ID_PREFIX,
+    private_event_linkage_value,
+    project_runtime_event,
+    public_event_envelope_alias,
+    public_event_id,
+    public_event_linkage_id,
+    public_event_linkage_sequence,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._interruption_coordinator import (
@@ -176,6 +191,12 @@ from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,
     copy_mcp_manifest_policy,
 )
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+    parse_public_authority_alias,
+    public_authority_alias_is_reserved,
+)
 from cayu.runtime.retry_policy import (
     RetryPolicy,
     copy_retry_policy,
@@ -184,6 +205,7 @@ from cayu.runtime.sessions import (
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
+    EventOrder,
     EventQuery,
     EventRecord,
     ForkSessionRequest,
@@ -193,6 +215,8 @@ from cayu.runtime.sessions import (
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
+    PendingActionQuery,
+    PendingActionResultTooLarge,
     ResumeRequest,
     RunRequest,
     Session,
@@ -411,6 +435,7 @@ class CayuApp:
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
         secret_redactor: SecretRedactor | None = None,
+        public_authority_alias_keyring: PublicAuthorityAliasKeyring | None = None,
         max_file_attachment_bytes: int = DEFAULT_MAX_FILE_ATTACHMENT_BYTES,
         max_total_file_attachment_bytes: int = DEFAULT_MAX_TOTAL_FILE_ATTACHMENT_BYTES,
         max_file_attachments_per_request: int = DEFAULT_MAX_FILE_ATTACHMENTS_PER_REQUEST,
@@ -438,6 +463,11 @@ class CayuApp:
             raise TypeError("event_watcher_store must be an EventWatcherStore.")
         if secret_redactor is not None and not isinstance(secret_redactor, SecretRedactor):
             raise TypeError("secret_redactor must be a SecretRedactor.")
+        if public_authority_alias_keyring is not None and not isinstance(
+            public_authority_alias_keyring,
+            PublicAuthorityAliasKeyring,
+        ):
+            raise TypeError("public_authority_alias_keyring must be a PublicAuthorityAliasKeyring.")
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
@@ -448,6 +478,11 @@ class CayuApp:
         context_counting_config = copy_context_counting_config(context_counting)
         resolved_secret_redactor = (
             secret_redactor if secret_redactor is not None else SecretRedactor()
+        )
+        configured_alias_codec = (
+            None
+            if public_authority_alias_keyring is None
+            else PublicAuthorityAliasCodec(public_authority_alias_keyring)
         )
         if event_sinks is None:
             sinks = []
@@ -489,7 +524,27 @@ class CayuApp:
             max_environment_lifecycle_owners,
             "max_environment_lifecycle_owners",
         )
-        self.session_store = session_store if session_store is not None else InMemorySessionStore()
+        self.session_store = (
+            session_store
+            if session_store is not None
+            else InMemorySessionStore(
+                public_authority_alias_codec=configured_alias_codec,
+            )
+        )
+        store_alias_codec = self.session_store.public_authority_alias_codec
+        if configured_alias_codec is not None and store_alias_codec != configured_alias_codec:
+            raise ValueError(
+                "session_store and CayuApp must use the same public authority alias keyring."
+            )
+        self._public_authority_alias_codec = store_alias_codec or configured_alias_codec
+        if resolved_secret_redactor.has_values and (
+            self._public_authority_alias_codec is None
+            or not self.session_store.supports_public_authority_aliases
+        ):
+            raise ValueError(
+                "A secret-redacting CayuApp requires a SessionStore configured with "
+                "durable public authority aliases and an explicit alias keyring."
+            )
         self._runtime_session_store = runtime_checkpoint_session_store(self.session_store)
         self.task_store = task_store
         self.knowledge_store = knowledge_store
@@ -525,6 +580,7 @@ class CayuApp:
             budget_store=self.budget_store,
             event_sinks=self._event_sinks,
             secret_redactor=self._secret_redactor,
+            public_authority_alias_codec=self._public_authority_alias_codec,
         )
         self._environment_lifecycle = EnvironmentLifecycle(
             session_store=self._runtime_session_store,
@@ -662,6 +718,354 @@ class CayuApp:
         """Return a JSON-compatible value with configured secret values redacted."""
         return self._secret_redactor.redact_json(value)
 
+    def project_event_record_for_exposure(self, record: EventRecord) -> EventRecord:
+        """Return the canonical public view of one private durable event record."""
+
+        if type(record) is not EventRecord:
+            raise TypeError("record must be an EventRecord.")
+        return EventRecord(
+            sequence=record.sequence,
+            event=project_runtime_event(
+                record.event,
+                sequence=record.sequence,
+                redactor=self._secret_redactor,
+                public_authority_alias_codec=self._public_authority_alias_codec,
+            ),
+        )
+
+    async def _project_emitted_event_for_public_api(self, event: Event) -> Event:
+        """Project one emitted private event at the public application boundary."""
+
+        sequence = event_durable_sequence(event)
+        if sequence is None:
+            records = await self.session_store.query_events(
+                EventQuery(session_id=event.session_id, event_id=event.id, limit=2)
+            )
+            if len(records) != 1:
+                raise RuntimeError(
+                    "Runtime event has no unique durable record for public projection."
+                )
+            sequence = records[0].sequence
+            event = records[0].event
+        projected = project_runtime_event(
+            event,
+            sequence=sequence,
+            redactor=self._secret_redactor,
+            public_authority_alias_codec=self._public_authority_alias_codec,
+        )
+        return event_with_durable_sequence(projected, sequence)
+
+    async def _project_incomplete_recovery_result_for_public_api(
+        self,
+        result: IncompleteSessionRecoveryResult,
+    ) -> IncompleteSessionRecoveryResult:
+        """Project recovery events and their actionable pending identifiers together."""
+
+        projected_events = tuple(
+            [await self._project_emitted_event_for_public_api(event) for event in result.events]
+        )
+        updates: dict[str, Any] = {
+            "events": projected_events,
+            "session_id": self.project_session_id_for_exposure(result.session_id),
+        }
+        unavailable_linkage: list[str] = []
+        for result_field, event_field in (
+            ("pending_approval_id", "approval_id"),
+            ("pending_user_input_id", "input_id"),
+        ):
+            private_value = getattr(result, result_field)
+            if private_value is None:
+                continue
+            aliases = [
+                public_event_linkage_id(sequence, event_field)
+                for private_event, public_event in zip(
+                    result.events,
+                    projected_events,
+                    strict=True,
+                )
+                if private_event_linkage_value(
+                    private_event,
+                    field_name=event_field,
+                )
+                == private_value
+                and (sequence := event_durable_sequence(public_event)) is not None
+            ]
+            if not aliases:
+                try:
+                    records = await self.session_store.query_events(
+                        EventQuery(
+                            session_id=result.session_id,
+                            order_by=EventOrder.SEQUENCE_DESC,
+                            limit=5000,
+                        )
+                    )
+                except Exception:
+                    records = []
+                aliases = [
+                    public_event_linkage_id(record.sequence, event_field)
+                    for record in reversed(records)
+                    if private_event_linkage_value(
+                        record.event,
+                        field_name=event_field,
+                    )
+                    == private_value
+                ]
+            if not aliases:
+                # Recovery has already committed before this public projection
+                # boundary. A bounded legacy-history lookup may not locate an old
+                # linkage record, but that must not turn the committed recovery
+                # into a reported failure or expose the private action ID. Return
+                # a safe non-actionable representation and an explicit diagnostic
+                # in the result message instead.
+                updates[result_field] = None
+                unavailable_linkage.append(result_field)
+                continue
+            updates[result_field] = aliases[-1]
+        if unavailable_linkage:
+            fields = ", ".join(unavailable_linkage)
+            updates["message"] = (
+                f"{result.message} Public linkage unavailable for: {fields}; "
+                "inspect pending session actions before continuing."
+            )
+        return result.model_copy(update=updates, deep=True)
+
+    def project_session_id_for_exposure(self, value: str) -> str:
+        """Project private session authority to one stable public identifier."""
+
+        value = require_clean_nonblank(value, "session_id")
+        if self._secret_redactor.redact_text(value) == value:
+            return value
+        return public_event_envelope_alias(
+            value,
+            field_name="session_id",
+            codec=self._require_public_authority_alias_codec(),
+        )
+
+    def project_causal_budget_id_for_exposure(
+        self,
+        value: str,
+        *,
+        session_ids: Iterable[str],
+    ) -> str:
+        """Project session authority or redact an opaque causal-budget label."""
+
+        value = require_clean_nonblank(value, "causal_budget_id")
+        if any(
+            require_clean_nonblank(session_id, "session_id") == value for session_id in session_ids
+        ):
+            return self.project_session_id_for_exposure(value)
+        return self._secret_redactor.redact_text(value)
+
+    def project_interaction_id_for_exposure(
+        self,
+        value: str,
+        *,
+        session_id: str,
+    ) -> str:
+        """Project private interaction authority to one stable public identifier."""
+
+        value = require_clean_nonblank(value, "interaction_id")
+        if self._secret_redactor.redact_text(value) == value:
+            return value
+        return public_event_envelope_alias(
+            value,
+            field_name="interaction_id",
+            codec=self._require_public_authority_alias_codec(),
+            session_id=require_clean_nonblank(session_id, "session_id"),
+        )
+
+    def _require_public_authority_alias_codec(self) -> PublicAuthorityAliasCodec:
+        codec = self._public_authority_alias_codec
+        if codec is None:
+            raise RuntimeError(
+                "Secret-bearing public authority requires a configured alias keyring."
+            )
+        return codec
+
+    async def _resolve_public_action_linkage(
+        self,
+        *,
+        session_id: str,
+        value: str,
+        field_name: str,
+    ) -> str:
+        """Resolve one public event alias back to private durable authority.
+
+        The alias selects a record and schema field only. The durable event,
+        rather than the caller-provided alias, remains the authority used by
+        approval, input, and recovery operations.
+        """
+
+        if not value.startswith(PUBLIC_EVENT_ID_PREFIX):
+            return value
+        try:
+            pending = await self.session_store.query_pending_actions(
+                PendingActionQuery(session_id=session_id, limit=200)
+            )
+        except PendingActionResultTooLarge as exc:
+            raise ValueError(
+                f"{field_name} cannot be disambiguated from legacy private "
+                "authority because the pending-action evidence is too large."
+            ) from exc
+        action_field_name = (
+            "round_id" if field_name in {"round_id", "tool_round_id"} else field_name
+        )
+        raw_match = any(
+            getattr(action, action_field_name, None) == value for action in pending.actions
+        )
+        sequence = public_event_linkage_sequence(value, field_name=field_name)
+        if sequence is None:
+            if raw_match:
+                return value
+            raise ValueError(f"Public {field_name} alias is malformed or field-mismatched.")
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                after_sequence=sequence - 1,
+                limit=1,
+            )
+        )
+        if (
+            not records
+            or records[0].sequence != sequence
+            or records[0].event.session_id != session_id
+        ):
+            raise ValueError(f"Public {field_name} alias was not found in the requested session.")
+        private_value = private_event_linkage_value(
+            records[0].event,
+            field_name=field_name,
+        )
+        if private_value is None:
+            raise ValueError(f"Public {field_name} alias has no private durable authority.")
+        if raw_match and private_value != value:
+            raise ValueError(
+                f"{field_name} is ambiguous between legacy private authority "
+                "and a public event alias."
+            )
+        return private_value
+
+    async def _resolve_public_session_id(self, value: str) -> str:
+        """Resolve a stable public session alias to private store authority."""
+
+        private_value, _store_resolved_value = await self._resolve_public_session_authority(value)
+        return private_value
+
+    async def _resolve_public_causal_budget_id(self, value: str) -> str:
+        """Disambiguate raw causal-budget authority from a public session alias."""
+
+        return await self._resolve_public_session_backed_filter(
+            value,
+            field_name="causal_budget_id",
+        )
+
+    async def _resolve_public_parent_session_id(self, value: str) -> str:
+        """Disambiguate raw parent authority from a public session alias."""
+
+        return await self._resolve_public_session_backed_filter(
+            value,
+            field_name="parent_session_id",
+        )
+
+    async def _resolve_public_session_backed_filter(
+        self,
+        value: str,
+        *,
+        field_name: str,
+    ) -> str:
+        """Resolve a public session alias while preserving matching legacy linkage."""
+
+        if field_name not in {"causal_budget_id", "parent_session_id"}:
+            raise ValueError("Unsupported session-backed authority filter.")
+        value = require_clean_nonblank(value, field_name)
+        parsed = parse_public_authority_alias(value)
+        if parsed is None or parsed.field_name != "session_id":
+            return value
+
+        query = (
+            SessionQuery(causal_budget_id=value, limit=1)
+            if field_name == "causal_budget_id"
+            else SessionQuery(parent_session_id=value, limit=1)
+        )
+        raw_match = bool((await self.session_store.list_sessions(query)).sessions)
+        private_value = await self.session_store.resolve_public_authority_alias(
+            value,
+            field_name="session_id",
+        )
+        if private_value is None:
+            if raw_match:
+                return value
+            raise ValueError(f"Public {field_name} alias was not found.")
+        if raw_match and private_value != value:
+            raise ValueError(
+                f"{field_name} is ambiguous between legacy private authority "
+                "and a public session alias."
+            )
+        return value if raw_match else private_value
+
+    async def _resolve_public_session_authority(
+        self,
+        value: str,
+    ) -> tuple[str, str | None]:
+        """Return private authority plus positive store-resolution evidence."""
+
+        if not public_authority_alias_is_reserved(value):
+            return value, None
+        raw_session = await self.session_store.load(value)
+        parsed = parse_public_authority_alias(value)
+        if parsed is None or parsed.field_name != "session_id":
+            if raw_session is not None:
+                return value, value
+            raise ValueError("Public session_id alias is malformed or field-mismatched.")
+        private_value = await self.session_store.resolve_public_authority_alias(
+            value,
+            field_name="session_id",
+        )
+        if private_value is None:
+            if raw_session is not None:
+                return value, value
+            raise ValueError("Public session_id alias was not found.")
+        if raw_session is not None and private_value != value:
+            raise ValueError(
+                "session_id is ambiguous between legacy private authority and a public event alias."
+            )
+        return private_value, private_value
+
+    async def _resolve_public_interaction_id(
+        self,
+        *,
+        session_id: str,
+        value: str,
+    ) -> str:
+        """Resolve a stable interaction alias inside one private session."""
+
+        if not public_authority_alias_is_reserved(value):
+            return value
+        raw_value_exists = await self.session_store.public_authority_private_value_exists(
+            value,
+            field_name="interaction_id",
+            scope_session_id=session_id,
+        )
+        parsed = parse_public_authority_alias(value)
+        if parsed is None or parsed.field_name != "interaction_id":
+            if raw_value_exists:
+                return value
+            raise ValueError("Public interaction_id alias is malformed or field-mismatched.")
+        private_value = await self.session_store.resolve_public_authority_alias(
+            value,
+            field_name="interaction_id",
+            scope_session_id=session_id,
+        )
+        if private_value is None:
+            if raw_value_exists:
+                return value
+            raise ValueError("Public interaction_id alias was not found in the requested session.")
+        if raw_value_exists and private_value != value:
+            raise ValueError(
+                "interaction_id is ambiguous between legacy private authority "
+                "and a public event alias."
+            )
+        return private_value
+
     def redact_exception_diagnostic(
         self,
         error: BaseException,
@@ -731,7 +1135,9 @@ class CayuApp:
         )
 
     async def interruption_cascade_status(self, session_id: str) -> str:
-        session_id = require_clean_nonblank(session_id, "session_id")
+        session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
         return await self._session_engine.interruption_cascade_status(session_id=session_id)
 
     def register_agent(
@@ -1215,6 +1621,12 @@ class CayuApp:
         return copy_retry_policy(self._default_retry_policy)
 
     async def run(self, request: RunRequest) -> AsyncIterator[Event]:
+        stream = self._run_private(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _run_private(self, request: RunRequest) -> AsyncGenerator[Event, None]:
         if type(request) is not RunRequest:
             raise TypeError("Runtime run requires a RunRequest.")
         request = _validate_run_request(request)
@@ -1226,8 +1638,31 @@ class CayuApp:
     async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        stream = self._resume_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _resume_private(
+        self,
+        request: ResumeRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ResumeRequest:
+            raise TypeError("Runtime resume requires a ResumeRequest.")
         request = _validate_resume_request(request)
-        stream = self._session_engine.resume(request=request)
+        stream = self._session_engine.resume(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -1238,7 +1673,30 @@ class CayuApp:
     ) -> AsyncIterator[Event]:
         if type(request) is not CompactSessionRequest:
             raise TypeError("Runtime compaction requires a CompactSessionRequest.")
-        stream = self._session_engine.compact_session(request=request)
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        stream = self._compact_session_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _compact_session_private(
+        self,
+        request: CompactSessionRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not CompactSessionRequest:
+            raise TypeError("Runtime compaction requires a CompactSessionRequest.")
+        stream = self._session_engine.compact_session(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -1249,18 +1707,87 @@ class CayuApp:
     ) -> EnqueueSessionMessageResult:
         if type(request) is not EnqueueSessionMessageRequest:
             raise TypeError("Runtime queued input requires an EnqueueSessionMessageRequest.")
-        return await self._session_engine.enqueue_session_message(request=request)
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        result = await self._enqueue_session_message_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        event = await self._project_emitted_event_for_public_api(result.event)
+        return result.model_copy(
+            update={
+                "event": event,
+                "message": result.message.model_copy(
+                    update={"accepted_event_id": event.id},
+                    deep=True,
+                ),
+            },
+            deep=True,
+        )
+
+    async def _enqueue_session_message_private(
+        self,
+        request: EnqueueSessionMessageRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> EnqueueSessionMessageResult:
+        if type(request) is not EnqueueSessionMessageRequest:
+            raise TypeError("Runtime queued input requires an EnqueueSessionMessageRequest.")
+        return await self._session_engine.enqueue_session_message(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
 
     async def interrupt_session(self, request: InterruptSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not InterruptSessionRequest:
             raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        stream = self._interrupt_session_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _interrupt_session_private(
+        self,
+        request: InterruptSessionRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not InterruptSessionRequest:
+            raise TypeError("Runtime interruption requires an InterruptSessionRequest.")
         request = copy_interrupt_session_request(request)
-        stream = self._session_engine.interrupt_session(request=request)
+        stream = self._session_engine.interrupt_session(
+            request=request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
 
     async def recover_incomplete_session(
+        self,
+        request: IncompleteSessionRecoveryRequest,
+    ) -> IncompleteSessionRecoveryResult:
+        if type(request) is not IncompleteSessionRecoveryRequest:
+            raise TypeError(
+                "Runtime incomplete-session recovery requires an IncompleteSessionRecoveryRequest."
+            )
+        request = request.model_copy(
+            update={"session_id": await self._resolve_public_session_id(request.session_id)},
+            deep=True,
+        )
+        result = await self._recover_incomplete_session_private(request)
+        return await self._project_incomplete_recovery_result_for_public_api(result)
+
+    async def _recover_incomplete_session_private(
         self,
         request: IncompleteSessionRecoveryRequest,
     ) -> IncompleteSessionRecoveryResult:
@@ -1305,6 +1832,16 @@ class CayuApp:
         Healthy terminal inspection candidates are omitted from the result and
         do not consume ``request.limit``.
         """
+        page = await self._recover_incomplete_sessions_private(request)
+        projected: list[IncompleteSessionRecoveryResult] = []
+        for result in page.results:
+            projected.append(await self._project_incomplete_recovery_result_for_public_api(result))
+        return page.model_copy(update={"results": tuple(projected)}, deep=True)
+
+    async def _recover_incomplete_sessions_private(
+        self,
+        request: IncompleteSessionsRecoveryRequest,
+    ) -> IncompleteSessionsRecoveryPage:
         request = copy_incomplete_sessions_recovery_request(request)
         return await self._session_engine.recover_incomplete_sessions(request)
 
@@ -1312,11 +1849,42 @@ class CayuApp:
         if type(request) is not DispatchRequest:
             raise TypeError("Runtime dispatch requires a DispatchRequest.")
         request = copy_dispatch_request(request)
+        # Resolve at the public boundary to reject malformed or unknown aliases. Keep
+        # the public request value across dispatcher boundaries so durable queues do
+        # not persist private session authority; dispatch_inline resolves it again in
+        # the worker that owns execution.
+        private_session_id, _ = await self._resolve_public_session_authority(request.session_id)
         handle = await self.dispatcher.submit(self, request)
         _validate_dispatch_handle_for_request(handle=handle, request=request)
-        return copy_dispatch_handle(handle)
+        copied = copy_dispatch_handle(handle)
+        return copied.model_copy(
+            update={
+                "session_id": self.project_session_id_for_exposure(private_session_id),
+            },
+            deep=True,
+        )
 
     async def dispatch_inline(self, request: DispatchRequest) -> AsyncIterator[Event]:
+        if type(request) is not DispatchRequest:
+            raise TypeError("Inline dispatch requires a DispatchRequest.")
+        session_id, store_resolved_session_id = await self._resolve_public_session_authority(
+            request.session_id
+        )
+        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        stream = self._dispatch_inline_private(
+            request,
+            store_resolved_session_id=store_resolved_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _dispatch_inline_private(
+        self,
+        request: DispatchRequest,
+        *,
+        store_resolved_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
         if type(request) is not DispatchRequest:
             raise TypeError("Inline dispatch requires a DispatchRequest.")
         request = copy_dispatch_request(request)
@@ -1334,6 +1902,11 @@ class CayuApp:
             structured_output=request.structured_output,
             thinking=request.thinking,
             loop_policies=request.loop_policies,
+        )
+        resume_request = session_request_boundary.prepare_resume_request(
+            resume_request,
+            redactor=self._secret_redactor,
+            store_resolved_session_id=store_resolved_session_id,
         )
         start_event_payload_extra = {"dispatch_id": request.dispatch_id}
         if request.task_id is not None:
@@ -1403,18 +1976,24 @@ class CayuApp:
         return await self.task_store.resume_task(task_id)
 
     async def get_session_usage(self, session_id: str) -> SessionUsageSummary:
-        session_id = require_clean_nonblank(session_id, "session_id")
+        session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
         events = await self._run_limit_controller.session_usage_events(session_id)
-        return session_usage_summary(session_id, events)
+        summary = session_usage_summary(session_id, events)
+        return summary.model_copy(
+            update={"session_id": self.project_session_id_for_exposure(session_id)},
+            deep=True,
+        )
 
     async def get_causal_budget_usage(
         self,
         causal_budget_id: str,
     ) -> CausalBudgetUsageSummary:
-        causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+        causal_budget_id = await self._resolve_public_causal_budget_id(causal_budget_id)
         sessions = await self._list_all_sessions(
             SessionQuery(
                 causal_budget_id=causal_budget_id,
@@ -1422,7 +2001,7 @@ class CayuApp:
             )
         )
         if not sessions:
-            raise KeyError(f"Causal budget not found: {causal_budget_id}") from None
+            raise KeyError("Causal budget not found") from None
         records = await self._query_all_event_records(
             EventQuery(
                 causal_budget_id=causal_budget_id,
@@ -1430,10 +2009,35 @@ class CayuApp:
             )
         )
         events = [record.event for record in records]
-        return causal_budget_usage_summary(
+        summary = causal_budget_usage_summary(
             causal_budget_id=causal_budget_id,
             session_ids=[session.id for session in sessions],
             events=events,
+        )
+        public_session_ids = [
+            self.project_session_id_for_exposure(session_id) for session_id in summary.session_ids
+        ]
+        public_causal_budget_id = self.project_causal_budget_id_for_exposure(
+            causal_budget_id,
+            session_ids=(session.id for session in sessions),
+        )
+        return summary.model_copy(
+            update={
+                "causal_budget_id": public_causal_budget_id,
+                "session_ids": public_session_ids,
+                "session_summaries": tuple(
+                    session_summary.model_copy(
+                        update={
+                            "session_id": self.project_session_id_for_exposure(
+                                session_summary.session_id
+                            )
+                        },
+                        deep=True,
+                    )
+                    for session_summary in summary.session_summaries
+                ),
+            },
+            deep=True,
         )
 
     async def _list_all_sessions(self, query: SessionQuery) -> list[Session]:
@@ -1508,7 +2112,7 @@ class CayuApp:
                             watcher,
                             EventWatcherContext(
                                 watcher_name=watcher.name,
-                                record=record,
+                                record=self.project_event_record_for_exposure(record),
                                 attempt=claim.attempt,
                             ),
                         )
@@ -1526,7 +2130,12 @@ class CayuApp:
                             error=watcher_error,
                             max_attempts=watcher.max_attempts,
                         )
-                        deliveries.append(delivery)
+                        deliveries.append(
+                            delivery.model_copy(
+                                update={"event_id": public_event_id(delivery.event_sequence)},
+                                deep=True,
+                            )
+                        )
                         remaining -= 1
                         processed_for_watcher += 1
                         if delivery.status is not EventWatcherDeliveryStatus.DEAD_LETTERED:
@@ -1535,7 +2144,12 @@ class CayuApp:
                         continue
 
                     delivery = await self.event_watcher_store.mark_success(claim)
-                    deliveries.append(delivery)
+                    deliveries.append(
+                        delivery.model_copy(
+                            update={"event_id": public_event_id(delivery.event_sequence)},
+                            deep=True,
+                        )
+                    )
                     remaining -= 1
                     processed_for_watcher += 1
 
@@ -1566,7 +2180,9 @@ class CayuApp:
         *,
         currency: str = "USD",
     ) -> SessionCostSummary:
-        session_id = require_clean_nonblank(session_id, "session_id")
+        session_id = await self._resolve_public_session_id(
+            require_clean_nonblank(session_id, "session_id")
+        )
         session = await self.session_store.load(session_id)
         if session is None:
             raise KeyError(f"Session not found: {session_id}") from None
@@ -1577,11 +2193,15 @@ class CayuApp:
                 event_type=EventType.MODEL_COMPLETED,
             )
         )
-        return estimate_session_cost(
+        summary = estimate_session_cost(
             session_id=session_id,
             events=[record.event for record in cost_event_records],
             pricing=pricing,
             currency=currency,
+        )
+        return summary.model_copy(
+            update={"session_id": self.project_session_id_for_exposure(session_id)},
+            deep=True,
         )
 
     async def get_causal_budget_cost(
@@ -1591,7 +2211,7 @@ class CayuApp:
         *,
         currency: str = "USD",
     ) -> CausalBudgetCostSummary:
-        causal_budget_id = require_clean_nonblank(causal_budget_id, "causal_budget_id")
+        causal_budget_id = await self._resolve_public_causal_budget_id(causal_budget_id)
         sessions = await self._list_all_sessions(
             SessionQuery(
                 causal_budget_id=causal_budget_id,
@@ -1599,19 +2219,44 @@ class CayuApp:
             )
         )
         if not sessions:
-            raise KeyError(f"Causal budget not found: {causal_budget_id}") from None
+            raise KeyError("Causal budget not found") from None
         records = await self._query_all_event_records(
             EventQuery(
                 causal_budget_id=causal_budget_id,
                 event_type=EventType.MODEL_COMPLETED,
             )
         )
-        return estimate_causal_budget_cost(
+        summary = estimate_causal_budget_cost(
             causal_budget_id=causal_budget_id,
             session_ids=[session.id for session in sessions],
             events=[record.event for record in records],
             pricing=pricing,
             currency=currency,
+        )
+        public_causal_budget_id = self.project_causal_budget_id_for_exposure(
+            causal_budget_id,
+            session_ids=(session.id for session in sessions),
+        )
+        return summary.model_copy(
+            update={
+                "causal_budget_id": public_causal_budget_id,
+                "session_ids": [
+                    self.project_session_id_for_exposure(session_id)
+                    for session_id in summary.session_ids
+                ],
+                "session_costs": tuple(
+                    session_cost.model_copy(
+                        update={
+                            "session_id": self.project_session_id_for_exposure(
+                                session_cost.session_id
+                            )
+                        },
+                        deep=True,
+                    )
+                    for session_cost in summary.session_costs
+                ),
+            },
+            deep=True,
         )
 
     async def emit_hook_event(
@@ -1629,13 +2274,41 @@ class CayuApp:
             session_id=session_id,
             payload=copy_json_value(payload or {}, "payload"),
         )
-        return await self._event_writer.emit(event)
+        emitted = await self._event_writer.emit(event)
+        return await self._project_emitted_event_for_public_api(emitted)
 
     async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not ForkSessionRequest:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
+        (
+            source_session_id,
+            store_resolved_source_session_id,
+        ) = await self._resolve_public_session_authority(request.source_session_id)
+        request = request.model_copy(
+            update={"source_session_id": source_session_id},
+            deep=True,
+        )
+        stream = self._fork_session_private(
+            request,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+        )
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _fork_session_private(
+        self,
+        request: ForkSessionRequest,
+        *,
+        store_resolved_source_session_id: str | None = None,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ForkSessionRequest:
+            raise TypeError("Runtime fork requires a ForkSessionRequest.")
         request = copy_fork_session_request(request)
-        stream = self._session_engine.fork_session(request=request)
+        stream = self._session_engine.fork_session(
+            request=request,
+            store_resolved_source_session_id=store_resolved_source_session_id,
+        )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:
                 yield item
@@ -1760,6 +2433,29 @@ class CayuApp:
         self,
         response: UserInputResponse,
     ) -> AsyncIterator[Event]:
+        if type(response) is not UserInputResponse:
+            raise TypeError("Runtime user input resolution requires a UserInputResponse.")
+        session_id = await self._resolve_public_session_id(response.session_id)
+        response = response.model_copy(
+            update={
+                "session_id": session_id,
+                "input_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=response.input_id,
+                    field_name="input_id",
+                ),
+            },
+            deep=True,
+        )
+        stream = self._resolve_user_input_private(response)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _resolve_user_input_private(
+        self,
+        response: UserInputResponse,
+    ) -> AsyncGenerator[Event, None]:
         """Resume a session paused by ``ask_user`` with the user's answer.
 
         The answer becomes the ``ask_user`` tool result; any other tool calls in the same
@@ -1777,6 +2473,34 @@ class CayuApp:
         self,
         request: UserInputRecoveryRequest,
     ) -> AsyncIterator[Event]:
+        if type(request) is not UserInputRecoveryRequest:
+            raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = request.model_copy(
+            update={
+                "session_id": session_id,
+                "input_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.input_id,
+                    field_name="input_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+            deep=True,
+        )
+        stream = self._recover_user_input_private(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _recover_user_input_private(
+        self,
+        request: UserInputRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
         """Recover a user-input round stuck on `manual_recovery_required`.
 
         A tool in the paused round started on a prior resume but recorded no terminal event
@@ -1799,6 +2523,39 @@ class CayuApp:
     ) -> AsyncIterator[Event]:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = request.model_copy(
+            update={
+                "session_id": session_id,
+                "approval_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.approval_id,
+                    field_name="approval_id",
+                ),
+                "tool_round_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_round_id,
+                    field_name="tool_round_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+            deep=True,
+        )
+        stream = self._resolve_tool_approval_private(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _resolve_tool_approval_private(
+        self,
+        request: ToolApprovalRequest,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ToolApprovalRequest:
+            raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
         request = _validate_tool_approval_request(request)
         stream = self._recovery_coordinator.resolve_tool_approval(request=request)
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -1811,6 +2568,39 @@ class CayuApp:
     ) -> AsyncIterator[Event]:
         if type(request) is not ToolApprovalRecoveryRequest:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = request.model_copy(
+            update={
+                "session_id": session_id,
+                "approval_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.approval_id,
+                    field_name="approval_id",
+                ),
+                "tool_round_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_round_id,
+                    field_name="tool_round_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+            deep=True,
+        )
+        stream = self._recover_tool_approval_private(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _recover_tool_approval_private(
+        self,
+        request: ToolApprovalRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
+        if type(request) is not ToolApprovalRecoveryRequest:
+            raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         request = _validate_tool_approval_recovery_request(request)
         stream = self._recovery_coordinator.recover_tool_approval_request(request=request)
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -1821,6 +2611,34 @@ class CayuApp:
         self,
         request: ToolRoundRecoveryRequest,
     ) -> AsyncIterator[Event]:
+        if type(request) is not ToolRoundRecoveryRequest:
+            raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
+        session_id = await self._resolve_public_session_id(request.session_id)
+        request = request.model_copy(
+            update={
+                "session_id": session_id,
+                "round_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.round_id,
+                    field_name="tool_round_id",
+                ),
+                "tool_call_id": await self._resolve_public_action_linkage(
+                    session_id=session_id,
+                    value=request.tool_call_id,
+                    field_name="tool_call_id",
+                ),
+            },
+            deep=True,
+        )
+        stream = self._recover_tool_round_private(request)
+        async with _close_delegated_event_stream(stream) as owned_stream:
+            async for event in owned_stream:
+                yield await self._project_emitted_event_for_public_api(event)
+
+    async def _recover_tool_round_private(
+        self,
+        request: ToolRoundRecoveryRequest,
+    ) -> AsyncGenerator[Event, None]:
         """Recover a crashed ordinary tool round with an operator-verified outcome.
 
         A tool call in a non-approval round started but recorded no terminal event
@@ -2135,7 +2953,12 @@ class CayuApp:
         self,
         session_id: str,
     ) -> Callable[[list[Event]], Awaitable[list[Event]]]:
-        """Return a workflow/custom emitter that permits Cayu-owned markers."""
+        """Return a trusted private emitter for workflow-owned runtime internals.
+
+        Results remain private authority because workflow execution feeds them
+        back into runtime control flow. Public callers use ``emit_event`` or the
+        server projection boundary instead.
+        """
 
         async def emit(events: list[Event]) -> list[Event]:
             _validate_workflow_event_batch(events, allow_cayu_internal=True)
@@ -2150,6 +2973,10 @@ class CayuApp:
         ``scoped_event_emitter`` when handing an emitter to a component. Redaction
         is applied by the sinks; callers must not place raw secrets in the payload.
         """
+        emitted = await self._emit_event_private(event)
+        return await self._project_emitted_event_for_public_api(emitted)
+
+    async def _emit_event_private(self, event: Event) -> Event:
         if not isinstance(event, Event):
             raise TypeError("emit_event requires an Event instance.")
         emitted = await self._event_writer.emit(event)
@@ -2185,7 +3012,8 @@ class CayuApp:
         batch uses the same durable budget/sink handoff.
         """
         _validate_workflow_event_batch(events, allow_cayu_internal=False)
-        return await self._event_writer.emit_many(session_id, events)
+        emitted = await self._event_writer.emit_many(session_id, events)
+        return [await self._project_emitted_event_for_public_api(event) for event in emitted]
 
 
 def _validate_workflow_event_batch(

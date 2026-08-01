@@ -43,6 +43,7 @@ from cayu import (
     SessionStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
+    public_authority_alias_codec_from_environment,
     TaskStore,
 )
 
@@ -132,7 +133,11 @@ def build_app(
     """
 
     app = CayuApp(
-        session_store=session_store or SQLiteSessionStore("data/cayu.db"),
+        session_store=session_store
+        or SQLiteSessionStore(
+            "data/cayu.db",
+            public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+        ),
         task_store=task_store or SQLiteTaskStore("data/cayu.db"),
     )
     selected_provider = provider

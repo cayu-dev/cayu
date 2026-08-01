@@ -9,6 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.events import Event
 
+# Journaled once per workflow context to fence superseded attempts. The event
+# projection layer also owns an exact payload policy for this internal type.
+WORKFLOW_ATTEMPT_EVENT_TYPE = "custom.cayu.workflow.attempt"
+
 
 class WorkflowSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")

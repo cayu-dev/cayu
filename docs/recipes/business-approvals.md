@@ -80,10 +80,13 @@ The pause is Cayu's ordinary durable approval interrupt: a
 routing rides along — an approval inbox reads it straight off the event:
 
 ```python
-from cayu import PendingToolApproval, business_approval_routing
+from cayu import BUSINESS_APPROVAL_ROUTING_METADATA_KEY, BusinessApprovalRouting
 
-pending = PendingToolApproval.from_event(approval_requested_event)
-routing = business_approval_routing(pending)   # required_tier, chain, product metadata
+approval = approval_requested_event.payload["approval"]
+routing = BusinessApprovalRouting.model_validate(
+    approval["metadata"][BUSINESS_APPROVAL_ROUTING_METADATA_KEY]
+)
+approval_id = approval_requested_event.payload["approval_id"]
 ```
 
 Your product decides which humans hold which tier; the routing tells it which
@@ -97,7 +100,7 @@ from cayu import BusinessApprovalOutcome, resolve_business_approval
 events = await resolve_business_approval(
     app,
     session_id=session_id,
-    approval_id=pending.approval_id,
+    approval_id=approval_id,
     approver_id="maria.k",
     approver_tier="national",
     outcome=BusinessApprovalOutcome.CONDITIONED,

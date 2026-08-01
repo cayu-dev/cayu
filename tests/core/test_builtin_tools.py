@@ -3205,9 +3205,9 @@ def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
     assert payload["metadata"] == {}
     assert payload["reason"] == expected_reason
     assert payload["tool_name"] == "exec_command"
-    assert payload["tool_call_id"] == "call_policy_refusal"
-    assert payload["tool_round_id"]
-    assert payload["idempotency_key"].startswith("cayu-tool:v1:")
+    assert payload["tool_call_id"] == "cayu_event_8:tool_call_id"
+    assert payload["tool_round_id"] == "cayu_event_8:tool_round_id"
+    assert payload["idempotency_key"] == "[PRIVATE_EVENT_AUTHORITY]"
     assert payload["result"]["structured"]["error"] == expected_error
     assert payload["result"]["content"] != "rewritten as success"
     assert len(payload["result"]["content"].encode("utf-8")) <= (_POLICY_DENIAL_TEXT_MAX_BYTES)
@@ -3378,7 +3378,23 @@ def test_command_policy_redaction_preserves_protocol_fields_that_match_secrets()
     }
     observed_payload = dict(observed["payload"])
     observed_payload["tool_name"] = blocked.payload["tool_name"]
-    assert observed_payload == blocked.payload
+    private_authority_fields = {
+        "idempotency_key",
+        "model_attempt_id",
+        "model_step_id",
+        "tool_call_id",
+        "tool_round_id",
+    }
+    assert {
+        key: value for key, value in observed_payload.items() if key not in private_authority_fields
+    } == {
+        key: value for key, value in blocked.payload.items() if key not in private_authority_fields
+    }
+    assert blocked.payload["model_step_id"] == "[PRIVATE_EVENT_AUTHORITY]"
+    assert blocked.payload["model_attempt_id"] == "[PRIVATE_EVENT_AUTHORITY]"
+    assert blocked.payload["idempotency_key"] == "[PRIVATE_EVENT_AUTHORITY]"
+    assert blocked.payload["tool_call_id"] == "cayu_event_8:tool_call_id"
+    assert blocked.payload["tool_round_id"] == "cayu_event_8:tool_round_id"
     assert observed["structured"] == blocked.payload["result"]["structured"]
     assert runner.command is None
 
@@ -3543,13 +3559,14 @@ def test_command_policy_denial_resolves_once_inside_mixed_tool_round():
             EventType.TOOL_CALL_BLOCKED,
         }
     ]
-    assert [(event.payload["tool_call_id"], event.type) for event in terminal] == [
-        ("call_denied", EventType.TOOL_CALL_BLOCKED),
-        ("call_allowed", EventType.TOOL_CALL_COMPLETED),
+    assert [event.type for event in terminal] == [
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_COMPLETED,
     ]
+    assert all(event.payload["tool_call_id"] == f"{event.id}:tool_call_id" for event in terminal)
     assert terminal[0].payload["denied_by"] == "command_policy"
     assert terminal[0].payload["metadata"] == {}
-    assert terminal[0].payload["tool_round_id"] == terminal[1].payload["tool_round_id"]
+    assert all(event.payload["tool_round_id"] == f"{event.id}:tool_round_id" for event in terminal)
     assert runner.command is None
     assert recorder.context is not None
 

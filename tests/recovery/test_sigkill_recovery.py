@@ -11,6 +11,7 @@ from worker_harness import BackendConfig, RecoveryHarness
 
 from cayu.core import EventType, ToolResultPart
 from cayu.runtime import CHECKPOINT_SCHEMA_VERSION_KEY, SessionStatus, TaskStatus
+from cayu.runtime._event_projection import public_event_linkage_sequence
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
@@ -189,7 +190,19 @@ def test_sigkill_after_durable_approval_request_preserves_resolution(
         assert pre_kill.session is not None
         assert pre_kill.session.status == SessionStatus.RUNNING
         pending = pre_kill.checkpoint["pending_tool_approval"]
-        assert pending["approval_id"] == phase["approval_id"]
+        requested = next(
+            event
+            for event in pre_kill.events
+            if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        )
+        assert pending["approval_id"] == requested.payload["approval"]["approval_id"]
+        assert (
+            public_event_linkage_sequence(
+                phase["approval_id"],
+                field_name="approval_id",
+            )
+            is not None
+        )
         assert [event.type for event in pre_kill.events][-2:] == [
             EventType.SESSION_CHECKPOINTED,
             EventType.TOOL_CALL_APPROVAL_REQUESTED,

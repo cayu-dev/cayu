@@ -444,16 +444,19 @@ async def _collect_tool_round_trip_events(harness: ProviderHarness) -> list[Any]
         AgentSpec(name="assistant", model=harness.model, system_prompt="Use the echo tool."),
         tools=[_EchoTool()],
     )
-    return [
+    session_id = "provider-conformance-tool-round-trip"
+    _ = [
         event
         async for event in app.run(
             RunRequest(
                 agent_name="assistant",
+                session_id=session_id,
                 messages=[Message.text("user", "Echo the text conformance-tool.")],
                 max_steps=3,
             )
         )
     ]
+    return await app.session_store.load_events(session_id)
 
 
 def test_provider_conformance_registration_requires_bounded_capability_reasons() -> None:

@@ -3,10 +3,10 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 from cayu._validation import (
     copy_durable_json_value,
@@ -15,6 +15,18 @@ from cayu._validation import (
 
 _CUSTOM_EVENT_TYPE_RE = re.compile(r"^custom\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
 EVENT_ID_MAX_CHARS = 512
+
+
+def _empty_runtime_authority() -> frozenset[tuple[str, str]]:
+    """Return a precisely typed empty private-authority registry."""
+
+    return frozenset()
+
+
+def _empty_runtime_nested_authority() -> frozenset[tuple[tuple[str, ...], str]]:
+    """Return a precisely typed empty nested-authority registry."""
+
+    return frozenset()
 
 
 class EventType(StrEnum):
@@ -156,6 +168,52 @@ class Event(BaseModel):
     workflow_name: str | None = None
     tool_name: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    _id_origin: Literal["caller", "runtime"] = PrivateAttr(default="caller")
+    _runtime_generated_id: str | None = PrivateAttr(default=None)
+    _runtime_payload_authority: frozenset[tuple[str, str]] = PrivateAttr(
+        default_factory=_empty_runtime_authority
+    )
+    _runtime_nested_payload_authority: frozenset[tuple[tuple[str, ...], str]] = PrivateAttr(
+        default_factory=_empty_runtime_nested_authority
+    )
+    _runtime_envelope_authority: frozenset[tuple[str, str]] = PrivateAttr(
+        default_factory=_empty_runtime_authority
+    )
+    _durable_sequence: int | None = PrivateAttr(default=None)
+
+    def model_post_init(self, __context: Any) -> None:
+        del __context
+        self._id_origin = "caller" if "id" in self.model_fields_set else "runtime"
+        self._runtime_generated_id = self.id if self._id_origin == "runtime" else None
+
+    def __eq__(self, other: object) -> bool:
+        """Compare only public durable fields, never private projection metadata."""
+
+        if type(other) is not Event:
+            return NotImplemented
+        return (
+            self.type,
+            self.session_id,
+            self.interaction_id,
+            self.id,
+            self.timestamp,
+            self.agent_name,
+            self.environment_name,
+            self.workflow_name,
+            self.tool_name,
+            self.payload,
+        ) == (
+            other.type,
+            other.session_id,
+            other.interaction_id,
+            other.id,
+            other.timestamp,
+            other.agent_name,
+            other.environment_name,
+            other.workflow_name,
+            other.tool_name,
+            other.payload,
+        )
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -206,7 +264,7 @@ class Event(BaseModel):
 def copy_event(event: Event) -> Event:
     if type(event) is not Event:
         raise TypeError("Events must be Event instances.")
-    return Event(
+    copied = Event(
         type=event.type,
         session_id=event.session_id,
         interaction_id=event.interaction_id,
@@ -218,3 +276,223 @@ def copy_event(event: Event) -> Event:
         tool_name=event.tool_name,
         payload=copy_durable_json_value(event.payload, "payload"),
     )
+    copied._id_origin = event._id_origin
+    copied._runtime_generated_id = event._runtime_generated_id
+    copied._runtime_payload_authority = event._runtime_payload_authority
+    copied._runtime_nested_payload_authority = event._runtime_nested_payload_authority
+    copied._runtime_envelope_authority = event._runtime_envelope_authority
+    copied._durable_sequence = event._durable_sequence
+    return copied
+
+
+def event_id_is_runtime_generated(event: Event) -> bool:
+    """Return positive in-process provenance for a default-generated event id."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    return (
+        event._id_origin == "runtime"
+        and event._runtime_generated_id is not None
+        and event.id == event._runtime_generated_id
+    )
+
+
+def event_with_runtime_generated_id(event: Event) -> Event:
+    """Copy an internally constructed event and attest its exact explicit ID.
+
+    Deserialization and ordinary ``Event(id=...)`` construction intentionally do
+    not acquire this in-process provenance. Runtime producers use this helper
+    only when they themselves generated a UUID or content-addressed identity.
+    """
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    copied = copy_event(event)
+    copied._id_origin = "runtime"
+    copied._runtime_generated_id = copied.id
+    return copied
+
+
+def event_with_runtime_payload_authority(
+    event: Event,
+    *field_names: str,
+) -> Event:
+    """Copy an event and attest exact runtime-produced top-level payload linkage."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    authority = set(event._runtime_payload_authority)
+    for field_name in field_names:
+        if type(field_name) is not str or not field_name or not field_name.isidentifier():
+            raise ValueError("Runtime payload authority fields must be identifiers.")
+        value = event.payload.get(field_name)
+        if type(value) is not str or not value.strip():
+            raise ValueError(
+                f"event.payload.{field_name} must be a non-empty string before attestation."
+            )
+        authority.add((field_name, value))
+    copied = copy_event(event)
+    copied._runtime_payload_authority = frozenset(authority)
+    return copied
+
+
+def event_with_runtime_nested_payload_authority(
+    event: Event,
+    *paths: tuple[str, ...],
+) -> Event:
+    """Attest exact runtime-produced linkage below a typed payload container."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    authority = set(event._runtime_nested_payload_authority)
+
+    def collect(value: Any, path: tuple[str, ...], offset: int) -> None:
+        if offset == len(path):
+            if type(value) is not str or not value.strip():
+                raise ValueError(
+                    f"event.payload.{'.'.join(path)} must contain non-empty strings "
+                    "before attestation."
+                )
+            authority.add((path, value))
+            return
+        segment = path[offset]
+        if segment == "*":
+            if type(value) is not list:
+                raise ValueError(
+                    f"event.payload.{'.'.join(path[:offset])} must be a list before attestation."
+                )
+            for child in value:
+                collect(child, path, offset + 1)
+            return
+        if not segment.isidentifier():
+            raise ValueError("Runtime nested payload authority paths must use identifiers or '*'.")
+        if type(value) is not dict or segment not in value:
+            raise ValueError(
+                f"event.payload.{'.'.join(path[: offset + 1])} is missing before attestation."
+            )
+        collect(value[segment], path, offset + 1)
+
+    for path in paths:
+        if type(path) is not tuple or len(path) < 2:
+            raise ValueError(
+                "Runtime nested payload authority paths require at least two segments."
+            )
+        collect(event.payload, path, 0)
+    copied = copy_event(event)
+    copied._runtime_nested_payload_authority = frozenset(authority)
+    return copied
+
+
+def event_with_runtime_envelope_authority(
+    event: Event,
+    *field_names: str,
+) -> Event:
+    """Attest exact envelope identities selected by the runtime.
+
+    Ordinary construction and deserialization intentionally do not acquire this
+    provenance. Runtime producers may attest only identities that have already
+    crossed their caller-input boundary.
+    """
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    authority = set(event._runtime_envelope_authority)
+    for field_name in field_names:
+        if field_name not in {"session_id", "interaction_id"}:
+            raise ValueError("Runtime envelope authority supports session_id and interaction_id.")
+        value = getattr(event, field_name)
+        if type(value) is not str or not value.strip():
+            raise ValueError(f"event.{field_name} must be a non-empty string before attestation.")
+        authority.add((field_name, value))
+    copied = copy_event(event)
+    copied._runtime_envelope_authority = frozenset(authority)
+    return copied
+
+
+def event_envelope_authority_is_runtime_generated(
+    event: Event,
+    *,
+    field_name: str,
+    value: str,
+) -> bool:
+    """Return positive in-process provenance for one exact envelope identity."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    return (
+        field_name in {"session_id", "interaction_id"}
+        and type(value) is str
+        and getattr(event, field_name) == value
+        and (field_name, value) in event._runtime_envelope_authority
+    )
+
+
+def event_payload_authority_is_runtime_generated(
+    event: Event,
+    *,
+    field_name: str,
+    value: str,
+) -> bool:
+    """Return positive in-process provenance for one exact payload authority value."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    return (
+        type(field_name) is str
+        and type(value) is str
+        and event.payload.get(field_name) == value
+        and (field_name, value) in event._runtime_payload_authority
+    )
+
+
+def event_nested_payload_authority_is_runtime_generated(
+    event: Event,
+    *,
+    path: tuple[str, ...],
+    value: str,
+) -> bool:
+    """Return positive provenance for one exact nested payload authority value."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+
+    def contains(candidate: Any, offset: int) -> bool:
+        if offset == len(path):
+            return type(candidate) is str and candidate == value
+        segment = path[offset]
+        if segment == "*":
+            return type(candidate) is list and any(
+                contains(child, offset + 1) for child in candidate
+            )
+        return (
+            type(candidate) is dict
+            and segment in candidate
+            and contains(candidate[segment], offset + 1)
+        )
+
+    return (
+        type(path) is tuple
+        and type(value) is str
+        and contains(event.payload, 0)
+        and (path, value) in event._runtime_nested_payload_authority
+    )
+
+
+def event_with_durable_sequence(event: Event, sequence: int) -> Event:
+    """Copy an event and attach its private durable sequence for live projection."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    if type(sequence) is not int or sequence < 1:
+        raise ValueError("sequence must be an integer greater than or equal to 1.")
+    copied = copy_event(event)
+    copied._durable_sequence = sequence
+    return copied
+
+
+def event_durable_sequence(event: Event) -> int | None:
+    """Return a private attached sequence without making it part of serialization."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    return event._durable_sequence

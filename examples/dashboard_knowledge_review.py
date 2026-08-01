@@ -22,6 +22,7 @@ from cayu import (
     SQLiteKnowledgeStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
+    public_authority_alias_codec_from_environment,
 )
 from cayu.server import ServerConfig, create_server
 
@@ -136,7 +137,10 @@ def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
 
     database = DATA_DIR / "cayu.db"
-    session_store = SQLiteSessionStore(database)
+    session_store = SQLiteSessionStore(
+        database,
+        public_authority_alias_codec=public_authority_alias_codec_from_environment(),
+    )
     task_store = SQLiteTaskStore(database)
     knowledge_store = SQLiteKnowledgeStore(database)
     asyncio.run(seed_knowledge(knowledge_store))

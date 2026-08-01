@@ -88,11 +88,11 @@ def event_to_sse_data(event: Event) -> str:
 
 
 def sse_event_id(event: Event) -> str:
-    """Stable SSE ``id:`` field for an event: ``<session_id>:<event_id>``.
+    """Return a session-bound SSE marker containing a public event alias.
 
-    Carrying the session id lets a reconnecting client's ``Last-Event-ID`` name
-    both the session and the last event it saw, so the server can replay the
-    persisted events it missed.
+    The server resolves the sequence-backed alias to the private durable record
+    on reconnect. The session component prevents a marker from being replayed
+    against a different session; the raw durable event ID stays private.
     """
     return f"{event.session_id}:{event.id}"
 
@@ -235,12 +235,15 @@ def parse_last_event_id(
     value: str,
     *,
     expected_session_id: str | None = None,
+    public_session_id: str | None = None,
 ) -> tuple[str, str | None] | None:
     """Parse an event marker or the explicit ``<session_id>:`` start marker.
 
     A ``None`` event id means replay from the start of the named session. Supplying
     ``expected_session_id`` preserves existing session identities that contain a
     colon by removing the exact known prefix instead of guessing a split point.
+    ``public_session_id`` does the same for a server-issued redacted marker while
+    leaving the private expected identity available to scope the replay.
     Marker components are intentionally strict because a reconnect request must
     never fall back from a malformed or unknown boundary to an ambiguous mutation.
     """
@@ -250,6 +253,10 @@ def parse_last_event_id(
     if expected_session_id is not None and value.startswith(expected_prefix):
         session_id = expected_session_id
         event_id = value[len(expected_prefix) :]
+        sep = ":"
+    elif public_session_id is not None and value.startswith(f"{public_session_id}:"):
+        session_id = public_session_id
+        event_id = value[len(public_session_id) + 1 :]
         sep = ":"
     else:
         session_id, sep, event_id = value.partition(":")

@@ -67,6 +67,9 @@ _TABLES = (
     "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
+    "cayu_public_authority_aliases",
+    "cayu_public_authority_alias_keys",
+    "cayu_public_authority_alias_config",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",
@@ -258,7 +261,10 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+            ):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -411,7 +417,10 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+            ):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -438,7 +447,10 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+            ):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -482,7 +494,10 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+            ):
                 await validator.ensure_schema()
         finally:
             await validator.close()
@@ -541,7 +556,10 @@ def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: s
 
         validator = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 26"):
+            with pytest.raises(
+                schema.SchemaTooOld,
+                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+            ):
                 await validator.ensure_schema()
         finally:
             await validator.close()

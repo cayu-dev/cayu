@@ -10,6 +10,7 @@ import pytest
 from cayu.core.events import Event, EventType
 from cayu.core.messages import ToolResultPart
 from cayu.core.tools import ToolResult
+from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_execution import tool_idempotency_key
 from cayu.runtime._tool_round_publication import (
@@ -29,6 +30,7 @@ from cayu.runtime.approvals import PendingToolCallApproval
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.event_sinks import InMemoryEventSink
 from cayu.runtime.sessions import (
+    EventQuery,
     InMemorySessionStore,
     RunRequest,
     RuntimePublicationReceipt,
@@ -1507,9 +1509,15 @@ def test_auxiliary_event_fan_out_runs_after_commit_and_is_replay_safe() -> None:
 
         assert first.replayed is False
         assert replay.replayed is True
+        records = await store.query_events(EventQuery(session_id=session.id))
         assert [event.id for event in sink.events] == [
-            "structured-validating",
-            "structured-validated",
+            public_event_id(record.sequence)
+            for record in records
+            if record.event.id
+            in {
+                "structured-validating",
+                "structured-validated",
+            }
         ]
 
     asyncio.run(scenario())

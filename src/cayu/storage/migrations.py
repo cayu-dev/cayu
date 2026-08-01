@@ -178,6 +178,11 @@ REVISIONS: tuple[Revision, ...] = (
     # bounded task-topology reads. Both indexes are additive; revision-26
     # writers continue to maintain every indexed source column.
     Revision(revision=27, kind=RevisionKind.ADDITIVE, compatible_from=26),
+    # Public authority aliases become durable, indexed store state. Every
+    # process that can publish an alias must register it before exposure;
+    # pre-28 writers do not maintain that reverse index, so mixed-version
+    # workers could publish aliases that no revision-28 worker can resolve.
+    Revision(revision=28, kind=RevisionKind.BREAKING, compatible_from=28),
 )
 
 #: The revision an empty database is initialized to.

@@ -14,7 +14,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from tests.core.checkpoint_schema_conformance import (
     assert_future_checkpoint_rejection_conformance,
     assert_versionless_checkpoint_resume_conformance,
@@ -41,6 +41,10 @@ from cayu.runtime import (
     SessionTopologyQuery,
     TranscriptQuery,
 )
+from cayu.runtime.public_authority import (
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
+)
 from cayu.runtime.sessions import (
     EventQueryResultTooLarge,
     PendingActionKind,
@@ -60,6 +64,9 @@ _TABLES = (
     "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
+    "cayu_public_authority_aliases",
+    "cayu_public_authority_alias_keys",
+    "cayu_public_authority_alias_config",
     "cayu_transcript_messages",
     "cayu_session_message_queue",
     "cayu_persisted_event_side_effects",
@@ -74,6 +81,20 @@ _TABLES = (
 
 def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
+
+
+def _public_authority_codec(
+    *,
+    active_key_id: str = "primary",
+    key_byte: int = 7,
+) -> PublicAuthorityAliasCodec:
+    encoded_key = base64.urlsafe_b64encode(bytes([key_byte]) * 32).decode().rstrip("=")
+    return PublicAuthorityAliasCodec(
+        PublicAuthorityAliasKeyring(
+            active_key_id=active_key_id,
+            keys={active_key_id: SecretStr(encoded_key)},
+        )
+    )
 
 
 def _tool_round_identity_payload() -> dict[str, str]:
@@ -120,6 +141,373 @@ def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
 
 def test_postgres_session_topology_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_session_topology_store_conformance)
+
+
+def test_postgres_public_authority_aliases_are_indexed_and_durable(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        codec = _public_authority_codec()
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+            public_authority_alias_codec=codec,
+        )
+        session_id = "session-private-authority"
+        interaction_id = "interaction-private-authority"
+        event_interaction_id = "event-written-interaction"
+        transcript_interaction_id = "transcript-written-interaction"
+        nested_interaction_id = "nested-written-interaction"
+        session_alias = codec.encode(session_id, field_name="session_id")
+        interaction_alias = codec.encode(
+            interaction_id,
+            field_name="interaction_id",
+            session_id=session_id,
+        )
+        try:
+            assert store.public_authority_alias_codec is codec
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            await store.register_public_authority_alias(
+                interaction_alias,
+                field_name="interaction_id",
+                private_value=interaction_id,
+                scope_session_id=session_id,
+            )
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        type=EventType.TURN_COMPLETED,
+                        session_id=session_id,
+                        interaction_id=event_interaction_id,
+                        payload={"interaction_ids": [nested_interaction_id]},
+                    )
+                ],
+            )
+            await store.append_transcript_messages(
+                session_id,
+                [Message.text("user", "indexed")],
+                interaction_id=transcript_interaction_id,
+            )
+            assert (
+                await store.resolve_public_authority_alias(
+                    session_alias,
+                    field_name="session_id",
+                )
+                == session_id
+            )
+            assert (
+                await store.resolve_public_authority_alias(
+                    interaction_alias,
+                    field_name="interaction_id",
+                    scope_session_id=session_id,
+                )
+                == interaction_id
+            )
+            assert (
+                await store.resolve_public_authority_alias(
+                    interaction_alias,
+                    field_name="interaction_id",
+                    scope_session_id="another-session",
+                )
+                is None
+            )
+            for indexed_interaction_id in (
+                event_interaction_id,
+                transcript_interaction_id,
+                nested_interaction_id,
+            ):
+                indexed_alias = codec.encode(
+                    indexed_interaction_id,
+                    field_name="interaction_id",
+                    session_id=session_id,
+                )
+                assert (
+                    await store.resolve_public_authority_alias(
+                        indexed_alias,
+                        field_name="interaction_id",
+                        scope_session_id=session_id,
+                    )
+                    == indexed_interaction_id
+                )
+        finally:
+            await store.close()
+
+        reopened = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=codec,
+        )
+        try:
+            assert (
+                await reopened.resolve_public_authority_alias(
+                    session_alias,
+                    field_name="session_id",
+                )
+                == session_id
+            )
+            assert (
+                await reopened.resolve_public_authority_alias(
+                    interaction_alias,
+                    field_name="interaction_id",
+                    scope_session_id=session_id,
+                )
+                == interaction_id
+            )
+        finally:
+            await reopened.close()
+
+        secondary_key = base64.urlsafe_b64encode(bytes([11]) * 32).decode().rstrip("=")
+        rotated = codec.rotated(
+            active_key_id="secondary",
+            key=SecretStr(secondary_key),
+        )
+        stale_store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=codec,
+        )
+        assert await stale_store.load(session_id) is not None
+        rotated_store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=rotated,
+        )
+        rotated_session_alias = rotated.encode(session_id, field_name="session_id")
+        try:
+            assert (
+                await rotated_store.resolve_public_authority_alias(
+                    rotated_session_alias,
+                    field_name="session_id",
+                )
+                == session_id
+            )
+            assert (
+                await rotated_store.resolve_public_authority_alias(
+                    session_alias,
+                    field_name="session_id",
+                )
+                == session_id
+            )
+            with pytest.raises(RuntimeError, match="configuration is stale"):
+                await stale_store.load(session_id)
+        finally:
+            await stale_store.close()
+            await rotated_store.close()
+
+        retired = rotated.rotated(
+            active_key_id="secondary",
+            key=SecretStr(secondary_key),
+            retire_key_ids=("primary",),
+        )
+        retired_store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=retired,
+        )
+        try:
+            assert (
+                await retired_store.resolve_public_authority_alias(
+                    session_alias,
+                    field_name="session_id",
+                )
+                is None
+            )
+            assert (
+                await retired_store.resolve_public_authority_alias(
+                    rotated_session_alias,
+                    field_name="session_id",
+                )
+                == session_id
+            )
+        finally:
+            await retired_store.close()
+
+        codec_less = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="configure.*alias keyring"):
+                await codec_less.ensure_schema()
+        finally:
+            await codec_less.close()
+
+        reused_key_id = _public_authority_codec(key_byte=19)
+        mismatched = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=reused_key_id,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="different key material"):
+                await mismatched.ensure_schema()
+        finally:
+            await mismatched.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_public_authority_alias_registration_fails_closed_without_codec(
+    postgres_dsn: str,
+) -> None:
+    codec = _public_authority_codec()
+
+    async def ops(store) -> None:
+        alias = codec.encode("private-session", field_name="session_id")
+        with pytest.raises(ValueError, match="store-configured provenance"):
+            await store.register_public_authority_alias(
+                alias,
+                field_name="session_id",
+                private_value="private-session",
+            )
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_already_open_codec_less_writer_is_fenced_after_key_initialization(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        stale = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        keyed = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=_public_authority_codec(),
+        )
+        try:
+            await stale.ensure_schema()
+            await keyed.ensure_schema()
+            with pytest.raises(RuntimeError, match="aliases require.*keyring"):
+                await stale.create(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="must-not-commit",
+                        messages=[],
+                    ),
+                    identity=_identity(),
+                )
+            assert await keyed.load("must-not-commit") is None
+        finally:
+            await stale.close()
+            await keyed.close()
+
+    asyncio.run(runner())
+
+
+def test_postgres_public_authority_alias_startup_backfills_every_identity_source(
+    postgres_dsn: str,
+) -> None:
+    async def runner() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _truncate(postgres_dsn)
+        session_id = "legacy-session"
+        event_interaction_id = "event-only-interaction"
+        transcript_interaction_id = "transcript-only-interaction"
+        nested_interaction_id = "nested-turn-interaction"
+        initial = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await initial.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            await initial.append_events(
+                session_id,
+                [
+                    Event(
+                        type=EventType.TURN_COMPLETED,
+                        session_id=session_id,
+                        interaction_id=event_interaction_id,
+                        payload={"interaction_ids": [nested_interaction_id]},
+                    )
+                ],
+            )
+            await initial.append_transcript_messages(
+                session_id,
+                [Message.text("user", "legacy")],
+                interaction_id=transcript_interaction_id,
+            )
+        finally:
+            await initial.close()
+
+        codec = _public_authority_codec()
+        backfilling = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            public_authority_alias_codec=codec,
+        )
+        try:
+            session_alias = codec.encode(session_id, field_name="session_id")
+            assert (
+                await backfilling.resolve_public_authority_alias(
+                    session_alias,
+                    field_name="session_id",
+                )
+                == session_id
+            )
+            for interaction_id in (
+                event_interaction_id,
+                transcript_interaction_id,
+                nested_interaction_id,
+            ):
+                alias = codec.encode(
+                    interaction_id,
+                    field_name="interaction_id",
+                    session_id=session_id,
+                )
+                assert (
+                    await backfilling.resolve_public_authority_alias(
+                        alias,
+                        field_name="interaction_id",
+                        scope_session_id=session_id,
+                    )
+                    == interaction_id
+                )
+        finally:
+            await backfilling.close()
+
+    asyncio.run(runner())
 
 
 def test_postgres_checkpoint_schema_runtime_conformance(postgres_dsn: str) -> None:

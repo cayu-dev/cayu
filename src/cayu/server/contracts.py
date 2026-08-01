@@ -75,9 +75,9 @@ from cayu.server.sse import (
 )
 
 SERVER_API_PREFIX = "/api"
-SERVER_CONTRACT_VERSION = "5"
+SERVER_CONTRACT_VERSION = "6"
 SSE_CONTENT_TYPE = "text/event-stream"
-SSE_LAST_EVENT_ID_FORMAT = "session_id:event_id"
+SSE_LAST_EVENT_ID_FORMAT = "session_id:cayu_event_<sequence>"
 MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64
 MAX_SYSTEM_DEPLOYMENT_NAME_CHARS = 128
 MAX_SYSTEM_PRICING_METADATA_CHARS = 256
@@ -692,7 +692,7 @@ class SseFrameExamples(ApiBaseModel):
 
 class SseContract(ApiBaseModel):
     content_type: Literal["text/event-stream"] = SSE_CONTENT_TYPE
-    event_id_format: Literal["session_id:event_id"] = SSE_LAST_EVENT_ID_FORMAT
+    event_id_format: Literal["session_id:cayu_event_<sequence>"] = SSE_LAST_EVENT_ID_FORMAT
     replay_header: Literal["Last-Event-ID"] = "Last-Event-ID"
     max_event_id_chars: StrictInt = Field(default=EVENT_ID_MAX_CHARS, ge=1)
     mutation_id_header: Literal["Cayu-Mutation-ID"] = "Cayu-Mutation-ID"

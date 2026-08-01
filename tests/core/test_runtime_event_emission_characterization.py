@@ -14,8 +14,11 @@ from cayu.runtime import (
     SessionIdentity,
     SessionStatus,
 )
+from cayu.runtime._event_projection import public_event_id, public_event_sequence
 from cayu.runtime.budgets import BudgetStore
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.sessions import EventQuery, EventRecord, SessionQuery
+from cayu.vaults import SecretRedactor
 
 
 class _OneShotProvider(ModelProvider):
@@ -32,8 +35,19 @@ class _StoreObservingSink(EventSink):
         self.persisted_before_delivery: list[bool] = []
 
     async def emit(self, event: Event) -> None:
-        persisted = await self._store.load_events(event.session_id)
-        self.persisted_before_delivery.append(any(item.id == event.id for item in persisted))
+        sequence = public_event_sequence(event.id)
+        persisted = (
+            []
+            if sequence is None
+            else await self._store.query_events(
+                EventQuery(
+                    session_id=event.session_id,
+                    after_sequence=sequence - 1,
+                    limit=1,
+                )
+            )
+        )
+        self.persisted_before_delivery.append(bool(persisted and persisted[0].sequence == sequence))
 
 
 class _FailingSink(EventSink):
@@ -91,6 +105,42 @@ def test_runtime_event_is_persisted_before_sink_delivery() -> None:
     assert all(sink.persisted_before_delivery)
 
 
+def test_generated_session_and_interaction_ids_survive_short_secret_collisions() -> None:
+    async def scenario() -> tuple[list[Event], list[EventRecord]]:
+        store = InMemorySessionStore()
+        app = CayuApp(
+            session_store=store,
+            secret_redactor=SecretRedactor("-"),
+            enable_logging=False,
+        )
+        app.register_provider(_OneShotProvider(), default=True)
+        app.register_agent(AgentSpec(name="assistant", model="model"))
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    messages=[Message.text("user", "go")],
+                )
+            )
+        ]
+        sessions = (await store.list_sessions(SessionQuery(limit=1))).sessions
+        assert len(sessions) == 1
+        records = await store.query_events(EventQuery(session_id=sessions[0].id, limit=100))
+        return events, records
+
+    events, records = asyncio.run(scenario())
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert all(
+        event.id == public_event_id(record.sequence)
+        for event, record in zip(events, records, strict=True)
+    )
+    assert all("-" in record.event.session_id for record in records)
+    assert all(record.event.interaction_id is not None for record in records[:-2])
+
+
 def test_failing_sink_does_not_block_later_sink() -> None:
     store = InMemorySessionStore()
     recorder = _RecordingSink()
@@ -102,6 +152,7 @@ def test_failing_sink_does_not_block_later_sink() -> None:
 
     events = asyncio.run(_collect_run(app, "sess_later_sink"))
     persisted = asyncio.run(store.load_events("sess_later_sink"))
+    persisted_records = asyncio.run(store.query_events(EventQuery(session_id="sess_later_sink")))
     session = asyncio.run(store.load("sess_later_sink"))
 
     assert [event.type for event in events] == [
@@ -113,6 +164,11 @@ def test_failing_sink_does_not_block_later_sink() -> None:
         EventType.INTERACTION_COMPLETED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_COMPLETED,
+    ]
+    assert [event.id for event in events] == [
+        public_event_id(record.sequence)
+        for record in persisted_records
+        if record.event.type != EventType.RUNTIME_SINK_FAILED
     ]
     assert [event.id for event in recorder.events] == [event.id for event in events]
     assert session is not None
@@ -141,11 +197,11 @@ def test_model_completed_is_forwarded_to_budget_store_once() -> None:
 
     completed = [event for event in events if event.type == EventType.MODEL_COMPLETED]
     assert len(completed) == 1
-    assert [event.id for event in budget_store.events] == [completed[0].id]
+    assert [event.type for event in budget_store.events] == [EventType.MODEL_COMPLETED]
 
 
 def test_emit_events_batch_is_persisted_before_fanout() -> None:
-    async def scenario() -> tuple[list[Event], list[Event], list[bool]]:
+    async def scenario() -> tuple[list[Event], list[Event], list[EventRecord], list[bool]]:
         store = InMemorySessionStore()
         observer = _StoreObservingSink(store)
         recorder = _RecordingSink()
@@ -177,9 +233,42 @@ def test_emit_events_batch_is_persisted_before_fanout() -> None:
 
         emitted = await app.emit_events("sess_batch_emit", source)
         persisted = await store.load_events("sess_batch_emit")
-        return emitted, persisted, observer.persisted_before_delivery
+        records = await store.query_events(EventQuery(session_id="sess_batch_emit"))
+        return emitted, persisted, records, observer.persisted_before_delivery
 
-    emitted, persisted, observed = asyncio.run(scenario())
+    emitted, persisted, records, observed = asyncio.run(scenario())
 
-    assert [event.id for event in emitted] == [event.id for event in persisted]
+    assert [event.id for event in emitted] == [
+        public_event_id(record.sequence) for record in records
+    ]
+    assert [event.type for event in emitted] == [event.type for event in persisted]
     assert observed == [True, True]
+
+
+def test_emit_event_returns_public_identity_while_store_retains_private_authority() -> None:
+    async def scenario() -> tuple[Event, EventRecord]:
+        store = InMemorySessionStore()
+        app = CayuApp(session_store=store, enable_logging=False)
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_public_emit",
+                messages=[Message.text("user", "go")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        emitted = await app.emit_event(
+            Event(
+                type="custom.example",
+                session_id="sess_public_emit",
+                payload={"safe": True},
+            )
+        )
+        records = await store.query_events(EventQuery(session_id="sess_public_emit"))
+        assert len(records) == 1
+        return emitted, records[0]
+
+    emitted, record = asyncio.run(scenario())
+
+    assert emitted.id == public_event_id(record.sequence)
+    assert emitted.id != record.event.id

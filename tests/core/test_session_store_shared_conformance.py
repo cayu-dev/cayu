@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import hashlib
 import io
@@ -12,7 +13,7 @@ from hashlib import sha256
 from typing import Any, cast
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_engine as session_engine_module
@@ -61,6 +62,8 @@ from cayu.runtime import (
     PendingToolApproval,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectStatus,
+    PublicAuthorityAliasCodec,
+    PublicAuthorityAliasKeyring,
     ResolutionActor,
     ResumeRequest,
     RunLimits,
@@ -100,6 +103,12 @@ from cayu.runtime import (
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
+from cayu.runtime._event_projection import (
+    PRIVATE_EVENT_AUTHORITY,
+    REDACTED_CUSTOM_EVENT_TYPE,
+    public_event_id,
+    public_event_sequence,
+)
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
@@ -144,6 +153,9 @@ from cayu.storage.jsonl_export import export_sessions, import_sessions
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
 _POSTGRES_TABLES = (
+    "cayu_public_authority_aliases",
+    "cayu_public_authority_alias_keys",
+    "cayu_public_authority_alias_config",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
@@ -170,6 +182,16 @@ _POSTGRES_TABLES = (
 
 def _identity() -> SessionIdentity:
     return SessionIdentity(provider_name="fake", model="fake-model")
+
+
+def _public_authority_alias_codec() -> PublicAuthorityAliasCodec:
+    encoded_key = base64.urlsafe_b64encode(bytes([23]) * 32).decode("ascii").rstrip("=")
+    return PublicAuthorityAliasCodec(
+        PublicAuthorityAliasKeyring(
+            active_key_id="conformance",
+            keys={"conformance": SecretStr(encoded_key)},
+        )
+    )
 
 
 def _publication_tool_round_identity(label: str) -> dict[str, str]:
@@ -247,17 +269,43 @@ async def _truncate_postgres(dsn: str) -> None:
         await conn.commit()
 
 
-def _new_postgres_store(dsn: str) -> SessionStore:
+def _new_postgres_store(
+    dsn: str,
+    *,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+) -> SessionStore:
     from cayu import PostgresSessionStore
     from cayu.storage.migrations import SchemaMode
 
-    return PostgresSessionStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
+    return PostgresSessionStore(
+        dsn,
+        min_size=1,
+        max_size=4,
+        schema_mode=SchemaMode.CREATE,
+        public_authority_alias_codec=public_authority_alias_codec,
+    )
 
 
 async def _close_store(store: SessionStore) -> None:
     close = getattr(store, "close", None)
     if close is not None:
         await close()
+
+
+async def _private_event_for_public_event(store: SessionStore, event: Event) -> Event:
+    sequence = public_event_sequence(event.id)
+    assert sequence is not None
+    records = await store.query_events(EventQuery(session_id=event.session_id))
+    matches = [record.event for record in records if record.sequence == sequence]
+    assert len(matches) == 1
+    return matches[0]
+
+
+async def _pending_approval_for_public_event(
+    store: SessionStore,
+    event: Event,
+) -> PendingToolApproval:
+    return PendingToolApproval.from_event(await _private_event_for_public_event(store, event))
 
 
 def _summary_with_existing(request: CompactionRequest, summary: str) -> str:
@@ -555,24 +603,103 @@ def session_store_case(request, tmp_path):
     return request.param, tmp_path, request.getfixturevalue("postgres_dsn")
 
 
-async def _open_store(case) -> SessionStore:
+def test_in_memory_public_authority_aliases_reject_retired_keys() -> None:
+    first = _public_authority_alias_codec()
+    replacement_key = SecretStr(
+        base64.urlsafe_b64encode(bytes([24]) * 32).decode("ascii").rstrip("=")
+    )
+    retained = first.rotated(
+        active_key_id="replacement",
+        key=replacement_key,
+    )
+    retired = retained.rotated(
+        active_key_id="replacement",
+        key=replacement_key,
+        retire_key_ids=("conformance",),
+    )
+    private_session_id = "private-session"
+    old_alias = first.encode(private_session_id, field_name="session_id")
+    active_alias = retained.encode(private_session_id, field_name="session_id")
+    store = InMemorySessionStore(public_authority_alias_codec=retained)
+
+    async def run() -> None:
+        await store.register_public_authority_alias(
+            old_alias,
+            field_name="session_id",
+            private_value=private_session_id,
+        )
+        await store.register_public_authority_alias(
+            active_alias,
+            field_name="session_id",
+            private_value=private_session_id,
+        )
+        assert (
+            await store.resolve_public_authority_alias(
+                old_alias,
+                field_name="session_id",
+            )
+            == private_session_id
+        )
+
+        store._public_authority_alias_codec = retired
+
+        assert (
+            await store.resolve_public_authority_alias(
+                old_alias,
+                field_name="session_id",
+            )
+            is None
+        )
+        assert (
+            await store.resolve_public_authority_alias(
+                active_alias,
+                field_name="session_id",
+            )
+            == private_session_id
+        )
+
+    asyncio.run(run())
+
+
+async def _open_store(
+    case,
+    *,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+) -> SessionStore:
+    if public_authority_alias_codec is None:
+        public_authority_alias_codec = _public_authority_alias_codec()
     store_kind, tmp_path, postgres_dsn = case
     if store_kind == "memory":
-        return InMemorySessionStore()
+        return InMemorySessionStore(
+            public_authority_alias_codec=public_authority_alias_codec,
+        )
     if store_kind == "sqlite":
-        return SQLiteSessionStore(tmp_path / "sessions.sqlite")
+        return SQLiteSessionStore(
+            tmp_path / "sessions.sqlite",
+            public_authority_alias_codec=public_authority_alias_codec,
+        )
     await _truncate_postgres(postgres_dsn)
-    return _new_postgres_store(postgres_dsn)
+    return _new_postgres_store(
+        postgres_dsn,
+        public_authority_alias_codec=public_authority_alias_codec,
+    )
 
 
 async def _reopen_store(case, store: SessionStore) -> SessionStore:
     store_kind, tmp_path, postgres_dsn = case
     if store_kind == "memory":
         return store
+    public_authority_alias_codec = store.public_authority_alias_codec
     await _close_store(store)
     if store_kind == "sqlite":
-        return SQLiteSessionStore(tmp_path / "sessions.sqlite")
-    return _new_postgres_store(postgres_dsn)
+        return SQLiteSessionStore(
+            tmp_path / "sessions.sqlite",
+            public_authority_alias_codec=public_authority_alias_codec,
+        )
+    return _new_postgres_store(
+        postgres_dsn,
+        public_authority_alias_codec=public_authority_alias_codec,
+    )
 
 
 def test_session_store_conformance_repairs_terminal_evidence_durably(
@@ -812,7 +939,18 @@ def test_session_store_conformance_deletes_reconciled_consecutive_interruptions(
                 IncompleteSessionRecoveryRequest(session_id=session_id)
             )
             assert repaired.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
-            assert repaired.events[0].payload == second_payload
+            assert repaired.events[0].payload == {
+                **second_payload,
+                "interruption_request_id": PRIVATE_EVENT_AUTHORITY,
+            }
+
+            durable_interruptions = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_INTERRUPTED,
+                )
+            )
+            assert durable_interruptions[-1].event.payload == second_payload
 
             store = await _reopen_store(session_store_case, store)
             settled = await CayuApp(
@@ -970,6 +1108,87 @@ def test_session_store_conformance_declares_usage_aggregate_support(
         store = await _open_store(session_store_case)
         try:
             assert store.supports_usage_aggregates is True
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_event_projection_preserves_private_authority(
+    session_store_case,
+) -> None:
+    class RecordingSink(EventSink):
+        def __init__(self) -> None:
+            self.events: list[Event] = []
+
+        async def emit(self, event: Event) -> None:
+            self.events.append(event.model_copy(deep=True))
+
+    async def run() -> None:
+        store = await _open_store(
+            session_store_case,
+            public_authority_alias_codec=_public_authority_alias_codec(),
+        )
+        try:
+            session_id = f"eventprojection{session_store_case[0]}"
+            await store.create(
+                RunRequest(
+                    session_id=session_id,
+                    agent_name="assistant",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            sink = RecordingSink()
+            app = CayuApp(
+                session_store=store,
+                event_sinks=[sink],
+                enable_logging=False,
+                secret_redactor=SecretRedactor(["-", "step", "legacycanary", "explicitsecret"]),
+            )
+            emitted = await app.emit_event(
+                Event(
+                    type=EventType.MODEL_STARTED,
+                    session_id=session_id,
+                    payload={"step": 1},
+                )
+            )
+            with pytest.raises(ValueError, match=r"event\.event_id"):
+                await app.emit_event(
+                    Event(
+                        id="caller-explicitsecret-event",
+                        type=EventType.MODEL_STARTED,
+                        session_id=session_id,
+                        payload={"step": 2},
+                    )
+                )
+            with pytest.raises(ValueError, match=r"event\.payload\.tool_call_id"):
+                await app.emit_event(
+                    Event(
+                        type=EventType.TOOL_CALL_STARTED,
+                        session_id=session_id,
+                        payload={"tool_call_id": "legacycanary"},
+                    )
+                )
+            legacy = Event(
+                type="custom.legacycanary",
+                session_id=session_id,
+                payload={"legacycanary": "legacycanary"},
+            )
+            await store.append_event(session_id, legacy)
+            recovered = await app.recover_persisted_event_side_effects()
+            records = await store.query_events(EventQuery(session_id=session_id))
+
+            assert public_event_sequence(emitted.id) == records[0].sequence
+            assert [record.event.id for record in records[1:]] == [legacy.id]
+            assert [event.id for event in sink.events] == [
+                public_event_id(records[0].sequence),
+                public_event_id(records[1].sequence),
+            ]
+            assert recovered[0].id == public_event_id(records[1].sequence)
+            assert sink.events[0].payload == {"step": 1}
+            assert sink.events[1].type == REDACTED_CUSTOM_EVENT_TYPE
+            assert "legacycanary" not in repr(sink.events[1].model_dump(mode="json"))
         finally:
             await _close_store(store)
 
@@ -1289,7 +1508,7 @@ def test_session_store_conformance_pre_digest_approval_claim_fails_closed(
                 for event in first_events
                 if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
             )
-            approval = PendingToolApproval.from_event(requested)
+            approval = await _pending_approval_for_public_event(store, requested)
             assert binding.bind_calls == 1
 
             binding.fail_next = True
@@ -1453,12 +1672,13 @@ def test_session_store_conformance_approval_open_and_close_lost_ack_replay_exact
                     )
                 )
             ]
-            approval = PendingToolApproval.from_event(
+            approval = await _pending_approval_for_public_event(
+                store,
                 next(
                     event
                     for event in paused
                     if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
-                )
+                ),
             )
             assert "approval-open" in lost_ack_kinds
             open_receipt = await store.load_runtime_publication_receipt(
@@ -1492,7 +1712,10 @@ def test_session_store_conformance_approval_open_and_close_lost_ack_replay_exact
             assert receipt.kind == "approval-close"
 
             replayed = [event async for event in app.resolve_tool_approval(request)]
-            assert tuple(event.id for event in replayed) == receipt.appended_event_ids
+            private_replayed = [
+                await _private_event_for_public_event(store, event) for event in replayed
+            ]
+            assert tuple(event.id for event in private_replayed) == receipt.appended_event_ids
             assert calls == []
             with pytest.raises(RuntimeError, match="conflicting identity or decision"):
                 _ = [
@@ -1517,7 +1740,10 @@ def test_session_store_conformance_approval_open_and_close_lost_ack_replay_exact
             await store.release_run_fence(session_id)
 
             stale_replay = [event async for event in app.resolve_tool_approval(request)]
-            assert tuple(event.id for event in stale_replay) == receipt.appended_event_ids
+            private_stale_replay = [
+                await _private_event_for_public_event(store, event) for event in stale_replay
+            ]
+            assert tuple(event.id for event in private_stale_replay) == receipt.appended_event_ids
             deferred = await store.load_deferred_interaction_input(session_id)
             assert deferred is not None
             assert deferred.interaction_id == later_interaction_id
@@ -1554,12 +1780,13 @@ def test_session_store_conformance_approval_limit_close_replays_exact_request(
                     )
                 )
             ]
-            approval = PendingToolApproval.from_event(
+            approval = await _pending_approval_for_public_event(
+                store,
                 next(
                     event
                     for event in paused
                     if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
-                )
+                ),
             )
             request = ToolApprovalRequest(
                 session_id=session_id,
@@ -1598,7 +1825,10 @@ def test_session_store_conformance_approval_limit_close_replays_exact_request(
             )
 
             replayed = [event async for event in app.resolve_tool_approval(request)]
-            assert tuple(event.id for event in replayed) == receipt.appended_event_ids
+            private_replayed = [
+                await _private_event_for_public_event(store, event) for event in replayed
+            ]
+            assert tuple(event.id for event in private_replayed) == receipt.appended_event_ids
             assert calls == []
 
             with pytest.raises(RuntimeError, match="conflicting identity or decision"):
@@ -1668,12 +1898,13 @@ def test_session_store_conformance_approval_event_ack_loss_rejects_request_drift
                     )
                 )
             ]
-            approval = PendingToolApproval.from_event(
+            approval = await _pending_approval_for_public_event(
+                store,
                 next(
                     event
                     for event in paused
                     if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
-                )
+                ),
             )
             request = ToolApprovalRequest(
                 session_id=session_id,
@@ -1840,7 +2071,7 @@ def test_session_store_conformance_legacy_history_cannot_be_poisoned_by_retry(
                 for event in first_events
                 if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
             )
-            approval = PendingToolApproval.from_event(requested)
+            approval = await _pending_approval_for_public_event(store, requested)
             historical_payload: dict[str, Any] = {
                 "model_step_id": approval.model_step_id,
                 "model_attempt_id": approval.model_attempt_id,
@@ -2071,12 +2302,13 @@ def test_session_store_conformance_lossy_legacy_grant_cannot_authorize_pending_s
                     )
                 )
             ]
-            approval = PendingToolApproval.from_event(
+            approval = await _pending_approval_for_public_event(
+                store,
                 next(
                     event
                     for event in paused
                     if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
-                )
+                ),
             )
             assert [call.policy_decision for call in approval.tool_calls] == [
                 ToolPolicyDecision.REQUIRE_APPROVAL.value,
@@ -2500,7 +2732,7 @@ def test_session_store_conformance_lost_policy_authority_never_becomes_executabl
                 for event in resume_events
                 if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
             )
-            approval = PendingToolApproval.from_event(requested)
+            approval = await _pending_approval_for_public_event(store, requested)
             assert approval.tool_calls[0].policy_evidence == "ambiguous"
             assert approval.tool_calls[0].policy_decision is None
 
@@ -2596,7 +2828,7 @@ def test_session_store_conformance_registration_drift_cannot_authorize_paused_ca
             requested = next(
                 event for event in events if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
             )
-            approval = PendingToolApproval.from_event(requested)
+            approval = await _pending_approval_for_public_event(store, requested)
             assert [call.policy_evidence for call in approval.tool_calls] == [
                 "unregistered",
                 "authoritative",
@@ -2631,9 +2863,12 @@ def test_session_store_conformance_registration_drift_cannot_authorize_paused_ca
 
             assert late_calls == []
             assert protected_calls == [{"value": "approved effect"}]
+            private_resolved = [
+                await _private_event_for_public_event(store, event) for event in resolved
+            ]
             late_failure = next(
                 event
-                for event in resolved
+                for event in private_resolved
                 if event.type is EventType.TOOL_CALL_FAILED
                 and event.payload.get("tool_call_id") == "call_late"
             )
@@ -2641,7 +2876,7 @@ def test_session_store_conformance_registration_drift_cannot_authorize_paused_ca
             assert not any(
                 event.type is EventType.TOOL_CALL_STARTED
                 and event.payload.get("tool_call_id") == "call_late"
-                for event in resolved
+                for event in private_resolved
             )
         finally:
             await _close_store(store)
@@ -10102,14 +10337,14 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
                     max_user_turns=1,
                 ),
             )
-            durable_events = [
-                record.event
-                for record in await store.query_events(EventQuery(session_id=created.id, limit=100))
-            ]
+            durable_records = await store.query_events(EventQuery(session_id=created.id, limit=100))
+            durable_events = [record.event for record in durable_records]
             replay = [event async for event in replay_app.compact_session(recovered_request)]
 
             assert recovered_events[-1].type == EventType.SESSION_CHECKPOINTED
-            assert [event.id for event in replay] == [event.id for event in durable_events]
+            assert [public_event_sequence(event.id) for event in replay] == [
+                record.sequence for record in durable_records
+            ]
             assert (
                 sum(
                     event.type == EventType.CONTEXT_COMPACTION_COMPLETED for event in durable_events

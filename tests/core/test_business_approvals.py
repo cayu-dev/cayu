@@ -122,8 +122,8 @@ def _paused_app(
         tool_policy=policy,
     )
 
-    async def run() -> list[Event]:
-        return [
+    async def run() -> tuple[list[Event], list[Event]]:
+        events = [
             event
             async for event in app.run(
                 RunRequest(
@@ -133,11 +133,12 @@ def _paused_app(
                 )
             )
         ]
+        return events, await store.load_events(session_id)
 
-    events = asyncio.run(run())
+    events, durable_events = asyncio.run(run())
     assert events[-1].type == EventType.SESSION_INTERRUPTED
     approval_event = next(
-        event for event in events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
+        event for event in durable_events if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
     return app, store, tool, approval_event
 

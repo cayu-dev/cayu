@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -17,6 +15,7 @@ from cayu._validation import (
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult
 from cayu.runners import RunnerExecutionError, RunnerUnavailableError
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime._tool_identity import tool_idempotency_key as tool_idempotency_key
 from cayu.runtime.tool_policy import ToolPolicyResult
 from cayu.tools._runner import (
     is_current_runner_cancellation_group,
@@ -93,28 +92,6 @@ def _execution_outcome(
         terminal_payload or {},
         _token=_OUTCOME_CONSTRUCTION_TOKEN,
     )
-
-
-def tool_idempotency_key(
-    *,
-    session_id: str,
-    tool_call_id: str,
-    tool_round_id: str | None = None,
-    approval_id: str | None = None,
-    pause_id: str | None = None,
-) -> str:
-    """Stable, bounded key for one runtime-owned tool execution identity."""
-
-    components = (
-        "cayu-tool-idempotency-v1",
-        session_id,
-        tool_round_id or "",
-        approval_id or "",
-        pause_id or "",
-        tool_call_id,
-    )
-    material = json.dumps(components, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return "cayu-tool:v1:" + hashlib.sha256(material).hexdigest()
 
 
 async def run_tool(

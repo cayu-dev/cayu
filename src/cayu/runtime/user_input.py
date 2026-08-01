@@ -10,6 +10,11 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
 )
+from cayu.core.events import (
+    Event,
+    event_with_runtime_nested_payload_authority,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.approvals import (
@@ -228,6 +233,40 @@ class PendingUserInput(BaseModel):
         if value is None:
             return None
         return copy_retry_policy(value)
+
+
+_RUNTIME_USER_INPUT_IDENTITY_FIELDS = (
+    "input_id",
+    "model_step_id",
+    "model_attempt_id",
+    "tool_round_id",
+)
+
+
+def event_with_pending_user_input_authority(
+    event: Event,
+    pending: PendingUserInput,
+) -> Event:
+    """Attest user-input identities from one validated runtime checkpoint model."""
+
+    if type(pending) is not PendingUserInput:
+        raise TypeError("pending must be a PendingUserInput.")
+    top_level_fields = tuple(
+        field_name
+        for field_name in _RUNTIME_USER_INPUT_IDENTITY_FIELDS
+        if event.payload.get(field_name) == getattr(pending, field_name)
+    )
+    if top_level_fields:
+        event = event_with_runtime_payload_authority(event, *top_level_fields)
+    nested = event.payload.get("user_input")
+    nested_paths = tuple(
+        ("user_input", field_name)
+        for field_name in _RUNTIME_USER_INPUT_IDENTITY_FIELDS
+        if type(nested) is dict and nested.get(field_name) == getattr(pending, field_name)
+    )
+    if nested_paths:
+        event = event_with_runtime_nested_payload_authority(event, *nested_paths)
+    return event
 
 
 def copy_user_input_response(response: UserInputResponse) -> UserInputResponse:

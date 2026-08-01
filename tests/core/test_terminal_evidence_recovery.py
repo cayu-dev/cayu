@@ -142,7 +142,7 @@ def test_cayu_app_terminal_evidence_repair_is_status_consistent_and_idempotent(
         assert persisted[0].event.type == event_type
         assert persisted[0].event.timestamp == terminal.updated_at
         assert first.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
-        assert first.events == (persisted[0].event,)
+        assert first.events == (app.project_event_record_for_exposure(persisted[0]).event,)
         assert second.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
         assert second.events == ()
 
@@ -184,9 +184,9 @@ def test_cayu_app_terminal_evidence_repair_reconciles_lost_append_acknowledgemen
                 event_type=EventType.SESSION_FAILED,
             )
         )
-        assert store.failed is True
-        assert repaired.events == (persisted[0].event,)
         assert len(persisted) == 1
+        assert store.failed is True
+        assert repaired.events == (app.project_event_record_for_exposure(persisted[0]).event,)
         assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
     asyncio.run(scenario())
@@ -247,7 +247,7 @@ def test_terminal_evidence_repair_reconciles_redacted_lost_append_acknowledgemen
 
         assert store.failed is True
         assert len(persisted) == 1
-        assert repaired.events == (persisted[0].event,)
+        assert repaired.events == (app.project_event_record_for_exposure(persisted[0]).event,)
         assert persisted[0].event.payload["reason"] == f"deploy {REDACTED_SECRET}"
         assert persisted[0].event.payload["metadata"] == {"source": REDACTED_SECRET}
         assert secret not in str(persisted[0].event.payload)
@@ -386,7 +386,7 @@ def test_cayu_app_terminal_evidence_repair_recognizes_event_before_marker_cleanu
                 event_type=EventType.SESSION_INTERRUPTED,
             )
         )
-        assert repaired.events == (existing_event,)
+        assert repaired.events == (app.project_event_record_for_exposure(records[0]).event,)
         assert [record.event.id for record in records] == [existing_event.id]
         assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
@@ -432,7 +432,13 @@ def test_cayu_app_terminal_evidence_repair_clears_expired_post_publication_claim
         repaired = await app.recover_incomplete_session(
             IncompleteSessionRecoveryRequest(session_id=session_id)
         )
-        assert repaired.events == (existing_event,)
+        records = await store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SESSION_COMPLETED,
+            )
+        )
+        assert repaired.events == (app.project_event_record_for_exposure(records[0]).event,)
         assert repaired.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
         assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
@@ -490,7 +496,7 @@ def test_cayu_app_terminal_evidence_repair_fences_delayed_original_publisher() -
         )
         assert repaired.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
         assert len(records) == 1
-        assert records[0].event.id == repaired.events[0].id
+        assert repaired.events == (app.project_event_record_for_exposure(records[0]).event,)
 
     asyncio.run(scenario())
 

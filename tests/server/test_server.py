@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -55,7 +56,12 @@ from cayu import (
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactReadResult, ArtifactStore
 from cayu.artifacts.attachments import FileAttachment, FileAttachmentKind
-from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
+from cayu.core.events import (
+    EVENT_ID_MAX_CHARS,
+    Event,
+    EventType,
+    event_with_durable_sequence,
+)
 from cayu.core.messages import FilePart, ProviderStatePart
 from cayu.providers import (
     ModelProvider,
@@ -67,8 +73,13 @@ from cayu.providers import (
 )
 from cayu.runtime import (
     CheckpointCompactionContextPolicy,
+    Dispatcher,
+    DispatchHandle,
+    DispatchRequest,
+    DispatchStatus,
     EventQuery,
     EventRecord,
+    ForkSessionRequest,
     IncompleteSessionsRecoveryPage,
     InMemoryEventSink,
     InMemorySessionStore,
@@ -76,6 +87,7 @@ from cayu.runtime import (
     PendingActionIssue,
     PendingActionIssueCode,
     PendingActionListResult,
+    PendingActionQuery,
     PersistedEventSideEffectStatus,
     ResumeRequest,
     RunRequest,
@@ -84,6 +96,14 @@ from cayu.runtime import (
     SessionStatus,
     TerminalEventPublicationUncertain,
     TranscriptDigestCompactor,
+)
+from cayu.runtime._event_projection import (
+    PRIVATE_EVENT_AUTHORITY,
+    REDACTED_CUSTOM_EVENT_TYPE,
+    public_event_envelope_alias_field,
+    public_event_id,
+    public_event_linkage_id,
+    public_event_sequence,
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
 from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
@@ -101,7 +121,9 @@ from cayu.server.routes import (
     _accepted_event_stream_response,
     _add_usage_metrics,
     _detached_event_stream_response,
+    _log_mutation_acceptance_failure,
     _next_replay_poll_interval,
+    _serialize_pending_action,
     _start_detached_event_stream_response,
 )
 from cayu.server.sse import (
@@ -605,6 +627,25 @@ def test_server_run_failure_before_acceptance_is_generic_and_creates_no_task(cap
     assert "error_type=OSError" in caplog.text
     assert client.get("/api/tasks").json() == []
     assert client.get("/api/sessions").json()["sessions"] == []
+
+
+def test_mutation_acceptance_log_projects_private_session_identity(caplog) -> None:
+    private_session_id = "private-session-secret"
+    app = CayuApp(
+        secret_redactor=SecretRedactor(private_session_id),
+        enable_logging=False,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="cayu.server.routes"):
+        _log_mutation_acceptance_failure(
+            app,
+            RuntimeError("acceptance failed"),
+            session_id=private_session_id,
+            stage="after_first_event",
+        )
+
+    assert private_session_id not in caplog.text
+    assert app.project_session_id_for_exposure(private_session_id) in caplog.text
 
 
 def test_server_run_task_setup_failure_finalizes_claimed_session(caplog) -> None:
@@ -4252,9 +4293,24 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         )
 
     asyncio.run(seed())
+    recovered_rounds = []
+
+    async def recover_tool_round(request):
+        recovered_rounds.append(request)
+        yield Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=request.session_id,
+        )
+
+    app.recover_tool_round = recover_tool_round
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
 
-    response = client.get("/api/pending-actions")
+    with patch.object(
+        app.session_store,
+        "query_events",
+        side_effect=AssertionError("pending-action serialization must use its bounded event"),
+    ):
+        response = client.get("/api/pending-actions")
     assert response.status_code == 200
     body = response.json()
     assert body["inspected_candidate_count"] == 4
@@ -4270,20 +4326,71 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     }
     approval = actions_by_session["pending_approval"]
     assert approval["kind"] == "tool_approval"
-    assert approval["approval_id"] == "approval_1"
+    assert approval["approval_id"] == public_event_linkage_id(
+        approval["event"]["sequence"],
+        "approval_id",
+    )
     assert approval["arguments"] == {"service": "api"}
     user_input = actions_by_session["pending_user_input"]
     assert user_input["kind"] == "user_input"
-    assert user_input["input_id"] == "input_1"
+    assert user_input["input_id"] == public_event_linkage_id(
+        user_input["event"]["sequence"],
+        "input_id",
+    )
     assert user_input["question"] == "Deploy now?"
     assert user_input["options"] == ["yes", "no"]
     tool_round = actions_by_session["manual_tool_round_recovery"]
     assert tool_round["kind"] == "manual_recovery"
-    assert tool_round["round_id"] == recovery_round_id
-    assert tool_round["tool_call_id"] == "call_charge"
+    assert tool_round["round_id"] == public_event_linkage_id(
+        tool_round["event"]["sequence"],
+        "tool_round_id",
+    )
+    assert tool_round["tool_call_id"] == public_event_linkage_id(
+        tool_round["event"]["sequence"],
+        "tool_call_id",
+    )
     assert tool_round["approval_id"] is None
     assert tool_round["input_id"] is None
     assert tool_round["arguments"] == {"amount": 42}
+    assert tool_round["event"]["type"] == EventType.SESSION_FAILED
+    assert tool_round["event"]["payload"] == {}
+
+    pending_approval = asyncio.run(
+        app._runtime_session_store.query_pending_actions(
+            PendingActionQuery(session_id="pending_approval", limit=1)
+        )
+    ).actions[0]
+    checkpoint_only_approval = pending_approval.model_copy(
+        update={
+            "source_linkage": {},
+            "event": pending_approval.event.model_copy(
+                update={
+                    "event": pending_approval.event.event.model_copy(update={"payload": {}}),
+                },
+                deep=True,
+            ),
+        },
+        deep=True,
+    )
+    checkpoint_only_payload = _serialize_pending_action(app, checkpoint_only_approval)
+    assert checkpoint_only_payload["approval_id"] is None
+    assert checkpoint_only_payload["round_id"] is None
+    assert checkpoint_only_payload["tool_call_id"] is None
+
+    with patch.object(
+        app.session_store,
+        "query_events",
+        side_effect=AssertionError("pending-action serialization must not query per action"),
+    ):
+        full_page = [_serialize_pending_action(app, pending_approval) for _ in range(200)]
+        assert len(full_page) == 200
+
+    contradictory_approval = pending_approval.model_copy(
+        update={"approval_id": "different-approval"},
+        deep=True,
+    )
+    with pytest.raises(RuntimeError, match="disagrees with its durable event authority"):
+        _serialize_pending_action(app, contradictory_approval)
     approval_recovery = actions_by_session["manual_recovery"]
     assert approval_recovery["kind"] == "manual_recovery"
     assert approval_recovery["arguments"] == {"invoice_id": "inv_123"}
@@ -4306,7 +4413,37 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     tool_round_exact_body = tool_round_exact.json()
     assert tool_round_exact_body["inspected_candidate_count"] == 1
     assert tool_round_exact_body["total_count"] == 1
-    assert tool_round_exact_body["actions"][0]["round_id"] == recovery_round_id
+    exact_tool_round = tool_round_exact_body["actions"][0]
+    assert exact_tool_round["round_id"] == public_event_linkage_id(
+        exact_tool_round["event"]["sequence"],
+        "tool_round_id",
+    )
+
+    with client.stream(
+        "POST",
+        "/api/tool-rounds/recover",
+        json={
+            "session_id": "manual_tool_round_recovery",
+            "round_id": exact_tool_round["round_id"],
+            "tool_call_id": exact_tool_round["tool_call_id"],
+            "outcome": "completed",
+            "message": "verified externally",
+        },
+    ) as recovery_response:
+        assert recovery_response.status_code == 200
+        list(recovery_response.iter_lines())
+
+    assert len(recovered_rounds) == 1
+    assert recovered_rounds[0].round_id == recovery_round_id
+    assert recovered_rounds[0].tool_call_id == "call_charge"
+
+    history = client.get("/api/sessions/manual_tool_round_recovery/events").json()["events"]
+    failed = next(event for event in history if event["type"] == EventType.SESSION_FAILED)
+    assert failed["payload"]["model_step_id"] == PRIVATE_EVENT_AUTHORITY
+    assert failed["payload"]["model_attempt_id"] == PRIVATE_EVENT_AUTHORITY
+    assert failed["payload"]["tool_round_id"] == tool_round["round_id"]
+    assert failed["payload"]["tool_call_id"] == tool_round["tool_call_id"]
+    assert recovery_round_id not in repr(failed)
 
     stale_exact = client.get("/api/pending-actions?session_id=missing_checkpoint")
     assert stale_exact.status_code == 200
@@ -4323,7 +4460,7 @@ def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_
         secret_redactor=SecretRedactor(secret),
         enable_logging=False,
     )
-    session_id = "legacy_control_plane_secret"
+    session_id = f"legacy-{secret}-session"
     model_step_id = f"mstep_{'1' * 32}"
     model_attempt_id = f"matt_{'2' * 32}"
     tool_round_id = f"tround_{'3' * 32}"
@@ -4433,27 +4570,36 @@ def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_
 
     asyncio.run(seed())
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    public_session_id = app.project_session_id_for_exposure(session_id)
+    assert public_session_id != session_id
 
     responses = [
-        client.get(f"/api/sessions/{session_id}"),
-        client.get(f"/api/sessions/{session_id}/events"),
-        client.get(f"/api/sessions/{session_id}/transcript"),
-        client.get(f"/api/pending-actions?session_id={session_id}"),
+        client.get(f"/api/sessions/{public_session_id}"),
+        client.get(f"/api/sessions/{public_session_id}/events"),
+        client.get(f"/api/sessions/{public_session_id}/transcript"),
+        client.get(f"/api/pending-actions?session_id={public_session_id}"),
         client.get("/api/tasks"),
         client.get("/api/tasks/legacy_secret_task"),
+        client.get("/api/sessions"),
     ]
 
     for response in responses:
         assert response.status_code == 200
         rendered = json.dumps(response.json(), sort_keys=True)
         assert secret not in rendered
+
+    for response in responses[:-1]:
+        rendered = json.dumps(response.json(), sort_keys=True)
         assert REDACTED_SECRET in rendered
 
     pending_body = responses[3].json()
+    assert pending_body["actions"][0]["session"]["id"] == public_session_id
     assert pending_body["actions"][0]["arguments"] == {
         REDACTED_SECRET: f"checkpoint value {REDACTED_SECRET}"
     }
     assert pending_body["next_cursor"] is None
+    assert responses[0].json()["id"] == public_session_id
+    assert responses[-1].json()["sessions"][0]["id"] == public_session_id
 
 
 def test_control_plane_rejects_secret_bearing_session_cursor_authority() -> None:
@@ -5349,6 +5495,74 @@ def test_server_exposes_causal_budget_usage_and_cost_with_tiered_price_book() ->
     assert missing_summary_response.json() == {"detail": "Causal budget not found"}
 
 
+def test_server_projects_session_authority_across_session_and_causal_budget_views() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("-"), enable_logging=False)
+    app.register_provider(UsageProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    events = _sse_events(
+        client,
+        "/api/run",
+        {
+            "agent": "assistant",
+            "model": "fakemodel",
+            "prompt": "hello",
+            "causal_budget_id": "job_shared",
+        },
+    )
+    public_session_id = events[0]["session_id"]
+    private_session_id = asyncio.run(app.session_store.list_sessions()).sessions[0].id
+    assert public_session_id == app.project_session_id_for_exposure(private_session_id)
+
+    pricing_body = {"pricing": _price_book_payload(model="fakemodel")}
+    session_summary = client.post("/api/sessions/summary", json=pricing_body)
+    session_usage = client.get(f"/api/sessions/{public_session_id}/usage")
+    session_cost = client.post(
+        f"/api/sessions/{public_session_id}/cost",
+        json=pricing_body,
+    )
+    usage = client.get("/api/causal-budgets/job_shared/usage")
+    cost = client.post("/api/causal-budgets/job_shared/cost", json=pricing_body)
+    causal_summary = client.post(
+        "/api/causal-budgets/job_shared/summary",
+        json=pricing_body,
+    )
+
+    assert session_summary.status_code == 200
+    session_item = session_summary.json()["sessions"][0]
+    assert session_item["session"]["id"] == public_session_id
+    assert session_item["outcome"]["session_id"] == public_session_id
+    assert session_summary.json()["usage"]["session_ids"] == [public_session_id]
+    assert [
+        item["session_id"] for item in session_summary.json()["usage"]["session_summaries"]
+    ] == [public_session_id]
+    assert session_summary.json()["cost"]["session_ids"] == [public_session_id]
+    assert [item["session_id"] for item in session_summary.json()["cost"]["session_costs"]] == [
+        public_session_id
+    ]
+
+    assert session_usage.status_code == 200
+    assert session_usage.json()["session_id"] == public_session_id
+    assert session_cost.status_code == 200
+    assert session_cost.json()["session_id"] == public_session_id
+
+    assert usage.status_code == 200
+    assert usage.json()["session_ids"] == [public_session_id]
+    assert [item["session_id"] for item in usage.json()["session_summaries"]] == [public_session_id]
+
+    assert cost.status_code == 200
+    assert cost.json()["session_ids"] == [public_session_id]
+    assert [item["session_id"] for item in cost.json()["session_costs"]] == [public_session_id]
+
+    assert causal_summary.status_code == 200
+    causal_body = causal_summary.json()
+    assert causal_body["sessions"][0]["session"]["id"] == public_session_id
+    assert causal_body["sessions"][0]["outcome"]["session_id"] == public_session_id
+    assert causal_body["usage"]["session_ids"] == [public_session_id]
+    assert causal_body["cost"]["session_ids"] == [public_session_id]
+
+
 def test_server_rejects_a_merged_flat_and_model_catalog_pricing_body() -> None:
     app = CayuApp()
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
@@ -5582,9 +5796,9 @@ def test_server_session_summary_exposes_interrupted_outcome_and_retry() -> None:
         "delay_seconds": 0.0,
         "reason": "timeout",
     }
-    assert outcome["terminal_event"]["id"] == "summary_terminal"
-    assert outcome["latest_retry_event"]["id"] == "summary_retry"
-    assert body["events"]["latest_event"]["id"] == "summary_hook"
+    assert outcome["terminal_event"]["id"] == public_event_id(2)
+    assert outcome["latest_retry_event"]["id"] == public_event_id(1)
+    assert body["events"]["latest_event"]["id"] == public_event_id(3)
 
 
 def test_server_session_summary_returns_404_for_missing_session() -> None:
@@ -5722,10 +5936,13 @@ def test_server_exposes_paginated_session_events() -> None:
     assert first_body["has_more"] is True
     assert first_body["next_sequence"] == 2
     assert first_body["scan_through_sequence"] == 2
-    assert [event["id"] for event in first_body["events"]] == ["event_1", "event_2"]
+    assert [event["id"] for event in first_body["events"]] == [
+        public_event_id(1),
+        public_event_id(2),
+    ]
     assert first_body["events"][1] == {
         "sequence": 2,
-        "id": "event_2",
+        "id": public_event_id(2),
         "type": "tool.call.completed",
         "session_id": "events_1",
         "interaction_id": None,
@@ -5744,7 +5961,7 @@ def test_server_exposes_paginated_session_events() -> None:
     assert second_body["order_by"] == "sequence_asc"
     assert second_body["next_sequence"] == 3
     assert second_body["scan_through_sequence"] == 3
-    assert [event["id"] for event in second_body["events"]] == ["event_3"]
+    assert [event["id"] for event in second_body["events"]] == [public_event_id(3)]
 
     latest_page = client.get("/api/sessions/events_1/events?order_by=sequence_desc&limit=2")
     assert latest_page.status_code == 200
@@ -5753,7 +5970,10 @@ def test_server_exposes_paginated_session_events() -> None:
     assert latest_body["has_more"] is True
     assert latest_body["next_sequence"] == 2
     assert latest_body["scan_through_sequence"] == 3
-    assert [event["id"] for event in latest_body["events"]] == ["event_3", "event_2"]
+    assert [event["id"] for event in latest_body["events"]] == [
+        public_event_id(3),
+        public_event_id(2),
+    ]
 
     older_page = client.get(
         "/api/sessions/events_1/events?order_by=sequence_desc&before_sequence=2&limit=2"
@@ -5764,7 +5984,7 @@ def test_server_exposes_paginated_session_events() -> None:
     assert older_body["has_more"] is False
     assert older_body["next_sequence"] == 1
     assert older_body["scan_through_sequence"] is None
-    assert [event["id"] for event in older_body["events"]] == ["event_1"]
+    assert [event["id"] for event in older_body["events"]] == [public_event_id(1)]
 
     exhausted_page = client.get(
         "/api/sessions/events_1/events?order_by=sequence_desc&before_sequence=1&limit=2"
@@ -5841,7 +6061,7 @@ def test_server_filters_session_events() -> None:
     assert body["has_more"] is False
     assert body["next_sequence"] == 1
     assert body["scan_through_sequence"] == 3
-    assert [event["id"] for event in body["events"]] == ["event_filter_1"]
+    assert [event["id"] for event in body["events"]] == [public_event_id(1)]
 
     bounded_response = client.get(
         "/api/sessions/events_filters/events",
@@ -5851,7 +6071,7 @@ def test_server_filters_session_events() -> None:
     bounded_body = bounded_response.json()
     assert bounded_body["has_more"] is True
     assert bounded_body["scan_through_sequence"] == 1
-    assert [event["id"] for event in bounded_body["events"]] == ["event_filter_1"]
+    assert [event["id"] for event in bounded_body["events"]] == [public_event_id(1)]
 
 
 def test_server_finds_exact_session_scoped_event_id() -> None:
@@ -5900,7 +6120,7 @@ def test_server_finds_exact_session_scoped_event_id() -> None:
     assert body["next_sequence"] == 1
     assert body["scan_through_sequence"] == 1
     assert [(event["id"], event["session_id"], event["payload"]) for event in body["events"]] == [
-        (event_id, "event_lookup", {"source": "selected"})
+        (public_event_id(1), "event_lookup", {"source": "selected"})
     ]
 
     missing_response = client.get(
@@ -5981,7 +6201,10 @@ def test_server_excludes_event_type_before_pagination() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["has_more"] is False
-    assert [event["id"] for event in body["events"]] == ["useful_new", "useful_old"]
+    assert [event["id"] for event in body["events"]] == [
+        public_event_id(22),
+        public_event_id(1),
+    ]
     assert body["scan_through_sequence"] == 32
 
     useful_new_sequence = body["events"][0]["sequence"]
@@ -6061,6 +6284,16 @@ def test_server_session_events_validates_query() -> None:
         client.get("/api/sessions/events_validation/events?event_type=not.valid").status_code == 422
     )
     assert client.get("/api/sessions/events_validation/events?event_id=%20").status_code == 422
+    for malformed_alias in (
+        f"cayu_event_{MAX_DURABLE_JSON_INTEGER + 1}",
+        f"cayu_event_{'9' * 5000}",
+    ):
+        response = client.get(
+            "/api/sessions/events_validation/events",
+            params={"event_id": malformed_alias},
+        )
+        assert response.status_code == 422
+        assert "malformed Cayu public event alias" in response.json()["detail"]
     assert (
         client.get(
             "/api/sessions/events_validation/events?exclude_event_type=not.valid"
@@ -6268,6 +6501,658 @@ def test_server_exposes_response_scoped_interaction_summaries() -> None:
         ).status_code
         == 422
     )
+
+
+def test_generated_session_and_interaction_aliases_remain_distinct_and_addressable() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("-"), enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+
+    async def seed() -> tuple[str, str, str]:
+        first_session_events = await _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+        first_session_id = first_session_events[0].session_id
+        assert {event.session_id for event in first_session_events} == {first_session_id}
+        assert (
+            len(
+                {
+                    event.interaction_id
+                    for event in first_session_events
+                    if event.interaction_id is not None
+                }
+            )
+            == 1
+        )
+        second_session_events = await _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "other")],
+            ),
+        )
+        return first_session_id, first_session_events[0].id, second_session_events[0].session_id
+
+    first_session_id, first_event_id, second_session_id = asyncio.run(seed())
+    assert public_event_envelope_alias_field(first_session_id) == "session_id"
+    assert public_event_envelope_alias_field(second_session_id) == "session_id"
+    assert first_session_id != second_session_id
+
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    replay = client.post(
+        "/api/resume",
+        json={"session_id": first_session_id, "prompt": "must not dispatch"},
+        headers={"Last-Event-ID": f"{first_session_id}:{first_event_id}"},
+    )
+    assert replay.status_code == 200
+
+    response = client.get(f"/api/sessions/{first_session_id}/interactions?limit=10")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == first_session_id
+    assert len(body["interactions"]) == 1
+    interaction_ids = [item["interaction_id"] for item in body["interactions"]]
+    assert len(set(interaction_ids)) == 1
+    assert all(
+        public_event_envelope_alias_field(interaction_id) == "interaction_id"
+        for interaction_id in interaction_ids
+    )
+
+    interaction = body["interactions"][0]
+    detail = client.get(
+        f"/api/sessions/{first_session_id}/interactions/{interaction['interaction_id']}"
+    )
+    assert detail.status_code == 200
+    assert detail.json() == interaction
+
+    events = client.get(
+        f"/api/sessions/{first_session_id}/events",
+        params={"interaction_id": interaction["interaction_id"]},
+    )
+    assert events.status_code == 200
+    event_body = events.json()
+    assert event_body["session_id"] == first_session_id
+    assert event_body["events"]
+    assert {event["session_id"] for event in event_body["events"]} == {first_session_id}
+    assert {event["interaction_id"] for event in event_body["events"]} == {
+        interaction["interaction_id"]
+    }
+
+    transcript = client.get(
+        f"/api/sessions/{first_session_id}/transcript",
+        params={"interaction_id": interaction["interaction_id"]},
+    )
+    assert transcript.status_code == 200
+    assert transcript.json()["session_id"] == first_session_id
+    assert transcript.json()["messages"]
+    assert {
+        message["interaction_id"]
+        for message in transcript.json()["messages"]
+        if message["interaction_id"] is not None
+    } == {interaction["interaction_id"]}
+    assert (
+        client.get(
+            f"/api/sessions/{second_session_id}/interactions/{interaction['interaction_id']}"
+        ).status_code
+        == 409
+    )
+
+    resumed = client.post(
+        "/api/resume",
+        json={"session_id": first_session_id, "prompt": "continue normally"},
+    )
+    assert resumed.status_code == 200
+    assert '"type":"session.completed"' in resumed.text
+
+
+def test_alias_shaped_legacy_private_authority_requires_positive_projection() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("_"), enable_logging=False)
+    private_session_id = "cayu_authority_v1.legacy.session_id." + "A" * 43
+    private_interaction_id = "cayu_authority_v1.legacy.interaction_id." + "B" * 43
+
+    async def scenario() -> tuple[str, str]:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=private_session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="model"),
+        )
+        await app.session_store.append_transcript_messages(
+            private_session_id,
+            [Message.text("user", "legacy")],
+            interaction_id=private_interaction_id,
+        )
+        return (
+            app.project_session_id_for_exposure(private_session_id),
+            app.project_interaction_id_for_exposure(
+                private_interaction_id,
+                session_id=private_session_id,
+            ),
+        )
+
+    public_session_id, public_interaction_id = asyncio.run(scenario())
+    assert public_session_id != private_session_id
+    assert public_interaction_id != private_interaction_id
+    assert public_event_envelope_alias_field(public_session_id) == "session_id"
+    assert public_event_envelope_alias_field(public_interaction_id) == "interaction_id"
+
+
+def test_transcript_only_raw_interaction_alias_conflict_is_rejected() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("private"), enable_logging=False)
+    session_id = "session"
+    private_interaction_id = "other-private-interaction"
+    conflicting_raw_id = app.project_interaction_id_for_exposure(
+        private_interaction_id,
+        session_id=session_id,
+    )
+
+    async def scenario() -> None:
+        await app.session_store.create(
+            RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="model"),
+        )
+        await app.session_store.append_event(
+            session_id,
+            Event(
+                type=EventType.INTERACTION_COMPLETED,
+                session_id=session_id,
+                interaction_id=private_interaction_id,
+            ),
+        )
+        await app.session_store.append_transcript_messages(
+            session_id,
+            [Message.text("user", "legacy")],
+            interaction_id=conflicting_raw_id,
+        )
+        with pytest.raises(ValueError, match="ambiguous"):
+            await app._resolve_public_interaction_id(
+                session_id=session_id,
+                value=conflicting_raw_id,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_in_memory_nested_turn_interaction_alias_round_trips() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("private"), enable_logging=False)
+    session_id = "session"
+    private_interaction_id = "nested-private-interaction"
+
+    async def scenario() -> None:
+        await app.session_store.create(
+            RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+            identity=SessionIdentity(provider_name="fake", model="model"),
+        )
+        await app.session_store.append_event(
+            session_id,
+            Event(
+                type=EventType.TURN_COMPLETED,
+                session_id=session_id,
+                payload={"interaction_ids": [private_interaction_id]},
+            ),
+        )
+        public_interaction_id = app.project_interaction_id_for_exposure(
+            private_interaction_id,
+            session_id=session_id,
+        )
+        assert (
+            await app._resolve_public_interaction_id(
+                session_id=session_id,
+                value=public_interaction_id,
+            )
+            == private_interaction_id
+        )
+
+    asyncio.run(scenario())
+
+
+def test_server_generated_session_authority_survives_short_secret_collision() -> None:
+    store = InMemorySessionStore()
+    task_store = InMemoryTaskStore()
+    app = CayuApp(
+        session_store=store,
+        task_store=task_store,
+        secret_redactor=SecretRedactor("-"),
+        enable_logging=False,
+    )
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    events = _sse_events(client, "/api/run", {"agent": "assistant", "prompt": "first"})
+    public_session_id = events[0]["session_id"]
+    public_interaction_id = next(
+        event["interaction_id"] for event in events if event["type"] == "interaction.started"
+    )
+    turn_completed = next(event for event in events if event["type"] == "turn.completed")
+
+    async def private_state() -> tuple[str, str, list[str]]:
+        sessions = await store.list_sessions()
+        assert len(sessions.sessions) == 1
+        private_session_id = sessions.sessions[0].id
+        turn_records = await store.query_events(
+            EventQuery(
+                session_id=private_session_id,
+                event_type=EventType.TURN_COMPLETED,
+            )
+        )
+        interaction_records = await store.query_events(
+            EventQuery(
+                session_id=private_session_id,
+                event_type=EventType.INTERACTION_STARTED,
+            )
+        )
+        assert len(turn_records) == 1
+        assert len(interaction_records) == 1
+        private_interaction_id = interaction_records[0].event.interaction_id
+        assert private_interaction_id is not None
+        private_interaction_ids = turn_records[0].event.payload["interaction_ids"]
+        assert type(private_interaction_ids) is list
+        assert all(type(value) is str for value in private_interaction_ids)
+        return private_session_id, private_interaction_id, private_interaction_ids
+
+    private_session_id, private_interaction_id, private_interaction_ids = asyncio.run(
+        private_state()
+    )
+    tasks = asyncio.run(task_store.list_tasks())
+
+    assert private_session_id.startswith("session-")
+    assert public_session_id == app.project_session_id_for_exposure(private_session_id)
+    assert private_interaction_ids == [private_interaction_id]
+    assert turn_completed["payload"]["interaction_ids"] == [public_interaction_id]
+    assert len(tasks) == 1
+    assert tasks[0].session_id == private_session_id
+    assert tasks[0].status is TaskStatus.COMPLETED
+
+    resumed = _sse_events(
+        client,
+        "/api/resume",
+        {"session_id": public_session_id, "prompt": "second"},
+    )
+    assert resumed[-1]["type"] == "session.completed"
+    assert {event["session_id"] for event in resumed} == {public_session_id}
+
+
+def test_generated_session_causal_budget_alias_round_trips_through_http() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("private"), enable_logging=False)
+    private_session_id = "generated-private-session"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=private_session_id,
+                causal_budget_id=private_session_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+        )
+
+    asyncio.run(seed())
+    public_session_id = app.project_session_id_for_exposure(private_session_id)
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    pricing_body = {"pricing": _price_book_payload(model="fakemodel")}
+    responses = (
+        client.get(f"/api/causal-budgets/{public_session_id}/usage"),
+        client.post(
+            f"/api/causal-budgets/{public_session_id}/cost",
+            json=pricing_body,
+        ),
+        client.post(
+            f"/api/causal-budgets/{public_session_id}/summary",
+            json=pricing_body,
+        ),
+    )
+    for response in responses:
+        assert response.status_code == 200, response.text
+        assert response.json()["causal_budget_id"] == public_session_id
+    assert responses[0].json()["session_ids"] == [public_session_id]
+    assert responses[1].json()["session_ids"] == [public_session_id]
+    assert responses[2].json()["usage"]["causal_budget_id"] == public_session_id
+    assert responses[2].json()["cost"]["causal_budget_id"] == public_session_id
+
+
+def test_public_session_lineage_aliases_round_trip_through_list_filters() -> None:
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor("private"),
+        enable_logging=False,
+    )
+    private_root_id = "private-root-session"
+    child_id = "child-session"
+
+    async def seed() -> None:
+        identity = SessionIdentity(provider_name="fake", model="fakemodel")
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=private_root_id,
+                messages=[],
+            ),
+            identity=identity,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=child_id,
+                parent_session_id=private_root_id,
+                causal_budget_id=private_root_id,
+                messages=[],
+            ),
+            identity=identity,
+        )
+
+    asyncio.run(seed())
+    public_root_id = app.project_session_id_for_exposure(private_root_id)
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    unfiltered = client.get("/api/sessions", params={"order_by": "created_at_asc"})
+    assert unfiltered.status_code == 200, unfiltered.text
+    sessions = unfiltered.json()["sessions"]
+    assert [session["id"] for session in sessions] == [public_root_id, child_id]
+    assert sessions[0]["causal_budget_id"] == public_root_id
+    assert sessions[1]["parent_session_id"] == public_root_id
+    assert sessions[1]["causal_budget_id"] == public_root_id
+
+    parent_list = client.get(
+        "/api/sessions",
+        params={"parent_session_id": public_root_id},
+    )
+    parent_summary = client.post(
+        "/api/sessions/summary",
+        params={"parent_session_id": public_root_id},
+    )
+    causal_list = client.get(
+        "/api/sessions",
+        params={"causal_budget_id": public_root_id, "order_by": "created_at_asc"},
+    )
+    causal_summary = client.post(
+        "/api/sessions/summary",
+        params={"causal_budget_id": public_root_id, "order_by": "created_at_asc"},
+    )
+
+    assert parent_list.status_code == 200, parent_list.text
+    assert [session["id"] for session in parent_list.json()["sessions"]] == [child_id]
+    assert parent_summary.status_code == 200, parent_summary.text
+    assert [item["session"]["id"] for item in parent_summary.json()["sessions"]] == [child_id]
+    assert causal_list.status_code == 200, causal_list.text
+    assert [session["id"] for session in causal_list.json()["sessions"]] == [
+        public_root_id,
+        child_id,
+    ]
+    assert causal_summary.status_code == 200, causal_summary.text
+    assert [item["session"]["id"] for item in causal_summary.json()["sessions"]] == [
+        public_root_id,
+        child_id,
+    ]
+
+
+def test_alias_shaped_raw_causal_budget_round_trips_through_all_http_summaries() -> None:
+    session_store = InMemorySessionStore()
+    raw_causal_budget_id = session_store.public_authority_alias_codec.encode(
+        "not-a-session",
+        field_name="session_id",
+    )
+    app = CayuApp(session_store=session_store, enable_logging=False)
+
+    async def seed() -> None:
+        await session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="raw-causal-budget-session",
+                causal_budget_id=raw_causal_budget_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    pricing_body = {"pricing": _price_book_payload(model="fakemodel")}
+    responses = (
+        client.get(f"/api/causal-budgets/{raw_causal_budget_id}/usage"),
+        client.post(
+            f"/api/causal-budgets/{raw_causal_budget_id}/cost",
+            json=pricing_body,
+        ),
+        client.post(
+            f"/api/causal-budgets/{raw_causal_budget_id}/summary",
+            json=pricing_body,
+        ),
+    )
+    for response in responses:
+        assert response.status_code == 200, response.text
+        assert response.json()["causal_budget_id"] == raw_causal_budget_id
+
+
+def test_non_session_causal_budget_secret_is_redacted_from_all_http_summaries() -> None:
+    private_causal_budget_id = "legacy-secret-budget"
+    app = CayuApp(secret_redactor=SecretRedactor("secret"), enable_logging=False)
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session-one",
+                causal_budget_id=private_causal_budget_id,
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    pricing_body = {"pricing": _price_book_payload(model="fakemodel")}
+    responses = (
+        client.get(f"/api/causal-budgets/{private_causal_budget_id}/usage"),
+        client.post(
+            f"/api/causal-budgets/{private_causal_budget_id}/cost",
+            json=pricing_body,
+        ),
+        client.post(
+            f"/api/causal-budgets/{private_causal_budget_id}/summary",
+            json=pricing_body,
+        ),
+    )
+    public_causal_budget_id = f"legacy-{REDACTED_SECRET}-budget"
+
+    for response in responses:
+        assert response.status_code == 200, response.text
+        assert private_causal_budget_id not in response.text
+        assert response.json()["causal_budget_id"] == public_causal_budget_id
+    assert responses[2].json()["usage"]["causal_budget_id"] == public_causal_budget_id
+    assert responses[2].json()["cost"]["causal_budget_id"] == public_causal_budget_id
+
+
+def test_direct_app_resume_accepts_a_generated_public_session_alias() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("-"), enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+
+    async def scenario() -> tuple[list[Event], list[Event]]:
+        initial = await _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+        resumed = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=initial[0].session_id,
+                    messages=[Message.text("user", "second")],
+                )
+            )
+        ]
+        return initial, resumed
+
+    initial, resumed = asyncio.run(scenario())
+
+    assert public_event_envelope_alias_field(initial[0].session_id) == "session_id"
+    assert resumed[-1].type is EventType.SESSION_COMPLETED
+    assert {event.session_id for event in resumed} == {initial[0].session_id}
+
+
+def test_direct_app_fork_and_dispatch_accept_generated_public_session_alias() -> None:
+    app = CayuApp(secret_redactor=SecretRedactor("-"), enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+
+    async def scenario() -> tuple[str, list[Event], list[Event], list[Event], Any]:
+        initial = await _collect_run(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "first")],
+            ),
+        )
+        public_session_id = initial[0].session_id
+        forked = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(source_session_id=public_session_id)
+            )
+        ]
+        grandchild = [
+            event
+            async for event in app.fork_session(
+                ForkSessionRequest(source_session_id=forked[0].session_id)
+            )
+        ]
+        inline = [
+            event
+            async for event in app.dispatch_inline(
+                DispatchRequest(
+                    session_id=public_session_id,
+                    dispatch_id="inline_dispatch",
+                    messages=[Message.text("user", "inline dispatch")],
+                )
+            )
+        ]
+        handle = await app.dispatch(
+            DispatchRequest(
+                session_id=public_session_id,
+                dispatch_id="submitted_dispatch",
+                messages=[Message.text("user", "submitted dispatch")],
+            )
+        )
+        return public_session_id, forked, grandchild, inline, handle
+
+    public_session_id, forked, grandchild, inline, handle = asyncio.run(scenario())
+
+    assert public_event_envelope_alias_field(public_session_id) == "session_id"
+    assert [event.type for event in forked] == [EventType.SESSION_FORKED]
+    assert public_event_envelope_alias_field(forked[0].session_id) == "session_id"
+    assert [event.type for event in grandchild] == [EventType.SESSION_FORKED]
+    assert public_event_envelope_alias_field(grandchild[0].session_id) == "session_id"
+    assert grandchild[0].session_id != forked[0].session_id
+    assert inline[-1].type is EventType.SESSION_COMPLETED, inline[-1].payload
+    assert {event.session_id for event in inline} == {public_session_id}
+    assert handle.status is DispatchStatus.COMPLETED
+    assert handle.session_id == public_session_id
+
+
+def test_exact_secret_source_alias_rejects_fork_before_child_creation() -> None:
+    private_session_id = "exact-session-secret"
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(private_session_id),
+        enable_logging=False,
+    )
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+
+    async def scenario() -> tuple[str, ...]:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=private_session_id,
+                messages=[Message.text("user", "legacy")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+        )
+        await store.update_status(private_session_id, SessionStatus.COMPLETED)
+        public_session_id = app.project_session_id_for_exposure(private_session_id)
+        with pytest.raises(ValueError, match="source_session.id contains a workload secret"):
+            _ = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(source_session_id=public_session_id)
+                )
+            ]
+        sessions = await store.list_sessions()
+        return tuple(session.id for session in sessions.sessions)
+
+    assert asyncio.run(scenario()) == (private_session_id,)
+
+
+def test_dispatch_projects_a_private_session_id_returned_by_a_dispatcher() -> None:
+    class EchoDispatcher(Dispatcher):
+        async def submit(self, runtime, request):
+            del runtime
+            return DispatchHandle(
+                dispatch_id=request.dispatch_id,
+                session_id=request.session_id,
+                backend="echo",
+            )
+
+    app = CayuApp(
+        dispatcher=EchoDispatcher(),
+        secret_redactor=SecretRedactor("-"),
+        enable_logging=False,
+    )
+    handle = asyncio.run(
+        app.dispatch(
+            DispatchRequest(
+                session_id="private-session-id",
+                dispatch_id="safe_dispatch",
+                messages=[Message.text("user", "queued")],
+            )
+        )
+    )
+
+    assert handle.session_id == app.project_session_id_for_exposure("private-session-id")
+
+
+def test_public_session_alias_resolution_uses_the_store_index_without_a_scan() -> None:
+    class EndlessSessionStore(InMemorySessionStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.list_calls = 0
+
+        async def list_sessions(self, query=None):
+            del query
+            self.list_calls += 1
+            return SessionListResult(
+                sessions=[],
+                next_cursor=f"opaque-page-{self.list_calls}",
+            )
+
+    store = EndlessSessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor("private"),
+        enable_logging=False,
+    )
+    alias = app.project_session_id_for_exposure("private-session")
+
+    async def resolve() -> None:
+        with pytest.raises(ValueError, match="was not found"):
+            await app._resolve_public_session_id(alias)
+
+    asyncio.run(resolve())
+
+    assert store.list_calls == 0
 
 
 def test_server_filters_session_transcript_by_role() -> None:
@@ -6841,7 +7726,7 @@ def test_mount_cayu_recovers_backlog_past_poison_delivery(monkeypatch) -> None:
     with TestClient(server):
         deliveries = asyncio.run(store.list_persisted_event_side_effect_deliveries())
 
-    assert [event.id for event in sink.events] == [healthy.id]
+    assert [event.id for event in sink.events] == [public_event_id(2)]
     assert [(delivery.event_id, delivery.status.value) for delivery in deliveries] == [
         (poison.id, "failed"),
         (healthy.id, "delivered"),
@@ -7078,6 +7963,284 @@ def test_tool_approval_endpoints_preserve_metadata() -> None:
         "actor": "operator",
         "source": "dashboard",
     }
+
+    mismatched_alias = client.post(
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_resolve_metadata",
+            "approval_id": public_event_linkage_id(1, "tool_call_id"),
+            "tool_round_id": "round_1",
+            "tool_call_id": "call_1",
+            "decision": "approve",
+        },
+    )
+    assert mismatched_alias.status_code == 409
+    assert "field-mismatched" in mismatched_alias.json()["detail"]
+    assert len(resolved_requests) == 1
+
+
+def test_action_routes_resolve_schema_owned_nested_public_linkage_aliases() -> None:
+    app = CayuApp(enable_logging=False)
+
+    async def seed() -> None:
+        for session_id, payload in (
+            (
+                "session_nested_approval_alias",
+                {
+                    "interruption_type": "tool_approval_required",
+                    "approval": {
+                        "approval_id": "approval-private",
+                        "tool_round_id": "round-private",
+                        "tool_call_id": "call-private",
+                    },
+                },
+            ),
+            (
+                "session_nested_input_alias",
+                {
+                    "interruption_type": "user_input_required",
+                    "user_input": {
+                        "input_id": "input-private",
+                        "tool_call_id": "input-call-private",
+                    },
+                },
+            ),
+        ):
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await app.session_store.append_event(
+                session_id,
+                Event(
+                    type=EventType.SESSION_INTERRUPTED,
+                    session_id=session_id,
+                    payload=payload,
+                ),
+            )
+            await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+    asyncio.run(seed())
+    approval_sequence = asyncio.run(
+        app.session_store.query_events(
+            EventQuery(session_id="session_nested_approval_alias", limit=1)
+        )
+    )[0].sequence
+    input_sequence = asyncio.run(
+        app.session_store.query_events(EventQuery(session_id="session_nested_input_alias", limit=1))
+    )[0].sequence
+    approvals = []
+    inputs = []
+
+    async def resolve_approval(request):
+        approvals.append(request)
+        yield await app.emit_event(
+            Event(
+                type=EventType.SESSION_RESUMED,
+                session_id=request.session_id,
+            )
+        )
+
+    async def resolve_input(request):
+        inputs.append(request)
+        yield await app.emit_event(
+            Event(
+                type=EventType.SESSION_RESUMED,
+                session_id=request.session_id,
+            )
+        )
+
+    app.resolve_tool_approval = resolve_approval
+    app.resolve_user_input = resolve_input
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    with client.stream(
+        "POST",
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_nested_approval_alias",
+            "approval_id": public_event_linkage_id(approval_sequence, "approval_id"),
+            "tool_round_id": public_event_linkage_id(approval_sequence, "tool_round_id"),
+            "tool_call_id": public_event_linkage_id(approval_sequence, "tool_call_id"),
+            "decision": "approve",
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    with client.stream(
+        "POST",
+        "/api/user-input/resolve",
+        json={
+            "session_id": "session_nested_input_alias",
+            "input_id": public_event_linkage_id(input_sequence, "input_id"),
+            "answer": "continue",
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    malformed_alias = client.post(
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_nested_approval_alias",
+            "approval_id": f"cayu_event_{MAX_DURABLE_JSON_INTEGER + 1}:approval_id",
+            "tool_round_id": public_event_linkage_id(
+                approval_sequence,
+                "tool_round_id",
+            ),
+            "tool_call_id": public_event_linkage_id(
+                approval_sequence,
+                "tool_call_id",
+            ),
+            "decision": "approve",
+        },
+    )
+
+    assert malformed_alias.status_code == 409
+    assert "malformed" in malformed_alias.json()["detail"]
+    assert (
+        approvals[0].approval_id,
+        approvals[0].tool_round_id,
+        approvals[0].tool_call_id,
+    ) == (
+        "approval-private",
+        "round-private",
+        "call-private",
+    )
+    assert inputs[0].input_id == "input-private"
+    assert len(approvals) == 1
+
+
+def test_action_linkage_disambiguates_legacy_raw_values_from_public_aliases() -> None:
+    app = CayuApp(enable_logging=False)
+
+    async def seed(
+        session_id: str,
+        *,
+        approval_id: str,
+        alias_target: str | None = None,
+    ) -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        if alias_target is not None:
+            await app.session_store.append_event(
+                session_id,
+                Event(
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session_id,
+                    payload={
+                        "approval_id": alias_target,
+                        "tool_round_id": "alias-round",
+                        "tool_call_id": "alias-call",
+                    },
+                ),
+            )
+        await app.session_store.append_event(
+            session_id,
+            Event(
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=session_id,
+                payload={
+                    "interruption_type": "tool_approval_required",
+                    "approval": {
+                        "approval_id": approval_id,
+                        "tool_round_id": "legacy-round",
+                        "tool_call_id": "legacy-call",
+                    },
+                },
+            ),
+        )
+        await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+
+    asyncio.run(
+        seed(
+            "session_linkage_raw_only",
+            approval_id="cayu_event_01:approval_id",
+        )
+    )
+    asyncio.run(
+        seed(
+            "session_linkage_same",
+            approval_id="cayu_event_2:approval_id",
+        )
+    )
+    asyncio.run(
+        seed(
+            "session_linkage_conflict",
+            approval_id="cayu_event_3:approval_id",
+            alias_target="different-private-approval",
+        )
+    )
+    legacy_approval_ids = {
+        "session_linkage_raw_only": "cayu_event_01:approval_id",
+        "session_linkage_same": "cayu_event_2:approval_id",
+        "session_linkage_conflict": "cayu_event_3:approval_id",
+    }
+
+    async def pending_actions(query):
+        approval_id = legacy_approval_ids[query.session_id]
+        return SimpleNamespace(actions=[SimpleNamespace(approval_id=approval_id)])
+
+    app.session_store.query_pending_actions = pending_actions
+    captured = []
+
+    async def resolve(request):
+        captured.append(request)
+        yield await app.emit_event(
+            Event(type=EventType.SESSION_RESUMED, session_id=request.session_id)
+        )
+
+    app.resolve_tool_approval = resolve
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    for session_id, approval_id in (
+        ("session_linkage_raw_only", "cayu_event_01:approval_id"),
+        ("session_linkage_same", "cayu_event_2:approval_id"),
+    ):
+        with client.stream(
+            "POST",
+            "/api/tool-approvals/resolve",
+            json={
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "tool_round_id": "legacy-round",
+                "tool_call_id": "legacy-call",
+                "decision": "approve",
+            },
+        ) as response:
+            if response.status_code != 200:
+                response.read()
+            assert response.status_code == 200, f"{session_id}: {response.text}"
+            list(response.iter_lines())
+
+    conflict = client.post(
+        "/api/tool-approvals/resolve",
+        json={
+            "session_id": "session_linkage_conflict",
+            "approval_id": "cayu_event_3:approval_id",
+            "tool_round_id": "legacy-round",
+            "tool_call_id": "legacy-call",
+            "decision": "approve",
+        },
+    )
+
+    assert [request.approval_id for request in captured] == [
+        "cayu_event_01:approval_id",
+        "cayu_event_2:approval_id",
+    ]
+    assert conflict.status_code == 409
+    assert "ambiguous" in conflict.json()["detail"]
 
 
 def test_dev_mode_resolution_restamps_body_resolved_by_as_request_source() -> None:
@@ -8320,10 +9483,13 @@ def test_runtime_failure_survives_cancelled_stream_cleanup() -> None:
         async def __anext__(self) -> Event:
             self.calls += 1
             if self.calls == 1:
-                return Event(
-                    id="event_before_runtime_failure",
-                    type="custom.before_runtime_failure",
-                    session_id="session_cancelled_stream_cleanup",
+                return event_with_durable_sequence(
+                    Event(
+                        id="event_before_runtime_failure",
+                        type="custom.before_runtime_failure",
+                        session_id="session_cancelled_stream_cleanup",
+                    ),
+                    1,
                 )
             raise RuntimeError("runtime failed")
 
@@ -8344,7 +9510,7 @@ def test_runtime_failure_survives_cancelled_stream_cleanup() -> None:
 
     messages = asyncio.run(exercise())
 
-    assert messages[0]["id"] == ("session_cancelled_stream_cleanup:event_before_runtime_failure")
+    assert messages[0]["id"] == (f"session_cancelled_stream_cleanup:{public_event_id(1)}")
     assert messages[-1]["event"] == "error"
     error = json.loads(messages[-1]["data"])
     assert error["kind"] == "runtime"
@@ -8356,10 +9522,13 @@ def test_terminal_publication_uncertainty_requests_durable_reconciliation() -> N
     reconciliation_failure = TimeoutError("terminal reconciliation unavailable")
 
     async def uncertain_stream() -> AsyncIterator[Event]:
-        yield Event(
-            id="event_before_terminal_uncertainty",
-            type="custom.before_terminal_uncertainty",
-            session_id="session_terminal_uncertainty",
+        yield event_with_durable_sequence(
+            Event(
+                id="event_before_terminal_uncertainty",
+                type="custom.before_terminal_uncertainty",
+                session_id="session_terminal_uncertainty",
+            ),
+            1,
         )
         raise TerminalEventPublicationUncertain(
             event=Event(
@@ -8381,7 +9550,7 @@ def test_terminal_publication_uncertainty_requests_durable_reconciliation() -> N
 
     messages = asyncio.run(exercise())
 
-    assert messages[0]["id"] == ("session_terminal_uncertainty:event_before_terminal_uncertainty")
+    assert messages[0]["id"] == (f"session_terminal_uncertainty:{public_event_id(1)}")
     assert messages[-1]["event"] == "error"
     error = json.loads(messages[-1]["data"])
     assert error["kind"] == "runtime"
@@ -8491,13 +9660,40 @@ def test_interrupt_accepts_before_first_frame_terminal_publication_uncertainty(
 
     assert len(interrupted) == int(terminal_append_committed)
     assert len(accepted) == 1
-    assert accepted[0]["payload"] == {
+    expected_accepted_payload = {
         "mutation_id": mutation_id,
         "mutation_kind": "interrupt",
-        "accepted_event_id": store.attempted_terminal_event_id,
+        "accepted_event_id": (
+            interrupted[0]["id"] if terminal_append_committed else PRIVATE_EVENT_AUTHORITY
+        ),
         "accepted_event_type": EventType.SESSION_INTERRUPTED,
         "accepted_event_publication_uncertain": True,
     }
+    if terminal_append_committed:
+        expected_accepted_payload["accepted_event_sequence"] = interrupted[0]["sequence"]
+    assert accepted[0]["payload"] == expected_accepted_payload
+
+    durable_markers = asyncio.run(
+        store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.SERVER_MUTATION_ACCEPTED,
+                limit=1,
+            )
+        )
+    )
+    assert len(durable_markers) == 1
+    if terminal_append_committed:
+        assert (
+            durable_markers[0].event.payload["accepted_event_sequence"]
+            == interrupted[0]["sequence"]
+        )
+        assert "accepted_event_id" not in durable_markers[0].event.payload
+    else:
+        assert (
+            durable_markers[0].event.payload["accepted_event_id"]
+            == store.attempted_terminal_event_id
+        )
     if terminal_append_committed:
         assert events.index(interrupted[0]) < events.index(accepted[0])
     state = client.get(f"/api/sessions/{session_id}/state").json()
@@ -8591,10 +9787,13 @@ def test_request_cancellation_does_not_cancel_uncertain_acceptance_marker() -> N
 
 def test_runtime_cancellation_group_becomes_structured_stream_error() -> None:
     async def grouped_failure_stream() -> AsyncIterator[Event]:
-        yield Event(
-            id="event_before_grouped_failure",
-            type="custom.before_grouped_failure",
-            session_id="session_grouped_stream_failure",
+        yield event_with_durable_sequence(
+            Event(
+                id="event_before_grouped_failure",
+                type="custom.before_grouped_failure",
+                session_id="session_grouped_stream_failure",
+            ),
+            1,
         )
         raise BaseExceptionGroup(
             "runtime cleanup cancelled and failed",
@@ -8611,7 +9810,7 @@ def test_runtime_cancellation_group_becomes_structured_stream_error() -> None:
 
     messages = asyncio.run(exercise())
 
-    assert messages[0]["id"] == "session_grouped_stream_failure:event_before_grouped_failure"
+    assert messages[0]["id"] == (f"session_grouped_stream_failure:{public_event_id(1)}")
     assert messages[-1]["event"] == "error"
     error = json.loads(messages[-1]["data"])
     assert error["kind"] == "runtime"
@@ -8625,10 +9824,13 @@ def test_runtime_cancellation_only_group_is_not_reported_as_runtime_failure() ->
     )
 
     async def grouped_cancellation_stream() -> AsyncIterator[Event]:
-        yield Event(
-            id="event_before_grouped_cancellation",
-            type="custom.before_grouped_cancellation",
-            session_id="session_grouped_stream_cancellation",
+        yield event_with_durable_sequence(
+            Event(
+                id="event_before_grouped_cancellation",
+                type="custom.before_grouped_cancellation",
+                session_id="session_grouped_stream_cancellation",
+            ),
+            1,
         )
         raise cancellation_group
 
@@ -8649,15 +9851,60 @@ def test_runtime_cancellation_only_group_is_not_reported_as_runtime_failure() ->
     assert [message.get("event") for message in messages] == [None]
 
 
+def test_live_projection_requires_a_unique_durable_event_record() -> None:
+    app = CayuApp(enable_logging=False)
+    queried_limits: list[int | None] = []
+
+    async def duplicate_query(query: EventQuery | None = None):
+        assert query is not None
+        queried_limits.append(query.limit)
+        return [
+            EventRecord(
+                sequence=sequence,
+                event=Event(
+                    id="duplicate-event",
+                    type="custom.duplicate",
+                    session_id="duplicate-session",
+                ),
+            )
+            for sequence in (1, 2)
+        ]
+
+    app.session_store.query_events = duplicate_query
+
+    async def event_stream() -> AsyncIterator[Event]:
+        yield Event(
+            id="duplicate-event",
+            type="custom.duplicate",
+            session_id="duplicate-session",
+        )
+
+    async def exercise() -> list[dict[str, str]]:
+        response = _detached_event_stream_response(
+            event_stream(),
+            cayu_app=app,
+            session_id="duplicate-session",
+        )
+        return [message async for message in response.body_iterator]
+
+    messages = asyncio.run(exercise())
+
+    assert queried_limits == [2]
+    assert messages[-1]["event"] == "error"
+
+
 def test_accepted_stream_driver_finishes_when_response_start_send_fails() -> None:
     async def exercise() -> bool:
         completed = asyncio.Event()
 
         async def event_stream() -> AsyncIterator[Event]:
-            yield Event(
-                id="event_response_start_failure",
-                type="custom.accepted",
-                session_id="session_response_start_failure",
+            yield event_with_durable_sequence(
+                Event(
+                    id="event_response_start_failure",
+                    type="custom.accepted",
+                    session_id="session_response_start_failure",
+                ),
+                1,
             )
             completed.set()
 
@@ -8706,8 +9953,8 @@ def _detached_observer_first_message(events: list[Event]) -> tuple[dict[str, str
         async def event_stream() -> AsyncIterator[Event]:
             nonlocal completed
             try:
-                for event in events:
-                    yield event
+                for sequence, event in enumerate(events, start=1):
+                    yield event_with_durable_sequence(event, sequence)
             finally:
                 completed = True
 
@@ -8758,10 +10005,13 @@ def test_detached_observer_does_not_misclassify_a_healthy_synchronous_burst() ->
         nonlocal completed
         try:
             for index in range(SSE_OBSERVER_MAX_FRAMES + 1):
-                yield Event(
-                    id=f"event_{index}",
-                    type="custom.observer",
-                    session_id=request.session_id,
+                yield event_with_durable_sequence(
+                    Event(
+                        id=f"event_{index}",
+                        type="custom.observer",
+                        session_id=request.session_id,
+                    ),
+                    index + 1,
                 )
         finally:
             completed = True
@@ -8776,7 +10026,7 @@ def test_detached_observer_does_not_misclassify_a_healthy_synchronous_burst() ->
     assert completed is True
     assert len(frames) == SSE_OBSERVER_MAX_FRAMES + 1
     assert [frame["data"]["id"] for frame in frames] == [
-        f"event_{index}" for index in range(SSE_OBSERVER_MAX_FRAMES + 1)
+        public_event_id(index + 1) for index in range(SSE_OBSERVER_MAX_FRAMES + 1)
     ]
     assert all(frame.get("event") != "error" for frame in frames)
 
@@ -8888,8 +10138,10 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
         frame["data"]["interaction_id"] for frame in frames[1:]
     ]
     assert replayed[-1]["data"]["type"] == "session.completed"
-    assert queries[0].event_id == frames[0]["data"]["id"]
-    assert queries[1].limit == SSE_REPLAY_PAGE_EVENTS
+    alias_lookup = next(query for query in queries if query.after_sequence == 0)
+    replay_page = next(query for query in queries if query.after_sequence == 1)
+    assert alias_lookup.limit == 1
+    assert replay_page.limit == SSE_REPLAY_PAGE_EVENTS
 
     with client.stream(
         "POST",
@@ -8936,6 +10188,269 @@ def test_run_stream_carries_resumable_event_ids_and_replays_on_last_event_id() -
     assert len(client.get("/api/tasks").json()) == 1
 
 
+def test_legacy_custom_event_uses_one_safe_rest_sse_and_replay_projection() -> None:
+    secret = "eventscope-canary"
+    session_id = f"session-{secret}"
+    private_event_id = f"private-{secret}-event"
+    app = CayuApp(
+        enable_logging=False,
+        secret_redactor=SecretRedactor(secret),
+    )
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "inspect legacy event")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    id=private_event_id,
+                    type=f"custom.{secret}",
+                    session_id=session_id,
+                    payload={
+                        secret: secret,
+                        "tool_call_id": f"tool-{secret}",
+                    },
+                ),
+                Event(
+                    id="private-terminal-event",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                ),
+            ],
+        )
+        await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    history = client.get(f"/api/sessions/{session_id}/events").json()["events"]
+    assert [event["id"] for event in history] == [
+        public_event_id(1),
+        public_event_id(2),
+    ]
+    assert history[0]["type"] == REDACTED_CUSTOM_EVENT_TYPE
+    assert secret not in repr(history[0])
+
+    for event_id in (public_event_id(1), private_event_id):
+        selected = client.get(
+            f"/api/sessions/{session_id}/events",
+            params={"event_id": event_id},
+        ).json()["events"]
+        assert [event["id"] for event in selected] == [public_event_id(1)]
+        assert secret not in repr(selected)
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "ignored", "session_id": session_id},
+        headers={"Last-Event-ID": f"{session_id}:"},
+    ) as response:
+        frames = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in frames] == [
+        public_event_id(1),
+        public_event_id(2),
+    ]
+    assert frames[0]["data"]["type"] == REDACTED_CUSTOM_EVENT_TYPE
+    assert secret not in repr(frames)
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"prompt": "ignored", "session_id": session_id},
+        headers={"Last-Event-ID": frames[0]["id"]},
+    ) as response:
+        projected_session_replay = [frame for frame in _sse_frames(response) if "data" in frame]
+    assert [frame["data"]["id"] for frame in projected_session_replay] == [public_event_id(2)]
+    assert secret not in repr(projected_session_replay)
+
+    for marker_id in (public_event_id(1), private_event_id):
+        with client.stream(
+            "POST",
+            "/api/run",
+            json={"prompt": "ignored", "session_id": session_id},
+            headers={"Last-Event-ID": f"{session_id}:{marker_id}"},
+        ) as response:
+            replay = [frame for frame in _sse_frames(response) if "data" in frame]
+        assert [frame["data"]["id"] for frame in replay] == [public_event_id(2)]
+        assert secret not in repr(replay)
+
+
+def test_replay_accepts_server_issued_redacted_colon_bearing_session_marker() -> None:
+    secret = "colon-session-canary"
+    session_id = f"legacy-{secret}:partition"
+    app = CayuApp(
+        enable_logging=False,
+        secret_redactor=SecretRedactor(secret),
+    )
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "inspect legacy session")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id=session_id,
+                ),
+                Event(
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=session_id,
+                ),
+            ],
+        )
+        await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"prompt": "ignored", "session_id": session_id},
+        headers={"Last-Event-ID": f"{session_id}:"},
+    ) as response:
+        initial = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    assert len(initial) == 2
+    assert secret not in initial[0]["id"]
+    assert public_event_envelope_alias_field(initial[0]["id"].split(":", 1)[0]) == "session_id"
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json={"prompt": "ignored", "session_id": session_id},
+        headers={"Last-Event-ID": initial[0]["id"]},
+    ) as response:
+        replay = [frame for frame in _sse_frames(response) if "data" in frame]
+
+    assert [frame["data"]["id"] for frame in replay] == [public_event_id(2)]
+    assert secret not in repr(replay)
+
+
+def test_unknown_public_event_alias_cannot_collide_with_a_private_event_id() -> None:
+    private_sentinel = "__cayu_missing_private_event__"
+    app = CayuApp(enable_logging=False)
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_alias_miss",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.append_event(
+            "session_alias_miss",
+            Event(
+                id=private_sentinel,
+                type=EventType.SESSION_STARTED,
+                session_id="session_alias_miss",
+            ),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    missing = client.get(
+        "/api/sessions/session_alias_miss/events",
+        params={"event_id": public_event_id(999)},
+    )
+    assert missing.status_code == 200
+    assert missing.json()["events"] == []
+
+    legacy_exact = client.get(
+        "/api/sessions/session_alias_miss/events",
+        params={"event_id": private_sentinel},
+    )
+    assert [event["id"] for event in legacy_exact.json()["events"]] == [public_event_id(1)]
+
+
+def test_public_event_aliases_disambiguate_legacy_raw_namespace_collisions() -> None:
+    app = CayuApp(enable_logging=False)
+
+    async def seed() -> None:
+        for session_id, first_event_id in (
+            ("session-alias-ambiguous", public_event_id(2)),
+            ("session-alias-raw-only", public_event_id(9)),
+            ("session-alias-same-record", public_event_id(5)),
+            ("session-alias-malformed-raw", "cayu_event_legacy"),
+        ):
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            await app.session_store.append_events(
+                session_id,
+                [
+                    Event(
+                        id=first_event_id,
+                        type=EventType.SESSION_STARTED,
+                        session_id=session_id,
+                    ),
+                    Event(
+                        id=f"{session_id}-completed",
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session_id,
+                    ),
+                ],
+            )
+            await app.session_store.update_status(session_id, SessionStatus.COMPLETED)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    ambiguous = client.get(
+        "/api/sessions/session-alias-ambiguous/events",
+        params={"event_id": public_event_id(2)},
+    )
+    assert ambiguous.status_code == 409
+    assert "ambiguous" in ambiguous.json()["detail"]
+
+    replay_ambiguous = client.post(
+        "/api/resume",
+        json={"prompt": "ignored", "session_id": "session-alias-ambiguous"},
+        headers={"Last-Event-ID": (f"session-alias-ambiguous:{public_event_id(2)}")},
+    )
+    assert replay_ambiguous.status_code == 409
+
+    raw_only = client.get(
+        "/api/sessions/session-alias-raw-only/events",
+        params={"event_id": public_event_id(9)},
+    )
+    assert [event["id"] for event in raw_only.json()["events"]] == [public_event_id(3)]
+
+    same_record = client.get(
+        "/api/sessions/session-alias-same-record/events",
+        params={"event_id": public_event_id(5)},
+    )
+    assert [event["id"] for event in same_record.json()["events"]] == [public_event_id(5)]
+
+    malformed_raw = client.get(
+        "/api/sessions/session-alias-malformed-raw/events",
+        params={"event_id": "cayu_event_legacy"},
+    )
+    assert [event["id"] for event in malformed_raw.json()["events"]] == [public_event_id(7)]
+
+
 def test_streaming_mutation_id_creates_an_exact_durable_acceptance_event() -> None:
     app = CayuApp()
     app.register_provider(OneShotProvider(), default=True)
@@ -8967,6 +10482,7 @@ def test_streaming_mutation_id_creates_an_exact_durable_acceptance_event() -> No
         "mutation_id": mutation_id,
         "mutation_kind": "run",
         "accepted_event_id": frames[0]["data"]["id"],
+        "accepted_event_sequence": public_event_sequence(frames[0]["data"]["id"]),
         "accepted_event_type": frames[0]["data"]["type"],
     }
     assert frames.index(next(frame for frame in frames if frame["data"] == marker)) > 0
@@ -8991,6 +10507,25 @@ def test_streaming_mutation_id_header_rejects_unsafe_values_before_execution() -
 
     assert response.status_code == 422
     assert asyncio.run(app.session_store.load_state("session-invalid-mutation-id")) is None
+
+
+def test_secret_bearing_mutation_id_is_rejected_before_execution() -> None:
+    session_id = "sess-secret-id"
+    app = CayuApp(
+        enable_logging=False,
+        secret_redactor=SecretRedactor("u"),
+    )
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.post(
+        "/api/run",
+        json={"prompt": "hello", "session_id": session_id},
+        headers={"Cayu-Mutation-ID": "mutation-identity"},
+    )
+
+    assert response.status_code == 422
+    assert "workload secret" in response.json()["detail"]
+    assert asyncio.run(app.session_store.load_state(session_id)) is None
 
 
 def test_explicit_compaction_endpoint_uses_replayable_mutation_contract() -> None:
@@ -9057,6 +10592,7 @@ def test_explicit_compaction_endpoint_uses_replayable_mutation_contract() -> Non
         "mutation_id": "mutation-compact-1",
         "mutation_kind": "session.compact",
         "accepted_event_id": frames[0]["data"]["id"],
+        "accepted_event_sequence": public_event_sequence(frames[0]["data"]["id"]),
         "accepted_event_type": EventType.CONTEXT_COMPACTION_STARTED,
     }
     assert frames[0]["data"]["payload"]["actor"] == {
@@ -9184,9 +10720,9 @@ def test_sse_replay_preserves_canonical_policy_denial_attribution() -> None:
     assert blocked["payload"]["decision"] == "deny"
     assert blocked["payload"]["tool_name"] == "exec_command"
     assert [frame["data"]["id"] for frame in frames] == [
-        "event_tool_started",
-        "event_tool_blocked",
-        "event_session_completed",
+        public_event_id(1),
+        public_event_id(2),
+        public_event_id(3),
     ]
 
 
@@ -9242,6 +10778,7 @@ def test_enqueue_session_message_endpoint_uses_replayable_mutation_contract() ->
         "mutation_id": "mutation-message-1",
         "mutation_kind": "session.message.enqueue",
         "accepted_event_id": queued["id"],
+        "accepted_event_sequence": public_event_sequence(queued["id"]),
         "accepted_event_type": EventType.SESSION_MESSAGE_QUEUED,
     }
     assert "/api/sessions/{session_id}/messages" in client.get("/openapi.json").json()["paths"]
@@ -9320,7 +10857,9 @@ def test_run_disconnect_after_http_acceptance_before_first_body_replays_from_sta
         assert response.status_code == 200
         replayed = [frame["data"]["id"] for frame in _sse_frames(response) if "data" in frame]
 
-    assert replayed == durable_event_ids
+    assert replayed == [
+        public_event_id(sequence) for sequence in range(1, len(durable_event_ids) + 1)
+    ]
     assert executed == []
 
 
@@ -9416,7 +10955,7 @@ def test_existing_session_reconnect_cannot_race_accepted_mutation_transition() -
         assert response.status_code == 200
         replayed = [frame["data"]["id"] for frame in _sse_frames(response) if "data" in frame]
 
-    assert replayed == ["event_resume_accepted", "event_resume_completed"]
+    assert replayed == [public_event_id(2), public_event_id(3)]
     assert executions == 1
 
 
@@ -9491,6 +11030,47 @@ def test_run_replay_rejects_malformed_last_event_id_and_unknown_session() -> Non
         assert unknown.status_code == 404
 
 
+def test_run_replay_missing_session_does_not_expose_resolved_private_identity() -> None:
+    private_session_id = "private-session-secret"
+
+    class VanishingSessionStore(InMemorySessionStore):
+        async def load_state(self, session_id: str):
+            if session_id == private_session_id:
+                return None
+            return await super().load_state(session_id)
+
+    store = VanishingSessionStore()
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(private_session_id),
+        enable_logging=False,
+    )
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=private_session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+        )
+
+    asyncio.run(seed())
+    public_session_id = app.project_session_id_for_exposure(private_session_id)
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.post(
+        "/api/run",
+        json={"prompt": "ignored", "session_id": public_session_id},
+        headers={"Last-Event-ID": f"{public_session_id}:"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": f"Session not found: {public_session_id}"}
+    assert private_session_id not in response.text
+
+
 def test_run_replay_rejects_unknown_event_and_mismatched_body_identity() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
 
@@ -9538,11 +11118,22 @@ def test_run_replay_rejects_unknown_event_and_mismatched_body_identity() -> None
         json={"prompt": "ignored", "session_id": "session_marker_validation"},
         headers={"Last-Event-ID": "session_other:event_seen"},
     )
+    malformed_public_alias = client.post(
+        "/api/run",
+        json={"prompt": "ignored", "session_id": "session_marker_validation"},
+        headers={
+            "Last-Event-ID": (
+                f"session_marker_validation:cayu_event_{MAX_DURABLE_JSON_INTEGER + 1}"
+            )
+        },
+    )
 
     assert unknown_event.status_code == 409
     assert "event was not found" in unknown_event.json()["detail"]
     assert mismatched_session.status_code == 422
     assert "does not match" in mismatched_session.json()["detail"]
+    assert malformed_public_alias.status_code == 422
+    assert "malformed Cayu public event alias" in malformed_public_alias.json()["detail"]
     assert executed == []
     assert client.get("/api/tasks").json() == []
 
@@ -9729,8 +11320,8 @@ def test_replay_waits_for_terminal_event_after_terminal_status() -> None:
     assert response.status_code == 200
     frames = [frame for frame in _sse_frames(response) if "data" in frame]
     assert [frame["data"]["id"] for frame in frames] == [
-        "event_resume_baseline",
-        "event_delayed_terminal",
+        public_event_id(3),
+        public_event_id(4),
     ]
     assert frames[-1]["data"]["type"] == EventType.SESSION_INTERRUPTED
 
@@ -9874,7 +11465,7 @@ def test_replay_does_not_attach_stale_hook_marker_across_operation_start(
 
     assert response.status_code == 200
     frames = [frame for frame in _sse_frames(response) if "data" in frame]
-    assert [frame["data"]["id"] for frame in frames] == ["event_current_terminal"]
+    assert [frame["data"]["id"] for frame in frames] == [public_event_id(4)]
 
 
 def test_replay_unverified_hook_does_not_erase_observed_terminal_boundary() -> None:
@@ -9932,8 +11523,8 @@ def test_replay_unverified_hook_does_not_erase_observed_terminal_boundary() -> N
         frames = _sse_frames(response)
 
     assert [frame["data"]["id"] for frame in frames] == [
-        "event_terminal",
-        "event_unverified_hook",
+        public_event_id(2),
+        public_event_id(3),
     ]
 
 
@@ -10184,7 +11775,7 @@ def test_replay_does_not_attach_stale_cascade_marker_across_operation_start() ->
 
     assert response.status_code == 200
     frames = [frame for frame in _sse_frames(response) if "data" in frame]
-    assert [frame["data"]["id"] for frame in frames] == ["event_current_terminal"]
+    assert [frame["data"]["id"] for frame in frames] == [public_event_id(4)]
 
 
 def test_replay_streams_complete_history_in_bounded_pages() -> None:
@@ -10243,9 +11834,9 @@ def test_replay_streams_complete_history_in_bounded_pages() -> None:
     assert all(frame.get("event") != "error" for frame in frames)
     assert len(frames) == event_count + 1
     event_frames = frames
-    assert event_frames[0]["data"]["id"] == "event_0"
-    assert event_frames[-2]["data"]["id"] == f"event_{event_count - 1}"
-    assert event_frames[-1]["data"]["id"] == "event_replay_terminal"
+    assert event_frames[0]["data"]["id"] == public_event_id(2)
+    assert event_frames[-2]["data"]["id"] == public_event_id(event_count + 1)
+    assert event_frames[-1]["data"]["id"] == public_event_id(event_count + 2)
 
 
 def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly() -> None:
@@ -10387,8 +11978,11 @@ def test_oversized_replay_frame_remains_durable_and_fails_live_observer_clearly(
 @pytest.mark.parametrize(
     ("last_event_id", "expected_event_ids"),
     [
-        ("session_approval_replay:event_seen", ["event_missed"]),
-        ("session_approval_replay:", ["event_seen", "event_missed"]),
+        ("session_approval_replay:event_seen", [public_event_id(2)]),
+        (
+            "session_approval_replay:",
+            [public_event_id(1), public_event_id(2)],
+        ),
     ],
 )
 def test_mutation_routes_replay_without_reexecuting(
@@ -10704,7 +12298,9 @@ def test_create_server_drains_persisted_event_side_effect_backlog() -> None:
     app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
 
     with TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG)):
-        assert [event.id for event in sink.events] == [event.id for event in events]
+        assert [event.id for event in sink.events] == [
+            public_event_id(index) for index in range(1, len(events) + 1)
+        ]
 
 
 @pytest.mark.parametrize("adapter", ["create_server", "mount_cayu"])
@@ -10801,7 +12397,7 @@ def test_create_server_retries_crash_claim_after_lease_expiry(monkeypatch) -> No
         assert claim is not None
         return store, event
 
-    store, event = asyncio.run(prepare())
+    store, _event = asyncio.run(prepare())
     sink = InMemoryEventSink()
     app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
     monkeypatch.setattr(
@@ -10814,7 +12410,7 @@ def test_create_server_retries_crash_claim_after_lease_expiry(monkeypatch) -> No
         while not sink.events and time.monotonic() < deadline:
             time.sleep(0.01)
 
-    assert [recovered.id for recovered in sink.events] == [event.id]
+    assert [recovered.id for recovered in sink.events] == [public_event_id(1)]
 
 
 def test_mount_cayu_retries_crash_claim_after_lease_expiry(monkeypatch) -> None:
@@ -10834,7 +12430,7 @@ def test_mount_cayu_retries_crash_claim_after_lease_expiry(monkeypatch) -> None:
         assert claim is not None
         return store, event
 
-    store, event = asyncio.run(prepare())
+    store, _event = asyncio.run(prepare())
     sink = InMemoryEventSink()
     app = CayuApp(session_store=store, event_sinks=[sink], enable_logging=False)
     server = FastAPI()
@@ -10849,7 +12445,7 @@ def test_mount_cayu_retries_crash_claim_after_lease_expiry(monkeypatch) -> None:
         while not sink.events and time.monotonic() < deadline:
             time.sleep(0.01)
 
-    assert [recovered.id for recovered in sink.events] == [event.id]
+    assert [recovered.id for recovered in sink.events] == [public_event_id(1)]
 
 
 def test_create_server_defers_transient_sink_retry_to_periodic_loop() -> None:
@@ -10995,10 +12591,13 @@ def test_run_stream_failure_emits_terminal_structured_error_frame() -> None:
     client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
 
     async def broken_run(request):
-        yield Event(
-            type=EventType.SESSION_STARTED,
-            session_id=request.session_id,
-            agent_name=request.agent_name,
+        yield event_with_durable_sequence(
+            Event(
+                type=EventType.SESSION_STARTED,
+                session_id=request.session_id,
+                agent_name=request.agent_name,
+            ),
+            1,
         )
         raise RuntimeError("run exploded with secret-token " + "x" * 1000)
 
@@ -11043,11 +12642,14 @@ def test_interrupt_stream_uses_same_typed_redacted_runtime_error_contract() -> N
     asyncio.run(seed())
 
     async def broken_interrupt(request):
-        yield Event(
-            id="event_interrupted",
-            type=EventType.SESSION_INTERRUPTED,
-            session_id=request.session_id,
-            agent_name="assistant",
+        yield event_with_durable_sequence(
+            Event(
+                id="event_interrupted",
+                type=EventType.SESSION_INTERRUPTED,
+                session_id=request.session_id,
+                agent_name="assistant",
+            ),
+            1,
         )
         raise RuntimeError("interrupt failed with secret-token")
 
@@ -11062,7 +12664,7 @@ def test_interrupt_stream_uses_same_typed_redacted_runtime_error_contract() -> N
         assert response.status_code == 200
         frames = _sse_frames(response)
 
-    assert frames[0]["data"]["id"] == "event_interrupted"
+    assert frames[0]["data"]["id"] == public_event_id(1)
     error_frame = frames[-1]
     assert error_frame["event"] == "error"
     assert error_frame["data"]["kind"] == "runtime"

@@ -26,7 +26,8 @@ from cayu.runtime import (
     TranscriptQuery,
     UserInputResponse,
 )
-from cayu.runtime.sessions import SESSION_MESSAGE_DELIVERY_BATCH_LIMIT
+from cayu.runtime._event_projection import PRIVATE_EVENT_AUTHORITY, public_event_sequence
+from cayu.runtime.sessions import SESSION_MESSAGE_DELIVERY_BATCH_LIMIT, EventQuery
 from cayu.storage import SQLiteSessionStore
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -275,6 +276,26 @@ class CommitThenLoseDeliveryAcknowledgementStore(InMemorySessionStore):
             self.lost_delivery_id = result.delivery_id
             raise ConnectionError("queue delivery acknowledgement lost")
         return result
+
+
+async def _assert_public_delivery_resolves_to_queue(
+    store: InMemorySessionStore,
+    delivery: Event,
+    expected_queue_id: str,
+) -> None:
+    assert delivery.payload["queue_id"] == PRIVATE_EVENT_AUTHORITY
+    delivery_sequence = public_event_sequence(delivery.id)
+    assert delivery_sequence is not None
+    durable_delivery = await store.query_events(
+        EventQuery(
+            session_id=delivery.session_id,
+            after_sequence=delivery_sequence - 1,
+            limit=1,
+        )
+    )
+    assert [record.sequence for record in durable_delivery] == [delivery_sequence]
+    assert durable_delivery[0].event.type is EventType.SESSION_MESSAGE_DELIVERED
+    assert durable_delivery[0].event.payload["queue_id"] == expected_queue_id
 
 
 def test_enqueue_session_message_request_validates_public_contract() -> None:
@@ -671,7 +692,11 @@ def test_queued_message_waits_for_pending_tool_approval_resolution() -> None:
             if event.type == EventType.TOOL_CALL_COMPLETED
         )
         assert resolution_events.index(delivery) > tool_completed_index
-        assert delivery.payload["queue_id"] == accepted.message.queue_id
+        await _assert_public_delivery_resolves_to_queue(
+            store,
+            delivery,
+            accepted.message.queue_id,
+        )
         model_started = [
             event
             for event in [*run_events, *resolution_events]
@@ -746,7 +771,11 @@ def test_queued_message_does_not_bypass_pending_user_input() -> None:
             for event in resolution_events
             if event.type == EventType.SESSION_MESSAGE_DELIVERED
         )
-        assert delivery.payload["queue_id"] == accepted.message.queue_id
+        await _assert_public_delivery_resolves_to_queue(
+            store,
+            delivery,
+            accepted.message.queue_id,
+        )
         assert len(provider.requests) == 3
         assert all(
             message.role is not MessageRole.USER
@@ -977,7 +1006,11 @@ def test_queued_message_at_model_step_limit_interrupts_and_survives_resume() -> 
         delivery = next(
             event for event in resumed if event.type == EventType.SESSION_MESSAGE_DELIVERED
         )
-        assert delivery.payload["queue_id"] == accepted.message.queue_id
+        await _assert_public_delivery_resolves_to_queue(
+            store,
+            delivery,
+            accepted.message.queue_id,
+        )
         completed = await store.load("sess_queue_step_limit")
         assert completed is not None and completed.status is SessionStatus.COMPLETED
 
@@ -1067,7 +1100,12 @@ def test_queued_message_survives_interruption_and_is_delivered_on_resume() -> No
         deliveries = [
             event for event in events if event.type == EventType.SESSION_MESSAGE_DELIVERED
         ]
-        assert [event.payload["queue_id"] for event in deliveries] == [accepted.message.queue_id]
+        assert len(deliveries) == 1
+        await _assert_public_delivery_resolves_to_queue(
+            store,
+            deliveries[0],
+            accepted.message.queue_id,
+        )
         session = await store.load("sess_queue_resume")
         assert session is not None and session.status is SessionStatus.COMPLETED
 

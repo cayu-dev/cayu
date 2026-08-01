@@ -4007,22 +4007,21 @@ def test_operator_interrupt_redacts_secret_resolved_during_cancelled_tool() -> N
 
 
 @pytest.mark.parametrize(
-    "authority_field",
+    ("event_type", "authority_field"),
     [
-        "approval_id",
-        "checkpoint",
-        "event_id",
-        "input_id",
-        "model",
-        "policy_name",
-        "provider",
-        "session_id",
-        "task_id",
-        "tool_call_id",
-        "tool_round_id",
+        (EventType.TOOL_CALL_APPROVAL_REQUESTED, "approval_id"),
+        (EventType.RUNTIME_SINK_FAILED, "event_id"),
+        (EventType.SESSION_AWAITING_USER_INPUT, "input_id"),
+        (EventType.MODEL_STARTED, "model_attempt_id"),
+        (EventType.BUDGET_RESERVED, "session_id"),
+        (EventType.TASK_CREATED, "task_id"),
+        (EventType.TOOL_CALL_STARTED, "tool_call_id"),
+        (EventType.TOOL_CALL_STARTED, "tool_round_id"),
+        (EventType.TOOL_CALL_STARTED, "idempotency_key"),
     ],
 )
-def test_runtime_event_rejects_secret_in_every_payload_authority_field(
+def test_runtime_event_rejects_secret_in_event_type_owned_payload_authority(
+    event_type: EventType,
     authority_field: str,
 ) -> None:
     from cayu.runtime._event_writer import prepare_runtime_event
@@ -4030,7 +4029,7 @@ def test_runtime_event_rejects_secret_in_every_payload_authority_field(
 
     secret = f"event-{authority_field}-secret-canary"
     event = Event(
-        type=EventType.SESSION_STARTED,
+        type=event_type,
         session_id="sess-safe",
         payload={authority_field: secret},
     )
@@ -4040,6 +4039,40 @@ def test_runtime_event_rejects_secret_in_every_payload_authority_field(
             event,
             redactor=SecretRedactor(secret),
         )
+
+
+@pytest.mark.parametrize("descriptive_field", ["model", "provider", "policy_name"])
+def test_runtime_event_redacts_secret_descriptive_values_without_granting_authority(
+    descriptive_field: str,
+) -> None:
+    from cayu.runtime._event_writer import prepare_runtime_event
+
+    secret = f"event-{descriptive_field}-description-canary"
+    event = Event(
+        type=EventType.MODEL_STARTED,
+        session_id="sess-safe",
+        payload={descriptive_field: secret},
+    )
+
+    prepared = prepare_runtime_event(event, redactor=SecretRedactor(secret))
+
+    assert prepared.payload[descriptive_field] == REDACTED_SECRET
+
+
+def test_runtime_event_does_not_borrow_authority_from_unrelated_event_type() -> None:
+    from cayu.runtime._event_writer import prepare_runtime_event
+
+    secret = "unrelated-tool-call-id-secret-canary"
+    prepared = prepare_runtime_event(
+        Event(
+            type=EventType.SESSION_STARTED,
+            session_id="sess-safe",
+            payload={"tool_call_id": secret},
+        ),
+        redactor=SecretRedactor(secret),
+    )
+
+    assert prepared.payload == {"tool_call_id": REDACTED_SECRET}
 
 
 def test_runtime_event_rejects_secret_interaction_authority() -> None:
@@ -4086,7 +4119,7 @@ def test_interaction_lifecycle_schema_keys_survive_secret_name_collisions() -> N
     now = datetime.now(UTC)
     evidence = InteractionSummaryEvidence(
         status=InteractionStatus.COMPLETED,
-        start_event_id="interaction-start-safe",
+        start_event_id="interaction-anchor-safe",
         source_transcript_start=0,
         source_transcript_end=0,
         result_transcript_start=1,
@@ -4128,7 +4161,7 @@ def test_interaction_lifecycle_schema_keys_survive_secret_name_collisions() -> N
 
     restored = InteractionSummaryEvidence.model_validate(prepared.payload)
     assert restored.status is InteractionStatus.COMPLETED
-    assert restored.start_event_id == "interaction-start-safe"
+    assert restored.start_event_id == "interaction-anchor-safe"
 
 
 def test_pending_tool_round_rejects_secret_authority_on_write_and_legacy_load() -> None:

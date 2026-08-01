@@ -88,6 +88,26 @@ def test_storage_export_uninitialized_fails_cleanly(tmp_path, capsys):
     assert json.loads(captured.out)["error"]["code"] == "STORAGE_COMMAND_FAILED"
 
 
+def test_storage_migrate_alias_keyring_runtime_failure_is_rendered(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    def fail_migration(_args):
+        raise RuntimeError("Postgres public authority alias key configuration is stale")
+
+    monkeypatch.setattr(storage_cli, "_migrate", fail_migration)
+    db = tmp_path / "configured.sqlite"
+    assert main(["storage", "migrate", "--sqlite", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    payload = json.loads(captured.out)
+    assert payload["error"] == {
+        "code": "STORAGE_COMMAND_FAILED",
+        "message": "Postgres public authority alias key configuration is stale",
+    }
+
+
 def test_storage_export_failure_does_not_truncate_existing_output(tmp_path, capsys):
     db = tmp_path / "empty.sqlite"
     out_file = tmp_path / "existing.jsonl"

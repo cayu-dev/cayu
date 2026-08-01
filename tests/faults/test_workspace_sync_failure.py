@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.core._event_projection_support import private_events_for_public_events
 
 from cayu import (
     AgentSpec,
@@ -351,7 +352,8 @@ def test_sync_binding_retains_owner_until_finalize_failure_evidence_is_durable(
             for event in sink.events
             if event.type == EventType.ENVIRONMENT_BINDING_FINALIZE_FAILED
         ]
-        assert [event.id for event in sink_failures] == [finalize_failures[0].id]
+        private_sink_failures = await private_events_for_public_events(store, sink_failures)
+        assert [event.id for event in private_sink_failures] == [finalize_failures[0].id]
 
         rebound = await binding.bind(source, None, session_id="successful-rebind")
         binding.abandon(rebound)
