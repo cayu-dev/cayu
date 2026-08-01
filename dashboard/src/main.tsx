@@ -17,6 +17,7 @@ import { parseDashboardSearch, stringifyDashboardSearch } from "./lib/search-par
 import { validateSessionHistorySearch } from "./lib/session-history-search"
 import { validateSessionIndexSearch } from "./lib/session-index-search"
 import { validateUsageRollupSearch } from "./lib/usage-rollup-search"
+import { validateWorkflowSearch } from "./lib/workflow-search"
 
 const AgentsPage = lazyRouteComponent(() => import("./routes/agents"), "AgentsPage")
 const ArtifactsPage = lazyRouteComponent(() => import("./routes/artifacts"), "ArtifactsPage")
@@ -38,6 +39,7 @@ const SessionDetailPage = lazyRouteComponent(
 const SessionsPage = lazyRouteComponent(() => import("./routes/sessions"), "SessionsPage")
 const TasksPage = lazyRouteComponent(() => import("./routes/tasks"), "TasksPage")
 const UsagePage = lazyRouteComponent(() => import("./routes/usage"), "UsagePage")
+const WorkflowPage = lazyRouteComponent(() => import("./routes/workflow"), "WorkflowPage")
 const SystemPage = lazyRouteComponent(() => import("./routes/system"), "SystemPage")
 
 function RoutePending() {
@@ -128,6 +130,21 @@ const sessionDetailRoute = createRoute({
   component: SessionDetailPage,
 })
 
+const workflowRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/sessions/$sessionId/workflow",
+  validateSearch: validateWorkflowSearch,
+  remountDeps: ({ params }) => ({ sessionId: params.sessionId }),
+  component: () => (
+    <CapabilityRoute
+      requirement={DASHBOARD_ROUTE_REQUIREMENTS["/sessions/$sessionId/workflow"]}
+      title="Workflow"
+    >
+      <WorkflowPage />
+    </CapabilityRoute>
+  ),
+})
+
 const knowledgeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/knowledge",
@@ -163,6 +180,7 @@ const routeTree = rootRoute.addChildren([
   agentsRoute,
   environmentsRoute,
   artifactsRoute,
+  workflowRoute,
   sessionDetailRoute,
   knowledgeRoute,
   runRoute,

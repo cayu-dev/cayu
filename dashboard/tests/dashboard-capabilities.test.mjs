@@ -139,6 +139,25 @@ test("direct optional routes share the same server-authoritative requirements as
     dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/artifacts"]),
     true,
   )
+  assert.equal(
+    dashboardCapabilityEnabled(
+      snapshot,
+      DASHBOARD_ROUTE_REQUIREMENTS["/sessions/$sessionId/workflow"],
+    ),
+    false,
+  )
+  snapshot.surfaces.workflow = {
+    configured: true,
+    read: operation(true),
+    mutate: operation(false, "unsupported"),
+  }
+  assert.equal(
+    dashboardCapabilityEnabled(
+      snapshot,
+      DASHBOARD_ROUTE_REQUIREMENTS["/sessions/$sessionId/workflow"],
+    ),
+    true,
+  )
   assert.equal(dashboardCapabilityEnabled(snapshot, DASHBOARD_ROUTE_REQUIREMENTS["/run"]), true)
 })
 

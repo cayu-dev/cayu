@@ -21,6 +21,7 @@ import {
   Send,
   ShieldCheck,
   UserRound,
+  Workflow,
   Wrench,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
@@ -1128,6 +1129,10 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
   const artifactsCapability = useDashboardCapability({
     kind: "surface",
     surface: "artifacts",
+  })
+  const workflowCapability = useDashboardCapability({
+    kind: "surface",
+    surface: "workflow",
   })
   const sessionExecutionCapability = useDashboardCapability({
     kind: "mutation",
@@ -2650,6 +2655,17 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             {session.model && <Badge variant="outline">{session.model}</Badge>}
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
+            {workflowCapability.enabled && (
+              <Link
+                to="/sessions/$sessionId/workflow"
+                params={{ sessionId: session.id }}
+                search={{}}
+                className={buttonVariants({ variant: "outline", size: "sm" })}
+              >
+                <Workflow className="h-4 w-4" />
+                Workflow
+              </Link>
+            )}
             <a
               href={dashboardPath("/agents", { q: session.agent_name })}
               className={buttonVariants({ variant: "outline", size: "sm" })}
