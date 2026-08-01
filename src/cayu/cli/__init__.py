@@ -33,6 +33,7 @@ def _command_specs() -> tuple[
     from cayu.cli.inspect import add_inspect_parser, run_inspect
     from cayu.cli.lambda_microvm import add_lambda_microvm_parser, run_lambda_microvm
     from cayu.cli.scaffold import add_new_parser, run_new
+    from cayu.cli.serve import add_serve_parser, run_serve
     from cayu.cli.session import add_session_parser, run_session
     from cayu.cli.storage import add_storage_parser, run_storage
 
@@ -47,6 +48,7 @@ def _command_specs() -> tuple[
         ("inspect", add_inspect_parser, run_inspect),
         ("lambda-microvm", add_lambda_microvm_parser, run_lambda_microvm),
         ("new", add_new_parser, run_new),
+        ("serve", add_serve_parser, run_serve),
         ("session", add_session_parser, run_session),
         ("storage", add_storage_parser, run_storage),
     )

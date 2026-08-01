@@ -80,6 +80,16 @@ Custom session stores must forward the optional `checkpoint_root_guard` on
 bounded pending-action and interruption-marker reads and invoke it before
 interpreting nested checkpoint state.
 
+### Configured projects can start server processes
+
+`cayu serve` now discovers the nearest configured project, constructs its
+process-scoped application once, wraps it with the supported `create_server`
+contract, and starts uvicorn with explicit host and port values. Open access
+requires `--dev`; protected deployments resolve a configured auth target.
+Incomplete-session startup recovery remains off unless bounded statuses and an
+inactivity threshold are both configured. Autoreload and multi-process server
+workers remain out of scope.
+
 ### Interaction durability advances the server and storage contracts
 
 First-interaction admission, queued delivery, and lifecycle closure now retain

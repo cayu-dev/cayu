@@ -200,6 +200,20 @@ def test_application_anatomy_guide_is_linked_from_release_facing_docs() -> None:
         )
 
 
+def test_project_server_command_is_release_visible_and_fail_closed() -> None:
+    guide = " ".join(
+        (_REPO_ROOT / "docs" / "project-server.md").read_text(encoding="utf-8").split()
+    )
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    runtime_contract = (_REPO_ROOT / "docs" / "runtime-contracts.md").read_text(encoding="utf-8")
+
+    assert "docs/project-server.md" in readme
+    assert "`cayu serve` is a process-role adapter" in runtime_contract
+    assert "Without `--dev`, the command fails closed" in guide
+    assert "Autoreload and multi-process workers are v1 non-goals" in guide
+    assert "Incomplete-session startup recovery is off by default" in guide
+
+
 def test_server_auth_tenant_isolation_boundary_is_documented() -> None:
     readme = " ".join((_REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
     runtime_contract = " ".join(

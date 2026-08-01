@@ -178,7 +178,7 @@ def _discover_configured_project(
     *,
     command: str,
     configuration_example: str,
-    explicit_target_example: str,
+    explicit_target_example: str | None,
     discovery_keys: tuple[str, ...] = ("factory",),
 ) -> _ConfiguredCayuProject:
     discovered = discover_cayu_project_configuration(discovery_keys=discovery_keys)
@@ -201,16 +201,20 @@ def _discover_configured_project(
             config=discovered.config,
         )
 
-    raise ProjectError(
-        f"No Cayu project found. Add {configuration_example} to pyproject.toml, "
-        f"or pass {command} {explicit_target_example}."
-    )
+    message = f"No Cayu project found. Add {configuration_example} to pyproject.toml."
+    if explicit_target_example is not None:
+        message = (
+            f"No Cayu project found. Add {configuration_example} to pyproject.toml, "
+            f"or pass {command} {explicit_target_example}."
+        )
+    raise ProjectError(message)
 
 
 def resolve_project(
     explicit_target: str | None = None,
     *,
     command: str = "cayu",
+    suggest_explicit_target: bool = True,
 ) -> CayuProject:
     if explicit_target is not None:
         return CayuProject(root=Path.cwd().resolve(), target=explicit_target)
@@ -218,7 +222,7 @@ def resolve_project(
     configured = _discover_configured_project(
         command=command,
         configuration_example='[tool.cayu] factory = "module:build_app"',
-        explicit_target_example="module:build_app",
+        explicit_target_example=("module:build_app" if suggest_explicit_target else None),
     )
     return CayuProject(root=configured.root, target=configured.factory_target)
 

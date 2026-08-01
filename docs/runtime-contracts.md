@@ -112,6 +112,13 @@ that application-owned behavior. The canonical
 these boundaries and the console, script, server-integration,
 worker-integration, and test process roles.
 
+`cayu serve` is a process-role adapter over this same factory contract. It
+discovers the nearest configured project, enters its import context, and builds
+the app exactly once. The command requires either an explicit open
+local-development profile or a resolved authentication target; incomplete-
+session startup recovery remains disabled unless bounded statuses and an
+inactivity threshold are configured. See [project server](project-server.md).
+
 `CayuApp.describe()` emits a structural, redacted manifest. Agent entries expose
 `has_system_prompt`, but prompt text and implementation bodies never enter the
 manifest. The application fingerprint therefore changes when prompt presence

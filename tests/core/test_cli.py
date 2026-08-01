@@ -13,11 +13,10 @@ def test_cli_version(capsys):
     assert output.startswith("cayu ")
 
 
-@pytest.mark.parametrize("command", ["serve", "validate"])
-def test_cli_unimplemented_stubs_removed(command, capsys):
-    # The serve/validate stubs were removed rather than left as misleading
-    # "not implemented yet" placeholders; argparse now rejects them.
+def test_cli_unimplemented_validate_stub_removed(capsys):
+    # The validate stub was removed rather than left as a misleading
+    # "not implemented yet" placeholder; argparse now rejects it.
     with pytest.raises(SystemExit) as excinfo:
-        main([command])
+        main(["validate"])
     assert excinfo.value.code != 0
     assert "invalid choice" in capsys.readouterr().err

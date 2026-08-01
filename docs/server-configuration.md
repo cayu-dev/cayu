@@ -5,6 +5,10 @@ and lifecycle policy. `ServerConfig` is the fully resolved, validated contract
 consumed by `create_server()`; it does not read environment variables or know
 which secret manager an application uses.
 
+Configured projects can apply the same contract through `cayu serve`; see
+[project server](project-server.md) for its fail-closed
+authentication, startup-recovery, and single-process boundaries.
+
 ## Programmatic configuration
 
 Authentication is required unless open access is selected deliberately:

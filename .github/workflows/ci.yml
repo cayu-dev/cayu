@@ -172,6 +172,14 @@ jobs:
       - run: uv run python scripts/check_release_artifacts.py dist/first/*
       - run: uv venv --python 3.11 .release-venv
       - run: uv pip install --python .release-venv/bin/python dist/first/*.whl
+      - run: uv venv --python 3.11 .release-server-venv
+      - name: Install built wheel with server extra
+        run: |
+          for wheel_path in dist/first/*.whl; do
+            uv pip install --python .release-server-venv/bin/python "${wheel_path}[server]"
+          done
+      - name: Smoke-test protected cayu serve from the built wheel
+        run: .release-server-venv/bin/python scripts/smoke_built_wheel_serve.py
       - name: Check bundled model catalog and price book from the installed wheel
         run: |
           .release-venv/bin/python - <<'PY'

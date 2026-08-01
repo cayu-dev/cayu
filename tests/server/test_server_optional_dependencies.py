@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
 
 import pytest
+
+from cayu.cli import main
 
 
 def _purge_cached_modules(monkeypatch: pytest.MonkeyPatch, *prefixes: str) -> None:
@@ -42,6 +45,28 @@ def test_unrelated_missing_module_is_not_masked(monkeypatch: pytest.MonkeyPatch)
 
     with pytest.raises(ModuleNotFoundError, match="pydantic"):
         importlib.import_module("cayu.server")
+
+
+def test_serve_reports_missing_server_extra(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.cayu]\nfactory = "optional_server_project:build_app"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "optional_server_project.py").write_text(
+        "from cayu import CayuApp\n\ndef build_app():\n    return CayuApp(enable_logging=False)\n",
+        encoding="utf-8",
+    )
+    _purge_cached_modules(monkeypatch, "cayu.server", "fastapi")
+    monkeypatch.setitem(sys.modules, "fastapi", None)
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("optional_server_project", None)
+
+    assert main(["serve", "--dev"]) == 1
+    assert 'pip install "cayu[server]"' in capsys.readouterr().err
 
 
 def test_server_imports_cleanly_with_extra_installed() -> None:
