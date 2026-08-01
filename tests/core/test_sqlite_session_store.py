@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cayu import SQLiteSessionStore, SQLiteTaskStore
+from cayu import CHECKPOINT_SCHEMA_VERSION_KEY, SQLiteSessionStore, SQLiteTaskStore
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.providers import (
@@ -910,7 +910,10 @@ def test_sqlite_session_store_persists_forked_session_state(tmp_path):
             "first answer",
         ]
         checkpoint = await reopened.load_checkpoint("sess_sqlite_fork_child")
-        assert checkpoint == {"context_compaction": {}}
+        assert checkpoint == {
+            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            "context_compaction": {},
+        }
         children = (
             await reopened.list_sessions(SessionQuery(parent_session_id="sess_sqlite_fork_source"))
         ).sessions

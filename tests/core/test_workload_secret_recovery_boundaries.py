@@ -13,6 +13,7 @@ from tests.core._workload_secret_support import (
     collect_tool_approval_recovery_events,
 )
 
+from cayu import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.core import AgentSpec, EventType, Message
 from cayu.providers import ModelStreamEvent
 from cayu.runtime import (
@@ -121,7 +122,9 @@ def test_cayu_app_never_executes_new_tool_call_with_redaction_marker() -> None:
 
     assert events[-1].type == EventType.SESSION_FAILED
     assert tool.calls == []
-    assert asyncio.run(store.load_checkpoint("sess_new_tool_marker")) is None
+    assert asyncio.run(store.load_checkpoint("sess_new_tool_marker")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+    }
 
 
 def test_cayu_app_rejects_workload_secret_before_approval_checkpoint() -> None:
@@ -166,7 +169,7 @@ def test_cayu_app_rejects_workload_secret_before_approval_checkpoint() -> None:
     transcript = asyncio.run(store.load_transcript("sess_tool_approval_redaction"))
     assert events[-1].type == EventType.SESSION_FAILED
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
-    assert checkpoint is None
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
     assert tool.calls == []
     assert secret not in str([event.model_dump(mode="json") for event in events])
     assert secret not in str([message.model_dump(mode="json") for message in transcript])

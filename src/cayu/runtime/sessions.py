@@ -114,6 +114,10 @@ from cayu.runtime.budgets import (
     project_budget_model_attempt_inspection_event,
     session_budget_inspection,
 )
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -1383,6 +1387,128 @@ CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
     dict[str, Any] | None,
 ]
+CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS = 32
+
+
+@dataclass(frozen=True)
+class CheckpointRootFieldProjection:
+    """Bounded opaque evidence for one runtime-selected root field."""
+
+    is_present: bool
+    json_type: str | None
+    scalar_text: str | None
+    scalar_text_truncated: bool = False
+
+
+CheckpointRootFieldProjectionValidator = Callable[
+    [str, CheckpointRootFieldProjection],
+    None,
+]
+
+
+@dataclass(frozen=True)
+class CheckpointRootFieldGuard:
+    """One runtime-owned validator to run inside a store read snapshot."""
+
+    key: str
+    validate: CheckpointRootFieldProjectionValidator
+
+    def __post_init__(self) -> None:
+        key = require_clean_nonblank(self.key, "checkpoint root field key")
+        if any(
+            char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+            for char in key
+        ):
+            raise ValueError(
+                "checkpoint root field key must contain only ASCII letters, digits, "
+                "and underscores."
+            )
+        if not callable(self.validate):
+            raise TypeError("checkpoint root field validator must be callable.")
+
+
+def checkpoint_root_field_projection(
+    checkpoint: dict[str, Any] | None,
+    key: str,
+) -> CheckpointRootFieldProjection:
+    """Project one root field without copying arbitrary checkpoint contents."""
+
+    if checkpoint is None or key not in checkpoint:
+        return CheckpointRootFieldProjection(
+            is_present=False,
+            json_type=None,
+            scalar_text=None,
+        )
+    value = checkpoint[key]
+    if value is None:
+        json_type = "null"
+        scalar_text = None
+    elif type(value) is bool:
+        json_type = "boolean"
+        scalar_text = None
+    elif type(value) is int:
+        json_type = "integer"
+        scalar_text = str(value)
+    elif type(value) is float:
+        json_type = "number"
+        scalar_text = None
+    elif type(value) is str:
+        json_type = "string"
+        scalar_text = None
+    elif type(value) is list:
+        json_type = "array"
+        scalar_text = None
+    elif type(value) is dict:
+        json_type = "object"
+        scalar_text = None
+    else:
+        json_type = "other"
+        scalar_text = None
+    truncated = (
+        scalar_text is not None and len(scalar_text) > CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS
+    )
+    return CheckpointRootFieldProjection(
+        is_present=True,
+        json_type=json_type,
+        scalar_text=(
+            None if scalar_text is None else scalar_text[:CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS]
+        ),
+        scalar_text_truncated=truncated,
+    )
+
+
+def checkpoint_root_field_projection_from_storage(
+    *,
+    json_type: str | None,
+    scalar_text: Any,
+) -> CheckpointRootFieldProjection:
+    """Normalize bounded root-field evidence projected by a durable store."""
+
+    json_type_aliases = {
+        "false": "boolean",
+        "real": "number",
+        "text": "string",
+        "true": "boolean",
+    }
+    normalized_json_type = (
+        None if json_type is None else json_type_aliases.get(json_type, json_type)
+    )
+    normalized_scalar = None if scalar_text is None else str(scalar_text)
+    return CheckpointRootFieldProjection(
+        is_present=json_type is not None,
+        json_type=normalized_json_type,
+        scalar_text=(
+            None
+            if normalized_scalar is None
+            else normalized_scalar[:CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS]
+        ),
+        scalar_text_truncated=(
+            normalized_scalar is not None
+            and len(normalized_scalar) > CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS
+        ),
+    )
+
+
 ForkTranscriptValidator = Callable[[tuple[Message, ...]], bool]
 FORK_TRANSCRIPT_VALIDATION_ERROR = (
     "Fork transcript contains a workload secret and cannot be copied without "
@@ -4525,8 +4651,14 @@ class SessionStore(ABC):
         self,
         session_id: str,
         idempotency_key: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> dict[str, Any] | None:
-        """Load one terminal durable operation record by caller idempotency key."""
+        """Load one terminal durable operation record by caller idempotency key.
+
+        A supplied root guard runs in the same read snapshot before the
+        checkpoint-coupled operation record is interpreted.
+        """
 
     @abstractmethod
     async def publish_session_operation(
@@ -4966,7 +5098,12 @@ class SessionStore(ABC):
     async def summarize_outcome(self, session_id: str) -> SessionOutcome:
         """Derive the current session outcome from durable events."""
 
-    async def inspect_summary(self, session_id: str) -> SessionInspectionSummary:
+    async def inspect_summary(
+        self,
+        session_id: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> SessionInspectionSummary:
         """Return one exact, content-free diagnostic summary.
 
         The default implementation deliberately composes the public paginated
@@ -5066,7 +5203,8 @@ class SessionStore(ABC):
                 break
 
         pending = await self.query_pending_actions(
-            PendingActionQuery(session_id=session_id, limit=200)
+            PendingActionQuery(session_id=session_id, limit=200),
+            checkpoint_root_guard=checkpoint_root_guard,
         )
         usage, model_calls_with_usage = usage_accumulator.result(session_id)
         budget = session_budget_inspection(
@@ -5167,11 +5305,15 @@ class SessionStore(ABC):
     async def query_pending_actions(
         self,
         query: PendingActionQuery | None = None,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> PendingActionListResult:
         """List current checkpoint-backed actions without scanning session histories.
 
         Implementations must bound candidate and event reads, apply filtering at
         the storage layer where possible, and avoid per-session history queries.
+        A supplied root guard runs on bounded opaque evidence in the same read
+        snapshot before any pending state is interpreted.
         """
 
     async def delete_session(self, session_id: str) -> None:
@@ -5235,6 +5377,7 @@ class SessionStore(ABC):
         replacement_messages: list[Message],
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> None:
         """Atomically materialize deferred input as the ordered initial transcript.
 
@@ -5242,6 +5385,8 @@ class SessionStore(ABC):
         bootstrap/system messages are stored with null interaction attribution;
         the source suffix is attributed to ``interaction_id``.  No partial or
         externally visible pre-finalization transcript is permitted.
+        When supplied, ``checkpoint_transform`` runs inside the same write
+        transaction before the initial-transcript authority marker is read.
         """
 
     @abstractmethod
@@ -5318,8 +5463,17 @@ class SessionStore(ABC):
         """Load the latest checkpoint for a session."""
 
     @abstractmethod
-    async def load_interruption_cascade_marker(self, session_id: str) -> dict[str, Any] | None:
-        """Load a bounded structural projection of the durable cascade marker."""
+    async def load_interruption_cascade_marker(
+        self,
+        session_id: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> dict[str, Any] | None:
+        """Load a bounded structural projection of the durable cascade marker.
+
+        A supplied root guard runs on bounded opaque evidence in the same read
+        snapshot before the marker is interpreted.
+        """
 
 
 @dataclass(frozen=True)
@@ -7365,6 +7519,8 @@ class InMemorySessionStore(SessionStore):
         self,
         session_id: str,
         idempotency_key: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         idempotency_key = _reject_reserved_runtime_publication_key(
@@ -7374,6 +7530,14 @@ class InMemorySessionStore(SessionStore):
         async with self._lock:
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
+            if checkpoint_root_guard is not None:
+                checkpoint_root_guard.validate(
+                    session_id,
+                    checkpoint_root_field_projection(
+                        self._checkpoints.get(session_id),
+                        checkpoint_root_guard.key,
+                    ),
+                )
             record = self._session_operation_records.get(session_id, {}).get(idempotency_key)
             return None if record is None else copy_durable_json_object(record, "session_operation")
 
@@ -8492,6 +8656,8 @@ class InMemorySessionStore(SessionStore):
     async def query_pending_actions(
         self,
         query: PendingActionQuery | None = None,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> PendingActionListResult:
         from cayu.runtime.pending_actions import (
             PENDING_ACTION_CHECKPOINT_KEYS,
@@ -8558,6 +8724,14 @@ class InMemorySessionStore(SessionStore):
                 previous_last_inspected_session = last_inspected_session
                 projected_session = PendingActionSession.from_session(session)
                 checkpoint = self._checkpoints.get(session.id)
+                if checkpoint_root_guard is not None:
+                    checkpoint_root_guard.validate(
+                        session.id,
+                        checkpoint_root_field_projection(
+                            checkpoint,
+                            checkpoint_root_guard.key,
+                        ),
+                    )
                 pending_checkpoint_source = (
                     None
                     if checkpoint is None
@@ -8770,6 +8944,7 @@ class InMemorySessionStore(SessionStore):
         replacement_messages: list[Message],
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         interaction_id = resolve_interaction_attribution(session_id, interaction_id)
@@ -8792,8 +8967,19 @@ class InMemorySessionStore(SessionStore):
             ):
                 raise RuntimeError("Initial transcript must preserve the admitted source suffix.")
             prefix_count = len(replacement) - len(expected)
+            current_checkpoint = self._checkpoints.get(session_id)
+            if checkpoint_transform is not None:
+                transformed = checkpoint_transform(
+                    session.model_copy(deep=True),
+                    None if current_checkpoint is None else deepcopy(current_checkpoint),
+                )
+                if transformed is not None:
+                    current_checkpoint = copy_durable_json_object(
+                        transformed,
+                        "checkpoint",
+                    )
             checkpoint = _checkpoint_after_initial_transcript_publication(
-                self._checkpoints.get(session_id),
+                current_checkpoint,
                 interaction_id=interaction_id,
             )
             self._transcripts[session_id] = replacement
@@ -8992,10 +9178,23 @@ class InMemorySessionStore(SessionStore):
                 return None
             return deepcopy(checkpoint)
 
-    async def load_interruption_cascade_marker(self, session_id: str) -> dict[str, Any] | None:
+    async def load_interruption_cascade_marker(
+        self,
+        session_id: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
+    ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:
             checkpoint = self._checkpoints.get(session_id)
+            if checkpoint_root_guard is not None:
+                checkpoint_root_guard.validate(
+                    session_id,
+                    checkpoint_root_field_projection(
+                        checkpoint,
+                        checkpoint_root_guard.key,
+                    ),
+                )
             marker = (
                 _INTERRUPTION_CASCADE_MISSING
                 if checkpoint is None or "pending_interruption_cascade" not in checkpoint
@@ -10844,10 +11043,27 @@ def _validate_assistant_model_completion_publication(
     if tool_calls:
         expected_operation_keys.add(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     operations_by_key = {operation.key: operation for operation in publication.mutation.operations}
-    if set(operations_by_key) != expected_operation_keys:
+    actual_operation_keys = frozenset(operations_by_key)
+    if actual_operation_keys not in {
+        frozenset(expected_operation_keys),
+        frozenset(expected_operation_keys | {CHECKPOINT_SCHEMA_VERSION_KEY}),
+    }:
         raise ValueError(
             "An assistant model completion must atomically publish exactly its model-step "
-            "pointer and optional pending tool-round marker."
+            "pointer, optional pending tool-round marker, and optional root checkpoint "
+            "schema stamp."
+        )
+    schema_operation = operations_by_key.get(CHECKPOINT_SCHEMA_VERSION_KEY)
+    if schema_operation is not None and (
+        schema_operation.action != "set"
+        or schema_operation.expected_value_digest
+        != runtime_publication_checkpoint_value_digest(
+            CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        )
+        or schema_operation.value != CURRENT_CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            "A model completion root checkpoint schema stamp must fence the current version."
         )
 
     pointer_operation = operations_by_key[LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY]
@@ -13646,10 +13862,11 @@ def _initial_transcript_pending_checkpoint(interaction_id: str) -> dict[str, Any
     """Create the authority marker held until initial transcript publication."""
 
     return {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY: {
             "version": 1,
             "interaction_id": require_clean_nonblank(interaction_id, "interaction_id"),
-        }
+        },
     }
 
 

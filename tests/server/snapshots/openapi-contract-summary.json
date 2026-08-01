@@ -3394,6 +3394,87 @@
       "title": "CausalBudgetUsageSummary",
       "type": "object"
     },
+    "CheckpointCompatibilityErrorResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "$ref": "#/components/schemas/CheckpointCompatibilityEvidence"
+        }
+      },
+      "required": [
+        "detail"
+      ],
+      "title": "CheckpointCompatibilityErrorResponse",
+      "type": "object"
+    },
+    "CheckpointCompatibilityEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "checkpoint_kind": {
+          "const": "root",
+          "title": "Checkpoint Kind",
+          "type": "string"
+        },
+        "observed_version": {
+          "anyOf": [
+            {
+              "minimum": 1.0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Observed Version"
+        },
+        "reason": {
+          "enum": [
+            "invalid_root_checkpoint",
+            "invalid_checkpoint_schema_version",
+            "checkpoint_schema_version_too_new",
+            "checkpoint_schema_version_too_old"
+          ],
+          "title": "Reason",
+          "type": "string"
+        },
+        "recovery_disposition": {
+          "const": "cannot_migrate",
+          "title": "Recovery Disposition",
+          "type": "string"
+        },
+        "resumable_in_place": {
+          "const": false,
+          "title": "Resumable In Place",
+          "type": "boolean"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "supported_max_version": {
+          "minimum": 1.0,
+          "title": "Supported Max Version",
+          "type": "integer"
+        },
+        "supported_min_version": {
+          "minimum": 1.0,
+          "title": "Supported Min Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "checkpoint_kind",
+        "observed_version",
+        "reason",
+        "recovery_disposition",
+        "resumable_in_place",
+        "session_id",
+        "supported_max_version",
+        "supported_min_version"
+      ],
+      "title": "CheckpointCompatibilityEvidence",
+      "type": "object"
+    },
     "ClientGenerationContract": {
       "additionalProperties": false,
       "properties": {
@@ -9842,6 +9923,13 @@
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/PendingActionsResponse"
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/CheckpointCompatibilityErrorResponse"
               }
             }
           },

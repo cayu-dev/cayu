@@ -585,6 +585,29 @@ class ApiErrorResponse(ApiBaseModel):
     detail: str
 
 
+CheckpointCompatibilityReason = Literal[
+    "invalid_root_checkpoint",
+    "invalid_checkpoint_schema_version",
+    "checkpoint_schema_version_too_new",
+    "checkpoint_schema_version_too_old",
+]
+
+
+class CheckpointCompatibilityEvidence(ApiBaseModel):
+    checkpoint_kind: Literal["root"]
+    observed_version: StrictInt | None = Field(ge=1)
+    reason: CheckpointCompatibilityReason
+    recovery_disposition: Literal["cannot_migrate"]
+    resumable_in_place: Literal[False]
+    session_id: str
+    supported_max_version: StrictInt = Field(ge=1)
+    supported_min_version: StrictInt = Field(ge=1)
+
+
+class CheckpointCompatibilityErrorResponse(ApiBaseModel):
+    detail: CheckpointCompatibilityEvidence
+
+
 AGGREGATE_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     501: {
         "description": "The configured store does not implement this aggregate read.",
@@ -1220,10 +1243,14 @@ class PendingActionsResponse(ApiBaseModel):
 
 
 PENDING_ACTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    409: {
+        "description": "A checkpoint requires a different Cayu runtime version.",
+        "model": CheckpointCompatibilityErrorResponse,
+    },
     413: {
         "description": "The pending-action page exceeds the bounded response size.",
         "model": ApiErrorResponse,
-    }
+    },
 }
 
 

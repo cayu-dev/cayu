@@ -73,6 +73,7 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
+from cayu.runtime.checkpoints import CheckpointCompatibilityError
 from cayu.runtime.costs import (
     CausalBudgetCostSummary,
     PriceBook,
@@ -4167,7 +4168,7 @@ def create_router(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            result = await session_store.query_pending_actions(
+            result = await cayu_app._runtime_session_store.query_pending_actions(
                 PendingActionQuery(
                     session_id=requested_session_id,
                     kind=kind,
@@ -4178,6 +4179,11 @@ def create_router(
                     limit=limit,
                 )
             )
+        except CheckpointCompatibilityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=exc.safe_evidence(),
+            ) from exc
         except PendingActionResultTooLarge as exc:
             raise HTTPException(status_code=413, detail=str(exc)) from exc
         return {

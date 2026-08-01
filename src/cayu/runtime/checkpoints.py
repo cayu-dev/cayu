@@ -1,0 +1,284 @@
+"""Versioned root checkpoint payloads owned by the Cayu runtime."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any
+
+from cayu._validation import copy_durable_json_object
+from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
+
+if TYPE_CHECKING:
+    from cayu.runtime.sessions import CheckpointRootFieldProjection
+
+CHECKPOINT_SCHEMA_VERSION_KEY = "checkpoint_schema_version"
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 1
+MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
+_VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
+
+
+def _bounded_checkpoint_evidence_session_id(session_id: str) -> str:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    encoded = session_id.encode("utf-8")
+    if len(encoded) <= _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES:
+        return session_id
+    return f"sha256:{sha256(encoded).hexdigest()}"
+
+
+class CheckpointCompatibilityError(RuntimeError):
+    """A root checkpoint cannot be interpreted safely by this runtime."""
+
+    def __init__(
+        self,
+        *,
+        reason: str,
+        session_id: str,
+        observed_version: int | None,
+        supported_min_version: int = MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION,
+        supported_max_version: int = CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    ) -> None:
+        self.reason = reason
+        self.checkpoint_kind = "root"
+        self.observed_version = observed_version
+        self.supported_min_version = supported_min_version
+        self.supported_max_version = supported_max_version
+        self.session_id = _bounded_checkpoint_evidence_session_id(session_id)
+        self.recovery_disposition = "cannot_migrate"
+        self.resumable_in_place = False
+        if reason == "checkpoint_schema_version_too_new":
+            message = (
+                f"Session {self.session_id!r} uses a newer root checkpoint schema; "
+                "upgrade Cayu before resuming it."
+            )
+        else:
+            message = f"Session {self.session_id!r} has an invalid root checkpoint schema version."
+        super().__init__(message)
+
+    def safe_evidence(self) -> dict[str, Any]:
+        """Return bounded, content-free evidence for events and operator surfaces."""
+
+        return {
+            "checkpoint_kind": self.checkpoint_kind,
+            "observed_version": self.observed_version,
+            "reason": self.reason,
+            "recovery_disposition": self.recovery_disposition,
+            "resumable_in_place": self.resumable_in_place,
+            "session_id": self.session_id,
+            "supported_max_version": self.supported_max_version,
+            "supported_min_version": self.supported_min_version,
+        }
+
+
+class CheckpointMigrationDefinitionError(ValueError):
+    """The runtime's ordered checkpoint migration chain is invalid."""
+
+
+@dataclass(frozen=True)
+class CheckpointMigration:
+    """One pure, unit-step root checkpoint upcaster."""
+
+    source_version: int
+    target_version: int
+    migrate: Callable[[dict[str, Any]], dict[str, Any]]
+
+    def __post_init__(self) -> None:
+        if type(self.source_version) is not int or self.source_version < 1:
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint migration source_version must be a positive integer."
+            )
+        if type(self.target_version) is not int or self.target_version < 1:
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint migration target_version must be a positive integer."
+            )
+        if self.target_version != self.source_version + 1:
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint migrations must advance exactly one version."
+            )
+        if not callable(self.migrate):
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint migration migrate must be callable."
+            )
+
+
+class CheckpointMigrator:
+    """Decode and upcast root checkpoints through one ordered chain."""
+
+    def __init__(
+        self,
+        *,
+        current_version: int,
+        migrations: Iterable[CheckpointMigration] = (),
+        min_supported_version: int = MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION,
+    ) -> None:
+        if type(current_version) is not int or current_version < 1:
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint current_version must be a positive integer."
+            )
+        if type(min_supported_version) is not int or min_supported_version < 1:
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint min_supported_version must be a positive integer."
+            )
+        if min_supported_version > current_version:
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint min_supported_version cannot exceed current_version."
+            )
+        by_source: dict[int, CheckpointMigration] = {}
+        for migration in migrations:
+            if type(migration) is not CheckpointMigration:
+                raise CheckpointMigrationDefinitionError(
+                    "Checkpoint migrations must contain CheckpointMigration values."
+                )
+            if migration.source_version in by_source:
+                raise CheckpointMigrationDefinitionError(
+                    "Checkpoint migration chain contains a duplicate migration "
+                    f"from version {migration.source_version}."
+                )
+            by_source[migration.source_version] = migration
+        for source_version in range(min_supported_version, current_version):
+            if source_version not in by_source:
+                raise CheckpointMigrationDefinitionError(
+                    "Checkpoint migration chain is missing migration "
+                    f"from version {source_version}."
+                )
+        if any(
+            source_version < min_supported_version or source_version >= current_version
+            for source_version in by_source
+        ):
+            raise CheckpointMigrationDefinitionError(
+                "Checkpoint migration chain contains a step outside its supported range."
+            )
+        self.current_version = current_version
+        self.min_supported_version = min_supported_version
+        self._migrations = by_source
+
+    def decode(
+        self,
+        checkpoint: dict[str, Any] | None,
+        *,
+        session_id: str,
+    ) -> dict[str, Any] | None:
+        """Decode one root checkpoint and apply every required unit upcaster."""
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if checkpoint is None:
+            return None
+        if type(checkpoint) is not dict:
+            raise CheckpointCompatibilityError(
+                reason="invalid_root_checkpoint",
+                session_id=session_id,
+                observed_version=None,
+                supported_min_version=self.min_supported_version,
+                supported_max_version=self.current_version,
+            )
+        raw_version = checkpoint.get(CHECKPOINT_SCHEMA_VERSION_KEY)
+        if CHECKPOINT_SCHEMA_VERSION_KEY not in checkpoint:
+            observed_version = _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION
+        elif type(raw_version) is not int or raw_version < 1:
+            raise CheckpointCompatibilityError(
+                reason="invalid_checkpoint_schema_version",
+                session_id=session_id,
+                observed_version=None,
+                supported_min_version=self.min_supported_version,
+                supported_max_version=self.current_version,
+            )
+        else:
+            observed_version = raw_version
+        if observed_version > self.current_version:
+            raise CheckpointCompatibilityError(
+                reason="checkpoint_schema_version_too_new",
+                session_id=session_id,
+                observed_version=observed_version,
+                supported_min_version=self.min_supported_version,
+                supported_max_version=self.current_version,
+            )
+        if observed_version < self.min_supported_version:
+            raise CheckpointCompatibilityError(
+                reason="checkpoint_schema_version_too_old",
+                session_id=session_id,
+                observed_version=observed_version,
+                supported_min_version=self.min_supported_version,
+                supported_max_version=self.current_version,
+            )
+        decoded = copy_durable_json_object(checkpoint, "checkpoint")
+        decoded[CHECKPOINT_SCHEMA_VERSION_KEY] = observed_version
+        while observed_version < self.current_version:
+            migration = self._migrations[observed_version]
+            try:
+                migrated = migration.migrate(copy_durable_json_object(decoded, "checkpoint"))
+                migrated = copy_durable_json_object(migrated, "checkpoint")
+            except Exception:
+                raise CheckpointMigrationDefinitionError(
+                    f"Checkpoint migration from version {migration.source_version} failed."
+                ) from None
+            target_version = migrated.get(CHECKPOINT_SCHEMA_VERSION_KEY)
+            if type(target_version) is not int or target_version != migration.target_version:
+                raise CheckpointMigrationDefinitionError(
+                    "Checkpoint migration from version "
+                    f"{migration.source_version} must return checkpoint schema "
+                    f"version {migration.target_version}."
+                )
+            decoded = migrated
+            observed_version = target_version
+        return decoded
+
+
+_RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
+    current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
+)
+
+
+def validate_runtime_checkpoint_version_projection(
+    *,
+    session_id: str,
+    version_is_present: bool,
+    version: Any,
+) -> None:
+    """Validate a bounded root-version projection without checkpoint contents."""
+
+    projected = {CHECKPOINT_SCHEMA_VERSION_KEY: version} if version_is_present else {}
+    decode_runtime_checkpoint(projected, session_id=session_id)
+
+
+def validate_runtime_checkpoint_root_projection(
+    session_id: str,
+    projection: CheckpointRootFieldProjection,
+) -> None:
+    """Validate one store-projected root version without nested checkpoint state."""
+
+    version: Any = None
+    scalar_text = projection.scalar_text
+    if (
+        projection.is_present
+        and projection.json_type in {"integer", "number"}
+        and not projection.scalar_text_truncated
+        and type(scalar_text) is str
+    ):
+        digits = scalar_text[1:] if scalar_text.startswith("-") else scalar_text
+        if digits and digits.isascii() and digits.isdigit():
+            version = int(scalar_text)
+    validate_runtime_checkpoint_version_projection(
+        session_id=session_id,
+        version_is_present=projection.is_present,
+        version=version,
+    )
+
+
+def decode_runtime_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    session_id: str,
+) -> dict[str, Any] | None:
+    """Decode one root checkpoint into the current runtime-owned schema."""
+
+    try:
+        return _RUNTIME_CHECKPOINT_MIGRATOR.decode(
+            checkpoint,
+            session_id=session_id,
+        )
+    except CheckpointCompatibilityError as error:
+        checkpoint = None
+        error.__traceback__ = None
+        raise error from None

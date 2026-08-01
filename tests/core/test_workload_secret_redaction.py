@@ -73,6 +73,7 @@ from cayu.runtime import (
     ToolPolicyRequest,
     ToolPolicyResult,
 )
+from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 
@@ -163,7 +164,9 @@ def test_runtime_managed_context_rejects_secret_checkpoint_before_publication(
     )
 
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint("secret_context_checkpoint")) is None
+    assert asyncio.run(store.load_checkpoint("secret_context_checkpoint")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+    }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
     assert events[-1].type is EventType.SESSION_FAILED
@@ -247,7 +250,9 @@ def test_runtime_managed_context_rejects_secret_checkpoint_event_payload_before_
     )
 
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint(f"secret_context_event_{secret_location}")) is None
+    assert asyncio.run(store.load_checkpoint(f"secret_context_event_{secret_location}")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+    }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
     assert events[-1].type is EventType.SESSION_FAILED
@@ -307,7 +312,9 @@ def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure()
     )
 
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint("secret_context_failure_checkpoint")) is None
+    assert asyncio.run(store.load_checkpoint("secret_context_failure_checkpoint")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+    }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
     assert events[-1].type is EventType.SESSION_FAILED
@@ -3354,7 +3361,10 @@ def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
 
     child_checkpoint = asyncio.run(scenario())
 
-    assert child_checkpoint == {"safe_state": {"value": "copied"}}
+    assert child_checkpoint == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        "safe_state": {"value": "copied"},
+    }
     assert secret not in repr(child_checkpoint)
 
 

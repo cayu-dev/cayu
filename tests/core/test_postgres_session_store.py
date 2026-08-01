@@ -15,6 +15,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
+from tests.core.checkpoint_schema_conformance import (
+    assert_future_checkpoint_rejection_conformance,
+    assert_versionless_checkpoint_resume_conformance,
+    assert_versionless_noop_transform_stamps_conformance,
+)
 from tests.core.pending_action_conformance import assert_pending_action_store_conformance
 from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
@@ -115,6 +120,24 @@ def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
 
 def test_postgres_session_topology_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_session_topology_store_conformance)
+
+
+def test_postgres_checkpoint_schema_runtime_conformance(postgres_dsn: str) -> None:
+    async def exercise(store) -> None:
+        await assert_versionless_checkpoint_resume_conformance(
+            store,
+            session_id="sess-postgres-versionless-checkpoint",
+        )
+        await assert_versionless_noop_transform_stamps_conformance(
+            store,
+            session_id="sess-postgres-versionless-noop-transform",
+        )
+        await assert_future_checkpoint_rejection_conformance(
+            store,
+            session_id="sess-postgres-future-checkpoint",
+        )
+
+    _run(postgres_dsn, exercise)
 
 
 def test_postgres_bounded_event_query_rejects_payload_bytes_before_return(

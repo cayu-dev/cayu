@@ -38,6 +38,7 @@ from cayu.runtime import (
     session_usage_summary,
     usage_metrics_from_event_payload,
 )
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
 from cayu.runtime.budgets import is_complete_budget_reconciliation_pricing
 from cayu.runtime.interactions import INTERACTION_TERMINAL_EVENT_TYPES
@@ -365,7 +366,7 @@ async def _list_sessions(args: argparse.Namespace, store: SessionStore) -> int:
 
 async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
     try:
-        summary = await store.inspect_summary(args.session_id)
+        summary = await runtime_checkpoint_session_store(store).inspect_summary(args.session_id)
     except KeyError as exc:
         raise ValueError(f"Session not found: {args.session_id}") from exc
     identity = summary.session

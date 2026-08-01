@@ -119,6 +119,11 @@ from cayu.runtime.budgets import (
     budget_reconciliation_payload,
     budget_settlement_id,
 )
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    CheckpointCompatibilityError,
+)
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink
 from cayu.runtime.sessions import (
@@ -629,7 +634,7 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                 assert session.status == status
                 assert session.run_epoch == original_epochs[session_id] + 2
                 assert [record.event.type for record in records] == [expected_type]
-                assert await store.load_checkpoint(session_id) == {}
+                assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
             class CompleteThenBlockProvider(ModelProvider):
                 name = "fake"
@@ -882,7 +887,7 @@ def test_session_store_conformance_repairs_pre_boundary_resume_failure(
                 EventType.SESSION_FAILED,
             ]
             assert records[-1].event.payload["session_run_operation_id"] == operation_id
-            assert await store.load_checkpoint(session_id) == {}
+            assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
         finally:
             await _close_store(store)
 
@@ -4222,6 +4227,89 @@ def _model_completion_publication_checkpoint(
     assert operation.action == "set"
     assert operation.key == LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY
     return {operation.key: operation.value}
+
+
+def test_session_store_conformance_model_completion_accepts_root_schema_stamp(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_model_completion_root_schema"
+            logical_step_id = "model-step:root-schema"
+            stage_id = f"{logical_step_id}:attempt-0"
+            intent = {"logical_step": logical_step_id}
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            running = await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.checkpoint(
+                session_id,
+                {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: (CURRENT_CHECKPOINT_SCHEMA_VERSION),
+                },
+            )
+            await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=stage_id,
+                    logical_step_id=logical_step_id,
+                    dispatch_ordinal=0,
+                    intent=intent,
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            valid = _assistant_model_completion_publication(
+                session_id=session_id,
+                stage_id=stage_id,
+                logical_step_id=logical_step_id,
+                intent=intent,
+                completion_event_id="root-schema-completed",
+                source_transcript_cursor=0,
+                assistant_message=Message.text("assistant", "authoritative"),
+            )
+            publication = RuntimePublicationRequest(
+                publication_id=valid.publication_id,
+                kind=valid.kind,
+                intent=valid.intent,
+                mutation=RuntimePublicationMutation(
+                    operations=(
+                        *valid.mutation.operations,
+                        RuntimePublicationCheckpointOperation(
+                            key=CHECKPOINT_SCHEMA_VERSION_KEY,
+                            expected_value_digest=(
+                                runtime_publication_checkpoint_value_digest(
+                                    CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                                )
+                            ),
+                            action="set",
+                            value=CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                        ),
+                    )
+                ),
+                transcript_messages=valid.transcript_messages,
+                events=valid.events,
+                referenced_events=valid.referenced_events,
+            )
+
+            completed = await store.complete_model_completion_stage(
+                session_id,
+                stage_id=stage_id,
+                publication=publication,
+            )
+
+            assert completed.stage.state == "completed"
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
 
 
 async def _load_raw_session_operation_record(
@@ -10204,6 +10292,65 @@ def test_session_store_conformance_operation_commit_guard_is_atomic(
     asyncio.run(run())
 
 
+def test_session_store_conformance_rejects_future_checkpoint_before_operation_load(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_future_operation_load",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+
+            def transform(_session, checkpoint, _persisted_record):
+                return SessionOperationPublication(
+                    checkpoint={} if checkpoint is None else dict(checkpoint),
+                    operation_records={
+                        "completed-request": {
+                            "status": "completed",
+                            "private_detail": "must-not-be-interpreted",
+                        }
+                    },
+                )
+
+            await store.publish_session_operation(
+                created.id,
+                idempotency_key="completed-request",
+                operation_transform=transform,
+                events=[],
+            )
+            await store.checkpoint(
+                created.id,
+                {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                    "private_checkpoint_detail": "must-not-be-reported",
+                },
+            )
+
+            runtime_store = CayuApp(
+                session_store=store,
+                enable_logging=False,
+            )._runtime_session_store
+            with pytest.raises(CheckpointCompatibilityError) as caught:
+                await runtime_store.load_session_operation(
+                    created.id,
+                    "completed-request",
+                )
+
+            assert caught.value.reason == "checkpoint_schema_version_too_new"
+            assert "must-not-be-interpreted" not in str(caught.value)
+            assert "must-not-be-reported" not in str(caught.value)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_guarded_operation_publication_requires_native_commit_boundary() -> None:
     class LegacyOverrideStore(InMemorySessionStore):
         def __init__(self) -> None:
@@ -11474,6 +11621,45 @@ def test_session_store_conformance_lists_pending_interruption_cascades(session_s
     asyncio.run(run())
 
 
+def test_session_store_conformance_rejects_future_checkpoint_before_marker_projection(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_future_cascade_projection"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await store.checkpoint(
+                session_id,
+                {
+                    CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                    "pending_interruption_cascade": {
+                        "attempt_id": "must-not-be-interpreted",
+                    },
+                },
+            )
+
+            with pytest.raises(CheckpointCompatibilityError) as caught:
+                await CayuApp(
+                    session_store=store,
+                    enable_logging=False,
+                ).interruption_cascade_status(session_id)
+
+            assert caught.value.reason == "checkpoint_schema_version_too_new"
+            assert "must-not-be-interpreted" not in str(caught.value)
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_applies_query_filters(session_store_case) -> None:
     async def run() -> None:
         session_store = await _open_store(session_store_case)
@@ -11736,10 +11922,11 @@ def test_session_store_conformance_create_atomically_claims_and_admits_first_int
             assert deferred.source_messages == []
             checkpoint = await store.load_checkpoint(session.id)
             assert checkpoint == {
+                CHECKPOINT_SCHEMA_VERSION_KEY: 1,
                 "initial_transcript_pending": {
                     "version": 1,
                     "interaction_id": "interaction-atomic-create",
-                }
+                },
             }
             assert await store.materialize_deferred_interaction_input(
                 session.id,
@@ -11841,11 +12028,69 @@ def test_session_store_conformance_initial_transcript_publication_clears_authori
             )
 
             store = await _reopen_store(session_store_case, store)
-            assert await store.load_checkpoint(session.id) is None
+            assert await store.load_checkpoint(session.id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
             transcript = await store.query_transcript(
                 TranscriptQuery(session_id=session.id, limit=10)
             )
             assert [record.message for record in transcript.records] == final
+        finally:
+            await store.release_run_fence(session_id)
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_rejects_future_checkpoint_before_initial_transcript_write(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "sess_future_initial_transcript"
+        interaction_id = "interaction-future-initial-transcript"
+        source = [Message.text("user", "start")]
+        try:
+            session = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=source,
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="evt_future_initial_transcript",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                ),
+                interaction_source_messages=source,
+            )
+            checkpoint = await store.load_checkpoint(session.id)
+            assert checkpoint is not None
+            checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+            checkpoint["private_checkpoint_detail"] = "must-not-be-reported"
+            await store.checkpoint(session.id, checkpoint)
+
+            runtime_store = CayuApp(
+                session_store=store,
+                enable_logging=False,
+            )._runtime_session_store
+            with pytest.raises(CheckpointCompatibilityError) as caught:
+                await runtime_store.replace_initial_transcript_messages(
+                    session.id,
+                    source,
+                    [Message.text("system", "authoritative"), *source],
+                    interaction_id=interaction_id,
+                )
+
+            assert caught.value.reason == "checkpoint_schema_version_too_new"
+            assert "must-not-be-reported" not in str(caught.value)
+            assert (
+                await store.query_transcript(TranscriptQuery(session_id=session.id))
+            ).records == []
+            deferred = await store.load_deferred_interaction_input(session.id)
+            assert deferred is not None
+            assert deferred.interaction_id == interaction_id
+            assert await store.load_checkpoint(session.id) == checkpoint
         finally:
             await store.release_run_fence(session_id)
             await _close_store(store)

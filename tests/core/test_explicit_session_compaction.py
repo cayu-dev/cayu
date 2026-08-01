@@ -56,6 +56,7 @@ from cayu.runtime import (
     SessionStatus,
 )
 from cayu.runtime._run_limits import BudgetReservationLeaseLost
+from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.runtime.context import ContextBuildError
 from cayu.storage import SQLiteSessionStore
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -122,6 +123,10 @@ def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
         ]
         await store.append_transcript_messages(session.id, transcript)
         completed = await store.update_status(session.id, SessionStatus.COMPLETED)
+        await store.checkpoint(
+            session.id,
+            {"future_additive_field": {"preserved": True}},
+        )
         events = [
             event
             async for event in app.compact_session(
@@ -135,6 +140,8 @@ def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
         ]
         checkpoint = await store.load_checkpoint(session.id)
         assert checkpoint is not None
+        assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+        assert checkpoint["future_additive_field"] == {"preserved": True}
         assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 1
         first_request_count = len(provider.requests)
         first_prompts = [request.messages[-1].content[0].text for request in provider.requests]
@@ -2419,7 +2426,7 @@ def test_compact_session_rejects_secret_checkpoint_event_payload_before_publicat
 
     error, policy, checkpoint, durable_events = asyncio.run(run())
 
-    assert checkpoint == {}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
     assert secret not in repr(durable_events)
     assert policy.result is not None
     assert policy.result.messages == []

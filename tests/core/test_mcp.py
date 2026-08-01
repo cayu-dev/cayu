@@ -15,6 +15,7 @@ from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.mcp as mcp_module
 from cayu import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
     DEFAULT_MCP_MAX_LIST_ITEMS,
     DEFAULT_MCP_MAX_LIST_PAGES,
     AgentSpec,
@@ -511,7 +512,7 @@ def test_runtime_composes_mcp_session_secrets_before_durable_tool_checkpoint() -
 
     assert events[-1].type == EventType.SESSION_FAILED
     assert calls == 0
-    assert checkpoint is None
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
     assert secret not in serialized
 
 

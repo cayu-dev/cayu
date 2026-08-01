@@ -39,6 +39,7 @@ from cayu._validation import (
     require_durable_text,
 )
 from cayu.core import Event, Message
+from cayu.runtime.checkpoints import decode_runtime_checkpoint
 from cayu.runtime.sessions import (
     DeferredInteractionInput,
     Session,
@@ -104,7 +105,10 @@ async def export_sessions(store: SessionStore, *, stream: _TextStream) -> int:
         for session in result.sessions:
             events = await store.load_events(session.id)
             transcript_records = await _load_transcript_records(store, session.id)
-            checkpoint = await store.load_checkpoint(session.id)
+            checkpoint = decode_runtime_checkpoint(
+                await store.load_checkpoint(session.id),
+                session_id=session.id,
+            )
             deferred_interaction_input = await store.load_deferred_interaction_input(session.id)
             _write_line(
                 stream,
@@ -262,9 +266,11 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
                 raise ValueError(f"Session record is missing {required_field}.")
         if obj.keys() != _SESSION_RECORD_FIELDS:
             raise ValueError("Session record contains unsupported fields.")
-        checkpoint = obj["checkpoint"]
-        if checkpoint is not None:
-            checkpoint = copy_durable_json_object(checkpoint, "checkpoint")
+        session = Session.model_validate(obj["session"])
+        checkpoint = decode_runtime_checkpoint(
+            obj["checkpoint"],
+            session_id=session.id,
+        )
         raw_transcript_records = obj["transcript_records"]
         if type(raw_transcript_records) is not list:
             raise ValueError("Session transcript_records must be a list.")
@@ -276,7 +282,7 @@ def import_sessions(lines: Iterable[str]) -> Iterator[ImportedSession]:
             raise ValueError("Session transcript record indices must be strictly increasing.")
         transcript = [record.message for record in transcript_records]
         yield ImportedSession(
-            session=Session.model_validate(obj["session"]),
+            session=session,
             events=[Event.model_validate(event) for event in obj["events"]],
             transcript=transcript,
             transcript_records=transcript_records,

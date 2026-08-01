@@ -65,6 +65,21 @@ Custom `SandboxEgressAdapter` implementations must now explicitly classify
 `process_external_allocation`; an undeclared classification fails new creation
 before adapter preparation rather than assuming process-local behavior.
 
+### Root checkpoints now have an explicit compatibility boundary
+
+Runtime-owned checkpoint objects now carry `checkpoint_schema_version=1`.
+Versionless prerelease checkpoints remain readable and are stamped on their
+next normal write or JSONL export. Unsupported future or malformed roots fail
+before governed work with the bounded public
+`CheckpointCompatibilityError`; checkpoint contents are not rendered in the
+error. In-memory, SQLite, and Postgres restart tests cover pause/resume and
+future-version rejection. Future root-schema rollouts must deploy compatible
+readers everywhere before enabling newer writers.
+
+Custom session stores must forward the optional `checkpoint_root_guard` on
+bounded pending-action and interruption-marker reads and invoke it before
+interpreting nested checkpoint state.
+
 ### Interaction durability advances the server and storage contracts
 
 First-interaction admission, queued delivery, and lifecycle closure now retain

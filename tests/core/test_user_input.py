@@ -41,6 +41,10 @@ from cayu.runtime import (
     UserInputResponse,
 )
 from cayu.runtime import _tool_execution as tool_execution
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CheckpointCompatibilityError,
+)
 from cayu.tools.user_input import UserInputTool
 from cayu.vaults import SecretRedactor
 
@@ -373,6 +377,7 @@ def test_ask_user_pauses_the_session() -> None:
     assert interrupted.payload["interruption_type"] == "user_input_required"
     assert asyncio.run(store.load("s_pause")).status == SessionStatus.INTERRUPTED
     checkpoint = asyncio.run(store.load_checkpoint("s_pause"))
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
     assert "pending_user_input" in checkpoint
 
 
@@ -442,6 +447,106 @@ def test_resolve_user_input_injects_answer_and_continues() -> None:
     assert ask_part.content == "prod"
     assert ask_part.is_error is False
     assert "pending_user_input" not in asyncio.run(store.load_checkpoint("s_resume"))
+
+
+def test_resolve_user_input_lifts_versionless_root_checkpoint() -> None:
+    async def run() -> dict:
+        session_id = "s_resume_versionless_root_checkpoint"
+        app, store = _build(
+            [("call_1", "ask_user", {"question": "Which env?"})],
+            final_text="Deploying.",
+        )
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        versionless = await store.load_checkpoint(session_id)
+        assert versionless is not None
+        versionless.pop(CHECKPOINT_SCHEMA_VERSION_KEY, None)
+        versionless["future_additive_field"] = {"kept": True}
+        await store.checkpoint(session_id, versionless)
+
+        resume_events = await _drain(
+            app.resolve_user_input(
+                UserInputResponse(
+                    session_id=session_id,
+                    input_id=input_id,
+                    answer="prod",
+                )
+            )
+        )
+        assert resume_events[-1].type == EventType.SESSION_COMPLETED
+        checkpoint = await store.load_checkpoint(session_id)
+        assert checkpoint is not None
+        return checkpoint
+
+    checkpoint = asyncio.run(run())
+
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert checkpoint["future_additive_field"] == {"kept": True}
+    assert "pending_user_input" not in checkpoint
+
+
+def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() -> None:
+    async def run() -> tuple[CheckpointCompatibilityError, int, SessionStatus, dict]:
+        session_id = "s_future_root_checkpoint"
+        store = InMemorySessionStore()
+        provider = _ScriptedProvider(
+            [("call_1", "ask_user", {"question": "Which env?"})],
+            final_text="must not run",
+        )
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            tools=[UserInputTool()],
+        )
+        pause_events = await _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "go")],
+            ),
+        )
+        input_id = next(
+            event for event in pause_events if event.type == EventType.SESSION_AWAITING_USER_INPUT
+        ).payload["input_id"]
+        future_checkpoint = await store.load_checkpoint(session_id)
+        assert future_checkpoint is not None
+        future_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+        await store.checkpoint(session_id, future_checkpoint)
+
+        with pytest.raises(CheckpointCompatibilityError) as caught:
+            await _drain(
+                app.resolve_user_input(
+                    UserInputResponse(
+                        session_id=session_id,
+                        input_id=input_id,
+                        answer="prod",
+                    )
+                )
+            )
+        session = await store.load(session_id)
+        checkpoint_after = await store.load_checkpoint(session_id)
+        assert session is not None
+        assert checkpoint_after is not None
+        return caught.value, len(provider.requests), session.status, checkpoint_after
+
+    error, provider_calls, status, checkpoint_after = asyncio.run(run())
+
+    assert error.reason == "checkpoint_schema_version_too_new"
+    assert provider_calls == 1
+    assert status is SessionStatus.INTERRUPTED
+    assert checkpoint_after[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert "pending_user_input" in checkpoint_after
 
 
 def test_resolve_user_input_releases_run_fence_once_after_handoff() -> None:

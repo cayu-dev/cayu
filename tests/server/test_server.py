@@ -4705,8 +4705,9 @@ def test_pending_action_issue_preserves_typed_timestamp_for_short_secret() -> No
     observed_at = datetime(2026, 7, 27, tzinfo=UTC)
 
     class IssueStore(InMemorySessionStore):
-        async def query_pending_actions(self, query=None):
+        async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
             del query
+            del checkpoint_root_guard
             return PendingActionListResult(
                 issues=[
                     PendingActionIssue(
@@ -4810,7 +4811,8 @@ def test_server_pending_actions_uses_one_store_native_query() -> None:
             super().__init__()
             self.pending_query_count = 0
 
-        async def query_pending_actions(self, query=None):
+        async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
+            del checkpoint_root_guard
             self.pending_query_count += 1
             return PendingActionListResult()
 
@@ -4842,7 +4844,8 @@ def test_server_pending_actions_uses_one_store_native_query() -> None:
 
 def test_server_pending_actions_returns_413_for_oversized_page() -> None:
     class OversizedPendingActionStore(InMemorySessionStore):
-        async def query_pending_actions(self, query=None):
+        async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
+            del checkpoint_root_guard
             from cayu.runtime.sessions import PendingActionResultTooLarge
 
             raise PendingActionResultTooLarge(2 * 1024 * 1024)
@@ -4859,6 +4862,51 @@ def test_server_pending_actions_returns_413_for_oversized_page() -> None:
     assert "2097152-byte result limit" in response.json()["detail"]
 
 
+def test_server_pending_actions_reports_future_checkpoint_without_exposing_contents() -> None:
+    app = CayuApp()
+    session_id = "future_checkpoint"
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(session_id, SessionStatus.INTERRUPTED)
+        await app.session_store.checkpoint(
+            session_id,
+            {
+                "checkpoint_schema_version": 2,
+                "pending_user_input": {"secret": "must-not-escape"},
+            },
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    response = client.get("/api/pending-actions")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "checkpoint_kind": "root",
+        "observed_version": 2,
+        "reason": "checkpoint_schema_version_too_new",
+        "recovery_disposition": "cannot_migrate",
+        "resumable_in_place": False,
+        "session_id": session_id,
+        "supported_max_version": 1,
+        "supported_min_version": 1,
+    }
+    assert "must-not-escape" not in response.text
+    error_schema = client.get("/openapi.json").json()["paths"]["/api/pending-actions"]["get"][
+        "responses"
+    ]["409"]["content"]["application/json"]["schema"]
+    assert error_schema == {"$ref": "#/components/schemas/CheckpointCompatibilityErrorResponse"}
+
+
 def test_server_pending_actions_rejects_invalid_cursor_as_400() -> None:
     client = TestClient(create_server(CayuApp(), config=_LOCAL_SERVER_CONFIG))
 
@@ -4870,7 +4918,8 @@ def test_server_pending_actions_rejects_invalid_cursor_as_400() -> None:
 
 def test_server_pending_actions_does_not_misclassify_store_failure_as_400() -> None:
     class FailingPendingActionStore(InMemorySessionStore):
-        async def query_pending_actions(self, query=None):
+        async def query_pending_actions(self, query=None, *, checkpoint_root_guard=None):
+            del checkpoint_root_guard
             raise ValueError("persisted pending-action projection is corrupt")
 
     client = TestClient(

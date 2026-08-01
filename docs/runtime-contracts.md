@@ -12,6 +12,61 @@ Core message parts, tool results, events, model requests, session/task stores, c
 
 Runtime APIs copy framework objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state. Session stores return isolated transcript copies: messages loaded from a store share no mutable payload state with the stored transcript, and messages passed to append cannot rewrite stored history after the fact.
 
+## Root checkpoint schema compatibility
+
+The runtime-owned root checkpoint object carries
+`checkpoint_schema_version`. The current and minimum supported version are
+both `1`. A versionless root is the single supported legacy representation and
+is decoded as version 1; a present value that is not a positive integer is
+never treated as legacy. Runtime reads decode at one compatibility boundary
+before approval, user-input, tool-round, compaction, session-operation,
+pending-action, fork, or recovery logic interprets the payload. Every
+runtime-authored checkpoint write preserves or stamps the current root version,
+including atomic publications, transcript/checkpoint transforms, forks, and
+JSONL export/import.
+
+An unsupported future, too-old, malformed-version, or non-object root fails
+closed with `cayu.CheckpointCompatibilityError` before session status changes
+or provider, tool, effect, compactor, or policy work begins. Its safe evidence
+contains only checkpoint kind, observed and supported versions, session id,
+reason, recovery disposition, and whether the checkpoint is resumable in place;
+checkpoint contents are never included. A
+session id above the evidence bound is represented by its SHA-256 digest. A
+future version is not resumable in place: deploy a Cayu version that supports
+it, then retry the unchanged operation. Versionless roots are upgraded on the
+next normal checkpoint write or portable export, not by an eager background
+rewrite.
+
+Custom `SessionStore` implementations must accept the optional
+`checkpoint_root_guard` on bounded pending-action, interruption-marker,
+session-operation, and inspection reads. They project only the requested
+scalar root field and invoke the runtime-supplied guard inside the same read
+snapshot before parsing nested state; they do not interpret checkpoint
+versions themselves. Initial-transcript materialization likewise accepts a
+runtime-supplied `checkpoint_transform` and invokes it inside the same write
+transaction before reading or clearing checkpoint-backed authority.
+
+Root checkpoint versions are separate from three other version domains:
+
+- database DDL revisions govern tables, columns, and indexes;
+- nested payload versions such as `context_compaction.version` govern one
+  checkpoint component; and
+- versioned execution-profile adoption governs which application semantics may
+  control a later invocation.
+
+None substitutes for another. Root upcasters are pure, ordered, unit-version
+steps and preserve unknown additive fields. Version 1 remains supported until
+an explicitly documented breaking release provides an upgrade window and
+removes its frozen compatibility fixtures; a patch release must not silently
+remove a supported reader.
+
+Rolling deployments follow a reader-first rule. Before any writer can persist
+root version N+1, every process that may load that store must already run a
+reader that accepts and upcasts N+1. Only then may N+1 writers be enabled.
+Rollback remains safe only to a release whose reader supports every version
+already written. Mixed deployments must never enable a newer writer while an
+older reader can still claim or resume sessions.
+
 ## Workload-secret boundaries
 
 `SecretRedactor` defines the runtime's exact-value workload-secret contract. The

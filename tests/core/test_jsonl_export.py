@@ -20,6 +20,10 @@ from cayu.runtime import (
     SessionIdentity,
     TaskCreate,
 )
+from cayu.runtime.checkpoints import (
+    CHECKPOINT_SCHEMA_VERSION_KEY,
+    CheckpointCompatibilityError,
+)
 from cayu.storage import SQLiteSessionStore
 from cayu.storage.jsonl_export import (
     ImportedSession,
@@ -99,7 +103,10 @@ def test_export_sessions_writes_one_line_per_session_with_nested_state():
         assert rich["events"][0]["type"] == EventType.SESSION_STARTED.value
         assert len(rich["transcript_records"]) == 1
         assert rich["transcript_records"][0]["message"]["role"] == "assistant"
-        assert rich["checkpoint"] == {"step": 3}
+        assert rich["checkpoint"] == {
+            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            "step": 3,
+        }
 
         bare = by_id["sess_bare"]
         assert bare["events"] == []
@@ -422,7 +429,10 @@ def test_import_sessions_round_trips_export():
         assert rich.session == await store.load("sess_rich")
         assert rich.events == await store.load_events("sess_rich")
         assert rich.transcript == await store.load_transcript("sess_rich")
-        assert rich.checkpoint == {"step": 3}
+        assert rich.checkpoint == {
+            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            "step": 3,
+        }
         assert rich.deferred_interaction_input is None
 
         bare = by_id["sess_bare"]
@@ -432,6 +442,46 @@ def test_import_sessions_round_trips_export():
         assert bare.deferred_interaction_input is None
 
     asyncio.run(run())
+
+
+def test_session_export_and_import_reject_future_root_checkpoint_versions() -> None:
+    async def build_export() -> str:
+        store = InMemorySessionStore()
+        await store.create(
+            RunRequest(
+                agent_name="builder",
+                session_id="sess_future_export",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await store.checkpoint(
+            "sess_future_export",
+            {
+                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                "private": "must-not-appear",
+            },
+        )
+        stream = io.StringIO()
+        with pytest.raises(CheckpointCompatibilityError) as caught:
+            await export_sessions(store, stream=stream)
+        assert caught.value.observed_version == 2
+        assert "must-not-appear" not in str(caught.value)
+        assert stream.getvalue() == ""
+
+        await store.checkpoint("sess_future_export", {"portable": True})
+        await export_sessions(store, stream=stream)
+        return stream.getvalue()
+
+    record = _lines(io.StringIO(asyncio.run(build_export())))[0]
+    record["checkpoint"][CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+    record["checkpoint"]["private"] = "must-not-appear"
+
+    with pytest.raises(CheckpointCompatibilityError) as caught:
+        list(import_sessions([json.dumps(record)]))
+
+    assert caught.value.observed_version == 2
+    assert "must-not-appear" not in str(caught.value)
 
 
 @pytest.mark.parametrize("missing_field", ["transcript_records", "deferred_interaction_input"])

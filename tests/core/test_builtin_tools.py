@@ -61,6 +61,7 @@ from cayu.runtime._model_completion_publication import (
     model_step_publication_from_checkpoint,
 )
 from cayu.runtime._tool_execution import run_tool
+from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.tools import ExecCommandTool
 from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import InvocationArtifactStoreHandle, InvocationWorkspaceHandle
@@ -3229,7 +3230,11 @@ def test_exec_command_policy_refusal_emits_one_canonical_blocked_event(
         assert expected_reason in tool_result.content
     checkpoint = asyncio.run(app.session_store.load_checkpoint(blocked[0].session_id))
     assert checkpoint is not None
-    assert set(checkpoint) == {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
+    assert set(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY,
+        LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    }
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
     assert model_step_publication_from_checkpoint(checkpoint) is not None
 
 

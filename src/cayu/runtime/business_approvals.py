@@ -337,7 +337,7 @@ async def resolve_business_approval(
     # Load the persisted pending approval and gate against ITS routing — the
     # tier gate is adapter-only (the primitive does not know tiers), so its
     # input must come from trusted checkpoint state, never from the caller.
-    checkpoint = await app.session_store.load_checkpoint(session_id)
+    checkpoint = await app._runtime_session_store.load_checkpoint(session_id)
     pending = app._pending_tool_approval_from_checkpoint(
         checkpoint,
         consume_on_rejection=True,

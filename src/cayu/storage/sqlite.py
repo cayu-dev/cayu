@@ -29,6 +29,7 @@ from cayu.runtime.sessions import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
     _TOOL_ROUND_LIFECYCLE_EVENT_TYPES,
+    CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS,
     DELETE_BLOCKED_SESSION_STATUSES,
     FORK_TRANSCRIPT_VALIDATION_ERROR,
     INHERIT_INTERACTION,
@@ -40,6 +41,7 @@ from cayu.runtime.sessions import (
     SESSION_INSPECTION_LABEL_LIMIT,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     BudgetReservationIdentityConflict,
+    CheckpointRootFieldGuard,
     CheckpointTransform,
     DeferredInteractionInput,
     EnqueueSessionMessageRequest,
@@ -179,6 +181,7 @@ from cayu.runtime.sessions import (
     _validate_tool_round_checkpoint_mutation,
     _validate_tool_round_publication,
     build_session_topology_result,
+    checkpoint_root_field_projection_from_storage,
     copy_enqueue_session_message_request,
     copy_event_query,
     copy_run_request,
@@ -562,10 +565,30 @@ def _load_checkpoint_state(
 def _load_interruption_cascade_marker(
     connection: sqlite3.Connection,
     session_id: str,
+    checkpoint_root_guard: CheckpointRootFieldGuard | None,
 ) -> dict[str, Any] | None:
+    checkpoint_root_key = (
+        "__cayu_no_checkpoint_root_guard__"
+        if checkpoint_root_guard is None
+        else checkpoint_root_guard.key
+    )
+    checkpoint_root_path = f"$.{checkpoint_root_key}"
     row = connection.execute(
-        """
+        f"""
         SELECT
+            json_type(state_json, '{checkpoint_root_path}')
+                AS checkpoint_root_field_type,
+            CASE
+                WHEN json_type(state_json, '{checkpoint_root_path}') = 'integer'
+                THEN substr(
+                    CAST(json_extract(
+                        state_json,
+                        '{checkpoint_root_path}'
+                    ) AS TEXT),
+                    1,
+                    {CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS + 1}
+                )
+            END AS checkpoint_root_field_scalar,
             json_type(state_json, '$.pending_interruption_cascade') AS marker_type,
             json_type(state_json, '$.pending_interruption_cascade.attempt_id') AS attempt_id_type,
             substr(
@@ -643,6 +666,17 @@ def _load_interruption_cascade_marker(
         if value in {"true", "false"}:
             return "boolean"
         return value
+
+    checkpoint_root_field_type = row["checkpoint_root_field_type"]
+    scalar_text = row["checkpoint_root_field_scalar"]
+    if checkpoint_root_guard is not None:
+        checkpoint_root_guard.validate(
+            session_id,
+            checkpoint_root_field_projection_from_storage(
+                json_type=checkpoint_root_field_type,
+                scalar_text=scalar_text,
+            ),
+        )
 
     field_names = (
         "attempt_id",
@@ -3305,6 +3339,8 @@ class SQLiteSessionStore(SessionStore):
         self,
         session_id: str,
         idempotency_key: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         idempotency_key = _reject_reserved_runtime_publication_key(
@@ -3312,15 +3348,59 @@ class SQLiteSessionStore(SessionStore):
             "idempotency_key",
         )
 
+        checkpoint_root_key = (
+            "__cayu_no_checkpoint_root_guard__"
+            if checkpoint_root_guard is None
+            else checkpoint_root_guard.key
+        )
+        checkpoint_root_path = f"$.{checkpoint_root_key}"
+
         def query(connection: sqlite3.Connection) -> dict[str, Any] | None:
-            if not _session_exists(connection, session_id):
-                raise KeyError(f"Session not found: {session_id}")
             row = connection.execute(
-                "SELECT record_json FROM cayu_session_operations "
-                "WHERE session_id = ? AND idempotency_key = ?",
-                (session_id, idempotency_key),
+                f"""
+                SELECT
+                    cayu_session_operations.record_json,
+                    json_type(
+                        cayu_checkpoints.state_json,
+                        '{checkpoint_root_path}'
+                    ) AS checkpoint_root_field_type,
+                    CASE
+                        WHEN json_type(
+                            cayu_checkpoints.state_json,
+                            '{checkpoint_root_path}'
+                        ) = 'integer'
+                        THEN substr(
+                            CAST(json_extract(
+                                cayu_checkpoints.state_json,
+                                '{checkpoint_root_path}'
+                            ) AS TEXT),
+                            1,
+                            {CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS + 1}
+                        )
+                    END AS checkpoint_root_field_scalar
+                FROM cayu_sessions
+                LEFT JOIN cayu_session_operations
+                    ON cayu_session_operations.session_id = cayu_sessions.id
+                    AND cayu_session_operations.idempotency_key = ?
+                LEFT JOIN cayu_checkpoints
+                    ON cayu_checkpoints.session_id = cayu_sessions.id
+                WHERE cayu_sessions.id = ?
+                """,
+                (idempotency_key, session_id),
             ).fetchone()
-            return None if row is None else json.loads(row["record_json"])
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            scalar_text = row["checkpoint_root_field_scalar"]
+            if checkpoint_root_guard is not None:
+                checkpoint_root_guard.validate(
+                    session_id,
+                    checkpoint_root_field_projection_from_storage(
+                        json_type=row["checkpoint_root_field_type"],
+                        scalar_text=scalar_text,
+                    ),
+                )
+            record_json = row["record_json"]
+            return None if record_json is None else json.loads(record_json)
 
         return await self._run_read(query)
 
@@ -5510,6 +5590,8 @@ class SQLiteSessionStore(SessionStore):
     async def query_pending_actions(
         self,
         query: PendingActionQuery | None = None,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> PendingActionListResult:
         from cayu.runtime.pending_actions import (
             pending_action_from_records,
@@ -5605,11 +5687,35 @@ class SQLiteSessionStore(SessionStore):
                 SELECT CAST(value AS TEXT) FROM json_each(?)
             )
         """
-        checkpoint_preflight_sql = """
+        checkpoint_root_key = (
+            "__cayu_no_checkpoint_root_guard__"
+            if checkpoint_root_guard is None
+            else checkpoint_root_guard.key
+        )
+        checkpoint_root_path = f"$.{checkpoint_root_key}"
+        checkpoint_preflight_sql = f"""
             SELECT
                 cayu_checkpoints.session_id,
                 cayu_checkpoints.pending_action_source_bytes AS pending_state_bytes,
-                cayu_checkpoints.pending_action_tool_call_count AS pending_tool_call_count
+                cayu_checkpoints.pending_action_tool_call_count AS pending_tool_call_count,
+                json_type(
+                    cayu_checkpoints.state_json,
+                    '{checkpoint_root_path}'
+                ) AS checkpoint_root_field_type,
+                CASE
+                    WHEN json_type(
+                        cayu_checkpoints.state_json,
+                        '{checkpoint_root_path}'
+                    ) = 'integer'
+                    THEN substr(
+                        CAST(json_extract(
+                            cayu_checkpoints.state_json,
+                            '{checkpoint_root_path}'
+                        ) AS TEXT),
+                        1,
+                        {CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS + 1}
+                    )
+                END AS checkpoint_root_field_scalar
             FROM cayu_checkpoints
             WHERE cayu_checkpoints.session_id IN (
                 SELECT CAST(value AS TEXT) FROM json_each(?)
@@ -6124,6 +6230,16 @@ class SQLiteSessionStore(SessionStore):
                         checkpoint_preflight_sql,
                         (selected_ids_json,),
                     ).fetchall():
+                        version_type = row["checkpoint_root_field_type"]
+                        scalar_text = row["checkpoint_root_field_scalar"]
+                        if checkpoint_root_guard is not None:
+                            checkpoint_root_guard.validate(
+                                row["session_id"],
+                                checkpoint_root_field_projection_from_storage(
+                                    json_type=version_type,
+                                    scalar_text=scalar_text,
+                                ),
+                            )
                         if row["pending_state_bytes"] is not None:
                             checkpoint_preflight_by_session_id[row["session_id"]] = (
                                 int(row["pending_state_bytes"]),
@@ -6489,6 +6605,7 @@ class SQLiteSessionStore(SessionStore):
         replacement_messages: list[Message],
         *,
         interaction_id: InteractionAttribution = INHERIT_INTERACTION,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         interaction_id = resolve_interaction_attribution(session_id, interaction_id)
@@ -6528,8 +6645,19 @@ class SQLiteSessionStore(SessionStore):
                         "Initial transcript must preserve the admitted source suffix."
                     )
                 prefix_count = len(replacement) - len(expected)
+                current_checkpoint = self._load_checkpoint_unlocked(session_id)
+                if checkpoint_transform is not None:
+                    transformed = checkpoint_transform(
+                        session,
+                        current_checkpoint,
+                    )
+                    if transformed is not None:
+                        current_checkpoint = copy_durable_json_object(
+                            transformed,
+                            "checkpoint",
+                        )
                 checkpoint = _checkpoint_after_initial_transcript_publication(
-                    self._load_checkpoint_unlocked(session_id),
+                    current_checkpoint,
                     interaction_id=interaction_id,
                 )
                 connection.executemany(
@@ -6922,10 +7050,16 @@ class SQLiteSessionStore(SessionStore):
     async def load_interruption_cascade_marker(
         self,
         session_id: str,
+        *,
+        checkpoint_root_guard: CheckpointRootFieldGuard | None = None,
     ) -> dict[str, Any] | None:
         session_id = require_clean_nonblank(session_id, "session_id")
         return await self._run_read(
-            lambda connection: _load_interruption_cascade_marker(connection, session_id)
+            lambda connection: _load_interruption_cascade_marker(
+                connection,
+                session_id,
+                checkpoint_root_guard,
+            )
         )
 
     def _load_checkpoint_unlocked(self, session_id: str) -> dict[str, Any] | None:

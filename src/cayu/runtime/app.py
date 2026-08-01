@@ -60,6 +60,7 @@ from cayu.providers import (
 )
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime._diagnostics import ExceptionDiagnostic, exception_diagnostic
 from cayu.runtime._environment_lifecycle import (
     DEFAULT_MAX_ENVIRONMENT_LIFECYCLE_OWNERS,
@@ -489,6 +490,7 @@ class CayuApp:
             "max_environment_lifecycle_owners",
         )
         self.session_store = session_store if session_store is not None else InMemorySessionStore()
+        self._runtime_session_store = runtime_checkpoint_session_store(self.session_store)
         self.task_store = task_store
         self.knowledge_store = knowledge_store
         self.knowledge_review_namespace = (
@@ -519,20 +521,20 @@ class CayuApp:
         self._context_counting = context_counting_config
         self._event_sinks = tuple(sinks)
         self._event_writer = RuntimeEventWriter(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             budget_store=self.budget_store,
             event_sinks=self._event_sinks,
             secret_redactor=self._secret_redactor,
         )
         self._environment_lifecycle = EnvironmentLifecycle(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             event_writer=self._event_writer,
             checkpoint_transform=_replace_checkpoint_preserving_runtime_state,
             secret_redactor=self._secret_redactor,
             max_environment_lifecycle_owners=self._max_environment_lifecycle_owners,
         )
         self._run_limit_controller = RunLimitController(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             budget_store=self.budget_store,
             budget_ledger=self.budget_ledger,
             event_writer=self._event_writer,
@@ -545,10 +547,10 @@ class CayuApp:
         self._default_provider_name: str | None = None
         self._default_environment_name: str | None = None
         self._session_control = SessionControl[SessionUsageTracker](
-            session_store=self.session_store
+            session_store=self._runtime_session_store
         )
         self._model_step_executor = ModelStepExecutor(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             event_writer=self._event_writer,
             session_control=self._session_control,
             run_limit_controller=self._run_limit_controller,
@@ -567,7 +569,7 @@ class CayuApp:
             ),
         )
         self._tool_round_executor = ToolRoundExecutor(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             event_writer=self._event_writer,
             session_control=self._session_control,
             hook_runtime=self,
@@ -582,7 +584,7 @@ class CayuApp:
             close_interrupted_round=self._close_tool_round_after_interrupt,
         )
         self._recovery_coordinator = RecoveryCoordinator(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             task_store=self.task_store,
             event_writer=self._event_writer,
             session_control=self._session_control,
@@ -608,7 +610,7 @@ class CayuApp:
             resume_interaction=self._resume_recovery_interaction,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             event_writer=self._event_writer,
             clock=self._clock,
             interrupt_session=self.interrupt_session,
@@ -630,7 +632,7 @@ class CayuApp:
         )
 
         self._session_engine = SessionEngine(
-            session_store=self.session_store,
+            session_store=self._runtime_session_store,
             task_store=self.task_store,
             get_budget_policy=lambda: self.budget_policy,
             event_writer=self._event_writer,

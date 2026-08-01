@@ -1768,6 +1768,51 @@ export type CausalBudgetUsageSummary = {
 };
 
 /**
+ * CheckpointCompatibilityErrorResponse
+ */
+export type CheckpointCompatibilityErrorResponse = {
+    detail: CheckpointCompatibilityEvidence;
+};
+
+/**
+ * CheckpointCompatibilityEvidence
+ */
+export type CheckpointCompatibilityEvidence = {
+    /**
+     * Checkpoint Kind
+     */
+    checkpoint_kind: 'root';
+    /**
+     * Observed Version
+     */
+    observed_version: number | null;
+    /**
+     * Reason
+     */
+    reason: 'invalid_root_checkpoint' | 'invalid_checkpoint_schema_version' | 'checkpoint_schema_version_too_new' | 'checkpoint_schema_version_too_old';
+    /**
+     * Recovery Disposition
+     */
+    recovery_disposition: 'cannot_migrate';
+    /**
+     * Resumable In Place
+     */
+    resumable_in_place: false;
+    /**
+     * Session Id
+     */
+    session_id: string;
+    /**
+     * Supported Max Version
+     */
+    supported_max_version: number;
+    /**
+     * Supported Min Version
+     */
+    supported_min_version: number;
+};
+
+/**
  * ClientGenerationContract
  */
 export type ClientGenerationContract = {
@@ -5204,6 +5249,10 @@ export type ListPendingActionsApiPendingActionsGetData = {
 };
 
 export type ListPendingActionsApiPendingActionsGetErrors = {
+    /**
+     * A checkpoint requires a different Cayu runtime version.
+     */
+    409: CheckpointCompatibilityErrorResponse;
     /**
      * The pending-action page exceeds the bounded response size.
      */

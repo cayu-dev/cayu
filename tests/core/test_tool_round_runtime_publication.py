@@ -33,6 +33,7 @@ from cayu.runtime._model_completion_publication import (
     model_step_publication_from_checkpoint,
 )
 from cayu.runtime._tool_round_executor import InterruptedToolRoundRequest
+from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.runtime.context import ContextPolicy, ContextRequest, validate_context_messages
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -89,7 +90,11 @@ def _assert_only_model_step_publication_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> None:
     assert checkpoint is not None
-    assert set(checkpoint) == {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
+    assert set(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY,
+        LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    }
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
     assert model_step_publication_from_checkpoint(checkpoint) is not None
 
 

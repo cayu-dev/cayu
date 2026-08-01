@@ -216,6 +216,7 @@ from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation_group,
 )
 from cayu.runtime._session_engine import _require_native_structured_output_support
+from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.runtime.context import (
     ContextBuildError,
     ContextBuildResult,
@@ -1369,8 +1370,10 @@ def assert_only_model_step_publication_checkpoint(
 ) -> None:
     assert checkpoint is not None
     assert set(checkpoint) == {
-        model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY
+        CHECKPOINT_SCHEMA_VERSION_KEY,
+        model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
     assert (
         model_completion_publication_module.model_step_publication_from_checkpoint(checkpoint)
         is not None
@@ -2514,12 +2517,13 @@ def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoi
     }
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_fail_closed_after_compaction"))
     assert checkpoint == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "context_compaction": {
             "version": 2,
             "summary": "old|old answer",
             "compacted_transcript_cursor": 2,
             "metadata": {"request_count": 1},
-        }
+        },
     }
     assert provider.requests == []
 
@@ -2597,12 +2601,13 @@ def test_knowledge_injection_policy_composes_with_checkpoint_compaction() -> Non
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_injection_compaction"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "context_compaction": {
             "version": 2,
             "summary": "old|old answer",
             "compacted_transcript_cursor": 2,
             "metadata": {"request_count": 1},
-        }
+        },
     }
 
 
@@ -13991,6 +13996,15 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
         )
     )
 
+    async def make_source_checkpoint_versionless() -> None:
+        checkpoint = await store.load_checkpoint("sess_fork_source")
+        assert checkpoint is not None
+        checkpoint.pop(CHECKPOINT_SCHEMA_VERSION_KEY)
+        checkpoint["future_additive_field"] = {"kept": True}
+        await store.checkpoint("sess_fork_source", checkpoint)
+
+    asyncio.run(make_source_checkpoint_versionless())
+
     fork_events = asyncio.run(
         collect_fork_events(
             app,
@@ -14015,6 +14029,10 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     assert fork.model == source.model == "fake-model"
     assert fork.labels == source.labels == {"owner": "org_123", "project": "feature_a"}
     assert fork.metadata == {"purpose": "alternate path"}
+    fork_checkpoint = asyncio.run(store.load_checkpoint("sess_fork_child"))
+    assert fork_checkpoint is not None
+    assert fork_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert fork_checkpoint["future_additive_field"] == {"kept": True}
 
     fork_transcript = asyncio.run(store.load_transcript("sess_fork_child"))
     source_transcript = asyncio.run(store.load_transcript("sess_fork_source"))
@@ -14137,7 +14155,10 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
             assert after_takeover.run_epoch > stale_epoch
             assert after_takeover.metadata == {"stale_owner_write_before_atomic_takeover": True}
             source_checkpoint = await store.load_checkpoint(session_id)
-            assert source_checkpoint == {"custom_state": {"value": 1}}
+            assert source_checkpoint == {
+                CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+                "custom_state": {"value": 1},
+            }
         finally:
             store.allow_takeover.set()
             release_stale_owner.set()
@@ -14152,7 +14173,14 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
             ),
         )
         child_checkpoint = await store.load_checkpoint(child_id)
-        expected_checkpoint = {"custom_state": {"value": 1}} if copy_checkpoint else None
+        expected_checkpoint = (
+            {
+                CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+                "custom_state": {"value": 1},
+            }
+            if copy_checkpoint
+            else None
+        )
         assert child_checkpoint == expected_checkpoint
 
     asyncio.run(scenario())
@@ -14222,7 +14250,10 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
         assert after_failure is not None
         assert after_failure.run_epoch > completed.run_epoch
         assert await store.load(child_id) is None
-        assert await store.load_checkpoint(session_id) == {"custom_state": {"value": 1}}
+        assert await store.load_checkpoint(session_id) == {
+            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            "custom_state": {"value": 1},
+        }
 
         retry_events = await collect_fork_events(
             app,
@@ -14233,7 +14264,10 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
             ),
         )
         assert [event.type for event in retry_events] == [EventType.SESSION_FORKED]
-        assert await store.load_checkpoint(child_id) == {"custom_state": {"value": 1}}
+        assert await store.load_checkpoint(child_id) == {
+            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            "custom_state": {"value": 1},
+        }
 
     asyncio.run(scenario())
 
@@ -15888,7 +15922,7 @@ def test_background_interruption_reconciles_child_already_interrupting_elsewhere
     assert all(
         event.type != EventType.SESSION_INTERRUPTION_CASCADE_FAILED for event in parent_events
     )
-    assert parent_checkpoint == {}
+    assert parent_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
 
 def test_background_interruption_cascade_isolates_child_completion_race(monkeypatch):
@@ -16337,7 +16371,10 @@ def test_pending_interruption_startup_bounds_healthy_external_claim_recovery():
             timeout=0.2,
         )
         active_tasks = len(app._background_interruption_coordinator._tasks)
-        drained = await app.drain_background_interruptions(timeout_s=0.01)
+        # Each candidate now performs a bounded root-version guard before
+        # projecting the marker. Keep the drain bounded without making
+        # scheduler timing, rather than concurrency, the assertion.
+        drained = await app.drain_background_interruptions(timeout_s=0.1)
         return root_count, scheduled, active_tasks, drained
 
     root_count, scheduled, active_tasks, drained = asyncio.run(run())
@@ -17280,7 +17317,7 @@ def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeyp
     assert first_event.type == EventType.SESSION_INTERRUPTED
     assert "pending_interruption_cascade" in checkpoint_before_terminal
     assert tasks_before_terminal == 0
-    assert final_checkpoint == {}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
 
 def test_pending_interruption_cascade_resumes_from_durable_checkpoint():
@@ -17799,7 +17836,7 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
     assert stale_completion == (False, False)
     assert failed_generation_completion == (False, False)
     assert current_completion == (True, True)
-    assert checkpoint == {}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
 
 def test_interruption_cascade_completion_publish_failure_keeps_retryable_marker(monkeypatch):
@@ -20911,7 +20948,9 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
     session = asyncio.run(store.load("sess_broken_transcript"))
     assert session is not None
     assert session.status == SessionStatus.FAILED
-    assert asyncio.run(store.load_checkpoint("sess_broken_transcript")) == {}
+    assert asyncio.run(store.load_checkpoint("sess_broken_transcript")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+    }
 
 
 def test_cayu_app_resume_uses_context_policy_and_preserves_full_transcript():
@@ -26918,7 +26957,7 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
             str(UUID(terminal_records[-1].event.payload["session_run_operation_id"]))
             == terminal_records[-1].event.payload["session_run_operation_id"]
         )
-        assert await store.load_checkpoint(session_id) == {}
+        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
     asyncio.run(scenario())
 
@@ -27174,7 +27213,7 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
         )
         checkpoint = await store.load_checkpoint(session_id)
         assert repaired.events[0].payload == pending_payload
-        assert checkpoint == {}
+        assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
         resumed = await collect_resume_events(
             app,
@@ -27253,7 +27292,7 @@ def test_cayu_app_recover_incomplete_session_finalizes_pending_interrupt():
 
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
-    assert checkpoint == {}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
     assert result.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
     assert interruption_payload_without_request_id(result.events[0].payload) == {
@@ -36284,13 +36323,14 @@ def test_usage_triggered_context_policy_stays_triggered_after_previous_actual_us
     }
     checkpoint = asyncio.run(app.session_store.load_checkpoint("usage_triggered_policy"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "usage_triggered_context": {
             "version": 1,
             "min_input_tokens": 50,
             "min_total_tokens": None,
             "last_input_tokens": 100,
             "last_total_tokens": 104,
-        }
+        },
     }
 
 
@@ -36380,6 +36420,7 @@ def test_usage_triggered_context_policy_preserves_marker_with_checkpoint_policy(
         app.session_store.load_checkpoint("usage_triggered_policy_checkpoint_merge")
     )
     assert checkpoint_without_model_step_publication(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "triggered_policy": {"calls": 2},
         "usage_triggered_context": {
             "version": 1,
@@ -36777,12 +36818,13 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
         app.session_store.load_checkpoint("context_overflow_compaction_recovery")
     )
     assert checkpoint_without_model_step_publication(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "context_compaction": {
             "version": 2,
             "summary": "old request",
             "compacted_transcript_cursor": 1,
             "metadata": {"request_count": 1},
-        }
+        },
     }
 
 
@@ -40215,7 +40257,7 @@ def test_automatic_compaction_internal_persistence_cancellation_is_not_caller_ca
             "Context outcome persistence was cancelled without caller cancellation."
         )
         assert task.exception() is None
-        assert await store.load_checkpoint(session_id) is None
+        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
     asyncio.run(run())
 
@@ -41987,12 +42029,13 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
     ]
     checkpoint = asyncio.run(store.load_checkpoint("sess_compaction"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "context_compaction": {
             "version": 2,
             "summary": "old one|old answer one|old two|old answer two",
             "compacted_transcript_cursor": 5,
             "metadata": {"request_count": 1},
-        }
+        },
     }
 
 
@@ -42114,6 +42157,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_model_compaction"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
         "context_compaction": {
             "version": 2,
             "summary": "model summary",
@@ -42130,7 +42174,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
                     "model_attempt_id": events[2].payload["model_attempt_id"],
                 },
             },
-        }
+        },
     }
 
 
@@ -45166,7 +45210,9 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             "error_type": expected_error_type,
         }
     assert runtime_provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary")) is None
+    assert asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+    }
 
     usage = asyncio.run(app.get_session_usage("sess_invalid_compaction_summary"))
     assert usage.model_steps == 1
@@ -45287,7 +45333,9 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
     assert events[4].payload["token_usage"]["total_tokens"] == 86
     assert events[5].payload["error"] == "Compaction model must not call tools."
     assert runtime_provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_rejected_compaction_tool_call")) is None
+    assert asyncio.run(store.load_checkpoint("sess_rejected_compaction_tool_call")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+    }
 
     usage = asyncio.run(app.get_session_usage("sess_rejected_compaction_tool_call"))
     assert usage.model_steps == 1
@@ -45403,7 +45451,9 @@ def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
     assert events[4].payload["step_count"] == 1
     assert events[5].payload["error"] == expected_error
     assert runtime_provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_unfinished_compaction")) is None
+    assert asyncio.run(store.load_checkpoint("sess_unfinished_compaction")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+    }
 
     usage = asyncio.run(app.get_session_usage("sess_unfinished_compaction"))
     assert usage.model_steps == 1
@@ -45601,7 +45651,7 @@ def test_automatic_compaction_real_cancellation_records_uncertain_dispatch() -> 
         assert completions[0].payload["compaction_outcome"] == "cancelled"
         assert completions[0].payload["usage_unavailable_reason"]
         assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events) == 1
-        assert await store.load_checkpoint(session_id) is None
+        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
         usage = await app.get_session_usage(session_id)
         assert usage.model_steps == 1
         assert usage.usage.total_tokens == 0
@@ -45784,7 +45834,9 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
         "error_type": "RuntimeError",
     }
     assert provider.requests == []
-    assert asyncio.run(store.load_checkpoint("sess_compaction_failed")) is None
+    assert asyncio.run(store.load_checkpoint("sess_compaction_failed")) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+    }
 
 
 def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
@@ -50935,7 +50987,7 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
     assert [event for event in stored_events if event.type == EventType.SESSION_INTERRUPTED] == [
         first_events[0]
     ]
-    assert checkpoint == {}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
 
 def test_new_interruption_does_not_reuse_terminal_event_from_before_resume():
@@ -51492,7 +51544,7 @@ def test_interrupt_session_clears_payload_before_yielding_direct_terminal_event(
     assert first_event.type == EventType.SESSION_INTERRUPTED
     assert first_event.payload["reason"] == "operator stop"
     assert "pending_session_interrupt" not in checkpoint_after_event
-    assert final_checkpoint == {}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
 
 def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
@@ -51556,7 +51608,7 @@ def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
     assert run_event.id == interrupt_events[0].id
     assert run_event.payload["reason"] == "operator stop"
     assert "pending_session_interrupt" not in checkpoint_after_event
-    assert final_checkpoint == {}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
 
 
 def test_interrupt_session_persists_payload_atomically_with_interrupting_status():

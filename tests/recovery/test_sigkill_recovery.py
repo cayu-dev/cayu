@@ -10,7 +10,7 @@ import pytest
 from worker_harness import BackendConfig, RecoveryHarness
 
 from cayu.core import EventType, ToolResultPart
-from cayu.runtime import SessionStatus, TaskStatus
+from cayu.runtime import CHECKPOINT_SCHEMA_VERSION_KEY, SessionStatus, TaskStatus
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     model_step_publication_from_checkpoint,
@@ -26,7 +26,11 @@ pytestmark = [
 
 
 def _assert_only_model_step_publication(checkpoint: dict) -> None:
-    assert set(checkpoint) == {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
+    assert set(checkpoint) == {
+        CHECKPOINT_SCHEMA_VERSION_KEY,
+        LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
+    }
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
     publication = model_step_publication_from_checkpoint(checkpoint)
     assert publication is not None
     assert publication.assistant_message_published is True
