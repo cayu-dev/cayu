@@ -3102,10 +3102,17 @@ class ToolRoundRun:
         current_cancellation_cause: BaseException | None = None
         parent_task = asyncio.current_task()
         cancellation_baseline = 0 if parent_task is None else parent_task.cancelling()
-        try:
+
+        async def execute_parallel_calls() -> None:
+            # Keep TaskGroup's internal parent cancellation on a dedicated task.
+            # Python 3.11 and 3.12 can leave that bookkeeping visible after a
+            # child failure, which would otherwise look like caller cancellation.
             async with asyncio.TaskGroup() as task_group:
                 for index, tool_call in enumerate(tool_calls):
                     task_group.create_task(execute_call(index, tool_call))
+
+        try:
+            await asyncio.create_task(execute_parallel_calls())
         except BaseExceptionGroup as exc_group:
             flush_completed_outcomes()
             child_runner_failures: list[BaseException] = []
