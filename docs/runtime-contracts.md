@@ -2990,7 +2990,40 @@ deny path even when its scheme is missing or unrecognized; it cannot fall
 through to a credentialless destination. Header scheme selection is therefore
 part of the credential grant, not a caller-owned rewrite hint.
 
-A custom `Tool` uses those same services through `ctx`: `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the environment's runner, while `ctx.workspace.read_bytes(path, offset=..., max_bytes=...)` and `ctx.artifact_store.read_bytes(...)` return invocation-safe byte projections. Runtime-created contexts redact complete source windows before the requested bound and fail closed if the invocation's secret registry changes repeatedly during the read. `source_bytes_read` records raw-source cursor progress even when redaction changes `len(content)`; `redaction_truncated` reports bytes withheld by the safety projection separately from raw `truncated`. Complete offset-zero workspace snapshots carry an opaque source `revision` and diagnostic `sha256`. Use `create_bytes`, `replace_bytes(expected_revision=...)`, or `delete_if_revision(expected_revision=...)` for model-facing mutations; a separate read followed by unconditional `write_bytes` or `delete` is not a safe precondition. Guard against a missing service (`if ctx.runner is None: ...`), since not every environment configures one. See [`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for the framework's own reference.
+A native Python `Tool.run()` executes inside the trusted Cayu application
+process. Registering a native tool therefore grants its implementation the same
+host-process access as other application code. `ToolPolicy` authorizes the
+model-requested call and arguments; it does not sandbox the Python
+implementation. Applications must not install model-authored or otherwise
+untrusted code as native tools. Put that code behind an admitted runner, a
+separately governed MCP server, or another external execution boundary instead.
+Native tools that need credentials should resolve explicit `SecretRef` values
+through `ctx.proxy` or `ctx.vault`, prefer the proxy when request authorization
+is required, and return only safe results. Arbitrary values read directly from
+the host process environment do not automatically enter Cayu's workload-secret
+tracking or redaction boundary.
+
+A custom `Tool` uses environment services through `ctx`:
+`await ctx.runner.exec(ExecCommand.process(...))` runs a command in the
+environment's runner, while `ctx.workspace.read_bytes(path, offset=...,
+max_bytes=...)` and `ctx.artifact_store.read_bytes(...)` return invocation-safe
+byte projections. Calling the runner does not move the surrounding `Tool.run()`
+implementation into that runner; only the requested runner operation crosses
+the execution boundary. Runtime-created contexts redact complete source windows
+before the requested bound and fail closed if the invocation's secret registry
+changes repeatedly during the read. `source_bytes_read` records raw-source
+cursor progress even when redaction changes `len(content)`;
+`redaction_truncated` reports bytes withheld by the safety projection separately
+from raw `truncated`. Complete offset-zero workspace snapshots carry an opaque
+source `revision` and diagnostic `sha256`. Use `create_bytes`,
+`replace_bytes(expected_revision=...)`, or
+`delete_if_revision(expected_revision=...)` for model-facing mutations; a
+separate read followed by unconditional `write_bytes` or `delete` is not a safe
+precondition. Guard against a missing service (`if ctx.runner is None: ...`),
+since not every environment configures one. See
+[`examples/custom_runner_tool.py`](../examples/custom_runner_tool.py) for a
+worked tool, and `src/cayu/tools/commands.py` (`ExecCommandTool`) for Cayu's
+built-in reference.
 
 Conditional mutations compare the expected revision and mutate as one backend
 operation. Built-in backends serialize conforming Cayu clients by backend
@@ -4374,7 +4407,7 @@ The first MCP implementation supports stdio servers:
   action. Without a configured policy, manifest checks remain audit-only.
 - `McpToolAdapter` exposes one MCP tool as a normal Cayu `Tool`, so tool policies,
   approvals, events, transcript persistence, and provider adapters work through the
-  same path as framework-native tools. Exact boolean MCP annotations map into tool
+  same path as native Python tools. Exact boolean MCP annotations map into tool
   execution metadata: `readOnlyHint=true` makes the adapter `parallel_safe=True` and
   `effect="none"`, `idempotentHint=true` makes `effect="idempotent"` when the tool is
   not read-only, and missing/spoofed values stay `parallel_safe=False` with

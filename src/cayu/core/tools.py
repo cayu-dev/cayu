@@ -129,7 +129,7 @@ class _ToolSpecInput(BaseModel):
 
 
 class ToolSpec(BaseModel):
-    """Immutable public declaration for a framework-native tool.
+    """Immutable public declaration for a native Python tool.
 
     ``input_schema`` is the default JSON Schema exposed through ``Tool.schema``.
     Tool subclasses may override that property when the runtime schema is derived;
@@ -554,10 +554,15 @@ class ToolContext(BaseModel):
 
 
 class Tool(ABC):
-    """Base class for framework-native tools.
+    """Base class for Cayu's native Python tools.
 
     Subclasses declare a ``ToolSpec`` and implement ``run`` with ``async def``.
     Registration validates both contracts before a session can execute the tool.
+
+    A native tool runs inside the trusted Cayu application process. Tool policy
+    authorizes model-requested calls; it does not sandbox the Python implementation.
+    Put model-authored or otherwise untrusted code behind an admitted runner or an
+    independently governed external tool boundary.
     """
 
     spec: ToolSpec

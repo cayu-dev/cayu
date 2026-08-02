@@ -218,8 +218,10 @@ ToolContext
 - **Agent** describes who is acting and how model work is configured.
 - **Environment** describes what that agent can touch.
 - **Session** records one durable execution and its lineage.
-- **Tool** is an explicitly registered capability that controls what model
-  requests can execute.
+- **Tool** is an explicitly registered, application-owned capability that the
+  model may request. A native Python `Tool` runs inside the trusted Cayu
+  application process; `ToolPolicy` gates its invocation but does not sandbox
+  its implementation.
 - **Task** is an optional durable unit of background or orchestrated work.
 - **Workflow** is deterministic application orchestration around agent steps.
 
@@ -228,6 +230,16 @@ when tools need files, commands, artifacts, secrets, network policy, or a
 sandbox. Static environments are useful for trusted local work;
 `EnvironmentFactory` creates or reattaches session-specific environments in
 production.
+
+Choose the execution surface according to where code should run and which
+boundary should contain it:
+
+| Surface | Execution location | Boundary |
+| --- | --- | --- |
+| Native Python `Tool` | Cayu application process | Trusted application code; policy controls invocation, not host-process access |
+| Runner-backed operation (`ctx.runner`) | Selected runner for that operation; the enclosing `Tool.run()` stays in the Cayu application process | Isolation, environment, network, and filesystem guarantees for the operation come from the admitted runner and environment |
+| MCP tool | Configured MCP process or server | Separate integration boundary whose process, transport, credentials, and isolation remain deployment choices |
+| Virtual egress | Selected runner plus a trusted broker outside it | A conforming adapter can keep the real credential out of the workload; code isolation still depends on the runner |
 
 ## Use the smallest runtime shape
 
@@ -339,6 +351,14 @@ its identity or transcript contract.
 
 Cayu makes safety boundaries explicit, but configuration still matters:
 
+- Native Python `Tool` implementations are trusted host-process code and can
+  access authority available to the Cayu application. `ToolPolicy` controls
+  whether the model may call a tool and with which arguments; it is not an OS
+  isolation boundary. Run model-authored or otherwise untrusted code through an
+  admitted runner or separately governed external tool boundary. Native tools
+  that need credentials should use explicit `SecretRef` values through
+  `ctx.proxy` or `ctx.vault` and return only safe results; ambient host
+  environment values are not automatically mediated as workload credentials.
 - `LocalRunner` executes directly on a trusted local machine and provides no
   sandbox isolation.
 - `DockerRunner` is useful for development and CI; ordinary Docker isolation
