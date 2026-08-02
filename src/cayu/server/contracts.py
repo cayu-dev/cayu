@@ -84,6 +84,11 @@ MAX_SYSTEM_PRICING_METADATA_CHARS = 256
 DEFAULT_SESSION_TOPOLOGY_RESULT_BYTES = 1024 * 1024
 MAX_SESSION_TOPOLOGY_RESULT_BYTES = 4 * 1024 * 1024
 MAX_SESSION_TOPOLOGY_REQUEST_BYTES = 256 * 1024
+MAX_CONTROL_PLANE_METADATA_BYTES = 64 * 1024
+MAX_CONTROL_PLANE_METADATA_MEMBERS = 1024
+MAX_CONTROL_PLANE_METADATA_NESTING = 32
+MAX_CONTROL_PLANE_PROMPT_BYTES = 64 * 1024
+MAX_CONTROL_PLANE_REQUEST_BYTES = 1024 * 1024
 MAX_EXECUTION_TOPOLOGY_EDGES = 1500
 
 SessionTopologyIdentifier = Annotated[
@@ -1549,6 +1554,14 @@ STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     },
     500: {
         "description": "The mutation could not open an accepted durable stream.",
+        "model": ApiErrorResponse,
+    },
+}
+
+BOUNDED_STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **STREAMING_ENDPOINT_RESPONSES,
+    413: {
+        "description": "The control-plane request exceeds its encoded byte limit.",
         "model": ApiErrorResponse,
     },
 }

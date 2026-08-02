@@ -5105,7 +5105,8 @@ def test_server_run_rejects_request_budget_reservations() -> None:
     )
 
     assert response.status_code == 422
-    assert "Request budget limits must not use reservations" in response.text
+    assert response.json() == {"detail": "Invalid control-plane request."}
+    assert response.headers["cache-control"] == "private, no-store"
 
 
 def test_server_session_usage_returns_404_for_missing_session() -> None:

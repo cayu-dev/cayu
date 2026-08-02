@@ -1211,6 +1211,24 @@ event retains that terminal replay boundary only when its referenced or nearest
 prior terminal event is durable and no newer operation started before the
 telemetry marker. Arbitrary custom-event payloads cannot claim terminal lineage.
 
+Control-plane mutation admission is bounded before route execution. `/run` and
+`/resume` prompts accept at most 65,536 UTF-8 bytes and reject NUL characters or
+lone Unicode surrogates before constructing runtime messages or calling a
+provider. Run, resume, interrupt, approval, tool-round recovery, and user-input
+resolution/recovery requests accept at most 1 MiB of HTTP body bytes, including
+when the body arrives without `Content-Length`; an oversized stream is stopped
+without retaining the complete body. Interrupt and resolution/recovery
+`metadata` accepts at most 65,536 bytes of compact UTF-8 JSON, 32 container
+levels, and 1,024 aggregate object members/list items. The model boundary
+defensively copies the complete metadata tree and rejects non-string keys, NUL
+or surrogate text, non-finite numbers, integers outside signed 64-bit range,
+unsupported values, duplicate JSON object keys, and deeper or
+higher-cardinality input identically before any session-store call. Admission
+failures return only a fixed `413` or `422`
+detail with `Cache-Control: private, no-store`; rejected content is never echoed
+or durably mutated. These limits are framework safety ceilings and cannot be
+weakened by a reverse proxy.
+
 `GET /api/sessions/{session_id}/state` is the bounded lifecycle-polling surface.
 It returns the session id, status, update/activity timestamps, and typed
 interruption-cascade state. `SessionStore.load_state` projects the mutable

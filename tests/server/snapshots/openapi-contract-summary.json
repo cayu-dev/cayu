@@ -10006,6 +10006,13 @@
               }
             }
           },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
@@ -10073,6 +10080,13 @@
             }
           },
           "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"
@@ -11220,6 +11234,13 @@
               }
             }
           },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12127,6 +12148,13 @@
               }
             }
           },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12200,6 +12228,13 @@
               }
             }
           },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12267,6 +12302,13 @@
             }
           },
           "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"
@@ -12404,6 +12446,13 @@
               }
             }
           },
+          "413": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "422": {
             "content": {
               "application/json": {
@@ -12471,6 +12520,13 @@
             }
           },
           "409": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
+          "413": {
             "content": {
               "application/json": {
                 "$ref": "#/components/schemas/ApiErrorResponse"

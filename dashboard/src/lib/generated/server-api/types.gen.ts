@@ -5299,6 +5299,10 @@ export type ResumeAgentApiResumePostErrors = {
      */
     409: ApiErrorResponse;
     /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
@@ -5343,6 +5347,10 @@ export type RunAgentApiRunPostErrors = {
      * The replay event marker is unknown or the mutation conflicts with the current session state.
      */
     409: ApiErrorResponse;
+    /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
     /**
      * Validation Error
      */
@@ -5867,6 +5875,10 @@ export type InterruptSessionApiSessionsSessionIdInterruptPostErrors = {
      * The replay event marker is unknown or the mutation conflicts with the current session state.
      */
     409: ApiErrorResponse;
+    /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
     /**
      * Validation Error
      */
@@ -6448,6 +6460,10 @@ export type RecoverToolApprovalApiToolApprovalsRecoverPostErrors = {
      */
     409: ApiErrorResponse;
     /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
@@ -6493,6 +6509,10 @@ export type ResolveToolApprovalApiToolApprovalsResolvePostErrors = {
      */
     409: ApiErrorResponse;
     /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
@@ -6537,6 +6557,10 @@ export type RecoverToolRoundApiToolRoundsRecoverPostErrors = {
      * The replay event marker is unknown or the mutation conflicts with the current session state.
      */
     409: ApiErrorResponse;
+    /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
     /**
      * Validation Error
      */
@@ -6624,6 +6648,10 @@ export type RecoverUserInputApiUserInputRecoverPostErrors = {
      */
     409: ApiErrorResponse;
     /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
+    /**
      * Validation Error
      */
     422: HttpValidationError;
@@ -6668,6 +6696,10 @@ export type ResolveUserInputApiUserInputResolvePostErrors = {
      * The replay event marker is unknown or the mutation conflicts with the current session state.
      */
     409: ApiErrorResponse;
+    /**
+     * The control-plane request exceeds its encoded byte limit.
+     */
+    413: ApiErrorResponse;
     /**
      * Validation Error
      */

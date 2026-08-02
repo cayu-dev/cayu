@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 from cayu._exception_groups import exception_tree_contains
 from cayu._validation import (
     JsonUtf8SizeCounter,
+    copy_durable_json_object,
     copy_json_value,
     copy_label_map,
     json_utf8_size_within_limit,
@@ -178,7 +180,13 @@ from cayu.server.contracts import (
     AGGREGATE_ENDPOINT_RESPONSES,
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
+    BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
+    MAX_CONTROL_PLANE_METADATA_BYTES,
+    MAX_CONTROL_PLANE_METADATA_MEMBERS,
+    MAX_CONTROL_PLANE_METADATA_NESTING,
+    MAX_CONTROL_PLANE_PROMPT_BYTES,
+    MAX_CONTROL_PLANE_REQUEST_BYTES,
     MAX_SESSION_TOPOLOGY_REQUEST_BYTES,
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
     MAX_USAGE_ROLLUP_REQUEST_BYTES,
@@ -274,12 +282,34 @@ def _private_no_store_validation_error_response(detail: str) -> JSONResponse:
     )
 
 
+def _parse_json_without_duplicate_keys(body: bytes) -> object:
+    """Parse one request body while rejecting non-portable JSON spellings."""
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"Non-finite JSON number {value!r} is not supported.")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Duplicate JSON object keys are not supported.")
+            result[key] = value
+        return result
+
+    return json.loads(
+        body,
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+
+
 class _BoundedPrivateJsonBodyRoute(APIRoute):
     """Bound and sanitize a private JSON body before validation can expose input."""
 
     max_request_bytes: int
     invalid_request_detail: str
     oversized_request_detail: str
+    reject_duplicate_json_keys = False
 
     def _invalid_request_response(self) -> JSONResponse:
         return _private_no_store_error_response(422, self.invalid_request_detail)
@@ -289,6 +319,7 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
         max_request_bytes = self.max_request_bytes
         invalid_request_response = self._invalid_request_response
         oversized_request_detail = self.oversized_request_detail
+        reject_duplicate_json_keys = self.reject_duplicate_json_keys
 
         async def bounded_route_handler(request: Request) -> Response:
             content_length = request.headers.get("content-length")
@@ -305,22 +336,59 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
                         oversized_request_detail,
                     )
 
-            received_bytes = 0
             original_receive = request.receive
 
-            async def bounded_receive():
-                nonlocal received_bytes
-                message = await original_receive()
-                if message["type"] == "http.request":
-                    received_bytes += len(message.get("body", b""))
-                    if received_bytes > max_request_bytes:
-                        raise HTTPException(
-                            status_code=413,
-                            detail=oversized_request_detail,
-                        )
-                return message
+            if reject_duplicate_json_keys:
+                received = bytearray()
+                try:
+                    while True:
+                        message = await original_receive()
+                        if message["type"] != "http.request":
+                            return invalid_request_response()
+                        chunk = message.get("body", b"")
+                        if len(received) + len(chunk) > max_request_bytes:
+                            return _private_no_store_error_response(
+                                413,
+                                oversized_request_detail,
+                            )
+                        received.extend(chunk)
+                        if not message.get("more_body", False):
+                            break
+                    if received:
+                        _parse_json_without_duplicate_keys(bytes(received))
+                except (UnicodeDecodeError, ValueError, RecursionError):
+                    return invalid_request_response()
 
-            bounded_request = Request(request.scope, receive=bounded_receive)
+                replayed = False
+
+                async def replay_receive():
+                    nonlocal replayed
+                    if replayed:
+                        return {"type": "http.disconnect"}
+                    replayed = True
+                    return {
+                        "type": "http.request",
+                        "body": bytes(received),
+                        "more_body": False,
+                    }
+
+                bounded_request = Request(request.scope, receive=replay_receive)
+            else:
+                received_bytes = 0
+
+                async def bounded_receive():
+                    nonlocal received_bytes
+                    message = await original_receive()
+                    if message["type"] == "http.request":
+                        received_bytes += len(message.get("body", b""))
+                        if received_bytes > max_request_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=oversized_request_detail,
+                            )
+                    return message
+
+                bounded_request = Request(request.scope, receive=bounded_receive)
             try:
                 response = await route_handler(bounded_request)
             except RequestValidationError:
@@ -345,6 +413,15 @@ class _BoundedSessionTopologyRoute(_BoundedPrivateJsonBodyRoute):
     max_request_bytes = MAX_SESSION_TOPOLOGY_REQUEST_BYTES
     invalid_request_detail = "Invalid session topology request."
     oversized_request_detail = "Session topology request exceeds the server byte limit."
+
+
+class _BoundedControlPlaneRequestRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound mutation bodies before validation, provider calls, or durable writes."""
+
+    max_request_bytes = MAX_CONTROL_PLANE_REQUEST_BYTES
+    invalid_request_detail = "Invalid control-plane request."
+    oversized_request_detail = "Control-plane request exceeds the server byte limit."
+    reject_duplicate_json_keys = True
 
 
 class _BoundedUsageRollupRoute(_BoundedPrivateJsonBodyRoute):
@@ -1083,7 +1160,22 @@ def _start_detached_event_stream_response(
     return response, pump_task, abandon_observer
 
 
-class RunBody(BaseModel):
+class _BoundedControlPlanePromptBody(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    @field_validator("prompt", check_fields=False)
+    @classmethod
+    def validate_prompt(cls, value: str) -> str:
+        require_durable_json_text(value, "prompt")
+        if len(value.encode("utf-8")) > MAX_CONTROL_PLANE_PROMPT_BYTES:
+            raise ValueError(
+                "prompt exceeds the maximum encoded size of "
+                f"{MAX_CONTROL_PLANE_PROMPT_BYTES} bytes."
+            )
+        return value
+
+
+class RunBody(_BoundedControlPlanePromptBody):
     prompt: NonBlankString
     session_id: ReplaySafeSessionId | None = Field(
         default=None,
@@ -1115,7 +1207,7 @@ class RunBody(BaseModel):
         return copy_label_map(value, "labels", allow_reserved=False)
 
 
-class ResumeBody(BaseModel):
+class ResumeBody(_BoundedControlPlanePromptBody):
     session_id: NonBlankString
     prompt: NonBlankString
     max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
@@ -1131,7 +1223,46 @@ class ResumeBody(BaseModel):
         return copy_request_budget_limits(value)
 
 
-class InterruptSessionBody(BaseModel):
+def _copy_control_plane_metadata(value: Any) -> dict[str, Any]:
+    copied = copy_durable_json_object(value, "metadata")
+    if not json_utf8_size_within_limit(copied, MAX_CONTROL_PLANE_METADATA_BYTES):
+        raise ValueError(
+            "metadata exceeds the maximum encoded size of "
+            f"{MAX_CONTROL_PLANE_METADATA_BYTES} bytes."
+        )
+
+    member_count = 0
+    pending: list[tuple[dict[str, Any] | list[Any], int]] = [(copied, 1)]
+    while pending:
+        container, depth = pending.pop()
+        if depth > MAX_CONTROL_PLANE_METADATA_NESTING:
+            raise ValueError(
+                "metadata exceeds the maximum nesting depth of "
+                f"{MAX_CONTROL_PLANE_METADATA_NESTING}."
+            )
+        member_count += len(container)
+        if member_count > MAX_CONTROL_PLANE_METADATA_MEMBERS:
+            raise ValueError(
+                "metadata exceeds the maximum aggregate member count of "
+                f"{MAX_CONTROL_PLANE_METADATA_MEMBERS}."
+            )
+        values = container.values() if type(container) is dict else container
+        for item in values:
+            if type(item) is dict or type(item) is list:
+                pending.append((item, depth + 1))
+    return copied
+
+
+class _BoundedControlPlaneMetadataBody(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    @field_validator("metadata", mode="before", check_fields=False)
+    @classmethod
+    def copy_metadata(cls, value: Any) -> dict[str, Any]:
+        return _copy_control_plane_metadata(value)
+
+
+class InterruptSessionBody(_BoundedControlPlaneMetadataBody):
     reason: NonBlankString | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     requested_by: ResolutionActor | None = None
@@ -1234,7 +1365,7 @@ class TaskHoldBody(BaseModel):
     payload: dict[str, Any] | None = None
 
 
-class ToolApprovalBody(BaseModel):
+class ToolApprovalBody(_BoundedControlPlaneMetadataBody):
     """Body for resolving a pending tool approval.
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
@@ -1265,7 +1396,7 @@ class ToolApprovalBody(BaseModel):
         return copy_request_budget_limits(value)
 
 
-class ToolApprovalRecoveryBody(BaseModel):
+class ToolApprovalRecoveryBody(_BoundedControlPlaneMetadataBody):
     """Body for recovering an approved tool call with an unknown result.
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
@@ -1299,7 +1430,7 @@ class ToolApprovalRecoveryBody(BaseModel):
         return copy_request_budget_limits(value)
 
 
-class ToolRoundRecoveryBody(BaseModel):
+class ToolRoundRecoveryBody(_BoundedControlPlaneMetadataBody):
     """Body for recovering a crashed ordinary tool call with an operator outcome.
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default
@@ -1332,7 +1463,7 @@ class ToolRoundRecoveryBody(BaseModel):
         return copy_request_budget_limits(value)
 
 
-class UserInputResolveBody(BaseModel):
+class UserInputResolveBody(_BoundedControlPlaneMetadataBody):
     """Body for answering a session paused by ``ask_user``.
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
@@ -1361,7 +1492,7 @@ class UserInputResolveBody(BaseModel):
         return copy_request_budget_limits(value)
 
 
-class UserInputRecoveryBody(BaseModel):
+class UserInputRecoveryBody(_BoundedControlPlaneMetadataBody):
     """Body for recovering a user-input round stuck on ``manual_recovery_required``.
 
     ``max_steps``, ``limits``, ``budget_limits``, and ``retry_policy`` default to ``None``: the
@@ -2895,6 +3026,7 @@ def create_router(
 
     api_prefix = normalize_api_path(api_path, field_name="api_path")
     router = APIRouter(prefix=api_prefix)
+    bounded_control_plane_router = APIRouter(route_class=_BoundedControlPlaneRequestRoute)
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
         dashboard_configured=dashboard_configured,
@@ -3645,11 +3777,11 @@ def create_router(
 
         return EventSourceResponse(replay(), send_timeout=SSE_SEND_TIMEOUT_SECONDS)
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/run",
         dependencies=protected,
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def run_agent(
         body: RunBody,
@@ -3750,11 +3882,11 @@ def create_router(
             ),
         )
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/resume",
         dependencies=protected,
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def resume_agent(
         body: ResumeBody,
@@ -3901,10 +4033,10 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/sessions/{session_id}/interrupt",
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def interrupt_session(
         session_id: NonBlankString,
@@ -3953,10 +4085,10 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/tool-approvals/resolve",
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def resolve_tool_approval(
         body: ToolApprovalBody,
@@ -4019,10 +4151,10 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/tool-approvals/recover",
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def recover_tool_approval(
         body: ToolApprovalRecoveryBody,
@@ -4088,10 +4220,10 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/tool-rounds/recover",
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def recover_tool_round(
         body: ToolRoundRecoveryBody,
@@ -4152,10 +4284,10 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/user-input/resolve",
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def resolve_user_input(
         body: UserInputResolveBody,
@@ -4209,10 +4341,10 @@ def create_router(
             conflict_error_types=(RuntimeError, TimeoutError, ValueError),
         )
 
-    @router.post(
+    @bounded_control_plane_router.post(
         "/user-input/recover",
         response_class=EventSourceResponse,
-        responses=STREAMING_ENDPOINT_RESPONSES,
+        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     )
     async def recover_user_input(
         body: UserInputRecoveryBody,
@@ -6029,4 +6161,5 @@ def create_router(
     async def health():
         return {"ok": True}
 
+    router.include_router(bounded_control_plane_router)
     return router
