@@ -89,7 +89,10 @@ from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime._message_redaction import redact_message_for_boundary
+from cayu.runtime._message_redaction import (
+    redact_runtime_message_for_boundary,
+    redact_untrusted_message_for_boundary,
+)
 from cayu.runtime._model_errors import (
     copy_provider_exception_control,
     model_provider_error_from_payload,
@@ -317,7 +320,7 @@ def _durable_assistant_step_result(
         if copied.tool_calls:
             raise ValueError("Assistant tool calls require an assistant message.")
         return copied
-    assistant_message = redact_message_for_boundary(
+    assistant_message = redact_untrusted_message_for_boundary(
         copied.assistant_message,
         redactor=redactor,
         field_name="assistant_message",
@@ -1229,7 +1232,7 @@ class ModelStepExecutor:
         if thinking_payload is not None:
             request_options["thinking"] = thinking_payload
         redacted_messages = [
-            redact_message_for_boundary(
+            redact_runtime_message_for_boundary(
                 message,
                 redactor=self._secret_redactor,
                 field_name="model_message",

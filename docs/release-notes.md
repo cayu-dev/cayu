@@ -99,6 +99,42 @@ grace period. The entrypoint still chooses `TaskStoreDispatcher.run_worker`,
 `run_task_worker`, or another supported loop; the CLI does not infer task or
 recovery policy.
 
+### Oversized terminal tool results can be externalized before model context
+
+`CayuApp(tool_result_projection_policy=...)` now provides an opt-in,
+default-off projection boundary after tool-result redaction and hooks but before
+terminal event and transcript publication. The built-in
+`ArtifactExternalizingToolResultPolicy` keeps results at or below configured
+byte/token-estimate thresholds unchanged. Above a threshold it stores the
+redacted UTF-8 text through the active environment's `ArtifactStore` and gives
+the model a bounded preview plus a typed reference whose generated
+`ReadFileTool` instruction includes a policy-safe byte limit. Application
+manifests fingerprint the built-in
+policy's configured thresholds, preview bound, and token-estimation method.
+
+Direct and MCP tools share the same boundary. Structured data, existing
+artifact/file references, error disposition, and effect evidence are
+preserved. Artifact identities are deterministic for a
+session/tool-call/content combination, and local/S3 stores reuse exact
+caller-supplied identities. Recovery republishes the original projected
+terminal result without rerunning the tool. Store failure emits a bounded
+explicit result rather than falling back to the oversized content. Events,
+logs, and OpenTelemetry spans report only content-free sizes, identities,
+hashes, estimation method, and outcome. Projection persistence has a bounded
+deadline so a non-settling store cannot hold interruption open indefinitely;
+completed projection evidence is published before concurrent cancellation is
+redelivered. `LocalArtifactStore` stages complete deterministic artifacts before
+atomic publication and repairs only matching legacy partial writes. The S3
+store settles an in-flight threaded content upload and metadata commit before
+redelivering cancellation, so timeout cannot leave an undiscoverable
+content-only object; if metadata fails, it first removes content created by the
+cancelled invocation.
+
+The public application manifest and generator plan advance from schema version
+6 to version 7. The runtime manifest now identifies the configured projection
+policy, so enabling it changes the application fingerprint. This feature does
+not change the storage schema or server contract.
+
 ### Interaction durability advances the server and storage contracts
 
 First-interaction admission, queued delivery, and lifecycle closure now retain

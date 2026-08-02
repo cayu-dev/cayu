@@ -196,7 +196,7 @@ trial per scenario. Real GitHub promotion for the repository tournament remains
 an explicit manual check because it creates a branch and pull request in the
 configured disposable repository.
 
-There are 34 live example files across `examples/` and its provider subdirectories:
+There are 35 live example files across `examples/` and its provider subdirectories:
 
 | prerequisite | examples |
 | --- | --- |
@@ -207,7 +207,7 @@ There are 34 live example files across `examples/` and its provider subdirectori
 | AWS credentials, region, and Bedrock model | `aws/bedrock_provider_live.py` |
 | Gemini key | `chat_completions_contract_live.py` |
 | Playwright Chromium | `dashboard_behavior_live.py` |
-| OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |
+| OpenAI or Anthropic key | `structured_output_live.py`, `subagent_live.py`, `subagent_parallel_live.py`, `artifact_file_live.py`, `tool_result_projection_live.py`, `context_counting_live.py`, `context_pressure_calibration_live.py`, `knowledge_recall_live.py`, `knowledge_recall_many_live.py` |
 | OpenAI key | `knowledge_embedding_live.py`, `real_spend_budget_live.py` |
 
 The deterministic runner examples use `_live_checks.py` and raise on wrong
@@ -217,8 +217,9 @@ The E2B and Microsandbox workspace examples also reuse
 validation scenarios used by the credential-free workspace conformance suite.
 Those live checks prove provider integration and a real sandbox boundary; the
 ordinary pytest suite remains hermetic.
-`artifact_file_live.py`, `context_counting_live.py`, and
-`structured_output_live.py` assert structural provider/runtime behavior and
+`artifact_file_live.py`, `tool_result_projection_live.py`,
+`context_counting_live.py`, and `structured_output_live.py` assert structural
+provider/runtime behavior and
 report `verified`; `knowledge_embedding_live.py` verifies a real OpenAI embedding
 and semantic-retrieval result. The context-pressure, knowledge-recall, and
 subagent examples remain manually runnable demos but are not executed by the

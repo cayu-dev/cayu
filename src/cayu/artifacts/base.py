@@ -276,6 +276,26 @@ class ArtifactListResult:
         object.__setattr__(self, "artifacts", tuple(validated_artifacts))
 
 
+def _require_matching_artifact(
+    existing: ArtifactReadResult,
+    *,
+    expected: ArtifactMetadata,
+    content: bytes,
+) -> None:
+    """Require an idempotent write to match stored bytes and immutable metadata."""
+
+    comparable_existing = existing.metadata.model_dump(
+        mode="json",
+        exclude={"created_at"},
+    )
+    comparable_expected = expected.model_dump(
+        mode="json",
+        exclude={"created_at"},
+    )
+    if comparable_existing != comparable_expected or existing.content != content:
+        raise ValueError("Artifact identity already exists with different content or metadata.")
+
+
 class ArtifactStore(ABC):
     """Durable uploaded/generated file storage for an environment."""
 
@@ -286,6 +306,7 @@ class ArtifactStore(ABC):
         self,
         content: bytes,
         *,
+        artifact_id: str | None = None,
         filename: str,
         content_type: str | None = None,
         scope: ArtifactScope = ArtifactScope.SESSION,
@@ -294,7 +315,12 @@ class ArtifactStore(ABC):
         environment_name: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ArtifactMetadata:
-        """Store bytes and return a durable artifact reference."""
+        """Store bytes and return a durable artifact reference.
+
+        ``artifact_id`` opts into idempotent addressing. Implementations must
+        return an existing artifact only when its content and immutable metadata
+        match the requested value exactly; a conflicting identity must fail.
+        """
 
     @abstractmethod
     async def read_bytes(

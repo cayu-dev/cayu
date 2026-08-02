@@ -9,6 +9,7 @@ from cayu import (
     AgentAuthoringState,
     AgentSpec,
     AppManifest,
+    ArtifactExternalizingToolResultPolicy,
     CayuApp,
     Environment,
     EnvironmentFactory,
@@ -151,7 +152,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "6"
+    assert manifest.schema_version == "7"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -175,6 +176,47 @@ def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:
     assert first.runtime.max_environment_lifecycle_owners == 1
     assert second.runtime.max_environment_lifecycle_owners == 2
     assert first.fingerprint != second.fingerprint
+
+
+def test_tool_result_projection_policy_is_manifested_and_fingerprinted() -> None:
+    default = CayuApp(enable_logging=False).describe()
+    externalizing = CayuApp(
+        enable_logging=False,
+        tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(),
+    ).describe()
+    tuned = CayuApp(
+        enable_logging=False,
+        tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
+            max_inline_bytes=64,
+            max_inline_token_estimate=None,
+            preview_bytes=1,
+            chars_per_token=2,
+        ),
+    ).describe()
+
+    assert default.runtime.tool_result_projection_policy is None
+    assert externalizing.runtime.tool_result_projection_policy is not None
+    assert externalizing.runtime.tool_result_projection_policy.identity == (
+        "cayu.artifact_externalizing_tool_result.v1"
+    )
+    assert externalizing.runtime.tool_result_projection_policy.max_inline_bytes == 32 * 1024
+    assert externalizing.runtime.tool_result_projection_policy.max_inline_token_estimate == 8 * 1024
+    assert externalizing.runtime.tool_result_projection_policy.preview_bytes == 2 * 1024
+    assert externalizing.runtime.tool_result_projection_policy.token_estimation_method == (
+        "unicode_codepoints_divided_by_4_ceiling_v1"
+    )
+    assert tuned.runtime.tool_result_projection_policy is not None
+    assert tuned.runtime.tool_result_projection_policy.identity == (
+        externalizing.runtime.tool_result_projection_policy.identity
+    )
+    assert tuned.runtime.tool_result_projection_policy.max_inline_bytes == 64
+    assert tuned.runtime.tool_result_projection_policy.max_inline_token_estimate is None
+    assert tuned.runtime.tool_result_projection_policy.preview_bytes == 1
+    assert tuned.runtime.tool_result_projection_policy.token_estimation_method == (
+        "unicode_codepoints_divided_by_2_ceiling_v1"
+    )
+    assert default.fingerprint != externalizing.fingerprint
+    assert externalizing.fingerprint != tuned.fingerprint
 
 
 def test_agent_authoring_state_is_typed_copied_and_fingerprinted() -> None:
@@ -363,7 +405,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "6"
+    assert schema["properties"]["schema_version"]["const"] == "7"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -472,7 +514,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "6",
+                "schema_version": "7",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {

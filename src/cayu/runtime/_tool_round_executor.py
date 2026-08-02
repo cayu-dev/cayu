@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -27,6 +28,7 @@ from cayu._exception_groups import (
     set_exception_cause,
 )
 from cayu._task_wait import (
+    await_shielded_task_outcome,
     consume_pending_task_cancellation,
     unexpected_child_cancellation_error,
 )
@@ -45,6 +47,7 @@ from cayu.core.events import (
     EventType,
     copy_event,
     event_with_runtime_envelope_authority,
+    event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
 from cayu.core.messages import Message
@@ -158,6 +161,14 @@ from cayu.runtime.tool_policy import (
     metadata_with_taint_labels,
     taint_labels_from_metadata,
 )
+from cayu.runtime.tool_result_projection import (
+    _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+    ToolResultProjectionPolicy,
+    ToolResultProjectionRequest,
+    projection_failure,
+    safe_projection_failure_type,
+    validate_tool_result_projection,
+)
 from cayu.runtime.user_input import (
     PENDING_USER_INPUT_CHECKPOINT_KEY,
     PendingUserInput,
@@ -196,6 +207,8 @@ def _event_with_tool_round_authority(
     event = event_with_runtime_envelope_authority(event, "session_id")
     return event_with_runtime_payload_authority(event, *fields) if fields else event
 
+
+_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS = 30.0
 
 CheckpointTransform = Callable[
     [Session, dict[str, Any] | None],
@@ -316,6 +329,13 @@ class UserInputRequired(Exception):
         self.pending = copy_pending_user_input(pending)
 
 
+def _consume_projection_task_outcome(task: asyncio.Task[Any]) -> None:
+    """Observe a timed-out policy task after requesting cooperative cancellation."""
+
+    with suppress(BaseException):
+        task.result()
+
+
 class ToolRoundExecutor:
     """Execute tool calls and complete ordinary tool rounds.
 
@@ -335,6 +355,7 @@ class ToolRoundExecutor:
         hook_runtime: RuntimeHookRuntime,
         runtime_hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         mcp_manifest_policy: McpManifestPolicy | None,
+        tool_result_projection_policy: ToolResultProjectionPolicy | None,
         secret_redactor: SecretRedactor,
         tool_timeout_seconds: float | None,
         max_parallel_tool_calls: int,
@@ -349,6 +370,7 @@ class ToolRoundExecutor:
         self._hook_runtime = hook_runtime
         self._runtime_hooks = runtime_hooks
         self._mcp_manifest_policy = mcp_manifest_policy
+        self._tool_result_projection_policy = tool_result_projection_policy
         self._secret_redactor = secret_redactor
         self._tool_timeout_seconds = tool_timeout_seconds
         self._max_parallel_tool_calls = max_parallel_tool_calls
@@ -1684,6 +1706,7 @@ class ToolRoundExecutor:
         policy_denial = tool_context._policy_denial_for(registered_tool.tool)
         result_event: Event | None = None
         published_terminal_event: Event | None = None
+        projection_cancellation: asyncio.CancelledError | None = None
         if policy_denial is None:
             event_type = (
                 EventType.TOOL_CALL_FAILED if result.is_error else EventType.TOOL_CALL_COMPLETED
@@ -1714,6 +1737,17 @@ class ToolRoundExecutor:
                     result=result,
                     redactor=redactor,
                 )
+                (
+                    result_event,
+                    result,
+                    projection_cancellation,
+                ) = await self._project_terminal_tool_result(
+                    event=result_event,
+                    result=result,
+                    session=session,
+                    registered_environment=registered_environment,
+                    tool_call=effective_tool_call,
+                )
                 published_terminal_event = await self._event_writer.emit(result_event)
                 yield (
                     published_terminal_event,
@@ -1732,6 +1766,8 @@ class ToolRoundExecutor:
             redactor=redactor,
         ):
             yield event, None
+        if projection_cancellation is not None:
+            raise projection_cancellation
         current_task = asyncio.current_task()
         tool_swallowed_cancellation = current_task is not None and current_task.cancelling() > 0
         if tool_swallowed_cancellation and await self._session_control.is_interrupting(session.id):
@@ -2389,8 +2425,17 @@ class ToolRoundExecutor:
             redactor=resolved_redactor,
         )
         if publish_before_hooks:
+            event, result, projection_cancellation = await self._project_terminal_tool_result(
+                event=event,
+                result=result,
+                session=session,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+            )
             tool_event = await self._event_writer.emit(event)
             yield tool_event, runtime_records.ToolCallOutcome(call=tool_call, result=result)
+            if projection_cancellation is not None:
+                raise projection_cancellation
             async for hook_event, modified in self.run_tool_call_hooks(
                 session=session,
                 tool_event=tool_event,
@@ -2432,8 +2477,109 @@ class ToolRoundExecutor:
                 result=final_result,
                 redactor=resolved_redactor,
             )
+        event, final_result, projection_cancellation = await self._project_terminal_tool_result(
+            event=event,
+            result=final_result,
+            session=session,
+            registered_environment=registered_environment,
+            tool_call=tool_call,
+        )
         tool_event = await self._event_writer.emit(event)
         yield tool_event, runtime_records.ToolCallOutcome(call=tool_call, result=final_result)
+        if projection_cancellation is not None:
+            raise projection_cancellation
+
+    async def _project_terminal_tool_result(
+        self,
+        *,
+        event: Event,
+        result: ToolResult,
+        session: Session,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_call: runtime_records.ToolCallRequest,
+    ) -> tuple[Event, ToolResult, asyncio.CancelledError | None]:
+        policy = self._tool_result_projection_policy
+        if policy is None:
+            return event, result, None
+        request = ToolResultProjectionRequest(
+            result=result,
+            session_id=session.id,
+            agent_name=session.agent_name,
+            environment_name=_environment_name(registered_environment),
+            tool_call_id=tool_call.id,
+            artifact_store=_artifact_store(registered_environment),
+        )
+        policy_task = asyncio.create_task(policy.project(request))
+        outcome = await await_shielded_task_outcome(
+            policy_task,
+            timeout_s=_TOOL_RESULT_PROJECTION_TIMEOUT_SECONDS,
+        )
+        error = outcome.error
+        if outcome.timed_out:
+            policy_task.cancel()
+            policy_task.add_done_callback(_consume_projection_task_outcome)
+            projection = projection_failure(
+                policy=policy,
+                request=request,
+                failure_type="projection_timeout",
+            )
+        elif error is not None:
+            if isinstance(error, asyncio.CancelledError):
+                error = unexpected_child_cancellation_error(
+                    error,
+                    operation="Tool-result projection policy",
+                )
+            if not isinstance(error, Exception):
+                raise error
+            projection = projection_failure(
+                policy=policy,
+                request=request,
+                failure_type=safe_projection_failure_type(
+                    error,
+                    fallback="projection_policy_failure",
+                ),
+            )
+        elif outcome.result is None:
+            projection = projection_failure(
+                policy=policy,
+                request=request,
+                failure_type="missing_projection_result",
+            )
+        else:
+            try:
+                projection = validate_tool_result_projection(
+                    outcome.result,
+                    request=request,
+                    policy=policy,
+                )
+            except Exception as exc:
+                projection = projection_failure(
+                    policy=policy,
+                    request=request,
+                    failure_type=safe_projection_failure_type(
+                        exc,
+                        fallback="projection_policy_failure",
+                    ),
+                )
+        payload = dict(event.payload)
+        payload["result"] = projection.result.model_dump()
+        payload["tool_result_projection"] = projection.record.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+        projected_event = event.model_copy(update={"payload": payload})
+        # The policy receives the final redacted result. Reapplying generic
+        # redaction here would rewrite runtime-owned artifact identities when
+        # a registered secret happens to overlap an id, hash, type, or status.
+        projected_event, projected_result = _validate_and_synchronize_tool_result_event(
+            event=projected_event,
+            result=projection.result,
+        )
+        projected_event = event_with_runtime_nested_payload_authority(
+            projected_event,
+            _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+        )
+        return projected_event, projected_result, outcome.cancellation
 
     async def run_tool_call_hooks(
         self,
@@ -4413,6 +4559,13 @@ def _prepare_tool_result_event(
     result: ToolResult,
     redactor: SecretRedactor,
 ) -> tuple[Event, ToolResult]:
+    result = result.model_copy(
+        update={
+            "artifacts": tool_results.strip_runtime_tool_result_projection_authority(
+                result.artifacts
+            )
+        }
+    )
     event, result = _validate_and_synchronize_tool_result_event(
         event=event,
         result=result,

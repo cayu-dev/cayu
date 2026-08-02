@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import errno
 import json
 import mimetypes
@@ -8,6 +9,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from os import PathLike
@@ -29,6 +31,7 @@ from cayu.artifacts.base import (
     ArtifactStore,
     ArtifactStoreUnavailableError,
     InvalidArtifactIdError,
+    _require_matching_artifact,
 )
 
 _CONTENT_FILE = "content"
@@ -39,9 +42,13 @@ _OPEN_READ_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BI
 _OPEN_NOFOLLOW_FLAG = getattr(os, "O_NOFOLLOW", 0)
 _OPEN_DIRECTORY_FLAG = getattr(os, "O_DIRECTORY", 0)
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+_RENAME_EXCL = 4
 _SUPPORTS_DIRECTORY_FD = (
     os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
+    and os.rename in os.supports_dir_fd
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
 )
@@ -71,6 +78,7 @@ class LocalArtifactStore(ArtifactStore):
         self,
         content: bytes,
         *,
+        artifact_id: str | None = None,
         filename: str,
         content_type: str | None = None,
         scope: ArtifactScope = ArtifactScope.SESSION,
@@ -92,8 +100,11 @@ class LocalArtifactStore(ArtifactStore):
         _validate_scope_owner(scope, session_id=session_id, environment_name=environment_name)
         copied_metadata = copy_durable_json_object(metadata or {}, "metadata")
 
+        resolved_artifact_id = (
+            _new_artifact_id() if artifact_id is None else _validate_artifact_id(artifact_id)
+        )
         artifact = ArtifactMetadata(
-            id=_new_artifact_id(),
+            id=resolved_artifact_id,
             filename=filename,
             content_type=content_type,
             size_bytes=len(content),
@@ -104,14 +115,37 @@ class LocalArtifactStore(ArtifactStore):
             metadata=copied_metadata,
         )
         try:
-            await asyncio.to_thread(
-                _write_artifact,
-                self.root,
-                self._root_identity,
-                artifact,
-                content,
-            )
-        except (ArtifactStoreUnavailableError, FileExistsError, TypeError, ValueError):
+            for attempt in range(3):
+                try:
+                    await asyncio.to_thread(
+                        _write_artifact,
+                        self.root,
+                        self._root_identity,
+                        artifact,
+                        content,
+                    )
+                    break
+                except FileExistsError:
+                    if artifact_id is None:
+                        raise
+                    try:
+                        existing = await self.read_bytes(resolved_artifact_id)
+                    except (FileNotFoundError, ValueError):
+                        if attempt >= 2:
+                            raise
+                        await asyncio.to_thread(
+                            _remove_matching_incomplete_artifact,
+                            self.root,
+                            self._root_identity,
+                            artifact,
+                            content,
+                        )
+                        continue
+                    _require_matching_artifact(existing, expected=artifact, content=content)
+                    return existing.metadata
+            else:
+                raise AssertionError("Artifact write retry loop did not terminate.")
+        except (ArtifactStoreUnavailableError, TypeError, ValueError):
             raise
         except OSError as exc:
             raise ArtifactStoreUnavailableError(
@@ -197,6 +231,17 @@ class LocalArtifactStore(ArtifactStore):
 
 def _new_artifact_id() -> str:
     return f"{_ARTIFACT_ID_PREFIX}{uuid4().hex}"
+
+
+def _validate_artifact_id(value: str) -> str:
+    try:
+        value = require_clean_nonblank(value, "artifact_id")
+        value = require_unicode_scalar_text(value, "artifact_id")
+    except (TypeError, ValueError) as exc:
+        raise InvalidArtifactIdError("Invalid local artifact id.") from exc
+    if _ARTIFACT_ID_PATTERN.fullmatch(value) is None:
+        raise InvalidArtifactIdError("Invalid local artifact id.")
+    return value
 
 
 def _validate_scope(value: ArtifactScope | str) -> ArtifactScope:
@@ -304,24 +349,28 @@ def _write_artifact(
     content: bytes,
 ) -> None:
     target = _artifact_dir(root, artifact.id)
+    staging_name = f"{artifact.id}.staging-{uuid4().hex}"
+    staging = root / staging_name
     with _open_store_root(root, root_identity) as root_fd:
         try:
             if root_fd is None:
-                target.mkdir(mode=0o700, parents=False)
+                staging.mkdir(mode=0o700, parents=False)
             else:
-                os.mkdir(artifact.id, mode=0o700, dir_fd=root_fd)
-        except FileExistsError as exc:
-            raise FileExistsError(f"Artifact already exists: {artifact.id}") from exc
+                os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
+        except FileExistsError as exc:  # pragma: no cover - UUID collision
+            raise ArtifactStoreUnavailableError(
+                "Local artifact staging directory already exists."
+            ) from exc
 
-        created_identity = _stat_identity(_stat_directory_entry(target, parent_fd=root_fd))
+        created_identity = _stat_identity(_stat_directory_entry(staging, parent_fd=root_fd))
         try:
-            with _open_artifact_directory(target, parent_fd=root_fd) as (
+            with _open_artifact_directory(staging, parent_fd=root_fd) as (
                 directory_fd,
                 directory_identity,
             ):
                 _write_artifact_file(
                     directory_fd,
-                    target,
+                    staging,
                     directory_identity,
                     _CONTENT_FILE,
                     content,
@@ -333,18 +382,198 @@ def _write_artifact(
                 ).encode("utf-8")
                 _write_artifact_file(
                     directory_fd,
-                    target,
+                    staging,
                     directory_identity,
                     _METADATA_FILE,
                     metadata_bytes,
                 )
+            try:
+                _rename_directory_no_replace(
+                    staging,
+                    target,
+                    parent_fd=root_fd,
+                )
+            except OSError as exc:
+                if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                    raise FileExistsError(f"Artifact already exists: {artifact.id}") from exc
+                raise
         except Exception:
             _remove_artifact_directory_if_unchanged(
-                target,
+                staging,
                 created_identity,
                 parent_fd=root_fd,
             )
             raise
+
+
+def _remove_matching_incomplete_artifact(
+    root: Path,
+    root_identity: tuple[int, int],
+    artifact: ArtifactMetadata,
+    content: bytes,
+) -> bool:
+    """Remove only a legacy partial directory for the same deterministic write."""
+
+    target = _artifact_dir(root, artifact.id)
+    with _open_store_root(root, root_identity) as root_fd:
+        try:
+            with _open_artifact_directory(target, parent_fd=root_fd) as (
+                directory_fd,
+                directory_identity,
+            ):
+                names = set(
+                    os.listdir(directory_fd) if directory_fd is not None else os.listdir(target)
+                )
+                if not names <= {_CONTENT_FILE, _METADATA_FILE}:
+                    raise ValueError("Incomplete artifact directory contains unexpected entries.")
+                if _CONTENT_FILE in names:
+                    content_fd = _open_artifact_file(
+                        directory_fd,
+                        target,
+                        directory_identity,
+                        _CONTENT_FILE,
+                        missing_message=f"Artifact content not found: {artifact.id}",
+                    )
+                    with os.fdopen(content_fd, "rb") as file:
+                        existing_content = file.read()
+                    if existing_content != content:
+                        raise ValueError(
+                            "Incomplete artifact content conflicts with deterministic retry."
+                        )
+                if _METADATA_FILE in names:
+                    try:
+                        existing_metadata = _load_metadata_from_directory(
+                            target,
+                            directory_fd,
+                            directory_identity,
+                        )
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        comparable_existing = existing_metadata.model_dump(
+                            mode="json",
+                            exclude={"created_at"},
+                        )
+                        comparable_expected = artifact.model_dump(
+                            mode="json",
+                            exclude={"created_at"},
+                        )
+                        if comparable_existing != comparable_expected:
+                            raise ValueError(
+                                "Incomplete artifact metadata conflicts with deterministic retry."
+                            )
+                        if _CONTENT_FILE in names:
+                            return False
+                incomplete_identity = directory_identity
+        except FileNotFoundError:
+            return True
+        quarantine_name = f"{artifact.id}.partial-{uuid4().hex}"
+        quarantine = root / quarantine_name
+        try:
+            if root_fd is None:
+                target.rename(quarantine)
+            else:
+                os.rename(
+                    artifact.id,
+                    quarantine_name,
+                    src_dir_fd=root_fd,
+                    dst_dir_fd=root_fd,
+                )
+        except FileNotFoundError:
+            return True
+        claimed_identity = _stat_identity(_stat_directory_entry(quarantine, parent_fd=root_fd))
+        if claimed_identity != incomplete_identity:
+            try:
+                if root_fd is None:
+                    quarantine.rename(target)
+                else:
+                    os.rename(
+                        quarantine_name,
+                        artifact.id,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd,
+                    )
+            except OSError as exc:
+                raise ArtifactStoreUnavailableError(
+                    "A completed artifact raced legacy partial-write recovery."
+                ) from exc
+            return False
+        _remove_artifact_directory_if_unchanged(
+            quarantine,
+            incomplete_identity,
+            parent_fd=root_fd,
+            ignore_errors=False,
+        )
+        try:
+            _stat_directory_entry(quarantine, parent_fd=root_fd)
+        except FileNotFoundError:
+            return True
+        return False
+
+
+def _rename_directory_no_replace(
+    source: Path,
+    target: Path,
+    *,
+    parent_fd: int | None,
+) -> None:
+    """Atomically publish a staged directory without replacing any target."""
+
+    if os.name == "nt":
+        os.rename(source, target)
+        return
+    if sys.platform == "darwin":
+        if parent_fd is None:
+            _call_native_rename(
+                "renamex_np",
+                (os.fsencode(source), os.fsencode(target), _RENAME_EXCL),
+            )
+        else:
+            _call_native_rename(
+                "renameatx_np",
+                (
+                    parent_fd,
+                    os.fsencode(source.name),
+                    parent_fd,
+                    os.fsencode(target.name),
+                    _RENAME_EXCL,
+                ),
+            )
+        return
+    if sys.platform.startswith("linux"):
+        source_fd = _AT_FDCWD if parent_fd is None else parent_fd
+        target_fd = _AT_FDCWD if parent_fd is None else parent_fd
+        source_path = source if parent_fd is None else Path(source.name)
+        target_path = target if parent_fd is None else Path(target.name)
+        _call_native_rename(
+            "renameat2",
+            (
+                source_fd,
+                os.fsencode(source_path),
+                target_fd,
+                os.fsencode(target_path),
+                _RENAME_NOREPLACE,
+            ),
+        )
+        return
+    raise ArtifactStoreUnavailableError(
+        "Local artifact publication requires atomic no-replace rename support."
+    )
+
+
+def _call_native_rename(function_name: str, arguments: tuple[object, ...]) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = getattr(libc, function_name)
+    except AttributeError as exc:
+        raise ArtifactStoreUnavailableError(
+            "Atomic no-replace rename is unavailable on this platform."
+        ) from exc
+    function.restype = ctypes.c_int
+    if function(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    raise OSError(error_number, os.strerror(error_number))
 
 
 def _read_artifact(

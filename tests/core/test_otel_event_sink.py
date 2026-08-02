@@ -564,6 +564,79 @@ def test_tool_span_carries_genai_tool_attributes() -> None:
     assert attrs["gen_ai.tool.call.id"] == "call_1"
 
 
+def test_tool_span_carries_bounded_projection_diagnostics() -> None:
+    exporter, sink = _make_sink()
+    events = _session_events("sess_projection")
+    events[4] = events[4].model_copy(
+        update={
+            "type": EventType.TOOL_CALL_FAILED,
+            "payload": {
+                "tool_call_id": "call_1",
+                "result": {
+                    "content": "private oversized preview content",
+                    "is_error": True,
+                },
+                "tool_result_projection": {
+                    "status": "externalized",
+                    "policy_id": "cayu.artifact_externalizing_tool_result.v1",
+                    "original_bytes": 40_000,
+                    "projected_bytes": 512,
+                    "original_token_estimate": 10_000,
+                    "projected_token_estimate": 128,
+                    "token_estimation_method": ("unicode_codepoints_divided_by_4_ceiling_v1"),
+                    "artifact_id": "art_11111111111111111111111111111111",
+                    "artifact_sha256": "a" * 64,
+                },
+            },
+        }
+    )
+
+    _drive(sink, events)
+
+    tool = _spans_by_name(exporter)["execute_tool exec_command"]
+    attrs = tool.attributes
+    assert attrs[otel.CAYU_TOOL_RESULT_PROJECTION_STATUS] == "externalized"
+    assert attrs[otel.CAYU_TOOL_RESULT_ORIGINAL_BYTES] == 40_000
+    assert attrs[otel.CAYU_TOOL_RESULT_PROJECTED_BYTES] == 512
+    assert attrs[otel.CAYU_TOOL_RESULT_ARTIFACT_ID] == ("art_11111111111111111111111111111111")
+    assert tool.status.status_code == StatusCode.ERROR
+    assert tool.status.description == "tool.call.failed"
+    assert "private oversized preview content" not in repr(attrs)
+    assert "private oversized preview content" not in str(tool.status.description)
+
+
+def test_unchanged_tool_projection_keeps_span_failure_description() -> None:
+    exporter, sink = _make_sink()
+    events = _session_events("sess_projection_unchanged")
+    events[4] = events[4].model_copy(
+        update={
+            "type": EventType.TOOL_CALL_FAILED,
+            "payload": {
+                "tool_call_id": "call_1",
+                "result": {
+                    "content": "ordinary tool failure",
+                    "is_error": True,
+                },
+                "tool_result_projection": {
+                    "status": "unchanged",
+                    "policy_id": "cayu.artifact_externalizing_tool_result.v1",
+                    "original_bytes": 21,
+                    "projected_bytes": 21,
+                    "original_token_estimate": 6,
+                    "projected_token_estimate": 6,
+                    "token_estimation_method": "unicode_codepoints_divided_by_4_ceiling_v1",
+                },
+            },
+        }
+    )
+
+    _drive(sink, events)
+
+    tool = _spans_by_name(exporter)["execute_tool exec_command"]
+    assert tool.status.status_code == StatusCode.ERROR
+    assert tool.status.description == "ordinary tool failure"
+
+
 def test_inbound_traceparent_roots_span_under_remote_trace() -> None:
     exporter, sink = _make_sink()
     _drive(

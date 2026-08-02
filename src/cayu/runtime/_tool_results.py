@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cayu._validation import (
     DurableValueError,
@@ -25,7 +25,15 @@ from cayu.runtime._diagnostics import (
     bound_diagnostic_text,
     exception_diagnostic,
 )
+from cayu.runtime.tool_result_projection import (
+    _TOOL_RESULT_PROJECTION_AUTHORITY_FIELD,
+    TOOL_RESULT_ARTIFACT_TYPE,
+    redact_tool_result_projection_content,
+)
 from cayu.vaults import SecretRedactor
+
+if TYPE_CHECKING:
+    from cayu.runtime.tool_result_projection import ToolResultProjection
 
 _MAX_DIAGNOSTIC_UTF8_BYTES = MAX_DIAGNOSTIC_UTF8_BYTES
 _MAX_PORTABLE_EVIDENCE_UTF8_BYTES = 12 * 1024
@@ -130,6 +138,20 @@ def redact_tool_result(result: ToolResult, redactor: SecretRedactor) -> ToolResu
         artifacts=redactor.redact_json(result.artifacts),
         is_error=result.is_error,
     )
+
+
+def strip_runtime_tool_result_projection_authority(
+    artifacts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove runtime-only ownership evidence from application-authored artifacts."""
+
+    copied = copy_durable_json_value(artifacts, "artifacts")
+    if type(copied) is not list:
+        raise AssertionError("Tool-result artifacts copied as a non-list.")
+    for artifact in copied:
+        if type(artifact) is dict and artifact.get("type") == TOOL_RESULT_ARTIFACT_TYPE:
+            artifact.pop(_TOOL_RESULT_PROJECTION_AUTHORITY_FIELD, None)
+    return copied
 
 
 def redact_tool_result_event(
@@ -244,21 +266,111 @@ def runtime_terminal_controls(payload: dict[str, Any]) -> dict[str, Any]:
     return controls
 
 
-def runtime_tool_event_controls(
+def runtime_tool_event_boundary_controls(
     payload: dict[str, Any],
     *,
     include_terminal_controls: bool = True,
-) -> dict[str, Any]:
-    """Return validated runtime-owned linkage and terminal control fields."""
+) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
+    """Return validated controls and strict projection references for publication."""
 
     if type(payload) is not dict:
         raise TypeError("Runtime tool event payload must be a dict.")
     if type(include_terminal_controls) is not bool:
         raise TypeError("include_terminal_controls must be a bool.")
     controls: dict[str, Any] = _runtime_tool_event_linkage_fields(payload)
+    projection_references: dict[int, dict[str, Any]] = {}
     if include_terminal_controls:
         controls.update(runtime_terminal_controls(payload))
-    return copy_durable_json_value(controls, "runtime_tool_event_controls")
+    evidence = _runtime_tool_result_projection(payload)
+    if evidence is not None:
+        projection, projection_references = evidence
+        controls["tool_result_projection"] = projection.record.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+    return (
+        copy_durable_json_value(controls, "runtime_tool_event_controls"),
+        {
+            index: copy_durable_json_value(
+                reference,
+                "runtime_tool_event_projection_reference",
+            )
+            for index, reference in projection_references.items()
+        },
+    )
+
+
+def project_runtime_tool_result_for_boundary(
+    *,
+    original_content: object,
+    redacted_artifacts: object,
+    references: dict[int, dict[str, Any]],
+    redactor: SecretRedactor,
+) -> tuple[str, list[object]]:
+    """Re-redact projected text and restore exactly one strict artifact reference."""
+
+    if type(original_content) is not str or type(redacted_artifacts) is not list:
+        raise AssertionError("Validated projection lost its content or artifacts.")
+    if len(references) != 1:
+        raise AssertionError("Validated projection must own exactly one artifact reference.")
+    artifact_index, reference = next(iter(references.items()))
+    if artifact_index >= len(redacted_artifacts):
+        raise AssertionError("Validated projection artifact position changed during redaction.")
+    artifact_id = reference.get("artifact_id")
+    if type(artifact_id) is not str:
+        raise AssertionError("Validated projection reference lost its artifact identity.")
+    readback_max_bytes = reference.get("readback_max_bytes")
+    if type(readback_max_bytes) is not int:
+        raise AssertionError("Validated projection reference lost its readback bound.")
+    content = redact_tool_result_projection_content(
+        original_content,
+        artifact_id=artifact_id,
+        readback_max_bytes=readback_max_bytes,
+        redact_text=redactor.redact_text,
+    )
+    artifacts = list(redacted_artifacts)
+    artifacts[artifact_index] = reference
+    return content, artifacts
+
+
+def _runtime_tool_result_projection(
+    payload: dict[str, Any],
+) -> tuple[ToolResultProjection, dict[int, dict[str, Any]]] | None:
+    record_payload = payload.get("tool_result_projection")
+    if record_payload is None:
+        return None
+    result_payload = payload.get("result")
+    if type(record_payload) is not dict or type(result_payload) is not dict:
+        raise TypeError("Projected tool-result events require object result and record fields.")
+
+    from cayu.runtime.tool_result_projection import (
+        ToolResultProjection,
+        ToolResultProjectionRecord,
+        ToolResultProjectionStatus,
+        _validate_externalized_projection_reference,
+    )
+
+    try:
+        projection = ToolResultProjection(
+            result=ToolResult(**copy_durable_json_value(result_payload, "projected_tool_result")),
+            record=ToolResultProjectionRecord.model_validate(
+                copy_durable_json_value(record_payload, "tool_result_projection")
+            ),
+        )
+    except (TypeError, ValueError):
+        return None
+    references: dict[int, dict[str, Any]] = {}
+    if projection.record.status is ToolResultProjectionStatus.EXTERNALIZED:
+        try:
+            reference = _validate_externalized_projection_reference(projection)
+        except (TypeError, ValueError):
+            return None
+        references = {
+            index: reference
+            for index, artifact in enumerate(projection.result.artifacts)
+            if artifact == reference
+        }
+    return projection, references
 
 
 def _tool_result_without_terminal_controls(

@@ -4,6 +4,7 @@ import asyncio
 import copy
 import importlib.util
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import ModuleType
 
@@ -17,7 +18,7 @@ from cayu.embeddings import (
     TextEmbeddingRequest,
     TextEmbeddingResult,
 )
-from cayu.providers import ModelStreamEvent, build_openai_payload
+from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, build_openai_payload
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.storage import KnowledgeEntry, KnowledgeHit, KnowledgeQuery, KnowledgeSearchResult
 
@@ -53,6 +54,7 @@ context_counting_live = _load_example("context_counting_live")
 knowledge_embedding_live = _load_example("knowledge_embedding_live")
 real_spend_budget_live = _load_example("real_spend_budget_live")
 structured_output_live = _load_example("structured_output_live")
+tool_result_projection_live = _load_example("tool_result_projection_live")
 
 DEMO_ONLY_EXAMPLES = (
     "context_pressure_calibration_live",
@@ -304,6 +306,204 @@ def test_artifact_file_contract_fails_when_provider_configuration_is_missing(
 
     with pytest.raises(SystemExit, match="provider configuration missing"):
         asyncio.run(artifact_file_live.main())
+
+
+def test_tool_result_projection_live_contract_requires_externalization_readback_and_usage() -> None:
+    artifact_id = f"art_{'a' * 32}"
+    evidence = tool_result_projection_live._validate_runtime_events(
+        [
+            _event(
+                EventType.TOOL_CALL_COMPLETED,
+                tool_name="large_report",
+                payload={
+                    "result": {
+                        "content": "bounded projection",
+                        "structured": {
+                            "receipt_id": tool_result_projection_live.RECEIPT_ID,
+                        },
+                        "artifacts": [
+                            {
+                                "type": "cayu.tool_result_artifact.v1",
+                                "artifact_id": artifact_id,
+                            }
+                        ],
+                    },
+                    "tool_result_projection": {
+                        "status": "externalized",
+                        "artifact_id": artifact_id,
+                        "original_bytes": 131_072,
+                        "projected_bytes": 256,
+                    },
+                },
+            ),
+            _event(
+                EventType.TOOL_CALL_COMPLETED,
+                tool_name="read_file",
+                payload={
+                    "result": {
+                        "content": "bounded artifact read\n\n[file truncated]",
+                        "structured": {
+                            "source": "artifact",
+                            "artifact_id": artifact_id,
+                            "bytes": 256,
+                            "total_bytes": 131_072,
+                            "truncated": True,
+                        },
+                    }
+                },
+            ),
+            _event(
+                EventType.MODEL_COMPLETED,
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "openai",
+                        "input_tokens": 200,
+                        "output_tokens": 20,
+                        "total_tokens": 220,
+                    }
+                },
+            ),
+            _event(EventType.SESSION_COMPLETED),
+        ],
+        provider_name="openai",
+        model="live-model",
+        large_report_calls=1,
+    )
+
+    assert evidence == {
+        "provider": "openai",
+        "model": "live-model",
+        "artifact_id": artifact_id,
+        "original_bytes": 131_072,
+        "projected_bytes": 256,
+        "readback_bytes": 256,
+        "readback_truncated": True,
+        "large_report_calls": 1,
+        "total_tokens": 220,
+    }
+
+
+class _ProjectionLiveProvider(ModelProvider):
+    name = "projection-live-test"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        request_index = len(self.requests) - 1
+        if request_index == 0:
+            yield ModelStreamEvent.tool_call(
+                id="call_large_report",
+                name="large_report",
+                arguments={},
+            )
+            yield self._completed("tool_calls")
+            return
+        if request_index == 1:
+            projected = next(
+                part
+                for message in request.messages
+                if message.role == "tool"
+                for part in message.content
+                if part.tool_call_id == "call_large_report"
+            )
+            assert projected.structured == {
+                "receipt_id": tool_result_projection_live.RECEIPT_ID,
+                "report_kind": "projection-live",
+            }
+            assert tool_result_projection_live.SECRET_CANARY not in projected.content
+            assert tool_result_projection_live.REPORT_END_MARKER not in projected.content
+            reference = projected.artifacts[-1]
+            assert reference["type"] == "cayu.tool_result_artifact.v1"
+            yield ModelStreamEvent.tool_call(
+                id="call_readback",
+                name="read_file",
+                arguments={"artifact_id": reference["artifact_id"], "max_bytes": 256},
+            )
+            yield self._completed("tool_calls")
+            return
+        if request_index == 2:
+            readback = next(
+                part
+                for message in request.messages
+                if message.role == "tool"
+                for part in message.content
+                if part.tool_call_id == "call_readback"
+            )
+            assert readback.structured["source"] == "artifact"
+            assert readback.structured["truncated"] is True
+            assert tool_result_projection_live.SECRET_CANARY not in readback.content
+            assert tool_result_projection_live.REPORT_END_MARKER not in readback.content
+            yield ModelStreamEvent.text_delta("projection live contract complete")
+            yield self._completed()
+            return
+        raise AssertionError(f"unexpected provider request {request_index}")
+
+    @staticmethod
+    def _completed(finish_reason: str = "stop") -> ModelStreamEvent:
+        return ModelStreamEvent.completed(
+            {
+                "finish_reason": finish_reason,
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 5,
+                    "total_tokens": 25,
+                },
+            }
+        )
+
+
+def test_tool_result_projection_live_contract_exercises_durable_runtime(tmp_path: Path) -> None:
+    provider = _ProjectionLiveProvider()
+
+    evidence = asyncio.run(
+        tool_result_projection_live._run_contract(
+            provider=provider,
+            provider_name=provider.name,
+            model="projection-live-model",
+            root=tmp_path / "run",
+        )
+    )
+
+    assert evidence["provider"] == provider.name
+    assert evidence["model"] == "projection-live-model"
+    assert evidence["large_report_calls"] == 1
+    assert evidence["provider_requests"] == 3
+    assert evidence["readback_truncated"] is True
+    assert evidence["artifact_bytes"] > 128 * 1024
+    assert evidence["total_tokens"] == 75
+    assert len(provider.requests) == 3
+
+
+def test_tool_result_projection_live_contract_selects_anthropic_from_its_only_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = object()
+    monkeypatch.delenv("CAYU_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-key")
+    monkeypatch.setattr(tool_result_projection_live, "AnthropicProvider", lambda: provider)
+
+    provider_name, model, configured_provider = tool_result_projection_live._provider_config()
+
+    assert provider_name == "anthropic"
+    assert model == "claude-sonnet-4-6"
+    assert configured_provider is provider
+
+
+def test_tool_result_projection_live_contract_scans_sqlite_wal_for_leaks(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "cayu.db"
+    database.write_bytes(b"safe database")
+    Path(f"{database}-wal").write_bytes(b"prefix forbidden-marker suffix")
+
+    with pytest.raises(RuntimeError, match=r"raw secret.*cayu\.db-wal"):
+        tool_result_projection_live._require_sqlite_files_exclude(
+            database,
+            {"raw secret": b"forbidden-marker"},
+        )
 
 
 def test_structured_output_contract_validates_expected_invoice_and_usage() -> None:

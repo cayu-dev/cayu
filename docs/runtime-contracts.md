@@ -916,7 +916,7 @@ conversation state.
 
 `before_tool_call` runs after `ToolPolicy` authorizes a call and before the tool executes — policy is the security gate, this phase is the transform layer. It receives `BeforeToolCallHookContext` (copied session data, tool name/id, copied arguments, optional task id, and the same controlled helpers as terminal hooks) and may return a `BeforeToolCallDecision`: `proceed` (or `None`) runs the tool unchanged, `proceed_modified` runs it with replaced `modified_arguments`, `short_circuit` skips the tool and uses a `synthetic_result`, and `block` skips the tool and returns an error result carrying `block_reason` as `tool.call.blocked`. Hooks compose in app-then-agent registration order, each seeing the prior hook's modified arguments; the first `short_circuit`/`block` stops the chain. When a hook replaces the arguments (`proceed_modified`), the effective arguments are **re-authorized by `ToolPolicy`** before the tool runs, so the gate always vets what actually executes — a hook cannot slip modified arguments past policy. A re-authorization that returns `deny` blocks the call; `require_approval` on hook-modified arguments also blocks (fail-safe) rather than re-entering approval, which is unsupported in v1. The executed (effective) arguments are what `after_tool_call`, `ToolCallOutcome`, and the result event's `effective_arguments` field carry; the `tool.call.started` event keeps the model's originally requested arguments. A hook-modified call is therefore authorized twice — once on the original arguments, once on the effective arguments; the re-authorization request carries `metadata[TOOL_POLICY_REAUTHORIZATION_METADATA_KEY] = True`, so a stateful policy (rate limiter, counter, audit sink) can re-verify the effective arguments while incrementing/logging only once.
 
-`after_tool_call` normally runs after the tool executes and **before** the tool result event is persisted, so it can rewrite the result the transcript keeps and the model sees. It receives `ToolCallHookContext` (copied session data, the tool event, tool name/id, copied arguments, copied `ToolResult`, optional task id, and the controlled helpers) and may return an `AfterToolCallDecision`: `pass_through` (or `None`) leaves the result unchanged, `modify` replaces it with `modified_result`. `modify` is honored only for **real tool outcomes** — the executed tool's `tool.call.completed`/`failed` result and a before-hook `short_circuit` result. If a dispatched tool with `idempotent` or `external` effects returns invalid output, raises, or times out, Cayu first persists its runtime-owned terminal failure and reconciliation controls; after-hooks then observe that immutable result. This closes the crash window after a possible irreversible effect. A `none`-effect tool failure retains the normal pre-persistence, modifiable hook contract. On other authority/infrastructure results — policy `tool.call.blocked`, an unregistered-tool error, a before-hook `block`, and operator approval denials — `after_tool_call` still runs but is observe-only, so a hook cannot rewrite a gate decision into a success. Secret redaction runs before `after_tool_call`, over both the result **and** the context arguments, so an after-hook never observes raw secrets; a modified result is re-redacted. (`before_tool_call` receives raw arguments by design — it is the input-transform layer, so a redact-an-argument hook must see the real value.) Except for the post-effect and approval-recovery cases just described, the `ToolCallHookContext.tool_event` handed to the hook is not yet persisted during this phase (it persists afterward, with the same id) — use `context.result`, do not reload it. Mutating the context's copied arguments or result is still a no-op — modification happens only through the returned decision. In the normal path, the tool result event (`tool.call.completed`/`failed`/`blocked`) is emitted after that phase's `hook.started`/`hook.completed` events; post-effect terminal evidence is emitted before hook telemetry. Both tool phases apply to subagent tool calls through app-level hooks, since a subagent reuses the parent `CayuApp`. A hook that raises or returns an invalid decision emits `hook.failed` and the call proceeds unmodified (before) or passes through (after); the tool round is never aborted by a hook error. The manual approval-recovery path (`resolve_tool_approval` supplying a recovered result) also persists before hooks run, so `after_tool_call` is observe-only there.
+`after_tool_call` normally runs after the tool executes and **before** the tool result event is persisted, so it can rewrite the result the transcript keeps and the model sees. It receives `ToolCallHookContext` (copied session data, the tool event, tool name/id, copied arguments, copied `ToolResult`, optional task id, and the controlled helpers) and may return an `AfterToolCallDecision`: `pass_through` (or `None`) leaves the result unchanged, `modify` replaces it with `modified_result`. `modify` is honored only for **real tool outcomes** — the executed tool's `tool.call.completed`/`failed` result and a before-hook `short_circuit` result. If a dispatched tool with `idempotent` or `external` effects returns invalid output, raises, or times out, Cayu first persists its runtime-owned terminal failure and reconciliation controls; after-hooks then observe that immutable result. This closes the crash window after a possible irreversible effect. A `none`-effect tool failure retains the normal pre-persistence, modifiable hook contract. On other authority/infrastructure results — policy `tool.call.blocked`, an unregistered-tool error, a before-hook `block`, and operator approval denials — `after_tool_call` still runs but is observe-only, so a hook cannot rewrite a gate decision into a success. Secret redaction runs before `after_tool_call`, over both the result **and** the context arguments, so an after-hook never observes raw secrets; a modified result is re-redacted. (`before_tool_call` receives raw arguments by design — it is the input-transform layer, so a redact-an-argument hook must see the real value.) When an opt-in tool-result projection policy is configured, it runs after that final redaction and before the terminal event, so hook-authored oversized text crosses the same durable boundary. Except for the post-effect and approval-recovery cases just described, the `ToolCallHookContext.tool_event` handed to the hook is not yet persisted during this phase (it persists afterward, with the same id) — use `context.result`, do not reload it. Mutating the context's copied arguments or result is still a no-op — modification happens only through the returned decision. In the normal path, the tool result event (`tool.call.completed`/`failed`/`blocked`) is emitted after that phase's `hook.started`/`hook.completed` events; post-effect terminal evidence is emitted before hook telemetry. Both tool phases apply to subagent tool calls through app-level hooks, since a subagent reuses the parent `CayuApp`. A hook that raises or returns an invalid decision emits `hook.failed` and the call proceeds unmodified (before) or passes through (after); the tool round is never aborted by a hook error. The manual approval-recovery path (`resolve_tool_approval` supplying a recovered result) also persists before hooks run, so `after_tool_call` is observe-only there.
 
 Hook helper side effects are persisted and sent to event sinks; the parent run stream yields the hook telemetry events. Hook-emitted custom events must use the `custom.` namespace. `CayuApp(runtime_hooks=[...])` registers app-level hooks for global middleware, while `register_agent(..., runtime_hooks=[...])` registers hooks that run only for that agent. App-level hooks run before agent-level hooks. Hooks that fork and dispatch follow-up sessions should still guard on session metadata, task type, or another app-owned marker when they can process their own follow-up sessions. This lets apps implement follow-up work such as “fork this completed builder session and dispatch a knowledge-extraction task” without making fork, task, or dispatch mean the same thing.
 
@@ -3902,7 +3902,7 @@ when the adapter crosses an external sandbox boundary.
 
 Uploaded/generated file reference boundary. Artifacts are not the active project filesystem. They are durable file blobs with metadata, content type, size, creation time, and explicit scope.
 
-`LocalArtifactStore` is available for local filesystem-backed artifact storage. It stores each artifact as content plus JSON metadata under one root. Local artifact ids use the exact generated form `art_` followed by 32 lowercase hexadecimal characters; malformed ids are rejected before filesystem access. The store pins the initialized root directory identity and anchors operations to a validated root directory descriptor where the platform supports directory-relative access. Replacing the configured root path, including with a symlink or Windows reparse point, makes the store unavailable rather than redirecting artifact I/O. Stored artifact directories, metadata, and content must be regular filesystem entries rather than symbolic links. Session-scoped artifacts require `session_id`; environment-scoped artifacts require `environment_name`. `read_file(artifact_id=...)` enforces that the artifact belongs to the current session or current environment before exposing content to the model.
+`LocalArtifactStore` is available for local filesystem-backed artifact storage. It stores each artifact as content plus JSON metadata under one root. Writes prepare both files in a private staging directory and atomically rename the complete directory into place with no-replace semantics, so a process crash cannot expose a newly partial artifact under its final id and a racing target is never overwritten. A deterministic retry reuses a committed exact match; it may also replace a legacy partial directory only after validating that any existing content and metadata match the same requested write. Concurrent identical writers therefore converge on one committed artifact, while malformed metadata, conflicting content, or unexpected filesystem entries fail closed. Local artifact ids use the exact generated form `art_` followed by 32 lowercase hexadecimal characters; malformed ids are rejected before filesystem access. The store pins the initialized root directory identity and anchors operations to a validated root directory descriptor where the platform supports directory-relative access. Replacing the configured root path, including with a symlink or Windows reparse point, makes the store unavailable rather than redirecting artifact I/O. Stored artifact directories, metadata, and content must be regular filesystem entries rather than symbolic links. Session-scoped artifacts require `session_id`; environment-scoped artifacts require `environment_name`. `read_file(artifact_id=...)` enforces that the artifact belongs to the current session or current environment before exposing content to the model.
 
 An `ArtifactStore.id` is a stable identity for the lifetime of the store. Within
 one `CayuApp`, distinct store instances must use distinct ids; registration
@@ -3918,6 +3918,138 @@ Environment(
     artifact_store=LocalArtifactStore("./.cayu/artifacts", store_id="local-artifacts"),
 )
 ```
+
+### Oversized terminal tool-result projection
+
+Tool-result externalization is opt-in and default-off. Without a projection
+policy, Cayu keeps the existing durable and model-facing `ToolResult` semantics.
+Applications that want a bounded terminal result can configure the built-in
+policy and make the ordinary bounded `read_file` tool available:
+
+```python
+from cayu import (
+    ArtifactExternalizingToolResultPolicy,
+    CayuApp,
+    ReadFileTool,
+)
+
+app = CayuApp(
+    tool_result_projection_policy=ArtifactExternalizingToolResultPolicy(
+        max_inline_bytes=32 * 1024,
+        max_inline_token_estimate=8 * 1024,
+        preview_bytes=2 * 1024,
+    )
+)
+
+# Register ReadFileTool() on agents that should be able to inspect the artifact.
+```
+
+A non-empty result is externalized when it is strictly greater than either
+configured threshold; equality remains inline. Either threshold may be
+disabled with `None`, but at least one must remain. The token value is an
+estimate, not provider tokenization: version 1 reports
+`unicode_codepoints_divided_by_4_ceiling_v1` by default and records both the
+original and projected estimate. The preview limit is a UTF-8 byte limit and
+never splits a Unicode scalar. The complete projected text is also subject to
+a 64 KiB runtime safety ceiling; configuration therefore caps the preview at
+60 KiB to leave room for the typed readback instruction. The built-in policy
+configuration is immutable after construction. A non-default
+`chars_per_token` value is encoded into the reported estimation-method
+identity. Application manifests and fingerprints include the built-in policy's
+byte threshold, token-estimate threshold, preview bound, and estimation-method
+identity, so deployments with different projection bounds remain
+distinguishable even though they use the same policy implementation.
+Each enabled threshold must also leave room for at least one byte of text plus
+`read_file`'s truncation marker. The typed artifact reference and generated
+instruction carry a derived `max_bytes` no larger than 32 KiB and small enough
+that the resulting text plus marker remains at or below every configured byte
+and token-estimate threshold. Following the generated instruction verbatim
+therefore cannot immediately externalize the readback result again.
+
+Direct tools and MCP tools cross one shared runtime boundary. Cayu validates
+and redacts the result, runs `after_tool_call`, re-redacts any hook
+modification, and only then invokes the projection policy. For an oversized
+result, artifact persistence completes before the terminal tool event can
+publish its typed `cayu.tool_result_artifact.v1` reference. That terminal event
+is the recovery authority used to build the atomic tool-round transcript
+publication and the next provider request. `structured`, `is_error`, existing
+artifact references (including provider-native image/document references), and
+runtime-owned effect evidence keep their existing meaning; only model-facing
+text is replaced. Publication boundaries positively validate the projection
+record and typed reference before preserving their runtime-owned identifiers;
+malformed lookalikes remain on the ordinary untrusted redaction path. This
+prevents a registered secret that happens to overlap an artifact id, hash,
+scope, type, or status from rewriting the committed reference after the source
+tool result has already been redacted. On a new write, this exemption is
+available only to result-bearing terminal or blocked tool events whose
+projection record carries positive in-process runtime provenance. Fabricated
+projection shapes on started, approval, or unattested terminal events stay on
+the untrusted path; persisted side-effect delivery may restore only the record
+that already crossed this new-write boundary. The typed reference carries a
+runtime-issued projection-authority discriminator. Ingress messages and
+application-authored tool artifacts cannot assert that discriminator: Cayu
+removes it before ordinary redaction, while the built-in policy adds it only
+after the final source-result redaction. A later or recovered publication
+re-redacts the preview with the current workload-secret registry and rebuilds
+only the bounded `read_file` instruction from the validated artifact identity;
+it never restores earlier preview text wholesale. Every valid projection
+status resynchronizes projected byte and token-estimate evidence to that
+current boundary-safe content.
+
+The built-in policy derives an `art_...` identity from the session id, logical
+tool-call id, and SHA-256 of the redacted UTF-8 content. Its artifact metadata
+records the versioned policy/type, logical identity hash, content hash, and
+tool-call hash; the published reference records store identity, content type,
+size, scope, a fixed session-identity hash, and content hash. The complete
+serialized reference has a 4 KiB safety ceiling and never copies an unbounded
+raw session id. `LocalArtifactStore` and
+`S3ArtifactStore` accept this caller-supplied identity idempotently: an exact
+content/metadata retry reuses the object, while a conflict fails. The S3
+content object precedes its metadata commit marker, and a retry can complete a
+missing marker after verifying already-uploaded bytes. Because cancellation
+cannot stop an in-flight threaded S3 request, the built-in store settles the
+content upload and metadata commit before redelivering caller cancellation; a
+late successful upload therefore remains discoverable instead of leaving a
+content-only object. If that metadata commit fails, the cancelled invocation
+settles cleanup of content it created before redelivering cancellation. A
+store identity copied into the model-facing reference is limited to 256 UTF-8
+bytes; a store with a larger identity fails projection before artifact
+persistence.
+
+If the artifact store is missing, unavailable, or returns an invalid object,
+Cayu publishes an explicit bounded projection-failure result. It never falls
+back to the oversized text, and it retains structured receipts, existing
+artifacts, and error disposition. A failure after artifact persistence but
+before session publication can leave an unreferenced object, but recovery
+reuses the same deterministic identity and the terminal projection rather than
+executing the tool or externalizing again. Operators can identify a possible
+orphan by artifact metadata type, session scope, logical identity hash, and the
+absence of the artifact id from terminal tool evidence; automatic garbage
+collection is intentionally outside this policy. Projection persistence has a
+30-second runtime deadline. Cayu asks a timed-out policy task to cancel,
+publishes a bounded `projection_timeout` failure, and continues interruption or
+terminal publication instead of leaving a session in `interrupting`
+indefinitely. A custom policy or store must cooperate with task cancellation.
+If it completes after the deadline despite cancellation, its deterministic
+object is a possible publication orphan identifiable by the same metadata
+described above. When operator cancellation arrives while persistence is
+already completing, Cayu consumes the completed projection (or its bounded
+failure), publishes that terminal evidence, and only then redelivers
+cancellation. Resume therefore does not rerun the completed tool or repeat the
+store write.
+
+Terminal events, Python logs, and OpenTelemetry tool spans expose only bounded
+projection diagnostics: status, policy id, original/projected byte and token
+estimates, estimation method, artifact id/hash, and safe failure type. They do
+not include externalized or projection-failure content or backend exception
+messages. An `unchanged` failed tool result retains its ordinary bounded,
+redacted failure reason in logs and span status because its content was not
+replaced.
+
+This feature bounds a completed tool's model-facing text. It does not replace
+oversized prompt-file fallback, stream progress from a running tool, compact
+older conversation context, or semantically summarize tool output. Artifact
+readback remains explicit and bounded through `ReadFileTool`.
 
 Artifact reads and listings are bounded through `max_bytes`, `max_attachment_bytes`, and `limit`. `ArtifactStore.read_bytes(..., max_bytes=N)` is a hard materialization contract: implementations must not read into application memory or return more than `N` content bytes, and must mark the result truncated when more bytes exist. Server and tool callers rely on this guarantee for custom stores as well as `LocalArtifactStore`. Store implementations raise `InvalidArtifactIdError` for ids that are syntactically invalid for that store, `FileNotFoundError` for valid ids that do not exist, and `ArtifactStoreUnavailableError` for operational backend failures; other validation failures indicate invalid store data. The control-plane artifact APIs consistently expose operational failures as typed `503` responses and invalid store results as typed `500` responses. Read consumers revalidate store results, reject content returned beyond the requested bound, require returned metadata to identify the requested artifact, and require `metadata.size_bytes` to equal the reported full byte count. Artifact metadata records and their nested JSON metadata are immutable after construction. Text artifacts are decoded as UTF-8 with replacement for invalid bytes. Workspace image/PDF path reads are first captured into session-scoped artifact snapshots so the inspected bytes are durable across replay, resume, fork, and provider projection. Image and PDF artifacts return a small model-facing note plus a persisted `cayu.file_attachment.v1` reference in the tool result only after the built-in reader validates that the bytes are parseable. The persisted transcript/event stores the reference, not base64 bytes.
 

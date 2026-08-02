@@ -23,12 +23,16 @@ from cayu.runtime.tool_policy import (
     TaintAwareToolPolicy,
     ToolPolicy,
 )
+from cayu.runtime.tool_result_projection import (
+    ArtifactExternalizingToolResultPolicy,
+    ToolResultProjectionPolicy,
+)
 
 if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "6"
+APP_MANIFEST_SCHEMA_VERSION = "7"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -215,6 +219,14 @@ class ApplicationDefaultsManifest(_ManifestModel):
     environment: str | None
 
 
+class ToolResultProjectionPolicyManifest(_ManifestModel):
+    identity: str
+    max_inline_bytes: int | None = None
+    max_inline_token_estimate: int | None = None
+    preview_bytes: int | None = None
+    token_estimation_method: str | None = None
+
+
 class RuntimeManifest(_ManifestModel):
     dispatcher: str
     retry_policy: str | None
@@ -223,6 +235,7 @@ class RuntimeManifest(_ManifestModel):
     loop_policies: tuple[str, ...]
     event_sinks: tuple[str, ...]
     mcp_manifest_policy: str | None
+    tool_result_projection_policy: ToolResultProjectionPolicyManifest | None
     context_counting: str
     max_file_attachment_bytes: int
     max_total_file_attachment_bytes: int
@@ -233,7 +246,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["6"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["7"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -296,6 +309,9 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
         loop_policies=tuple(_type_name(item) for item in app._loop_policies),
         event_sinks=tuple(_type_name(item) for item in app._event_sinks),
         mcp_manifest_policy=_optional_type_name(app._mcp_manifest_policy),
+        tool_result_projection_policy=_tool_result_projection_policy_manifest(
+            app._tool_result_projection_policy
+        ),
         context_counting=_type_name(app._context_counting),
         max_file_attachment_bytes=app._max_file_attachment_bytes,
         max_total_file_attachment_bytes=app._max_total_file_attachment_bytes,
@@ -335,6 +351,22 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
             "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         }
     )
+
+
+def _tool_result_projection_policy_manifest(
+    policy: ToolResultProjectionPolicy | None,
+) -> ToolResultProjectionPolicyManifest | None:
+    if policy is None:
+        return None
+    if isinstance(policy, ArtifactExternalizingToolResultPolicy):
+        return ToolResultProjectionPolicyManifest(
+            identity=policy.identity,
+            max_inline_bytes=policy.max_inline_bytes,
+            max_inline_token_estimate=policy.max_inline_token_estimate,
+            preview_bytes=policy.preview_bytes,
+            token_estimation_method=policy.token_estimation_method,
+        )
+    return ToolResultProjectionPolicyManifest(identity=policy.identity)
 
 
 def _describe_agent(

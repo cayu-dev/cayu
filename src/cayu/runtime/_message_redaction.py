@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from typing import cast
+from typing import Any, cast
 
 from cayu.core.messages import Message
 from cayu.runtime import _tool_results as tool_results
+from cayu.runtime.tool_result_projection import (
+    _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS,
+    TOOL_RESULT_ARTIFACT_TYPE,
+    _validate_builtin_tool_result_artifact_reference,
+)
 from cayu.vaults import SecretRedactor
 
 _MESSAGE_ROOT_STRUCTURE_KEYS = frozenset({"content", "role"})
@@ -105,11 +110,44 @@ _MESSAGE_PRESERVED_STRING_FIELDS = _MESSAGE_AUTHORITY_STRING_FIELDS | {
 }
 
 
-def redact_message_for_boundary(
+def redact_untrusted_message_for_boundary(
     message: Message,
     *,
     redactor: SecretRedactor,
     field_name: str,
+) -> Message:
+    """Redact untrusted ingress without accepting runtime projection authority."""
+
+    return _redact_message_for_boundary(
+        message,
+        redactor=redactor,
+        field_name=field_name,
+        trust_runtime_tool_result_projection=False,
+    )
+
+
+def redact_runtime_message_for_boundary(
+    message: Message,
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> Message:
+    """Redact runtime-owned transcript state after validating projection authority."""
+
+    return _redact_message_for_boundary(
+        message,
+        redactor=redactor,
+        field_name=field_name,
+        trust_runtime_tool_result_projection=True,
+    )
+
+
+def _redact_message_for_boundary(
+    message: Message,
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+    trust_runtime_tool_result_projection: bool,
 ) -> Message:
     """Redact one message without rewriting executable protocol authorities."""
 
@@ -118,6 +156,8 @@ def redact_message_for_boundary(
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
     payload = message.model_dump(mode="json")
+    if not trust_runtime_tool_result_projection:
+        _strip_untrusted_runtime_tool_result_projection_authority(payload)
     content = payload.get("content")
     if type(content) is not list:
         raise AssertionError("Message serialization returned non-list content.")
@@ -126,12 +166,17 @@ def redact_message_for_boundary(
         content=content,
         redactor=redactor,
         field_name=field_name,
+        trust_runtime_tool_result_projection=trust_runtime_tool_result_projection,
     )
     redacted_content: list[object] = []
     for index, part in enumerate(content):
         if type(part) is not dict:
             raise AssertionError("Message content serialized as a non-object.")
         part = cast("dict[str, object]", part)
+        projection_references = _runtime_tool_result_artifact_references(
+            part,
+            trust_runtime_tool_result_projection=trust_runtime_tool_result_projection,
+        )
         # Protocol linkage and routing fields are executable authority. They
         # must fail closed instead of being rewritten into a different value.
         for authority_field in _MESSAGE_AUTHORITY_STRING_FIELDS:
@@ -147,6 +192,17 @@ def redact_message_for_boundary(
         )
         if type(redacted_part) is not dict:
             raise AssertionError("Message part redaction returned a non-object.")
+        if projection_references:
+            projected_content, projected_artifacts = (
+                tool_results.project_runtime_tool_result_for_boundary(
+                    original_content=part.get("content"),
+                    redacted_artifacts=redacted_part.get("artifacts"),
+                    references=projection_references,
+                    redactor=redactor,
+                )
+            )
+            redacted_part["content"] = projected_content
+            redacted_part["artifacts"] = projected_artifacts
         structured = part.get("structured")
         if type(structured) is dict:
             terminal_controls = _recognized_runtime_terminal_controls(
@@ -170,6 +226,7 @@ def _require_secret_free_message_keys(
     content: list[object],
     redactor: SecretRedactor,
     field_name: str,
+    trust_runtime_tool_result_projection: bool,
 ) -> None:
     """Validate message keys against the schema that owns each typed container."""
 
@@ -191,6 +248,7 @@ def _require_secret_free_message_keys(
             raise AssertionError("Message content serialized with an unknown part type.")
         part_to_validate = part
         attachment: object | None = None
+        artifacts: object | None = None
         structured: object | None = None
         if part_type == "file":
             part_to_validate = dict(part)
@@ -198,7 +256,9 @@ def _require_secret_free_message_keys(
             part_to_validate["attachment"] = None
         elif part_type == "tool_result":
             part_to_validate = dict(part)
+            artifacts = part_to_validate.get("artifacts")
             structured = part_to_validate.get("structured")
+            part_to_validate["artifacts"] = None
             part_to_validate["structured"] = None
         redactor.require_no_secret_keys(
             part_to_validate,
@@ -220,13 +280,95 @@ def _require_secret_free_message_keys(
                 untrusted_container_keys={"metadata"},
                 match_short_substrings=True,
             )
-        elif part_type == "tool_result" and type(structured) is dict:
-            _require_secret_free_tool_result_structure(
-                part,
-                structured=cast("dict[str, object]", structured),
+        elif part_type == "tool_result":
+            _require_secret_free_tool_result_artifacts(
+                artifacts,
                 redactor=redactor,
-                field_name=f"{field_name}.content[{index}].structured",
+                field_name=f"{field_name}.content[{index}].artifacts",
+                trust_runtime_tool_result_projection=(trust_runtime_tool_result_projection),
             )
+            if type(structured) is dict:
+                _require_secret_free_tool_result_structure(
+                    part,
+                    structured=cast("dict[str, object]", structured),
+                    redactor=redactor,
+                    field_name=f"{field_name}.content[{index}].structured",
+                )
+
+
+def _runtime_tool_result_artifact_references(
+    part: dict[str, object],
+    *,
+    trust_runtime_tool_result_projection: bool,
+) -> dict[int, dict[str, object]]:
+    if not trust_runtime_tool_result_projection or part.get("type") != "tool_result":
+        return {}
+    artifacts = part.get("artifacts")
+    if type(artifacts) is not list:
+        return {}
+    references: dict[int, dict[str, object]] = {}
+    for index, artifact in enumerate(artifacts):
+        if type(artifact) is not dict:
+            continue
+        artifact = cast("dict[str, Any]", artifact)
+        if artifact.get("type") != TOOL_RESULT_ARTIFACT_TYPE:
+            continue
+        try:
+            reference = _validate_builtin_tool_result_artifact_reference(artifact)
+        except (TypeError, ValueError):
+            continue
+        references[index] = cast("dict[str, object]", reference)
+    return references
+
+
+def _require_secret_free_tool_result_artifacts(
+    artifacts: object,
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+    trust_runtime_tool_result_projection: bool,
+) -> None:
+    if type(artifacts) is not list:
+        raise AssertionError("Tool result artifacts serialized as a non-list.")
+    references = _runtime_tool_result_artifact_references(
+        {
+            "type": "tool_result",
+            "artifacts": artifacts,
+        },
+        trust_runtime_tool_result_projection=trust_runtime_tool_result_projection,
+    )
+    for index, artifact in enumerate(artifacts):
+        if type(artifact) is not dict:
+            raise AssertionError("Tool result artifact serialized as a non-object.")
+        reference = references.get(index)
+        redactor.require_no_secret_keys(
+            artifact if reference is None else reference,
+            field_name=f"{field_name}[{index}]",
+            preserve_keys=(
+                () if reference is None else _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS
+            ),
+            match_short_substrings=True,
+        )
+
+
+def _strip_untrusted_runtime_tool_result_projection_authority(
+    payload: dict[str, object],
+) -> None:
+    content = payload.get("content")
+    if type(content) is not list:
+        return
+    for part in content:
+        if type(part) is not dict:
+            continue
+        part = cast("dict[str, object]", part)
+        if part.get("type") != "tool_result":
+            continue
+        artifacts = part.get("artifacts")
+        if type(artifacts) is not list:
+            continue
+        part["artifacts"] = tool_results.strip_runtime_tool_result_projection_authority(
+            cast("list[dict[str, Any]]", artifacts)
+        )
 
 
 def _require_secret_free_tool_result_structure(

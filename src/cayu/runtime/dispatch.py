@@ -22,7 +22,7 @@ from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._diagnostics import ExceptionDiagnostic
-from cayu.runtime._message_redaction import redact_message_for_boundary
+from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 from cayu.runtime.budgets import BudgetLimit, copy_request_budget_limits
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
@@ -682,7 +682,7 @@ def redact_dispatch_request(
     return DispatchRequest(
         session_id=request.session_id,
         messages=[
-            redact_message_for_boundary(
+            redact_untrusted_message_for_boundary(
                 message,
                 redactor=redactor,
                 field_name="DispatchRequest.messages",

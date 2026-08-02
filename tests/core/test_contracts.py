@@ -3516,6 +3516,108 @@ def test_local_artifact_store_enforces_scope_owners_and_limits(tmp_path):
     assert malformed_artifact_dir.name not in {artifact.id for artifact in listed.artifacts}
 
 
+def test_local_artifact_store_repairs_matching_partial_deterministic_write(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact_id = f"art_{'a' * 32}"
+    partial = store.root / artifact_id
+    partial.mkdir()
+    (partial / "content").write_bytes(b"retry-safe-content")
+
+    artifact = asyncio.run(
+        store.put_bytes(
+            b"retry-safe-content",
+            artifact_id=artifact_id,
+            filename="retry.txt",
+            content_type="text/plain",
+            session_id="sess_retry",
+            metadata={"logical_identity": "same-operation"},
+        )
+    )
+
+    read = asyncio.run(store.read_bytes(artifact_id))
+    assert artifact.id == artifact_id
+    assert read.metadata == artifact
+    assert read.content == b"retry-safe-content"
+    assert [path.name for path in store.root.iterdir()] == [artifact_id]
+
+
+def test_local_artifact_store_rejects_malformed_partial_metadata(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact_id = f"art_{'c' * 32}"
+    partial = store.root / artifact_id
+    partial.mkdir()
+    (partial / "content").write_bytes(b"retry-safe-content")
+    (partial / "metadata.json").write_text("{malformed", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="metadata is not valid JSON"):
+        asyncio.run(
+            store.put_bytes(
+                b"retry-safe-content",
+                artifact_id=artifact_id,
+                filename="retry.txt",
+                content_type="text/plain",
+                session_id="sess_retry",
+            )
+        )
+
+    assert (partial / "content").read_bytes() == b"retry-safe-content"
+    assert (partial / "metadata.json").read_text(encoding="utf-8") == "{malformed"
+
+
+def test_local_artifact_store_atomic_publish_does_not_replace_empty_target(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact_id = f"art_{'d' * 32}"
+    target = store.root / artifact_id
+    target.mkdir()
+    artifact = ArtifactMetadata(
+        id=artifact_id,
+        filename="atomic.txt",
+        content_type="text/plain",
+        size_bytes=6,
+        session_id="sess_atomic",
+    )
+
+    with pytest.raises(FileExistsError):
+        artifact_local_module._write_artifact(
+            store.root,
+            store._root_identity,
+            artifact,
+            b"atomic",
+        )
+
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+    assert [path.name for path in store.root.iterdir()] == [artifact_id]
+
+
+def test_local_artifact_store_concurrent_deterministic_writes_publish_once(tmp_path):
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact_id = f"art_{'b' * 32}"
+    partial = store.root / artifact_id
+    partial.mkdir()
+    (partial / "content").write_bytes(b"shared-content")
+
+    async def write_twice():
+        return await asyncio.gather(
+            *(
+                store.put_bytes(
+                    b"shared-content",
+                    artifact_id=artifact_id,
+                    filename="shared.txt",
+                    content_type="text/plain",
+                    session_id="sess_shared",
+                )
+                for _ in range(2)
+            )
+        )
+
+    first, second = asyncio.run(write_twice())
+
+    assert first == second
+    assert asyncio.run(store.read_bytes(artifact_id)).content == b"shared-content"
+    assert [path.name for path in store.root.iterdir()] == [artifact_id]
+
+
 def test_local_artifact_store_rejects_symlinked_artifact_files(tmp_path):
     store = LocalArtifactStore(tmp_path / "artifacts")
     artifact = asyncio.run(

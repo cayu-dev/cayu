@@ -64,6 +64,7 @@ MAX_EDIT_OPERATIONS = 100
 MAX_FILE_REVISION_CHARS = 4096
 DEFAULT_LIST_LIMIT = 500
 MAX_LIST_LIMIT = 10_000
+_READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
 
 IMAGE_CONTENT_TYPES = FILE_ATTACHMENT_IMAGE_CONTENT_TYPES
 PDF_CONTENT_TYPE = "application/pdf"
@@ -856,7 +857,7 @@ class TextArtifactReader:
         )
         truncated = request.initial_read.truncated or redaction_truncated
         return ToolResult(
-            content=f"{text}\n\n[file truncated]" if truncated else text,
+            content=f"{text}{_READ_FILE_TRUNCATION_MARKER}" if truncated else text,
             structured={
                 **request.structured,
                 "encoding": "utf-8",

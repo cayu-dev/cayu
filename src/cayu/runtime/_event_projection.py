@@ -6,7 +6,11 @@ from datetime import datetime
 from hmac import compare_digest
 from typing import Any, cast
 
-from cayu._validation import MAX_DURABLE_JSON_INTEGER, collision_safe_json_object
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    collision_safe_json_object,
+    copy_durable_json_value,
+)
 from cayu.core.events import (
     Event,
     EventType,
@@ -31,6 +35,10 @@ from cayu.runtime.public_authority import (
     PUBLIC_AUTHORITY_ALIAS_PREFIX,
     PublicAuthorityAliasCodec,
     parse_public_authority_alias,
+)
+from cayu.runtime.tool_result_projection import (
+    _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+    reestimate_tool_result_projection_tokens,
 )
 from cayu.vaults.redaction import SecretRedactor
 
@@ -88,6 +96,13 @@ class EventPayloadPolicy:
             raise ValueError("Nested event schema paths require an owned top-level key.")
 
 
+@dataclass(frozen=True, slots=True)
+class _ToolEventBoundary:
+    controls: dict[str, Any]
+    projection_references: dict[int, dict[str, Any]]
+    malformed: bool = False
+
+
 _MODEL_EXECUTION_AUTHORITY_KEYS = frozenset(
     {
         "model_attempt_id",
@@ -105,6 +120,18 @@ _TOOL_LINKAGE_AUTHORITY_KEYS = frozenset(
         "task_id",
         "tool_call_id",
         "tool_round_id",
+    }
+)
+_TOOL_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        EventType.TOOL_CALL_APPROVED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+        EventType.TOOL_CALL_APPROVAL_EXPIRED,
     }
 )
 _INTERACTION_STATUS_BY_EVENT = {
@@ -599,11 +626,35 @@ _TOOL_RESULT_NESTED_PATHS = frozenset(
         ("result", "structured", "durable_value_error_path"),
     }
 )
+_TOOL_RESULT_PROJECTION_RECORD_FIELDS = frozenset(
+    {
+        "artifact_id",
+        "artifact_sha256",
+        "failure_type",
+        "logical_identity_sha256",
+        "original_bytes",
+        "original_token_estimate",
+        "policy_id",
+        "projected_bytes",
+        "projected_token_estimate",
+        "schema_version",
+        "status",
+        "token_estimation_method",
+        "tool_call_id_sha256",
+    }
+)
+_TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS = frozenset(
+    ("tool_result_projection", field_name) for field_name in _TOOL_RESULT_PROJECTION_RECORD_FIELDS
+)
+_TOOL_EVENT_NESTED_PATHS = _TOOL_RESULT_NESTED_PATHS | _TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS
 _TOOL_DENIAL_RESULT_NESTED_PATHS = _TOOL_RESULT_NESTED_PATHS | {
     ("result", "structured", "decision"),
     ("result", "structured", "error"),
     ("result", "structured", "reason"),
 }
+_TOOL_PROJECTED_DENIAL_RESULT_NESTED_PATHS = (
+    _TOOL_DENIAL_RESULT_NESTED_PATHS | _TOOL_RESULT_PROJECTION_RECORD_NESTED_PATHS
+)
 _TOOL_RESULT_NESTED_AUTHORITY_PATHS = frozenset(
     {("result", "structured", field_name) for field_name in _TOOL_LINKAGE_AUTHORITY_KEYS}
 )
@@ -1173,7 +1224,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             "limit",
             "reason",
             "resolved_by",
-            owned_nested_paths=_TOOL_RESULT_NESTED_PATHS | tool_actor_paths,
+            "tool_result_projection",
+            owned_nested_paths=_TOOL_EVENT_NESTED_PATHS | tool_actor_paths,
             authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
             aliased_authority_keys={
                 "approval_id",
@@ -1201,7 +1253,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "decision",
         "denied_by",
         "reason",
-        owned_nested_paths=_TOOL_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
+        "tool_result_projection",
+        owned_nested_paths=_TOOL_PROJECTED_DENIAL_RESULT_NESTED_PATHS | tool_actor_paths,
         authority_keys=_TOOL_LINKAGE_AUTHORITY_KEYS,
         aliased_authority_keys={
             "approval_id",
@@ -1756,10 +1809,19 @@ def _prepare_runtime_event(
     _validate_fixed_field_types(event, policy=policy)
     if validate_budget_payload:
         _validate_budget_payload_schema(event)
+    tool_event_boundary = _recognized_tool_event_boundary(
+        event,
+        reject_malformed=True,
+        trust_persisted_projection=False,
+    )
+    projection_references = (
+        {} if tool_event_boundary is None else tool_event_boundary.projection_references
+    )
     _require_no_secret_payload_keys(
         event.payload,
         policy=policy,
         redactor=redactor,
+        projection_references=projection_references,
     )
     _reject_secret_authority_values(
         event,
@@ -1771,11 +1833,15 @@ def _prepare_runtime_event(
         policy=policy,
         redactor=redactor,
     )
-    controls = _recognized_controls(event)
+    controls = _recognized_controls(
+        event,
+        tool_event_boundary=tool_event_boundary,
+    )
     redacted_payload = _redact_payload(
         event.payload,
         policy=policy,
         redactor=redactor,
+        projection_references=projection_references,
     )
     _restore_runtime_payload_authority(
         event,
@@ -1792,6 +1858,12 @@ def _prepare_runtime_event(
         redacted_payload=redacted_payload,
         redactor=redactor,
     )
+    _restore_runtime_tool_result_projection(
+        event,
+        redacted_payload=redacted_payload,
+        references=projection_references,
+        redactor=redactor,
+    )
     redacted_payload.update(_top_level_controls(controls))
     _restore_nested_controls(
         event,
@@ -1802,6 +1874,10 @@ def _prepare_runtime_event(
         event,
         redacted_payload=redacted_payload,
         reject_malformed=True,
+    )
+    _synchronize_runtime_tool_result_projection_record(
+        redacted_payload,
+        controls=controls,
     )
     return _copy_projected_event(
         event,
@@ -1821,15 +1897,64 @@ def project_runtime_event(
     redactor: SecretRedactor,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
 ) -> Event:
+    """Project an untrusted or legacy record without granting projection authority."""
+
+    return _project_runtime_event(
+        event,
+        sequence=sequence,
+        redactor=redactor,
+        public_authority_alias_codec=public_authority_alias_codec,
+        trust_persisted_projection=False,
+    )
+
+
+def project_persisted_runtime_event(
+    event: Event,
+    *,
+    sequence: int,
+    redactor: SecretRedactor,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+) -> Event:
     """Project one durable record for an external consumer.
 
     The caller retains the original record for claims, accounting, cursor
     advancement, and terminal-lineage decisions.
     """
 
+    return _project_runtime_event(
+        event,
+        sequence=sequence,
+        redactor=redactor,
+        public_authority_alias_codec=public_authority_alias_codec,
+        trust_persisted_projection=True,
+    )
+
+
+def _project_runtime_event(
+    event: Event,
+    *,
+    sequence: int,
+    redactor: SecretRedactor,
+    public_authority_alias_codec: PublicAuthorityAliasCodec | None,
+    trust_persisted_projection: bool,
+) -> Event:
+    """Apply the shared public projection with an internal persisted-record capability."""
+
     _validate_inputs(event, redactor)
     policy = event_payload_policy(event.type)
-    controls = _recognized_controls(event, reject_malformed=False)
+    tool_event_boundary = _recognized_tool_event_boundary(
+        event,
+        reject_malformed=False,
+        trust_persisted_projection=trust_persisted_projection,
+    )
+    projection_references = (
+        {} if tool_event_boundary is None else tool_event_boundary.projection_references
+    )
+    controls = _recognized_controls(
+        event,
+        reject_malformed=False,
+        tool_event_boundary=tool_event_boundary,
+    )
     resolvable_alias_fields = _resolvable_alias_fields(event, policy=policy)
     redacted_payload = _redact_payload(
         event.payload,
@@ -1839,6 +1964,7 @@ def project_runtime_event(
         resolvable_alias_fields=resolvable_alias_fields,
         public_authority_alias_codec=public_authority_alias_codec,
         envelope_alias_session_id=event.session_id,
+        projection_references=projection_references,
     )
     _restore_policy_denial_truncation_markers(
         event,
@@ -1850,6 +1976,12 @@ def project_runtime_event(
         policy=policy,
         redacted_payload=redacted_payload,
         controls=controls,
+    )
+    _restore_runtime_tool_result_projection(
+        event,
+        redacted_payload=redacted_payload,
+        references=projection_references,
+        redactor=redactor,
     )
     for key in policy.authority_keys:
         if key not in redacted_payload or redacted_payload[key] is None:
@@ -1880,6 +2012,10 @@ def project_runtime_event(
         event,
         redacted_payload=redacted_payload,
         reject_malformed=False,
+    )
+    _synchronize_runtime_tool_result_projection_record(
+        redacted_payload,
+        controls=controls,
     )
     event_type: EventType | str = event.type
     if not isinstance(event_type, EventType) and redactor.redact_text(str(event_type)) != str(
@@ -2200,7 +2336,10 @@ def _redact_payload(
     resolvable_alias_fields: Collection[str] = (),
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
     envelope_alias_session_id: str | None = None,
+    projection_references: Mapping[int, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    strict_projection_references = projection_references or {}
+
     def redact(
         value: Any,
         *,
@@ -2265,14 +2404,29 @@ def _redact_payload(
                 )
             return collision_safe_json_object(items, preserve_input_order=True)
         if type(value) is list:
-            return [
-                redact(
-                    item,
-                    inside_untrusted=inside_untrusted,
-                    path=(*path, "*"),
+            projected_items: list[Any] = []
+            for index, item in enumerate(value):
+                strict_reference = (
+                    strict_projection_references.get(index)
+                    if path == ("result", "artifacts")
+                    else None
                 )
-                for item in value
-            ]
+                if type(item) is dict and item == strict_reference:
+                    projected_items.append(
+                        copy_durable_json_value(
+                            strict_reference,
+                            "tool_result_projection_reference",
+                        )
+                    )
+                    continue
+                projected_items.append(
+                    redact(
+                        item,
+                        inside_untrusted=inside_untrusted,
+                        path=(*path, "*"),
+                    )
+                )
+            return projected_items
         if type(value) is str:
             return redactor.redact_text(value)
         return value
@@ -2288,8 +2442,11 @@ def _require_no_secret_payload_keys(
     *,
     policy: EventPayloadPolicy,
     redactor: SecretRedactor,
+    projection_references: Mapping[int, dict[str, Any]] | None = None,
 ) -> None:
     """Reject secret-bearing keys outside one exact event schema."""
+
+    strict_projection_references = projection_references or {}
 
     def visit(
         value: Any,
@@ -2318,7 +2475,14 @@ def _require_no_secret_payload_keys(
                 )
             return
         if type(value) is list:
-            for child in value:
+            for index, child in enumerate(value):
+                strict_reference = (
+                    strict_projection_references.get(index)
+                    if path == ("result", "artifacts")
+                    else None
+                )
+                if type(child) is dict and child == strict_reference:
+                    continue
                 visit(
                     child,
                     inside_untrusted=inside_untrusted,
@@ -2363,6 +2527,7 @@ def _policy_marks_untrusted(
 def _recognized_controls(
     event: Event,
     *,
+    tool_event_boundary: _ToolEventBoundary | None,
     reject_malformed: bool = True,
 ) -> dict[str, Any]:
     event_type = event.type
@@ -2387,22 +2552,13 @@ def _recognized_controls(
         if status is not None and reject_malformed:
             raise ValueError(f"Invalid {event.type} status control: {status!r}.")
         return {}
-    if event.type in {
-        EventType.TOOL_CALL_STARTED,
-        EventType.TOOL_CALL_COMPLETED,
-        EventType.TOOL_CALL_FAILED,
-        EventType.TOOL_CALL_BLOCKED,
-        EventType.TOOL_CALL_APPROVAL_REQUESTED,
-        EventType.TOOL_CALL_APPROVED,
-        EventType.TOOL_CALL_APPROVAL_DENIED,
-        EventType.TOOL_CALL_APPROVAL_EXPIRED,
-    }:
+    if event.type in _TOOL_EVENT_TYPES:
         try:
-            controls = tool_results.runtime_tool_event_controls(
-                event.payload,
-                include_terminal_controls=event.type
-                in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
-            )
+            if tool_event_boundary is None:
+                raise AssertionError("Tool event controls require a parsed boundary.")
+            if tool_event_boundary.malformed:
+                return {}
+            controls = dict(tool_event_boundary.controls)
             # Tool names are descriptive data. Linkage controls are restored
             # only after the strict new-write authority check, while public
             # projection filters them below.
@@ -2477,6 +2633,63 @@ def _recognized_controls(
     return {}
 
 
+def _recognized_tool_event_boundary(
+    event: Event,
+    *,
+    reject_malformed: bool,
+    trust_persisted_projection: bool,
+) -> _ToolEventBoundary | None:
+    """Parse runtime tool controls and projection references exactly once."""
+
+    if event.type not in _TOOL_EVENT_TYPES:
+        return None
+    try:
+        controls, references = tool_results.runtime_tool_event_boundary_controls(
+            event.payload,
+            include_terminal_controls=event.type
+            in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
+        )
+    except (TypeError, ValueError):
+        if reject_malformed:
+            raise
+        return _ToolEventBoundary(
+            controls={},
+            projection_references={},
+            malformed=True,
+        )
+    if "tool_result_projection" not in event_payload_policy(event.type).owned_keys or (
+        not trust_persisted_projection
+        and not _tool_result_projection_has_runtime_provenance(
+            event,
+            controls=controls,
+        )
+    ):
+        controls.pop("tool_result_projection", None)
+        references = {}
+    return _ToolEventBoundary(
+        controls=controls,
+        projection_references=references,
+    )
+
+
+def _tool_result_projection_has_runtime_provenance(
+    event: Event,
+    *,
+    controls: Mapping[str, Any],
+) -> bool:
+    """Require in-process attestation before projection data bypasses new-write redaction."""
+
+    record = controls.get("tool_result_projection")
+    if type(record) is not dict:
+        return False
+    policy_id = record.get("policy_id")
+    return type(policy_id) is str and event_nested_payload_authority_is_runtime_generated(
+        event,
+        path=_TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+        value=policy_id,
+    )
+
+
 def _remove_malformed_public_controls(
     event: Event,
     *,
@@ -2518,21 +2731,7 @@ def _remove_malformed_public_controls(
     ):
         redacted_payload.pop("status", None)
 
-    if (
-        event.type
-        in {
-            EventType.TOOL_CALL_STARTED,
-            EventType.TOOL_CALL_COMPLETED,
-            EventType.TOOL_CALL_FAILED,
-            EventType.TOOL_CALL_BLOCKED,
-            EventType.TOOL_CALL_APPROVAL_REQUESTED,
-            EventType.TOOL_CALL_APPROVED,
-            EventType.TOOL_CALL_APPROVAL_DENIED,
-            EventType.TOOL_CALL_APPROVAL_EXPIRED,
-        }
-        and "effect" in event.payload
-        and "effect" not in controls
-    ):
+    if event.type in _TOOL_EVENT_TYPES and "effect" in event.payload and "effect" not in controls:
         redacted_payload.pop("effect", None)
 
     if (
@@ -2594,17 +2793,7 @@ def _remove_malformed_public_controls(
                     structured.pop(field_name, None)
 
     if (
-        event.type
-        in {
-            EventType.TOOL_CALL_STARTED,
-            EventType.TOOL_CALL_COMPLETED,
-            EventType.TOOL_CALL_FAILED,
-            EventType.TOOL_CALL_BLOCKED,
-            EventType.TOOL_CALL_APPROVAL_REQUESTED,
-            EventType.TOOL_CALL_APPROVED,
-            EventType.TOOL_CALL_APPROVAL_DENIED,
-            EventType.TOOL_CALL_APPROVAL_EXPIRED,
-        }
+        event.type in _TOOL_EVENT_TYPES
         and "registration_state" in event.payload
         and "registration_state" not in controls
     ):
@@ -2648,6 +2837,57 @@ def _public_authority_aliases(
         if type(sequence) is int and sequence >= 1:
             return {"start_event_id": public_event_id(sequence)}
     return {}
+
+
+def _restore_runtime_tool_result_projection(
+    event: Event,
+    *,
+    redacted_payload: dict[str, Any],
+    references: Mapping[int, dict[str, Any]],
+    redactor: SecretRedactor,
+) -> None:
+    """Rebuild model-facing text while preserving one validated runtime reference."""
+
+    if not references:
+        return
+    original_result = event.payload.get("result")
+    redacted_result = redacted_payload.get("result")
+    if type(original_result) is not dict or type(redacted_result) is not dict:
+        raise AssertionError("Validated projection lost its result object.")
+    projected_content, projected_artifacts = tool_results.project_runtime_tool_result_for_boundary(
+        original_content=original_result.get("content"),
+        redacted_artifacts=redacted_result.get("artifacts"),
+        references=dict(references),
+        redactor=redactor,
+    )
+    redacted_result["content"] = projected_content
+    redacted_result["artifacts"] = projected_artifacts
+
+
+def _synchronize_runtime_tool_result_projection_record(
+    payload: dict[str, Any],
+    *,
+    controls: Mapping[str, Any],
+) -> None:
+    """Keep validated projection evidence aligned with boundary-redacted content."""
+
+    if type(controls.get("tool_result_projection")) is not dict:
+        return
+    result = payload.get("result")
+    record = payload.get("tool_result_projection")
+    if type(result) is not dict or type(record) is not dict:
+        raise AssertionError("Validated projection lost its result or evidence record.")
+    content = result.get("content")
+    if type(content) is not str:
+        raise AssertionError("Validated projection lost its content.")
+    record["projected_bytes"] = len(content.encode("utf-8"))
+    (
+        record["projected_token_estimate"],
+        record["token_estimation_method"],
+    ) = reestimate_tool_result_projection_tokens(
+        content,
+        token_estimation_method=record.get("token_estimation_method"),
+    )
 
 
 def _restore_policy_denial_truncation_markers(

@@ -883,10 +883,10 @@ def _start_detached_event_stream_response(
                         "Live event has no unique durable record for public projection."
                     )
                 record = records[0]
-                public_event = cayu_app.project_event_record_for_exposure(record).event
+                public_event = cayu_app._project_persisted_event_record_for_exposure(record).event
             else:
                 record = EventRecord(sequence=sequence, event=event)
-                public_event = cayu_app.project_event_record_for_exposure(record).event
+                public_event = cayu_app._project_persisted_event_record_for_exposure(record).event
             message = event_to_sse_message(public_event)
         except SseEventFrameTooLargeError as exc:
             await enqueue("observer_error", exc, terminal=True)
@@ -1456,7 +1456,7 @@ def _request_interruption_actor(
 
 
 def _serialize_event_record(cayu_app: Any, record: EventRecord) -> dict[str, Any]:
-    public_record = cayu_app.project_event_record_for_exposure(record)
+    public_record = cayu_app._project_persisted_event_record_for_exposure(record)
     event = public_record.event
     # The event-domain projector is authoritative. A second generic redaction
     # pass would corrupt validated controls and sequence aliases under short
@@ -1524,7 +1524,7 @@ def _serialize_pending_action(
 
 
 def _serialize_interaction_record(cayu_app: Any, record: EventRecord) -> dict[str, Any]:
-    public_record = cayu_app.project_event_record_for_exposure(record)
+    public_record = cayu_app._project_persisted_event_record_for_exposure(record)
     event = public_record.event
     interaction_id = event.interaction_id
     if interaction_id is None:
@@ -3560,7 +3560,7 @@ def create_router(
                 for record in page:
                     try:
                         message = event_to_sse_message(
-                            cayu_app.project_event_record_for_exposure(record).event
+                            cayu_app._project_persisted_event_record_for_exposure(record).event
                         )
                     except SseEventFrameTooLargeError as exc:
                         yield _stream_error_sse_message(

@@ -83,7 +83,7 @@ from cayu.runtime._interruption_coordinator import (
     _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY,
     _is_background_subagent_session,
 )
-from cayu.runtime._message_redaction import redact_message_for_boundary
+from cayu.runtime._message_redaction import redact_runtime_message_for_boundary
 from cayu.runtime._run_limits import RunLimitController, SessionUsageTracker
 from cayu.runtime._session_control import (
     ActiveSessionRun,
@@ -6291,7 +6291,7 @@ class RecoveryCoordinator:
 
         def redacted_transcript_view(messages: list[Message]) -> list[Message]:
             return [
-                redact_message_for_boundary(
+                redact_runtime_message_for_boundary(
                     message,
                     redactor=self._secret_redactor,
                     field_name=f"session.transcript[{index}]",

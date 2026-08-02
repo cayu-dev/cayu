@@ -6,9 +6,10 @@ import json
 import mimetypes
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, Never
 from uuid import uuid4
 
+from cayu._task_wait import await_shielded_task_outcome, unexpected_child_cancellation_error
 from cayu._validation import (
     copy_durable_json_object,
     require_clean_nonblank,
@@ -23,6 +24,7 @@ from cayu.artifacts.base import (
     ArtifactStore,
     ArtifactStoreUnavailableError,
     InvalidArtifactIdError,
+    _require_matching_artifact,
 )
 
 _ARTIFACT_ID_PATTERN = re.compile(r"\Aart_[0-9a-f]{32}\Z")
@@ -77,6 +79,7 @@ class S3ArtifactStore(ArtifactStore):
         self,
         content: bytes,
         *,
+        artifact_id: str | None = None,
         filename: str,
         content_type: str | None = None,
         scope: ArtifactScope = ArtifactScope.SESSION,
@@ -101,8 +104,11 @@ class S3ArtifactStore(ArtifactStore):
             session_id=session_id,
             environment_name=environment_name,
         )
+        resolved_artifact_id = (
+            f"art_{uuid4().hex}" if artifact_id is None else _validate_artifact_id(artifact_id)
+        )
         artifact = ArtifactMetadata(
-            id=f"art_{uuid4().hex}",
+            id=resolved_artifact_id,
             filename=filename,
             content_type=resolved_content_type,
             size_bytes=len(content),
@@ -112,36 +118,133 @@ class S3ArtifactStore(ArtifactStore):
             environment_name=environment_name,
             metadata=copy_durable_json_object(metadata or {}, "metadata"),
         )
+        if artifact_id is not None:
+            try:
+                existing = await self.read_bytes(resolved_artifact_id)
+            except FileNotFoundError:
+                pass
+            else:
+                _require_matching_artifact(existing, expected=artifact, content=content)
+                return existing.metadata
+
         content_key = self._artifact_key(artifact.id, "content")
         metadata_key = self._artifact_key(artifact.id, "metadata.json")
         client = await self._get_client()
         content_written = False
-        try:
-            await asyncio.to_thread(
-                client.put_object,
-                Bucket=self.bucket,
-                Key=content_key,
-                Body=content,
-                ContentType=resolved_content_type,
-                IfNoneMatch="*",
-                **self._encryption_options(),
-            )
+        cancellation: asyncio.CancelledError | None = None
+        content_error, cancellation = await _await_s3_mutation(
+            client.put_object,
+            operation="S3 artifact content upload",
+            cancellation=cancellation,
+            Bucket=self.bucket,
+            Key=content_key,
+            Body=content,
+            ContentType=resolved_content_type,
+            IfNoneMatch="*",
+            **self._encryption_options(),
+        )
+        if content_error is None:
             content_written = True
-            await asyncio.to_thread(
-                client.put_object,
-                Bucket=self.bucket,
-                Key=metadata_key,
-                Body=artifact.model_dump_json().encode("utf-8"),
-                ContentType="application/json",
-                IfNoneMatch="*",
-                **self._encryption_options(),
-            )
-        except Exception as exc:
+        else:
+            if not isinstance(content_error, Exception):
+                raise content_error
+            exc = content_error
+            if artifact_id is None:
+                _raise_s3_failure(
+                    ArtifactStoreUnavailableError(
+                        "S3 artifact store could not write artifact content."
+                    ),
+                    cause=exc,
+                    cancellation=cancellation,
+                    cancellation_note=(
+                        "S3 artifact content upload also failed during cancellation."
+                    ),
+                )
+            try:
+                existing_content = await self._read_object_bytes(client, content_key)
+            except Exception as read_error:
+                _raise_s3_failure(
+                    ArtifactStoreUnavailableError(
+                        "S3 artifact store could not write artifact content."
+                    ),
+                    cause=read_error,
+                    cancellation=cancellation,
+                    cancellation_note=(
+                        "S3 artifact content upload also failed during cancellation."
+                    ),
+                )
+            if existing_content != content:
+                _raise_s3_failure(
+                    ValueError(
+                        "Artifact identity already exists with different content or metadata."
+                    ),
+                    cause=exc,
+                    cancellation=cancellation,
+                    cancellation_note=("S3 artifact identity conflicted during cancellation."),
+                )
+
+        metadata_error, cancellation = await _await_s3_mutation(
+            client.put_object,
+            operation="S3 artifact metadata commit",
+            cancellation=cancellation,
+            Bucket=self.bucket,
+            Key=metadata_key,
+            Body=artifact.model_dump_json().encode("utf-8"),
+            ContentType="application/json",
+            IfNoneMatch="*",
+            **self._encryption_options(),
+        )
+        if metadata_error is not None:
+            if not isinstance(metadata_error, Exception):
+                raise metadata_error
+            exc = metadata_error
+            if artifact_id is not None:
+                try:
+                    existing = await self.read_bytes(resolved_artifact_id)
+                except Exception:
+                    pass
+                else:
+                    _require_matching_artifact(existing, expected=artifact, content=content)
+                    if cancellation is not None:
+                        raise cancellation
+                    return existing.metadata
             if content_written:
-                await self._delete_keys_best_effort(client, (content_key, metadata_key))
-            raise ArtifactStoreUnavailableError(
-                "S3 artifact store could not write artifact content."
-            ) from exc
+                if cancellation is not None:
+                    cleanup_error, cancellation = await _await_s3_mutation(
+                        self._delete_keys,
+                        operation="Incomplete S3 artifact cleanup",
+                        cancellation=cancellation,
+                        client=client,
+                        keys=(content_key, metadata_key),
+                    )
+                    if cleanup_error is not None:
+                        if not isinstance(cleanup_error, Exception):
+                            raise cleanup_error
+                        cleanup_error.add_note(
+                            "S3 artifact metadata commit also failed before cleanup."
+                        )
+                        _raise_s3_failure(
+                            ArtifactStoreUnavailableError(
+                                "S3 artifact store could not clean an incomplete artifact."
+                            ),
+                            cause=cleanup_error,
+                            cancellation=cancellation,
+                            cancellation_note=(
+                                "S3 artifact cleanup also failed during cancellation."
+                            ),
+                        )
+                elif artifact_id is None:
+                    await self._delete_keys_best_effort(client, (content_key, metadata_key))
+            _raise_s3_failure(
+                ArtifactStoreUnavailableError(
+                    "S3 artifact store could not commit artifact metadata."
+                ),
+                cause=exc,
+                cancellation=cancellation,
+                cancellation_note=("S3 artifact metadata commit also failed during cancellation."),
+            )
+        if cancellation is not None:
+            raise cancellation
         return artifact
 
     async def read_bytes(
@@ -266,6 +369,14 @@ class S3ArtifactStore(ArtifactStore):
         if metadata.id != artifact_id:
             raise ValueError("S3 artifact metadata id did not match its object key.")
         return metadata
+
+    async def _read_object_bytes(self, client: Any, key: str) -> bytes:
+        response = await asyncio.to_thread(
+            client.get_object,
+            Bucket=self.bucket,
+            Key=key,
+        )
+        return await asyncio.to_thread(_response_body_bytes, response)
 
     def _list_metadata_ids(self, client: Any) -> Sequence[str]:
         prefix = f"{self.prefix}/" if self.prefix else ""
@@ -416,6 +527,39 @@ def _response_body_bytes(response: Any) -> bytes:
     if type(value) is not bytes:
         raise TypeError("S3 object body must return bytes.")
     return value
+
+
+async def _await_s3_mutation(
+    callback: Any,
+    *,
+    operation: str,
+    cancellation: asyncio.CancelledError | None,
+    **kwargs: Any,
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Settle one threaded S3 mutation before redelivering caller cancellation."""
+
+    task = asyncio.create_task(asyncio.to_thread(callback, **kwargs))
+    outcome = await await_shielded_task_outcome(task, cancellation=cancellation)
+    error = outcome.error
+    if isinstance(error, asyncio.CancelledError):
+        error = unexpected_child_cancellation_error(error, operation=operation)
+    return error, outcome.cancellation
+
+
+def _raise_s3_failure(
+    error: Exception,
+    *,
+    cause: Exception,
+    cancellation: asyncio.CancelledError | None,
+    cancellation_note: str,
+) -> Never:
+    """Keep caller cancellation authoritative without losing the S3 failure cause."""
+
+    if cancellation is not None:
+        error.__cause__ = cause
+        cancellation.add_note(cancellation_note)
+        raise cancellation from error
+    raise error from cause
 
 
 def _aws_error_code(exc: Exception) -> str | None:

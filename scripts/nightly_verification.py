@@ -713,6 +713,17 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_provider_api_key=True,
     ),
     VerificationCheck(
+        id="tool-result-projection-live",
+        capability="OpenAI/Anthropic oversized tool-result projection contract",
+        lane="provider-contract",
+        command=("uv", "run", "python", "examples/tool_result_projection_live.py"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=("OPENAI_API_KEY or ANTHROPIC_API_KEY",),
+        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
+        requires_provider_api_key=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="context-counting-live",
         capability="OpenAI/Anthropic context counting contract",
         lane="provider-contract",

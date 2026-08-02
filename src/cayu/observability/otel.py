@@ -9,6 +9,9 @@ from typing import Any
 from cayu.core.events import Event, EventType, copy_event, event_durable_sequence
 from cayu.runtime._event_projection import project_runtime_event, public_event_sequence
 from cayu.runtime.event_sinks import EventSink, _EventSinkDelivery
+from cayu.runtime.tool_result_projection import (
+    tool_result_projection_suppresses_result_content,
+)
 from cayu.vaults.redaction import SecretRedactor
 
 # GenAI attribute names, mirrored as plain strings from the OpenTelemetry GenAI
@@ -35,6 +38,16 @@ CAYU_ENVIRONMENT_NAME = "cayu.environment.name"
 CAYU_MODEL_STEP = "cayu.model.step"
 CAYU_TOOL_DENIED_BY = "cayu.tool.denied_by"
 CAYU_TOOL_POLICY_DECISION = "cayu.tool.policy_decision"
+CAYU_TOOL_RESULT_PROJECTION_STATUS = "cayu.tool_result.projection.status"
+CAYU_TOOL_RESULT_PROJECTION_POLICY_ID = "cayu.tool_result.projection.policy_id"
+CAYU_TOOL_RESULT_ORIGINAL_BYTES = "cayu.tool_result.original_bytes"
+CAYU_TOOL_RESULT_PROJECTED_BYTES = "cayu.tool_result.projected_bytes"
+CAYU_TOOL_RESULT_ORIGINAL_TOKEN_ESTIMATE = "cayu.tool_result.original_token_estimate"
+CAYU_TOOL_RESULT_PROJECTED_TOKEN_ESTIMATE = "cayu.tool_result.projected_token_estimate"
+CAYU_TOOL_RESULT_TOKEN_ESTIMATION_METHOD = "cayu.tool_result.token_estimation_method"
+CAYU_TOOL_RESULT_ARTIFACT_ID = "cayu.tool_result.artifact_id"
+CAYU_TOOL_RESULT_ARTIFACT_SHA256 = "cayu.tool_result.artifact_sha256"
+CAYU_TOOL_RESULT_PROJECTION_FAILURE_TYPE = "cayu.tool_result.projection.failure_type"
 # Marks a span force-closed without its own completion event (e.g. an in-flight
 # model/tool span when the session was interrupted) so it is not mistaken for a
 # clean success.
@@ -492,6 +505,11 @@ class OpenTelemetryEventSink(EventSink):
         if event.type == EventType.TOOL_CALL_BLOCKED:
             _set_str(span, CAYU_TOOL_DENIED_BY, denied_by)
             _set_str(span, CAYU_TOOL_POLICY_DECISION, event.payload.get("decision"))
+        _set_tool_result_projection_attributes(
+            span,
+            event.payload,
+            redactor=self._redactor,
+        )
         self._finish(span, error=error, end_time=event_ns)
         return True
 
@@ -633,6 +651,35 @@ def _set_int(span: Any, key: str, value: Any) -> None:
         span.set_attribute(key, value)
 
 
+def _set_tool_result_projection_attributes(
+    span: Any,
+    payload: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+) -> None:
+    projection = payload.get("tool_result_projection")
+    if type(projection) is not dict:
+        return
+    for key, attribute in (
+        ("status", CAYU_TOOL_RESULT_PROJECTION_STATUS),
+        ("policy_id", CAYU_TOOL_RESULT_PROJECTION_POLICY_ID),
+        ("token_estimation_method", CAYU_TOOL_RESULT_TOKEN_ESTIMATION_METHOD),
+        ("artifact_id", CAYU_TOOL_RESULT_ARTIFACT_ID),
+        ("artifact_sha256", CAYU_TOOL_RESULT_ARTIFACT_SHA256),
+        ("failure_type", CAYU_TOOL_RESULT_PROJECTION_FAILURE_TYPE),
+    ):
+        value = projection.get(key)
+        if type(value) is str and value:
+            span.set_attribute(attribute, redactor.redact_text(value))
+    for key, attribute in (
+        ("original_bytes", CAYU_TOOL_RESULT_ORIGINAL_BYTES),
+        ("projected_bytes", CAYU_TOOL_RESULT_PROJECTED_BYTES),
+        ("original_token_estimate", CAYU_TOOL_RESULT_ORIGINAL_TOKEN_ESTIMATE),
+        ("projected_token_estimate", CAYU_TOOL_RESULT_PROJECTED_TOKEN_ESTIMATE),
+    ):
+        _set_int(span, attribute, projection.get(key))
+
+
 def _error_text(event: Event) -> str:
     payload = event.payload
     error = payload.get("error")
@@ -649,6 +696,12 @@ def _tool_error_text(event: Event) -> str:
     # errors: TOOL_CALL_FAILED in result.content, BLOCKED/APPROVAL_DENIED in "reason".
     payload = event.payload
     if event.type == EventType.TOOL_CALL_FAILED:
+        projection = payload.get("tool_result_projection")
+        if tool_result_projection_suppresses_result_content(projection):
+            failure_type = projection.get("failure_type")
+            if type(failure_type) is str and failure_type:
+                return failure_type
+            return str(event.type)
         result = payload.get("result")
         if type(result) is dict:
             content = result.get("content")

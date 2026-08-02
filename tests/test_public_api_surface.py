@@ -65,6 +65,7 @@ MANIFEST_RUNTIME_ONLY_EXPORTS = (
     "RuntimeManifest",
     "StoreManifest",
     "ToolManifest",
+    "ToolResultProjectionPolicyManifest",
 )
 
 

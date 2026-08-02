@@ -5,7 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from cayu.core.messages import Message
-from cayu.runtime._message_redaction import redact_message_for_boundary
+from cayu.runtime._message_redaction import (
+    redact_runtime_message_for_boundary,
+    redact_untrusted_message_for_boundary,
+)
 from cayu.runtime.approvals import ResolutionActor
 from cayu.runtime.public_authority import public_authority_alias_is_reserved
 from cayu.runtime.sessions import (
@@ -372,7 +375,7 @@ def redact_messages(
     field_name: str,
 ) -> list[Message]:
     return [
-        redact_message_for_boundary(
+        redact_untrusted_message_for_boundary(
             message,
             redactor=redactor,
             field_name=field_name,
@@ -393,7 +396,7 @@ def redact_transcript(
     for index, message in enumerate(messages):
         try:
             redacted_messages.append(
-                redact_message_for_boundary(
+                redact_runtime_message_for_boundary(
                     message,
                     redactor=redactor,
                     field_name=f"{field_name}[{index}]",
@@ -436,7 +439,7 @@ def fork_transcript_is_secret_free(
 
     for index, message in enumerate(messages):
         try:
-            redacted_message = redact_message_for_boundary(
+            redacted_message = redact_runtime_message_for_boundary(
                 message,
                 redactor=redactor,
                 field_name=f"source_session.transcript[{index}]",

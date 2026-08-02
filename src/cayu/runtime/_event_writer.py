@@ -15,7 +15,7 @@ from cayu.core.events import (
 from cayu.runtime._event_projection import (
     prepare_budget_settlement_event_template,
     prepare_new_runtime_event,
-    project_runtime_event,
+    project_persisted_runtime_event,
 )
 from cayu.runtime.budgets import BudgetStore
 from cayu.runtime.event_sinks import (
@@ -244,7 +244,7 @@ class RuntimeEventWriter:
             try:
                 _, delivered = await self._deliver_persisted_side_effect_claim(claim)
             except Exception as exc:
-                public = project_runtime_event(
+                public = project_persisted_runtime_event(
                     claim.event,
                     sequence=claim.event_sequence,
                     redactor=self._secret_redactor,
@@ -261,7 +261,7 @@ class RuntimeEventWriter:
                 continue
             if delivered:
                 recovered.append(
-                    project_runtime_event(
+                    project_persisted_runtime_event(
                         claim.event,
                         sequence=claim.event_sequence,
                         redactor=self._secret_redactor,
@@ -280,7 +280,7 @@ class RuntimeEventWriter:
             # private authority decisions have completed.
             private_event = claim.event.model_copy(deep=True)
             await self._forward_budget_event_if_required(private_event)
-            public_event = project_runtime_event(
+            public_event = project_persisted_runtime_event(
                 private_event,
                 sequence=claim.event_sequence,
                 redactor=self._secret_redactor,
@@ -416,7 +416,7 @@ class RuntimeEventWriter:
         except PersistedEventSideEffectClaimLost:
             return None
         if delivery.status is PersistedEventSideEffectStatus.DEAD_LETTERED:
-            public = project_runtime_event(
+            public = project_persisted_runtime_event(
                 claim.event,
                 sequence=claim.event_sequence,
                 redactor=self._secret_redactor,

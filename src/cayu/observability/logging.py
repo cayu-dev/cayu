@@ -5,6 +5,9 @@ from typing import Any
 
 from cayu.core.events import Event, EventType
 from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.tool_result_projection import (
+    tool_result_projection_suppresses_result_content,
+)
 from cayu.vaults import SecretRedactor
 
 DEFAULT_CAYU_LOGGER_NAME = "cayu"
@@ -169,8 +172,16 @@ def _summarize_event(
         _append(parts, "tool", event.tool_name, redactor=redactor)
         _append(parts, "call", payload.get("tool_call_id"), redactor=redactor)
         _append_error(parts, payload, limit=error_summary_limit, redactor=redactor)
+        _append_tool_result_projection(parts, payload, redactor=redactor)
         if event_type == EventType.TOOL_CALL_FAILED:
-            _append_tool_result_reason(parts, payload, limit=error_summary_limit, redactor=redactor)
+            projection = payload.get("tool_result_projection")
+            if not tool_result_projection_suppresses_result_content(projection):
+                _append_tool_result_reason(
+                    parts,
+                    payload,
+                    limit=error_summary_limit,
+                    redactor=redactor,
+                )
         elif event_type == EventType.TOOL_CALL_BLOCKED:
             _append_policy_denial(
                 parts,
@@ -304,6 +315,35 @@ def _append_tool_result_reason(
         content = result.get("content")
         if type(content) is str and content:
             parts.append(f"reason={_truncate(_clean(content, redactor=redactor), limit)}")
+
+
+def _append_tool_result_projection(
+    parts: list[str],
+    payload: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+) -> None:
+    projection = payload.get("tool_result_projection")
+    if type(projection) is not dict:
+        return
+    for key in (
+        "status",
+        "policy_id",
+        "original_bytes",
+        "projected_bytes",
+        "original_token_estimate",
+        "projected_token_estimate",
+        "token_estimation_method",
+        "artifact_id",
+        "artifact_sha256",
+        "failure_type",
+    ):
+        _append(
+            parts,
+            f"projection_{key}",
+            projection.get(key),
+            redactor=redactor,
+        )
 
 
 def _append_policy_denial(

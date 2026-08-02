@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+from threading import Event as ThreadEvent
 from typing import Any
 
 import pytest
@@ -27,12 +28,25 @@ class _S3Client:
         self.get_calls: list[dict[str, Any]] = []
         self.delete_calls: list[dict[str, Any]] = []
         self.fail_put_suffix: str | None = None
+        self.fail_put_once_suffix: str | None = None
         self.fail_get_code: str | None = None
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         self.put_calls.append(kwargs)
         if self.fail_put_suffix and kwargs["Key"].endswith(self.fail_put_suffix):
             raise _ClientError("AccessDenied")
+        if self.fail_put_once_suffix and kwargs["Key"].endswith(self.fail_put_once_suffix):
+            self.fail_put_once_suffix = None
+            raise _ClientError("AccessDenied")
+        if (
+            kwargs.get("IfNoneMatch") == "*"
+            and (
+                kwargs["Bucket"],
+                kwargs["Key"],
+            )
+            in self.objects
+        ):
+            raise _ClientError("PreconditionFailed")
         self.objects[(kwargs["Bucket"], kwargs["Key"])] = kwargs["Body"]
         return {"ETag": '"etag"'}
 
@@ -66,6 +80,24 @@ class _S3Client:
         for item in kwargs["Delete"]["Objects"]:
             self.objects.pop((kwargs["Bucket"], item["Key"]), None)
         return {"Deleted": kwargs["Delete"]["Objects"]}
+
+
+class _BlockingContentUploadS3Client(_S3Client):
+    def __init__(self) -> None:
+        super().__init__()
+        self.content_upload_started = ThreadEvent()
+        self.release_content_upload = ThreadEvent()
+        self.content_upload_finished = ThreadEvent()
+
+    def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs["Key"].endswith("/content"):
+            self.content_upload_started.set()
+            self.release_content_upload.wait()
+            try:
+                return super().put_object(**kwargs)
+            finally:
+                self.content_upload_finished.set()
+        return super().put_object(**kwargs)
 
 
 def test_s3_artifact_store_puts_reads_lists_and_deletes() -> None:
@@ -147,6 +179,128 @@ def test_s3_artifact_store_lists_all_metadata_then_applies_limit() -> None:
     assert result.truncated is True
 
 
+def test_s3_artifact_store_reuses_a_supplied_identity_only_for_an_exact_match() -> None:
+    client = _S3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'1' * 32}"
+    kwargs = {
+        "artifact_id": artifact_id,
+        "filename": "tool-result.txt",
+        "content_type": "text/plain",
+        "session_id": "sess_1",
+        "metadata": {"type": "cayu.tool_result_artifact.v1"},
+    }
+
+    first = asyncio.run(store.put_bytes(b"stable", **kwargs))
+    replayed = asyncio.run(store.put_bytes(b"stable", **kwargs))
+
+    assert replayed == first
+    assert asyncio.run(store.list(session_id="sess_1")).artifacts == (first,)
+    with pytest.raises(ValueError, match="different content or metadata"):
+        asyncio.run(store.put_bytes(b"changed", **kwargs))
+    with pytest.raises(ValueError, match="different content or metadata"):
+        asyncio.run(store.put_bytes(b"stable", **{**kwargs, "filename": "changed.txt"}))
+
+
+def test_s3_supplied_identity_finishes_metadata_commit_after_retry() -> None:
+    client = _S3Client()
+    client.fail_put_once_suffix = "metadata.json"
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'2' * 32}"
+    kwargs = {
+        "artifact_id": artifact_id,
+        "filename": "tool-result.txt",
+        "content_type": "text/plain",
+        "session_id": "sess_1",
+        "metadata": {"type": "cayu.tool_result_artifact.v1"},
+    }
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="commit"):
+        asyncio.run(store.put_bytes(b"recoverable", **kwargs))
+
+    assert ("bucket", f"cayu/artifacts/{artifact_id}/content") in client.objects
+    assert ("bucket", f"cayu/artifacts/{artifact_id}/metadata.json") not in client.objects
+
+    recovered = asyncio.run(store.put_bytes(b"recoverable", **kwargs))
+
+    assert recovered.id == artifact_id
+    assert asyncio.run(store.read_bytes(artifact_id)).content == b"recoverable"
+    assert asyncio.run(store.list(session_id="sess_1")).artifacts == (recovered,)
+
+
+def test_s3_cancelled_content_upload_does_not_leave_an_unlisted_object() -> None:
+    client = _BlockingContentUploadS3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'3' * 32}"
+
+    async def scenario() -> None:
+        put_task = asyncio.create_task(
+            store.put_bytes(
+                b"recoverable",
+                artifact_id=artifact_id,
+                filename="tool-result.txt",
+                content_type="text/plain",
+                session_id="sess_1",
+                metadata={"type": "cayu.tool_result_artifact.v1"},
+            )
+        )
+        try:
+            assert await asyncio.to_thread(client.content_upload_started.wait, 1)
+
+            put_task.cancel("projection timeout")
+            await asyncio.sleep(0)
+        finally:
+            client.release_content_upload.set()
+
+        with pytest.raises(asyncio.CancelledError, match="projection timeout"):
+            await put_task
+        assert await asyncio.to_thread(client.content_upload_finished.wait, 1)
+
+        listed = await store.list(session_id="sess_1")
+        assert [artifact.id for artifact in listed.artifacts] == [artifact_id]
+        read = await store.read_bytes(artifact_id)
+        assert read.content == b"recoverable"
+        assert read.metadata.id == artifact_id
+
+    asyncio.run(scenario())
+
+
+def test_s3_cancelled_content_upload_is_removed_when_metadata_commit_fails() -> None:
+    client = _BlockingContentUploadS3Client()
+    client.fail_put_suffix = "metadata.json"
+    store = S3ArtifactStore("bucket", client=client)
+    artifact_id = f"art_{'4' * 32}"
+
+    async def scenario() -> None:
+        put_task = asyncio.create_task(
+            store.put_bytes(
+                b"recoverable",
+                artifact_id=artifact_id,
+                filename="tool-result.txt",
+                content_type="text/plain",
+                session_id="sess_1",
+                metadata={"type": "cayu.tool_result_artifact.v1"},
+            )
+        )
+        try:
+            assert await asyncio.to_thread(client.content_upload_started.wait, 1)
+
+            put_task.cancel("projection timeout")
+            await asyncio.sleep(0)
+        finally:
+            client.release_content_upload.set()
+
+        with pytest.raises(asyncio.CancelledError, match="projection timeout"):
+            await put_task
+        assert await asyncio.to_thread(client.content_upload_finished.wait, 1)
+
+        assert client.objects == {}
+        assert len(client.delete_calls) == 1
+        assert (await store.list(session_id="sess_1")).artifacts == ()
+
+    asyncio.run(scenario())
+
+
 def test_s3_artifact_store_rejects_invalid_ids_before_aws() -> None:
     client = _S3Client()
     store = S3ArtifactStore("bucket", client=client)
@@ -166,7 +320,7 @@ def test_s3_artifact_store_removes_content_when_metadata_commit_fails() -> None:
     client.fail_put_suffix = "metadata.json"
     store = S3ArtifactStore("bucket", client=client)
 
-    with pytest.raises(ArtifactStoreUnavailableError, match="write"):
+    with pytest.raises(ArtifactStoreUnavailableError, match="commit"):
         asyncio.run(store.put_bytes(b"orphan", filename="orphan.txt", session_id="sess_1"))
 
     assert client.objects == {}

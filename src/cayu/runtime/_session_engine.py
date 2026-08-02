@@ -100,7 +100,10 @@ from cayu.runtime._interruption_coordinator import (
     interruption_cascade_suppressed,
     suppress_interruption_cascade,
 )
-from cayu.runtime._message_redaction import redact_message_for_boundary
+from cayu.runtime._message_redaction import (
+    redact_runtime_message_for_boundary,
+    redact_untrusted_message_for_boundary,
+)
 from cayu.runtime._model_errors import (
     detach_billing_identity_cancellation,
     detach_billing_identity_cancellation_group,
@@ -7785,7 +7788,7 @@ class SessionEngine:
 
         provider = registered_provider.provider
         messages = [
-            redact_message_for_boundary(
+            redact_runtime_message_for_boundary(
                 message,
                 redactor=self._secret_redactor,
                 field_name="message",
@@ -7793,7 +7796,7 @@ class SessionEngine:
             for message in messages
         ]
         messages_to_append = [
-            redact_message_for_boundary(
+            redact_runtime_message_for_boundary(
                 message,
                 redactor=self._secret_redactor,
                 field_name="message",
@@ -8264,7 +8267,7 @@ class SessionEngine:
                 )
                 raw_assistant_message = assistant_step_result.assistant_message
                 assistant_message = (
-                    redact_message_for_boundary(
+                    redact_untrusted_message_for_boundary(
                         raw_assistant_message,
                         redactor=self._secret_redactor,
                         field_name="assistant_message",

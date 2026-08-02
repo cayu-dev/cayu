@@ -826,6 +826,11 @@ def test_lambda_metadata_isolation_live_check_retains_verified_adapter_evidence(
     [
         ("context-counting-live", "provider-contract", "examples/context_counting_live.py"),
         ("artifact-file-live", "provider-contract", "examples/artifact_file_live.py"),
+        (
+            "tool-result-projection-live",
+            "provider-contract",
+            "examples/tool_result_projection_live.py",
+        ),
         ("structured-output-live", "provider-contract", "examples/structured_output_live.py"),
         (
             "knowledge-embedding-live",

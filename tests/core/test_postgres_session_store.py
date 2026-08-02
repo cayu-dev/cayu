@@ -24,7 +24,12 @@ from tests.core.pending_action_conformance import assert_pending_action_store_co
 from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
 )
+from tests.core.tool_result_projection_conformance import (
+    assert_tool_result_projection_recovery_conformance,
+    assert_tool_result_projection_session_store_conformance,
+)
 
+from cayu import LocalArtifactStore
 from cayu.core import Event, EventType, Message
 from cayu.runtime import (
     EventOrder,
@@ -133,6 +138,25 @@ def _run(dsn: str, coro_factory) -> object:
             await store.close()
 
     return asyncio.run(runner())
+
+
+def test_postgres_session_store_preserves_projected_tool_results(
+    postgres_dsn: str,
+    tmp_path,
+) -> None:
+    async def ops(store) -> None:
+        await assert_tool_result_projection_session_store_conformance(
+            store,
+            LocalArtifactStore(tmp_path / "postgres-projection-artifacts"),
+            session_id="sess_projection_postgres",
+        )
+        await assert_tool_result_projection_recovery_conformance(
+            store,
+            LocalArtifactStore(tmp_path / "postgres-projection-recovery-artifacts"),
+            session_id="sess_projection_recovery_postgres",
+        )
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:

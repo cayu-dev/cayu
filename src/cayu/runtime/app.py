@@ -75,6 +75,7 @@ from cayu.runtime._environment_lifecycle import (
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
     private_event_linkage_value,
+    project_persisted_runtime_event,
     project_runtime_event,
     public_event_envelope_alias,
     public_event_id,
@@ -247,6 +248,10 @@ from cayu.runtime.tasks import (
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     ToolPolicy,
+)
+from cayu.runtime.tool_result_projection import (
+    ToolResultProjectionPolicy,
+    copy_tool_result_projection_policy,
 )
 from cayu.runtime.tool_rounds import (
     ToolRoundRecoveryRequest,
@@ -431,6 +436,7 @@ class CayuApp:
         runtime_hooks: Iterable[RuntimeHook] | None = None,
         loop_policies: Iterable[LoopPolicy] | None = None,
         mcp_manifest_policy: McpManifestPolicy | None = None,
+        tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         context_counting: ContextCountingConfig | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
@@ -475,6 +481,7 @@ class CayuApp:
         # Wall-clock seam for time-based approval expiry (tests inject a fake).
         self._clock = _clock_or_utc_now(clock)
         manifest_policy = copy_mcp_manifest_policy(mcp_manifest_policy)
+        result_projection_policy = copy_tool_result_projection_policy(tool_result_projection_policy)
         context_counting_config = copy_context_counting_config(context_counting)
         resolved_secret_redactor = (
             secret_redactor if secret_redactor is not None else SecretRedactor()
@@ -573,6 +580,7 @@ class CayuApp:
         self._runtime_hooks = tuple(hooks)
         self._loop_policies = tuple(policies)
         self._mcp_manifest_policy = manifest_policy
+        self._tool_result_projection_policy = result_projection_policy
         self._context_counting = context_counting_config
         self._event_sinks = tuple(sinks)
         self._event_writer = RuntimeEventWriter(
@@ -631,6 +639,7 @@ class CayuApp:
             hook_runtime=self,
             runtime_hooks=self._runtime_hooks,
             mcp_manifest_policy=self._mcp_manifest_policy,
+            tool_result_projection_policy=self._tool_result_projection_policy,
             secret_redactor=self._secret_redactor,
             tool_timeout_seconds=self._tool_timeout_seconds,
             max_parallel_tool_calls=self._max_parallel_tool_calls,
@@ -719,13 +728,31 @@ class CayuApp:
         return self._secret_redactor.redact_json(value)
 
     def project_event_record_for_exposure(self, record: EventRecord) -> EventRecord:
-        """Return the canonical public view of one private durable event record."""
+        """Project a caller-supplied record without granting persisted authority."""
 
         if type(record) is not EventRecord:
             raise TypeError("record must be an EventRecord.")
         return EventRecord(
             sequence=record.sequence,
             event=project_runtime_event(
+                record.event,
+                sequence=record.sequence,
+                redactor=self._secret_redactor,
+                public_authority_alias_codec=self._public_authority_alias_codec,
+            ),
+        )
+
+    def _project_persisted_event_record_for_exposure(
+        self,
+        record: EventRecord,
+    ) -> EventRecord:
+        """Project a record obtained internally from the durable session store."""
+
+        if type(record) is not EventRecord:
+            raise TypeError("record must be an EventRecord.")
+        return EventRecord(
+            sequence=record.sequence,
+            event=project_persisted_runtime_event(
                 record.event,
                 sequence=record.sequence,
                 redactor=self._secret_redactor,
@@ -747,7 +774,7 @@ class CayuApp:
                 )
             sequence = records[0].sequence
             event = records[0].event
-        projected = project_runtime_event(
+        projected = project_persisted_runtime_event(
             event,
             sequence=sequence,
             redactor=self._secret_redactor,
@@ -2112,7 +2139,7 @@ class CayuApp:
                             watcher,
                             EventWatcherContext(
                                 watcher_name=watcher.name,
-                                record=self.project_event_record_for_exposure(record),
+                                record=self._project_persisted_event_record_for_exposure(record),
                                 attempt=claim.attempt,
                             ),
                         )

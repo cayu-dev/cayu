@@ -2649,7 +2649,7 @@ def test_tool_failure_redacts_dynamically_resolved_secret_before_diagnostic_boun
 
 
 def test_short_secret_in_message_argument_key_fails_closed() -> None:
-    from cayu.runtime._message_redaction import redact_message_for_boundary
+    from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
     from cayu.vaults import SecretRedactor
 
     secret = "k9"
@@ -2660,7 +2660,7 @@ def test_short_secret_in_message_argument_key_fails_closed() -> None:
     )
 
     with pytest.raises(ValueError, match="workload secret in an object key"):
-        redact_message_for_boundary(
+        redact_untrusted_message_for_boundary(
             message,
             redactor=SecretRedactor(secret),
             field_name="message",
@@ -2669,7 +2669,7 @@ def test_short_secret_in_message_argument_key_fails_closed() -> None:
 
 def test_short_secret_substring_in_typed_attachment_key_remains_valid() -> None:
     from cayu.artifacts import FileAttachment, FileAttachmentKind
-    from cayu.runtime._message_redaction import redact_message_for_boundary
+    from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     attachment = FileAttachment(
         artifact_id="artifact-safe",
@@ -2683,7 +2683,7 @@ def test_short_secret_substring_in_typed_attachment_key_remains_valid() -> None:
         content=(FilePart(attachment=attachment.model_dump(mode="json")),),
     )
 
-    redacted = redact_message_for_boundary(
+    redacted = redact_untrusted_message_for_boundary(
         message,
         redactor=SecretRedactor("id"),
         field_name="message",
@@ -2709,7 +2709,7 @@ def test_attachment_schema_key_exemption_is_scoped_to_typed_attachment(
 ) -> None:
     from cayu.artifacts import FileAttachment, FileAttachmentKind
     from cayu.core.messages import ToolResultPart
-    from cayu.runtime._message_redaction import redact_message_for_boundary
+    from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     attachment = FileAttachment(
         artifact_id="artifact-safe",
@@ -2724,7 +2724,7 @@ def test_attachment_schema_key_exemption_is_scoped_to_typed_attachment(
     )
 
     assert (
-        redact_message_for_boundary(
+        redact_untrusted_message_for_boundary(
             file_message,
             redactor=SecretRedactor(secret),
             field_name="message",
@@ -2743,7 +2743,7 @@ def test_attachment_schema_key_exemption_is_scoped_to_typed_attachment(
         ),
     )
     with pytest.raises(ValueError, match="workload secret in an object key"):
-        redact_message_for_boundary(
+        redact_untrusted_message_for_boundary(
             untrusted_message,
             redactor=SecretRedactor(secret),
             field_name="message",
@@ -2755,7 +2755,7 @@ def test_runtime_result_schema_key_exemption_rejects_untyped_lookalike(
     secret: str,
 ) -> None:
     from cayu.core.messages import ToolResultPart
-    from cayu.runtime._message_redaction import redact_message_for_boundary
+    from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     message = Message(
         role=MessageRole.TOOL,
@@ -2769,7 +2769,7 @@ def test_runtime_result_schema_key_exemption_rejects_untyped_lookalike(
     )
 
     with pytest.raises(ValueError, match="workload secret in an object key"):
-        redact_message_for_boundary(
+        redact_untrusted_message_for_boundary(
             message,
             redactor=SecretRedactor(secret),
             field_name="message",
@@ -2778,7 +2778,7 @@ def test_runtime_result_schema_key_exemption_rejects_untyped_lookalike(
 
 def test_invalid_terminal_control_is_treated_as_untrusted_tool_data() -> None:
     from cayu.core.messages import ToolResultPart
-    from cayu.runtime._message_redaction import redact_message_for_boundary
+    from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     message = Message(
         role=MessageRole.TOOL,
@@ -2795,7 +2795,7 @@ def test_invalid_terminal_control_is_treated_as_untrusted_tool_data() -> None:
     )
 
     assert (
-        redact_message_for_boundary(
+        redact_untrusted_message_for_boundary(
             message,
             redactor=SecretRedactor("unrelated-secret"),
             field_name="message",
@@ -2898,7 +2898,7 @@ def test_approval_denial_schema_keys_do_not_block_model_continuation(secret: str
 
 def test_short_secret_in_attachment_metadata_key_fails_closed() -> None:
     from cayu.artifacts import FileAttachment, FileAttachmentKind
-    from cayu.runtime._message_redaction import redact_message_for_boundary
+    from cayu.runtime._message_redaction import redact_untrusted_message_for_boundary
 
     secret = "k9"
     attachment = FileAttachment(
@@ -2915,7 +2915,7 @@ def test_short_secret_in_attachment_metadata_key_fails_closed() -> None:
     )
 
     with pytest.raises(ValueError, match="workload secret in an object key"):
-        redact_message_for_boundary(
+        redact_untrusted_message_for_boundary(
             message,
             redactor=SecretRedactor(secret),
             field_name="message",
