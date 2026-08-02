@@ -183,6 +183,10 @@ REVISIONS: tuple[Revision, ...] = (
     # pre-28 writers do not maintain that reverse index, so mixed-version
     # workers could publish aliases that no revision-28 worker can resolve.
     Revision(revision=28, kind=RevisionKind.BREAKING, compatible_from=28),
+    # Add partial workflow-journal indexes for attempt-fenced step replay and
+    # attempt-marker lookup. Existing writers already persist every indexed
+    # field, so the revision remains additive for revision-28 binaries.
+    Revision(revision=29, kind=RevisionKind.ADDITIVE, compatible_from=28),
 )
 
 #: The revision an empty database is initialized to.

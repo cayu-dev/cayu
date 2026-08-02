@@ -17,6 +17,7 @@ from cayu._validation import require_clean_nonblank
 from cayu.core.events import Event, EventType, event_with_runtime_generated_id
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime import (
+    EventOrder,
     EventQuery,
     EventRecord,
     RunRequest,
@@ -24,6 +25,7 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
 )
+from cayu.workflows._step_identity import upgraded_legacy_gated_loop_step_id
 
 # Identity stamped on the synthetic session that holds a workflow run's journal.
 # The session is never executed by ``app.run``; it only anchors the append-only
@@ -33,6 +35,7 @@ WORKFLOW_JOURNAL_MODEL = "cayu.workflow"
 _EVENT_QUERY_PAGE_LIMIT = 5000  # EventQuery.limit hard cap
 _WORKFLOW_STEP_STARTED_EVENT_NAMESPACE = UUID("f6c3b09d-f866-42fd-8508-cf50894c4b97")
 EventEmitter = Callable[[list[Event]], Awaitable[list[Event]]]
+StepEventReserver = Callable[[Event, str], Awaitable[bool]]
 
 
 def validate_workflow_journal_event_type(event_type: EventType | str) -> None:
@@ -57,6 +60,7 @@ class WorkflowJournalContext:
     session_id: str
     workflow_name: str
     emit_events: EventEmitter
+    reserve_step_started: StepEventReserver | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_store, SessionStore):
@@ -71,6 +75,8 @@ class WorkflowJournalContext:
         )
         if not callable(self.emit_events):
             raise TypeError("WorkflowJournalContext.emit_events must be callable.")
+        if self.reserve_step_started is not None and not callable(self.reserve_step_started):
+            raise TypeError("WorkflowJournalContext.reserve_step_started must be callable or None.")
 
 
 @runtime_checkable
@@ -117,6 +123,7 @@ class EventStoreJournal:
         workflow_name: str,
         *,
         event_emitter: EventEmitter | None = None,
+        step_event_reserver: StepEventReserver | None = None,
     ) -> None:
         if not isinstance(session_store, SessionStore):
             raise TypeError("EventStoreJournal requires a SessionStore.")
@@ -124,6 +131,7 @@ class EventStoreJournal:
         self._session_id = require_clean_nonblank(session_id, "session_id")
         self._workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
         self._event_emitter = event_emitter
+        self._step_event_reserver = step_event_reserver
         self._lock = asyncio.Lock()
         self._ensured = False
         self._attempt_cursor = 0
@@ -167,13 +175,6 @@ class EventStoreJournal:
         step_id = event.payload["step_id"]
         async with self._lock:
             await self._ensure_session_unlocked()
-            latest_attempt_id, _sequence = await self._latest_attempt_unlocked()
-            if latest_attempt_id != attempt_id:
-                return False
-            attempt = 1
-            async for existing in self._iter_workflow_events(EventType.WORKFLOW_STEP_STARTED):
-                if existing.payload.get("step_id") == step_id:
-                    attempt += 1
             reserved = event_with_runtime_generated_id(
                 event.model_copy(
                     update={
@@ -181,18 +182,19 @@ class EventStoreJournal:
                             session_id=self._session_id,
                             workflow_name=self._workflow_name,
                             step_id=step_id,
-                            attempt=attempt,
+                            attempt_id=attempt_id,
                         )
                     }
                 )
             )
-            try:
-                await self._append_events([reserved])
-            except ValueError as exc:
-                if "Event already exists" in str(exc):
-                    return False
-                raise
-            return True
+            if self._step_event_reserver is not None:
+                return await self._step_event_reserver(reserved, attempt_id)
+            return await self._store.append_workflow_step_started(
+                self._session_id,
+                reserved,
+                workflow_name=self._workflow_name,
+                attempt_id=attempt_id,
+            )
 
     async def completed_step_ids(self, *, attempt_id: str) -> set[str]:
         attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
@@ -213,6 +215,18 @@ class EventStoreJournal:
             step_id = event.payload.get("step_id")
             if isinstance(step_id, str) and step_id:
                 completed.add(step_id)
+                item_key = event.payload.get("item_key")
+                if (
+                    "step_id_version" not in event.payload
+                    and isinstance(item_key, str)
+                    and item_key
+                ):
+                    upgraded_step_id = upgraded_legacy_gated_loop_step_id(
+                        step_id,
+                        item_key,
+                    )
+                    if upgraded_step_id is not None:
+                        completed.add(upgraded_step_id)
         return completed
 
     async def latest_step_child_session_id(
@@ -241,26 +255,41 @@ class EventStoreJournal:
         latest_attempt_id, _sequence = await self._latest_attempt()
         if latest_attempt_id != attempt_id:
             return None, None
-        completed: str | None = None
-        started: str | None = None
-        active_attempt_id: str | None = None
-        async for record in self._iter_workflow_records(None):
-            event = record.event
-            if event.type == WORKFLOW_ATTEMPT_EVENT_TYPE:
-                active_attempt_id = _event_attempt_id(event)
-                continue
-            if event.payload.get("step_id") != step_id:
-                continue
-            if _event_attempt_id(event) != active_attempt_id:
-                continue
-            child_session_id = event.payload.get("child_session_id")
-            if not (isinstance(child_session_id, str) and child_session_id):
-                continue
-            if event.type == EventType.WORKFLOW_STEP_COMPLETED:
-                completed = child_session_id
-            elif event.type == EventType.WORKFLOW_STEP_STARTED:
-                started = child_session_id
+        completed, started = await asyncio.gather(
+            self._latest_fenced_step_child_session_id(
+                step_id=step_id,
+                event_type=EventType.WORKFLOW_STEP_COMPLETED,
+            ),
+            self._latest_fenced_step_child_session_id(
+                step_id=step_id,
+                event_type=EventType.WORKFLOW_STEP_STARTED,
+            ),
+        )
         return completed, started
+
+    async def _latest_fenced_step_child_session_id(
+        self,
+        *,
+        step_id: str,
+        event_type: EventType,
+    ) -> str | None:
+        records = await self._store.query_events(
+            EventQuery(
+                session_id=self._session_id,
+                workflow_name=self._workflow_name,
+                workflow_step_id=step_id,
+                workflow_attempt_fenced=True,
+                event_type=event_type,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        if not records:
+            return None
+        child_session_id = records[0].event.payload.get("child_session_id")
+        if isinstance(child_session_id, str) and child_session_id:
+            return child_session_id
+        return None
 
     async def latest_attempt_id(self) -> str | None:
         attempt_id, _sequence = await self._latest_attempt()
@@ -422,11 +451,11 @@ def _step_started_event_id(
     session_id: str,
     workflow_name: str,
     step_id: str,
-    attempt: int,
+    attempt_id: str,
 ) -> str:
     return str(
         uuid5(
             _WORKFLOW_STEP_STARTED_EVENT_NAMESPACE,
-            f"{session_id}\0{workflow_name}\0{step_id}\0{attempt}",
+            f"{session_id}\0{workflow_name}\0{step_id}\0{attempt_id}",
         )
     )

@@ -1671,6 +1671,38 @@ replace the resource, introduce/remove an identity, or widen possible pricing.
 These rules apply equally to normal model steps, compaction, durable usage, and
 budget reservation/reconciliation.
 
+## Workflow journal replay
+
+`EventStoreJournal` fences every workflow event against the attempt marker that
+was active when that event was appended. Step replay selects the newest valid
+`workflow.step.completed` and `workflow.step.started` records across workflow
+restarts; a late event from a superseded attempt cannot replace valid earlier
+evidence. The lookup is a bounded newest-first store query for one workflow run,
+workflow name, step ID, and event type. It does not scan or hydrate the complete
+workflow history once per step. `InMemorySessionStore`, `SQLiteSessionStore`, and
+`PostgresSessionStore` implement the same attempt-fenced selection.
+Publishing `workflow.step.started` uses a store-atomic reservation: the current
+attempt check and unique started-event insert share the same in-memory lock,
+SQLite write transaction, or PostgreSQL session-row transaction. A takeover
+cannot therefore interleave between the fence and insert, and concurrent
+reservation retains one winner before child execution.
+
+`gated_loop` journal identities use the fixed-size `gated-loop:v2:` form derived
+from the canonical `(loop_name, item_key)` tuple. Delimiters, Unicode, and long
+keys therefore cannot make distinct tuples share the old concatenated identity.
+The source `loop_name`, `item_key`, and identity version remain in each journal
+payload for audit and migration. Resume also recognizes a legacy
+`gated-loop:{loop_name}:{item_key}` completion when its separately stored
+`item_key` proves the one unambiguous v2 tuple; it never treats the delimiter
+collision counterpart as completed.
+
+Schema revision 29 adds the workflow-step replay and attempt-marker indexes.
+The revision is additive and preserves revision 28's rolling-compatibility floor,
+but current SQLite and PostgreSQL session stores require it before serving this
+bounded replay path. PostgreSQL builds and validates both indexes concurrently;
+SQLite installs the equivalent expression indexes through `cayu storage
+migrate`.
+
 ## Event Watchers
 
 Event watchers are durable app-side processors for events that were already

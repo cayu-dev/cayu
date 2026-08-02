@@ -41,6 +41,7 @@ from cayu.workflows import (
     pipeline,
     step,
 )
+from cayu.workflows._step_identity import gated_loop_step_id
 
 COUNT_SCHEMA = {
     "type": "object",
@@ -151,7 +152,10 @@ def test_gated_loop_pass_path_runs_on_pass_and_journals_verdict():
 
     # Completions are journaled under the namespaced per-item key.
     journaled = asyncio.run(ctx.journal.completed_step_ids(attempt_id=ctx.attempt_id))
-    assert journaled == {"gated-loop:loop0:one", "gated-loop:loop0:two"}
+    assert journaled == {
+        gated_loop_step_id("loop0", "one"),
+        gated_loop_step_id("loop0", "two"),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -203,7 +207,10 @@ def test_gated_loop_fail_path_runs_on_fail_journals_fail_and_continues():
 
     # A failing verdict still counts as *completed* for resume purposes.
     journaled = asyncio.run(ctx.journal.completed_step_ids(attempt_id=ctx.attempt_id))
-    assert journaled == {"gated-loop:loop0:a", "gated-loop:loop0:b"}
+    assert journaled == {
+        gated_loop_step_id("loop0", "a"),
+        gated_loop_step_id("loop0", "b"),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +292,7 @@ def test_gated_loop_resume_skips_journaled_item():
     # Process 1 got as far as completing "alpha" before crashing on "beta".
     assert obs["do_calls_1"] == ["alpha", "beta"]
     assert obs["pass_calls_1"] == ["alpha"]
-    assert obs["completed_after_1"] == {"gated-loop:loop0:alpha"}
+    assert obs["completed_after_1"] == {gated_loop_step_id("loop0", "alpha")}
 
     # Process 2 (resume) SKIPS the already-journaled "alpha": its `do` and
     # `on_pass` never fire for it again.
@@ -297,16 +304,16 @@ def test_gated_loop_do_raise_leaves_item_unjournaled_and_retries_on_resume():
     obs = _crash_then_resume()
 
     # "beta" raised inside `do`, so it was never journaled as completed...
-    assert "gated-loop:loop0:beta" not in obs["completed_after_1"]
+    assert gated_loop_step_id("loop0", "beta") not in obs["completed_after_1"]
 
     # ...and on resume it is retried (not skipped), together with the untouched
     # "gamma". Exactly the two remaining items run, in order.
     assert obs["do_calls_2"] == ["beta", "gamma"]
     assert obs["pass_calls_2"] == ["beta", "gamma"]
     assert obs["completed_after_2"] == {
-        "gated-loop:loop0:alpha",
-        "gated-loop:loop0:beta",
-        "gated-loop:loop0:gamma",
+        gated_loop_step_id("loop0", "alpha"),
+        gated_loop_step_id("loop0", "beta"),
+        gated_loop_step_id("loop0", "gamma"),
     }
 
 

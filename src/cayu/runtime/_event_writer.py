@@ -173,6 +173,27 @@ class RuntimeEventWriter:
         copied_events = await self.persist_many(session_id, events)
         return await self.fan_out_persisted(copied_events)
 
+    async def reserve_workflow_step_started(
+        self,
+        event: Event,
+        *,
+        workflow_name: str,
+        attempt_id: str,
+    ) -> bool:
+        """Atomically fence and publish one workflow step reservation."""
+
+        prepared = self.prepare(attribute_event_to_current_interaction(event))
+        reserved = await self._session_store.append_workflow_step_started(
+            prepared.session_id,
+            prepared,
+            workflow_name=workflow_name,
+            attempt_id=attempt_id,
+        )
+        if not reserved:
+            return False
+        await self.fan_out_persisted([prepared])
+        return True
+
     async def persist_many(self, session_id: str, events: list[Event]) -> list[Event]:
         """Persist a defensive event batch without delivering its side effects.
 

@@ -41,6 +41,11 @@ from cayu.runtime.structured_output import (
     validate_structured_output_tool_arguments,
 )
 from cayu.vaults import contains_redacted_secret
+from cayu.workflows._step_identity import (
+    GATED_LOOP_STEP_ID_PREFIX,
+    GATED_LOOP_STEP_ID_VERSION,
+    gated_loop_step_id,
+)
 from cayu.workflows.journal import (
     WORKFLOW_ATTEMPT_EVENT_TYPE,
     WORKFLOW_JOURNAL_PROVIDER,
@@ -60,7 +65,7 @@ from cayu.workflows.models import (
 
 # gated_loop namespaces its per-item completion under this prefix so an item's
 # resume key can never collide with an inner ``do`` step's own ``step_id``.
-_GATED_ITEM_PREFIX = "gated-loop:"
+_GATED_ITEM_PREFIX = GATED_LOOP_STEP_ID_PREFIX
 _LIVE_CHILD_STATUSES = {
     SessionStatus.PENDING,
     SessionStatus.RUNNING,
@@ -156,6 +161,7 @@ def _default_journal_factory(
         context.session_id,
         context.workflow_name,
         event_emitter=context.emit_events,
+        step_event_reserver=context.reserve_step_started,
     )
 
 
@@ -410,6 +416,10 @@ class WorkflowBase(Workflow):
             session_id=session_id,
             workflow_name=self.spec.name,
             emit_events=self.app._workflow_event_emitter(session_id),
+            reserve_step_started=self.app._workflow_step_reserver(
+                session_id,
+                self.spec.name,
+            ),
         )
         journal = self._journal_factory(journal_context)
         return WorkflowContext(
@@ -1107,14 +1117,20 @@ async def gated_loop(
         if item_key in seen_item_keys:
             raise ValueError(f"Duplicate gated_loop key {item_key!r}.")
         seen_item_keys.add(item_key)
-        journal_id = f"{_GATED_ITEM_PREFIX}{loop_name}:{item_key}"
+        journal_id = gated_loop_step_id(loop_name, item_key)
         if journal_id in completed:
             continue
 
         await ctx._check_fence()
         started_event = ctx.event(
             EventType.WORKFLOW_STEP_STARTED,
-            payload={"step_id": journal_id, "item_key": item_key, "kind": "gated_loop"},
+            payload={
+                "step_id": journal_id,
+                "step_id_version": GATED_LOOP_STEP_ID_VERSION,
+                "loop_name": loop_name,
+                "item_key": item_key,
+                "kind": "gated_loop",
+            },
         )
         if not await ctx.journal.append_step_started(
             started_event,
@@ -1146,6 +1162,8 @@ async def gated_loop(
             EventType.WORKFLOW_STEP_COMPLETED,
             payload={
                 "step_id": journal_id,
+                "step_id_version": GATED_LOOP_STEP_ID_VERSION,
+                "loop_name": loop_name,
                 "item_key": item_key,
                 "kind": "gated_loop",
                 "passed": outcome.passed,

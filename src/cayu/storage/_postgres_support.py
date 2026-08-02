@@ -352,6 +352,40 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_type_timestamp ON cayu_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_agent_name ON cayu_events(agent_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_environment_name ON cayu_events(environment_name)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_step_replay
+    ON cayu_events(
+        session_id,
+        workflow_name,
+        (event -> 'payload' ->> 'step_id'),
+        event_type,
+        sequence DESC
+    )
+    WHERE event_type IN (
+        'workflow.step.started',
+        'workflow.step.completed'
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_step_attempt
+    ON cayu_events(
+        session_id,
+        workflow_name,
+        (event -> 'payload' ->> 'attempt_id'),
+        (event -> 'payload' ->> 'step_id'),
+        event_type,
+        sequence DESC
+    )
+    WHERE event_type IN (
+        'workflow.step.started',
+        'workflow.step.completed'
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_attempt_marker
+    ON cayu_events(session_id, workflow_name, sequence DESC)
+    WHERE event_type = 'custom.cayu.workflow.attempt'
+    """,
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_name ON cayu_events(workflow_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_tool_name ON cayu_events(tool_name)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_sequence "

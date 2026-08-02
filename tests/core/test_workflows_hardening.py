@@ -55,6 +55,7 @@ from cayu.runtime import (
     EventQuery,
     IncompleteSessionsRecoveryRequest,
     InMemoryEventSink,
+    InMemorySessionStore,
     ModelPrice,
     PriceBook,
     RetryPolicy,
@@ -95,6 +96,7 @@ from cayu.workflows import (
     pipeline,
     step,
 )
+from cayu.workflows._step_identity import gated_loop_step_id
 
 
 async def _passing_gate(item, result):
@@ -379,7 +381,7 @@ class TwoLoopWorkflow(WorkflowBase):
             return StepResult(step_id=f"do-{item}", session_id=f"{session_id}:do-{item}")
 
         # Both loops process the SAME item key. Pre-fix, the second loop skipped
-        # "item" because the first journaled "gated-loop:item"; explicit per-loop
+        # "item" because the first journaled a gated-loop step; explicit per-loop
         # names keep them independent (and order-independent across resume).
         async for event in gated_loop(
             ctx, ["item"], do=do, gate=_passing_gate, key=str, name="first"
@@ -410,7 +412,233 @@ def test_two_gated_loops_do_not_cross_skip():
         return await journal.completed_step_ids(attempt_id=attempt_id)
 
     journaled = asyncio.run(load_completed())
-    assert {"gated-loop:first:item", "gated-loop:second:item"} <= journaled
+    assert {
+        gated_loop_step_id("first", "item"),
+        gated_loop_step_id("second", "item"),
+    } <= journaled
+
+
+def test_gated_loop_identity_is_injective_across_delimiter_boundaries():
+    app = CayuApp(enable_logging=False)
+    ctx = TinyWorkflow(app).context("wf-delimiter-identity")
+    calls: list[str] = []
+
+    async def do(item: str) -> StepResult:
+        calls.append(item)
+        return StepResult(step_id=f"do-{item}", session_id=f"child-{len(calls)}")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            ctx,
+            ["b:c"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="a",
+        ):
+            pass
+        async for _event in gated_loop(
+            ctx,
+            ["c"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="a:b",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert calls == ["b:c", "c"]
+
+    records = asyncio.run(
+        app.session_store.query_events(
+            EventQuery(
+                session_id="wf-delimiter-identity",
+                event_type=EventType.WORKFLOW_STEP_COMPLETED,
+            )
+        )
+    )
+    loop_events = [
+        record.event for record in records if record.event.payload.get("kind") == "gated_loop"
+    ]
+    assert len(loop_events) == 2
+    assert len({event.payload["step_id"] for event in loop_events}) == 2
+    assert {(event.payload["loop_name"], event.payload["item_key"]) for event in loop_events} == {
+        ("a", "b:c"),
+        ("a:b", "c"),
+    }
+
+
+def test_gated_loop_replays_legacy_identity_without_cross_skipping_collision() -> None:
+    app = CayuApp(enable_logging=False)
+    first = TinyWorkflow(app).context("wf-legacy-delimiter-identity")
+
+    async def seed_legacy_completion() -> None:
+        await first.journal.append(first.event(WORKFLOW_ATTEMPT_EVENT_TYPE))
+        appended = await first.journal.append_current_attempt(
+            first.event(
+                EventType.WORKFLOW_STEP_COMPLETED,
+                payload={
+                    "step_id": "gated-loop:a:b:c",
+                    "item_key": "b:c",
+                    "kind": "gated_loop",
+                    "passed": True,
+                    "outcome": "pass",
+                    "child_session_id": "legacy-child",
+                },
+            ),
+            attempt_id=first.attempt_id,
+        )
+        assert appended is True
+
+    asyncio.run(seed_legacy_completion())
+
+    resumed = TinyWorkflow(app).context("wf-legacy-delimiter-identity")
+    calls: list[str] = []
+
+    async def do(item: str) -> StepResult:
+        calls.append(item)
+        return StepResult(step_id=f"do-{item}", session_id=f"child-{item}")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            resumed,
+            ["b:c"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="a",
+        ):
+            pass
+        async for _event in gated_loop(
+            resumed,
+            ["c"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="a:b",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert calls == ["c"]
+
+
+@pytest.mark.parametrize(
+    ("loop_name", "item_key"),
+    [
+        ("v2", "item"),
+        ("v2:name", "item"),
+        ("v2", "a" * 64),
+    ],
+)
+def test_gated_loop_replays_unversioned_legacy_identity_that_looks_like_v2(
+    loop_name: str,
+    item_key: str,
+) -> None:
+    app = CayuApp(enable_logging=False)
+    first = TinyWorkflow(app).context("wf-legacy-v2-shaped-identity")
+
+    async def seed_legacy_completion() -> None:
+        await first.journal.append(first.event(WORKFLOW_ATTEMPT_EVENT_TYPE))
+        appended = await first.journal.append_current_attempt(
+            first.event(
+                EventType.WORKFLOW_STEP_COMPLETED,
+                payload={
+                    "step_id": f"gated-loop:{loop_name}:{item_key}",
+                    "item_key": item_key,
+                    "kind": "gated_loop",
+                    "passed": True,
+                    "outcome": "pass",
+                    "child_session_id": "legacy-child",
+                },
+            ),
+            attempt_id=first.attempt_id,
+        )
+        assert appended is True
+
+    asyncio.run(seed_legacy_completion())
+
+    resumed = TinyWorkflow(app).context("wf-legacy-v2-shaped-identity")
+    calls: list[str] = []
+
+    async def do(item: str) -> StepResult:
+        calls.append(item)
+        return StepResult(step_id="unexpected", session_id="unexpected-child")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            resumed,
+            [item_key],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name=loop_name,
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert calls == []
+
+
+def test_step_replay_ids_returns_a_bounded_number_of_records_for_many_steps() -> None:
+    class CountingStore(InMemorySessionStore):
+        returned_event_records = 0
+        candidate_event_records = 0
+
+        async def query_events(self, query=None):
+            records = await super().query_events(query)
+            self.returned_event_records += len(records)
+            return records
+
+        def _query_candidate_records(self, query, event_types):
+            records = super()._query_candidate_records(query, event_types)
+            self.candidate_event_records += len(records)
+            return records
+
+    store = CountingStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    ctx = TinyWorkflow(app).context("wf-bounded-step-replay")
+
+    async def seed_and_lookup() -> list[tuple[str | None, str | None]]:
+        await ctx.journal.append(ctx.event(WORKFLOW_ATTEMPT_EVENT_TYPE))
+        step_ids = [f"step-{index}" for index in range(1000)]
+        await store.append_events(
+            ctx.session_id,
+            [
+                Event(
+                    id=f"completion-{index}",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id=ctx.session_id,
+                    workflow_name=ctx.workflow_name,
+                    payload={
+                        "attempt_id": ctx.attempt_id,
+                        "step_id": step_id,
+                        "child_session_id": f"child-{index}",
+                    },
+                )
+                for index, step_id in enumerate(step_ids)
+            ],
+        )
+        store.returned_event_records = 0
+        store.candidate_event_records = 0
+        results = [
+            await ctx.journal.step_replay_ids(
+                step_id=step_id,
+                attempt_id=ctx.attempt_id,
+            )
+            for step_id in step_ids
+        ]
+        assert store.returned_event_records <= (2 * len(step_ids)) + 1
+        assert store.candidate_event_records <= (2 * len(step_ids)) + 1
+        return results
+
+    replay_ids = asyncio.run(seed_and_lookup())
+
+    assert replay_ids == [(f"child-{index}", None) for index in range(1000)]
 
 
 class TinyWorkflow(WorkflowBase):
@@ -573,6 +801,7 @@ def test_custom_journal_factory_receives_runtime_event_emitter():
             context.session_id,
             context.workflow_name,
             event_emitter=context.emit_events,
+            step_event_reserver=context.reserve_step_started,
         )
 
     ctx = TinyWorkflow(app, journal_factory=journal_factory).context("wf-custom-emitter")
@@ -596,6 +825,7 @@ def test_custom_journal_runtime_event_emitter_rejects_runtime_namespace():
             context.session_id,
             context.workflow_name,
             event_emitter=context.emit_events,
+            step_event_reserver=context.reserve_step_started,
         )
 
     TinyWorkflow(app, journal_factory=journal_factory).context("wf-custom-runtime-event")
@@ -624,6 +854,7 @@ def test_custom_journal_runtime_event_emitter_allows_cayu_attempt_marker():
             context.session_id,
             context.workflow_name,
             event_emitter=context.emit_events,
+            step_event_reserver=context.reserve_step_started,
         )
 
     ctx = TinyWorkflow(app, journal_factory=journal_factory).context("wf-custom-reserved-event")
@@ -1804,7 +2035,7 @@ def test_sqlite_crash_resume_replays_prefix_without_model_calls(tmp_path):
     item_started = [
         record.event
         for record in records
-        if record.event.payload["step_id"] == "gated-loop:fixes:three"
+        if record.event.payload["step_id"] == gated_loop_step_id("fixes", "three")
     ]
     assert len(item_started) == 2
     first_attempt, second_attempt = (event.payload["attempt_id"] for event in item_started)
@@ -1821,7 +2052,7 @@ def test_sqlite_crash_resume_replays_prefix_without_model_calls(tmp_path):
     item_completed = [
         record.event
         for record in completed
-        if record.event.payload["step_id"] == "gated-loop:fixes:three"
+        if record.event.payload["step_id"] == gated_loop_step_id("fixes", "three")
     ]
     assert [event.payload["attempt_id"] for event in item_completed] == [second_attempt]
     asyncio.run(app_b.session_store.close())
@@ -2121,14 +2352,13 @@ def test_concurrent_first_step_is_durably_reserved_before_child_run():
     ready_count = 0
 
     class DelayedStartedJournal(EventStoreJournal):
-        async def _append_events(self, events: list[Event]) -> None:
+        async def append_step_started(self, event: Event, *, attempt_id: str) -> bool:
             nonlocal ready_count
-            if any(event.type == EventType.WORKFLOW_STEP_STARTED for event in events):
-                ready_count += 1
-                if ready_count == 2:
-                    both_ready.set()
-                await both_ready.wait()
-            await super()._append_events(events)
+            ready_count += 1
+            if ready_count == 2:
+                both_ready.set()
+            await both_ready.wait()
+            return await super().append_step_started(event, attempt_id=attempt_id)
 
     def journal_factory(context: WorkflowJournalContext) -> WorkflowJournal:
         return DelayedStartedJournal(
@@ -2136,6 +2366,7 @@ def test_concurrent_first_step_is_durably_reserved_before_child_run():
             context.session_id,
             context.workflow_name,
             event_emitter=context.emit_events,
+            step_event_reserver=context.reserve_step_started,
         )
 
     workflow = TinyWorkflow(app, journal_factory=journal_factory)
@@ -2158,6 +2389,74 @@ def test_concurrent_first_step_is_durably_reserved_before_child_run():
 
     asyncio.run(run())
     assert len(provider.requests) == 1
+
+
+def test_step_reservation_cannot_commit_after_attempt_takeover() -> None:
+    class DelayedReservationStore(InMemorySessionStore):
+        stale_entered = asyncio.Event()
+        release_stale = asyncio.Event()
+
+        async def append_workflow_step_started(
+            self,
+            session_id,
+            event,
+            *,
+            workflow_name,
+            attempt_id,
+        ):
+            if attempt_id == stale_attempt_id:
+                self.stale_entered.set()
+                await self.release_stale.wait()
+            return await super().append_workflow_step_started(
+                session_id,
+                event,
+                workflow_name=workflow_name,
+                attempt_id=attempt_id,
+            )
+
+    store = DelayedReservationStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    workflow = TinyWorkflow(app)
+    stale = workflow.context("wf-attempt-reservation-race")
+    stale_attempt_id = stale.attempt_id
+
+    async def run() -> None:
+        await stale.start()
+        stale_task = asyncio.create_task(
+            stale.journal.append_step_started(
+                stale.event(
+                    EventType.WORKFLOW_STEP_STARTED,
+                    payload={"step_id": "step-a"},
+                ),
+                attempt_id=stale.attempt_id,
+            )
+        )
+        await store.stale_entered.wait()
+
+        current = workflow.context("wf-attempt-reservation-race")
+        await current.start()
+        current_reserved = await current.journal.append_step_started(
+            current.event(
+                EventType.WORKFLOW_STEP_STARTED,
+                payload={"step_id": "step-a"},
+            ),
+            attempt_id=current.attempt_id,
+        )
+        store.release_stale.set()
+
+        assert current_reserved is True
+        assert await stale_task is False
+        records = await store.query_events(
+            EventQuery(
+                session_id=stale.session_id,
+                event_type=EventType.WORKFLOW_STEP_STARTED,
+                limit=10,
+            )
+        )
+        assert len(records) == 1
+        assert records[0].event.payload["attempt_id"] == current.attempt_id
+
+    asyncio.run(run())
 
 
 def test_step_structured_output_returns_unredacted_typed_edge():

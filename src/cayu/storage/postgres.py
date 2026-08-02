@@ -44,6 +44,7 @@ from cayu._validation import (
 from cayu.core.billing import BillingIdentity, copy_billing_identity
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
+from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import (
@@ -190,6 +191,7 @@ from cayu.runtime.sessions import (
     _copy_queued_interaction_started_event,
     _copy_session_event_batch,
     _copy_transition_interaction_admission,
+    _copy_workflow_step_reservation,
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
@@ -360,7 +362,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 28
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 29
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -1769,6 +1771,95 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             required_key_collations=(None, None, "C"),
         ),
     ),
+    29: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_workflow_step_replay",
+            table_name="cayu_events",
+            key_definitions=(
+                "session_id",
+                "workflow_name",
+                "event -> 'payload' ->> 'step_id'",
+                "event_type",
+                "sequence",
+            ),
+            predicate_definition="""
+                event_type = ANY (ARRAY[
+                    'workflow.step.started',
+                    'workflow.step.completed'
+                ])
+            """,
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_workflow_step_replay
+                ON cayu_events(
+                    session_id,
+                    workflow_name,
+                    (event -> 'payload' ->> 'step_id'),
+                    event_type,
+                    sequence DESC
+                )
+                WHERE event_type IN (
+                    'workflow.step.started',
+                    'workflow.step.completed'
+                )
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_workflow_step_replay"
+            ),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_workflow_attempt_marker",
+            table_name="cayu_events",
+            key_definitions=("session_id", "workflow_name", "sequence"),
+            predicate_definition=("event_type = 'custom.cayu.workflow.attempt'"),
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_workflow_attempt_marker
+                ON cayu_events(session_id, workflow_name, sequence DESC)
+                WHERE event_type = 'custom.cayu.workflow.attempt'
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_workflow_attempt_marker"
+            ),
+        ),
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_events_workflow_step_attempt",
+            table_name="cayu_events",
+            key_definitions=(
+                "session_id",
+                "workflow_name",
+                "event -> 'payload' ->> 'attempt_id'",
+                "event -> 'payload' ->> 'step_id'",
+                "event_type",
+                "sequence",
+            ),
+            predicate_definition="""
+                event_type = ANY (ARRAY[
+                    'workflow.step.started',
+                    'workflow.step.completed'
+                ])
+            """,
+            create_statement="""
+                CREATE INDEX CONCURRENTLY IF NOT EXISTS
+                    idx_cayu_events_workflow_step_attempt
+                ON cayu_events(
+                    session_id,
+                    workflow_name,
+                    (event -> 'payload' ->> 'attempt_id'),
+                    (event -> 'payload' ->> 'step_id'),
+                    event_type,
+                    sequence DESC
+                )
+                WHERE event_type IN (
+                    'workflow.step.started',
+                    'workflow.step.completed'
+                )
+            """,
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_events_workflow_step_attempt"
+            ),
+        ),
+    ),
 }
 
 
@@ -2602,7 +2693,9 @@ class _PostgresStoreBase:
             raise RuntimeError(
                 f"Postgres schema object {index.index_name!r} conflicts with the required "
                 f"{index_kind} index on {index.table_name}({columns}). Remove or rename the "
-                "conflicting object, then rerun `cayu storage migrate`."
+                "conflicting object, then rerun `cayu storage migrate`. "
+                f"Observed keys={key_definitions!r}, predicate={predicate!r}; "
+                f"expected keys={expected_keys!r}, predicate={expected_predicate!r}."
             )
         return bool(row[1]), bool(row[8])
 
@@ -7642,6 +7735,140 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         "Budget ledger reused a reservation identity."
                     ) from exc
                 raise
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def append_workflow_step_started(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        workflow_name: str,
+        attempt_id: str,
+    ) -> bool:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        session_id, copied_event, workflow_name, attempt_id = _copy_workflow_step_reservation(
+            session_id,
+            event,
+            workflow_name=workflow_name,
+            attempt_id=attempt_id,
+        )
+        await self._ensure_ready()
+        expected_run_epoch = _current_session_run_epoch(session_id)
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    activity_at = datetime.now(UTC)
+                    if expected_run_epoch is None:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET event_seq = event_seq + 1, last_activity_at = %s
+                            WHERE id = %s
+                            RETURNING event_seq
+                            """,
+                            (activity_at, session_id),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET event_seq = event_seq + 1, last_activity_at = %s
+                            WHERE id = %s AND run_epoch = %s
+                            RETURNING event_seq
+                            """,
+                            (activity_at, session_id, expected_run_epoch),
+                        )
+                    order_row = await cur.fetchone()
+                    if order_row is None:
+                        if expected_run_epoch is not None:
+                            await _raise_session_write_conflict(
+                                cur,
+                                session_id,
+                                expected_run_epoch,
+                            )
+                        raise KeyError(f"Session not found: {session_id}")
+
+                    await cur.execute(
+                        """
+                        SELECT event -> 'payload' ->> 'attempt_id'
+                        FROM cayu_events
+                        WHERE session_id = %s
+                          AND workflow_name = %s
+                          AND event_type = %s
+                        ORDER BY sequence DESC
+                        LIMIT 1
+                        """,
+                        (session_id, workflow_name, WORKFLOW_ATTEMPT_EVENT_TYPE),
+                    )
+                    latest_attempt = await cur.fetchone()
+                    if latest_attempt is None or latest_attempt[0] != attempt_id:
+                        await conn.rollback()
+                        return False
+
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                        (session_id, copied_event.id),
+                    )
+                    if await cur.fetchone() is not None:
+                        await conn.rollback()
+                        return False
+
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        [copied_event],
+                    )
+                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                        copied_event
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, session_order, event_id, interaction_id,
+                            event_type, timestamp,
+                            agent_name, environment_name, workflow_name, tool_name,
+                            payload, event, pending_action_lookup_key,
+                            pending_action_projection, pending_action_projection_bytes
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            session_id,
+                            order_row[0],
+                            copied_event.id,
+                            copied_event.interaction_id,
+                            str(copied_event.type),
+                            pg_support.to_utc(copied_event.timestamp),
+                            copied_event.agent_name,
+                            copied_event.environment_name,
+                            copied_event.workflow_name,
+                            copied_event.tool_name,
+                            _dumps(copied_event.payload),
+                            _dumps(copied_event.model_dump(mode="json")),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        ),
+                    )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        session_id,
+                        [copied_event.id],
+                    )
+                await conn.commit()
+                return True
+            except UniqueViolation as exc:
+                await conn.rollback()
+                existing = await self._first_existing_event_id(session_id, [copied_event.id])
+                if existing is not None:
+                    return False
+                raise exc
             except Exception:
                 await conn.rollback()
                 raise

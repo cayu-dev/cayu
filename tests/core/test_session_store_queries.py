@@ -158,6 +158,16 @@ def test_event_query_requires_ordered_sequence_bounds() -> None:
         EventQuery(session_id="session_1", after_sequence=2, before_sequence=2)
 
 
+def test_event_query_requires_attempt_scope_for_workflow_step() -> None:
+    with pytest.raises(ValidationError, match="exact or fenced attempt scope"):
+        EventQuery(
+            session_id="workflow-run",
+            workflow_name="workflow",
+            workflow_step_id="step",
+            event_type=EventType.WORKFLOW_STEP_STARTED,
+        )
+
+
 def test_pending_action_event_projection_rejects_oversized_selected_payload() -> None:
     event = Event(
         type=EventType.SESSION_INTERRUPTED,
@@ -1495,6 +1505,313 @@ def test_session_stores_query_events_with_filters_cursors_and_batching(
         with pytest.raises(KeyError, match="Session not found"):
             await store.summarize_events("missing_session")
         await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_query_exact_workflow_step_attempt(
+    store_factory: StoreFactory,
+    tmp_path,
+):
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="workflow",
+                session_id="workflow-run",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            "workflow-run",
+            [
+                Event(
+                    id="target-old",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="workflow-run",
+                    workflow_name="maintenance",
+                    payload={
+                        "attempt_id": "attempt-2",
+                        "step_id": "step-a",
+                        "child_session_id": "child-old",
+                    },
+                ),
+                Event(
+                    id="target-new",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="workflow-run",
+                    workflow_name="maintenance",
+                    payload={
+                        "attempt_id": "attempt-2",
+                        "step_id": "step-a",
+                        "child_session_id": "child-new",
+                    },
+                ),
+                Event(
+                    id="other-step",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="workflow-run",
+                    workflow_name="maintenance",
+                    payload={
+                        "attempt_id": "attempt-2",
+                        "step_id": "step-b",
+                        "child_session_id": "child-other",
+                    },
+                ),
+            ],
+        )
+
+        records = await store.query_events(
+            EventQuery(
+                session_id="workflow-run",
+                workflow_name="maintenance",
+                workflow_attempt_id="attempt-2",
+                workflow_step_id="step-a",
+                event_type=EventType.WORKFLOW_STEP_COMPLETED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+
+        assert [record.event.id for record in records] == ["target-new"]
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_query_latest_attempt_fenced_workflow_step(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="workflow",
+                session_id="workflow-fenced-run",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await store.append_events(
+            "workflow-fenced-run",
+            [
+                Event(
+                    id="attempt-1-marker",
+                    type="custom.cayu.workflow.attempt",
+                    session_id="workflow-fenced-run",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-1"},
+                ),
+                Event(
+                    id="valid-prior-start",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="workflow-fenced-run",
+                    workflow_name="maintenance",
+                    payload={
+                        "attempt_id": "attempt-1",
+                        "step_id": "step-a",
+                        "child_session_id": "child-prior",
+                    },
+                ),
+                Event(
+                    id="attempt-2-marker",
+                    type="custom.cayu.workflow.attempt",
+                    session_id="workflow-fenced-run",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2"},
+                ),
+                Event(
+                    id="stale-prior-start",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="workflow-fenced-run",
+                    workflow_name="maintenance",
+                    payload={
+                        "attempt_id": "attempt-1",
+                        "step_id": "step-a",
+                        "child_session_id": "child-stale",
+                    },
+                ),
+            ],
+        )
+
+        query = EventQuery(
+            session_id="workflow-fenced-run",
+            workflow_name="maintenance",
+            workflow_step_id="step-a",
+            workflow_attempt_fenced=True,
+            event_type=EventType.WORKFLOW_STEP_STARTED,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+        prior = await store.query_events(query)
+        assert [record.event.id for record in prior] == ["valid-prior-start"]
+
+        await store.append_events(
+            "workflow-fenced-run",
+            [
+                Event(
+                    id="valid-current-start",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="workflow-fenced-run",
+                    workflow_name="maintenance",
+                    payload={
+                        "attempt_id": "attempt-2",
+                        "step_id": "step-a",
+                        "child_session_id": "child-current",
+                    },
+                )
+            ],
+        )
+        current = await store.query_events(query)
+        assert [record.event.id for record in current] == ["valid-current-start"]
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
+def test_session_stores_atomically_fence_workflow_step_reservations(
+    store_factory: StoreFactory,
+    tmp_path,
+) -> None:
+    store = _make_store(store_factory, tmp_path)
+
+    async def run_store_operations() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="workflow",
+                session_id="workflow-reservation-run",
+                messages=[],
+            ),
+            identity=_identity(),
+        )
+        await store.append_event(
+            "workflow-reservation-run",
+            Event(
+                id="attempt-1-marker",
+                type="custom.cayu.workflow.attempt",
+                session_id="workflow-reservation-run",
+                workflow_name="maintenance",
+                payload={"attempt_id": "attempt-1"},
+            ),
+        )
+        await store.append_event(
+            "workflow-reservation-run",
+            Event(
+                id="attempt-2-marker",
+                type="custom.cayu.workflow.attempt",
+                session_id="workflow-reservation-run",
+                workflow_name="maintenance",
+                payload={"attempt_id": "attempt-2"},
+            ),
+        )
+
+        stale_reserved = await store.append_workflow_step_started(
+            "workflow-reservation-run",
+            Event(
+                id="stale-reservation",
+                type=EventType.WORKFLOW_STEP_STARTED,
+                session_id="workflow-reservation-run",
+                workflow_name="maintenance",
+                payload={"attempt_id": "attempt-1", "step_id": "step-a"},
+            ),
+            workflow_name="maintenance",
+            attempt_id="attempt-1",
+        )
+        current_event = Event(
+            id="current-reservation",
+            type=EventType.WORKFLOW_STEP_STARTED,
+            session_id="workflow-reservation-run",
+            workflow_name="maintenance",
+            payload={"attempt_id": "attempt-2", "step_id": "step-a"},
+        )
+        current_reserved = await store.append_workflow_step_started(
+            "workflow-reservation-run",
+            current_event,
+            workflow_name="maintenance",
+            attempt_id="attempt-2",
+        )
+        duplicate_reserved = await store.append_workflow_step_started(
+            "workflow-reservation-run",
+            current_event,
+            workflow_name="maintenance",
+            attempt_id="attempt-2",
+        )
+
+        assert stale_reserved is False
+        assert current_reserved is True
+        assert duplicate_reserved is False
+        records = await store.query_events(
+            EventQuery(
+                session_id="workflow-reservation-run",
+                event_type=EventType.WORKFLOW_STEP_STARTED,
+                limit=10,
+            )
+        )
+        assert [record.event.id for record in records] == ["current-reservation"]
+        await _close_store(store)
+
+    asyncio.run(run_store_operations())
+
+
+def test_sqlite_workflow_step_reservation_has_one_winner_across_store_instances(
+    tmp_path,
+) -> None:
+    database = tmp_path / "workflow-reservation-race.sqlite"
+    first = SQLiteSessionStore(database)
+    second = SQLiteSessionStore(database)
+
+    async def run_store_operations() -> None:
+        try:
+            await first.create(
+                RunRequest(
+                    agent_name="workflow",
+                    session_id="workflow-reservation-race",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await first.append_event(
+                "workflow-reservation-race",
+                Event(
+                    id="attempt-marker",
+                    type="custom.cayu.workflow.attempt",
+                    session_id="workflow-reservation-race",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-1"},
+                ),
+            )
+            event = Event(
+                id="shared-reservation",
+                type=EventType.WORKFLOW_STEP_STARTED,
+                session_id="workflow-reservation-race",
+                workflow_name="maintenance",
+                payload={"attempt_id": "attempt-1", "step_id": "step-a"},
+            )
+            outcomes = await asyncio.gather(
+                first.append_workflow_step_started(
+                    "workflow-reservation-race",
+                    event,
+                    workflow_name="maintenance",
+                    attempt_id="attempt-1",
+                ),
+                second.append_workflow_step_started(
+                    "workflow-reservation-race",
+                    event,
+                    workflow_name="maintenance",
+                    attempt_id="attempt-1",
+                ),
+            )
+            assert sorted(outcomes) == [False, True]
+        finally:
+            await first.close()
+            await second.close()
 
     asyncio.run(run_store_operations())
 

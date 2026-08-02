@@ -520,6 +520,28 @@ _BASELINE_DDL = """
         ON cayu_events(environment_name);
     CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_name
         ON cayu_events(workflow_name);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_step_replay
+        ON cayu_events(
+            session_id,
+            workflow_name,
+            json_extract(payload_json, '$.step_id'),
+            event_type,
+            sequence DESC
+        )
+        WHERE json_valid(payload_json);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_step_attempt
+        ON cayu_events(
+            session_id,
+            workflow_name,
+            json_extract(payload_json, '$.attempt_id'),
+            json_extract(payload_json, '$.step_id'),
+            event_type,
+            sequence DESC
+        )
+        WHERE json_valid(payload_json);
+    CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_attempt_marker
+        ON cayu_events(session_id, workflow_name, sequence DESC)
+        WHERE event_type = 'custom.cayu.workflow.attempt';
     CREATE INDEX IF NOT EXISTS idx_cayu_events_tool_name
         ON cayu_events(tool_name);
     CREATE INDEX IF NOT EXISTS idx_cayu_transcript_messages_session_sequence
@@ -1231,6 +1253,30 @@ _MIGRATION_STEPS: dict[int, str] = {
               AND trim(interaction.value) <> '';
         END;
     """,
+    29: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_step_replay
+            ON cayu_events(
+                session_id,
+                workflow_name,
+                json_extract(payload_json, '$.step_id'),
+                event_type,
+                sequence DESC
+            )
+            WHERE json_valid(payload_json);
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_step_attempt
+            ON cayu_events(
+                session_id,
+                workflow_name,
+                json_extract(payload_json, '$.attempt_id'),
+                json_extract(payload_json, '$.step_id'),
+                event_type,
+                sequence DESC
+            )
+            WHERE json_valid(payload_json);
+        CREATE INDEX IF NOT EXISTS idx_cayu_events_workflow_attempt_marker
+            ON cayu_events(session_id, workflow_name, sequence DESC)
+            WHERE event_type = 'custom.cayu.workflow.attempt';
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -1600,6 +1646,13 @@ _PENDING_ACTION_SCOPE_INDEX_NAMES = frozenset(
         "idx_cayu_events_pending_action_attempt_scope",
     }
 )
+_WORKFLOW_REPLAY_INDEX_NAMES = frozenset(
+    {
+        "idx_cayu_events_workflow_step_replay",
+        "idx_cayu_events_workflow_step_attempt",
+        "idx_cayu_events_workflow_attempt_marker",
+    }
+)
 
 
 def _normalize_sqlite_schema_definition(definition: str) -> str:
@@ -1672,6 +1725,68 @@ def _repair_missing_revision_17_indexes(connection: sqlite3.Connection) -> None:
             if index_name not in existing_names:
                 connection.execute(definition)
         _validate_revision_17_indexes(connection, require_all=True)
+
+
+def _workflow_replay_index_definitions() -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for statement in _iter_statements(_MIGRATION_STEPS[29]):
+        match = re.match(
+            r"CREATE\s+INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if match is not None and match.group(1) in _WORKFLOW_REPLAY_INDEX_NAMES:
+            definitions[match.group(1)] = statement
+    if definitions.keys() != _WORKFLOW_REPLAY_INDEX_NAMES:
+        raise RuntimeError("Cayu workflow replay index definitions are incomplete.")
+    return definitions
+
+
+def _validate_workflow_replay_indexes(
+    connection: sqlite3.Connection,
+    *,
+    require_all: bool,
+) -> None:
+    for index_name, expected in _workflow_replay_index_definitions().items():
+        row = connection.execute(
+            "SELECT type, tbl_name, sql FROM sqlite_master WHERE name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            if require_all:
+                raise RuntimeError(
+                    f"Required Cayu SQLite index is missing: {index_name}. "
+                    "Run with schema_mode='migrate' to repair the schema."
+                )
+            continue
+        actual_type, table_name, actual_definition = row
+        if (
+            actual_type != "index"
+            or table_name != "cayu_events"
+            or actual_definition is None
+            or _normalize_sqlite_schema_definition(actual_definition)
+            != _normalize_sqlite_schema_definition(expected)
+        ):
+            raise RuntimeError(
+                f"SQLite schema object {index_name!r} conflicts with Cayu's "
+                "workflow replay contract. Rename or remove the conflicting "
+                "object, then run with schema_mode='migrate'."
+            )
+
+
+def _repair_missing_workflow_replay_indexes(connection: sqlite3.Connection) -> None:
+    with _transaction(connection):
+        _validate_workflow_replay_indexes(connection, require_all=False)
+        existing_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        for index_name, definition in _workflow_replay_index_definitions().items():
+            if index_name not in existing_names:
+                connection.execute(definition)
+        _validate_workflow_replay_indexes(connection, require_all=True)
 
 
 def _reservation_event_index_definition() -> str:
@@ -1904,6 +2019,11 @@ def reconcile_schema(
             _validate_reservation_event_index(connection, require=True)
             _validate_pending_action_scope_indexes(connection, require_all=True)
         _validate_reservation_identity_registry(connection, require=True)
+    if current.revision >= 29:
+        if schema_mode is schema.SchemaMode.MIGRATE:
+            _repair_missing_workflow_replay_indexes(connection)
+        else:
+            _validate_workflow_replay_indexes(connection, require_all=True)
 
 
 def initialize_schema(connection: sqlite3.Connection) -> None:
@@ -2025,6 +2145,15 @@ def _apply_revision(connection: sqlite3.Connection, rev: schema.Revision) -> Non
                 require=True,
                 verify_event_ownership=True,
             )
+            _record_revision(connection, rev)
+            connection.execute(f"PRAGMA user_version = {rev.revision}")
+        return
+    if rev.revision == 29:
+        with _transaction(connection):
+            _validate_workflow_replay_indexes(connection, require_all=False)
+            for statement in _iter_statements(_MIGRATION_STEPS[29]):
+                connection.execute(statement)
+            _validate_workflow_replay_indexes(connection, require_all=True)
             _record_revision(connection, rev)
             connection.execute(f"PRAGMA user_version = {rev.revision}")
         return

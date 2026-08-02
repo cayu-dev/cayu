@@ -23,6 +23,7 @@ from cayu._validation import (
 )
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole
+from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
@@ -119,6 +120,7 @@ from cayu.runtime.sessions import (
     _copy_queued_interaction_started_event,
     _copy_session_event_batch,
     _copy_transition_interaction_admission,
+    _copy_workflow_step_reservation,
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
@@ -252,7 +254,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 28
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 29
 _SQLITE_TASK_TOPOLOGY_MIN_REQUIRED_REVISION = 27
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -2922,6 +2924,109 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         await self._run_write(statement)
+
+    async def append_workflow_step_started(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        workflow_name: str,
+        attempt_id: str,
+    ) -> bool:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        session_id, copied_event, workflow_name, attempt_id = _copy_workflow_step_reservation(
+            session_id,
+            event,
+            workflow_name=workflow_name,
+            attempt_id=attempt_id,
+        )
+
+        def statement(connection: sqlite3.Connection) -> bool:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if not _session_exists(connection, session_id):
+                    raise KeyError(f"Session not found: {session_id}")
+                row = connection.execute(
+                    """
+                    SELECT json_extract(payload_json, '$.attempt_id')
+                    FROM cayu_events
+                    WHERE session_id = ?
+                      AND workflow_name = ?
+                      AND event_type = ?
+                    ORDER BY sequence DESC
+                    LIMIT 1
+                    """,
+                    (session_id, workflow_name, WORKFLOW_ATTEMPT_EVENT_TYPE),
+                ).fetchone()
+                if row is None or row[0] != attempt_id:
+                    connection.rollback()
+                    return False
+                if _first_existing_event_id(connection, session_id, [copied_event.id]) is not None:
+                    connection.rollback()
+                    return False
+
+                _touch_session_activity(connection, session_id, datetime.now(UTC))
+                lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                    copied_event
+                )
+                connection.execute(
+                    """
+                    INSERT INTO cayu_events (
+                        session_id,
+                        event_id,
+                        interaction_id,
+                        event_type,
+                        timestamp,
+                        agent_name,
+                        environment_name,
+                        workflow_name,
+                        tool_name,
+                        payload_json,
+                        pending_action_lookup_key,
+                        pending_action_projection_json,
+                        pending_action_projection_bytes
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        copied_event.id,
+                        copied_event.interaction_id,
+                        str(copied_event.type),
+                        sqlite_support.format_datetime(copied_event.timestamp),
+                        copied_event.agent_name,
+                        copied_event.environment_name,
+                        copied_event.workflow_name,
+                        copied_event.tool_name,
+                        sqlite_support.json_dumps(copied_event.payload),
+                        lookup_key,
+                        projection,
+                        projection_bytes,
+                    ),
+                )
+                _enqueue_persisted_event_side_effects(
+                    connection,
+                    session_id,
+                    [copied_event.id],
+                )
+                connection.commit()
+                return True
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                existing_event_id = _first_existing_event_id(
+                    connection,
+                    session_id,
+                    [copied_event.id],
+                )
+                if existing_event_id is not None:
+                    return False
+                raise exc
+            except Exception:
+                connection.rollback()
+                raise
+
+        return await self._run_write(statement)
 
     async def load_mcp_manifest_baselines(
         self,

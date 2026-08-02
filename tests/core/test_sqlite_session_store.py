@@ -22,6 +22,8 @@ from cayu.providers import (
 from cayu.runtime import (
     CayuApp,
     EnqueueSessionMessageRequest,
+    EventOrder,
+    EventQuery,
     ForkSessionRequest,
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
@@ -43,6 +45,7 @@ from cayu.runtime.sessions import (
     ModelCompletionStageRequest,
     PendingActionQuery,
 )
+from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema_migrations
 
@@ -66,6 +69,90 @@ def test_read_only_session_store_does_not_create_missing_database(tmp_path) -> N
         )
     assert not missing.exists()
     assert not missing.parent.exists()
+
+
+def test_sqlite_workflow_replay_query_uses_step_and_attempt_indexes(tmp_path) -> None:
+    db_path = tmp_path / "workflow-replay.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+    query = EventQuery(
+        session_id="workflow-run",
+        workflow_name="workflow",
+        workflow_step_id="step",
+        workflow_attempt_fenced=True,
+        event_type=EventType.WORKFLOW_STEP_COMPLETED,
+        order_by=EventOrder.SEQUENCE_DESC,
+        limit=1,
+    )
+    dialect = session_store_sql.SessionStoreSqlDialect(
+        placeholder="?",
+        contains_style="sqlite_nocase_like",
+        datetime_param=lambda value: value,
+    )
+    plan = session_store_sql.build_event_query_sql(query, dialect=dialect)
+    exact_query = query.model_copy(
+        update={
+            "workflow_attempt_fenced": False,
+            "workflow_attempt_id": "attempt",
+        }
+    )
+    exact_plan = session_store_sql.build_event_query_sql(exact_query, dialect=dialect)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        details = [
+            row[3]
+            for row in connection.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT cayu_events.sequence FROM cayu_events "
+                "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                f"{plan.where_sql} "
+                f"ORDER BY cayu_events.sequence {plan.order_direction} LIMIT ?",
+                (*plan.params, query.limit),
+            )
+        ]
+        exact_details = [
+            row[3]
+            for row in connection.execute(
+                "EXPLAIN QUERY PLAN "
+                "SELECT cayu_events.sequence FROM cayu_events "
+                "JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id "
+                f"{exact_plan.where_sql} "
+                f"ORDER BY cayu_events.sequence {exact_plan.order_direction} LIMIT ?",
+                (*exact_plan.params, exact_query.limit),
+            )
+        ]
+    finally:
+        connection.close()
+
+    assert any("idx_cayu_events_workflow_step_replay" in detail for detail in details)
+    assert any("idx_cayu_events_workflow_attempt_marker" in detail for detail in details)
+    assert any("idx_cayu_events_workflow_step_attempt" in detail for detail in exact_details)
+
+
+def test_sqlite_migrate_repairs_missing_workflow_replay_index(tmp_path) -> None:
+    db_path = tmp_path / "workflow-replay-repair.sqlite"
+    store = SQLiteSessionStore(db_path)
+    asyncio.run(_close(store))
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("DROP INDEX idx_cayu_events_workflow_step_replay")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RuntimeError, match="Required Cayu SQLite index is missing"):
+        SQLiteSessionStore(db_path)
+
+    repaired = SQLiteSessionStore(
+        db_path,
+        schema_mode=schema_migrations.SchemaMode.MIGRATE,
+    )
+    asyncio.run(_close(repaired))
+
+    validated = SQLiteSessionStore(db_path)
+    asyncio.run(_close(validated))
 
 
 def test_sqlite_interaction_transcript_query_uses_persisted_absolute_order(
@@ -1839,7 +1926,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 27"):
@@ -1965,7 +2052,7 @@ def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2011,7 +2098,7 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2050,7 +2137,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 28"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2505,6 +2592,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (26, 26),
         (27, 26),
         (28, 28),
+        (29, 28),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

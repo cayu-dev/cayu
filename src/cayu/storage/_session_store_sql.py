@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Literal
 
 from cayu.core.events import EventType
+from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime.sessions import (
     EventOrder,
     EventQuery,
@@ -35,6 +36,31 @@ class SessionStoreSqlDialect:
         if self.contains_style == "sqlite_nocase_like":
             return f"{column} COLLATE NOCASE LIKE {self.placeholder} ESCAPE '\\'"
         return f"{column} ILIKE {self.placeholder} ESCAPE '\\'"
+
+    def event_payload_text(self, key: Literal["attempt_id", "step_id"]) -> str:
+        if self.contains_style == "sqlite_nocase_like":
+            return f"json_extract(cayu_events.payload_json, '$.{key}')"
+        return f"(cayu_events.event -> 'payload' ->> '{key}')"
+
+    def workflow_attempt_fence_clause(self) -> str:
+        if self.contains_style == "sqlite_nocase_like":
+            attempt_payload = "json_extract(workflow_attempt.payload_json, '$.attempt_id')"
+        else:
+            attempt_payload = "(workflow_attempt.event -> 'payload' ->> 'attempt_id')"
+        return (
+            f"{self.event_payload_text('attempt_id')} = ("
+            f"SELECT {attempt_payload} FROM cayu_events AS workflow_attempt "
+            "WHERE workflow_attempt.session_id = cayu_events.session_id "
+            "AND workflow_attempt.workflow_name = cayu_events.workflow_name "
+            f"AND workflow_attempt.event_type = '{WORKFLOW_ATTEMPT_EVENT_TYPE}' "
+            "AND workflow_attempt.sequence <= cayu_events.sequence "
+            "ORDER BY workflow_attempt.sequence DESC LIMIT 1)"
+        )
+
+    def workflow_step_payload_valid_clause(self) -> str | None:
+        if self.contains_style == "sqlite_nocase_like":
+            return "json_valid(cayu_events.payload_json)"
+        return None
 
 
 @dataclass(frozen=True)
@@ -128,6 +154,17 @@ def build_event_query_sql(
     if query.workflow_name is not None:
         clauses.append(f"cayu_events.workflow_name = {dialect.placeholder}")
         params.append(query.workflow_name)
+    if query.workflow_attempt_id is not None:
+        clauses.append(f"{dialect.event_payload_text('attempt_id')} = {dialect.placeholder}")
+        params.append(query.workflow_attempt_id)
+    if query.workflow_step_id is not None:
+        payload_valid_clause = dialect.workflow_step_payload_valid_clause()
+        if payload_valid_clause is not None:
+            clauses.append(payload_valid_clause)
+        clauses.append(f"{dialect.event_payload_text('step_id')} = {dialect.placeholder}")
+        params.append(query.workflow_step_id)
+    if query.workflow_attempt_fenced:
+        clauses.append(dialect.workflow_attempt_fence_clause())
     if query.tool_name is not None:
         clauses.append(f"cayu_events.tool_name = {dialect.placeholder}")
         params.append(query.tool_name)

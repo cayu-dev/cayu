@@ -9,12 +9,14 @@ These skip automatically when Postgres is unavailable (see ``conftest.py``).
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from cayu import PostgresSessionStore, PostgresTaskStore
 from cayu.core import Event, EventType, Message
-from cayu.runtime import RunRequest, SessionIdentity
+from cayu.runtime import EventOrder, EventQuery, RunRequest, SessionIdentity
+from cayu.storage import _session_store_sql as session_store_sql
 from cayu.storage import migrations as schema
 from cayu.storage import postgres as postgres_storage
 from cayu.storage.migrations import SchemaMode
@@ -48,6 +50,212 @@ def test_revision_seventeen_builds_hot_indexes_concurrently() -> None:
     assert "LIMIT 25" in postgres_storage._REVISION_17_EVENT_BACKFILL_SMALL_SQL
     assert "sequence > %s" in postgres_storage._REVISION_17_EVENT_BACKFILL_LARGE_SQL
     assert "LIMIT 1" in postgres_storage._REVISION_17_EVENT_BACKFILL_LARGE_SQL
+
+
+def test_revision_twenty_nine_builds_workflow_replay_indexes_concurrently() -> None:
+    indexes = {
+        index.index_name: index for index in postgres_storage._CONCURRENT_INDEX_MIGRATIONS[29]
+    }
+    assert indexes.keys() == {
+        "idx_cayu_events_workflow_step_replay",
+        "idx_cayu_events_workflow_step_attempt",
+        "idx_cayu_events_workflow_attempt_marker",
+    }
+    replay = indexes["idx_cayu_events_workflow_step_replay"]
+    assert replay.key_definitions == (
+        "session_id",
+        "workflow_name",
+        "event -> 'payload' ->> 'step_id'",
+        "event_type",
+        "sequence",
+    )
+    assert "sequence DESC" in replay.create_statement
+    assert all(
+        event_type in (replay.predicate_definition or "")
+        for event_type in ("workflow.step.started", "workflow.step.completed")
+    )
+    marker = indexes["idx_cayu_events_workflow_attempt_marker"]
+    assert marker.key_definitions == ("session_id", "workflow_name", "sequence")
+    assert "sequence DESC" in marker.create_statement
+    assert "custom.cayu.workflow.attempt" in (marker.predicate_definition or "")
+    exact = indexes["idx_cayu_events_workflow_step_attempt"]
+    assert exact.key_definitions == (
+        "session_id",
+        "workflow_name",
+        "event -> 'payload' ->> 'attempt_id'",
+        "event -> 'payload' ->> 'step_id'",
+        "event_type",
+        "sequence",
+    )
+    assert all("CREATE INDEX CONCURRENTLY" in index.create_statement for index in indexes.values())
+
+
+def test_postgres_workflow_replay_is_fenced_atomic_and_indexed(postgres_dsn: str) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        store = PostgresSessionStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="workflow",
+                    session_id="postgres-workflow-replay",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await store.append_events(
+                "postgres-workflow-replay",
+                [
+                    Event(
+                        id="attempt-1-marker",
+                        type="custom.cayu.workflow.attempt",
+                        session_id="postgres-workflow-replay",
+                        workflow_name="maintenance",
+                        payload={"attempt_id": "attempt-1"},
+                    ),
+                    Event(
+                        id="attempt-1-completed",
+                        type=EventType.WORKFLOW_STEP_COMPLETED,
+                        session_id="postgres-workflow-replay",
+                        workflow_name="maintenance",
+                        payload={
+                            "attempt_id": "attempt-1",
+                            "step_id": "step-a",
+                            "child_session_id": "child-completed",
+                        },
+                    ),
+                    Event(
+                        id="attempt-2-marker",
+                        type="custom.cayu.workflow.attempt",
+                        session_id="postgres-workflow-replay",
+                        workflow_name="maintenance",
+                        payload={"attempt_id": "attempt-2"},
+                    ),
+                ],
+            )
+            stale_reserved = await store.append_workflow_step_started(
+                "postgres-workflow-replay",
+                Event(
+                    id="stale-reservation",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="postgres-workflow-replay",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-1", "step_id": "step-a"},
+                ),
+                workflow_name="maintenance",
+                attempt_id="attempt-1",
+            )
+            current_reserved = await store.append_workflow_step_started(
+                "postgres-workflow-replay",
+                Event(
+                    id="current-reservation",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="postgres-workflow-replay",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2", "step_id": "step-a"},
+                ),
+                workflow_name="maintenance",
+                attempt_id="attempt-2",
+            )
+            assert stale_reserved is False
+            assert current_reserved is True
+
+            competitor = PostgresSessionStore(
+                postgres_dsn,
+                schema_mode=SchemaMode.VALIDATE,
+            )
+            try:
+                concurrent_event = Event(
+                    id="concurrent-reservation",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="postgres-workflow-replay",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2", "step_id": "step-b"},
+                )
+                concurrent_outcomes = await asyncio.gather(
+                    store.append_workflow_step_started(
+                        "postgres-workflow-replay",
+                        concurrent_event,
+                        workflow_name="maintenance",
+                        attempt_id="attempt-2",
+                    ),
+                    competitor.append_workflow_step_started(
+                        "postgres-workflow-replay",
+                        concurrent_event,
+                        workflow_name="maintenance",
+                        attempt_id="attempt-2",
+                    ),
+                )
+                assert sorted(concurrent_outcomes) == [False, True]
+            finally:
+                await competitor.close()
+
+            fenced_query = EventQuery(
+                session_id="postgres-workflow-replay",
+                workflow_name="maintenance",
+                workflow_step_id="step-a",
+                workflow_attempt_fenced=True,
+                event_type=EventType.WORKFLOW_STEP_STARTED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+            records = await store.query_events(fenced_query)
+            assert [record.event.id for record in records] == ["current-reservation"]
+
+            plan = session_store_sql.build_event_query_sql(
+                fenced_query,
+                dialect=postgres_storage._SQL_DIALECT,
+            )
+            exact_query = fenced_query.model_copy(
+                update={
+                    "workflow_attempt_id": "attempt-2",
+                    "workflow_attempt_fenced": False,
+                }
+            )
+            exact_plan = session_store_sql.build_event_query_sql(
+                exact_query,
+                dialect=postgres_storage._SQL_DIALECT,
+            )
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute("SET enable_seqscan = off")
+                await cur.execute(
+                    f"""
+                    EXPLAIN (FORMAT JSON)
+                    SELECT cayu_events.sequence, cayu_events.event
+                    FROM cayu_events
+                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                    {plan.where_sql}
+                    ORDER BY cayu_events.sequence {plan.order_direction}
+                    LIMIT %s
+                    """,
+                    (*plan.params, fenced_query.limit),
+                )
+                fenced_explain = json.dumps((await cur.fetchone())[0])
+                await cur.execute(
+                    f"""
+                    EXPLAIN (FORMAT JSON)
+                    SELECT cayu_events.sequence, cayu_events.event
+                    FROM cayu_events
+                    JOIN cayu_sessions ON cayu_sessions.id = cayu_events.session_id
+                    {exact_plan.where_sql}
+                    ORDER BY cayu_events.sequence {exact_plan.order_direction}
+                    LIMIT %s
+                    """,
+                    (*exact_plan.params, exact_query.limit),
+                )
+                exact_explain = json.dumps((await cur.fetchone())[0])
+            assert "idx_cayu_events_workflow_step_replay" in fenced_explain
+            assert "idx_cayu_events_workflow_attempt_marker" in fenced_explain
+            assert "idx_cayu_events_workflow_step_attempt" in exact_explain
+        finally:
+            await store.close()
+
+    asyncio.run(runner())
 
 
 def _request(agent_name: str) -> RunRequest:
@@ -263,7 +471,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+                match=rf"requires >= {postgres_storage._POSTGRES_SESSION_MIN_REQUIRED_REVISION}",
             ):
                 await validator.ensure_schema()
         finally:
@@ -419,7 +627,7 @@ def test_validate_mode_rejects_pre_insert_xid_postgres_schema(postgres_dsn: str)
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+                match=rf"requires >= {postgres_storage._POSTGRES_SESSION_MIN_REQUIRED_REVISION}",
             ):
                 await validator.ensure_schema()
         finally:
@@ -449,7 +657,7 @@ def test_revision_fourteen_requires_cascade_index_migration(postgres_dsn: str) -
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+                match=rf"requires >= {postgres_storage._POSTGRES_SESSION_MIN_REQUIRED_REVISION}",
             ):
                 await validator.ensure_schema()
         finally:
@@ -496,7 +704,7 @@ def test_revision_fifteen_requires_session_sequence_index_migration(postgres_dsn
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+                match=rf"requires >= {postgres_storage._POSTGRES_SESSION_MIN_REQUIRED_REVISION}",
             ):
                 await validator.ensure_schema()
         finally:
@@ -558,7 +766,7 @@ def test_revision_seventeen_requires_session_operation_migration(postgres_dsn: s
         try:
             with pytest.raises(
                 schema.SchemaTooOld,
-                match=rf"requires >= {schema.MIN_SUPPORTED_REVISION}",
+                match=rf"requires >= {postgres_storage._POSTGRES_SESSION_MIN_REQUIRED_REVISION}",
             ):
                 await validator.ensure_schema()
         finally:

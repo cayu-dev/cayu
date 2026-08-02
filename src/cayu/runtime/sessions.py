@@ -74,6 +74,7 @@ from cayu.core.messages import (
     detach_message,
 )
 from cayu.core.thinking import ThinkingConfig
+from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
@@ -3799,6 +3800,9 @@ class EventQuery(BaseModel):
     agent_name: str | None = None
     environment_name: str | None = None
     workflow_name: str | None = None
+    workflow_attempt_id: str | None = None
+    workflow_step_id: str | None = None
+    workflow_attempt_fenced: StrictBool = False
     tool_name: str | None = None
     since: datetime | None = None
     until: datetime | None = None
@@ -3815,6 +3819,8 @@ class EventQuery(BaseModel):
         "agent_name",
         "environment_name",
         "workflow_name",
+        "workflow_attempt_id",
+        "workflow_step_id",
         "tool_name",
     )
     @classmethod
@@ -3885,6 +3891,29 @@ class EventQuery(BaseModel):
             raise ValueError("EventQuery event_id requires session_id.")
         if self.event_type is not None and self.event_types:
             raise ValueError("Use either `event_type` or `event_types`, not both.")
+        if self.workflow_attempt_id is not None and self.workflow_step_id is None:
+            raise ValueError("EventQuery workflow_attempt_id requires workflow_step_id.")
+        if self.workflow_attempt_fenced and self.workflow_step_id is None:
+            raise ValueError("EventQuery workflow_attempt_fenced requires workflow_step_id.")
+        if self.workflow_attempt_fenced and self.workflow_attempt_id is not None:
+            raise ValueError("Use workflow_attempt_id or workflow_attempt_fenced, not both.")
+        if (
+            self.workflow_step_id is not None
+            and self.workflow_attempt_id is None
+            and not self.workflow_attempt_fenced
+        ):
+            raise ValueError(
+                "EventQuery workflow_step_id requires an exact or fenced attempt scope."
+            )
+        if self.workflow_step_id is not None and (
+            self.session_id is None
+            or self.workflow_name is None
+            or (self.event_type is None and not self.event_types)
+        ):
+            raise ValueError(
+                "Workflow-step event queries require session_id, workflow_name, "
+                "and an event-type filter."
+            )
         if self.since is not None and self.until is not None and self.since >= self.until:
             raise ValueError("EventQuery since must be before until.")
         if (
@@ -4672,6 +4701,25 @@ class SessionStore(ABC):
     @abstractmethod
     async def append_events(self, session_id: str, events: list[Event]) -> None:
         """Append events to a session in one durable batch."""
+
+    async def append_workflow_step_started(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        workflow_name: str,
+        attempt_id: str,
+    ) -> bool:
+        """Atomically append a step reservation only for the current attempt.
+
+        The attempt-fence check and event insert share one store transaction.
+        ``False`` means either a newer attempt won or this exact reservation was
+        already published.
+        """
+
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support atomic workflow step reservation."
+        )
 
     async def load_mcp_manifest_baselines(
         self,
@@ -5738,6 +5786,19 @@ class InMemorySessionStore(SessionStore):
         self._pending_action_latest_barrier_records: dict[str, EventRecord] = {}
         self._event_records_by_id: dict[tuple[str, str], EventRecord] = {}
         self._type_event_records: dict[str, list[EventRecord]] = {}
+        self._workflow_step_event_records: dict[
+            tuple[str, str, str, str, str],
+            list[EventRecord],
+        ] = {}
+        self._workflow_fenced_step_event_records: dict[
+            tuple[str, str, str, str],
+            list[EventRecord],
+        ] = {}
+        self._workflow_attempt_event_records: dict[
+            tuple[str, str],
+            list[EventRecord],
+        ] = {}
+        self._workflow_active_attempt_ids: dict[tuple[str, str], str] = {}
         self._event_ids: dict[str, set[str]] = {}
         # Store-wide ownership registry. It intentionally outlives session
         # deletion: reservation ids are ledger reconciliation keys, not
@@ -6526,6 +6587,26 @@ class InMemorySessionStore(SessionStore):
                 for key, record in self._event_records_by_id.items()
                 if key[0] != session_id
             }
+            self._workflow_step_event_records = {
+                key: records
+                for key, records in self._workflow_step_event_records.items()
+                if key[0] != session_id
+            }
+            self._workflow_fenced_step_event_records = {
+                key: records
+                for key, records in self._workflow_fenced_step_event_records.items()
+                if key[0] != session_id
+            }
+            self._workflow_attempt_event_records = {
+                key: records
+                for key, records in self._workflow_attempt_event_records.items()
+                if key[0] != session_id
+            }
+            self._workflow_active_attempt_ids = {
+                key: attempt_id
+                for key, attempt_id in self._workflow_active_attempt_ids.items()
+                if key[0] != session_id
+            }
             for event_type, records in list(self._type_event_records.items()):
                 remaining = [record for record in records if record.event.session_id != session_id]
                 if remaining:
@@ -7180,6 +7261,52 @@ class InMemorySessionStore(SessionStore):
                     for history_key in history_lookup_keys:
                         event_history.setdefault(history_key, []).append(record)
             self._type_event_records.setdefault(event_type, []).append(record)
+            workflow_name = stored_event.workflow_name
+            workflow_attempt_id = stored_event.payload.get("attempt_id")
+            workflow_step_id = stored_event.payload.get("step_id")
+            if (
+                stored_event.type == WORKFLOW_ATTEMPT_EVENT_TYPE
+                and isinstance(workflow_name, str)
+                and workflow_name
+                and isinstance(workflow_attempt_id, str)
+                and workflow_attempt_id
+            ):
+                self._workflow_attempt_event_records.setdefault(
+                    (session_id, workflow_name),
+                    [],
+                ).append(record)
+                self._workflow_active_attempt_ids[(session_id, workflow_name)] = workflow_attempt_id
+            if (
+                isinstance(workflow_name, str)
+                and workflow_name
+                and isinstance(workflow_attempt_id, str)
+                and workflow_attempt_id
+                and isinstance(workflow_step_id, str)
+                and workflow_step_id
+            ):
+                self._workflow_step_event_records.setdefault(
+                    (
+                        session_id,
+                        workflow_name,
+                        workflow_attempt_id,
+                        workflow_step_id,
+                        event_type,
+                    ),
+                    [],
+                ).append(record)
+                if (
+                    self._workflow_active_attempt_ids.get((session_id, workflow_name))
+                    == workflow_attempt_id
+                ):
+                    self._workflow_fenced_step_event_records.setdefault(
+                        (
+                            session_id,
+                            workflow_name,
+                            workflow_step_id,
+                            event_type,
+                        ),
+                        [],
+                    ).append(record)
             existing_ids.add(stored_event.id)
             if prepared_event.delivery is not None:
                 self._persisted_event_side_effect_deliveries[(session_id, stored_event.id)] = (
@@ -7213,6 +7340,32 @@ class InMemorySessionStore(SessionStore):
                 raise KeyError(f"Session not found: {session_id}")
             _assert_session_run_epoch(session_id, session)
             self._sessions[session_id] = self._append_events_unlocked(session, copied_events)
+
+    async def append_workflow_step_started(
+        self,
+        session_id: str,
+        event: Event,
+        *,
+        workflow_name: str,
+        attempt_id: str,
+    ) -> bool:
+        session_id, copied_event, workflow_name, attempt_id = _copy_workflow_step_reservation(
+            session_id,
+            event,
+            workflow_name=workflow_name,
+            attempt_id=attempt_id,
+        )
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _assert_session_run_epoch(session_id, session)
+            if self._workflow_active_attempt_ids.get((session_id, workflow_name)) != attempt_id:
+                return False
+            if (session_id, copied_event.id) in self._event_records_by_id:
+                return False
+            self._sessions[session_id] = self._append_events_unlocked(session, [copied_event])
+            return True
 
     async def load_mcp_manifest_baselines(
         self,
@@ -8779,6 +8932,73 @@ class InMemorySessionStore(SessionStore):
         if query.event_id is not None and query.session_id is not None:
             record = self._event_records_by_id.get((query.session_id, query.event_id))
             return [] if record is None else [record]
+        if (
+            query.session_id is not None
+            and query.workflow_name is not None
+            and event_types == frozenset((str(WORKFLOW_ATTEMPT_EVENT_TYPE),))
+        ):
+            return self._workflow_attempt_event_records.get(
+                (query.session_id, query.workflow_name),
+                [],
+            )
+        if query.workflow_step_id is not None:
+            assert query.session_id is not None
+            assert query.workflow_name is not None
+            if len(event_types) == 1:
+                event_type = next(iter(event_types))
+                if query.workflow_attempt_fenced:
+                    return self._workflow_fenced_step_event_records.get(
+                        (
+                            query.session_id,
+                            query.workflow_name,
+                            query.workflow_step_id,
+                            event_type,
+                        ),
+                        [],
+                    )
+                if query.workflow_attempt_id is not None:
+                    return self._workflow_step_event_records.get(
+                        (
+                            query.session_id,
+                            query.workflow_name,
+                            query.workflow_attempt_id,
+                            query.workflow_step_id,
+                            event_type,
+                        ),
+                        [],
+                    )
+                raise RuntimeError("Workflow-step queries require an attempt scope.")
+            merged: list[EventRecord] = []
+            for event_type in event_types:
+                if query.workflow_attempt_fenced:
+                    merged.extend(
+                        self._workflow_fenced_step_event_records.get(
+                            (
+                                query.session_id,
+                                query.workflow_name,
+                                query.workflow_step_id,
+                                event_type,
+                            ),
+                            [],
+                        )
+                    )
+                elif query.workflow_attempt_id is not None:
+                    merged.extend(
+                        self._workflow_step_event_records.get(
+                            (
+                                query.session_id,
+                                query.workflow_name,
+                                query.workflow_attempt_id,
+                                query.workflow_step_id,
+                                event_type,
+                            ),
+                            [],
+                        )
+                    )
+                else:
+                    raise RuntimeError("Workflow-step queries require an attempt scope.")
+            merged.sort(key=lambda record: record.sequence)
+            return merged
         if query.session_id is not None:
             if query.interaction_id is not None:
                 return self._interaction_event_records.get(query.session_id, {}).get(
@@ -12960,6 +13180,29 @@ def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str
     return session_id, copied_events
 
 
+def _copy_workflow_step_reservation(
+    session_id: str,
+    event: Event,
+    *,
+    workflow_name: str,
+    attempt_id: str,
+) -> tuple[str, Event, str, str]:
+    session_id, copied_events = _copy_session_event_batch(session_id, [event])
+    copied_event = copied_events[0]
+    workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
+    attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+    if copied_event.type != EventType.WORKFLOW_STEP_STARTED:
+        raise ValueError("Workflow step reservation requires a workflow.step.started event.")
+    if copied_event.workflow_name != workflow_name:
+        raise ValueError("Workflow step reservation event has the wrong workflow_name.")
+    if copied_event.payload.get("attempt_id") != attempt_id:
+        raise ValueError("Workflow step reservation event has the wrong attempt_id.")
+    step_id = copied_event.payload.get("step_id")
+    if not isinstance(step_id, str) or not step_id:
+        raise ValueError("Workflow step reservation requires a non-empty step_id.")
+    return session_id, copied_event, workflow_name, attempt_id
+
+
 def _validate_mcp_manifest_history_keys(history_keys: tuple[str, ...]) -> tuple[str, ...]:
     if type(history_keys) is not tuple:
         raise TypeError("history_keys must be a tuple.")
@@ -13450,6 +13693,9 @@ def copy_event_query(query: EventQuery | None) -> EventQuery:
         agent_name=query.agent_name,
         environment_name=query.environment_name,
         workflow_name=query.workflow_name,
+        workflow_attempt_id=query.workflow_attempt_id,
+        workflow_step_id=query.workflow_step_id,
+        workflow_attempt_fenced=query.workflow_attempt_fenced,
         tool_name=query.tool_name,
         since=query.since,
         until=query.until,
@@ -14794,6 +15040,16 @@ def _event_record_matches(
     if query.environment_name is not None and event.environment_name != query.environment_name:
         return False
     if query.workflow_name is not None and event.workflow_name != query.workflow_name:
+        return False
+    if (
+        query.workflow_attempt_id is not None
+        and event.payload.get("attempt_id") != query.workflow_attempt_id
+    ):
+        return False
+    if (
+        query.workflow_step_id is not None
+        and event.payload.get("step_id") != query.workflow_step_id
+    ):
         return False
     return not (query.tool_name is not None and event.tool_name != query.tool_name)
 

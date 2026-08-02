@@ -2993,6 +2993,25 @@ class CayuApp:
 
         return emit
 
+    def _workflow_step_reserver(
+        self,
+        session_id: str,
+        workflow_name: str,
+    ) -> Callable[[Event, str], Awaitable[bool]]:
+        """Return the atomic reservation boundary for one workflow journal."""
+
+        async def reserve(event: Event, attempt_id: str) -> bool:
+            _validate_workflow_event_batch([event], allow_cayu_internal=True)
+            if event.session_id != session_id:
+                raise ValueError("Workflow reservation event has the wrong session_id.")
+            return await self._event_writer.reserve_workflow_step_started(
+                event,
+                workflow_name=workflow_name,
+                attempt_id=attempt_id,
+            )
+
+        return reserve
+
     async def emit_event(self, event: Event) -> Event:
         """Publish an event to the session store and all sinks.
 
