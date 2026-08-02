@@ -163,7 +163,7 @@ def _build(
 
 
 def test_builtin_mutating_tools_are_not_parallel_safe() -> None:
-    # The framework's own side-effecting built-ins must opt out of concurrent execution so the
+    # Cayu's side-effecting built-ins must opt out of concurrent execution so the
     # default-on parallel engine never runs concurrent writes/commands/knowledge mutations.
     assert ExecCommandTool.spec.parallel_safe is False
     assert EditFileTool.spec.parallel_safe is False

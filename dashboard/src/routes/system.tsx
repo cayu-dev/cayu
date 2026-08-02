@@ -83,7 +83,7 @@ function CapabilityTables({ diagnostics }: { diagnostics: SystemDiagnostics }) {
 
       <DataCard
         title="Mutation families"
-        description="Framework-owned actions advertised to compatible control-plane clients."
+        description="Runtime-owned actions advertised to compatible control-plane clients."
         contentClassName="p-4"
       >
         <dl>
@@ -246,7 +246,7 @@ export function SystemPage() {
     <Page>
       <PageHeader
         title="System"
-        description="Inspect bounded framework-owned deployment configuration and capability state."
+        description="Inspect bounded runtime-owned deployment configuration and capability state."
         actions={
           <Button
             type="button"

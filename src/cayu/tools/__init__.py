@@ -1,4 +1,4 @@
-"""Framework-native tools."""
+"""Native Python tools."""
 
 from cayu.tools.command_policy import ProcessCommandPolicy
 from cayu.tools.commands import (

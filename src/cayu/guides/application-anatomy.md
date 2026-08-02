@@ -36,7 +36,7 @@ activity, or invoke models or tools.
 ## Process-scoped application graph
 
 Each factory call returns a distinct, process-scoped `CayuApp`. The app is not a
-framework singleton, global registry, or durable coordination mechanism. A
+runtime singleton, global registry, or durable coordination mechanism. A
 console, server integration, worker integration, script, and test each construct
 their own graph, even when all of them point at the same storage configuration.
 
@@ -82,7 +82,7 @@ Server, script, and worker integrations should follow the same contract, but
 ## Console contract
 
 `cayu console` constructs one console-local app and binds it as `app`. That name
-is not a framework registry or singleton. Opening the console does not start a
+is not a runtime registry or singleton. Opening the console does not start a
 server lifespan, recovery, workers, watchers, schedulers, sessions, models, or
 tools. Operations requested interactively may affect the same durable backends
 used by other processes.
@@ -107,7 +107,7 @@ Avoid these shapes:
 - calling `build_app()` during module import;
 - starting migrations, recovery, workers, watchers, schedulers, models, or tools
   as an import side effect; and
-- treating the console-local `app` binding as a framework-wide registry.
+- treating the console-local `app` binding as a runtime-wide registry.
 
 ## Verify the contract
 

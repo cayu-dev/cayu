@@ -3418,7 +3418,7 @@ def create_router(
         Terminal events carry their own lineage. Terminal-hook telemetry names its
         terminal event explicitly, but that reference still has to resolve to a
         matching durable record in the same operation epoch. Interruption-cascade
-        telemetry is also framework-owned and post-terminal, but does not carry an
+        telemetry is also runtime-owned and post-terminal, but does not carry an
         explicit reference, so resolve its latest prior terminal event. Reject both
         indirect associations if a later operation started before the marker.
         """

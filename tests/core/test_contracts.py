@@ -2314,7 +2314,7 @@ def test_runtime_identity_models_reject_edge_whitespace_fields():
         ToolContext(session_id="sess_1", workspace_id=" workspace")
 
 
-def test_framework_spec_models_reject_blank_names():
+def test_contract_models_reject_blank_required_strings():
     with pytest.raises(ValidationError, match="cannot be blank"):
         ToolSpec(name=" ")
 
@@ -2343,7 +2343,7 @@ def test_framework_spec_models_reject_blank_names():
         KnowledgeEntry(id="memory_1", text=" ")
 
 
-def test_framework_spec_models_reject_edge_whitespace_identity_fields():
+def test_contract_models_reject_edge_whitespace_identity_fields():
     with pytest.raises(ValidationError, match="must not start or end with whitespace"):
         ToolSpec(name=" echo")
 

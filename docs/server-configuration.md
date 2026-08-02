@@ -97,7 +97,7 @@ durable recovery candidates.
 
 The same API access policy guards `/api/contract` and
 `/api/system/diagnostics`. The latter is a bounded, probe-free snapshot of
-framework-owned deployment configuration and registrations; it is not a
+runtime-owned deployment configuration and registrations; it is not a
 readiness endpoint or infrastructure monitor. Keep load balancer liveness
 checks on `/api/health`.
 

@@ -1,7 +1,7 @@
 """A custom Tool that consumes runtime services from ``ToolContext``.
 
 ``ToolContext`` hands a tool live runtime handles — ``ctx.workspace`` (files) and
-``ctx.runner`` (command execution) — the same seam the framework's own
+``ctx.runner`` (command execution) — the same seam Cayu's built-in
 ``ExecCommandTool`` uses. Any bespoke tool (a coverage parser, a screenshot
 runner, a flaky-test detector) reaches for these. This example writes a file
 through the workspace, counts its lines through the runner, and reads it back.

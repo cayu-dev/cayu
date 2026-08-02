@@ -1,8 +1,8 @@
-"""Shared error contract for framework-native tools.
+"""Shared error contract for native Python tools.
 
 Built-in tools validate model-supplied arguments eagerly and raise
 ``ValueError`` (or pydantic ``ValidationError``) on bad input. Without a
-shared boundary those exceptions escape into the generic framework
+shared boundary those exceptions escape into the generic runtime
 exception path, which loses the structured ``{"error": "invalid_arguments"}``
 contract the knowledge tools already expose. The decorator below converts
 argument-validation failures explicitly marked inside a tool's ``run`` into

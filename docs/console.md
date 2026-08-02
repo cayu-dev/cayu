@@ -72,7 +72,7 @@ The initial namespace contains exactly these project-facing names:
 - `tasks`: `app.task_store`, or `None`
 - `knowledge`: `app.knowledge_store`, or `None`
 
-`app` is not a framework singleton. It is the object returned by your factory
+`app` is not a runtime singleton. It is the object returned by your factory
 for this one console process.
 
 ## Async behavior

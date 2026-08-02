@@ -462,7 +462,7 @@ def sanitize_external_cancellation(cancellation: asyncio.CancelledError) -> None
     if runner_failure is not None:
         try:
             # Import at the publication boundary to avoid making invocation
-            # secret tracking depend on the framework-tools package at import
+            # secret tracking depend on the built-in tools package at import
             # time. The authenticated object was visible to extension code, so
             # rebuild it now rather than trusting its current mutable state.
             from cayu.tools._runner import sanitize_runner_failure

@@ -2,7 +2,7 @@
 
 Bad model-supplied arguments must produce structured ``is_error`` results
 with ``{"error": "invalid_arguments"}`` (the contract the knowledge tools
-established) instead of raising raw ``ValueError`` into the framework
+established) instead of raising raw ``ValueError`` into the runtime
 exception path. Host misconfiguration (``TypeError``) must still raise.
 """
 

@@ -297,7 +297,7 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
     assert capabilities["mutations"]["knowledge_review"]["enabled"] is True
 
 
-def test_system_diagnostics_reports_bounded_protected_framework_state(tmp_path) -> None:
+def test_system_diagnostics_reports_bounded_protected_runtime_state(tmp_path) -> None:
     raw_store_id = str(tmp_path / "private-artifact-path")
     artifact_store = LocalArtifactStore(
         tmp_path / "artifacts",

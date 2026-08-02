@@ -1,16 +1,16 @@
 # Cayu Architecture
 
-This is a design/maintainer document for Cayu's runtime framework. It records architecture decisions and intended direction; it is not a complete end-user guide.
+This is a design/maintainer document for Cayu's production agent runtime. It records architecture decisions and intended direction; it is not a complete end-user guide.
 
-Cayu is a backend/runtime-first Python framework for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
+Cayu is a production agent runtime for building long-running agents, multi-agent workflows, and sandboxed tool runtimes.
 
-The framework should run locally, on a VPS, in Docker, in ECS, or behind any other normal runtime. Hosted deployments should be adapters around the framework, not a requirement for using it.
+The runtime should run locally, on a VPS, in Docker, in ECS, or in any other standard execution environment. Hosted deployments should be adapters around the runtime, not a requirement for using it.
 
 ## Core Decisions
 
 - Repo/package/CLI name: `cayu`
 - Language: Python for v1
-- Framework repo structure: horizontal by subsystem
+- Cayu repository structure: horizontal by subsystem
 - Generated user projects: Rails-like default layout, vertical domain modules allowed
 - CLI: developer/admin utility, not the primary product interface
 - Dashboard: optional viewer over runtime events and session storage
@@ -58,7 +58,7 @@ RunRequest
 Every important action should produce an event. Events are the shared contract for debugging, dashboards, hosted integrations, replay, and tests.
 Event identity fields such as agent, environment, workflow, and tool should be top-level event fields so event stores and dashboards can index them without parsing payload JSON.
 
-Runtime inputs are copied at framework boundaries. Framework code should depend on explicit registration and validated contract objects, not on later mutation of user-owned Python objects.
+Runtime inputs are copied at runtime boundaries. Runtime code should depend on explicit registration and validated contract objects, not on later mutation of user-owned Python objects.
 
 JSON-like contract fields should remain portable across local, hosted, and remote execution. They should contain JSON-compatible values only, without Python-specific object identity, circular references, or special numeric values such as NaN and Infinity.
 

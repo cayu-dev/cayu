@@ -1,6 +1,6 @@
 # Repo Plan
 
-This is a design/maintainer document for Cayu's runtime framework. It records implementation direction; it is not a public roadmap or complete end-user guide.
+This is a design/maintainer document for Cayu's production agent runtime. It records implementation direction; it is not a public roadmap or complete end-user guide.
 
 ## Naming
 
@@ -11,18 +11,18 @@ Import: import cayu
 CLI: cayu
 ```
 
-## Framework Direction
+## Runtime Direction
 
 The repository should preserve stable contracts while expanding runtime capabilities through small vertical slices. Avoid preserving accidental APIs before each public runtime shape is deliberate.
 
-Important framework capabilities:
+Important runtime capabilities:
 
 - event stream shape
 - basic agent loop
 - agent/environment/session separation
 - tool protocol
-- path-safe framework-native file tools
-- framework-native command execution tool
+- path-safe native Python file tools
+- native Python command-execution tool
 - Anthropic Messages API and OpenAI Responses API providers
 - LocalRunner implementation
 - LocalWorkspace implementation

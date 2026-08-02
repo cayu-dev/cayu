@@ -3,7 +3,7 @@
 A known event type validates back to the enum member through the ``Event`` model (so cayu's own
 store-sourced comparisons work), but an event deserialized from JSON elsewhere (webhook / SSE /
 JSONL, or ``payload["type"]``) carries ``.type`` as a plain str. Identity (``is``) silently fails on
-that str form, so framework and consumer code must use ``==``.
+that str form, so runtime and consumer code must use ``==``.
 """
 
 from __future__ import annotations

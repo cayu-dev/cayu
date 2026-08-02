@@ -778,13 +778,13 @@ def test_generated_tool_package_wins_over_an_unrelated_installed_tools_package(
     unrelated_tools = unrelated / "tools"
     unrelated_tools.mkdir(parents=True)
     (unrelated_tools / "__init__.py").write_text("SOURCE = 'unrelated'\n", encoding="utf-8")
-    framework_source = Path(__file__).parents[2] / "src"
+    cayu_source = Path(__file__).parents[2] / "src"
     completed = subprocess.run(
         [sys.executable, "-m", "cayu", "inspect", "--json"],
         cwd=project,
         env={
             **os.environ,
-            "PYTHONPATH": os.pathsep.join((str(framework_source), str(unrelated))),
+            "PYTHONPATH": os.pathsep.join((str(cayu_source), str(unrelated))),
         },
         text=True,
         capture_output=True,

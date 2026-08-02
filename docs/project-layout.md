@@ -1,12 +1,12 @@
 # Project Layout
 
-This is a design/maintainer document for Cayu's runtime framework. It describes the intended repo and generated-project structure; it is not a complete end-user guide.
+This is a design/maintainer document for Cayu's production agent runtime. It describes the intended repo and generated-project structure; it is not a complete end-user guide.
 
-The framework repo and user-created agent projects should use different structures.
+The Cayu repository and user-created agent projects should use different structures.
 
-## Framework Repo
+## Cayu Repository
 
-The framework repo is horizontal by subsystem:
+The Cayu repository is horizontal by subsystem:
 
 ```text
 src/cayu/
@@ -25,7 +25,7 @@ src/cayu/
   dashboard/
 ```
 
-This keeps framework dependency direction clear and avoids circular imports.
+This keeps runtime package dependency direction clear and avoids circular imports.
 
 ## Example and Verification Surfaces
 
@@ -108,7 +108,7 @@ support-agent/
     memory/
 ```
 
-The framework should care about explicit registration, not hardcoded folder names.
+Cayu should care about explicit registration, not hardcoded folder names.
 
 ```python
 from cayu import CayuApp

@@ -11589,7 +11589,7 @@ def test_replay_does_not_accept_custom_event_as_terminal_lineage() -> None:
         EventType.SESSION_INTERRUPTION_CASCADE_FAILED,
     ],
 )
-def test_replay_recognizes_framework_post_terminal_marker(
+def test_replay_recognizes_runtime_post_terminal_marker(
     post_terminal_event_type: EventType,
 ) -> None:
     app = CayuApp(enable_logging=False)

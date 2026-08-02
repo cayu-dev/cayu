@@ -157,7 +157,7 @@ generated agent-config region. For `cayu generate slice`, remove the
 `authoring_state` argument and unused `AgentAuthoringState` import from the
 generated agent module. Cayu deliberately trusts that explicit state instead
 of parsing arbitrary Python, prompts, or test source; clearing it is an author
-claim, not a framework proof of domain correctness.
+claim, not runtime-verified proof of domain correctness.
 
 Generated slices define each tool name once in the tool module and reuse that
 constant in the `ToolSpec`, agent instructions, `workflow_tool_names`, runtime

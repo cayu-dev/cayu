@@ -532,7 +532,7 @@ authority, or CA private material. The factory validates version, runner kind,
 session, environment, exact adapter-owned identity allowlists, and common
 replayable-authority field-name variants before attaching. Custom adapters that
 declare reconnect support are trusted extension code and must reject every
-identity field they do not own; the framework's generic scan is defense in
+identity field they do not own; the runtime's generic scan is defense in
 depth, not a substitute for that allowlist. Missing sandboxes and ownership or
 port conflicts have typed, actionable errors. Parent checkpoint metadata copied
 into a fork is recognized as parent-owned and ignored so the child creates a

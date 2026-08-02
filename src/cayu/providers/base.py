@@ -360,7 +360,7 @@ class ModelStreamEvent(BaseModel):
     """Provider-native stream event.
 
     Provider adapters may expose this lower-level shape while normalizing SDK
-    responses. Runtime code must convert these events into framework `Event`
+    responses. Runtime code must convert these events into Cayu `Event`
     records before persisting, dashboarding, or forwarding them.
     """
 
