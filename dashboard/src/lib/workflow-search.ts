@@ -244,11 +244,6 @@ export function validateWorkflowSearch(search: Record<string, unknown>): Workflo
   return encodedBytes > WORKFLOW_URL_MAX_BYTES ? { invalid: true } : canonical
 }
 
-export function workflowSearchKey(search: WorkflowSearch): string {
-  const canonical = validateWorkflowSearch(search as Record<string, unknown>)
-  return JSON.stringify(search.invalid ? { ...canonical, invalid: true } : canonical)
-}
-
 export function workflowSearchForUrl(search: WorkflowSearch): WorkflowSearch {
   if (search.invalid) {
     throw new Error("Invalid Workflow search state cannot be serialized into a shareable URL.")

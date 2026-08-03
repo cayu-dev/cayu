@@ -225,11 +225,71 @@ export function buildWorkflowTopologyRequest(
       request.task_child_cursors = { [continuation.scopeId]: continuation.cursor }
     }
   }
+  requireWorkflowRequestBound(request)
+  return request
+}
+
+function requireWorkflowRequestBound(request: SessionTopologyRequest): void {
   if (new TextEncoder().encode(JSON.stringify(request)).byteLength > WORKFLOW_MAX_REQUEST_BYTES) {
     throw new Error(
       `The Workflow topology request exceeds the server's ${WORKFLOW_MAX_REQUEST_BYTES}-byte limit.`,
     )
   }
+}
+
+function retainedBranchCursors<T>(
+  scopeIds: readonly string[],
+  branches: ReadonlyMap<string, WorkflowBranchPage<T>>,
+): Record<string, string> {
+  const cursors: Record<string, string> = {}
+  for (const scopeId of scopeIds) {
+    const branch = branches.get(scopeId)
+    if (
+      branch === undefined ||
+      branch.retainedNodeIds.length === 0 ||
+      !branch.hasMore ||
+      branch.nextCursor === null
+    ) {
+      continue
+    }
+    cursors[scopeId] = boundedAuthority(
+      branch.nextCursor,
+      "Refresh continuation cursor",
+      WORKFLOW_CURSOR_MAX_BYTES,
+    )
+  }
+  return cursors
+}
+
+/**
+ * Continue every refreshed branch whose older loaded pages remain visible.
+ *
+ * A first-page refresh intentionally preserves already loaded later pages.
+ * Subsequent refresh cycles must walk the new cursor chain so those retained
+ * rows are eventually reconciled without issuing one request per branch.
+ */
+export function buildWorkflowTopologyRefreshRequest(
+  focusSessionId: string,
+  search: WorkflowSearch,
+  state: WorkflowTopologyState,
+): SessionTopologyRequest {
+  if (state.focus.id !== focusSessionId) {
+    throw new Error("The Workflow refresh state does not match the focus session.")
+  }
+  const request = buildWorkflowTopologyRequest(focusSessionId, search)
+  request.child_cursors = retainedBranchCursors(
+    request.expanded_parent_ids ?? [],
+    state.sessionBranches,
+  )
+  request.task_session_cursors = retainedBranchCursors(
+    request.linked_task_session_ids ?? [],
+    state.linkedTaskBranches,
+  )
+  request.task_child_cursors = retainedBranchCursors(
+    request.expanded_task_parent_ids ?? [],
+    state.taskChildBranches,
+  )
+  requireWorkflowRequestBound(request)
   return request
 }
 

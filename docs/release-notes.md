@@ -315,6 +315,28 @@ work and response semantics; SQLite and PostgreSQL execute the session and
 session-aware pricing projections only when callers request them, inside the
 same store-local read snapshot as the shared rollup.
 
+### The dashboard can inspect bounded execution workflows
+
+Session detail now links to an accessible, shareable Workflow view when the
+configured session store advertises topology reads. The view combines the
+bounded ancestor path, independently pageable child-session and task branches,
+typed ownership links, lifecycle status, and one causal-budget usage/cost
+rollup. It does not load event or transcript histories and does not fan out one
+detail request per node. Native disclosure buttons, ordinary links, and a
+nested list keep the complete interaction keyboard-readable without a canvas or
+graph dependency.
+
+Expansion and loaded-scope filters round-trip through bounded URL state, while
+opaque continuation cursors remain transient. Manual refresh is always
+available; automatic topology and usage refreshes are independently
+single-flight, pause in hidden documents, and stop once every loaded node is
+terminal. Missing task topology, dashboard pricing, or the complete Workflow
+capability is reported explicitly instead of becoming an empty graph or a zero
+cost. The packaged Chromium contract covers navigation, keyboard expansion,
+all branch continuations, URL restoration, superseded-request cancellation,
+visibility and terminal refresh behavior, capability denial, and absence of
+history/per-node request fan-out.
+
 ### Usage and dashboard pricing advertise separate capabilities
 
 The control-plane contract now reports usage aggregation independently from the

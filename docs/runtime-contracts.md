@@ -1301,6 +1301,31 @@ or `unsupported` while preserving the session graph. The session and task
 stores are read in separate snapshots, exposed as `cross_store_atomic=false`;
 clients must refresh when they require a newer combined view.
 
+The packaged dashboard exposes this contract as a session-focused Workflow
+route at `/sessions/{session_id}/workflow` when
+`capabilities.surfaces.workflow.read` is enabled. It is an operational
+inspection view, not a workflow editor or deployment-wide workflow index. The
+initial read batches the focus ancestry, focus child branch, and focus-linked
+tasks; expanded session and task parents remain batched in one topology request
+with independent branch cursors. Continuation pages are retained in bounded
+client state but their opaque cursors are not persisted in shareable URLs.
+Filters apply only to the loaded projection and preserve nonmatching structural
+ancestors as labelled context. Session and task detail pages remain the
+authoritative drill-down surfaces.
+
+The Workflow route issues one separately authoritative usage-rollup request for
+the focus causal budget and selected half-open event-time window. Shared totals,
+per-session detail, omitted-session remainders, pricing coverage, and cost
+remainders remain distinct. Usage is still shown when no dashboard price book
+is configured; missing cost is never rendered as zero. Manual refresh is always
+available. Routine topology and usage refreshes run independently only while
+the document is visible and at least one loaded node is nonterminal, remain
+single-flight, and stop after the loaded topology becomes terminal. The final
+active-to-terminal transition triggers one bounded usage reconciliation. A
+failed background refresh preserves the last confirmed projection with an
+explicit stale/error state. The route never hydrates events or transcripts and
+never issues one detail request per loaded node.
+
 The optional server also exposes `GET /api/sessions/{session_id}/transcript`
 for paginated transcript inspection. It accepts `offset`, `limit`, and `role`
 filters and returns provider-neutral messages with their zero-based transcript

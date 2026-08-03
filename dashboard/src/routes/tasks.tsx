@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { Link } from "@tanstack/react-router"
 import { AlertTriangle, Ban, CirclePause, Play, Search, TriangleAlert } from "lucide-react"
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   DataCard,
   Page,
@@ -138,6 +138,12 @@ function taskMatchesQuery(task: TaskDetail, query: TaskListQuery) {
   )
 }
 
+function replaceSelectedTaskInLocation(taskId: string) {
+  const nextUrl = new URL(window.location.href)
+  nextUrl.searchParams.set("task_id", taskId)
+  window.history.replaceState(null, "", `${nextUrl.pathname}${nextUrl.search}${nextUrl.hash}`)
+}
+
 export function TasksPage() {
   const queryClient = useQueryClient()
   const taskLifecycleCapability = useDashboardCapability({
@@ -153,7 +159,10 @@ export function TasksPage() {
   const [status, setStatus] = useState<TaskStatusFilter>("all")
   const [orderBy, setOrderBy] = useState<TaskOrder>("updated_at_desc")
   const [offset, setOffset] = useState(0)
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(
+    () => currentQueryParam("task_id") || null,
+  )
+  const pinnedTaskIdRef = useRef(selectedTaskId)
   const [reason, setReason] = useState("")
   const debouncedSearch = useDebouncedValue(search, 300)
 
@@ -176,15 +185,19 @@ export function TasksPage() {
     refetchInterval: 5000,
   })
   const taskList = tasks.data ?? []
-  const selectedListTask =
-    taskList.find((task) => task.id === selectedTaskId) ?? taskList[0] ?? null
+  const listFallbackTask = taskList[0] ?? null
+  const selectedListTask = selectedTaskId
+    ? (taskList.find((task) => task.id === selectedTaskId) ?? null)
+    : listFallbackTask
+  const taskDetailId = selectedTaskId ?? listFallbackTask?.id ?? null
   const taskDetail = useQuery({
-    queryKey: ["task", selectedListTask?.id],
-    queryFn: () => fetchTask(selectedListTask?.id ?? ""),
-    enabled: selectedListTask != null,
+    queryKey: ["task", taskDetailId],
+    queryFn: () => fetchTask(taskDetailId ?? ""),
+    enabled: taskDetailId != null,
     refetchInterval: 5000,
   })
-  const selectedTask = taskDetail.data ?? selectedListTask
+  const selectedTask =
+    taskDetail.data ?? (selectedListTask?.id === taskDetailId ? selectedListTask : null)
   const hasNextPage = taskList.length === PAGE_LIMIT
   const hasPreviousPage = offset > 0
   const hasFilters =
@@ -205,12 +218,14 @@ export function TasksPage() {
     if (
       selectedTaskId &&
       taskList.length > 0 &&
-      !taskList.some((task) => task.id === selectedTaskId)
+      !taskList.some((task) => task.id === selectedTaskId) &&
+      pinnedTaskIdRef.current !== selectedTaskId
     ) {
       const firstTask = taskList[0]
       if (firstTask) {
         setReason("")
         setSelectedTaskId(firstTask.id)
+        replaceSelectedTaskInLocation(firstTask.id)
       }
     }
   }, [selectedTaskId, taskList])
@@ -241,6 +256,8 @@ export function TasksPage() {
   })
 
   function clearFilters() {
+    pinnedTaskIdRef.current = null
+    setSelectedTaskId(null)
     setSearch("")
     setAssignedAgentFilter("")
     setSessionFilter("")
@@ -256,10 +273,12 @@ export function TasksPage() {
   }
 
   function selectTask(taskId: string) {
+    pinnedTaskIdRef.current = null
     if (taskId !== selectedTaskId) {
       setReason("")
       setSelectedTaskId(taskId)
     }
+    replaceSelectedTaskInLocation(taskId)
   }
 
   return (
@@ -450,7 +469,9 @@ export function TasksPage() {
 
         <DataCard
           title="Task Details"
-          description={selectedTask ? selectedTask.id : "Select a task to inspect and operate it."}
+          description={
+            selectedTask?.id ?? taskDetailId ?? "Select a task to inspect and operate it."
+          }
         >
           {selectedTask ? (
             <div className="space-y-4 p-4">
@@ -643,6 +664,14 @@ export function TasksPage() {
                 )}
               </div>
             </div>
+          ) : taskDetail.isLoading ? (
+            <StateMessage>Loading task details...</StateMessage>
+          ) : taskDetail.isError ? (
+            <StateMessage tone="danger">
+              {taskDetail.error instanceof Error
+                ? taskDetail.error.message
+                : "Failed to load task details."}
+            </StateMessage>
           ) : (
             <StateMessage>No task selected.</StateMessage>
           )}

@@ -11,7 +11,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import uvicorn
@@ -26,14 +26,17 @@ from playwright.async_api import (
 from _live_checks import require, require_equal
 from cayu import (
     AgentSpec,
+    AlwaysRequireApprovalToolPolicy,
     CayuApp,
     Event,
     EventType,
+    InMemoryTaskStore,
     Message,
     MessageRole,
     ModelPrice,
     PriceBook,
     RunRequest,
+    TaskCreate,
     TextPart,
     ThinkingPart,
     Tool,
@@ -58,9 +61,6 @@ if TYPE_CHECKING:
 
 SESSION_ID = "dashboard-contract-session"
 APPROVAL_SESSION_ID = "dashboard-contract-approval"
-APPROVAL_MODEL_STEP_ID = f"mstep_{'1' * 32}"
-APPROVAL_MODEL_ATTEMPT_ID = f"matt_{'2' * 32}"
-APPROVAL_TOOL_ROUND_ID = f"tround_{'3' * 32}"
 INTERRUPT_SESSION_ID = "dashboard-contract-interrupt"
 INTERRUPT_FAILURE_SESSION_ID = "dashboard-contract-interrupt-failure"
 RESUME_INTERRUPT_SESSION_ID = "dashboard-contract-resume-interrupt"
@@ -77,6 +77,24 @@ AGENT_NAME = "dashboard-contract-agent"
 PROVIDER_NAME = "contract-provider"
 MODEL_NAME = "contract-model"
 PAYLOAD_MARKER = "dashboard-contract-usage"
+WORKFLOW_ROOT_SESSION_ID = "dashboard-workflow-root"
+WORKFLOW_PARENT_SESSION_ID = "dashboard-workflow-parent"
+WORKFLOW_FOCUS_SESSION_ID = "dashboard-workflow-focus"
+WORKFLOW_ACTIVE_SESSION_ID = "dashboard-workflow-child-active"
+WORKFLOW_FAILED_SESSION_ID = "dashboard-workflow-child-failed"
+WORKFLOW_INTERRUPTED_SESSION_ID = "dashboard-workflow-child-interrupted"
+WORKFLOW_CHILD_SESSION_PREFIX = "dashboard-workflow-child"
+WORKFLOW_CHILD_SESSION_COUNT = 27
+WORKFLOW_BUDGET_ID = "dashboard-workflow-budget"
+WORKFLOW_ENVIRONMENT = "dashboard-workflow-production"
+WORKFLOW_PROVIDER_NAME = "dashboard-workflow-provider"
+WORKFLOW_MODEL_NAME = "dashboard-workflow-model"
+WORKFLOW_PARENT_TASK_ID = "dashboard-workflow-task-parent"
+WORKFLOW_BLOCKED_TASK_ID = "dashboard-workflow-task-blocked"
+WORKFLOW_LINKED_TASK_PREFIX = "dashboard-workflow-linked-task"
+WORKFLOW_LINKED_TASK_COUNT = 26
+WORKFLOW_CHILD_TASK_PREFIX = "dashboard-workflow-child-task"
+WORKFLOW_CHILD_TASK_COUNT = 26
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 
 ObserverAbort = tuple[str, str | None, str]
@@ -91,6 +109,7 @@ class DashboardContractProvider(ModelProvider):
         self.direct_completions = 0
         self.recovery_requests: list[ModelRequest] = []
         self.replay_markers: list[str] = []
+        self._approval_seeded = False
         self._direct_started = asyncio.Condition()
         self._direct_releases: asyncio.Queue[None] = asyncio.Queue()
         self._replay_releases: asyncio.Queue[str] = asyncio.Queue()
@@ -117,6 +136,15 @@ class DashboardContractProvider(ModelProvider):
             if isinstance(part, TextPart)
         )
         if "recover after" not in request_text:
+            if "seed the dashboard approval" in request_text.lower() and not self._approval_seeded:
+                self._approval_seeded = True
+                yield ModelStreamEvent.tool_call(
+                    id="dashboard-approval-call",
+                    name="dashboard_contract_tool",
+                    arguments={"operation": "verify"},
+                )
+                yield ModelStreamEvent.completed({"finish_reason": "tool_calls"})
+                return
             async with self._direct_started:
                 self.direct_requests.append(request)
                 self._direct_started.notify_all()
@@ -253,7 +281,7 @@ async def main() -> None:
         ToolEffect.NONE,
         "dashboard contract tool must remain mutation-free",
     )
-    app, provider, store = await _seed_app()
+    app, provider, store, task_store = await _seed_app()
     price_book = _dashboard_price_book()
     server_app = MutationDisconnectFaults(
         create_server(
@@ -279,7 +307,13 @@ async def main() -> None:
     server_task = asyncio.create_task(server.serve(sockets=[listener]))
     try:
         await _wait_for_server(server, server_task)
-        evidence = await _run_browser_contract(base_url, provider, server_app)
+        evidence = await _run_browser_contract(
+            base_url,
+            provider,
+            server_app,
+            store,
+            task_store,
+        )
         require_equal(
             server_app.initial_run_requests,
             2,
@@ -338,13 +372,27 @@ async def main() -> None:
             require_equal(len(marker_parts), 2, "Last-Event-ID must contain a session and event id")
             session_id, event_id = marker_parts
             require(bool(session_id and event_id), "Last-Event-ID must name a durable event")
+            require(
+                event_id.startswith("cayu_event_") and event_id[11:].isdigit(),
+                "Last-Event-ID must use the server's public event identity",
+            )
+            event_sequence = int(event_id[11:])
             records = await store.query_events(
-                EventQuery(session_id=session_id, event_id=event_id, limit=1)
+                EventQuery(
+                    session_id=session_id,
+                    after_sequence=event_sequence - 1,
+                    limit=1,
+                )
             )
             require_equal(
                 len(records),
                 1,
                 "Last-Event-ID must be the exact identity of an existing durable event",
+            )
+            require_equal(
+                records[0].sequence,
+                event_sequence,
+                "Last-Event-ID must identify the exact durable event sequence",
             )
         evidence["mutation_provider_requests"] = len(provider.requests)
         evidence["injected_initial_disconnects"] = server_app.initial_run_requests
@@ -359,15 +407,22 @@ async def main() -> None:
             await asyncio.gather(server_task, return_exceptions=True)
 
 
-async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessionStore]:
+async def _seed_app() -> tuple[
+    CayuApp,
+    DashboardContractProvider,
+    InMemorySessionStore,
+    InMemoryTaskStore,
+]:
     store = InMemorySessionStore()
-    app = CayuApp(session_store=store, enable_logging=False)
+    task_store = InMemoryTaskStore()
+    app = CayuApp(session_store=store, task_store=task_store, enable_logging=False)
     provider = DashboardContractProvider()
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model=MODEL_NAME))
     app.register_agent(
         AgentSpec(name=AGENT_NAME, model=MODEL_NAME),
         tools=[DashboardContractTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools=["dashboard_contract_tool"]),
     )
     await store.create(
         RunRequest(
@@ -548,94 +603,24 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
             identity=SessionIdentity(provider_name=PROVIDER_NAME, model=MODEL_NAME),
         )
 
-    await store.create(
+    approval_events = []
+    async for event in app.run(
         RunRequest(
             agent_name=AGENT_NAME,
             session_id=APPROVAL_SESSION_ID,
-            messages=[Message.text("user", "Resolve the dashboard approval contract.")],
-        ),
-        identity=SessionIdentity(provider_name=PROVIDER_NAME, model=MODEL_NAME),
+            messages=[Message.text("user", "Seed the dashboard approval contract.")],
+        )
+    ):
+        approval_events.append(event)
+    require_equal(
+        approval_events[-1].type,
+        EventType.SESSION_INTERRUPTED,
+        "the browser approval fixture must pause through the real runtime contract",
     )
-    await store.append_transcript_messages(
-        APPROVAL_SESSION_ID,
-        [
-            Message.text("user", "Resolve the dashboard approval contract."),
-            Message.tool_call(
-                tool_call_id="dashboard-approval-call",
-                tool_name="dashboard_contract_tool",
-                arguments={"operation": "verify"},
-            ),
-        ],
+    require(
+        any(event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED for event in approval_events),
+        "the browser approval fixture must publish a durable approval request",
     )
-    await store.append_events(
-        APPROVAL_SESSION_ID,
-        [
-            Event(
-                id="dashboard-approval-requested",
-                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
-                session_id=APPROVAL_SESSION_ID,
-                agent_name=AGENT_NAME,
-                tool_name="dashboard_contract_tool",
-                payload={
-                    "model_step_id": APPROVAL_MODEL_STEP_ID,
-                    "model_attempt_id": APPROVAL_MODEL_ATTEMPT_ID,
-                    "tool_round_id": APPROVAL_TOOL_ROUND_ID,
-                    "approval_id": "dashboard-approval",
-                    "tool_call_id": "dashboard-approval-call",
-                    "approval": {
-                        "model_step_id": APPROVAL_MODEL_STEP_ID,
-                        "model_attempt_id": APPROVAL_MODEL_ATTEMPT_ID,
-                        "tool_round_id": APPROVAL_TOOL_ROUND_ID,
-                        "approval_id": "dashboard-approval",
-                        "tool_call_id": "dashboard-approval-call",
-                        "tool_name": "dashboard_contract_tool",
-                        "reason": "browser contract decision",
-                        "arguments": {"operation": "verify"},
-                        "agent_name": AGENT_NAME,
-                        "tool_calls": [
-                            {
-                                "tool_call_id": "dashboard-approval-call",
-                                "tool_name": "dashboard_contract_tool",
-                                "arguments": {"operation": "verify"},
-                                "policy_decision": None,
-                                "reason": None,
-                                "metadata": {},
-                                "active_taint_labels": [],
-                            }
-                        ],
-                    },
-                },
-            )
-        ],
-    )
-    await store.checkpoint(
-        APPROVAL_SESSION_ID,
-        {
-            "pending_tool_approval": {
-                "model_step_id": APPROVAL_MODEL_STEP_ID,
-                "model_attempt_id": APPROVAL_MODEL_ATTEMPT_ID,
-                "tool_round_id": APPROVAL_TOOL_ROUND_ID,
-                "approval_id": "dashboard-approval",
-                "tool_call_id": "dashboard-approval-call",
-                "tool_name": "dashboard_contract_tool",
-                "arguments": {"operation": "verify"},
-                "agent_name": AGENT_NAME,
-                "reason": "browser contract decision",
-                "tool_calls": [
-                    {
-                        "tool_call_id": "dashboard-approval-call",
-                        "tool_name": "dashboard_contract_tool",
-                        "arguments": {"operation": "verify"},
-                        "policy_decision": None,
-                        "reason": None,
-                        "metadata": {},
-                        "active_taint_labels": [],
-                    }
-                ],
-            }
-        },
-    )
-    await store.update_status(APPROVAL_SESSION_ID, SessionStatus.INTERRUPTED)
 
     for index in range(PAGINATED_SESSION_COUNT):
         await seed_completed_session(
@@ -654,7 +639,159 @@ async def _seed_app() -> tuple[CayuApp, DashboardContractProvider, InMemorySessi
         environment_name=DISCOVERY_ENVIRONMENT,
         labels={"tenant": "acme", "region": "us", "tier": "critical"},
     )
-    return app, provider, store
+
+    async def seed_workflow_session(
+        session_id: str,
+        *,
+        parent_session_id: str | None,
+        status: SessionStatus,
+        usage: tuple[int, int] | None = None,
+    ) -> None:
+        await store.create(
+            RunRequest(
+                agent_name=AGENT_NAME,
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+                causal_budget_id=WORKFLOW_BUDGET_ID,
+                environment_name=WORKFLOW_ENVIRONMENT,
+                labels={"workflow": "dashboard-contract"},
+                messages=[Message.text("user", f"Inspect Workflow node {session_id}.")],
+            ),
+            identity=SessionIdentity(
+                provider_name=WORKFLOW_PROVIDER_NAME,
+                model=WORKFLOW_MODEL_NAME,
+            ),
+        )
+        events: list[Event] = []
+        if usage is not None:
+            input_tokens, output_tokens = usage
+            events.append(
+                Event(
+                    id=f"{session_id}-model-completed",
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    agent_name=AGENT_NAME,
+                    environment_name=WORKFLOW_ENVIRONMENT,
+                    payload={
+                        "usage_metrics": {
+                            "provider_name": WORKFLOW_PROVIDER_NAME,
+                            "requested_model": WORKFLOW_MODEL_NAME,
+                            "model": WORKFLOW_MODEL_NAME,
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        }
+                    },
+                )
+            )
+        terminal_type = {
+            SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+            SessionStatus.FAILED: EventType.SESSION_FAILED,
+            SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+        }.get(status)
+        events.append(
+            Event(
+                id=f"{session_id}-{status}",
+                type=terminal_type or EventType.SESSION_STARTED,
+                session_id=session_id,
+                agent_name=AGENT_NAME,
+                environment_name=WORKFLOW_ENVIRONMENT,
+                payload={"error_type": "workflow_demo_failure"}
+                if status is SessionStatus.FAILED
+                else {},
+            )
+        )
+        await store.append_events(session_id, events)
+        await store.update_status(session_id, status)
+
+    await seed_workflow_session(
+        WORKFLOW_ROOT_SESSION_ID,
+        parent_session_id=None,
+        status=SessionStatus.COMPLETED,
+    )
+    await seed_workflow_session(
+        WORKFLOW_PARENT_SESSION_ID,
+        parent_session_id=WORKFLOW_ROOT_SESSION_ID,
+        status=SessionStatus.COMPLETED,
+    )
+    await seed_workflow_session(
+        WORKFLOW_FOCUS_SESSION_ID,
+        parent_session_id=WORKFLOW_PARENT_SESSION_ID,
+        status=SessionStatus.COMPLETED,
+        usage=(40, 10),
+    )
+    await seed_workflow_session(
+        WORKFLOW_FAILED_SESSION_ID,
+        parent_session_id=WORKFLOW_FOCUS_SESSION_ID,
+        status=SessionStatus.FAILED,
+        usage=(20, 5),
+    )
+    await seed_workflow_session(
+        WORKFLOW_INTERRUPTED_SESSION_ID,
+        parent_session_id=WORKFLOW_FOCUS_SESSION_ID,
+        status=SessionStatus.INTERRUPTED,
+    )
+    for index in range(WORKFLOW_CHILD_SESSION_COUNT - 3):
+        await seed_workflow_session(
+            f"{WORKFLOW_CHILD_SESSION_PREFIX}-{index:03d}",
+            parent_session_id=WORKFLOW_FOCUS_SESSION_ID,
+            status=SessionStatus.COMPLETED,
+        )
+    # Keep the running child beyond the first page so browser verification
+    # proves that routine refresh reconciles retained continuation pages.
+    await seed_workflow_session(
+        WORKFLOW_ACTIVE_SESSION_ID,
+        parent_session_id=WORKFLOW_FOCUS_SESSION_ID,
+        status=SessionStatus.RUNNING,
+    )
+
+    await task_store.create_task(
+        TaskCreate(
+            task_id=WORKFLOW_PARENT_TASK_ID,
+            type="workflow",
+            title="Coordinate dashboard Workflow verification",
+            session_id=WORKFLOW_FOCUS_SESSION_ID,
+            assigned_agent_name=AGENT_NAME,
+        )
+    )
+    await task_store.start_task(WORKFLOW_PARENT_TASK_ID)
+    for index in range(WORKFLOW_LINKED_TASK_COUNT - 1):
+        task_id = (
+            WORKFLOW_BLOCKED_TASK_ID if index == 0 else f"{WORKFLOW_LINKED_TASK_PREFIX}-{index:03d}"
+        )
+        await task_store.create_task(
+            TaskCreate(
+                task_id=task_id,
+                type="workflow_step",
+                title=f"Linked Workflow step {index}",
+                session_id=WORKFLOW_FOCUS_SESSION_ID,
+                assigned_agent_name=AGENT_NAME,
+            )
+        )
+        if task_id == WORKFLOW_BLOCKED_TASK_ID:
+            await task_store.block_task(task_id, reason="Waiting for a reviewed dependency.")
+        elif index == 1:
+            await task_store.fail_task(task_id, {"error_type": "workflow_demo_failure"})
+        else:
+            await task_store.complete_task(task_id, {"verified": True})
+
+    for index in range(WORKFLOW_CHILD_TASK_COUNT):
+        task_id = f"{WORKFLOW_CHILD_TASK_PREFIX}-{index:03d}"
+        await task_store.create_task(
+            TaskCreate(
+                task_id=task_id,
+                type="workflow_substep",
+                title=f"Child Workflow step {index}",
+                parent_task_id=WORKFLOW_PARENT_TASK_ID,
+                assigned_agent_name=AGENT_NAME,
+            )
+        )
+        if index == 0:
+            await task_store.fail_task(task_id, {"error_type": "workflow_demo_failure"})
+        else:
+            await task_store.complete_task(task_id, {"verified": True})
+
+    return app, provider, store, task_store
 
 
 def _dashboard_price_book() -> PriceBook:
@@ -680,6 +817,13 @@ def _dashboard_price_book() -> PriceBook:
                 input_per_million=Decimal("1"),
                 output_per_million=Decimal("1"),
             ),
+            ModelPrice.fixed(
+                provider_name=WORKFLOW_PROVIDER_NAME,
+                model=WORKFLOW_MODEL_NAME,
+                match="exact",
+                input_per_million=Decimal("2"),
+                output_per_million=Decimal("4"),
+            ),
         ),
     )
 
@@ -688,6 +832,8 @@ async def _run_browser_contract(
     base_url: str,
     provider: DashboardContractProvider,
     faults: MutationDisconnectFaults,
+    session_store: InMemorySessionStore,
+    task_store: InMemoryTaskStore,
 ) -> dict[str, object]:
     browser_failures: dict[str, list[str]] = {
         "console_errors": [],
@@ -736,7 +882,15 @@ async def _run_browser_contract(
             await _exercise_contract_version_gate(page, base_url)
             await _exercise_capability_contract(page, base_url)
             await _exercise_system_page(page, base_url)
-            await _exercise_dashboard(page, base_url, provider, faults)
+            await _exercise_dashboard(
+                page,
+                base_url,
+                provider,
+                faults,
+                session_store,
+                task_store,
+                expected_query_aborts,
+            )
             _require_no_browser_failures(browser_failures)
             run_observer_aborts = [
                 detail
@@ -751,8 +905,8 @@ async def _run_browser_contract(
             )
             require_equal(
                 len(expected_query_aborts),
-                2,
-                "the superseded session and usage queries must each abort one browser request",
+                3,
+                "the superseded session, usage, and Workflow queries must each abort one browser request",
             )
             require_equal(
                 len(expected_edit_rejections),
@@ -816,6 +970,13 @@ async def _run_browser_contract(
             "overview_operational_snapshot",
             "usage_aggregate_scope",
             "usage_filter_url_state",
+            "workflow_topology",
+            "workflow_branch_pagination",
+            "workflow_url_restoration",
+            "workflow_keyboard_navigation",
+            "workflow_refresh_policy",
+            "workflow_without_pricing",
+            "workflow_unavailable",
         ],
         "console_errors": 0,
         "page_errors": 0,
@@ -833,7 +994,27 @@ async def _exercise_dashboard(
     base_url: str,
     provider: DashboardContractProvider,
     faults: MutationDisconnectFaults,
+    session_store: InMemorySessionStore,
+    task_store: InMemoryTaskStore,
+    expected_query_aborts: list[str],
 ) -> None:
+    session_event_records = await session_store.query_events(
+        EventQuery(session_id=SESSION_ID, limit=100)
+    )
+
+    def projected_event_id(event_type: EventType) -> str:
+        matches = [record for record in session_event_records if record.event.type is event_type]
+        require_equal(
+            len(matches),
+            1,
+            f"the dashboard fixture must contain one {event_type} event",
+        )
+        record = matches[0]
+        return f"cayu_event_{record.sequence}"
+
+    model_completed_event_id = projected_event_id(EventType.MODEL_COMPLETED)
+    tool_failed_event_id = projected_event_id(EventType.TOOL_CALL_FAILED)
+
     await _exercise_operational_scope(page, base_url)
     await _exercise_mutation_recovery(page, base_url)
     await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
@@ -869,22 +1050,26 @@ async def _exercise_dashboard(
     await expect(page.get_by_role("button", name=re.compile(r"model\.started"))).to_have_count(0)
     await expect(page.get_by_text("Tool failed: browser_contract_tool", exact=True)).to_be_visible()
     await page.get_by_role("button", name="Inspect event").click()
-    await expect(page).to_have_url(re.compile(r"[?&]event_id=dashboard-tool-failed(?:&|$)"))
-    await expect(page.get_by_text("dashboard-tool-failed", exact=True)).to_be_visible()
+    await expect(page).to_have_url(
+        re.compile(rf"[?&]event_id={re.escape(tool_failed_event_id)}(?:&|$)")
+    )
+    await expect(page.get_by_text(tool_failed_event_id, exact=True)).to_be_visible()
 
     event_id_filter = page.get_by_label("Filter events by exact event ID")
-    await event_id_filter.fill("dashboard-model-completed")
+    await event_id_filter.fill(model_completed_event_id)
     await event_type_filter.fill("model.completed")
     await page.get_by_role("button", name="Apply filters").click()
-    await expect(page).to_have_url(re.compile(r"[?&]event_id=dashboard-model-completed(?:&|$)"))
-    await expect(page.get_by_text("dashboard-model-completed", exact=True)).to_be_visible()
+    await expect(page).to_have_url(
+        re.compile(rf"[?&]event_id={re.escape(model_completed_event_id)}(?:&|$)")
+    )
+    await expect(page.get_by_text(model_completed_event_id, exact=True)).to_be_visible()
 
     transcript_role_filter = page.get_by_label("Filter transcript by role")
     await transcript_role_filter.select_option("assistant")
     await expect(page).to_have_url(re.compile(r"[?&]transcript_role=assistant(?:&|$)"))
     await page.reload(wait_until="networkidle")
     await expect(event_type_filter).to_have_value("model.completed")
-    await expect(event_id_filter).to_have_value("dashboard-model-completed")
+    await expect(event_id_filter).to_have_value(model_completed_event_id)
     await expect(transcript_role_filter).to_have_value("assistant")
     await expect(
         page.get_by_text("dashboard transcript assistant marker", exact=True)
@@ -905,6 +1090,551 @@ async def _exercise_dashboard(
     await expect(include_thinking).to_be_checked()
     await expect(thinking_payload).to_be_visible()
     await _exercise_existing_session_mutations(page, base_url, provider)
+    await _exercise_workflow(
+        page,
+        base_url,
+        session_store,
+        task_store,
+        expected_query_aborts,
+    )
+
+
+async def _exercise_workflow(
+    page: Page,
+    base_url: str,
+    session_store: InMemorySessionStore,
+    task_store: InMemoryTaskStore,
+    expected_query_aborts: list[str],
+) -> None:
+    topology_path = f"/api/sessions/{WORKFLOW_FOCUS_SESSION_ID}/topology"
+    workflow_url = f"{base_url}/cayu/sessions/{WORKFLOW_FOCUS_SESSION_ID}/workflow"
+    observed_requests: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def record_workflow_request(request: Request) -> None:
+        path = urlsplit(request.url).path
+        if not path.startswith("/api/"):
+            return
+        body: dict[str, object] | None = None
+        if request.method == "POST":
+            try:
+                parsed_body = request.post_data_json
+                if isinstance(parsed_body, dict):
+                    body = parsed_body
+            except Exception:
+                body = None
+        observed_requests.append((request.method, path, body))
+
+    def request_count(method: str, path: str) -> int:
+        return sum(
+            1
+            for observed_method, observed_path, _body in observed_requests
+            if observed_method == method and observed_path == path
+        )
+
+    async def wait_for_request_count(method: str, path: str, minimum: int) -> None:
+        deadline = asyncio.get_running_loop().time() + 10
+        while request_count(method, path) < minimum:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(
+                    f"Timed out waiting for {minimum} {method} {path} requests; "
+                    f"observed={observed_requests!r}"
+                )
+            await asyncio.sleep(0.05)
+
+    page.on("request", record_workflow_request)
+    try:
+        await page.goto(
+            f"{base_url}/cayu/sessions/{WORKFLOW_FOCUS_SESSION_ID}",
+            wait_until="networkidle",
+        )
+        workflow_link = page.get_by_role("link", name="Workflow", exact=True)
+        await expect(workflow_link).to_be_visible()
+        observed_requests.clear()
+        await workflow_link.click()
+        await expect(page).to_have_url(re.compile(rf"{re.escape(workflow_url)}$"))
+        await expect(page.get_by_role("heading", name="Workflow", exact=True)).to_be_visible()
+        await expect(
+            page.get_by_text(
+                "Bounded operational topology and causal-budget usage for one focus session.",
+                exact=True,
+            )
+        ).to_be_visible()
+        await expect(page.get_by_text("25 loaded child sessions", exact=True)).to_be_visible()
+        await expect(page.get_by_text("25 loaded linked tasks", exact=True)).to_be_visible()
+        topology_list = page.get_by_role("list", name="Loaded Workflow topology")
+        await expect(
+            topology_list.get_by_text(WORKFLOW_ACTIVE_SESSION_ID, exact=True)
+        ).to_have_count(0)
+        await expect(
+            topology_list.get_by_text(WORKFLOW_FAILED_SESSION_ID, exact=True)
+        ).to_be_visible()
+        await expect(
+            topology_list.get_by_text(WORKFLOW_INTERRUPTED_SESSION_ID, exact=True)
+        ).to_be_visible()
+        await expect(page.get_by_text("Causal-budget usage", exact=True)).to_be_visible()
+        await expect(page.get_by_text("75", exact=True)).to_be_visible()
+        await expect(page.get_by_text("0.00018 USD", exact=True)).to_be_visible()
+        await expect(
+            page.get_by_text(
+                "2 returned session groups are outside the loaded topology and are not mapped to rows here.",
+                exact=True,
+            )
+        ).to_be_visible()
+
+        require_equal(
+            request_count("POST", topology_path),
+            1,
+            "initial Workflow navigation must issue one coalesced topology request",
+        )
+        require_equal(
+            request_count("POST", "/api/usage/rollup"),
+            1,
+            "initial Workflow navigation must issue one independent usage request",
+        )
+        initial_usage_body = next(
+            body
+            for method, path, body in observed_requests
+            if method == "POST" and path == "/api/usage/rollup"
+        )
+        if initial_usage_body is None:
+            raise AssertionError("the initial Workflow usage request body must be a JSON object")
+        initial_usage_end = initial_usage_body.get("end_at")
+        if not isinstance(initial_usage_end, str):
+            raise AssertionError("the initial Workflow usage request must have a string end_at")
+        initial_topology_body = next(
+            body
+            for method, path, body in observed_requests
+            if method == "POST" and path == topology_path
+        )
+        if initial_topology_body is None:
+            raise AssertionError("the Workflow topology request body must be a JSON object")
+        require_equal(
+            initial_topology_body.get("expanded_parent_ids"),
+            [WORKFLOW_FOCUS_SESSION_ID],
+            "the initial Workflow read must expand only the focus session branch",
+        )
+        require_equal(
+            initial_topology_body.get("linked_task_session_ids"),
+            [WORKFLOW_FOCUS_SESSION_ID],
+            "the initial Workflow read must batch the focus task linkage",
+        )
+
+        await page.get_by_role("button", name="Load more child sessions", exact=True).click()
+        await expect(page.get_by_text("27 loaded child sessions", exact=True)).to_be_visible()
+        await expect(
+            topology_list.get_by_text(WORKFLOW_ACTIVE_SESSION_ID, exact=True)
+        ).to_be_visible()
+
+        session_detail_link = topology_list.locator(
+            f'a[href="/cayu/sessions/{WORKFLOW_ACTIVE_SESSION_ID}"]'
+        )
+        await expect(session_detail_link).to_have_count(1)
+        task_detail_link = topology_list.locator(
+            f'a[href="/cayu/tasks?q={WORKFLOW_PARENT_TASK_ID}&task_id={WORKFLOW_PARENT_TASK_ID}"]'
+        )
+        await expect(task_detail_link).to_have_count(1)
+
+        slow_topology_started = asyncio.Event()
+        release_slow_topology = asyncio.Event()
+        slow_topology_continued = asyncio.Event()
+
+        async def delay_superseded_topology(route, request) -> None:
+            body = request.post_data_json
+            expanded_ids = body.get("expanded_parent_ids", []) if isinstance(body, dict) else []
+            if not (
+                WORKFLOW_ACTIVE_SESSION_ID in expanded_ids
+                and WORKFLOW_FAILED_SESSION_ID not in expanded_ids
+            ):
+                await route.continue_()
+                return
+            slow_topology_started.set()
+            await release_slow_topology.wait()
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+            finally:
+                slow_topology_continued.set()
+
+        aborted_before = len(expected_query_aborts)
+        await page.route(f"**{topology_path}", delay_superseded_topology)
+        try:
+            await page.get_by_role(
+                "button",
+                name=f"Expand session {WORKFLOW_ACTIVE_SESSION_ID}",
+                exact=True,
+            ).click()
+            await asyncio.wait_for(slow_topology_started.wait(), timeout=5)
+            await page.get_by_role(
+                "button",
+                name=f"Expand session {WORKFLOW_FAILED_SESSION_ID}",
+                exact=True,
+            ).click()
+            await expect(page.get_by_text("refreshing", exact=True)).to_have_count(0)
+        finally:
+            release_slow_topology.set()
+            if slow_topology_started.is_set():
+                await asyncio.wait_for(slow_topology_continued.wait(), timeout=5)
+            await page.unroute(f"**{topology_path}", delay_superseded_topology)
+        deadline = asyncio.get_running_loop().time() + 5
+        while len(expected_query_aborts) == aborted_before:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("the superseded Workflow topology request was not aborted")
+            await asyncio.sleep(0.05)
+        require_equal(
+            len(expected_query_aborts),
+            aborted_before + 1,
+            "one newer Workflow expansion must abort exactly one superseded topology read",
+        )
+
+        task_expand = page.get_by_role(
+            "button",
+            name=f"Expand child tasks for {WORKFLOW_PARENT_TASK_ID}",
+            exact=True,
+        )
+        await task_expand.focus()
+        await page.keyboard.press("Enter")
+        await expect(
+            page.get_by_role(
+                "button",
+                name=f"Collapse child tasks for {WORKFLOW_PARENT_TASK_ID}",
+                exact=True,
+            )
+        ).to_be_visible()
+        await expect(page.get_by_text("25 loaded child tasks", exact=True)).to_be_visible()
+
+        await page.get_by_role("button", name="Load more linked tasks", exact=True).click()
+        await expect(page.get_by_text("26 loaded linked tasks", exact=True)).to_be_visible()
+        await page.get_by_role("button", name="Load more child tasks", exact=True).click()
+        await expect(page.get_by_text("26 loaded child tasks", exact=True)).to_be_visible()
+
+        restored_query = parse_qs(urlsplit(page.url).query)
+        require_equal(
+            set(restored_query.get("expanded_session_id", [])),
+            {WORKFLOW_ACTIVE_SESSION_ID, WORKFLOW_FAILED_SESSION_ID},
+            "expanded Workflow session branches must round-trip through the URL",
+        )
+        require_equal(
+            restored_query.get("expanded_task_id"),
+            [WORKFLOW_PARENT_TASK_ID],
+            "expanded Workflow task branches must round-trip through the URL",
+        )
+        require(
+            not any("cursor" in key for key in restored_query),
+            "opaque Workflow continuation cursors must not enter shareable URL state",
+        )
+        await page.get_by_role(
+            "button",
+            name=f"Collapse session {WORKFLOW_ACTIVE_SESSION_ID}",
+            exact=True,
+        ).click()
+        await expect(page.get_by_text("refreshing", exact=True)).to_have_count(0)
+        collapsed_query = parse_qs(urlsplit(page.url).query)
+        require_equal(
+            collapsed_query.get("expanded_session_id"),
+            [WORKFLOW_FAILED_SESSION_ID],
+            "collapsing a Workflow session must remove only that durable URL expansion",
+        )
+        topology_before_reload = request_count("POST", topology_path)
+        usage_before_reload = request_count("POST", "/api/usage/rollup")
+        await page.reload(wait_until="networkidle")
+        await expect(page.get_by_text("25 loaded child sessions", exact=True)).to_be_visible()
+        await expect(page.get_by_text("25 loaded child tasks", exact=True)).to_be_visible()
+        require_equal(
+            request_count("POST", topology_path),
+            topology_before_reload + 1,
+            "restoring a Workflow URL must replay one bounded first-page topology request",
+        )
+        require_equal(
+            request_count("POST", "/api/usage/rollup"),
+            usage_before_reload + 1,
+            "restoring a Workflow URL must issue one independently authoritative usage request",
+        )
+
+        filter_summary = page.locator("summary").filter(has_text="Loaded-node filters")
+        await filter_summary.click()
+        failed_filter = page.get_by_label("failed", exact=True)
+        await failed_filter.check()
+        await page.get_by_role("button", name="Apply view", exact=True).click()
+        await expect(page).to_have_url(re.compile(r"[?&]status=failed(?:&|$)"))
+        await expect(
+            topology_list.get_by_text(WORKFLOW_FAILED_SESSION_ID, exact=True)
+        ).to_be_visible()
+        await expect(
+            topology_list.get_by_text(WORKFLOW_ACTIVE_SESSION_ID, exact=True)
+        ).to_have_count(0)
+        await page.reload(wait_until="networkidle")
+        await expect(page.get_by_label("failed", exact=True)).to_be_checked()
+        await expect(
+            topology_list.get_by_text(WORKFLOW_FAILED_SESSION_ID, exact=True)
+        ).to_be_visible()
+        await page.get_by_role("button", name="Clear loaded-node filters", exact=True).click()
+        await expect(page).not_to_have_url(re.compile(r"[?&]status="))
+        await expect(
+            topology_list.get_by_text(WORKFLOW_ACTIVE_SESSION_ID, exact=True)
+        ).to_have_count(0)
+        await page.get_by_role("button", name="Load more child sessions", exact=True).click()
+        await expect(page.get_by_text("27 loaded child sessions", exact=True)).to_be_visible()
+        await expect(
+            topology_list.get_by_text(WORKFLOW_ACTIVE_SESSION_ID, exact=True)
+        ).to_be_visible()
+
+        await page.evaluate(
+            """() => {
+                Object.defineProperty(document, "visibilityState", {
+                    configurable: true,
+                    get: () => "hidden",
+                });
+                document.dispatchEvent(new Event("visibilitychange"));
+            }"""
+        )
+        hidden_topology_count = request_count("POST", topology_path)
+        hidden_usage_count = request_count("POST", "/api/usage/rollup")
+        await page.wait_for_timeout(5_500)
+        require_equal(
+            request_count("POST", topology_path),
+            hidden_topology_count,
+            "a hidden Workflow page must not poll topology",
+        )
+        require_equal(
+            request_count("POST", "/api/usage/rollup"),
+            hidden_usage_count,
+            "a hidden Workflow page must not poll usage",
+        )
+
+        retained_refresh_start = len(observed_requests)
+        await page.evaluate(
+            """() => {
+                Object.defineProperty(document, "visibilityState", {
+                    configurable: true,
+                    get: () => "visible",
+                });
+                document.dispatchEvent(new Event("visibilitychange"));
+            }"""
+        )
+        await wait_for_request_count("POST", topology_path, hidden_topology_count + 1)
+        await wait_for_request_count("POST", "/api/usage/rollup", hidden_usage_count + 1)
+
+        await session_store.append_events(
+            WORKFLOW_ACTIVE_SESSION_ID,
+            [
+                Event(
+                    id=f"{WORKFLOW_ACTIVE_SESSION_ID}-completed",
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=WORKFLOW_ACTIVE_SESSION_ID,
+                    agent_name=AGENT_NAME,
+                    environment_name=WORKFLOW_ENVIRONMENT,
+                )
+            ],
+        )
+        await session_store.update_status(WORKFLOW_ACTIVE_SESSION_ID, SessionStatus.COMPLETED)
+        await task_store.complete_task(WORKFLOW_PARENT_TASK_ID, {"verified": True})
+        await task_store.resume_task(WORKFLOW_BLOCKED_TASK_ID)
+        await task_store.complete_task(WORKFLOW_BLOCKED_TASK_ID, {"verified": True})
+        await expect(
+            page.get_by_text(
+                "Every loaded node is terminal, so routine refresh is stopped.",
+            )
+        ).to_be_visible(timeout=12_000)
+        await page.wait_for_load_state("networkidle")
+        terminal_topology_count = request_count("POST", topology_path)
+        terminal_usage_count = request_count("POST", "/api/usage/rollup")
+        await page.wait_for_timeout(5_500)
+        require_equal(
+            request_count("POST", topology_path),
+            terminal_topology_count,
+            "a terminal loaded Workflow must stop routine topology polling",
+        )
+        require_equal(
+            request_count("POST", "/api/usage/rollup"),
+            terminal_usage_count,
+            "a terminal loaded Workflow must stop routine usage polling after final reconciliation",
+        )
+
+        range_usage_count = request_count("POST", "/api/usage/rollup")
+        await page.locator("#workflow-range").select_option("7d")
+        await page.get_by_role("button", name="Apply view", exact=True).click()
+        await expect(page).to_have_url(re.compile(r"[?&]range=7d(?:&|$)"))
+        await wait_for_request_count("POST", "/api/usage/rollup", range_usage_count + 1)
+        range_usage_body = next(
+            body
+            for method, path, body in reversed(observed_requests)
+            if method == "POST" and path == "/api/usage/rollup"
+        )
+        if range_usage_body is None:
+            raise AssertionError("the changed Workflow usage request body must be a JSON object")
+        range_usage_end = range_usage_body.get("end_at")
+        if not isinstance(range_usage_end, str):
+            raise AssertionError("the changed Workflow usage request must have a string end_at")
+        require(
+            range_usage_end > initial_usage_end,
+            "changing a relative Workflow range must use a fresh stable request boundary",
+        )
+        await page.wait_for_timeout(10)
+        restored_range_usage_count = request_count("POST", "/api/usage/rollup")
+        await page.locator("#workflow-range").select_option("30d")
+        await page.get_by_role("button", name="Apply view", exact=True).click()
+        await wait_for_request_count("POST", "/api/usage/rollup", restored_range_usage_count + 1)
+        restored_range_usage_body = next(
+            body
+            for method, path, body in reversed(observed_requests)
+            if method == "POST" and path == "/api/usage/rollup"
+        )
+        if restored_range_usage_body is None:
+            raise AssertionError("the restored Workflow usage request body must be a JSON object")
+        restored_range_usage_end = restored_range_usage_body.get("end_at")
+        require(
+            isinstance(restored_range_usage_end, str)
+            and restored_range_usage_end > range_usage_end,
+            "returning to a previous relative range must not restore its stale request boundary",
+        )
+
+        retained_refresh_bodies: list[dict[str, object]] = []
+        for method, path, body in observed_requests[retained_refresh_start:]:
+            if method != "POST" or path != topology_path or body is None:
+                continue
+            child_cursors = body.get("child_cursors")
+            if not isinstance(child_cursors, dict):
+                continue
+            child_cursors = cast("dict[str, object]", child_cursors)
+            focus_cursor = child_cursors.get(WORKFLOW_FOCUS_SESSION_ID)
+            if isinstance(focus_cursor, str) and focus_cursor:
+                retained_refresh_bodies.append(body)
+        require(
+            bool(retained_refresh_bodies),
+            "routine Workflow refresh must advance the retained child-session cursor chain",
+        )
+
+        allowed_workflow_requests = {
+            ("GET", "/api/contract"),
+            ("POST", topology_path),
+            ("POST", "/api/usage/rollup"),
+        }
+        unexpected_workflow_requests = [
+            f"{method} {path}"
+            for method, path, _body in observed_requests
+            if (method, path) not in allowed_workflow_requests
+        ]
+        require_equal(
+            unexpected_workflow_requests,
+            [],
+            "the Workflow route must use only its bounded topology, usage, and contract APIs",
+        )
+
+        exact_task_path = f"/api/tasks/{WORKFLOW_PARENT_TASK_ID}"
+        await task_detail_link.click()
+        await expect(page).to_have_url(
+            re.compile(
+                rf"/cayu/tasks\?q={re.escape(WORKFLOW_PARENT_TASK_ID)}&task_id={re.escape(WORKFLOW_PARENT_TASK_ID)}$"
+            )
+        )
+        await expect(page.get_by_role("heading", name="Tasks", exact=True)).to_be_visible()
+        task_details_header = page.get_by_text("Task Details", exact=True).locator("..")
+        await expect(
+            task_details_header.get_by_text(WORKFLOW_PARENT_TASK_ID, exact=True)
+        ).to_be_visible()
+        require(
+            any(
+                method == "GET" and path == exact_task_path
+                for method, path, _body in observed_requests
+            ),
+            "a Workflow task deep link must load the exact task detail resource",
+        )
+
+        await page.get_by_role("button", name="Clear", exact=True).click()
+        fallback_source_row = page.get_by_role("row").filter(has_text=WORKFLOW_BLOCKED_TASK_ID)
+        await expect(fallback_source_row).to_have_count(1)
+        await fallback_source_row.click()
+        await expect(page).to_have_url(
+            re.compile(rf"[?&]task_id={re.escape(WORKFLOW_BLOCKED_TASK_ID)}(?:&|$)")
+        )
+        await page.get_by_label("Filter by task status", exact=True).select_option("failed")
+        await expect(page).not_to_have_url(
+            re.compile(rf"[?&]task_id={re.escape(WORKFLOW_BLOCKED_TASK_ID)}(?:&|$)")
+        )
+        fallback_task_ids = parse_qs(urlsplit(page.url).query).get("task_id", [])
+        require_equal(
+            len(fallback_task_ids),
+            1,
+            "an automatic task fallback must keep one selected task in the URL",
+        )
+        await expect(
+            task_details_header.get_by_text(fallback_task_ids[0], exact=True)
+        ).to_be_visible()
+
+        usage_without_pricing = False
+
+        async def observe_workflow_usage_without_pricing(route, request) -> None:
+            nonlocal usage_without_pricing
+            body = request.post_data_json
+            if (
+                isinstance(body, dict)
+                and body.get("session_filter", {}).get("causal_budget_id") == WORKFLOW_BUDGET_ID
+            ):
+                require(
+                    body.get("pricing") is None,
+                    "Workflow usage without a dashboard price book must omit pricing inputs",
+                )
+                usage_without_pricing = True
+            await route.continue_()
+
+        await page.route(f"{workflow_url}*", _serve_dashboard_without_pricebook)
+        await page.route("**/api/usage/rollup", observe_workflow_usage_without_pricing)
+        try:
+            await page.goto(workflow_url, wait_until="networkidle")
+            await expect(
+                page.get_by_text(
+                    "No dashboard price book is configured. Usage remains available; cost is unavailable rather than zero.",
+                    exact=True,
+                )
+            ).to_be_visible()
+            require(
+                usage_without_pricing,
+                "a no-pricing Workflow must still issue its bounded usage request",
+            )
+        finally:
+            await page.unroute("**/api/usage/rollup", observe_workflow_usage_without_pricing)
+            await page.unroute(f"{workflow_url}*", _serve_dashboard_without_pricebook)
+
+        workflow_topology_requested = False
+
+        def observe_unavailable_workflow_request(request: Request) -> None:
+            nonlocal workflow_topology_requested
+            if request.method == "POST" and urlsplit(request.url).path == topology_path:
+                workflow_topology_requested = True
+
+        async def serve_workflow_unavailable_contract(route) -> None:
+            response = await route.fetch()
+            body = await response.json()
+            body["capabilities"]["surfaces"]["workflow"] = {
+                "configured": False,
+                "read": {
+                    "enabled": False,
+                    "unavailable_reason": "unsupported",
+                },
+                "mutate": {
+                    "enabled": False,
+                    "unavailable_reason": "unsupported",
+                },
+            }
+            await route.fulfill(response=response, json=body)
+
+        page.on("request", observe_unavailable_workflow_request)
+        await page.route("**/api/contract", serve_workflow_unavailable_contract)
+        try:
+            await page.goto(workflow_url, wait_until="networkidle")
+            await expect(page.get_by_test_id("dashboard-capability-unavailable")).to_contain_text(
+                "Workflow is unavailable"
+            )
+            require(
+                not workflow_topology_requested,
+                "an unavailable Workflow route must not probe the topology endpoint",
+            )
+        finally:
+            await page.unroute("**/api/contract", serve_workflow_unavailable_contract)
+            page.remove_listener("request", observe_unavailable_workflow_request)
+    finally:
+        page.remove_listener("request", record_workflow_request)
 
 
 async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
@@ -915,11 +1645,11 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
         if path == "/api/contract":
             response = await route.fetch()
             body = await response.json()
-            # Reconstruct the immediately preceding valid v4 response. It
-            # predates approval-resolution identity fencing and must be
+            # Reconstruct the immediately preceding valid v5 response. It
+            # predates the native-tool trust contract and must be
             # rejected before navigation evaluates any capability requirement.
-            body["contract_version"] = "4"
-            body["versioning"]["contract_version"] = "4"
+            body["contract_version"] = "5"
+            body["versioning"]["contract_version"] = "5"
             await route.fulfill(
                 response=response,
                 json=body,
@@ -936,26 +1666,62 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
     try:
         await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
         await expect(page.get_by_test_id("dashboard-contract-gate")).to_contain_text(
-            "Dashboard expects CAYU server contract v5, but the server reports v4."
+            "Dashboard expects CAYU server contract v6, but the server reports v5."
         )
         await expect(page.get_by_role("heading", name="Usage", exact=True)).to_have_count(0)
         require_equal(
             api_requests_beyond_contract,
             [],
-            "a previous valid v4 contract must not start route-specific API requests",
+            "a previous valid v5 contract must not start route-specific API requests",
         )
     finally:
         await page.unroute("**/api/**", serve_incompatible_contract)
 
 
+async def _serve_dashboard_without_pricebook(route) -> None:
+    response = await route.fetch()
+    html = await response.text()
+    marker = "window.__CAYU_DASHBOARD_CONFIG__="
+    config_start = html.index(marker) + len(marker)
+    config_end = html.index(";</script>", config_start)
+    config = json.loads(html[config_start:config_end])
+    require(
+        isinstance(config, dict) and "priceBook" in config,
+        "the no-pricing browser scenario requires a configured price book to remove",
+    )
+    config.pop("priceBook", None)
+    config_json = json.dumps(config, separators=(",", ":")).replace("<", "\\u003c")
+    await route.fulfill(
+        response=response,
+        body=f"{html[:config_start]}{config_json}{html[config_end:]}",
+    )
+
+
 async def _exercise_capability_contract(page: Page, base_url: str) -> None:
     observed_requests: list[str] = []
+
+    async def serve_without_task_surface(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        body["capabilities"]["surfaces"]["tasks"] = {
+            "configured": False,
+            "read": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+            "mutate": {
+                "enabled": False,
+                "unavailable_reason": "not_configured",
+            },
+        }
+        await route.fulfill(response=response, json=body)
 
     def record_api_request(request) -> None:
         path = urlsplit(request.url).path
         if path.startswith("/api/"):
             observed_requests.append(f"{request.method} {path}")
 
+    await page.route("**/api/contract", serve_without_task_surface)
     page.on("request", record_api_request)
     try:
         await page.goto(f"{base_url}/cayu/tasks", wait_until="networkidle")
@@ -990,6 +1756,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         )
     finally:
         page.remove_listener("request", record_api_request)
+        await page.unroute("**/api/contract", serve_without_task_surface)
 
     async def serve_usage_without_pricing_contract(route) -> None:
         response = await route.fetch()
@@ -1007,24 +1774,6 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         }
         await route.fulfill(response=response, json=body)
 
-    async def serve_dashboard_without_pricebook(route) -> None:
-        response = await route.fetch()
-        html = await response.text()
-        marker = "window.__CAYU_DASHBOARD_CONFIG__="
-        config_start = html.index(marker) + len(marker)
-        config_end = html.index(";</script>", config_start)
-        config = json.loads(html[config_start:config_end])
-        require(
-            isinstance(config, dict) and "priceBook" in config,
-            "the no-pricing browser scenario requires a configured price book to remove",
-        )
-        config.pop("priceBook", None)
-        config_json = json.dumps(config, separators=(",", ":")).replace("<", "\\u003c")
-        await route.fulfill(
-            response=response,
-            body=f"{html[:config_start]}{config_json}{html[config_end:]}",
-        )
-
     usage_request_without_pricing = False
 
     async def observe_usage_without_pricing(route, request) -> None:
@@ -1038,7 +1787,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         await route.continue_()
 
     await page.route("**/api/contract", serve_usage_without_pricing_contract)
-    await page.route(f"{base_url}/cayu/usage", serve_dashboard_without_pricebook)
+    await page.route(f"{base_url}/cayu/usage", _serve_dashboard_without_pricebook)
     await page.route("**/api/usage/rollup", observe_usage_without_pricing)
     try:
         await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
@@ -1056,7 +1805,7 @@ async def _exercise_capability_contract(page: Page, base_url: str) -> None:
         )
     finally:
         await page.unroute("**/api/usage/rollup", observe_usage_without_pricing)
-        await page.unroute(f"{base_url}/cayu/usage", serve_dashboard_without_pricebook)
+        await page.unroute(f"{base_url}/cayu/usage", _serve_dashboard_without_pricebook)
         await page.unroute("**/api/contract", serve_usage_without_pricing_contract)
 
     async def serve_read_only_contract(route) -> None:
@@ -1120,7 +1869,7 @@ async def _exercise_system_page(page: Page, base_url: str) -> None:
             "does not probe databases, workers, networks, or external services"
         )
         await expect(page.get_by_text("Server contract", exact=True)).to_be_visible()
-        await expect(page.get_by_text("v5", exact=True)).to_be_visible()
+        await expect(page.get_by_text("v6", exact=True)).to_be_visible()
         require_equal(diagnostics_requests, 1, "the System page must load one initial snapshot")
 
         await page.wait_for_timeout(5_500)
@@ -1252,7 +2001,7 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     await expect(coverage.get_by_text("Evaluated steps", exact=True)).to_be_visible()
     await expect(coverage.get_by_text("Without identity", exact=True)).to_be_visible()
     await expect(bedrock_breakdown.get_by_test_id("usage-billing-identity-gap")).to_contain_text(
-        "Billing identity is missing for 1 of 2 evaluated model steps"
+        "Billing identity is missing for 4 of 5 evaluated model steps"
     )
     bedrock_row = bedrock_breakdown.get_by_role("row").filter(
         has_text="global.anthropic.claude-sonnet-4-6"
@@ -1266,11 +2015,11 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     await page.goto(f"{base_url}/cayu/usage?{no_identity_query}", wait_until="networkidle")
     no_identity_breakdown = page.get_by_test_id("usage-billing-breakdown")
     await expect(no_identity_breakdown).to_contain_text(
-        "No billing identity was reported. Evaluated model-step count: 1."
+        "No billing identity was reported. Evaluated model-step count: 2."
     )
     await expect(
         no_identity_breakdown.get_by_test_id("usage-billing-identity-gap")
-    ).to_contain_text("Billing identity is missing for 1 of 1 evaluated model steps")
+    ).to_contain_text("Billing identity is missing for 2 of 2 evaluated model steps")
 
     await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
 
@@ -1781,24 +2530,31 @@ async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> 
     events_path = f"**/api/sessions/{REOBSERVE_SESSION_ID}/events*"
     baseline_response = await page.request.get(
         f"{base_url}/api/sessions/{REOBSERVE_SESSION_ID}/events",
-        params={"event_id": f"{REOBSERVE_SESSION_ID}-completed", "limit": 1},
+        params={"order_by": "sequence_desc", "limit": 1},
     )
     require_equal(baseline_response.status, 200, "manual recovery baseline must be readable")
     baseline_payload = await baseline_response.json()
     baseline_events = baseline_payload.get("events", [])
     require_equal(len(baseline_events), 1, "manual recovery requires one durable baseline event")
     baseline_sequence = baseline_events[0]["sequence"]
+    baseline_event_id = baseline_events[0]["id"]
     require(
         isinstance(baseline_sequence, int) and baseline_sequence > 0,
         "manual recovery baseline must have a positive durable sequence",
+    )
+    require_equal(
+        baseline_event_id,
+        f"cayu_event_{baseline_sequence}",
+        "manual recovery must begin from the server's public event identity",
     )
     mutation_id: str | None = None
     recovered = False
     timestamp = "2026-01-01T00:00:00Z"
     terminal_event = {
-        "id": f"{REOBSERVE_SESSION_ID}-recovered-completed",
+        "id": f"cayu_event_{baseline_sequence + 1}",
         "type": "session.completed",
         "session_id": REOBSERVE_SESSION_ID,
+        "interaction_id": None,
         "timestamp": timestamp,
         "agent_name": AGENT_NAME,
         "tool_name": None,
@@ -1839,13 +2595,14 @@ async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> 
         )
         require_equal(
             last_event_id,
-            f"{REOBSERVE_SESSION_ID}:{REOBSERVE_SESSION_ID}-completed",
+            f"{REOBSERVE_SESSION_ID}:{baseline_event_id}",
             "manual recovery must replay from the original durable baseline",
         )
         acceptance_event = {
-            "id": f"{REOBSERVE_SESSION_ID}-mutation-accepted",
+            "id": f"cayu_event_{baseline_sequence + 2}",
             "type": "server.mutation.accepted",
             "session_id": REOBSERVE_SESSION_ID,
+            "interaction_id": None,
             "timestamp": timestamp,
             "agent_name": AGENT_NAME,
             "tool_name": None,
@@ -1885,9 +2642,10 @@ async def _exercise_manual_mutation_reobservation(page: Page, base_url: str) -> 
         records = [
             {**terminal_event, "sequence": baseline_sequence + 1},
             {
-                "id": f"{REOBSERVE_SESSION_ID}-mutation-accepted",
+                "id": f"cayu_event_{baseline_sequence + 2}",
                 "type": "server.mutation.accepted",
                 "session_id": REOBSERVE_SESSION_ID,
+                "interaction_id": None,
                 "timestamp": timestamp,
                 "agent_name": AGENT_NAME,
                 "tool_name": None,
@@ -1992,6 +2750,19 @@ def _record_browser_failures(
             body = request.post_data_json
             agent_name = body.get("session_filter", {}).get("agent_name") if body else None
             if agent_name == SLOW_USAGE_AGENT and request.failure == "net::ERR_ABORTED":
+                expected_query_aborts.append(detail)
+                return
+        if (
+            request.method == "POST"
+            and path == f"/api/sessions/{WORKFLOW_FOCUS_SESSION_ID}/topology"
+            and request.failure == "net::ERR_ABORTED"
+        ):
+            body = request.post_data_json
+            expanded_ids = body.get("expanded_parent_ids", []) if isinstance(body, dict) else []
+            if (
+                WORKFLOW_ACTIVE_SESSION_ID in expanded_ids
+                and WORKFLOW_FAILED_SESSION_ID not in expanded_ids
+            ):
                 expected_query_aborts.append(detail)
                 return
         failures["request_failures"].append(detail)

@@ -8,6 +8,7 @@ import {
   workflowSearchForUrl,
 } from "../src/lib/workflow-search.ts"
 import {
+  buildWorkflowTopologyRefreshRequest,
   buildWorkflowTopologyRequest,
   buildWorkflowUsageRequest,
   LatestWorkflowRequestCoordinator,
@@ -442,10 +443,13 @@ test("topology pages merge by branch without duplicating nodes or losing prior p
   assert.deepEqual(refreshed.sessionBranches.get("focus").retainedNodeIds, ["child-2", "child-3"])
   assert.equal(refreshed.sessionBranches.get("focus").mixedSnapshot, true)
 
-  const refreshedContinuationRequest = buildWorkflowTopologyRequest("focus", search, {
-    kind: "session_children",
-    scopeId: "focus",
-    cursor: "new-first-page",
+  const refreshedContinuationRequest = buildWorkflowTopologyRefreshRequest(
+    "focus",
+    search,
+    refreshed,
+  )
+  assert.deepEqual(refreshedContinuationRequest.child_cursors, {
+    focus: "new-first-page",
   })
   const reconciledTail = mergeWorkflowTopologyResponse(
     refreshed,
@@ -501,6 +505,142 @@ test("topology pages merge by branch without duplicating nodes or losing prior p
   )
   assert.equal(completeRefresh.sessionBranches.get("focus").mixedSnapshot, false)
   assert.equal(workflowTopologyContainsMixedSnapshots(completeRefresh), false)
+})
+
+test("routine Workflow refresh reconciles active rows retained beyond the first page", () => {
+  const search = validateWorkflowSearch({})
+  const firstPageRequest = buildWorkflowTopologyRequest("focus", search)
+  const focus = sessionNode("focus")
+  const firstPage = Array.from({ length: 25 }, (_, index) =>
+    sessionNode(`child-${String(index).padStart(2, "0")}`, "focus"),
+  )
+  const initial = mergeWorkflowTopologyResponse(
+    undefined,
+    "focus",
+    firstPageRequest,
+    topologyResponse({
+      focus,
+      expandedParents: [focus],
+      branches: [
+        {
+          parent_session_id: "focus",
+          children: firstPage,
+          next_cursor: "original-page-2",
+          has_more: true,
+        },
+      ],
+      taskStatus: "not_configured",
+      edges: [],
+    }),
+  )
+  const pageTwoRequest = buildWorkflowTopologyRequest("focus", search, {
+    kind: "session_children",
+    scopeId: "focus",
+    cursor: "original-page-2",
+  })
+  const loaded = mergeWorkflowTopologyResponse(
+    initial,
+    "focus",
+    pageTwoRequest,
+    topologyResponse({
+      focus,
+      expandedParents: [focus],
+      branches: [
+        {
+          parent_session_id: "focus",
+          children: [sessionNode("active-page-2", "focus", { status: "running" })],
+          next_cursor: null,
+          has_more: false,
+        },
+      ],
+      taskStatus: "not_configured",
+      edges: [],
+      observedAt: "2026-07-01T00:03:00Z",
+    }),
+  )
+  assert.equal(workflowTopologyContainsActiveNodes(loaded), true)
+
+  const refreshedFirstPage = mergeWorkflowTopologyResponse(
+    loaded,
+    "focus",
+    firstPageRequest,
+    topologyResponse({
+      focus,
+      expandedParents: [focus],
+      branches: [
+        {
+          parent_session_id: "focus",
+          children: firstPage,
+          next_cursor: "refresh-page-2",
+          has_more: true,
+        },
+      ],
+      taskStatus: "not_configured",
+      edges: [],
+      observedAt: "2026-07-01T00:04:00Z",
+    }),
+  )
+  assert.deepEqual(refreshedFirstPage.sessionBranches.get("focus").retainedNodeIds, [
+    "active-page-2",
+  ])
+
+  const retainedPageRequest = buildWorkflowTopologyRefreshRequest(
+    "focus",
+    search,
+    refreshedFirstPage,
+  )
+  assert.deepEqual(retainedPageRequest.child_cursors, { focus: "refresh-page-2" })
+  const reconciled = mergeWorkflowTopologyResponse(
+    refreshedFirstPage,
+    "focus",
+    retainedPageRequest,
+    topologyResponse({
+      focus,
+      expandedParents: [focus],
+      branches: [
+        {
+          parent_session_id: "focus",
+          children: [sessionNode("active-page-2", "focus")],
+          next_cursor: null,
+          has_more: false,
+        },
+      ],
+      taskStatus: "not_configured",
+      edges: [],
+      observedAt: "2026-07-01T00:05:00Z",
+    }),
+  )
+  assert.deepEqual(reconciled.sessionBranches.get("focus").retainedNodeIds, [])
+  assert.equal(workflowTopologyContainsActiveNodes(reconciled), false)
+})
+
+test("routine Workflow refresh batches retained cursors across branch kinds", () => {
+  const search = validateWorkflowSearch({
+    expanded_session_id: ["session-parent"],
+    expanded_task_id: ["task-parent"],
+  })
+  const retainedPage = (cursor) => ({
+    nodes: [],
+    nextCursor: cursor,
+    hasMore: true,
+    pageCount: 1,
+    observedAt: "2026-07-01T00:03:00Z",
+    oldestObservedAt: "2026-07-01T00:02:00Z",
+    currentPageChainStartedAt: "2026-07-01T00:03:00Z",
+    retainedNodeIds: ["retained"],
+    mixedSnapshot: true,
+  })
+  const request = buildWorkflowTopologyRefreshRequest("focus", search, {
+    focus: sessionNode("focus"),
+    sessionBranches: new Map([["focus", retainedPage("session-cursor")]]),
+    linkedTaskBranches: new Map([["session-parent", retainedPage("task-session-cursor")]]),
+    taskChildBranches: new Map([["task-parent", retainedPage("task-child-cursor")]]),
+  })
+  assert.deepEqual(request.child_cursors, { focus: "session-cursor" })
+  assert.deepEqual(request.task_session_cursors, {
+    "session-parent": "task-session-cursor",
+  })
+  assert.deepEqual(request.task_child_cursors, { "task-parent": "task-child-cursor" })
 })
 
 test("current session-model and task-attachment projections replace retained values", () => {

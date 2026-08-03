@@ -57,6 +57,7 @@ import {
   workflowSearchForUrl,
 } from "../lib/workflow-search.ts"
 import {
+  buildWorkflowTopologyRefreshRequest,
   buildWorkflowTopologyRequest,
   buildWorkflowUsageRequest,
   LatestWorkflowRequestCoordinator,
@@ -108,6 +109,11 @@ const selectClassName =
   "h-9 min-w-36 rounded-lg border border-input bg-background px-2.5 py-1 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
 
 type TopologyPendingRead = "initial" | "refresh" | WorkflowContinuation["kind"]
+
+type WorkflowUsageAnchor = {
+  authority: string
+  value: Date
+}
 
 type WorkflowFilterDraft = {
   statuses: WorkflowStatusFilter[]
@@ -596,7 +602,7 @@ function TaskTreeNode({
             </div>
           </div>
           <a
-            href={dashboardPath("/tasks", { q: node.id })}
+            href={dashboardPath("/tasks", { q: node.id, task_id: node.id })}
             className={buttonVariants({ variant: "outline", size: "sm" })}
           >
             Task details <ExternalLink className="h-3.5 w-3.5" />
@@ -1518,8 +1524,8 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
   const topologyRef = useRef<WorkflowTopologyState | undefined>(undefined)
   const topologyPendingRef = useRef(false)
   const usageRefreshPendingRef = useRef(false)
+  const usageRefetchAnchorRef = useRef<WorkflowUsageAnchor | null>(null)
   const terminalUsageReconciler = useRef(new WorkflowTerminalUsageReconciler())
-  const usageAnchor = useRef(new Date())
   const [topology, setTopology] = useState<WorkflowTopologyState>()
   const [topologyReadError, setTopologyReadError] = useState<unknown>(null)
   const [pendingRead, setPendingRead] = useState<TopologyPendingRead | null>(null)
@@ -1550,6 +1556,7 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
     async (
       continuation: WorkflowContinuation | undefined,
       kind: TopologyPendingRead,
+      advanceRetainedPages = false,
     ): Promise<boolean | null> => {
       const previous = topologyRef.current
       if (continuation !== undefined && previous === undefined) return null
@@ -1558,7 +1565,10 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
       topologyPendingRef.current = true
       setPendingRead(kind)
       try {
-        const request = buildWorkflowTopologyRequest(sessionId, topologySearch, continuation)
+        const request =
+          advanceRetainedPages && previous !== undefined
+            ? buildWorkflowTopologyRefreshRequest(sessionId, topologySearch, previous)
+            : buildWorkflowTopologyRequest(sessionId, topologySearch, continuation)
         const response = await fetchSessionTopology(sessionId, request, ticket.signal)
         let next: WorkflowTopologyState | undefined
         const committed = topologyCoordinator.current.commit(ticket, () => {
@@ -1566,6 +1576,7 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
           topologyRef.current = next
           setTopology(next)
           setTopologyReadError(null)
+          setTopologyRefreshFailures(0)
         })
         if (!committed) return null
         finishTopologyRead(ticket)
@@ -1604,6 +1615,22 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
     topology?.focus.causal_budget_id ?? null,
     usageSearchKey,
   ])
+  const [usageAuthorityAnchor, setUsageAuthorityAnchor] = useState<WorkflowUsageAnchor | null>(null)
+  useEffect(() => {
+    usageRefetchAnchorRef.current = null
+    setUsageAuthorityAnchor((current) =>
+      current?.authority === usageRefreshAuthority
+        ? current
+        : { authority: usageRefreshAuthority, value: new Date() },
+    )
+  }, [usageRefreshAuthority])
+  const currentUsageAnchor = useCallback((): Date | null => {
+    const refetchAnchor = usageRefetchAnchorRef.current
+    if (refetchAnchor?.authority === usageRefreshAuthority) return refetchAnchor.value
+    return usageAuthorityAnchor?.authority === usageRefreshAuthority
+      ? usageAuthorityAnchor.value
+      : null
+  }, [usageAuthorityAnchor, usageRefreshAuthority])
   const [usageRefreshBackoff, setUsageRefreshBackoff] = useState(() => ({
     authority: usageRefreshAuthority,
     failures: 0,
@@ -1611,13 +1638,14 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
   const usageRefreshFailures =
     usageRefreshBackoff.authority === usageRefreshAuthority ? usageRefreshBackoff.failures : 0
   const usageRequestState = useMemo(() => {
-    if (!usageEnabled || topology === undefined || search.invalid) {
+    const anchor = currentUsageAnchor()
+    if (!usageEnabled || topology === undefined || search.invalid || anchor === null) {
       return { request: null, error: null }
     }
     try {
       return {
         request: buildWorkflowUsageRequest(topology.focus.causal_budget_id, search, {
-          now: usageAnchor.current,
+          now: anchor,
           pricing: dashboardConfig.priceBook,
         }),
         error: null,
@@ -1628,7 +1656,7 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
         error: error instanceof Error ? error.message : "The usage request is invalid.",
       }
     }
-  }, [search, topology, usageEnabled])
+  }, [currentUsageAnchor, search, topology, usageEnabled])
   const usageRequest = usageRequestState.request
   const usageAvailable = usageRequest !== null
   const usage = useQuery({
@@ -1641,9 +1669,11 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
     queryFn: ({ signal }) => {
       const current = topologyRef.current
       if (current === undefined) throw new Error("Workflow topology is unavailable.")
+      const anchor = currentUsageAnchor()
+      if (anchor === null) throw new Error("Workflow usage authority is not ready.")
       return fetchUsageRollup(
         buildWorkflowUsageRequest(current.focus.causal_budget_id, search, {
-          now: usageAnchor.current,
+          now: anchor,
           pricing: dashboardConfig.priceBook,
         }),
         signal,
@@ -1661,9 +1691,9 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
 
   const refreshTopology = useCallback(async (): Promise<boolean | null> => {
     if (topologyPendingRef.current) return null
-    const succeeded = await readTopology(undefined, "refresh")
-    if (succeeded !== null) {
-      setTopologyRefreshFailures((current) => (succeeded ? 0 : Math.min(current + 1, 30)))
+    const succeeded = await readTopology(undefined, "refresh", true)
+    if (succeeded === false) {
+      setTopologyRefreshFailures((current) => Math.min(current + 1, 30))
     }
     return succeeded
   }, [readTopology])
@@ -1671,7 +1701,10 @@ function WorkflowPageForSession({ sessionId }: { sessionId: string }) {
   const refreshUsage = useCallback(async (): Promise<boolean | null> => {
     if (!usageAvailable || usageIsFetching || usageRefreshPendingRef.current) return null
     usageRefreshPendingRef.current = true
-    usageAnchor.current = new Date()
+    usageRefetchAnchorRef.current = {
+      authority: usageRefreshAuthority,
+      value: new Date(),
+    }
     const recordResult = (succeeded: boolean) => {
       setUsageRefreshBackoff((current) => {
         const failures = current.authority === usageRefreshAuthority ? current.failures : 0

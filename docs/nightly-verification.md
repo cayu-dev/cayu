@@ -180,7 +180,7 @@ high level:
 | real SQLite terminal-event transaction failure and manual recovery | verified on durable SQLite | `sqlite-write-failure` |
 | real subprocess cleanup failure, closed runner latch, and leak-free teardown | verified on POSIX | `runner-cleanup-failure` |
 | real partial workspace sync failure, durable diagnostics, and convergent retry | verified on local filesystems and SQLite | `workspace-sync-failure` |
-| packaged dashboard sessions list, session detail, and event detail | verified when Playwright Chromium is installed | `dashboard-behavior` |
+| packaged dashboard sessions, session/event detail, and bounded Workflow topology/usage behavior | verified when Playwright Chromium is installed | `dashboard-behavior` |
 | budgets under real provider spend | verified when `OPENAI_API_KEY` is present | `real-spend-budgets` |
 
 Do not update this document with exact pass counts. Counts move as tests are
