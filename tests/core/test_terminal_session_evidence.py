@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 from tests.core.postgres_contention_support import drop_cayu_tables
 
+import cayu.runtime.sessions as sessions_module
 import cayu.storage.sqlite as sqlite_store_module
 from cayu import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
@@ -29,6 +30,7 @@ from cayu import (
     SessionStore,
     SQLiteSessionStore,
     TerminalPublicationMarker,
+    TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
@@ -39,6 +41,8 @@ from cayu.runtime._terminal_evidence import SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
 from cayu.runtime.sessions import (
     _assemble_terminal_session_evidence,
     _classify_terminal_session_evidence_records,
+    _event_with_session_run_operation,
+    _SessionRunOperation,
 )
 
 
@@ -160,17 +164,20 @@ def _assert_error_code(
 async def _create_terminal_session(
     store: SessionStore,
     *,
+    session_id: str = "memory-terminal-evidence",
+    interaction_id: str = "memory-interaction",
     status: SessionStatus = SessionStatus.COMPLETED,
     terminal_payload: dict | None = None,
+    session_metadata: dict | None = None,
+    publish_terminal: bool = True,
 ) -> tuple[str, str]:
-    session_id = "memory-terminal-evidence"
-    interaction_id = "memory-interaction"
     user_message = Message.text("user", "Give a concise answer.")
     await store.create(
         RunRequest(
             agent_name="assistant",
             session_id=session_id,
             messages=[user_message],
+            metadata={} if session_metadata is None else session_metadata,
         ),
         identity=SessionIdentity(provider_name="fake", model="fake-model"),
         interaction_started_event=Event(
@@ -213,15 +220,16 @@ async def _create_terminal_session(
         from_statuses={SessionStatus.RUNNING},
         to_status=status,
     )
-    await store.append_event(
-        session_id,
-        Event(
-            id=f"memory-{status.value}-session",
-            type=session_terminal_type,
-            session_id=session_id,
-            payload={} if terminal_payload is None else terminal_payload,
-        ),
-    )
+    if publish_terminal:
+        await store.append_event(
+            session_id,
+            Event(
+                id=f"{session_id}-{status.value}-session",
+                type=session_terminal_type,
+                session_id=session_id,
+                payload={} if terminal_payload is None else terminal_payload,
+            ),
+        )
     return session_id, interaction_id
 
 
@@ -238,6 +246,478 @@ async def _reset_postgres(dsn: str) -> None:
             ):
                 await cursor.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
         await connection.commit()
+
+
+async def _create_running_session(
+    store: SessionStore,
+    *,
+    session_id: str,
+    interaction_id: str,
+) -> None:
+    message = Message.text("user", "Exercise terminal evidence.")
+    await store.create(
+        RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[message],
+        ),
+        identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        interaction_started_event=Event(
+            id=f"{session_id}-interaction-started",
+            type=EventType.INTERACTION_STARTED,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        ),
+        interaction_source_messages=[message],
+    )
+    await store.replace_initial_transcript_messages(
+        session_id,
+        [message],
+        [message],
+        interaction_id=interaction_id,
+    )
+
+
+async def _expect_store_error(
+    store: SessionStore,
+    session_id: str,
+    expected: TerminalSessionEvidenceErrorCode,
+) -> None:
+    with pytest.raises(TerminalSessionEvidenceError) as captured:
+        await store.load_terminal_session_evidence(session_id)
+    assert captured.value.code is expected
+
+
+def _assert_exact_snapshot_bytes(evidence: TerminalSessionEvidence) -> None:
+    assert evidence.boundary.total_bytes == compact_json_utf8_size(evidence.model_dump(mode="json"))
+
+
+async def _exercise_store_rejection_contract(store: SessionStore, *, prefix: str) -> None:
+    await _expect_store_error(
+        store,
+        f"{prefix}-absent",
+        TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND,
+    )
+
+    active_id = f"{prefix}-active"
+    await _create_running_session(
+        store,
+        session_id=active_id,
+        interaction_id=f"{active_id}-interaction",
+    )
+    await _expect_store_error(
+        store,
+        active_id,
+        TerminalSessionEvidenceErrorCode.SESSION_NOT_TERMINAL,
+    )
+
+    interrupted_id = f"{prefix}-interrupted"
+    interrupted_interaction_id = f"{interrupted_id}-interaction"
+    await _create_running_session(
+        store,
+        session_id=interrupted_id,
+        interaction_id=interrupted_interaction_id,
+    )
+    await store.publish_interaction_transition(
+        interrupted_id,
+        event=Event(
+            id=f"{interrupted_id}-interaction-terminal",
+            type=EventType.INTERACTION_INTERRUPTED,
+            session_id=interrupted_id,
+            interaction_id=interrupted_interaction_id,
+        ),
+        from_statuses={SessionStatus.RUNNING},
+        to_status=SessionStatus.INTERRUPTED,
+    )
+    await store.append_event(
+        interrupted_id,
+        Event(
+            id=f"{interrupted_id}-session-terminal",
+            type=EventType.SESSION_INTERRUPTED,
+            session_id=interrupted_id,
+        ),
+    )
+    await _expect_store_error(
+        store,
+        interrupted_id,
+        TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED,
+    )
+
+    missing_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-missing",
+        interaction_id=f"{prefix}-missing-interaction",
+        publish_terminal=False,
+    )
+    await _expect_store_error(
+        store,
+        missing_id,
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_MISSING,
+    )
+
+    conflict_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-conflict",
+        interaction_id=f"{prefix}-conflict-interaction",
+        publish_terminal=False,
+    )
+    await store.append_event(
+        conflict_id,
+        Event(
+            id=f"{conflict_id}-failed",
+            type=EventType.SESSION_FAILED,
+            session_id=conflict_id,
+        ),
+    )
+    await _expect_store_error(
+        store,
+        conflict_id,
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT,
+    )
+
+    duplicate_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-duplicate",
+        interaction_id=f"{prefix}-duplicate-interaction",
+        publish_terminal=False,
+    )
+    await store.append_events(
+        duplicate_id,
+        [
+            Event(
+                id=f"{duplicate_id}-completed-{index}",
+                type=EventType.SESSION_COMPLETED,
+                session_id=duplicate_id,
+            )
+            for index in range(2)
+        ],
+    )
+    await _expect_store_error(
+        store,
+        duplicate_id,
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE,
+    )
+
+    buried_conflict_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-buried-conflict",
+        interaction_id=f"{prefix}-buried-conflict-interaction",
+        publish_terminal=False,
+    )
+    await store.append_events(
+        buried_conflict_id,
+        [
+            Event(
+                id=f"{buried_conflict_id}-completed-first",
+                type=EventType.SESSION_COMPLETED,
+                session_id=buried_conflict_id,
+                payload={SESSION_RUN_OPERATION_ID_PAYLOAD_KEY: "operation-a"},
+            ),
+            Event(
+                id=f"{buried_conflict_id}-failed",
+                type=EventType.SESSION_FAILED,
+                session_id=buried_conflict_id,
+                payload={SESSION_RUN_OPERATION_ID_PAYLOAD_KEY: "operation-b"},
+            ),
+            Event(
+                id=f"{buried_conflict_id}-completed-last",
+                type=EventType.SESSION_COMPLETED,
+                session_id=buried_conflict_id,
+                payload={SESSION_RUN_OPERATION_ID_PAYLOAD_KEY: "operation-a"},
+            ),
+        ],
+    )
+    await _expect_store_error(
+        store,
+        buried_conflict_id,
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT,
+    )
+
+    buried_duplicate_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-buried-duplicate",
+        interaction_id=f"{prefix}-buried-duplicate-interaction",
+        publish_terminal=False,
+    )
+    await store.append_events(
+        buried_duplicate_id,
+        [
+            Event(
+                id=f"{buried_duplicate_id}-completed-{index}",
+                type=EventType.SESSION_COMPLETED,
+                session_id=buried_duplicate_id,
+                payload={SESSION_RUN_OPERATION_ID_PAYLOAD_KEY: operation_id},
+            )
+            for index, operation_id in enumerate(("operation-a", "operation-b", "operation-a"))
+        ],
+    )
+    await _expect_store_error(
+        store,
+        buried_duplicate_id,
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE,
+    )
+
+
+async def _exercise_marker_repair(store: SessionStore, *, prefix: str) -> None:
+    session_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-marker-repair",
+        interaction_id=f"{prefix}-initial-interaction",
+    )
+    operation_id = f"{prefix}-operation"
+
+    def mark_operation(session: Session, checkpoint: dict | None) -> dict:
+        updated = {} if checkpoint is None else dict(checkpoint)
+        updated["session_run_operation"] = {
+            "version": 1,
+            "operation_id": operation_id,
+            "run_epoch": session.run_epoch + 1,
+        }
+        return updated
+
+    resumed = await store.transition_status_and_checkpoint(
+        session_id,
+        from_statuses={SessionStatus.COMPLETED},
+        to_status=SessionStatus.RUNNING,
+        checkpoint_transform=mark_operation,
+    )
+    expected_run_epoch = resumed.run_epoch
+    assert expected_run_epoch >= 1
+    interaction_id = f"{prefix}-resumed-interaction"
+    await store.append_events(
+        session_id,
+        [
+            Event(
+                id=f"{prefix}-session-resumed",
+                type=EventType.SESSION_RESUMED,
+                session_id=session_id,
+            ),
+            Event(
+                id=f"{prefix}-interaction-resumed",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            ),
+        ],
+    )
+    await store.append_transcript_messages(
+        session_id,
+        [Message.text("user", "Try again."), Message.text("assistant", "Recovered.")],
+        interaction_id=interaction_id,
+    )
+    await store.publish_interaction_transition(
+        session_id,
+        event=Event(
+            id=f"{prefix}-resumed-interaction-completed",
+            type=EventType.INTERACTION_COMPLETED,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        ),
+        from_statuses={SessionStatus.RUNNING},
+        to_status=SessionStatus.COMPLETED,
+    )
+    terminal_event = _event_with_session_run_operation(
+        Event(
+            id=f"{prefix}-resumed-session-completed",
+            type=EventType.SESSION_COMPLETED,
+            session_id=session_id,
+        ),
+        _SessionRunOperation(
+            operation_id=operation_id,
+            run_epoch=expected_run_epoch,
+        ),
+    )
+    await store.append_event(session_id, terminal_event)
+
+    pending_cleanup = await store.load_terminal_session_evidence(session_id)
+    assert pending_cleanup.terminal_publication_marker == TerminalPublicationMarker(
+        operation_id=operation_id,
+        run_epoch=expected_run_epoch,
+    )
+    assert pending_cleanup.boundary.run_epoch == expected_run_epoch
+    assert pending_cleanup.terminal_event.event.id == terminal_event.id
+    _assert_exact_snapshot_bytes(pending_cleanup)
+
+    def clear_operation(_session: Session, checkpoint: dict | None) -> dict:
+        updated = {} if checkpoint is None else dict(checkpoint)
+        updated.pop("session_run_operation", None)
+        return updated
+
+    await store.transform_checkpoint(session_id, clear_operation)
+    repaired = await store.load_terminal_session_evidence(session_id)
+    assert repaired.terminal_publication_marker is None
+    assert repaired.events == pending_cleanup.events
+    assert repaired.transcript == pending_cleanup.transcript
+    assert repaired.boundary.run_epoch == pending_cleanup.boundary.run_epoch
+    _assert_exact_snapshot_bytes(repaired)
+
+
+async def _exercise_atomic_write_races(store: SessionStore, *, prefix: str) -> None:
+    session_id, interaction_id = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-terminal-race",
+        interaction_id=f"{prefix}-terminal-race-interaction",
+        publish_terminal=False,
+    )
+
+    async def read_while_terminalizing():
+        try:
+            return await store.load_terminal_session_evidence(session_id)
+        except TerminalSessionEvidenceError as exc:
+            return exc.code
+
+    async def publish_terminal() -> None:
+        await store.append_event(
+            session_id,
+            Event(
+                id=f"{prefix}-terminal-race-completed",
+                type=EventType.SESSION_COMPLETED,
+                session_id=session_id,
+            ),
+        )
+
+    results = await asyncio.gather(
+        *(read_while_terminalizing() for _ in range(4)),
+        publish_terminal(),
+        *(read_while_terminalizing() for _ in range(4)),
+    )
+    for result in results:
+        if result is None:
+            continue
+        if isinstance(result, TerminalSessionEvidenceErrorCode):
+            assert result is TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_MISSING
+            continue
+        assert result.events[-1] == result.terminal_event
+        assert result.boundary.event_count == len(result.events)
+
+    before_append = await store.load_terminal_session_evidence(session_id)
+
+    async def append_transcript() -> None:
+        await store.append_transcript_messages(
+            session_id,
+            [Message.text("assistant", "Trailing durable diagnostic.")],
+            interaction_id=interaction_id,
+        )
+
+    transcript_results = await asyncio.gather(
+        *(store.load_terminal_session_evidence(session_id) for _ in range(4)),
+        append_transcript(),
+        *(store.load_terminal_session_evidence(session_id) for _ in range(4)),
+    )
+    after_append = await store.load_terminal_session_evidence(session_id)
+    assert after_append.boundary.transcript_count == before_append.boundary.transcript_count + 1
+    for result in transcript_results:
+        if result is None:
+            continue
+        assert result in (before_append, after_append)
+
+
+async def _exercise_unpaginated_snapshot(store: SessionStore, *, prefix: str) -> str:
+    session_id = f"{prefix}-unpaginated"
+    interaction_id = f"{prefix}-unpaginated-interaction"
+    await _create_running_session(
+        store,
+        session_id=session_id,
+        interaction_id=interaction_id,
+    )
+    await store.append_events(
+        session_id,
+        [
+            Event(
+                id=f"{prefix}-bulk-event-{index}",
+                type="custom.evidence.pagination",
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            for index in range(257)
+        ],
+    )
+    await store.append_transcript_messages(
+        session_id,
+        [Message.text("assistant", f"record-{index}") for index in range(257)],
+        interaction_id=interaction_id,
+    )
+    await store.publish_interaction_transition(
+        session_id,
+        event=Event(
+            id=f"{prefix}-bulk-interaction-completed",
+            type=EventType.INTERACTION_COMPLETED,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        ),
+        from_statuses={SessionStatus.RUNNING},
+        to_status=SessionStatus.COMPLETED,
+    )
+    await store.append_event(
+        session_id,
+        Event(
+            id=f"{prefix}-bulk-session-completed",
+            type=EventType.SESSION_COMPLETED,
+            session_id=session_id,
+        ),
+    )
+
+    evidence = await store.load_terminal_session_evidence(session_id)
+    assert evidence.boundary.event_count == 260
+    assert evidence.boundary.transcript_count == 258
+    assert evidence.events[-2].event.id == f"{prefix}-bulk-interaction-completed"
+    assert evidence.transcript[-1].message == Message.text("assistant", "record-256")
+    _assert_exact_snapshot_bytes(evidence)
+    return session_id
+
+
+async def _exercise_separator_dense_canonical_limits(
+    store: SessionStore,
+    *,
+    prefix: str,
+) -> tuple[str, int, int, int]:
+    """Prove backend transport formatting cannot redefine canonical limits."""
+
+    session_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-separator-dense",
+        interaction_id=f"{prefix}-separator-dense-interaction",
+        terminal_payload={"values": [0] * 350_000},
+    )
+    evidence = await store.load_terminal_session_evidence(session_id)
+    canonical_record_bytes = compact_json_utf8_size(evidence.terminal_event.model_dump(mode="json"))
+    canonical_total_bytes = evidence.boundary.total_bytes
+    assert canonical_record_bytes < TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES
+    assert canonical_total_bytes < TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES
+
+    tight = await store.load_terminal_session_evidence(
+        session_id,
+        limits=TerminalSessionEvidenceLimits(
+            max_record_bytes=canonical_record_bytes,
+            max_total_bytes=canonical_total_bytes,
+        ),
+    )
+    assert tight == evidence
+    return (
+        session_id,
+        evidence.terminal_event.sequence,
+        canonical_record_bytes,
+        canonical_total_bytes,
+    )
+
+
+async def _create_scientific_notation_evidence(
+    store: SessionStore,
+    *,
+    prefix: str,
+) -> tuple[str, TerminalSessionEvidence, int]:
+    """Create portable evidence whose JSONB transport exceeds a 3:2 ratio."""
+
+    session_id, _ = await _create_terminal_session(
+        store,
+        session_id=f"{prefix}-scientific-notation",
+        interaction_id=f"{prefix}-scientific-notation-interaction",
+        terminal_payload={"values": [1e-7] * 1_000},
+    )
+    evidence = await store.load_terminal_session_evidence(session_id)
+    canonical_record_bytes = compact_json_utf8_size(evidence.terminal_event.model_dump(mode="json"))
+    assert canonical_record_bytes < TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES
+    return session_id, evidence, canonical_record_bytes
 
 
 def test_terminal_session_evidence_limits_publish_bounded_defaults_and_hard_caps() -> None:
@@ -313,6 +793,15 @@ def test_terminal_evidence_classification_rejects_missing_conflicting_and_duplic
         lambda: _classify(records=(_event_record(4, EventType.SESSION_FAILED),)),
     )
     _assert_error_code(
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT,
+        lambda: _classify(
+            records=(
+                _event_record(5, EventType.SESSION_COMPLETED),
+                _event_record(4, EventType.SESSION_FAILED),
+            )
+        ),
+    )
+    _assert_error_code(
         TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE,
         lambda: _classify(
             records=(
@@ -344,6 +833,7 @@ def test_terminal_evidence_classification_binds_a_pending_publication_marker() -
         )
         == current
     )
+    assert _classify(records=(current, prior)) == current
     _assert_error_code(
         TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT,
         lambda: _classify(
@@ -354,6 +844,21 @@ def test_terminal_evidence_classification_binds_a_pending_publication_marker() -
                     5,
                     EventType.SESSION_COMPLETED,
                     operation_id="different-operation",
+                ),
+            ),
+        ),
+    )
+    _assert_error_code(
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT,
+        lambda: _classify(
+            session=_session(run_epoch=2),
+            marker=marker,
+            records=(
+                current,
+                _event_record(
+                    4,
+                    EventType.SESSION_FAILED,
+                    operation_id="operation-2",
                 ),
             ),
         ),
@@ -415,9 +920,8 @@ def test_terminal_evidence_assembly_returns_exact_detached_boundaries() -> None:
     assert result.boundary.session_bytes == expected_session_bytes
     assert result.boundary.event_bytes == expected_event_bytes
     assert result.boundary.transcript_bytes == expected_transcript_bytes
-    assert result.boundary.total_bytes == (
-        expected_session_bytes + expected_event_bytes + expected_transcript_bytes
-    )
+    assert result.boundary.terminal_publication_marker_bytes == 0
+    assert result.boundary.total_bytes == compact_json_utf8_size(result.model_dump(mode="json"))
 
     session.metadata["purpose"] = "mutated"
     events[-1].event.payload["late"] = True
@@ -445,12 +949,8 @@ def test_terminal_evidence_assembly_preserves_a_matching_marker_in_its_byte_budg
 
     marker_bytes = compact_json_utf8_size(marker.model_dump(mode="json"))
     assert result.terminal_publication_marker == marker
-    assert result.boundary.total_bytes == (
-        result.boundary.session_bytes
-        + result.boundary.event_bytes
-        + result.boundary.transcript_bytes
-        + marker_bytes
-    )
+    assert result.boundary.terminal_publication_marker_bytes == marker_bytes
+    assert result.boundary.total_bytes == compact_json_utf8_size(result.model_dump(mode="json"))
 
 
 def test_terminal_evidence_assembly_enforces_independent_count_limits() -> None:
@@ -493,7 +993,14 @@ def test_terminal_evidence_assembly_enforces_record_and_total_byte_limits() -> N
         *(compact_json_utf8_size(record.model_dump(mode="json")) for record in events),
         *(compact_json_utf8_size(record.model_dump(mode="json")) for record in transcript),
     ]
-    exact_total = sum(record_sizes)
+    exact_total = _assemble_terminal_session_evidence(
+        session=session,
+        marker=None,
+        terminal_record=events[-1],
+        events=events,
+        transcript=transcript,
+        limits=TerminalSessionEvidenceLimits(),
+    ).boundary.total_bytes
 
     error = _assert_error_code(
         TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
@@ -521,6 +1028,35 @@ def test_terminal_evidence_assembly_enforces_record_and_total_byte_limits() -> N
     )
     assert (error.limit, error.observed) == (exact_total - 1, exact_total)
 
+    exact = _assemble_terminal_session_evidence(
+        session=session,
+        marker=None,
+        terminal_record=events[-1],
+        events=events,
+        transcript=transcript,
+        limits=TerminalSessionEvidenceLimits(max_total_bytes=exact_total),
+    )
+    assert exact.boundary.total_bytes == exact_total
+
+
+def test_terminal_evidence_public_validation_recomputes_derived_boundary_bytes() -> None:
+    events = _complete_records()
+    result = _assemble_terminal_session_evidence(
+        session=_session(),
+        marker=None,
+        terminal_record=events[-1],
+        events=events,
+        transcript=_transcript(),
+        limits=TerminalSessionEvidenceLimits(),
+    )
+    serialized = result.model_dump(mode="json")
+
+    assert TerminalSessionEvidence.model_validate(serialized) == result
+
+    serialized["boundary"]["total_bytes"] = 1
+    with pytest.raises(ValidationError, match="boundary metadata"):
+        TerminalSessionEvidence.model_validate(serialized)
+
 
 def test_terminal_evidence_assembly_rejects_torn_or_unattributed_boundaries() -> None:
     events = _complete_records()
@@ -532,6 +1068,28 @@ def test_terminal_evidence_assembly_rejects_torn_or_unattributed_boundaries() ->
             marker=None,
             terminal_record=events[-1],
             events=events[:-1],
+            transcript=_transcript(),
+            limits=TerminalSessionEvidenceLimits(),
+        ),
+    )
+
+    contradictory_prefix = (
+        _event_record(
+            1,
+            EventType.INTERACTION_STARTED,
+            interaction_id="interaction-1",
+        ),
+        _event_record(2, EventType.SESSION_COMPLETED, operation_id="operation-a"),
+        _event_record(3, EventType.SESSION_FAILED, operation_id="operation-b"),
+        _event_record(4, EventType.SESSION_COMPLETED, operation_id="operation-a"),
+    )
+    _assert_error_code(
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT,
+        lambda: _assemble_terminal_session_evidence(
+            session=_session(run_epoch=2),
+            marker=None,
+            terminal_record=contradictory_prefix[-1],
+            events=contradictory_prefix,
             transcript=_transcript(),
             limits=TerminalSessionEvidenceLimits(),
         ),
@@ -599,7 +1157,7 @@ def test_in_memory_terminal_evidence_returns_one_atomic_terminal_prefix(
         assert store.supports_terminal_session_evidence is True
         assert evidence.session.status is status
         assert evidence.terminal_event.event.type == expected_terminal_type
-        assert evidence.terminal_event.event.id == f"memory-{status.value}-session"
+        assert evidence.terminal_event.event.id == f"{session_id}-{status.value}-session"
         assert evidence.events[-1] == evidence.terminal_event
         assert all(record.event.id != "post-terminal-hook" for record in evidence.events)
         assert [record.index for record in evidence.transcript] == [0, 1, 2]
@@ -619,7 +1177,9 @@ def test_in_memory_terminal_evidence_returns_one_atomic_terminal_prefix(
     asyncio.run(run())
 
 
-def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors() -> None:
+def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors(
+    monkeypatch,
+) -> None:
     async def run() -> None:
         store = InMemorySessionStore()
         with pytest.raises(TerminalSessionEvidenceError) as missing:
@@ -627,6 +1187,19 @@ def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors() ->
         assert missing.value.code is TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
 
         session_id, _ = await _create_terminal_session(store)
+        sized_records = 0
+        original_record_bytes = sessions_module._terminal_session_evidence_record_bytes
+
+        def record_bytes_spy(value):
+            nonlocal sized_records
+            sized_records += 1
+            return original_record_bytes(value)
+
+        monkeypatch.setattr(
+            sessions_module,
+            "_terminal_session_evidence_record_bytes",
+            record_bytes_spy,
+        )
         with pytest.raises(TerminalSessionEvidenceError) as events:
             await store.load_terminal_session_evidence(
                 session_id,
@@ -634,6 +1207,7 @@ def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors() ->
             )
         assert events.value.code is TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED
         assert (events.value.limit, events.value.observed) == (2, 3)
+        assert sized_records == 0
 
         with pytest.raises(TerminalSessionEvidenceError) as transcript:
             await store.load_terminal_session_evidence(
@@ -642,6 +1216,49 @@ def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors() ->
             )
         assert transcript.value.code is TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED
         assert (transcript.value.limit, transcript.value.observed) == (2, 3)
+        assert sized_records == 0
+
+        with pytest.raises(TerminalSessionEvidenceError) as total:
+            await store.load_terminal_session_evidence(
+                session_id,
+                limits=TerminalSessionEvidenceLimits(max_total_bytes=1),
+            )
+        assert total.value.code is TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED
+        assert sized_records == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+def test_builtin_terminal_evidence_acceptance_matrix(tmp_path, backend: str) -> None:
+    async def run() -> None:
+        store: SessionStore
+        if backend == "memory":
+            store = InMemorySessionStore()
+        else:
+            store = SQLiteSessionStore(tmp_path / "terminal-evidence-acceptance.sqlite")
+        try:
+            await _exercise_store_rejection_contract(store, prefix=backend)
+            await _exercise_marker_repair(store, prefix=backend)
+            await _exercise_atomic_write_races(store, prefix=backend)
+            await _exercise_unpaginated_snapshot(store, prefix=backend)
+            await _exercise_separator_dense_canonical_limits(store, prefix=backend)
+            (
+                scientific_id,
+                scientific,
+                canonical_record_bytes,
+            ) = await _create_scientific_notation_evidence(store, prefix=backend)
+            tight_scientific = await store.load_terminal_session_evidence(
+                scientific_id,
+                limits=TerminalSessionEvidenceLimits(
+                    max_record_bytes=canonical_record_bytes,
+                    max_total_bytes=scientific.boundary.total_bytes,
+                ),
+            )
+            assert tight_scientific == scientific
+        finally:
+            if isinstance(store, SQLiteSessionStore):
+                await store.close()
 
     asyncio.run(run())
 
@@ -762,6 +1379,52 @@ def test_sqlite_terminal_evidence_rejects_an_oversized_terminal_before_hydration
     asyncio.run(run())
 
 
+def test_sqlite_terminal_evidence_queries_use_bounded_ordering_indexes(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(tmp_path / "terminal-evidence-query-plan.sqlite")
+        try:
+            session_id, _ = await _create_terminal_session(store)
+            evidence = await store.load_terminal_session_evidence(session_id)
+
+            def explain(connection):
+                event_rows = connection.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT sequence
+                    FROM cayu_events
+                    WHERE session_id = ? AND sequence <= ?
+                    ORDER BY sequence ASC
+                    LIMIT ?
+                    """,
+                    (session_id, evidence.boundary.terminal_event_sequence, 101),
+                ).fetchall()
+                transcript_rows = connection.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT session_order
+                    FROM cayu_transcript_messages
+                    WHERE session_id = ?
+                    ORDER BY session_order ASC
+                    LIMIT ?
+                    """,
+                    (session_id, 101),
+                ).fetchall()
+                return (
+                    " ".join(str(row[3]) for row in event_rows),
+                    " ".join(str(row[3]) for row in transcript_rows),
+                )
+
+            event_plan, transcript_plan = await store._run_read(explain)
+            assert "idx_cayu_events_session_sequence" in event_plan
+            assert "idx_cayu_transcript_session_order" in transcript_plan
+            assert "USE TEMP B-TREE FOR ORDER BY" not in event_plan
+            assert "USE TEMP B-TREE FOR ORDER BY" not in transcript_plan
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(
     "status",
     (SessionStatus.COMPLETED, SessionStatus.FAILED),
@@ -835,9 +1498,210 @@ def test_postgres_terminal_evidence_survives_restart_with_the_exact_boundary(
                     session_id,
                     limits=TerminalSessionEvidenceLimits(max_record_bytes=32),
                 )
-            assert record.value.code is TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED
+            assert record.value.code is TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED
             assert hydrated_json_values == 0
         finally:
             await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_terminal_evidence_acceptance_matrix(postgres_dsn: str) -> None:
+    async def run() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _reset_postgres(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            await _exercise_store_rejection_contract(store, prefix="postgres")
+            await _exercise_marker_repair(store, prefix="postgres")
+            await _exercise_atomic_write_races(store, prefix="postgres")
+            await _exercise_unpaginated_snapshot(store, prefix="postgres")
+            (
+                _,
+                terminal_sequence,
+                canonical_record_bytes,
+                _,
+            ) = await _exercise_separator_dense_canonical_limits(
+                store,
+                prefix="postgres",
+            )
+            async with store._connection() as connection, connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT octet_length(event::text) + 1
+                           + octet_length(sequence::text)
+                    FROM cayu_events
+                    WHERE sequence = %s
+                    """,
+                    (terminal_sequence,),
+                )
+                transport_row = await cursor.fetchone()
+            assert transport_row is not None
+            assert int(transport_row[0]) > canonical_record_bytes
+
+            (
+                scientific_id,
+                scientific,
+                scientific_record_bytes,
+            ) = await _create_scientific_notation_evidence(
+                store,
+                prefix="postgres",
+            )
+            scientific_transport_limit = (
+                scientific_record_bytes + (scientific_record_bytes + 1) // 2
+            )
+            with pytest.raises(TerminalSessionEvidenceError) as scientific_transport:
+                await store.load_terminal_session_evidence(
+                    scientific_id,
+                    limits=TerminalSessionEvidenceLimits(
+                        max_record_bytes=scientific_record_bytes,
+                        max_total_bytes=scientific.boundary.total_bytes,
+                    ),
+                )
+            assert (
+                scientific_transport.value.code
+                is TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED
+            )
+            async with store._connection() as connection, connection.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT octet_length(event::text) + 1
+                           + octet_length(sequence::text)
+                    FROM cayu_events
+                    WHERE sequence = %s
+                    """,
+                    (scientific.terminal_event.sequence,),
+                )
+                scientific_transport_row = await cursor.fetchone()
+            assert scientific_transport_row is not None
+            assert int(scientific_transport_row[0]) > scientific_transport_limit
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_terminal_evidence_preflight_bounds_whitespace_before_hydration(
+    postgres_dsn: str,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _reset_postgres(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            oversized_whitespace = " " * 2_000_025
+            event_session_id, _ = await _create_terminal_session(
+                store,
+                session_id="postgres-whitespace-event-preflight",
+                terminal_payload={"diagnostic": oversized_whitespace},
+            )
+            transcript_session_id, transcript_interaction_id = await _create_terminal_session(
+                store,
+                session_id="postgres-whitespace-transcript-preflight",
+            )
+            await store.append_transcript_messages(
+                transcript_session_id,
+                [Message.text("assistant", f"x{oversized_whitespace}")],
+                interaction_id=transcript_interaction_id,
+            )
+            metadata_session_id, _ = await _create_terminal_session(
+                store,
+                session_id="postgres-whitespace-metadata-preflight",
+                session_metadata={"diagnostic": oversized_whitespace},
+            )
+
+            import cayu.storage.postgres as postgres_store_module
+
+            hydrated_json_values = 0
+            original_json_obj = postgres_store_module._json_obj
+
+            def json_obj_spy(value):
+                nonlocal hydrated_json_values
+                hydrated_json_values += 1
+                return original_json_obj(value)
+
+            monkeypatch.setattr(postgres_store_module, "_json_obj", json_obj_spy)
+            for session_id in (
+                event_session_id,
+                transcript_session_id,
+                metadata_session_id,
+            ):
+                hydrated_json_values = 0
+                with pytest.raises(TerminalSessionEvidenceError) as captured:
+                    await store.load_terminal_session_evidence(session_id)
+                assert (
+                    captured.value.code is TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED
+                )
+                assert hydrated_json_values == 0
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_terminal_evidence_queries_use_bounded_ordering_indexes(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _reset_postgres(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            session_id, _ = await _create_terminal_session(store)
+            evidence = await store.load_terminal_session_evidence(session_id)
+            async with store._connection() as connection, connection.cursor() as cursor:
+                await cursor.execute("SET LOCAL enable_seqscan = off")
+                await cursor.execute("SET LOCAL enable_bitmapscan = off")
+                await cursor.execute(
+                    """
+                    EXPLAIN (FORMAT JSON)
+                    SELECT sequence
+                    FROM cayu_events
+                    WHERE session_id = %s AND sequence <= %s
+                    ORDER BY sequence ASC
+                    LIMIT %s
+                    """,
+                    (session_id, evidence.boundary.terminal_event_sequence, 101),
+                )
+                event_plan = str((await cursor.fetchone())[0])
+                await cursor.execute(
+                    """
+                    EXPLAIN (FORMAT JSON)
+                    SELECT session_order
+                    FROM cayu_transcript_messages
+                    WHERE session_id = %s
+                    ORDER BY session_order ASC
+                    LIMIT %s
+                    """,
+                    (session_id, 101),
+                )
+                transcript_plan = str((await cursor.fetchone())[0])
+
+            assert "idx_cayu_events_session_sequence" in event_plan
+            assert "idx_cayu_transcript_session_order" in transcript_plan
+        finally:
+            await store.close()
 
     asyncio.run(run())
