@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+import cayu.storage.sqlite as sqlite_store_module
 from cayu import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
@@ -24,6 +25,8 @@ from cayu import (
     Session,
     SessionIdentity,
     SessionStatus,
+    SessionStore,
+    SQLiteSessionStore,
     TerminalPublicationMarker,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
@@ -131,8 +134,11 @@ def _classify(
     initial_transcript_pending: bool = False,
     pending_session_interrupt: bool = False,
 ) -> EventRecord:
+    selected_session = _session() if session is None else session
     return _classify_terminal_session_evidence_records(
-        session=_session() if session is None else session,
+        session_id=selected_session.id,
+        status=selected_session.status,
+        run_epoch=selected_session.run_epoch,
         marker=marker,
         newest_evidence_records=records,
         initial_transcript_pending=initial_transcript_pending,
@@ -150,10 +156,11 @@ def _assert_error_code(
     return captured.value
 
 
-async def _create_terminal_memory_session(
-    store: InMemorySessionStore,
+async def _create_terminal_session(
+    store: SessionStore,
     *,
     status: SessionStatus = SessionStatus.COMPLETED,
+    terminal_payload: dict | None = None,
 ) -> tuple[str, str]:
     session_id = "memory-terminal-evidence"
     interaction_id = "memory-interaction"
@@ -211,6 +218,7 @@ async def _create_terminal_memory_session(
             id=f"memory-{status.value}-session",
             type=session_terminal_type,
             session_id=session_id,
+            payload={} if terminal_payload is None else terminal_payload,
         ),
     )
     return session_id, interaction_id
@@ -551,7 +559,7 @@ def test_in_memory_terminal_evidence_returns_one_atomic_terminal_prefix(
 ) -> None:
     async def run() -> None:
         store = InMemorySessionStore()
-        session_id, interaction_id = await _create_terminal_memory_session(
+        session_id, interaction_id = await _create_terminal_session(
             store,
             status=status,
         )
@@ -602,7 +610,7 @@ def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors() ->
             await store.load_terminal_session_evidence("missing-session")
         assert missing.value.code is TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
 
-        session_id, _ = await _create_terminal_memory_session(store)
+        session_id, _ = await _create_terminal_session(store)
         with pytest.raises(TerminalSessionEvidenceError) as events:
             await store.load_terminal_session_evidence(
                 session_id,
@@ -618,5 +626,121 @@ def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors() ->
             )
         assert transcript.value.code is TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED
         assert (transcript.value.limit, transcript.value.observed) == (2, 3)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "status",
+    (SessionStatus.COMPLETED, SessionStatus.FAILED),
+)
+def test_sqlite_terminal_evidence_survives_restart_with_the_exact_boundary(
+    tmp_path,
+    status: SessionStatus,
+) -> None:
+    async def run() -> None:
+        path = tmp_path / f"terminal-evidence-{status.value}.sqlite"
+        store = SQLiteSessionStore(path)
+        session_id, interaction_id = await _create_terminal_session(store, status=status)
+        await store.append_event(
+            session_id,
+            Event(
+                id="sqlite-post-terminal-hook",
+                type=EventType.HOOK_COMPLETED,
+                session_id=session_id,
+            ),
+        )
+        before_restart = await store.load_terminal_session_evidence(session_id)
+        await store.close()
+
+        reopened = SQLiteSessionStore(path)
+        try:
+            after_restart = await reopened.load_terminal_session_evidence(session_id)
+            assert reopened.supports_terminal_session_evidence is True
+            assert after_restart == before_restart
+            assert after_restart.initial_interaction_id == interaction_id
+            assert after_restart.boundary.event_count == 3
+            assert after_restart.boundary.transcript_count == 3
+            assert all(
+                record.event.id != "sqlite-post-terminal-hook" for record in after_restart.events
+            )
+        finally:
+            await reopened.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_terminal_evidence_preflights_counts_and_stored_record_lengths(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(tmp_path / "terminal-evidence-limits.sqlite")
+        try:
+            session_id, _ = await _create_terminal_session(store)
+            with pytest.raises(TerminalSessionEvidenceError) as events:
+                await store.load_terminal_session_evidence(
+                    session_id,
+                    limits=TerminalSessionEvidenceLimits(max_events=2),
+                )
+            assert events.value.code is TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED
+            assert (events.value.limit, events.value.observed) == (2, 3)
+
+            with pytest.raises(TerminalSessionEvidenceError) as transcript:
+                await store.load_terminal_session_evidence(
+                    session_id,
+                    limits=TerminalSessionEvidenceLimits(max_transcript_records=2),
+                )
+            assert (
+                transcript.value.code is TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED
+            )
+
+            with pytest.raises(TerminalSessionEvidenceError) as record:
+                await store.load_terminal_session_evidence(
+                    session_id,
+                    limits=TerminalSessionEvidenceLimits(max_record_bytes=32),
+                )
+            assert record.value.code is TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED
+
+            with pytest.raises(TerminalSessionEvidenceError) as total:
+                await store.load_terminal_session_evidence(
+                    session_id,
+                    limits=TerminalSessionEvidenceLimits(max_total_bytes=128),
+                )
+            assert total.value.code is TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_terminal_evidence_rejects_an_oversized_terminal_before_hydration(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(tmp_path / "terminal-evidence-oversized.sqlite")
+        try:
+            session_id, _ = await _create_terminal_session(
+                store,
+                terminal_payload={"diagnostic": "x" * 2048},
+            )
+            hydrated_rows = 0
+            original = sqlite_store_module._event_from_row
+
+            def spy(row):
+                nonlocal hydrated_rows
+                hydrated_rows += 1
+                return original(row)
+
+            monkeypatch.setattr(sqlite_store_module, "_event_from_row", spy)
+            with pytest.raises(TerminalSessionEvidenceError) as captured:
+                await store.load_terminal_session_evidence(
+                    session_id,
+                    limits=TerminalSessionEvidenceLimits(max_record_bytes=1024),
+                )
+            assert captured.value.code is TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED
+            assert hydrated_rows == 0
+        finally:
+            await store.close()
 
     asyncio.run(run())

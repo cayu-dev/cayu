@@ -9161,6 +9161,7 @@ class InMemorySessionStore(SessionStore):
                 raise TerminalSessionEvidenceError(
                     TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
                 )
+            _terminal_session_evidence_expected_event_type(session.status)
             checkpoint = self._checkpoints.get(session_id)
             marker = _terminal_session_evidence_marker_from_checkpoint(checkpoint)
             session_records = self._session_event_records.get(session_id, [])
@@ -9175,7 +9176,9 @@ class InMemorySessionStore(SessionStore):
                 )
             )
             terminal_record = _classify_terminal_session_evidence_records(
-                session=session,
+                session_id=session.id,
+                status=session.status,
+                run_epoch=session.run_epoch,
                 marker=marker,
                 newest_evidence_records=newest_evidence_records,
                 initial_transcript_pending=(
@@ -15009,10 +15012,10 @@ def _terminal_session_evidence_marker_from_checkpoint(
     )
 
 
-def _terminal_session_evidence_expected_event_type(session: Session) -> EventType:
-    if session.status == SessionStatus.INTERRUPTED:
+def _terminal_session_evidence_expected_event_type(status: SessionStatus) -> EventType:
+    if status == SessionStatus.INTERRUPTED:
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED)
-    expected = _TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS.get(session.status)
+    expected = _TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS.get(status)
     if expected not in {EventType.SESSION_COMPLETED, EventType.SESSION_FAILED}:
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.SESSION_NOT_TERMINAL)
     return expected
@@ -15020,7 +15023,9 @@ def _terminal_session_evidence_expected_event_type(session: Session) -> EventTyp
 
 def _classify_terminal_session_evidence_records(
     *,
-    session: Session,
+    session_id: str,
+    status: SessionStatus,
+    run_epoch: int,
     marker: TerminalPublicationMarker | None,
     newest_evidence_records: Sequence[EventRecord],
     initial_transcript_pending: bool,
@@ -15034,12 +15039,12 @@ def _classify_terminal_session_evidence_records(
     boundary, and a duplicate current-run publication.
     """
 
-    expected_event_type = _terminal_session_evidence_expected_event_type(session)
+    expected_event_type = _terminal_session_evidence_expected_event_type(status)
     if len(newest_evidence_records) > TERMINAL_EVIDENCE_QUERY_LIMIT:
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
     if any(left.sequence <= right.sequence for left, right in pairwise(newest_evidence_records)):
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
-    if any(record.event.session_id != session.id for record in newest_evidence_records):
+    if any(record.event.session_id != session_id for record in newest_evidence_records):
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
     if initial_transcript_pending:
         raise TerminalSessionEvidenceError(
@@ -15049,7 +15054,7 @@ def _classify_terminal_session_evidence_records(
         raise TerminalSessionEvidenceError(
             TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
         )
-    if marker is not None and marker.run_epoch != session.run_epoch:
+    if marker is not None and marker.run_epoch != run_epoch:
         raise TerminalSessionEvidenceError(
             TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
         )
@@ -15091,12 +15096,17 @@ def _classify_terminal_session_evidence_records(
             TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
         )
 
-    classification = classify_current_terminal_evidence(
-        evidence_events=tuple(record.event for record in newest_evidence_records),
-        expected_event_type=expected_event_type,
-        run_operation_id=None if marker is None else marker.operation_id,
-        interruption_request_id=None,
-    )
+    try:
+        classification = classify_current_terminal_evidence(
+            evidence_events=tuple(record.event for record in newest_evidence_records),
+            expected_event_type=expected_event_type,
+            run_operation_id=None if marker is None else marker.operation_id,
+            interruption_request_id=None,
+        )
+    except (TypeError, ValueError) as exc:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+        ) from exc
     if classification.run_operation_conflict:
         raise TerminalSessionEvidenceError(
             TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
