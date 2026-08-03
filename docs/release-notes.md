@@ -87,7 +87,7 @@ process restart. Coding agents should treat failed storage status, migration,
 contract, or project tests as a blocked upgrade rather than editing around the
 guard.
 
-## v0.1.0 (unreleased)
+## v0.1.0
 
 ### Remote environment allocation fails closed without exact recovery
 
