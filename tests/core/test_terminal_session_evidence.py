@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 import pytest
@@ -17,8 +18,11 @@ from cayu import (
     Event,
     EventRecord,
     EventType,
+    InMemorySessionStore,
     Message,
+    RunRequest,
     Session,
+    SessionIdentity,
     SessionStatus,
     TerminalPublicationMarker,
     TerminalSessionEvidenceError,
@@ -144,6 +148,72 @@ def _assert_error_code(
         callback()
     assert captured.value.code is expected
     return captured.value
+
+
+async def _create_terminal_memory_session(
+    store: InMemorySessionStore,
+    *,
+    status: SessionStatus = SessionStatus.COMPLETED,
+) -> tuple[str, str]:
+    session_id = "memory-terminal-evidence"
+    interaction_id = "memory-interaction"
+    user_message = Message.text("user", "Give a concise answer.")
+    await store.create(
+        RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            messages=[user_message],
+        ),
+        identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        interaction_started_event=Event(
+            id="memory-interaction-started",
+            type=EventType.INTERACTION_STARTED,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        ),
+        interaction_source_messages=[user_message],
+    )
+    await store.replace_initial_transcript_messages(
+        session_id,
+        [user_message],
+        [Message.text("system", "Be precise."), user_message],
+        interaction_id=interaction_id,
+    )
+    await store.append_transcript_messages(
+        session_id,
+        [Message.text("assistant", "A concise answer.")],
+        interaction_id=interaction_id,
+    )
+    interaction_terminal_type = (
+        EventType.INTERACTION_COMPLETED
+        if status == SessionStatus.COMPLETED
+        else EventType.INTERACTION_FAILED
+    )
+    session_terminal_type = (
+        EventType.SESSION_COMPLETED
+        if status == SessionStatus.COMPLETED
+        else EventType.SESSION_FAILED
+    )
+    await store.publish_interaction_transition(
+        session_id,
+        event=Event(
+            id=f"memory-{status.value}-interaction",
+            type=interaction_terminal_type,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        ),
+        from_statuses={SessionStatus.RUNNING},
+        to_status=status,
+    )
+    await store.append_event(
+        session_id,
+        Event(
+            id=f"memory-{status.value}-session",
+            type=session_terminal_type,
+            session_id=session_id,
+        ),
+    )
+    return session_id, interaction_id
 
 
 def test_terminal_session_evidence_limits_publish_bounded_defaults_and_hard_caps() -> None:
@@ -470,3 +540,83 @@ def test_terminal_evidence_errors_never_embed_session_or_record_content() -> Non
 
     assert str(error) == "Terminal-session evidence exceeds the total-byte limit. Limit: 1024."
     assert "4096" not in str(error)
+
+
+@pytest.mark.parametrize(
+    "status",
+    (SessionStatus.COMPLETED, SessionStatus.FAILED),
+)
+def test_in_memory_terminal_evidence_returns_one_atomic_terminal_prefix(
+    status: SessionStatus,
+) -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        session_id, interaction_id = await _create_terminal_memory_session(
+            store,
+            status=status,
+        )
+        await store.append_event(
+            session_id,
+            Event(
+                id="post-terminal-hook",
+                type=EventType.HOOK_COMPLETED,
+                session_id=session_id,
+                payload={"phase": "after_terminal"},
+            ),
+        )
+
+        evidence = await store.load_terminal_session_evidence(session_id)
+
+        expected_terminal_type = (
+            EventType.SESSION_COMPLETED
+            if status == SessionStatus.COMPLETED
+            else EventType.SESSION_FAILED
+        )
+        assert store.supports_terminal_session_evidence is True
+        assert evidence.session.status is status
+        assert evidence.terminal_event.event.type == expected_terminal_type
+        assert evidence.terminal_event.event.id == f"memory-{status.value}-session"
+        assert evidence.events[-1] == evidence.terminal_event
+        assert all(record.event.id != "post-terminal-hook" for record in evidence.events)
+        assert [record.index for record in evidence.transcript] == [0, 1, 2]
+        assert [record.interaction_id for record in evidence.transcript] == [
+            None,
+            interaction_id,
+            interaction_id,
+        ]
+        assert evidence.initial_interaction_id == interaction_id
+        assert evidence.boundary.event_count == 3
+        assert evidence.boundary.transcript_count == 3
+
+        evidence.terminal_event.event.payload["mutated"] = True
+        reread = await store.load_terminal_session_evidence(session_id)
+        assert "mutated" not in reread.terminal_event.event.payload
+
+    asyncio.run(run())
+
+
+def test_in_memory_terminal_evidence_returns_typed_missing_and_limit_errors() -> None:
+    async def run() -> None:
+        store = InMemorySessionStore()
+        with pytest.raises(TerminalSessionEvidenceError) as missing:
+            await store.load_terminal_session_evidence("missing-session")
+        assert missing.value.code is TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
+
+        session_id, _ = await _create_terminal_memory_session(store)
+        with pytest.raises(TerminalSessionEvidenceError) as events:
+            await store.load_terminal_session_evidence(
+                session_id,
+                limits=TerminalSessionEvidenceLimits(max_events=2),
+            )
+        assert events.value.code is TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED
+        assert (events.value.limit, events.value.observed) == (2, 3)
+
+        with pytest.raises(TerminalSessionEvidenceError) as transcript:
+            await store.load_terminal_session_evidence(
+                session_id,
+                limits=TerminalSessionEvidenceLimits(max_transcript_records=2),
+            )
+        assert transcript.value.code is TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED
+        assert (transcript.value.limit, transcript.value.observed) == (2, 3)
+
+    asyncio.run(run())

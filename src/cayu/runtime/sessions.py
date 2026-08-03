@@ -6026,6 +6026,7 @@ class InMemorySessionStore(SessionStore):
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
+    supports_terminal_session_evidence: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -9145,6 +9146,90 @@ class InMemorySessionStore(SessionStore):
             raise ValueError("max_bytes must be a positive integer.")
         async with self._lock:
             return self._query_events_unlocked(query, max_bytes=max_bytes)
+
+    async def load_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        limits: TerminalSessionEvidenceLimits | None = None,
+    ) -> TerminalSessionEvidence:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        limits = _copy_terminal_session_evidence_limits(limits)
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
+                )
+            checkpoint = self._checkpoints.get(session_id)
+            marker = _terminal_session_evidence_marker_from_checkpoint(checkpoint)
+            session_records = self._session_event_records.get(session_id, [])
+            newest_evidence_records = tuple(
+                islice(
+                    (
+                        record
+                        for record in reversed(session_records)
+                        if record.event.type in TERMINAL_EVIDENCE_EVENT_TYPES
+                    ),
+                    TERMINAL_EVIDENCE_QUERY_LIMIT,
+                )
+            )
+            terminal_record = _classify_terminal_session_evidence_records(
+                session=session,
+                marker=marker,
+                newest_evidence_records=newest_evidence_records,
+                initial_transcript_pending=(
+                    checkpoint is not None
+                    and INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY in checkpoint
+                ),
+                pending_session_interrupt=(
+                    checkpoint is not None and "pending_session_interrupt" in checkpoint
+                ),
+            )
+            event_stop = bisect_right(
+                session_records,
+                terminal_record.sequence,
+                key=lambda record: record.sequence,
+            )
+            if event_stop > limits.max_events:
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+                    limit=limits.max_events,
+                    observed=event_stop,
+                )
+            events = session_records[:event_stop]
+
+            messages = self._transcripts.get(session_id, [])
+            interaction_ids = self._transcript_interaction_ids.get(session_id, [])
+            if len(messages) != len(interaction_ids):
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                )
+            if len(messages) > limits.max_transcript_records:
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED,
+                    limit=limits.max_transcript_records,
+                    observed=len(messages),
+                )
+            # The store already owns detached, validated messages. Construct
+            # lightweight record views so oversized evidence is byte-checked
+            # before any message payload is copied for the returned model.
+            transcript_records = tuple(
+                TranscriptRecord.model_construct(
+                    index=index,
+                    interaction_id=interaction_ids[index],
+                    message=message,
+                )
+                for index, message in enumerate(messages)
+            )
+            return _assemble_terminal_session_evidence(
+                session=session,
+                marker=marker,
+                terminal_record=terminal_record,
+                events=events,
+                transcript=transcript_records,
+                limits=limits,
+            )
 
     def _query_events_unlocked(
         self,
