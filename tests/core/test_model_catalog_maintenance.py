@@ -29,7 +29,7 @@ from cayu import (
     estimate_session_cost,
 )
 from maintenance.model_catalog import agent_tools as catalog_tools
-from maintenance.model_catalog import browser, refresh, search
+from maintenance.model_catalog import browser, local_refresh, refresh, search
 from maintenance.model_catalog.agent_tools import ReadPageTool
 from maintenance.model_catalog.browser_verifier import (
     BrowserVerifier,
@@ -408,22 +408,27 @@ def test_pricing_only_verification_does_not_refresh_model_fact_provenance() -> N
 def test_verified_future_transition_creates_a_future_schedule() -> None:
     model = _provider_model("openai")
     original_price = _provider_price("openai")
-    original_pricing = _pricing(original_price)
-    original_price = _with_pricing(
-        original_price,
-        original_pricing.model_copy(
-            update={
-                "standard": (
-                    original_pricing.base().model_copy(
-                        update={
-                            "input_per_million": Decimal("1"),
-                            "output_per_million": Decimal("4"),
-                        }
-                    ),
-                )
-            }
-        ),
+    current_schedule = original_price.schedule_on(date(2026, 8, 3))
+    assert current_schedule is not None
+    original_pricing = current_schedule.pricing
+    single_schedule = current_schedule.model_copy(
+        update={
+            "effective_from": None,
+            "pricing": original_pricing.model_copy(
+                update={
+                    "standard": (
+                        original_pricing.base().model_copy(
+                            update={
+                                "input_per_million": Decimal("1"),
+                                "output_per_million": Decimal("4"),
+                            }
+                        ),
+                    )
+                }
+            ),
+        }
     )
+    original_price = original_price.model_copy(update={"schedules": (single_schedule,)})
 
     outcome = parse_verified(
         _verified_payload(
@@ -820,6 +825,45 @@ def test_verified_null_batch_without_batch_mode_preserves_curated_batch() -> Non
 
     assert outcome.verified and outcome.price is not None
     assert _pricing(outcome.price).batch == curated_batch
+
+
+def test_verified_does_not_flatten_tiered_batch_pricing() -> None:
+    model = _provider_model("openai")
+    price = _provider_price("openai")
+    payload = _verified_payload(
+        context_tiers=[
+            {
+                "up_to_tokens": 272_000,
+                "input_per_million": "2",
+                "output_per_million": "12",
+                "cache_read_per_million": "0.2",
+                "cache_write_per_million": "2.5",
+            },
+            {
+                "up_to_tokens": None,
+                "input_per_million": "4",
+                "output_per_million": "18",
+                "cache_read_per_million": "0.4",
+                "cache_write_per_million": "5",
+            },
+        ],
+        batch_input_per_million="1",
+        batch_output_per_million="6",
+    )
+
+    outcome = parse_verified(
+        payload,
+        model,
+        price,
+        as_of="2026-08-03",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard", "batch"}},
+    )
+
+    assert outcome.verified and outcome.price is not None
+    pricing = outcome.price.schedule_on(date(2026, 8, 3)).pricing
+    assert len(pricing.standard) == 2
+    assert pricing.batch is None
 
 
 def test_release_policy_rejects_zero_and_implausibly_large_prices() -> None:
@@ -1385,6 +1429,120 @@ def test_browser_verifier_applies_cost_limit_to_caller_supplied_app() -> None:
     assert len(app.requests[0].budget_limits) == 1
     assert app.requests[0].budget_limits[0].max_estimated_cost == Decimal("0.03")
     assert app.requests[0].budget_limits[0].allow_unpriced is False
+
+
+def test_browser_verifier_subscription_mode_uses_luna_max() -> None:
+    verifier = BrowserVerifier(
+        as_of="2026-08-02",
+        use_openai_subscription=True,
+        max_cost_usd=None,
+    )
+
+    assert verifier.app.list_providers() == ("openai",)
+    for agent_name in ("model-verifier", "model-verifier-recommendations"):
+        spec = verifier.app.get_agent(agent_name).spec
+        assert spec.model == "gpt-5.6-luna"
+        assert spec.provider_options == {"openai": {"reasoning": {"effort": "xhigh"}}}
+
+
+def test_browser_verifier_prompt_requires_reading_committed_official_sources() -> None:
+    class CapturingApp:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def run(self, request):
+            self.requests.append(request)
+            if False:
+                yield
+
+    model = _provider_model("openai")
+    price = _provider_price("openai")
+    schedule = price.schedule_on(_VERIFICATION_DATE)
+    assert schedule is not None
+    app = CapturingApp()
+    verifier = BrowserVerifier(as_of=_VERIFICATION_DATE.isoformat(), app=app)
+
+    asyncio.run(verifier.averify(model, price))
+
+    prompt = app.requests[0].messages[0].content[0].text
+    assert model.provenance.url in prompt
+    assert schedule.provenance.url in prompt
+    assert "call read_page on every source URL you return" in prompt
+
+
+def test_refresh_cli_selects_local_openai_subscription(monkeypatch) -> None:
+    observed = {}
+
+    async def fake_run(**kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr(refresh, "_run", fake_run)
+
+    refresh.main(["--openai-subscription"])
+
+    assert observed["use_openai_subscription"] is True
+
+
+def test_refresh_cli_can_use_the_repository_snapshot_with_an_installed_runtime(
+    monkeypatch, tmp_path
+) -> None:
+    observed = {}
+    catalog_path = tmp_path / "catalog.json"
+    price_book_path = tmp_path / "prices.json"
+
+    async def fake_run(**kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr(refresh, "_run", fake_run)
+
+    refresh.main(
+        [
+            "--source-catalog",
+            str(catalog_path),
+            "--source-price-book",
+            str(price_book_path),
+        ]
+    )
+
+    assert observed["source_catalog_path"] == catalog_path
+    assert observed["source_price_book_path"] == price_book_path
+
+
+def test_local_refresh_installs_public_cayu_and_uses_repository_data(tmp_path) -> None:
+    commands = local_refresh._commands(
+        uv_executable="/usr/local/bin/uv",
+        environment_dir=tmp_path / "venv",
+        passthrough=("--all",),
+    )
+
+    public_python = str(tmp_path / "venv/bin/python")
+    assert commands[0] == (
+        "/usr/local/bin/uv",
+        "venv",
+        "--python",
+        "3.12",
+        "--seed",
+        str(tmp_path / "venv"),
+    )
+    assert commands[1] == (
+        public_python,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "cayu",
+    )
+    assert commands[-1] == (
+        public_python,
+        "-m",
+        "maintenance.model_catalog.refresh",
+        "--openai-subscription",
+        "--source-catalog",
+        str(refresh.CATALOG_PATH),
+        "--source-price-book",
+        str(refresh.PRICE_BOOK_PATH),
+        "--all",
+    )
 
 
 def test_browser_verifier_rejects_unpriced_configured_model() -> None:

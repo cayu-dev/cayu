@@ -350,8 +350,11 @@ def parse_verified(
             and raw_bo is None
         ):
             pricing_over["batch"] = None
-        elif bi is not None and bo is not None:
+        elif bi is not None and bo is not None and len(new_standard) == 1:
             pricing_over["batch"] = PriceTier(input_per_million=bi, output_per_million=bo)
+        # ``TieredPricing.batch`` holds only one band. When the official page exposes
+        # short- and long-context Batch rates, do not flatten the short-context values
+        # into a rate that appears to apply to every request.
     new_pricing = original_pricing.model_copy(update=pricing_over)
 
     pricing_provenance = Provenance(source="official", url=source_url, as_of=as_of)

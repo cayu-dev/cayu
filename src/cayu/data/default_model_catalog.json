@@ -1,6 +1,6 @@
 {
-  "catalog_version": "2026-07-22",
-  "generated_at": "2026-07-22",
+  "catalog_version": "2026-08-03",
+  "generated_at": "2026-08-03",
   "models": [
     {
       "aliases": [],
@@ -415,7 +415,7 @@
       "model": "gpt-5.6-luna",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-07-14",
+        "as_of": "2026-08-03",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
       },
@@ -447,7 +447,7 @@
       "model": "gpt-5.6-sol",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-07-14",
+        "as_of": "2026-08-03",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
       },
@@ -477,7 +477,7 @@
       "model": "gpt-5.6-terra",
       "prompt_caching": true,
       "provenance": {
-        "as_of": "2026-07-14",
+        "as_of": "2026-08-03",
         "source": "official",
         "url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
       },

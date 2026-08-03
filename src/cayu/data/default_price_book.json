@@ -1,7 +1,7 @@
 {
   "contextual_pricing_requirements": [],
-  "generated_at": "2026-07-22",
-  "price_book_version": "2026-07-22",
+  "generated_at": "2026-08-03",
+  "price_book_version": "2026-08-03",
   "prices": [
     {
       "aliases": [],
@@ -552,7 +552,7 @@
       "schedules": [
         {
           "effective_from": null,
-          "effective_through": null,
+          "effective_through": "2026-08-02",
           "pricing": {
             "batch": null,
             "cache_write_1h_per_million": null,
@@ -580,6 +580,37 @@
             "source": "official",
             "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
           }
+        },
+        {
+          "effective_from": "2026-08-03",
+          "effective_through": null,
+          "pricing": {
+            "batch": null,
+            "cache_write_1h_per_million": null,
+            "cache_write_5m_per_million": null,
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.02",
+                "cache_write_input_per_million": "0.25",
+                "input_per_million": "0.2",
+                "max_input_tokens": 272000,
+                "output_per_million": "1.2"
+              },
+              {
+                "cache_read_input_per_million": "0.04",
+                "cache_write_input_per_million": "0.5",
+                "input_per_million": "0.4",
+                "max_input_tokens": null,
+                "output_per_million": "1.8"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-08-03",
+            "source": "official",
+            "url": "https://developers.openai.com/api/docs/pricing"
+          }
         }
       ]
     },
@@ -596,7 +627,7 @@
       "schedules": [
         {
           "effective_from": null,
-          "effective_through": null,
+          "effective_through": "2026-08-02",
           "pricing": {
             "batch": null,
             "cache_write_1h_per_million": null,
@@ -624,6 +655,37 @@
             "source": "official",
             "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
           }
+        },
+        {
+          "effective_from": "2026-08-03",
+          "effective_through": null,
+          "pricing": {
+            "batch": null,
+            "cache_write_1h_per_million": null,
+            "cache_write_5m_per_million": null,
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.5",
+                "cache_write_input_per_million": "6.25",
+                "input_per_million": "5",
+                "max_input_tokens": 272000,
+                "output_per_million": "30"
+              },
+              {
+                "cache_read_input_per_million": "1",
+                "cache_write_input_per_million": "12.5",
+                "input_per_million": "10",
+                "max_input_tokens": null,
+                "output_per_million": "45"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-08-03",
+            "source": "official",
+            "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+          }
         }
       ]
     },
@@ -638,7 +700,7 @@
       "schedules": [
         {
           "effective_from": null,
-          "effective_through": null,
+          "effective_through": "2026-08-02",
           "pricing": {
             "batch": null,
             "cache_write_1h_per_million": null,
@@ -665,6 +727,37 @@
             "as_of": "2026-07-14",
             "source": "official",
             "url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
+          }
+        },
+        {
+          "effective_from": "2026-08-03",
+          "effective_through": null,
+          "pricing": {
+            "batch": null,
+            "cache_write_1h_per_million": null,
+            "cache_write_5m_per_million": null,
+            "currency": "USD",
+            "standard": [
+              {
+                "cache_read_input_per_million": "0.2",
+                "cache_write_input_per_million": "2.5",
+                "input_per_million": "2",
+                "max_input_tokens": 272000,
+                "output_per_million": "12"
+              },
+              {
+                "cache_read_input_per_million": "0.4",
+                "cache_write_input_per_million": "5",
+                "input_per_million": "4",
+                "max_input_tokens": null,
+                "output_per_million": "18"
+              }
+            ]
+          },
+          "provenance": {
+            "as_of": "2026-08-03",
+            "source": "official",
+            "url": "https://developers.openai.com/api/docs/pricing"
           }
         }
       ]

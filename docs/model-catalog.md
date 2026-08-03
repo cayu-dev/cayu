@@ -190,6 +190,16 @@ per-session budgets, and a fixed verifier model. Inconclusive or suspicious chan
 the committed records and produce review flags. Builds and runtime loading never execute
 the maintenance agent or contact provider sites.
 
+For a local refresh using a signed-in ChatGPT subscription, run:
+
+```bash
+uv run python -m maintenance.model_catalog.local_refresh --all --audit-recommendations
+```
+
+The bootstrapper creates a disposable environment, installs the latest public `cayu` from
+PyPI, and runs Luna at maximum reasoning against the checkout's catalog data. This makes the
+maintenance run exercise the currently published runtime instead of the editable checkout.
+
 ## Pre-v0.1 migration
 
 The pre-v0.1 interface intentionally removed the overlapping pricing paths:

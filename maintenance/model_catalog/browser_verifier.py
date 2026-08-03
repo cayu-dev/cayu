@@ -26,6 +26,7 @@ from cayu import (
     ModelInfo,
     ModelPrice,
     OpenAIProvider,
+    OpenAISubscriptionProvider,
     PriceBook,
     RunRequest,
     default_model_catalog,
@@ -49,6 +50,7 @@ from maintenance.model_catalog.verify import RecommendationOutcome, VerifyOutcom
 DEFAULT_MAX_VERIFY_COST_USD = 0.15  # generous per-verification cap (a clean run costs ~$0.01-0.03)
 VERIFIER_PROVIDER_NAME = "openai"
 DEFAULT_VERIFIER_MODEL = "gpt-5.6-luna"
+LUNA_MAX_PROVIDER_OPTIONS = {"openai": {"reasoning": {"effort": "xhigh"}}}
 
 # Agent identity, core behavior, and the pricing-page rules required when the scheduled verifier
 # runs without an environment carrying workspace instructions.
@@ -135,6 +137,8 @@ def _prompt(model: ModelInfo, price: ModelPrice, *, effective_on: date) -> str:
         schedule_note = ""
     base = schedule.pricing.base()
     p = schedule.pricing
+    pricing_source_url = schedule.provenance.url
+    model_source_url = model.provenance.url
     tiers = "; ".join(
         f"up_to={tier.max_input_tokens}: input={tier.input_per_million}, "
         f"cache_read={tier.cache_read_input_per_million}, "
@@ -152,6 +156,12 @@ def _prompt(model: ModelInfo, price: ModelPrice, *, effective_on: date) -> str:
         f"{(p.batch.input_per_million if p.batch else None)} / {(p.batch.output_per_million if p.batch else None)}\n"
         f"  current context_window: {model.context_window}\n"
         f"  current context tiers: {tiers}\n"
+        f"  committed pricing source: {pricing_source_url}\n"
+        f"  committed model source: {model_source_url}\n"
+        "Start with those committed official sources. You must call read_page on every source "
+        "URL you return; search snippets and an unvisited URL are not evidence. If a committed "
+        "source is unavailable, use search_web to find another official source and then call "
+        "read_page on that replacement URL before citing it.\n"
         "Call read_page with pricing_mode=all. It returns separately labeled Standard and Batch "
         "sections when Batch is offered. Report Batch values only from a verified Batch section; "
         "never copy Standard values into Batch fields.\n"
@@ -287,19 +297,28 @@ class BrowserVerifier:
         environment: Any | None = None,
         environment_factory: Any | None = None,
         max_cost_usd: float | None = DEFAULT_MAX_VERIFY_COST_USD,
+        use_openai_subscription: bool = False,
+        catalog: ModelCatalog | None = None,
+        price_book: PriceBook | None = None,
     ) -> None:
         self.as_of = as_of
         self.agent_name = agent_name
         self.recommendation_agent_name = f"{agent_name}-recommendations"
         self._env_name: str | None = None
         self._artifact_dir: TemporaryDirectory[str] | None = None
-        catalog = default_model_catalog()
-        price_book = default_price_book()
+        catalog = catalog or default_model_catalog()
+        price_book = price_book or default_price_book()
         verifier_model_info(catalog, model=model)
         self._budget_limits = _build_budget_limits(max_cost_usd, price_book=price_book)
         if app is None:
             app = CayuApp(session_store=InMemorySessionStore())
-            app.register_provider(OpenAIProvider(), default=True)
+            provider = (
+                OpenAISubscriptionProvider(name=VERIFIER_PROVIDER_NAME)
+                if use_openai_subscription
+                else OpenAIProvider()
+            )
+            app.register_provider(provider, default=True)
+            provider_options = LUNA_MAX_PROVIDER_OPTIONS if use_openai_subscription else {}
             if environment_factory is not None:
                 # session-scoped: the runtime calls the factory per session to provision the microVM
                 app.register_environment_factory(
@@ -324,7 +343,12 @@ class BrowserVerifier:
                 app.register_environment(local_environment, default=True)
                 self._env_name = local_environment.spec.name
             app.register_agent(
-                AgentSpec(name=agent_name, model=model, system_prompt=SYSTEM),
+                AgentSpec(
+                    name=agent_name,
+                    model=model,
+                    system_prompt=SYSTEM,
+                    provider_options=provider_options,
+                ),
                 tools=[SearchWebTool(), ReadPageTool(), ScreenshotTool()],
             )
             app.register_agent(
@@ -332,6 +356,7 @@ class BrowserVerifier:
                     name=self.recommendation_agent_name,
                     model=model,
                     system_prompt=RECOMMENDATION_SYSTEM,
+                    provider_options=provider_options,
                 ),
                 tools=[SearchWebTool(), ReadPageTool(), ScreenshotTool()],
             )

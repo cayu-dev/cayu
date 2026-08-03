@@ -27,6 +27,8 @@ from cayu import (
     default_price_book,
     dump_model_catalog,
     dump_price_book,
+    load_model_catalog,
+    load_price_book,
 )
 from cayu.runtime.costs import resolve_price_book
 from maintenance.model_catalog.browser_verifier import (
@@ -157,10 +159,23 @@ async def _run(
     max_age_days: int,
     only: tuple[str, ...] = (),
     audit_recommendations: bool = False,
+    use_openai_subscription: bool = False,
+    source_catalog_path: Path | None = None,
+    source_price_book_path: Path | None = None,
 ) -> None:
     today = datetime.now(UTC).date().isoformat()
-    original = default_model_catalog()
-    original_price_book = default_price_book()
+    if (source_catalog_path is None) != (source_price_book_path is None):
+        raise ValueError("source catalog and price book must be provided together")
+    original = (
+        load_model_catalog(source_catalog_path)
+        if source_catalog_path is not None
+        else default_model_catalog()
+    )
+    original_price_book = (
+        load_price_book(source_price_book_path)
+        if source_price_book_path is not None
+        else default_price_book()
+    )
     requested = set(only)
     known = {f"{model.provider_name}/{model.model}" for model in original.models}
     unknown = sorted(requested - known)
@@ -222,7 +237,13 @@ async def _run(
         attempted += 1
         if verifier is None:
             try:
-                verifier = BrowserVerifier(as_of=today, max_cost_usd=max_cost)
+                verifier = BrowserVerifier(
+                    as_of=today,
+                    max_cost_usd=max_cost,
+                    use_openai_subscription=use_openai_subscription,
+                    catalog=original,
+                    price_book=original_price_book,
+                )
             except Exception as exc:
                 kept.append(model)
                 flagged.append(
@@ -392,7 +413,13 @@ async def _run(
             discovery_attempted += 1
             if verifier is None:
                 try:
-                    verifier = BrowserVerifier(as_of=today, max_cost_usd=max_cost)
+                    verifier = BrowserVerifier(
+                        as_of=today,
+                        max_cost_usd=max_cost,
+                        use_openai_subscription=use_openai_subscription,
+                        catalog=original,
+                        price_book=original_price_book,
+                    )
                 except Exception as exc:
                     flagged.append(
                         _VerificationFlag(
@@ -571,19 +598,42 @@ def main(argv: list[str] | None = None) -> None:
         help="audit official provider recommendation pages for unbundled current models",
     )
     parser.add_argument(
+        "--openai-subscription",
+        action="store_true",
+        help=(
+            "use the locally authenticated ChatGPT subscription with gpt-5.6-luna at "
+            "maximum xhigh reasoning"
+        ),
+    )
+    parser.add_argument(
         "--only",
         action="append",
         default=[],
         metavar="PROVIDER/MODEL",
         help="verify only this catalog identity (repeatable; combine with --all to force it)",
     )
+    parser.add_argument(
+        "--source-catalog",
+        type=Path,
+        help="load the input catalog from this path instead of the installed Cayu package",
+    )
+    parser.add_argument(
+        "--source-price-book",
+        type=Path,
+        help="load the input price book from this path instead of the installed Cayu package",
+    )
     args = parser.parse_args(argv)
+    if (args.source_catalog is None) != (args.source_price_book is None):
+        parser.error("--source-catalog and --source-price-book must be provided together")
     asyncio.run(
         _run(
             force_all=args.all,
             max_age_days=args.max_age_days,
             only=tuple(args.only),
             audit_recommendations=args.audit_recommendations,
+            use_openai_subscription=args.openai_subscription,
+            source_catalog_path=args.source_catalog,
+            source_price_book_path=args.source_price_book,
         )
     )
 
