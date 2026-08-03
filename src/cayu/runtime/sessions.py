@@ -165,6 +165,14 @@ class SessionRunFenced(RuntimeError):
     """A durable write was rejected because its run no longer owns the session epoch."""
 
 
+class SessionForkSourceNotFound(KeyError):
+    """A fork's source disappeared before the atomic child-creation boundary."""
+
+
+class SessionForkActiveModelStageConflict(ValueError):
+    """A fork was rejected because its source still owns an active model stage."""
+
+
 class McpManifestHistoryConflict(RuntimeError):
     """An MCP manifest check could not establish or fence authoritative history."""
 
@@ -6296,9 +6304,8 @@ class InMemorySessionStore(SessionStore):
             if MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY in self._session_operation_records.get(
                 source_session_id, {}
             ):
-                raise ValueError(
-                    "Cannot fork a session while a model-completion stage is active: "
-                    f"{source_session_id}"
+                raise SessionForkActiveModelStageConflict(
+                    "Cannot fork a session while a model-completion stage is active."
                 )
             if fork.id in self._sessions:
                 raise ValueError(f"Session already exists: {fork.id}")
@@ -10273,7 +10280,7 @@ def _validate_session_fork_source(
     expected_source_run_epoch: int,
 ) -> Session:
     if source_session is None:
-        raise KeyError(f"Session not found: {source_session_id}")
+        raise SessionForkSourceNotFound("Fork source session was not found.")
     if source_session.status not in allowed_statuses:
         raise ValueError(f"Source session status is not forkable: {source_session.status}")
     if source_session.run_epoch != expected_source_run_epoch:

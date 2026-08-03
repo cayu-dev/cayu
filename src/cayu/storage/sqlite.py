@@ -75,6 +75,7 @@ from cayu.runtime.sessions import (
     RuntimePublicationResult,
     Session,
     SessionAggregateFilter,
+    SessionForkActiveModelStageConflict,
     SessionIdentity,
     SessionInspectionIdentity,
     SessionListResult,
@@ -1720,9 +1721,8 @@ class SQLiteSessionStore(SessionStore):
                     ),
                 ).fetchone()
                 if active_stage is not None:
-                    raise ValueError(
-                        "Cannot fork a session while a model-completion stage is active: "
-                        f"{source_session_id}"
+                    raise SessionForkActiveModelStageConflict(
+                        "Cannot fork a session while a model-completion stage is active."
                     )
                 source_transcript_cursor = _transcript_cursor(
                     self._connection,

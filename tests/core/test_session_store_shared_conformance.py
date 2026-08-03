@@ -68,6 +68,8 @@ from cayu.runtime import (
     ResumeRequest,
     RunLimits,
     RunRequest,
+    RuntimeHook,
+    RuntimeHookContext,
     RuntimePublicationCheckpointOperation,
     RuntimePublicationMutation,
     RuntimePublicationRequest,
@@ -134,7 +136,7 @@ from cayu.runtime.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
-from cayu.runtime.event_sinks import EventSink
+from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.sessions import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
     BudgetReservationIdentityConflict,
@@ -192,6 +194,33 @@ def _public_authority_alias_codec() -> PublicAuthorityAliasCodec:
             keys={"conformance": SecretStr(encoded_key)},
         )
     )
+
+
+def _assert_exception_omits_private_values(
+    error: BaseException,
+    *private_values: str,
+) -> None:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered = f"{current!r} {current!s} {current.args!r}"
+        for private_value in private_values:
+            assert private_value not in rendered
+        traceback = current.__traceback__
+        while traceback is not None:
+            if "/src/cayu/" in traceback.tb_frame.f_code.co_filename:
+                rendered_locals = repr(traceback.tb_frame.f_locals)
+                for private_value in private_values:
+                    assert private_value not in rendered_locals
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
 
 
 def _publication_tool_round_identity(label: str) -> dict[str, str]:
@@ -13345,6 +13374,465 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
                 assert await session_store.load(child_id) is None
         finally:
             await _close_store(session_store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_rejects_unsafe_derived_fork_before_mutation(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        source_id = f"derived_fork_source_{store_kind}"
+        child_id = f"derived_fork_child_{store_kind}"
+        secret = "derived-store-fork-secret"
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="source-agent",
+                    session_id=source_id,
+                    messages=[Message.text("user", "fork")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="source-model"),
+            )
+            await store.append_transcript_messages(
+                source.id,
+                [Message.text("user", "copied transcript")],
+            )
+            await store.checkpoint(source.id, {"safe": "checkpoint"})
+            await store.update_status(source.id, SessionStatus.COMPLETED)
+            source_before = await store.load(source.id)
+            transcript_before = await store.load_transcript(source.id)
+            checkpoint_before = await store.load_checkpoint(source.id)
+            events_before = await store.load_events(source.id)
+
+            app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="source-agent", model="source-model"))
+            app.register_agent(AgentSpec(name="target-agent", model=secret))
+
+            with pytest.raises(ValueError, match="model"):
+                [
+                    event
+                    async for event in app.fork_session(
+                        ForkSessionRequest(
+                            source_session_id=source.id,
+                            session_id=child_id,
+                            agent_name="target-agent",
+                        )
+                    )
+                ]
+
+            assert await store.load(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_transcript(child_id)
+            assert await store.load_checkpoint(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_events(child_id)
+            assert await store.load(source.id) == source_before
+            assert await store.load_transcript(source.id) == transcript_before
+            assert await store.load_checkpoint(source.id) == checkpoint_before
+            assert await store.load_events(source.id) == events_before
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_runtime_hook_fork_preserves_generated_provenance(
+    session_store_case,
+) -> None:
+    class ForkCompletedSessionHook(RuntimeHook):
+        def __init__(self) -> None:
+            self.calls = 0
+            self.fork_events: list[Event] = []
+
+        async def after_session_completed(self, context: RuntimeHookContext) -> None:
+            self.calls += 1
+            self.fork_events = await context.fork_session(
+                ForkSessionRequest(source_session_id=context.session.id)
+            )
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        hook = ForkCompletedSessionHook()
+        try:
+            app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor("-"),
+                runtime_hooks=[hook],
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        messages=[Message.text("user", "start")],
+                    )
+                )
+            ]
+
+            assert hook.calls == 1
+            assert [event.type for event in hook.fork_events] == [EventType.SESSION_FORKED]
+            assert [event.type for event in events].count(EventType.SESSION_COMPLETED) == 1
+            assert [event.type for event in events].count(EventType.HOOK_STARTED) == 1
+            assert [event.type for event in events].count(EventType.HOOK_COMPLETED) == 1
+            sessions = (await store.list_sessions(SessionQuery(limit=10))).sessions
+            assert len(sessions) == 2
+            source = next(session for session in sessions if session.parent_session_id is None)
+            child = next(session for session in sessions if session.parent_session_id == source.id)
+            assert "-" in source.id
+            assert "-" in child.id
+            source_events = await store.load_events(source.id)
+            assert [event.type for event in source_events].count(EventType.SESSION_COMPLETED) == 1
+            assert [event.type for event in source_events].count(EventType.HOOK_STARTED) == 1
+            assert [event.type for event in source_events].count(EventType.HOOK_COMPLETED) == 1
+            child_events = await store.load_events(child.id)
+            assert [event.type for event in child_events] == [EventType.SESSION_FORKED]
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_fork_source_provenance_distinguishes_callers(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        secret = "private-fork-source"
+        source_id = f"legacy-{secret}-session-{store_kind}"
+        raw_child_id = f"raw-fork-child-{store_kind}"
+        alias_child_id = f"alias-fork-child-{store_kind}"
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "source")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+            )
+            await store.update_status(source.id, SessionStatus.COMPLETED)
+            app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+
+            with pytest.raises(ValueError, match="source_session_id"):
+                [
+                    event
+                    async for event in app.fork_session(
+                        ForkSessionRequest(
+                            source_session_id=source.id,
+                            session_id=raw_child_id,
+                        )
+                    )
+                ]
+            assert await store.load(raw_child_id) is None
+
+            public_source_id = app.project_session_id_for_exposure(source.id)
+            await store.register_public_authority_alias(
+                public_source_id,
+                field_name="session_id",
+                private_value=source.id,
+            )
+            alias_events = [
+                event
+                async for event in app.fork_session(
+                    ForkSessionRequest(
+                        source_session_id=public_source_id,
+                        session_id=alias_child_id,
+                    )
+                )
+            ]
+
+            assert [event.type for event in alias_events] == [EventType.SESSION_FORKED]
+            child = await store.load(alias_child_id)
+            assert child is not None
+            assert child.parent_session_id == source.id
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("source_kind", ("generated", "legacy-secret"))
+def test_session_store_conformance_stale_fork_alias_omits_private_authority(
+    session_store_case,
+    source_kind: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        secret = "stale-fork-private-secret" if source_kind == "legacy-secret" else "-"
+        requested_source_id = (
+            f"legacy-{secret}-session-{store_kind}" if source_kind == "legacy-secret" else None
+        )
+        child_id = f"stale_fork_child_{source_kind.replace('-', '_')}_{store_kind}"
+        sink = InMemoryEventSink()
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=requested_source_id,
+                    messages=[Message.text("user", "source")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+            )
+            await store.append_transcript_messages(
+                source.id,
+                [Message.text("user", "copied transcript")],
+            )
+            await store.checkpoint(source.id, {"safe": "checkpoint"})
+            await store.update_status(source.id, SessionStatus.COMPLETED)
+            await store.append_event(
+                source.id,
+                Event(
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=source.id,
+                ),
+            )
+
+            app = CayuApp(
+                session_store=store,
+                event_sinks=[sink],
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+            public_source_id = app.project_session_id_for_exposure(source.id)
+            await store.register_public_authority_alias(
+                public_source_id,
+                field_name="session_id",
+                private_value=source.id,
+            )
+
+            await store.delete_session(source.id)
+            assert await store.load(source.id) is None
+            assert (
+                await store.resolve_public_authority_alias(
+                    public_source_id,
+                    field_name="session_id",
+                )
+                == source.id
+            )
+
+            with pytest.raises(KeyError) as raised:
+                [
+                    event
+                    async for event in app.fork_session(
+                        ForkSessionRequest(
+                            source_session_id=public_source_id,
+                            session_id=child_id,
+                        )
+                    )
+                ]
+
+            assert raised.value.args == ("Fork source session was not found.",)
+            private_values = (source.id, secret) if len(secret) > 1 else (source.id,)
+            _assert_exception_omits_private_values(raised.value, *private_values)
+            assert await store.load(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_transcript(child_id)
+            assert await store.load_checkpoint(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_events(child_id)
+            assert sink.events == []
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_fork_source_deleted_after_initial_load_omits_private_authority(
+    session_store_case,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        secret = "fork-race-private-secret"
+        source_id = f"legacy-{secret}-session-{store_kind}"
+        child_id = f"fork_race_child_{store_kind}"
+        sink = InMemoryEventSink()
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "source")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+            )
+            await store.update_status(source.id, SessionStatus.COMPLETED)
+            await store.append_event(
+                source.id,
+                Event(
+                    type=EventType.SESSION_COMPLETED,
+                    session_id=source.id,
+                ),
+            )
+
+            app = CayuApp(
+                session_store=store,
+                event_sinks=[sink],
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+            public_source_id = app.project_session_id_for_exposure(source.id)
+            await store.register_public_authority_alias(
+                public_source_id,
+                field_name="session_id",
+                private_value=source.id,
+            )
+
+            original_create_fork = store.create_fork_with_transcript_validation
+            deleted_after_initial_load = False
+
+            async def delete_source_then_create_fork(**kwargs):
+                nonlocal deleted_after_initial_load
+                deleted_after_initial_load = True
+                await store.delete_session(source.id)
+                return await original_create_fork(**kwargs)
+
+            monkeypatch.setattr(
+                store,
+                "create_fork_with_transcript_validation",
+                delete_source_then_create_fork,
+            )
+
+            with pytest.raises(KeyError) as raised:
+                [
+                    event
+                    async for event in app.fork_session(
+                        ForkSessionRequest(
+                            source_session_id=public_source_id,
+                            session_id=child_id,
+                        )
+                    )
+                ]
+
+            assert deleted_after_initial_load is True
+            assert raised.value.args == ("Fork source session was not found.",)
+            _assert_exception_omits_private_values(raised.value, source.id, secret)
+            assert await store.load(source.id) is None
+            assert await store.load(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_transcript(child_id)
+            assert await store.load_checkpoint(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_events(child_id)
+            assert sink.events == []
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_active_stage_fork_omits_private_source_authority(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        secret = "active-stage-fork-private-secret"
+        source_id = f"legacy-{secret}-session-{store_kind}"
+        child_id = f"active_stage_fork_child_{store_kind}"
+        sink = InMemoryEventSink()
+        try:
+            source = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=source_id,
+                    messages=[Message.text("user", "source")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fakemodel"),
+            )
+            await store.append_transcript_messages(
+                source.id,
+                [Message.text("user", "source")],
+            )
+            running = await store.transition_status(
+                source.id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            await store.prepare_model_completion_stage(
+                source.id,
+                request=ModelCompletionStageRequest(
+                    stage_id="active-stage-fork-stage",
+                    logical_step_id="active-stage-fork-step",
+                    dispatch_ordinal=0,
+                    intent={"request_fingerprint": "active-stage-fork"},
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=1,
+            )
+            source = await store.update_status(source.id, SessionStatus.INTERRUPTED)
+            await store.append_event(
+                source.id,
+                Event(type=EventType.SESSION_INTERRUPTED, session_id=source.id),
+            )
+
+            app = CayuApp(
+                session_store=store,
+                event_sinks=[sink],
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            app.register_provider(_UnusedForkProvider(), default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fakemodel"))
+            public_source_id = app.project_session_id_for_exposure(source.id)
+            await store.register_public_authority_alias(
+                public_source_id,
+                field_name="session_id",
+                private_value=source.id,
+            )
+
+            with pytest.raises(ValueError) as raised:
+                [
+                    event
+                    async for event in app.fork_session(
+                        ForkSessionRequest(
+                            source_session_id=public_source_id,
+                            session_id=child_id,
+                        )
+                    )
+                ]
+
+            assert raised.value.args == (
+                "Fork source session has an active model-completion stage.",
+            )
+            assert raised.value.__cause__ is None
+            assert raised.value.__context__ is None
+            _assert_exception_omits_private_values(raised.value, source.id, secret)
+            assert await store.load(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_transcript(child_id)
+            assert await store.load_checkpoint(child_id) is None
+            with pytest.raises(KeyError, match=child_id):
+                await store.load_events(child_id)
+            assert sink.events == []
+        finally:
+            await _close_store(store)
 
     asyncio.run(run())
 

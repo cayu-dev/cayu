@@ -18,16 +18,31 @@ from cayu.runtime.sessions import (
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
+    Session,
     copy_compact_session_request,
     copy_enqueue_session_message_request,
     copy_fork_session_request,
     copy_interrupt_session_request,
     copy_resume_request,
     copy_run_request,
+    copy_session,
     run_request_authority_is_runtime_generated,
 )
 from cayu.runtime.structured_output import require_secret_free_structured_output_spec
+from cayu.runtime.tool_policy import TAINT_LABELS_METADATA_KEY, taint_labels_from_metadata
 from cayu.vaults import SecretRedactor
+
+
+class ForkAuthorityError(ValueError):
+    """Internal fork-authority rejection with a fixed public-safe message."""
+
+
+class ForkSourceNotFoundError(KeyError):
+    """Internal missing-source signal that never embeds private authority."""
+
+
+class ForkActiveModelStageError(ValueError):
+    """Internal active-stage signal that never embeds private authority."""
 
 
 def prepare_run_request(
@@ -228,29 +243,247 @@ def prepare_fork_session_request(
     store_resolved_source_session_id: str | None = None,
 ) -> ForkSessionRequest:
     request = copy_fork_session_request(request)
-    if public_authority_alias_is_reserved(request.session_id):
-        raise ValueError("session_id uses the reserved public-authority alias namespace.")
-    require_store_resolved_or_secret_free_session_authority(
-        request.source_session_id,
-        store_resolved_value=store_resolved_source_session_id,
-        field_name="source_session_id",
-        redactor=redactor,
-    )
-    for field_name in ("session_id", "agent_name", "model", "environment_name"):
-        require_secret_free_session_authority(
-            getattr(request, field_name),
-            field_name=field_name,
+    try:
+        if public_authority_alias_is_reserved(request.session_id):
+            raise ForkAuthorityError(
+                "session_id uses the reserved public-authority alias namespace."
+            )
+        require_store_resolved_or_secret_free_session_authority(
+            request.source_session_id,
+            store_resolved_value=store_resolved_source_session_id,
+            field_name="source_session_id",
             redactor=redactor,
         )
-    return request.model_copy(
-        update={
-            "metadata": redact_json_object(
-                request.metadata,
-                field_name="metadata",
+        for field_name in ("session_id", "agent_name", "model", "environment_name"):
+            require_secret_free_session_authority(
+                getattr(request, field_name),
+                field_name=field_name,
                 redactor=redactor,
             )
-        },
-    )
+        _require_secret_free_fork_policy_metadata(request.metadata, redactor=redactor)
+        return request.model_copy(
+            update={
+                "metadata": redact_json_object(
+                    request.metadata,
+                    field_name="metadata",
+                    redactor=redactor,
+                )
+            },
+        )
+    except ForkAuthorityError:
+        raise
+    except ValueError as exc:
+        raise ForkAuthorityError(str(exc)) from None
+
+
+def _require_secret_free_fork_policy_metadata(
+    metadata: dict[str, Any],
+    *,
+    redactor: SecretRedactor,
+) -> None:
+    """Reject fork policy authority before descriptive metadata is redacted."""
+
+    try:
+        labels = taint_labels_from_metadata(metadata)
+    except (TypeError, ValueError):
+        metadata.clear()
+        raise ForkAuthorityError(
+            f"metadata[{TAINT_LABELS_METADATA_KEY!r}] is not valid durable session "
+            "policy authority."
+        ) from None
+    contains_secret = any(redactor.redact_text(label) != label for label in labels)
+    labels = frozenset()
+    if contains_secret:
+        metadata.clear()
+        raise ForkAuthorityError(
+            f"metadata[{TAINT_LABELS_METADATA_KEY!r}] contains a workload secret "
+            "and cannot be used as durable session policy authority."
+        ) from None
+
+
+def prepare_fork_source_session(
+    source_session: Session,
+    *,
+    expected_source_session_id: str,
+    store_resolved_source_session_id: str | None,
+    redactor: SecretRedactor,
+) -> Session:
+    """Validate and detach the durable source authority used by a fork."""
+
+    source_session = copy_session(source_session)
+    error: str | None = None
+    if source_session.id != expected_source_session_id:
+        error = "source_session.id does not match requested session authority."
+    store_resolved = store_resolved_source_session_id == source_session.id
+    if error is None:
+        for field_name in (
+            "id",
+            "agent_name",
+            "provider_name",
+            "model",
+            "parent_session_id",
+            "causal_budget_id",
+            "runtime_name",
+            "runtime_version",
+            "environment_name",
+        ):
+            value = getattr(source_session, field_name)
+            if (
+                store_resolved
+                and field_name in {"id", "parent_session_id", "causal_budget_id"}
+                and type(value) is str
+            ):
+                if redactor.is_exact_secret(value):
+                    error = (
+                        f"source_session.{field_name} contains a workload secret and "
+                        "cannot be used as durable session authority."
+                    )
+                    break
+                continue
+            if type(value) is str and redactor.redact_text(value) != value:
+                error = (
+                    f"source_session.{field_name} contains a workload secret and "
+                    "cannot be used as durable session authority."
+                )
+                break
+    if error is None and _labels_contain_secret(source_session.labels, redactor=redactor):
+        error = (
+            "source_session.labels contain a workload secret and cannot be used as "
+            "durable session authority."
+        )
+    if error is not None:
+        del source_session
+        field_name = value = ""
+        expected_source_session_id = ""
+        store_resolved_source_session_id = None
+        raise ForkAuthorityError(error) from None
+    return source_session
+
+
+def prepare_fork_registered_authority(
+    *,
+    agent_name: str,
+    agent_provider_name: str | None,
+    model: str,
+    environment_name: str | None,
+    redactor: SecretRedactor,
+) -> tuple[str, str | None, str, str | None]:
+    """Validate registration-derived fork authority before it crosses a boundary."""
+
+    error: str | None = None
+    for field_name, value in (
+        ("agent_name", agent_name),
+        ("provider_name", agent_provider_name),
+        ("model", model),
+        ("environment_name", environment_name),
+    ):
+        if type(value) is str and redactor.redact_text(value) != value:
+            error = (
+                f"{field_name} contains a workload secret and cannot be used as "
+                "durable session authority."
+            )
+            break
+    if error is not None:
+        agent_name = model = field_name = value = ""
+        agent_provider_name = environment_name = None
+        raise ForkAuthorityError(error) from None
+    return agent_name, agent_provider_name, model, environment_name
+
+
+def prepare_derived_fork_session(
+    fork_session: Session,
+    *,
+    source_session: Session,
+    runtime_generated_session_id: str | None,
+    store_resolved_source_session_id: str | None,
+    redactor: SecretRedactor,
+) -> Session:
+    """Validate the complete derived child before the fork mutation."""
+
+    fork_session = copy_session(fork_session)
+    source_session = copy_session(source_session)
+    error: str | None = None
+    runtime_generated = runtime_generated_session_id is not None
+    if runtime_generated and fork_session.id != runtime_generated_session_id:
+        error = "session_id does not match runtime-generated authority."
+    elif runtime_generated:
+        if redactor.is_exact_secret(fork_session.id):
+            error = (
+                "session_id contains a workload secret and cannot be used as durable "
+                "session authority."
+            )
+    elif redactor.redact_text(fork_session.id) != fork_session.id:
+        error = (
+            "session_id contains a workload secret and cannot be used as durable session authority."
+        )
+
+    store_resolved = store_resolved_source_session_id == source_session.id
+    if error is None:
+        for field_name, value, expected in (
+            ("parent_session_id", fork_session.parent_session_id, source_session.id),
+            (
+                "causal_budget_id",
+                fork_session.causal_budget_id,
+                source_session.causal_budget_id,
+            ),
+        ):
+            if value != expected:
+                error = f"{field_name} does not match store-derived source authority."
+                break
+            if store_resolved and type(value) is str:
+                if redactor.is_exact_secret(value):
+                    error = (
+                        f"{field_name} contains a workload secret and cannot be used as "
+                        "durable session authority."
+                    )
+                    break
+                continue
+            if type(value) is str and redactor.redact_text(value) != value:
+                error = (
+                    f"{field_name} contains a workload secret and cannot be used as "
+                    "durable session authority."
+                )
+                break
+
+    if error is None:
+        for field_name in (
+            "agent_name",
+            "provider_name",
+            "model",
+            "runtime_name",
+            "runtime_version",
+            "environment_name",
+        ):
+            value = getattr(fork_session, field_name)
+            if type(value) is str and redactor.redact_text(value) != value:
+                error = (
+                    f"{field_name} contains a workload secret and cannot be used as "
+                    "durable session authority."
+                )
+                break
+    if error is None and _labels_contain_secret(fork_session.labels, redactor=redactor):
+        error = "labels contain a workload secret and cannot be used as durable session authority."
+    if error is None and _json_contains_secret_key(
+        fork_session.metadata,
+        redactor=redactor,
+    ):
+        error = (
+            "metadata contains a workload secret and cannot be used as durable session authority."
+        )
+    if (
+        error is None
+        and redactor.redact_json_values(fork_session.metadata) != fork_session.metadata
+    ):
+        error = (
+            "metadata contains a workload secret and cannot be used as durable session authority."
+        )
+    if error is not None:
+        fork_session.metadata.clear()
+        del fork_session, source_session
+        field_name = value = expected = ""
+        runtime_generated_session_id = store_resolved_source_session_id = None
+        raise ForkAuthorityError(error) from None
+    return fork_session
 
 
 def prepare_enqueue_message_request(
@@ -298,6 +531,28 @@ def require_secret_free_session_authority(
         raise ValueError(
             f"{field_name} contains a workload secret and cannot be used as {authority_kind}."
         )
+
+
+def _labels_contain_secret(
+    labels: dict[str, str],
+    *,
+    redactor: SecretRedactor,
+) -> bool:
+    for key, value in labels.items():
+        if redactor.redact_text(key) != key or redactor.redact_text(value) != value:
+            return True
+    return False
+
+
+def _json_contains_secret_key(value: Any, *, redactor: SecretRedactor) -> bool:
+    if type(value) is dict:
+        return any(
+            redactor.redact_text(key) != key or _json_contains_secret_key(item, redactor=redactor)
+            for key, item in value.items()
+        )
+    if type(value) is list:
+        return any(_json_contains_secret_key(item, redactor=redactor) for item in value)
+    return False
 
 
 def require_store_resolved_or_secret_free_session_authority(

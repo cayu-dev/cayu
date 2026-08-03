@@ -11,7 +11,13 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_clean_nonblank,
 )
-from cayu.core.events import Event, EventType, copy_event
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_id_is_runtime_generated,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
 from cayu.runtime.sessions import ForkSessionRequest, Session, copy_fork_session_request
@@ -29,6 +35,14 @@ class RuntimeHookPhase(StrEnum):
 class RuntimeHookRuntime(Protocol):
     def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
         """Create a session fork and stream fork events."""
+
+    def _fork_session_from_runtime_context(
+        self,
+        request: ForkSessionRequest,
+        *,
+        source_session_id: str,
+    ) -> AsyncIterator[Event]:
+        """Fork the runtime-owned hook session with positive source provenance."""
 
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
         """Submit work for an existing session."""
@@ -82,7 +96,15 @@ class _HookActionContext:
 
     async def fork_session(self, request: ForkSessionRequest) -> list[Event]:
         request = copy_fork_session_request(request)
-        events = [event async for event in self._runtime.fork_session(request)]
+        stream = (
+            self._runtime._fork_session_from_runtime_context(
+                request,
+                source_session_id=self._session.id,
+            )
+            if request.source_session_id == self._session.id
+            else self._runtime.fork_session(request)
+        )
+        events = [event async for event in stream]
         child_session_id = events[-1].session_id if events else request.session_id
         self._record_action(
             "fork_session",
@@ -411,13 +433,16 @@ def _runtime_hook_event(
         "terminal_event_type": str(terminal_event.type),
         **copy_json_value(payload, "payload"),
     }
-    return Event(
+    event = Event(
         type=event_type,
         session_id=session.id,
         agent_name=require_clean_nonblank(agent_name, "agent_name"),
         environment_name=environment_name,
         payload=event_payload,
     )
+    if event_id_is_runtime_generated(terminal_event):
+        event = event_with_runtime_payload_authority(event, "terminal_event_id")
+    return event
 
 
 def _runtime_hook_method_name(phase: RuntimeHookPhase) -> str:

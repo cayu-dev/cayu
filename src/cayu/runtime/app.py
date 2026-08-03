@@ -2307,21 +2307,101 @@ class CayuApp:
     async def fork_session(self, request: ForkSessionRequest) -> AsyncIterator[Event]:
         if type(request) is not ForkSessionRequest:
             raise TypeError("Runtime fork requires a ForkSessionRequest.")
-        (
-            source_session_id,
-            store_resolved_source_session_id,
-        ) = await self._resolve_public_session_authority(request.source_session_id)
-        request = request.model_copy(
-            update={"source_session_id": source_session_id},
-            deep=True,
-        )
-        stream = self._fork_session_private(
-            request,
-            store_resolved_source_session_id=store_resolved_source_session_id,
-        )
-        async with _close_delegated_event_stream(stream) as owned_stream:
-            async for event in owned_stream:
-                yield await self._project_emitted_event_for_public_api(event)
+        source_session_id: str | None = None
+        store_resolved_source_session_id: str | None = None
+        private_request: ForkSessionRequest | None = None
+        events: tuple[Event, ...] | None = None
+        try:
+            (
+                source_session_id,
+                store_resolved_source_session_id,
+            ) = await self._resolve_public_session_authority(request.source_session_id)
+            private_request = request.model_copy(
+                update={"source_session_id": source_session_id},
+                deep=True,
+            )
+            events = await self._collect_public_fork_events(
+                private_request,
+                store_resolved_source_session_id=store_resolved_source_session_id,
+            )
+        finally:
+            del request
+            source_session_id = store_resolved_source_session_id = None
+            private_request = None
+        if events is None:
+            raise RuntimeError("Session fork ended without events or a failure.")
+        for event in events:
+            yield event
+
+    async def _fork_session_from_runtime_context(
+        self,
+        request: ForkSessionRequest,
+        *,
+        source_session_id: str,
+    ) -> AsyncIterator[Event]:
+        """Fork a hook-owned source without granting that trust to public callers."""
+
+        if type(request) is not ForkSessionRequest:
+            raise TypeError("Runtime fork requires a ForkSessionRequest.")
+        private_request: ForkSessionRequest | None = None
+        events: tuple[Event, ...] | None = None
+        try:
+            source_session_id = require_clean_nonblank(
+                source_session_id,
+                "runtime hook source_session_id",
+            )
+            if request.source_session_id != source_session_id:
+                raise ValueError(
+                    "Runtime hook fork source_session_id does not match its context session."
+                )
+            private_request = copy_fork_session_request(request)
+            events = await self._collect_public_fork_events(
+                private_request,
+                store_resolved_source_session_id=source_session_id,
+            )
+        finally:
+            del request
+            source_session_id = ""
+            private_request = None
+        if events is None:
+            raise RuntimeError("Runtime-hook session fork ended without events or a failure.")
+        for event in events:
+            yield event
+
+    async def _collect_public_fork_events(
+        self,
+        request: ForkSessionRequest,
+        *,
+        store_resolved_source_session_id: str | None,
+    ) -> tuple[Event, ...]:
+        """Detach fork-authority failures before they cross the public boundary."""
+
+        failure: Exception | None = None
+        projected_events: list[Event] = []
+        stream: AsyncGenerator[Event, None] | None = None
+        owned_stream: _RunFenceOwnedEventStream | None = None
+        try:
+            stream = self._fork_session_private(
+                request,
+                store_resolved_source_session_id=store_resolved_source_session_id,
+            )
+            async with _close_delegated_event_stream(stream) as owned_stream:
+                async for event in owned_stream:
+                    projected_events.append(await self._project_emitted_event_for_public_api(event))
+        except session_request_boundary.ForkSourceNotFoundError:
+            failure = KeyError("Fork source session was not found.")
+        except session_request_boundary.ForkActiveModelStageError:
+            failure = ValueError("Fork source session has an active model-completion stage.")
+        except session_request_boundary.ForkAuthorityError as exc:
+            failure = ValueError(str(exc))
+        finally:
+            del request
+            store_resolved_source_session_id = None
+            stream = owned_stream = None
+        if failure is not None:
+            projected_events.clear()
+            raise failure from None
+        return tuple(projected_events)
 
     async def _fork_session_private(
         self,

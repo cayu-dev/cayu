@@ -41,6 +41,7 @@ from cayu.core.events import (
     Event,
     EventType,
     copy_event,
+    event_id_is_runtime_generated,
     event_with_runtime_envelope_authority,
     event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
@@ -276,6 +277,8 @@ from cayu.runtime.sessions import (
     RunRequest,
     RuntimePublicationRequest,
     Session,
+    SessionForkActiveModelStageConflict,
+    SessionForkSourceNotFound,
     SessionIdentity,
     SessionMessageDeliveryBatch,
     SessionOperationPublication,
@@ -7250,47 +7253,19 @@ class SessionEngine:
         )
         source_session = await self.session_store.load(request.source_session_id)
         if source_session is None:
-            raise KeyError(f"Session not found: {request.source_session_id}")
-        source_authority_error: str | None = None
-        for field_name in (
-            "id",
-            "agent_name",
-            "provider_name",
-            "model",
-            "parent_session_id",
-            "causal_budget_id",
-            "runtime_name",
-            "runtime_version",
-            "environment_name",
-        ):
-            value = getattr(source_session, field_name)
-            if (
-                store_resolved_source_session_id == source_session.id
-                and field_name in {"id", "parent_session_id", "causal_budget_id"}
-                and type(value) is str
-                and not self._secret_redactor.is_exact_secret(value)
-            ):
-                continue
-            if type(value) is str and self._secret_redactor.redact_text(value) != value:
-                source_authority_error = (
-                    f"source_session.{field_name} contains a workload secret and "
-                    "cannot be used as durable session authority."
-                )
-                break
-        for key, value in source_session.labels.items():
-            if (
-                self._secret_redactor.redact_text(key) != key
-                or self._secret_redactor.redact_text(value) != value
-            ):
-                source_authority_error = (
-                    "source_session.labels contain a workload secret and cannot be "
-                    "copied as durable session authority."
-                )
-                break
-        if source_authority_error is not None:
+            raise session_request_boundary.ForkSourceNotFoundError(
+                "Fork source session was not found."
+            ) from None
+        try:
+            source_session = session_request_boundary.prepare_fork_source_session(
+                source_session,
+                expected_source_session_id=request.source_session_id,
+                store_resolved_source_session_id=store_resolved_source_session_id,
+                redactor=self._secret_redactor,
+            )
+        except ValueError:
             del source_session
-            field_name = key = value = ""
-            raise ValueError(source_authority_error) from None
+            raise
         if source_session.status not in _FORKABLE_SESSION_STATUSES:
             raise ValueError(
                 "Only completed, failed, or interrupted sessions can be forked: "
@@ -7313,15 +7288,6 @@ class SessionEngine:
             ) from exc
         agent_name = request.agent_name or source_session.agent_name
         registered_agent = self._get_registered_agent(agent_name)
-        if (
-            request.agent_name is not None
-            and registered_agent.spec.provider_name is not None
-            and registered_agent.spec.provider_name != source_session.provider_name
-        ):
-            raise ValueError(
-                "Forking a session to an agent with a different provider is not supported: "
-                f"{registered_agent.spec.provider_name} != {source_session.provider_name}"
-            )
         model = request.model or (
             registered_agent.spec.model if request.agent_name is not None else source_session.model
         )
@@ -7330,6 +7296,34 @@ class SessionEngine:
             if request.environment_name is not None
             else source_session.environment_name
         )
+        try:
+            (
+                agent_name,
+                registered_agent_provider_name,
+                model,
+                environment_name,
+            ) = session_request_boundary.prepare_fork_registered_authority(
+                agent_name=agent_name,
+                agent_provider_name=(
+                    registered_agent.spec.provider_name if request.agent_name is not None else None
+                ),
+                model=model,
+                environment_name=environment_name,
+                redactor=self._secret_redactor,
+            )
+        except ValueError:
+            del registered_agent
+            agent_name = model = environment_name = ""
+            raise
+        if (
+            request.agent_name is not None
+            and registered_agent_provider_name is not None
+            and registered_agent_provider_name != source_session.provider_name
+        ):
+            raise ValueError(
+                "Forking a session to an agent with a different provider is not supported: "
+                f"{registered_agent_provider_name} != {source_session.provider_name}"
+            )
         registered_environment = self._get_registered_environment_for_session(environment_name)
 
         def reject_active_or_expired_recovery_claim(
@@ -7465,8 +7459,13 @@ class SessionEngine:
                 inherited_taint_labels | taint_labels_from_metadata(request.metadata),
             )
 
+        runtime_generated_session_id: str | None = None
+        destination_session_id = request.session_id
+        if destination_session_id is None:
+            runtime_generated_session_id = str(uuid4())
+            destination_session_id = runtime_generated_session_id
         fork_session = Session(
-            id=request.session_id or str(uuid4()),
+            id=destination_session_id,
             agent_name=agent_name,
             provider_name=registered_provider.name,
             model=model,
@@ -7479,9 +7478,29 @@ class SessionEngine:
             labels=source_session.labels,
             metadata=copy_json_value(fork_metadata, "metadata"),
         )
-        # Validate the complete evidence before the child-creation mutation. In
-        # particular, a store-resolved legacy source may still exactly equal a
-        # registered secret; that must fail before create_fork can commit a child.
+        try:
+            fork_session = session_request_boundary.prepare_derived_fork_session(
+                fork_session,
+                source_session=source_session,
+                runtime_generated_session_id=runtime_generated_session_id,
+                store_resolved_source_session_id=store_resolved_source_session_id,
+                redactor=self._secret_redactor,
+            )
+        except ValueError:
+            del (
+                fork_session,
+                source_session,
+                registered_agent,
+                source_registered_agent,
+                registered_environment,
+                registered_provider,
+            )
+            if type(fork_metadata) is dict:
+                fork_metadata.clear()
+            inherited_taint_labels = frozenset()
+            agent_name = model = environment_name = destination_session_id = ""
+            runtime_generated_session_id = None
+            raise
         fork_event = self._event_writer.prepare(
             event_with_runtime_payload_authority(
                 event_with_runtime_envelope_authority(
@@ -7531,6 +7550,14 @@ class SessionEngine:
                     checkpoint_transform=checkpoint_transform,
                     expected_source_run_epoch=source_session.run_epoch,
                 )
+        except SessionForkSourceNotFound:
+            raise session_request_boundary.ForkSourceNotFoundError(
+                "Fork source session was not found."
+            ) from None
+        except SessionForkActiveModelStageConflict:
+            raise session_request_boundary.ForkActiveModelStageError(
+                "Fork source session has an active model-completion stage."
+            ) from None
         except _ExpiredIncompleteRecoveryClaim as expired_claim:
             current = await self._require_session(source_session.id)
             fenced = await self._recovery_coordinator.fence_expired_incomplete_recovery_claim(
@@ -10784,6 +10811,12 @@ class SessionEngine:
                 terminal_event.id,
                 type(publication_failure).__name__,
             )
+        if terminal_event.model_dump(mode="json") != prepared_terminal_event.model_dump(
+            mode="json"
+        ):
+            raise RuntimeError("Terminal event publication returned different durable evidence.")
+        if event_id_is_runtime_generated(prepared_terminal_event):
+            terminal_event = event_with_runtime_generated_id(terminal_event)
         run_operation_id = terminal_event.payload.get(_SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
         if run_operation_id is not None:
             try:

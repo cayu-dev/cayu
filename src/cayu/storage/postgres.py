@@ -147,6 +147,7 @@ from cayu.runtime.sessions import (
     RuntimePublicationResult,
     Session,
     SessionAggregateFilter,
+    SessionForkActiveModelStageConflict,
     SessionIdentity,
     SessionInspectionIdentity,
     SessionListResult,
@@ -6423,9 +6424,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         ),
                     )
                     if await cur.fetchone() is not None:
-                        raise ValueError(
-                            "Cannot fork a session while a model-completion stage is active: "
-                            f"{source_session_id}"
+                        raise SessionForkActiveModelStageConflict(
+                            "Cannot fork a session while a model-completion stage is active."
                         )
 
                     source_transcript_cursor = await _transcript_cursor(cur, source_session_id)
