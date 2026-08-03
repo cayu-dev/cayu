@@ -66,6 +66,11 @@ VERIFIED_SCHEMA: dict[str, Any] = {
         "batch_output_per_million": dict(
             _PRICE, description="Output price under the batch API. Null if not offered."
         ),
+        "batch_cache_read_per_million": dict(
+            _PRICE,
+            description="Cached-input price under the batch API. Null if Batch does not "
+            "publish a separate cached-input rate.",
+        ),
         "context_tiers": {
             "type": ["array", "null"],
             "description": "ONLY if the provider charges different rates by input size (e.g. Google "
@@ -335,8 +340,9 @@ def parse_verified(
             pricing_over[field] = dec
     raw_bi = data.get("batch_input_per_million")
     raw_bo = data.get("batch_output_per_million")
-    bi, bo = _dec(raw_bi), _dec(raw_bo)
-    batch_values_reported = raw_bi is not None or raw_bo is not None
+    raw_bc = data.get("batch_cache_read_per_million")
+    bi, bo, bc = _dec(raw_bi), _dec(raw_bo), _dec(raw_bc)
+    batch_values_reported = raw_bi is not None or raw_bo is not None or raw_bc is not None
     if batch_values_reported and "batch" not in source_modes:
         return VerifyOutcome(
             verified=False,
@@ -346,12 +352,28 @@ def parse_verified(
         if (
             "batch_input_per_million" in data
             and "batch_output_per_million" in data
+            and "batch_cache_read_per_million" in data
             and raw_bi is None
             and raw_bo is None
+            and raw_bc is None
         ):
             pricing_over["batch"] = None
         elif bi is not None and bo is not None and len(new_standard) == 1:
-            pricing_over["batch"] = PriceTier(input_per_million=bi, output_per_million=bo)
+            original_batch = original_pricing.batch
+            cache_read = (
+                None
+                if raw_bc is None and "batch_cache_read_per_million" in data
+                else bc
+                if bc is not None
+                else original_batch.cache_read_input_per_million
+                if original_batch is not None
+                else None
+            )
+            pricing_over["batch"] = PriceTier(
+                input_per_million=bi,
+                output_per_million=bo,
+                cache_read_input_per_million=cache_read,
+            )
         # ``TieredPricing.batch`` holds only one band. When the official page exposes
         # short- and long-context Batch rates, do not flatten the short-context values
         # into a rate that appears to apply to every request.

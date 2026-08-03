@@ -46,11 +46,11 @@ these provider keys:
 - `azure` — Azure OpenAI
 - `bedrock` — Amazon Bedrock Runtime
 
-The Bedrock subset is deliberately narrow: Global Claude Sonnet 4.6 at the Standard
-(`default` on the wire) service tier, from the source regions documented by its AWS model
-card. Geographic profiles, direct regional invocation, Reserved/Priority/Flex tiers,
-provisioned throughput, negotiated rates, and other models require a complete
-application-owned `PriceBook`.
+The Bedrock subset is deliberately narrow: Global Claude Sonnet 4.6 and Global Claude
+Opus 5 at the Standard (`default` on the wire) service tier, each from the exact source
+regions documented by its AWS model card and public Price List entries. Geographic
+profiles, direct regional invocation, Reserved/Priority/Flex tiers, provisioned throughput,
+negotiated rates, and other models require a complete application-owned `PriceBook`.
 
 Provider names are part of both model and price identity. Model aliases never alias a
 provider name. Account discounts, regional premiums, negotiated rates, taxes, invoice

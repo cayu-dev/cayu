@@ -407,10 +407,19 @@ async def _run(
         selected_providers = (
             {identity.split("/", 1)[0] for identity in requested}
             if requested
-            else set(RECOMMENDATION_PAGES)
+            else {item.provider_name for item in original.models}
         )
         for provider_name in sorted(selected_providers):
             discovery_attempted += 1
+            if provider_name not in RECOMMENDATION_PAGES:
+                flagged.append(
+                    _VerificationFlag(
+                        identity=f"{provider_name} recommendation audit",
+                        reason="recommendation discovery unsupported",
+                        note="no provider-wide official recommendation source is configured",
+                    )
+                )
+                continue
             if verifier is None:
                 try:
                     verifier = BrowserVerifier(

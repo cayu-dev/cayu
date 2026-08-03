@@ -98,7 +98,6 @@ RECOMMENDATION_PAGES = {
     "google": "https://ai.google.dev/gemini-api/docs/models",
     "vertex": "https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude",
     "azure": "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
-    "bedrock": "https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html",
 }
 
 RECOMMENDATION_SCHEMA = {
@@ -152,8 +151,10 @@ def _prompt(model: ModelInfo, price: ModelPrice, *, effective_on: date) -> str:
         f"{base.input_per_million} / {base.output_per_million}\n"
         f"  current cache read per 1M: {base.cache_read_input_per_million}\n"
         f"  current cache write 5m / 1h per 1M: {p.cache_write_5m_per_million} / {p.cache_write_1h_per_million}\n"
-        f"  current batch input/output per 1M: "
-        f"{(p.batch.input_per_million if p.batch else None)} / {(p.batch.output_per_million if p.batch else None)}\n"
+        f"  current batch input/cache-read/output per 1M: "
+        f"{(p.batch.input_per_million if p.batch else None)} / "
+        f"{(p.batch.cache_read_input_per_million if p.batch else None)} / "
+        f"{(p.batch.output_per_million if p.batch else None)}\n"
         f"  current context_window: {model.context_window}\n"
         f"  current context tiers: {tiers}\n"
         f"  committed pricing source: {pricing_source_url}\n"

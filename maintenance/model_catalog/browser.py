@@ -16,7 +16,7 @@ import subprocess
 # is fully readable immediately after — so NO extra wait is needed. A `wait --load load`/`networkidle`
 # here is a ~25-30s no-op: it waits for the NEXT load/idle event, which never comes, so it blocks to
 # the timeout. One short settle covers any late JS paint without risking that hang.
-_PREP = "{browser} open {u} >/dev/null 2>&1 && {browser} wait 1200 >/dev/null 2>&1"
+_PREP = "{browser} open {u} >/dev/null && {browser} wait 1200 >/dev/null"
 _HOST_BROWSER_ENV_KEYS = frozenset(
     {
         "CI",

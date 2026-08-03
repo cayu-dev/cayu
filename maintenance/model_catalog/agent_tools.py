@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from cayu.artifacts.attachments import file_attachment
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
@@ -31,6 +33,9 @@ _PAGE_COMMAND_TIMEOUT_SECONDS = 120
 _SCREENSHOT_COMMAND_TIMEOUT_SECONDS = 180
 _PRICING_MODES = ("standard", "batch", "flex", "priority")
 _PRICING_MODE_OPTIONS = ("all", *_PRICING_MODES)
+_BROWSER_TRANSACTION_LOCKS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop, WeakValueDictionary[str, asyncio.Lock]
+] = WeakKeyDictionary()
 
 # Keep only a11y-snapshot lines that carry pricing-table signal — table structure (rows/cells/
 # headers), tab/radio state (which pricing mode is selected), and pricing prose/numbers. This drops
@@ -129,7 +134,44 @@ async def _exec(
     if runner is not None:
         result = await runner.exec(ExecCommand.bash(command), timeout_s=timeout)
         return result.stdout
-    return await asyncio.to_thread(browser.run_bash_host, command, timeout=timeout)
+    worker = asyncio.create_task(asyncio.to_thread(browser.run_bash_host, command, timeout=timeout))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancellation:
+        # Cancelling a to_thread await does not stop the worker or its subprocess. Keep the
+        # surrounding browser transaction lock owned until that stateful command reaches its
+        # bounded terminal outcome. ``asyncio.wait`` does not transfer caller cancellation to
+        # the worker and does not consume Task.cancelling().
+        while not worker.done():
+            try:
+                await asyncio.wait({worker})
+            except asyncio.CancelledError:
+                # Preserve every request in Task.cancelling(), while the first delivered
+                # cancellation remains the authoritative signal propagated to the caller.
+                continue
+        with suppress(BaseException):
+            worker.result()
+        # The result is observed to prevent an unretrieved-task diagnostic; caller
+        # cancellation remains authoritative over any terminal worker failure.
+        raise cancellation from None
+
+
+def _browser_transaction_lock(ctx: ToolContext) -> asyncio.Lock:
+    """Serialize stateful browser transactions within one Cayu session.
+
+    A model step may request several tools concurrently. ``agent-browser`` isolates sessions,
+    but commands inside one session all control the same active page. Letting two read/screenshot
+    transactions interleave can make one call snapshot the other call's URL or fail while both
+    commands mutate the page. Separate Cayu sessions retain their own locks and remain concurrent.
+    """
+
+    loop = asyncio.get_running_loop()
+    session_locks = _BROWSER_TRANSACTION_LOCKS.setdefault(loop, WeakValueDictionary())
+    lock = session_locks.get(ctx.session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        session_locks[ctx.session_id] = lock
+    return lock
 
 
 async def _prepare_pricing_page(
@@ -310,6 +352,10 @@ class ReadPageTool(Tool):
     )
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        async with _browser_transaction_lock(ctx):
+            return await self._run_transaction(ctx, args)
+
+    async def _run_transaction(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         url = args["url"]
         mode = _requested_pricing_mode(args)
         if mode != "all":
@@ -412,6 +458,10 @@ class ScreenshotTool(Tool):
     )
 
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        async with _browser_transaction_lock(ctx):
+            return await self._run_transaction(ctx, args)
+
+    async def _run_transaction(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         store = getattr(ctx, "artifact_store", None)
         if store is None:
             return ToolResult(

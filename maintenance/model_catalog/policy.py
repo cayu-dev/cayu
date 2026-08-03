@@ -29,7 +29,9 @@ BUNDLED_PRICE_ONLY_IDENTITIES: frozenset[tuple[str, str]] = frozenset()
 OFFICIAL_HOSTS = {
     "anthropic": frozenset({"docs.anthropic.com", "platform.claude.com"}),
     "azure": frozenset({"azure.microsoft.com", "learn.microsoft.com", "prices.azure.com"}),
-    "bedrock": frozenset({"aws.amazon.com", "docs.aws.amazon.com"}),
+    "bedrock": frozenset(
+        {"aws.amazon.com", "docs.aws.amazon.com", "pricing.us-east-1.amazonaws.com"}
+    ),
     "google": frozenset({"ai.google.dev"}),
     "openai": frozenset({"developers.openai.com", "openai.com", "platform.openai.com"}),
     "vertex": frozenset({"cloud.google.com", "docs.cloud.google.com"}),

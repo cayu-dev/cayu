@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gc
+import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -32,6 +34,7 @@ from maintenance.model_catalog import agent_tools as catalog_tools
 from maintenance.model_catalog import browser, local_refresh, refresh, search
 from maintenance.model_catalog.agent_tools import ReadPageTool
 from maintenance.model_catalog.browser_verifier import (
+    RECOMMENDATION_PAGES,
     BrowserVerifier,
     browsed_pricing_modes,
     browsed_urls,
@@ -69,6 +72,129 @@ def _provider_price(provider_name: str) -> ModelPrice:
         for price in default_price_book().prices
         if price.provider_name == model.provider_name and price.model == model.model
     )
+
+
+def test_bedrock_provider_wide_recommendation_audit_is_disabled() -> None:
+    assert "bedrock" not in RECOMMENDATION_PAGES
+
+
+def test_direct_bedrock_recommendation_audit_fails_closed() -> None:
+    verifier = object.__new__(BrowserVerifier)
+
+    with pytest.raises(ValueError, match="unsupported recommendation provider: bedrock"):
+        asyncio.run(verifier.adiscover_recommendations("bedrock", ()))
+
+
+def test_all_provider_recommendation_audit_reports_unsupported_bedrock(
+    tmp_path, monkeypatch
+) -> None:
+    observed: list[str] = []
+
+    class FakeBrowserVerifier:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def adiscover_recommendations(self, provider_name, existing_models):
+            observed.append(provider_name)
+            return RecommendationOutcome(
+                verified=True,
+                provider_name=provider_name,
+                models=existing_models,
+                source_url=RECOMMENDATION_PAGES[provider_name],
+                evidence="Current models are listed on the official provider page.",
+            )
+
+    report_path = tmp_path / "report.md"
+    monkeypatch.setattr(refresh, "BrowserVerifier", FakeBrowserVerifier)
+    monkeypatch.setattr(refresh, "CATALOG_PATH", tmp_path / "catalog.json")
+    monkeypatch.setattr(refresh, "PRICE_BOOK_PATH", tmp_path / "prices.json")
+    monkeypatch.setattr(refresh, "REPORT_PATH", report_path)
+
+    asyncio.run(
+        refresh._run(
+            force_all=False,
+            max_age_days=10_000,
+            audit_recommendations=True,
+        )
+    )
+
+    report = report_path.read_text(encoding="utf-8")
+    assert "bedrock recommendation audit" in report
+    assert "recommendation discovery unsupported" in report
+    assert "bedrock" not in observed
+    assert set(observed) == set(RECOMMENDATION_PAGES)
+
+
+def test_bedrock_opus_5_release_date_matches_aws_model_card() -> None:
+    model = default_model_catalog().match(
+        provider_name="bedrock", model="global.anthropic.claude-opus-5"
+    )
+
+    assert model is not None
+    assert model.release_date == date(2026, 7, 23)
+
+
+def test_bedrock_browser_allows_the_official_aws_bulk_price_list() -> None:
+    url = (
+        "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/"
+        "AmazonBedrockFoundationModels/current/index.json"
+    )
+
+    assert validate_official_url(url, provider_name="bedrock") == url
+
+
+@pytest.mark.parametrize(
+    ("model", "effective_from"),
+    [
+        ("gpt-5.4-mini", date(2026, 3, 1)),
+        ("gpt-5.4-nano", date(2026, 3, 1)),
+        ("gpt-5.5", date(2026, 5, 1)),
+        ("gpt-5.6-luna", date(2026, 7, 1)),
+        ("gpt-5.6-sol", date(2026, 7, 1)),
+        ("gpt-5.6-terra", date(2026, 7, 1)),
+    ],
+)
+def test_azure_prices_start_on_their_retail_meter_effective_date(
+    model: str, effective_from: date
+) -> None:
+    price = next(
+        item
+        for item in default_price_book().prices
+        if item.provider_name == "azure" and item.model == model
+    )
+
+    assert price.schedule_on(effective_from - timedelta(days=1)) is None
+    schedule = price.schedule_on(effective_from)
+    assert schedule is not None
+    assert schedule.effective_from == effective_from
+
+
+@pytest.mark.parametrize(
+    ("model", "input_price", "output_price", "cache_read_price"),
+    [
+        ("gpt-5.4-mini", "0.375", "2.25", "0.0375"),
+        ("gpt-5.4-nano", "0.1", "0.625", "0.01"),
+    ],
+)
+def test_azure_gpt_5_4_prices_include_published_batch_rates(
+    model: str,
+    input_price: str,
+    output_price: str,
+    cache_read_price: str,
+) -> None:
+    price = next(
+        item
+        for item in default_price_book().prices
+        if item.provider_name == "azure" and item.model == model
+    )
+    schedule = price.schedule_on(date(2026, 8, 3))
+
+    assert schedule is not None
+    batch = schedule.pricing.batch
+    assert batch is not None
+    assert batch.input_per_million == Decimal(input_price)
+    assert batch.output_per_million == Decimal(output_price)
+    assert batch.cache_read_input_per_million == Decimal(cache_read_price)
 
 
 _VERIFICATION_DATE = date(2026, 7, 13)
@@ -248,6 +374,7 @@ def test_verifier_schema_is_strict_and_covers_rich_catalog_pricing() -> None:
     assert {
         "batch_input_per_million",
         "batch_output_per_million",
+        "batch_cache_read_per_million",
         "cache_write_5m_per_million",
         "cache_write_1h_per_million",
         "context_tiers",
@@ -296,6 +423,7 @@ def test_verified_official_data_updates_the_canonical_model_info() -> None:
             "cache_write_1h_per_million": "6.5",
             "batch_input_per_million": "1.625",
             "batch_output_per_million": "8",
+            "batch_cache_read_per_million": "0.1625",
             "deprecated": False,
             "source_url": "https://platform.claude.com/docs/pricing",
             "pricing_effective_from": None,
@@ -319,6 +447,7 @@ def test_verified_official_data_updates_the_canonical_model_info() -> None:
     assert pricing.base().input_per_million == Decimal("3.25")
     assert pricing.batch is not None
     assert pricing.batch.output_per_million == Decimal("8")
+    assert pricing.batch.cache_read_input_per_million == Decimal("0.1625")
     assert outcome.model.provenance.source == "official"
     assert outcome.model.provenance.as_of == "2026-07-13"
 
@@ -574,6 +703,7 @@ def _verified_payload(**updates):
         "cache_write_1h_per_million": None,
         "batch_input_per_million": None,
         "batch_output_per_million": None,
+        "batch_cache_read_per_million": None,
         "context_tiers": None,
         "deprecated": False,
         "source_url": "https://openai.com/api/pricing/",
@@ -790,6 +920,7 @@ def test_verified_rejects_batch_values_without_batch_mode_browser_proof() -> Non
         _verified_payload(
             batch_input_per_million="0.375",
             batch_output_per_million="2.25",
+            batch_cache_read_per_million="0.0375",
         ),
         original,
         _provider_price("openai"),
@@ -800,6 +931,124 @@ def test_verified_rejects_batch_values_without_batch_mode_browser_proof() -> Non
 
     assert outcome.verified is False
     assert "without verified Batch mode" in outcome.note
+
+
+@pytest.mark.parametrize(
+    ("model_name", "input_price", "output_price", "cache_read_price"),
+    [
+        ("gpt-5.4-mini", "0.375", "2.25", "0.0375"),
+        ("gpt-5.4-nano", "0.1", "0.625", "0.01"),
+    ],
+)
+def test_verified_azure_batch_cache_prices_survive_refresh_round_trip(
+    model_name: str,
+    input_price: str,
+    output_price: str,
+    cache_read_price: str,
+) -> None:
+    model = default_model_catalog().match(provider_name="azure", model=model_name)
+    assert model is not None
+    price = next(
+        item
+        for item in default_price_book().prices
+        if item.provider_name == "azure" and item.model == model_name
+    )
+    source_url = price.schedules[0].provenance.url
+    original_schedule = price.schedule_on(date(2026, 8, 3))
+    assert original_schedule is not None
+    standard = original_schedule.pricing.base()
+
+    outcome = parse_verified(
+        _verified_payload(
+            input_per_million=str(standard.input_per_million),
+            output_per_million=str(standard.output_per_million),
+            cache_read_per_million=str(standard.cache_read_input_per_million),
+            batch_input_per_million=input_price,
+            batch_output_per_million=output_price,
+            batch_cache_read_per_million=cache_read_price,
+            source_url=source_url,
+            pricing_effective_from=original_schedule.effective_from.isoformat(),
+        ),
+        model,
+        price,
+        as_of="2026-08-03",
+        browsed_urls={source_url},
+        browsed_pricing_modes={source_url: {"standard", "batch"}},
+    )
+
+    assert outcome.verified and outcome.price is not None
+    updated_schedule = outcome.price.schedule_on(date(2026, 8, 3))
+    assert updated_schedule is not None and updated_schedule.pricing.batch is not None
+    assert updated_schedule.pricing.batch.cache_read_input_per_million == Decimal(cache_read_price)
+
+
+@pytest.mark.parametrize("cache_value", ["not-a-price", pytest.param("absent", id="absent")])
+def test_verified_ambiguous_batch_cache_price_preserves_curated_value(cache_value) -> None:
+    model = _provider_model("openai")
+    price = _provider_price("openai")
+    curated_batch = PriceTier(
+        input_per_million=Decimal("0.5"),
+        output_per_million=Decimal("3"),
+        cache_read_input_per_million=Decimal("0.05"),
+    )
+    original_price = _with_pricing(
+        price,
+        _pricing(price).model_copy(update={"batch": curated_batch}),
+    )
+    payload = _verified_payload(
+        batch_input_per_million="0.4",
+        batch_output_per_million="2.5",
+        batch_cache_read_per_million=cache_value,
+    )
+    if cache_value == "absent":
+        payload.pop("batch_cache_read_per_million")
+
+    outcome = parse_verified(
+        payload,
+        model,
+        original_price,
+        as_of="2026-07-13",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard", "batch"}},
+    )
+
+    assert outcome.verified and outcome.price is not None
+    assert _pricing(outcome.price).batch is not None
+    assert _pricing(outcome.price).batch.cache_read_input_per_million == Decimal("0.05")
+
+
+def test_verified_null_batch_cache_price_authoritatively_clears_curated_value() -> None:
+    model = _provider_model("openai")
+    price = _provider_price("openai")
+    original_price = _with_pricing(
+        price,
+        _pricing(price).model_copy(
+            update={
+                "batch": PriceTier(
+                    input_per_million=Decimal("0.5"),
+                    output_per_million=Decimal("3"),
+                    cache_read_input_per_million=Decimal("0.05"),
+                )
+            }
+        ),
+    )
+
+    outcome = parse_verified(
+        _verified_payload(
+            batch_input_per_million="0.4",
+            batch_output_per_million="2.5",
+            batch_cache_read_per_million=None,
+        ),
+        model,
+        original_price,
+        as_of="2026-07-13",
+        browsed_urls={"https://openai.com/api/pricing/"},
+        browsed_pricing_modes={"https://openai.com/api/pricing/": {"standard", "batch"}},
+    )
+
+    assert outcome.verified and outcome.price is not None
+    assert _pricing(outcome.price).batch is not None
+    assert _pricing(outcome.price).batch.cache_read_input_per_million is None
 
 
 def test_verified_null_batch_without_batch_mode_preserves_curated_batch() -> None:
@@ -1091,6 +1340,27 @@ def test_host_browser_subprocess_reports_exit_and_stderr(monkeypatch) -> None:
         browser.run_bash_host("missing-browser")
 
 
+def test_open_page_failure_preserves_agent_browser_stderr(tmp_path: Path, monkeypatch) -> None:
+    executable = tmp_path / "agent-browser"
+    executable.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in\n'
+        '  *" open "*) printf "%s\\n" "CDP error: no execution context" >&2; exit 7 ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/bin:/usr/bin")
+
+    command = browser.open_page_command(
+        _OPENAI_PAGE,
+        session="verification",
+        allowed_hosts=_OPENAI_HOSTS,
+    )
+    with pytest.raises(RuntimeError, match="CDP error: no execution context"):
+        browser.run_bash_host(command)
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -1252,6 +1522,124 @@ def test_read_page_all_mode_automatically_captures_standard_and_batch(monkeypatc
     assert "$0.75 $4.50" in result.content
     assert "[verified pricing_mode=batch" in result.content
     assert "$0.375 $2.25" in result.content
+
+
+def test_browser_tool_transactions_serialize_per_session_without_blocking_other_sessions(
+    monkeypatch,
+) -> None:
+    active_by_session: dict[str, int] = {}
+    peak_by_session: dict[str, int] = {}
+    active_total = 0
+    peak_total = 0
+
+    async def fake_read_page_mode(ctx, url, mode):
+        nonlocal active_total, peak_total
+        active_by_session[ctx.session_id] = active_by_session.get(ctx.session_id, 0) + 1
+        peak_by_session[ctx.session_id] = max(
+            peak_by_session.get(ctx.session_id, 0), active_by_session[ctx.session_id]
+        )
+        active_total += 1
+        peak_total = max(peak_total, active_total)
+        await asyncio.sleep(0.02)
+        active_total -= 1
+        active_by_session[ctx.session_id] -= 1
+        return catalog_tools.ToolResult(content=f"{ctx.session_id}:{url}:{mode}")
+
+    monkeypatch.setattr(catalog_tools, "_read_page_mode", fake_read_page_mode)
+    same_session = _browser_context().model_copy(update={"session_id": "same"})
+    other_session = _browser_context().model_copy(update={"session_id": "other"})
+    tool = ReadPageTool()
+
+    async def run_concurrently():
+        return await asyncio.gather(
+            tool.run(same_session, {"url": _OPENAI_PAGE, "pricing_mode": "standard"}),
+            tool.run(same_session, {"url": _OPENAI_PAGE, "pricing_mode": "standard"}),
+            tool.run(other_session, {"url": _OPENAI_PAGE, "pricing_mode": "standard"}),
+        )
+
+    results = asyncio.run(run_concurrently())
+
+    assert [result.content for result in results] == [
+        f"same:{_OPENAI_PAGE}:standard",
+        f"same:{_OPENAI_PAGE}:standard",
+        f"other:{_OPENAI_PAGE}:standard",
+    ]
+    assert peak_by_session == {"same": 1, "other": 1}
+    assert peak_total == 2
+
+
+def test_browser_transaction_registry_releases_finished_sessions_and_closed_loops() -> None:
+    catalog_tools._BROWSER_TRANSACTION_LOCKS.clear()
+
+    async def exercise() -> None:
+        context = _browser_context().model_copy(update={"session_id": "collectible"})
+        lock = catalog_tools._browser_transaction_lock(context)
+        async with lock:
+            waiter = asyncio.create_task(lock.acquire())
+            await asyncio.sleep(0)
+            assert not waiter.done()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        del waiter, lock, context
+
+    asyncio.run(exercise())
+    gc.collect()
+    assert len(catalog_tools._BROWSER_TRANSACTION_LOCKS) == 0
+
+
+@pytest.mark.parametrize(
+    "cancellation_messages",
+    [("stop browser transaction",), ("stop browser transaction", "stop again")],
+)
+def test_cancelled_host_browser_transaction_keeps_session_lock_until_worker_stops(
+    cancellation_messages,
+    monkeypatch,
+) -> None:
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+
+    def fake_run_bash_host(command: str, *, timeout: int) -> str:
+        if command == "first":
+            first_started.set()
+            if not release_first.wait(timeout=2):
+                raise TimeoutError("test did not release first browser command")
+        elif command == "second":
+            second_started.set()
+        return command
+
+    monkeypatch.setattr(browser, "run_bash_host", fake_run_bash_host)
+    context = _browser_context().model_copy(update={"session_id": "cancelled-host"})
+
+    async def run_locked(command: str) -> str:
+        async with catalog_tools._browser_transaction_lock(context):
+            return await catalog_tools._exec(context, command)
+
+    async def exercise() -> None:
+        first = asyncio.create_task(run_locked("first"))
+        assert await asyncio.to_thread(first_started.wait, 1)
+
+        for expected_count, message in enumerate(cancellation_messages, start=1):
+            first.cancel(message)
+            assert first.cancelling() == expected_count
+            await asyncio.sleep(0)
+            assert first.cancelling() == expected_count
+            assert not first.done()
+
+        second = asyncio.create_task(run_locked("second"))
+        await asyncio.sleep(0.02)
+        assert not second_started.is_set()
+
+        release_first.set()
+        with pytest.raises(asyncio.CancelledError, match="stop browser transaction"):
+            await first
+        assert first.cancelled()
+        assert first.cancelling() == len(cancellation_messages)
+        assert await second == "second"
+        assert second_started.is_set()
+
+    asyncio.run(exercise())
 
 
 def test_read_page_standard_mode_does_not_read_unselected_batch_values(monkeypatch) -> None:
