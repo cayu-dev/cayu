@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from cayu._filesystem_lock import cooperative_path_lock
 from cayu._validation import (
     copy_durable_json_object,
     require_clean_nonblank,
@@ -45,6 +46,7 @@ _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 4
+_ARTIFACT_LOCK_DIRECTORY_NAME = "cayu-artifact-locks"
 _SUPPORTS_DIRECTORY_FD = (
     os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
@@ -115,43 +117,28 @@ class LocalArtifactStore(ArtifactStore):
             metadata=copied_metadata,
         )
         try:
-            for attempt in range(3):
-                try:
-                    await asyncio.to_thread(
-                        _write_artifact,
-                        self.root,
-                        self._root_identity,
-                        artifact,
-                        content,
-                    )
-                    break
-                except FileExistsError:
-                    if artifact_id is None:
-                        raise
-                    try:
-                        existing = await self.read_bytes(resolved_artifact_id)
-                    except (FileNotFoundError, ValueError):
-                        if attempt >= 2:
-                            raise
-                        await asyncio.to_thread(
-                            _remove_matching_incomplete_artifact,
-                            self.root,
-                            self._root_identity,
-                            artifact,
-                            content,
-                        )
-                        continue
-                    _require_matching_artifact(existing, expected=artifact, content=content)
-                    return existing.metadata
-            else:
-                raise AssertionError("Artifact write retry loop did not terminate.")
+            if artifact_id is None:
+                await asyncio.to_thread(
+                    _write_artifact,
+                    self.root,
+                    self._root_identity,
+                    artifact,
+                    content,
+                )
+                return artifact
+            return await asyncio.to_thread(
+                _put_deterministic_artifact,
+                self.root,
+                self._root_identity,
+                artifact,
+                content,
+            )
         except (ArtifactStoreUnavailableError, TypeError, ValueError):
             raise
         except OSError as exc:
             raise ArtifactStoreUnavailableError(
                 "Local artifact store could not write artifact content."
             ) from exc
-        return artifact
 
     async def read_bytes(
         self,
@@ -404,6 +391,40 @@ def _write_artifact(
                 parent_fd=root_fd,
             )
             raise
+
+
+def _put_deterministic_artifact(
+    root: Path,
+    root_identity: tuple[int, int],
+    artifact: ArtifactMetadata,
+    content: bytes,
+) -> ArtifactMetadata:
+    with cooperative_path_lock(
+        root,
+        artifact.id,
+        lock_directory_name=_ARTIFACT_LOCK_DIRECTORY_NAME,
+    ):
+        for attempt in range(3):
+            try:
+                _write_artifact(root, root_identity, artifact, content)
+            except FileExistsError:
+                try:
+                    existing = _read_artifact(root, root_identity, artifact.id, None)
+                except (FileNotFoundError, ValueError):
+                    if attempt >= 2:
+                        raise
+                    _remove_matching_incomplete_artifact(
+                        root,
+                        root_identity,
+                        artifact,
+                        content,
+                    )
+                    continue
+                _require_matching_artifact(existing, expected=artifact, content=content)
+                return existing.metadata
+            else:
+                return artifact
+        raise AssertionError("Artifact write retry loop did not terminate.")
 
 
 def _remove_matching_incomplete_artifact(

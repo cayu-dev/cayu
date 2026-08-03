@@ -3618,6 +3618,53 @@ def test_local_artifact_store_concurrent_deterministic_writes_publish_once(tmp_p
     assert [path.name for path in store.root.iterdir()] == [artifact_id]
 
 
+@pytest.mark.parametrize("writer_count", (2, 4, 8))
+@pytest.mark.parametrize(
+    "force_directory_fd_fallback",
+    (False, True),
+    ids=("native-directory-fd", "directory-fd-fallback"),
+)
+def test_local_artifact_store_concurrent_partial_recovery_stress(
+    monkeypatch,
+    tmp_path,
+    writer_count,
+    force_directory_fd_fallback,
+):
+    if force_directory_fd_fallback:
+        monkeypatch.setattr(artifact_local_module, "_SUPPORTS_DIRECTORY_FD", False)
+
+    async def write_concurrently(store):
+        return await asyncio.gather(
+            *(
+                store.put_bytes(
+                    b"shared-content",
+                    artifact_id=artifact_id,
+                    filename="shared.txt",
+                    content_type="text/plain",
+                    session_id="sess_shared",
+                )
+                for _ in range(writer_count)
+            ),
+            return_exceptions=True,
+        )
+
+    artifact_id = f"art_{'b' * 32}"
+    for iteration in range(50):
+        store = LocalArtifactStore(tmp_path / str(iteration), store_id="artifacts")
+        partial = store.root / artifact_id
+        partial.mkdir()
+        (partial / "content").write_bytes(b"shared-content")
+
+        results = asyncio.run(write_concurrently(store))
+        failures = [result for result in results if isinstance(result, BaseException)]
+        assert failures == [], f"concurrent recovery failed at iteration {iteration}"
+        artifacts = [result for result in results if isinstance(result, ArtifactMetadata)]
+        assert len(artifacts) == writer_count
+        assert artifacts == [artifacts[0]] * writer_count
+        assert asyncio.run(store.read_bytes(artifact_id)).content == b"shared-content"
+        assert [path.name for path in store.root.iterdir()] == [artifact_id]
+
+
 def test_local_artifact_store_rejects_symlinked_artifact_files(tmp_path):
     store = LocalArtifactStore(tmp_path / "artifacts")
     artifact = asyncio.run(
