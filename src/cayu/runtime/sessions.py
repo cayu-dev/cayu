@@ -14998,6 +14998,12 @@ def _copy_terminal_session_evidence_limits(
 def _terminal_session_evidence_marker_from_checkpoint(
     checkpoint: dict[str, Any] | None,
 ) -> TerminalPublicationMarker | None:
+    if checkpoint is not None and _SESSION_RUN_OPERATION_CHECKPOINT_KEY in checkpoint:
+        raw_marker = checkpoint[_SESSION_RUN_OPERATION_CHECKPOINT_KEY]
+        if type(raw_marker) is not dict or type(raw_marker.get("version")) is not int:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID
+            )
     try:
         operation = _session_run_operation_from_checkpoint(checkpoint)
     except (TypeError, ValueError) as exc:

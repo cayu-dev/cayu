@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
+from tests.core.postgres_contention_support import drop_cayu_tables
 
 import cayu.storage.sqlite as sqlite_store_module
 from cayu import (
@@ -222,6 +223,21 @@ async def _create_terminal_session(
         ),
     )
     return session_id, interaction_id
+
+
+async def _reset_postgres(dsn: str) -> None:
+    await drop_cayu_tables(dsn)
+    import psycopg
+
+    async with await psycopg.AsyncConnection.connect(dsn) as connection:
+        async with connection.cursor() as cursor:
+            for table in (
+                "cayu_public_authority_aliases",
+                "cayu_public_authority_alias_keys",
+                "cayu_public_authority_alias_config",
+            ):
+                await cursor.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
+        await connection.commit()
 
 
 def test_terminal_session_evidence_limits_publish_bounded_defaults_and_hard_caps() -> None:
@@ -742,5 +758,86 @@ def test_sqlite_terminal_evidence_rejects_an_oversized_terminal_before_hydration
             assert hydrated_rows == 0
         finally:
             await store.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "status",
+    (SessionStatus.COMPLETED, SessionStatus.FAILED),
+)
+def test_postgres_terminal_evidence_survives_restart_with_the_exact_boundary(
+    postgres_dsn: str,
+    status: SessionStatus,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresSessionStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _reset_postgres(postgres_dsn)
+        store = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.CREATE,
+        )
+        session_id, interaction_id = await _create_terminal_session(store, status=status)
+        await store.append_event(
+            session_id,
+            Event(
+                id="postgres-post-terminal-hook",
+                type=EventType.HOOK_COMPLETED,
+                session_id=session_id,
+            ),
+        )
+        before_restart = await store.load_terminal_session_evidence(session_id)
+        await store.close()
+
+        reopened = PostgresSessionStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=2,
+            schema_mode=SchemaMode.VALIDATE,
+            read_only=True,
+        )
+        try:
+            after_restart = await reopened.load_terminal_session_evidence(session_id)
+            assert reopened.supports_terminal_session_evidence is True
+            assert after_restart == before_restart
+            assert after_restart.initial_interaction_id == interaction_id
+            assert after_restart.boundary.event_count == 3
+            assert after_restart.boundary.transcript_count == 3
+            assert all(
+                record.event.id != "postgres-post-terminal-hook" for record in after_restart.events
+            )
+
+            with pytest.raises(TerminalSessionEvidenceError) as events:
+                await reopened.load_terminal_session_evidence(
+                    session_id,
+                    limits=TerminalSessionEvidenceLimits(max_events=2),
+                )
+            assert events.value.code is TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED
+
+            import cayu.storage.postgres as postgres_store_module
+
+            hydrated_json_values = 0
+            original_json_obj = postgres_store_module._json_obj
+
+            def json_obj_spy(value):
+                nonlocal hydrated_json_values
+                hydrated_json_values += 1
+                return original_json_obj(value)
+
+            monkeypatch.setattr(postgres_store_module, "_json_obj", json_obj_spy)
+            with pytest.raises(TerminalSessionEvidenceError) as record:
+                await reopened.load_terminal_session_evidence(
+                    session_id,
+                    limits=TerminalSessionEvidenceLimits(max_record_bytes=32),
+                )
+            assert record.value.code is TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED
+            assert hydrated_json_values == 0
+        finally:
+            await reopened.close()
 
     asyncio.run(run())

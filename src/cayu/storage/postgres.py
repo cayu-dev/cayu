@@ -31,6 +31,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without 
 
 from cayu._validation import (
     EXECUTION_UNIT_ID_MAX_CHARS,
+    MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
     copy_durable_json_object,
     copy_durable_json_value,
@@ -173,6 +174,11 @@ from cayu.runtime.sessions import (
     SessionTopologyDepthExceeded,
     SessionTopologyQuery,
     SessionTopologyStoreResult,
+    TerminalPublicationMarker,
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+    TerminalSessionEvidenceLimits,
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
@@ -182,15 +188,18 @@ from cayu.runtime.sessions import (
     _active_unexpired_incomplete_recovery_claim_id,
     _active_unexpired_session_operation_id,
     _apply_runtime_publication_checkpoint_mutation,
+    _assemble_terminal_session_evidence,
     _assert_session_run_epoch,
     _assert_session_run_epoch_value,
     _authenticated_public_authority_alias_private_value,
     _build_runtime_publication_receipt,
     _checkpoint_after_initial_transcript_publication,
+    _classify_terminal_session_evidence_records,
     _copy_mcp_manifest_publication,
     _copy_optional_interaction_admission,
     _copy_queued_interaction_started_event,
     _copy_session_event_batch,
+    _copy_terminal_session_evidence_limits,
     _copy_transition_interaction_admission,
     _copy_workflow_step_reservation,
     _current_session_run_epoch,
@@ -234,6 +243,7 @@ from cayu.runtime.sessions import (
     _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline,
     _terminal_publication_delete_block_reason,
+    _terminal_session_evidence_expected_event_type,
     _tool_round_publication_identity,
     _validate_equivalent_queued_session_message,
     _validate_interaction_page,
@@ -5681,6 +5691,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
+    supports_terminal_session_evidence: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
 
@@ -10627,6 +10638,426 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 safe_insert_xid=safe_insert_xid,
                 force_snapshot_cutoff=needs_snapshot_cutoff,
             )
+
+    async def load_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        limits: TerminalSessionEvidenceLimits | None = None,
+    ) -> TerminalSessionEvidence:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        limits = _copy_terminal_session_evidence_limits(limits)
+        evidence_event_types = [
+            str(event_type) for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES
+        ]
+
+        def jsonb_transport_bytes(expression: str) -> str:
+            # Bound the complete JSONB text representation that PostgreSQL must
+            # transfer and the driver must decode. This intentionally retains
+            # serializer whitespace as well as every byte inside string values.
+            # The extra byte accounts for JSONB's binary-protocol version prefix
+            # when that transfer format is selected.
+            return f"octet_length(({expression})::text) + 1"
+
+        def transport_limit(canonical_limit: int) -> int:
+            # This is an independent PostgreSQL working-set policy, not an
+            # upper bound derived from Cayu's portable JSON representation.
+            # Besides separator spaces, JSONB can expand scientific-notation
+            # floats into fixed-point decimals by far more than 3:2. Refuse that
+            # transport expansion with its own typed error instead of weakening
+            # the hydration bound; the shared assembler applies the canonical
+            # caller limit to every payload that passes this backend guard.
+            return canonical_limit + (canonical_limit + 1) // 2
+
+        event_transport_bytes = f"{jsonb_transport_bytes('event')} + octet_length(sequence::text)"
+        transcript_transport_bytes = (
+            f"{jsonb_transport_bytes('message')} "
+            "+ octet_length(session_order::text) "
+            "+ COALESCE(octet_length(interaction_id), 0)"
+        )
+        session_transport_bytes = " + ".join(
+            f"COALESCE(octet_length(session.{column}), 0)"
+            for column in (
+                "id",
+                "agent_name",
+                "provider_name",
+                "model",
+                "parent_session_id",
+                "causal_budget_id",
+                "runtime_name",
+                "runtime_version",
+                "environment_name",
+                "status",
+            )
+        )
+        session_transport_bytes += (
+            " + octet_length(session.run_epoch::text)"
+            f" + {jsonb_transport_bytes('session.metadata')}"
+        )
+        max_record_transport_bytes = transport_limit(limits.max_record_bytes)
+        max_total_transport_bytes = transport_limit(limits.max_total_bytes)
+
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    await cur.execute(
+                        f"""
+                            SELECT session.status,
+                                   session.run_epoch,
+                                   ({session_transport_bytes})
+                                   + COALESCE((
+                                       SELECT SUM(
+                                           octet_length(label.key)
+                                           + octet_length(label.value)
+                                       )
+                                       FROM cayu_session_labels AS label
+                                       WHERE label.session_id = session.id
+                                   ), 0) AS transport_bytes
+                            FROM cayu_sessions AS session
+                            WHERE session.id = %s
+                            """,
+                        (session_id,),
+                    )
+                    session_preflight = await cur.fetchone()
+                    if session_preflight is None:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
+                        )
+                    session_status = SessionStatus(session_preflight[0])
+                    session_run_epoch = session_preflight[1]
+                    if type(session_run_epoch) is not int:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    _terminal_session_evidence_expected_event_type(session_status)
+                    session_transport_size = int(session_preflight[2])
+                    if session_transport_size > max_record_transport_bytes:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+                            limit=max_record_transport_bytes,
+                            observed=session_transport_size,
+                        )
+
+                    await cur.execute(
+                        """
+                        SELECT
+                            CASE
+                                WHEN state ? 'session_run_operation'
+                                THEN jsonb_typeof(state -> 'session_run_operation')
+                            END AS marker_type,
+                            jsonb_typeof(
+                                state #> '{session_run_operation,version}'
+                            ) AS version_type,
+                            state #>> '{session_run_operation,version}' AS version_value,
+                            jsonb_typeof(
+                                state #> '{session_run_operation,operation_id}'
+                            ) AS operation_id_type,
+                            octet_length(
+                                state #>> '{session_run_operation,operation_id}'
+                            ) AS operation_id_bytes,
+                            length(btrim(COALESCE(
+                                state #>> '{session_run_operation,operation_id}',
+                                ''
+                            ))) > 0 AS operation_id_nonblank,
+                            jsonb_typeof(
+                                state #> '{session_run_operation,run_epoch}'
+                            ) AS run_epoch_type,
+                            state #>> '{session_run_operation,run_epoch}' AS run_epoch_value,
+                            state ? 'initial_transcript_pending'
+                                AS initial_transcript_pending,
+                            state ? 'pending_session_interrupt'
+                                AS pending_session_interrupt
+                        FROM cayu_checkpoints
+                        WHERE session_id = %s
+                        """,
+                        (session_id,),
+                    )
+                    checkpoint_projection = await cur.fetchone()
+                    marker: TerminalPublicationMarker | None = None
+                    initial_transcript_pending = False
+                    pending_session_interrupt = False
+                    marker_stored_bytes = 0
+                    if checkpoint_projection is not None:
+                        initial_transcript_pending = bool(checkpoint_projection[8])
+                        pending_session_interrupt = bool(checkpoint_projection[9])
+                        marker_type = checkpoint_projection[0]
+                        if marker_type is not None:
+                            run_epoch_text = checkpoint_projection[7]
+                            marker_valid = (
+                                marker_type == "object"
+                                and checkpoint_projection[1] == "number"
+                                and checkpoint_projection[2] == "1"
+                                and checkpoint_projection[3] == "string"
+                                and bool(checkpoint_projection[5])
+                                and checkpoint_projection[6] == "number"
+                                and type(run_epoch_text) is str
+                                and run_epoch_text.isascii()
+                                and run_epoch_text.isdecimal()
+                            )
+                            if not marker_valid:
+                                raise TerminalSessionEvidenceError(
+                                    TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID
+                                )
+                            marker_run_epoch = int(run_epoch_text)
+                            if not 1 <= marker_run_epoch <= MAX_DURABLE_JSON_INTEGER:
+                                raise TerminalSessionEvidenceError(
+                                    TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID
+                                )
+                            operation_id_bytes = int(checkpoint_projection[4])
+                            marker_stored_bytes = operation_id_bytes + len(run_epoch_text)
+                            if marker_stored_bytes > limits.max_record_bytes:
+                                raise TerminalSessionEvidenceError(
+                                    TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
+                                    limit=limits.max_record_bytes,
+                                )
+                            await cur.execute(
+                                """
+                                SELECT state #>> '{session_run_operation,operation_id}'
+                                FROM cayu_checkpoints
+                                WHERE session_id = %s
+                                """,
+                                (session_id,),
+                            )
+                            operation_row = await cur.fetchone()
+                            if operation_row is None:
+                                raise TerminalSessionEvidenceError(
+                                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                                )
+                            try:
+                                marker = TerminalPublicationMarker(
+                                    operation_id=operation_row[0],
+                                    run_epoch=marker_run_epoch,
+                                )
+                            except (TypeError, ValueError) as exc:
+                                raise TerminalSessionEvidenceError(
+                                    TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID
+                                ) from exc
+
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            f"""
+                            SELECT sequence,
+                                   event_type,
+                                   ({event_transport_bytes}) AS transport_bytes,
+                                   jsonb_typeof(
+                                       payload -> 'session_run_operation_id'
+                                   ) AS operation_id_type,
+                                   length(btrim(COALESCE(
+                                       payload ->> 'session_run_operation_id',
+                                       ''
+                                   ))) > 0 AS operation_id_nonblank
+                            FROM cayu_events
+                            WHERE session_id = %s AND event_type = ANY(%s)
+                            ORDER BY sequence DESC
+                            LIMIT %s
+                            """,
+                        ),
+                        (
+                            session_id,
+                            evidence_event_types,
+                            _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
+                        ),
+                    )
+                    newest_preflight_rows = await cur.fetchall()
+                    if any(
+                        int(row[2]) > max_record_transport_bytes for row in newest_preflight_rows
+                    ):
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+                            limit=max_record_transport_bytes,
+                        )
+                    if any(
+                        row[3] not in {None, "string"} or (row[3] == "string" and not bool(row[4]))
+                        for row in newest_preflight_rows
+                    ):
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    newest_sequences = [row[0] for row in newest_preflight_rows]
+                    newest_evidence_records: tuple[EventRecord, ...]
+                    if newest_sequences:
+                        await cur.execute(
+                            """
+                            SELECT sequence,
+                                   event_id,
+                                   event_type,
+                                   payload ->> 'session_run_operation_id'
+                            FROM cayu_events
+                            WHERE sequence = ANY(%s)
+                            ORDER BY sequence DESC
+                            """,
+                            (newest_sequences,),
+                        )
+                        newest_rows = await cur.fetchall()
+                        newest_evidence_records = tuple(
+                            EventRecord(
+                                sequence=row[0],
+                                event=Event(
+                                    id=row[1],
+                                    type=row[2],
+                                    session_id=session_id,
+                                    payload=(
+                                        {}
+                                        if row[3] is None
+                                        else {"session_run_operation_id": row[3]}
+                                    ),
+                                ),
+                            )
+                            for row in newest_rows
+                        )
+                    else:
+                        newest_evidence_records = ()
+                    terminal_record = _classify_terminal_session_evidence_records(
+                        session_id=session_id,
+                        status=session_status,
+                        run_epoch=session_run_epoch,
+                        marker=marker,
+                        newest_evidence_records=newest_evidence_records,
+                        initial_transcript_pending=initial_transcript_pending,
+                        pending_session_interrupt=pending_session_interrupt,
+                    )
+
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            f"""
+                            WITH bounded_events AS (
+                                SELECT ({event_transport_bytes}) AS transport_bytes
+                                FROM cayu_events
+                                WHERE session_id = %s AND sequence <= %s
+                                ORDER BY sequence ASC
+                                LIMIT %s
+                            )
+                            SELECT COUNT(*),
+                                   COALESCE(MAX(transport_bytes), 0),
+                                   COALESCE(SUM(transport_bytes), 0)
+                            FROM bounded_events
+                            """,
+                        ),
+                        (session_id, terminal_record.sequence, limits.max_events + 1),
+                    )
+                    event_preflight = await cur.fetchone()
+                    await cur.execute(
+                        cast(
+                            "LiteralString",
+                            f"""
+                            WITH bounded_transcript AS (
+                                SELECT ({transcript_transport_bytes}) AS transport_bytes
+                                FROM cayu_transcript_messages
+                                WHERE session_id = %s
+                                ORDER BY session_order ASC
+                                LIMIT %s
+                            )
+                            SELECT COUNT(*),
+                                   COALESCE(MAX(transport_bytes), 0),
+                                   COALESCE(SUM(transport_bytes), 0)
+                            FROM bounded_transcript
+                            """,
+                        ),
+                        (session_id, limits.max_transcript_records + 1),
+                    )
+                    transcript_preflight = await cur.fetchone()
+                    if event_preflight is None or transcript_preflight is None:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    event_count = int(event_preflight[0])
+                    transcript_count = int(transcript_preflight[0])
+                    if event_count > limits.max_events:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+                            limit=limits.max_events,
+                            observed=event_count,
+                        )
+                    if transcript_count > limits.max_transcript_records:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED,
+                            limit=limits.max_transcript_records,
+                            observed=transcript_count,
+                        )
+                    largest_transport_bytes = max(
+                        session_transport_size,
+                        int(event_preflight[1]),
+                        int(transcript_preflight[1]),
+                        marker_stored_bytes,
+                    )
+                    if largest_transport_bytes > max_record_transport_bytes:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+                            limit=max_record_transport_bytes,
+                            observed=largest_transport_bytes,
+                        )
+                    total_transport_bytes = (
+                        session_transport_size
+                        + int(event_preflight[2])
+                        + int(transcript_preflight[2])
+                        + marker_stored_bytes
+                    )
+                    if total_transport_bytes > max_total_transport_bytes:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+                            limit=max_total_transport_bytes,
+                            observed=total_transport_bytes,
+                        )
+
+                    session = await self._load(cur, session_id)
+                    if session is None:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    await cur.execute(
+                        """
+                        SELECT sequence, event
+                        FROM cayu_events
+                        WHERE session_id = %s AND sequence <= %s
+                        ORDER BY sequence ASC
+                        """,
+                        (session_id, terminal_record.sequence),
+                    )
+                    event_rows = await cur.fetchall()
+                    await cur.execute(
+                        """
+                        SELECT session_order - 1, interaction_id, message
+                        FROM cayu_transcript_messages
+                        WHERE session_id = %s
+                        ORDER BY session_order ASC
+                        """,
+                        (session_id,),
+                    )
+                    transcript_rows = await cur.fetchall()
+                    if len(event_rows) != event_count or len(transcript_rows) != transcript_count:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    events = tuple(
+                        EventRecord(sequence=row[0], event=Event(**_json_obj(row[1])))
+                        for row in event_rows
+                    )
+                    transcript = tuple(
+                        TranscriptRecord(
+                            index=row[0],
+                            interaction_id=row[1],
+                            message=Message(**_json_obj(row[2])),
+                        )
+                        for row in transcript_rows
+                    )
+                    return _assemble_terminal_session_evidence(
+                        session=session,
+                        marker=marker,
+                        terminal_record=terminal_record,
+                        events=events,
+                        transcript=transcript,
+                        limits=limits,
+                    )
+            except TerminalSessionEvidenceError:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                ) from exc
 
     async def query_latest_interaction_events(
         self,

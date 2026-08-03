@@ -5941,13 +5941,19 @@ class SQLiteSessionStore(SessionStore):
                         SELECT ({event_stored_bytes}) AS stored_bytes
                         FROM cayu_events
                         WHERE session_id = ? AND sequence <= ?
+                        ORDER BY sequence ASC
+                        LIMIT ?
                     )
                     SELECT COUNT(*) AS record_count,
                            COALESCE(MAX(stored_bytes), 0) AS largest_record_bytes,
                            COALESCE(SUM(stored_bytes), 0) AS total_bytes
                     FROM bounded_events
                     """,
-                    (session_id, terminal_record.sequence),
+                    (
+                        session_id,
+                        terminal_record.sequence,
+                        limits.max_events + 1,
+                    ),
                 ).fetchone()
                 transcript_preflight = connection.execute(
                     f"""
@@ -5955,13 +5961,15 @@ class SQLiteSessionStore(SessionStore):
                         SELECT ({transcript_stored_bytes}) AS stored_bytes
                         FROM cayu_transcript_messages
                         WHERE session_id = ?
+                        ORDER BY session_order ASC
+                        LIMIT ?
                     )
                     SELECT COUNT(*) AS record_count,
                            COALESCE(MAX(stored_bytes), 0) AS largest_record_bytes,
                            COALESCE(SUM(stored_bytes), 0) AS total_bytes
                     FROM bounded_transcript
                     """,
-                    (session_id,),
+                    (session_id, limits.max_transcript_records + 1),
                 ).fetchone()
                 if event_preflight is None or transcript_preflight is None:
                     raise TerminalSessionEvidenceError(
