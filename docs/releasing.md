@@ -45,7 +45,11 @@ without protection rules.
 
 ## Publish a release
 
-1. Land the version bump on `main` and confirm the version in `pyproject.toml`.
+1. Land the version bump on `main`, confirm the version in `pyproject.toml`, and
+   add one exact, non-empty `## vX.Y.Z` section to `docs/release-notes.md` for
+   the matching tag. The workflow publishes that curated section verbatim and
+   does not generate release notes; a missing, duplicate, or empty section
+   fails before GitHub release creation.
 2. Create and push the matching tag:
 
    ```bash

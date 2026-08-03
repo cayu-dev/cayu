@@ -88,6 +88,8 @@ def test_release_runbook_records_external_security_prerequisites() -> None:
     assert "updates, deletion, and non-fast-forward changes" in runbook_words
     assert "Do not push any `v*` tag" in runbook
     assert "PYPI_PUBLISH_ENABLED" in runbook
+    assert "exact, non-empty `## vX.Y.Z` section" in runbook
+    assert "does not generate release notes" in runbook
     assert "0.1.0a1" not in runbook
     assert 'version="$(python -c' in runbook
 
@@ -122,6 +124,17 @@ def test_release_workflow_gates_publish_and_reuses_validated_artifact() -> None:
     assert "--verify-tag" in github_release
     assert "--prerelease" in github_release
     assert "--latest=false" in github_release
+
+
+def test_github_release_uses_curated_notes_for_the_exact_tag() -> None:
+    github_release = _job_block(_CI_WORKFLOW.read_text(), "github-release")
+
+    assert "python3 scripts/extract_release_notes.py" in github_release
+    assert "--notes docs/release-notes.md" in github_release
+    assert '--version "$GITHUB_REF_NAME"' in github_release
+    assert '--output "$RUNNER_TEMP/release-notes.md"' in github_release
+    assert '--notes-file "$RUNNER_TEMP/release-notes.md"' in github_release
+    assert "--generate-notes" not in github_release
 
 
 def test_pull_request_scopes_expensive_verification_jobs() -> None:

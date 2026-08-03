@@ -1,5 +1,51 @@
 # Release notes
 
+## v0.1.0rc5
+
+This is the final code candidate for `v0.1.0`. If its release evidence passes,
+the final release should differ only in version and release metadata.
+
+### Upgrade from v0.1.0rc4
+
+Pin the complete application to `cayu==0.1.0rc5`, refresh its lockfile, and run
+its own tests. Upgrade independently deployed Cayu servers, dashboards, and
+generated clients together: the server contract advances from version 4 to
+version 6, and the public application manifest and generator plan advance to
+schema version 7.
+
+The storage schema advances from revision 23 to revision 29. Revision 26 is a
+deliberate prerelease boundary: migration rejects a populated pre-26 Cayu
+session database instead of attempting to rewrite its durable interaction
+history. Stop all older workers, take an application-consistent backup, and
+recreate populated prerelease Cayu session databases before starting rc5.
+Empty stores migrate normally. Run `cayu storage status` and
+`cayu storage migrate` against every explicitly configured SQLite or PostgreSQL
+session store and budget ledger, then confirm revision 29 with no pending
+migrations. Do not run mixed rc4/rc5 workers.
+
+After deployment, verify `cayu version`, run `cayu check --json`, execute the
+application's test suite, and exercise a durable session through process
+restart, approval or deferred input, and recovery. Persistent multi-worker
+deployments must use one consistent public-authority alias keyring.
+
+### What this candidate validates
+
+- Durable interaction admission, replay, approval, model-budget settlement,
+  and terminal recovery now retain bounded, attributable evidence across
+  crashes and retries.
+- `cayu serve` and `cayu worker` provide stable entrypoints for configured
+  projects, while bounded topology, workflow, usage, and event projections
+  support control-plane inspection without exposing private authority.
+- Oversized tool results can be externalized after redaction, workspace
+  mutations support revision-checked reads and writes, and remote allocation
+  fails closed where exact recovery is unavailable.
+- The bundled model catalog and pricing snapshot have been refreshed against
+  current provider information.
+
+The complete intended `v0.1.0` contract remains documented in the unreleased
+section below. This rc5 section is the curated public GitHub release note and
+the focused upgrade guide for the candidate.
+
 ## v0.1.0rc4
 
 This release candidate is an upgrade-testing checkpoint for applications and
