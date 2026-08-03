@@ -806,3 +806,13 @@ a Cayu virtual-egress policy, or another explicit provider policy retain their
 chosen behavior. `MicrosandboxRunner.from_existing(...)` cannot retrofit a
 policy; the creator of the existing sandbox owns its creation-time network
 contract.
+
+### New Run selects a registered agent explicitly
+
+The control-plane New Run page now loads the registered agent inventory before
+enabling submission. A single registered agent is selected automatically;
+applications with multiple agents require an operator choice, and every
+dashboard run sends that exact agent identity to `/api/run`. Empty inventories
+and initial inventory failures keep execution disabled with a useful
+explanation. The page also states that this direct runtime operation does not
+invoke application-specific entrypoints or orchestration.

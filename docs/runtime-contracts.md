@@ -1231,6 +1231,14 @@ detail with `Cache-Control: private, no-store`; rejected content is never echoed
 or durably mutated. These limits are framework safety ceilings and cannot be
 weakened by a reverse proxy.
 
+The dashboard's New Run surface resolves the protected registered-agent
+inventory before enabling execution. It selects a sole registered agent
+automatically, requires an explicit operator choice when multiple agents are
+registered, and includes that exact identity in every `/run` request. An empty
+or initially unavailable inventory leaves the mutation disabled. New Run calls
+the Cayu runtime directly; it does not invoke application-specific entrypoints
+or orchestration.
+
 `GET /api/sessions/{session_id}/state` is the bounded lifecycle-polling surface.
 It returns the session id, status, update/activity timestamps, and typed
 interruption-cascade state. `SessionStore.load_state` projects the mutable

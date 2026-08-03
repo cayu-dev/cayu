@@ -481,10 +481,10 @@ def _price_book_payload(
     }
 
 
-def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
+def test_server_uses_explicit_non_assistant_agent_for_runs_and_task_list() -> None:
     app = CayuApp(task_store=InMemoryTaskStore())
     app.register_provider(OneShotProvider(), default=True)
-    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    app.register_agent(AgentSpec(name="reviewer", model="fake-model"))
 
     client = TestClient(
         create_server(
@@ -509,7 +509,11 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert '"apiBaseUrl":"/api"' in dashboard.text
     assert '"priceBook":{"price_book_version":"test"' in dashboard.text
 
-    with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
+    with client.stream(
+        "POST",
+        "/api/run",
+        json={"agent": "reviewer", "prompt": "hello"},
+    ) as response:
         assert response.status_code == 200
         list(response.iter_lines())
 
@@ -517,6 +521,7 @@ def test_server_uses_app_task_store_for_runs_and_task_list() -> None:
     assert len(tasks) == 1
     assert tasks[0]["type"] == "run"
     assert tasks[0]["status"] == "completed"
+    assert tasks[0]["assigned_agent_name"] == "reviewer"
     assert tasks[0]["worker_id"] is None
     assert tasks[0]["lease_expires_at"] is None
 

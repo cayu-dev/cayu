@@ -1,3 +1,4 @@
+import { useQuery } from "@tanstack/react-query"
 import { useNavigate } from "@tanstack/react-router"
 import {
   AlertCircle,
@@ -11,13 +12,17 @@ import {
   Wrench,
 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
-import { DataCard, Page, PageHeader } from "../components/dashboard/layout"
+import { DataCard, Page, PageHeader, StateMessage } from "../components/dashboard/layout"
 import { MutationTransportStatus } from "../components/dashboard/mutation-transport-status"
 import { Button } from "../components/ui/button"
 import { Textarea } from "../components/ui/textarea"
-import type { SSEEvent } from "../lib/api"
+import { fetchAgents, type SSEEvent } from "../lib/api"
 import { formatCount, modelUsagePayload, numericValue } from "../lib/format"
 import type { MutationTransportSnapshot } from "../lib/mutation-transport.ts"
+import { reconcileRunAgentSelection } from "../lib/run-agent-selection.ts"
+
+const selectClassName =
+  "h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50"
 
 function LiveEvent({ event }: { event: SSEEvent }) {
   const icons: Record<string, React.ReactNode> = {
@@ -98,6 +103,7 @@ function runAttention(events: SSEEvent[]) {
 export function RunPage() {
   const navigate = useNavigate()
   const [prompt, setPrompt] = useState("")
+  const [selectedAgentName, setSelectedAgentName] = useState("")
   const [running, setRunning] = useState(false)
   const [transport, setTransport] = useState<MutationTransportSnapshot | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -106,6 +112,15 @@ export function RunPage() {
   const runAbortRef = useRef<AbortController | null>(null)
   const eventsEndRef = useRef<HTMLDivElement>(null)
   const outputEndRef = useRef<HTMLDivElement>(null)
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: ({ signal }) => fetchAgents(signal),
+    staleTime: 15_000,
+  })
+  const registeredAgents = agents.data?.agents ?? []
+  const resolvedAgentName = reconcileRunAgentSelection(selectedAgentName, registeredAgents)
+  const selectedAgent = registeredAgents.find((agent) => agent.name === resolvedAgentName) ?? null
+  const agentInventoryError = agents.error instanceof Error ? agents.error.message : null
   const events = transport?.events ?? []
   const textOutput = transport?.liveText ?? ""
   const visibleEventCount = events.filter((event) => event.type !== "model.text.delta").length
@@ -131,7 +146,7 @@ export function RunPage() {
   }, [textOutput.length])
 
   const handleRun = async () => {
-    if (!prompt.trim()) return
+    if (!prompt.trim() || selectedAgent === null) return
     runAbortRef.current?.abort()
     const controller = new AbortController()
     runAbortRef.current = controller
@@ -145,7 +160,7 @@ export function RunPage() {
       const { executeRunMutation } = await import("../lib/mutation-browser")
       if (controller.signal.aborted || runAbortRef.current !== controller) return
       const snapshot = await executeRunMutation(
-        { prompt: prompt.trim() },
+        { agent: selectedAgent.name, prompt: prompt.trim() },
         {
           signal: controller.signal,
           onChange: (next) => {
@@ -196,17 +211,89 @@ export function RunPage() {
 
   return (
     <Page>
-      <PageHeader title="New Run" />
+      <PageHeader
+        title="New Run"
+        description="Start a registered agent directly through the Cayu runtime. Application-specific entrypoints and orchestration are not invoked."
+      />
 
-      <DataCard title="Prompt" headerClassName="pb-3" contentClassName="space-y-3 p-4">
-        <Textarea
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="Analyze the customer dataset in data/. Write a Python script that extracts top 10 countries by customer count..."
-          disabled={running}
-          rows={4}
-          className="resize-none"
-        />
+      <DataCard title="Run configuration" headerClassName="pb-3" contentClassName="space-y-4 p-4">
+        <div className="space-y-1.5">
+          <label htmlFor="run-agent" className="text-sm font-medium">
+            Agent
+          </label>
+          <select
+            id="run-agent"
+            className={selectClassName}
+            value={resolvedAgentName}
+            onChange={(event) => {
+              setSelectedAgentName(event.target.value)
+              setError(null)
+            }}
+            disabled={running || (agents.isLoading && agents.data === undefined)}
+            aria-describedby="run-agent-help"
+          >
+            <option value="">
+              {agents.isLoading && agents.data === undefined
+                ? "Loading registered agents..."
+                : "Select an agent"}
+            </option>
+            {registeredAgents.map((agent) => (
+              <option key={agent.name} value={agent.name}>
+                {agent.name}
+              </option>
+            ))}
+          </select>
+          <p id="run-agent-help" className="text-xs text-muted-foreground">
+            {selectedAgent
+              ? `${selectedAgent.provider_name ?? "default provider"} · ${selectedAgent.model} · ${formatCount(selectedAgent.tool_count)} ${selectedAgent.tool_count === 1 ? "tool" : "tools"}`
+              : registeredAgents.length > 1
+                ? "Choose which registered agent receives this prompt."
+                : "The selected agent identity is sent explicitly with the run request."}
+          </p>
+        </div>
+
+        {agents.isError && agents.data === undefined && (
+          <StateMessage tone="danger" className="rounded-md border border-destructive/30 py-4">
+            <div role="alert">Registered agents could not be loaded: {agentInventoryError}</div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-3"
+              disabled={agents.isFetching}
+              onClick={() => void agents.refetch()}
+            >
+              {agents.isFetching ? "Retrying..." : "Retry"}
+            </Button>
+          </StateMessage>
+        )}
+        {!agents.isLoading && !agents.isError && registeredAgents.length === 0 && (
+          <StateMessage className="rounded-md border border-border py-4">
+            No agents are registered. Register an agent in the Cayu application before starting a
+            control-plane run.
+          </StateMessage>
+        )}
+        {agents.isError && agents.data !== undefined && (
+          <p className="text-sm text-destructive" role="alert">
+            The agent inventory could not be refreshed. The last confirmed selection remains
+            available.
+          </p>
+        )}
+
+        <div className="space-y-1.5">
+          <label htmlFor="run-prompt" className="text-sm font-medium">
+            Prompt
+          </label>
+          <Textarea
+            id="run-prompt"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder="Analyze the customer dataset in data/. Write a Python script that extracts top 10 countries by customer count..."
+            disabled={running}
+            rows={4}
+            className="resize-none"
+          />
+        </div>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <MutationTransportStatus snapshot={transport} />
         {lastSessionId && (
@@ -250,7 +337,10 @@ export function RunPage() {
           </p>
         )}
         <div className="flex items-center justify-end">
-          <Button onClick={handleRun} disabled={running || !prompt.trim()}>
+          <Button
+            onClick={handleRun}
+            disabled={running || !prompt.trim() || selectedAgent === null}
+          >
             <Play className="h-4 w-4 mr-2" />
             {running ? "Running..." : "Run"}
           </Button>

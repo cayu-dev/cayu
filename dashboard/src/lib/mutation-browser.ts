@@ -56,6 +56,10 @@ export type MutationExecutionOptions = {
   visibility?: MutationVisibilitySource
 }
 
+export type ExplicitRunBody = Omit<RunBody, "agent"> & {
+  agent: string
+}
+
 class MutationAttemptStopped extends Error {
   readonly result: MutationAttemptResult
 
@@ -378,7 +382,7 @@ async function executeExistingSessionMutation(
 }
 
 export async function executeRunMutation(
-  body: RunBody,
+  body: ExplicitRunBody,
   options: MutationExecutionOptions = {},
 ): Promise<MutationTransportSnapshot> {
   const sessionId = createRunSessionId()

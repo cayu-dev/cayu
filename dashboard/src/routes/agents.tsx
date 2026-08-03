@@ -306,7 +306,7 @@ export function AgentsPage() {
 
   const agents = useQuery({
     queryKey: ["agents"],
-    queryFn: fetchAgents,
+    queryFn: ({ signal }) => fetchAgents(signal),
     staleTime: 15_000,
   })
 

@@ -941,6 +941,7 @@ async def _run_browser_contract(
         "base_url": base_url,
         "session_id": SESSION_ID,
         "interactions": [
+            "new_run_agent_selection",
             "mutation_pre_frame_recovery",
             "contract_version_gate",
             "capability_aware_routes",
@@ -1016,6 +1017,7 @@ async def _exercise_dashboard(
     tool_failed_event_id = projected_event_id(EventType.TOOL_CALL_FAILED)
 
     await _exercise_operational_scope(page, base_url)
+    await _exercise_run_agent_inventory(page, base_url)
     await _exercise_mutation_recovery(page, base_url)
     await page.goto(f"{base_url}/cayu/sessions", wait_until="networkidle")
     require((await page.locator("body").inner_text()).strip() != "", "dashboard rendered blank")
@@ -2376,39 +2378,101 @@ async def _exercise_session_discovery(
     await expect(page.get_by_role("link", name=SESSION_ID)).to_be_visible()
 
 
+async def _exercise_run_agent_inventory(page: Page, base_url: str) -> None:
+    inventory_mode = "empty"
+
+    async def serve_agent_inventory(route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        source_agents = body.get("agents", []) if isinstance(body, dict) else []
+        if inventory_mode == "empty":
+            projected_agents = []
+        else:
+            projected_agents = [
+                agent
+                for agent in source_agents
+                if isinstance(agent, dict) and agent.get("name") == AGENT_NAME
+            ]
+        await route.fulfill(
+            response=response,
+            json={"agents": projected_agents, "total_count": len(projected_agents)},
+        )
+
+    await page.route("**/api/agents", serve_agent_inventory)
+    try:
+        await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
+        agent_select = page.get_by_label("Agent", exact=True)
+        await expect(agent_select).to_have_value("")
+        await expect(page.get_by_text("No agents are registered.", exact=False)).to_be_visible()
+        await page.get_by_label("Prompt", exact=True).fill("This run must remain disabled.")
+        await expect(page.get_by_role("button", name="Run", exact=True)).to_be_disabled()
+
+        inventory_mode = "single"
+        await page.reload(wait_until="networkidle")
+        agent_select = page.get_by_label("Agent", exact=True)
+        await expect(agent_select).to_have_value(AGENT_NAME)
+        await page.get_by_label("Prompt", exact=True).fill("This run has one unambiguous agent.")
+        await expect(page.get_by_role("button", name="Run", exact=True)).to_be_enabled()
+    finally:
+        await page.unroute("**/api/agents", serve_agent_inventory)
+
+
 async def _exercise_mutation_recovery(page: Page, base_url: str) -> None:
     session_urls: list[str] = []
+    submitted_run_agents: list[str | None] = []
 
-    for prompt in (
-        "recover after HTTP acceptance before the first event",
-        "recover after the first durable event",
-    ):
-        await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
-        await expect(page.get_by_role("heading", name="New Run")).to_be_visible()
-        await page.get_by_placeholder(re.compile(r"Analyze the customer dataset")).fill(prompt)
-        await page.get_by_role("button", name="Run", exact=True).click()
-        await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
-            timeout=15_000
-        )
-        await expect(
-            page.get_by_text("dashboard mutation recovery completed", exact=True)
-        ).to_be_visible()
-        session_reference = page.get_by_test_id("run-session-reference")
-        await expect(session_reference).to_be_visible()
-        session_id = await session_reference.inner_text()
-        copy_button = page.get_by_role("button", name="Copy", exact=True)
-        await expect(copy_button).to_be_visible()
-        await copy_button.click()
-        await expect(page.get_by_role("button", name="Copied", exact=True)).to_be_visible()
-        session_button = page.get_by_role("button", name="View Session →")
-        await expect(session_button).to_be_visible()
-        await session_button.click()
-        await expect(page).to_have_url(f"{base_url}/cayu/sessions/{session_id}")
-        await expect(page.get_by_role("heading", name=session_id)).to_be_visible()
-        session_urls.append(page.url)
+    def record_run_request(request) -> None:
+        if urlsplit(request.url).path != "/api/run" or "last-event-id" in request.headers:
+            return
+        body = request.post_data_json
+        submitted_run_agents.append(body.get("agent") if isinstance(body, dict) else None)
+
+    page.on("request", record_run_request)
+
+    try:
+        for prompt in (
+            "recover after HTTP acceptance before the first event",
+            "recover after the first durable event",
+        ):
+            await page.goto(f"{base_url}/cayu/run", wait_until="networkidle")
+            await expect(page.get_by_role("heading", name="New Run")).to_be_visible()
+            agent_select = page.get_by_label("Agent", exact=True)
+            await expect(agent_select).to_have_value("")
+            await page.get_by_label("Prompt", exact=True).fill(prompt)
+            run_button = page.get_by_role("button", name="Run", exact=True)
+            await expect(run_button).to_be_disabled()
+            await agent_select.select_option(AGENT_NAME)
+            await expect(run_button).to_be_enabled()
+            await run_button.click()
+            await expect(page.locator('[data-mutation-transport-phase="terminal"]')).to_be_visible(
+                timeout=15_000
+            )
+            await expect(
+                page.get_by_text("dashboard mutation recovery completed", exact=True)
+            ).to_be_visible()
+            session_reference = page.get_by_test_id("run-session-reference")
+            await expect(session_reference).to_be_visible()
+            session_id = await session_reference.inner_text()
+            copy_button = page.get_by_role("button", name="Copy", exact=True)
+            await expect(copy_button).to_be_visible()
+            await copy_button.click()
+            await expect(page.get_by_role("button", name="Copied", exact=True)).to_be_visible()
+            session_button = page.get_by_role("button", name="View Session →")
+            await expect(session_button).to_be_visible()
+            await session_button.click()
+            await expect(page).to_have_url(f"{base_url}/cayu/sessions/{session_id}")
+            await expect(page.get_by_role("heading", name=session_id)).to_be_visible()
+            session_urls.append(page.url)
+    finally:
+        page.remove_listener("request", record_run_request)
 
     require_equal(
         len(set(session_urls)), 2, "each recovered run must keep a distinct session identity"
+    )
+    require_equal(
+        submitted_run_agents,
+        [AGENT_NAME, AGENT_NAME],
+        "each New Run submission must carry the exact operator-selected agent",
     )
 
 

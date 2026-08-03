@@ -14,7 +14,7 @@ Usage:
     curl -N -u "${CAYU_SERVER_USERNAME:-admin}:$CAYU_SERVER_PASSWORD" \
       -X POST http://localhost:8000/api/run \
       -H "Content-Type: application/json" \
-      -d '{"prompt": "List files in the workspace"}'
+      -d '{"agent": "assistant", "prompt": "List files in the workspace"}'
 """
 
 from __future__ import annotations

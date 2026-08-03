@@ -239,8 +239,8 @@ export async function fetchSystemDiagnostics(signal?: AbortSignal): Promise<Syst
   return requestJson<SystemDiagnostics>("/system/diagnostics", { signal })
 }
 
-export async function fetchAgents(): Promise<AgentsPage> {
-  const page = await requestJson<unknown>("/agents")
+export async function fetchAgents(signal?: AbortSignal): Promise<AgentsPage> {
+  const page = await requestJson<unknown>("/agents", { signal })
   const pageObject = objectRecord(page)
   if (pageObject === null || !Array.isArray(pageObject.agents)) {
     throw new Error("Unexpected /agents response.")
