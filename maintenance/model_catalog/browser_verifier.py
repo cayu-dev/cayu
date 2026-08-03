@@ -9,12 +9,14 @@ agent-browser; the live run is integration-gated (not in the unit suite).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, TypeVar
+from uuid import uuid4
 
 from cayu import (
     AgentSpec,
@@ -32,12 +34,18 @@ from cayu import (
     default_model_catalog,
     default_price_book,
 )
+from cayu._exception_groups import exception_cause, exception_context
 from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.runtime.budgets import BudgetLimit
 from cayu.runtime.sessions import InMemorySessionStore
 from cayu.runtime.structured_output import StructuredOutputSpec, StructuredOutputStrategy
-from maintenance.model_catalog.agent_tools import ReadPageTool, ScreenshotTool, SearchWebTool
+from maintenance.model_catalog.agent_tools import (
+    ReadPageTool,
+    ScreenshotTool,
+    SearchWebTool,
+    close_host_session,
+)
 from maintenance.model_catalog.guidance import WORKSPACE_GUIDANCE
 from maintenance.model_catalog.security import PROVIDER_METADATA_KEY
 from maintenance.model_catalog.verified import (
@@ -51,6 +59,82 @@ DEFAULT_MAX_VERIFY_COST_USD = 0.15  # generous per-verification cap (a clean run
 VERIFIER_PROVIDER_NAME = "openai"
 DEFAULT_VERIFIER_MODEL = "gpt-5.6-luna"
 LUNA_MAX_PROVIDER_OPTIONS = {"openai": {"reasoning": {"effort": "xhigh"}}}
+_OutcomeT = TypeVar("_OutcomeT", VerifyOutcome, RecommendationOutcome)
+_BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR = BaseException.__dict__["__suppress_context__"]
+
+
+def _visible_exception_evidence(error: BaseException) -> BaseException | None:
+    cause = exception_cause(error)
+    if cause is not None:
+        return cause
+    try:
+        suppresses_context = _BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR.__get__(
+            error, BaseException
+        )
+    except BaseException:
+        return None
+    return None if suppresses_context is not False else exception_context(error)
+
+
+def _attach_browser_cleanup_failure(
+    cancellation: asyncio.CancelledError, cleanup_error: Exception
+) -> None:
+    existing = _visible_exception_evidence(cancellation)
+    if existing is cleanup_error:
+        return
+    cancellation.__cause__ = (
+        cleanup_error
+        if existing is None
+        else BaseExceptionGroup(
+            "runtime and browser cleanup failed during model-catalog cancellation",
+            [existing, cleanup_error],
+        )
+    )
+
+
+async def _with_browser_cleanup(operation: Awaitable[_OutcomeT], *, session_id: str) -> _OutcomeT:
+    """Run one catalog operation and retain cleanup as diagnostic evidence."""
+
+    primary: BaseException | None = None
+    outcome: _OutcomeT | None = None
+    try:
+        outcome = await operation
+    except BaseException as error:
+        primary = error
+
+    cleanup_error: Exception | None = None
+    try:
+        await close_host_session(session_id)
+    except asyncio.CancelledError as cancellation:
+        if primary is not None:
+            cleanup_failure = cancellation.__cause__
+            cancellation.__cause__ = (
+                BaseExceptionGroup(
+                    "model-catalog operation and browser cleanup failed",
+                    [primary, cleanup_failure],
+                )
+                if isinstance(cleanup_failure, BaseException)
+                else primary
+            )
+        raise
+    except Exception as error:
+        cleanup_error = error
+
+    if primary is not None:
+        if isinstance(primary, asyncio.CancelledError):
+            if cleanup_error is not None:
+                _attach_browser_cleanup_failure(primary, cleanup_error)
+            raise primary
+        if cleanup_error is not None:
+            raise BaseExceptionGroup(
+                "model-catalog operation and browser cleanup failed",
+                [primary, cleanup_error],
+            )
+        raise primary
+
+    assert outcome is not None
+    return replace(outcome, cleanup_error=cleanup_error)
+
 
 # Agent identity, core behavior, and the pricing-page rules required when the scheduled verifier
 # runs without an environment carrying workspace instructions.
@@ -367,6 +451,14 @@ class BrowserVerifier:
         return asyncio.run(self.averify(model, price))
 
     async def averify(self, model: ModelInfo, price: ModelPrice) -> VerifyOutcome:
+        session_id = uuid4().hex
+        return await _with_browser_cleanup(
+            self._averify(model, price, session_id=session_id), session_id=session_id
+        )
+
+    async def _averify(
+        self, model: ModelInfo, price: ModelPrice, *, session_id: str
+    ) -> VerifyOutcome:
         # NATIVE: the provider enforces the JSON schema on the final message, so the agent can't
         # forget to emit it or return malformed output (a source of the old "no structured output"
         # flags) — tool calls during the run still work; only the final answer is schema-constrained.
@@ -383,6 +475,7 @@ class BrowserVerifier:
         events: list[Any] = []
         async for e in self.app.run(
             RunRequest(
+                session_id=session_id,
                 agent_name=self.agent_name,
                 messages=[msg],
                 structured_output=spec,
@@ -419,6 +512,21 @@ class BrowserVerifier:
     ) -> RecommendationOutcome:
         if provider_name not in RECOMMENDATION_PAGES:
             raise ValueError(f"unsupported recommendation provider: {provider_name}")
+        session_id = uuid4().hex
+        return await _with_browser_cleanup(
+            self._adiscover_recommendations(provider_name, existing_models, session_id=session_id),
+            session_id=session_id,
+        )
+
+    async def _adiscover_recommendations(
+        self,
+        provider_name: str,
+        existing_models: tuple[str, ...],
+        *,
+        session_id: str,
+    ) -> RecommendationOutcome:
+        if provider_name not in RECOMMENDATION_PAGES:
+            raise ValueError(f"unsupported recommendation provider: {provider_name}")
         spec = StructuredOutputSpec(
             name="recommended_models",
             json_schema=RECOMMENDATION_SCHEMA,
@@ -431,6 +539,7 @@ class BrowserVerifier:
         events: list[Any] = []
         async for event in self.app.run(
             RunRequest(
+                session_id=session_id,
                 agent_name=self.recommendation_agent_name,
                 messages=[msg],
                 structured_output=spec,

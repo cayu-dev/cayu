@@ -36,6 +36,7 @@ _PRICING_MODE_OPTIONS = ("all", *_PRICING_MODES)
 _BROWSER_TRANSACTION_LOCKS: WeakKeyDictionary[
     asyncio.AbstractEventLoop, WeakValueDictionary[str, asyncio.Lock]
 ] = WeakKeyDictionary()
+_HOST_BROWSER_SESSIONS: set[str] = set()
 
 # Keep only a11y-snapshot lines that carry pricing-table signal — table structure (rows/cells/
 # headers), tab/radio state (which pricing mode is selected), and pricing prose/numbers. This drops
@@ -134,6 +135,7 @@ async def _exec(
     if runner is not None:
         result = await runner.exec(ExecCommand.bash(command), timeout_s=timeout)
         return result.stdout
+    _HOST_BROWSER_SESSIONS.add(ctx.session_id)
     worker = asyncio.create_task(asyncio.to_thread(browser.run_bash_host, command, timeout=timeout))
     try:
         return await asyncio.shield(worker)
@@ -154,6 +156,29 @@ async def _exec(
         # The result is observed to prevent an unretrieved-task diagnostic; caller
         # cancellation remains authoritative over any terminal worker failure.
         raise cancellation from None
+
+
+async def close_host_session(session_id: str) -> None:
+    """Close a session that actually dispatched browser work on the host."""
+
+    if session_id not in _HOST_BROWSER_SESSIONS:
+        return
+    worker = asyncio.create_task(asyncio.to_thread(browser.close_session_host, session_id))
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError as cancellation:
+        while not worker.done():
+            try:
+                await asyncio.wait({worker})
+            except asyncio.CancelledError:
+                continue
+        try:
+            worker.result()
+        except Exception as cleanup_error:
+            cancellation.__cause__ = cleanup_error
+        raise cancellation
+    finally:
+        _HOST_BROWSER_SESSIONS.discard(session_id)
 
 
 def _browser_transaction_lock(ctx: ToolContext) -> asyncio.Lock:

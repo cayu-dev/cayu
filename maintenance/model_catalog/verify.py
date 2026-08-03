@@ -19,6 +19,7 @@ class VerifyOutcome:
     pricing_provenance: Provenance | None = None
     pricing_effective_from: date | None = None
     model_evidence: str = ""
+    cleanup_error: Exception | None = None
 
 
 @dataclass(frozen=True)
@@ -30,3 +31,4 @@ class RecommendationOutcome:
     evidence: str = ""
     note: str = ""
     usage: dict[str, int] | None = None
+    cleanup_error: Exception | None = None

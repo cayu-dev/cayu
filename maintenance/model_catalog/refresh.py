@@ -30,6 +30,13 @@ from cayu import (
     load_model_catalog,
     load_price_book,
 )
+from cayu._exception_groups import (
+    exception_cause,
+    exception_context,
+    exception_group_children,
+)
+from cayu._exception_state import exception_state
+from cayu.runtime._diagnostics import exception_diagnostic
 from cayu.runtime.costs import resolve_price_book
 from maintenance.model_catalog.browser_verifier import (
     DEFAULT_MAX_VERIFY_COST_USD,
@@ -61,6 +68,7 @@ PRICE_BOOK_PATH = REPOSITORY_ROOT / "src/cayu/data/default_price_book.json"
 REPORT_PATH = REPOSITORY_ROOT / "model-catalog-refresh.md"
 _REPORT_TEXT_LIMIT = 800
 _EVIDENCE_TEXT_LIMIT = 2_000
+_BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR = BaseException.__dict__["__suppress_context__"]
 
 
 @dataclass(frozen=True)
@@ -77,12 +85,59 @@ class _VerificationEvidence:
     quote: str
 
 
+def _exception_suppresses_context(error: BaseException) -> bool:
+    """Inspect base-owned suppression without requiring an unreleased Cayu helper."""
+
+    try:
+        value = _BASE_EXCEPTION_SUPPRESS_CONTEXT_DESCRIPTOR.__get__(error, BaseException)
+    except BaseException:
+        return True
+    return value if type(value) is bool else True
+
+
 def _safe_report_text(value: str, *, limit: int = _REPORT_TEXT_LIMIT) -> str:
     """Render untrusted verifier/page text as one bounded, inert Markdown line."""
 
     collapsed = " ".join(value.split())[:limit]
     html_escaped = html.escape(collapsed, quote=False)
     return re.sub(r"([\\`*_{}\[\]()#+.!|>-])", r"\\\1", html_escaped)
+
+
+def _exception_diagnostic(exc: BaseException) -> str:
+    """Render an exception tree once, preserving groups, causes, and notes."""
+
+    rendered: list[str] = []
+    seen: set[int] = set()
+
+    def visit(error: BaseException) -> None:
+        if id(error) in seen:
+            return
+        seen.add(id(error))
+        diagnostic = exception_diagnostic(error, preserve_empty_message=True)
+        details = diagnostic.error_type
+        if diagnostic.message:
+            details += f": {diagnostic.message}"
+        notes = exception_state(error, "__notes__")
+        if type(notes) is list:
+            safe_notes = [note[:_REPORT_TEXT_LIMIT] for note in notes[:8] if type(note) is str]
+            if safe_notes:
+                details += "; " + "; ".join(safe_notes)
+        rendered.append(details)
+        if isinstance(error, BaseExceptionGroup):
+            members = exception_group_children(error)
+            if members is not None:
+                for member in members:
+                    visit(member)
+        cause = exception_cause(error)
+        if cause is not None:
+            visit(cause)
+        elif not _exception_suppresses_context(error):
+            context = exception_context(error)
+            if context is not None:
+                visit(context)
+
+    visit(exc)
+    return " | ".join(rendered)
 
 
 def _verifier_rates(catalog: ModelCatalog, price_book: PriceBook) -> tuple[float, float]:
@@ -273,13 +328,21 @@ async def _run(
                 _VerificationFlag(
                     identity=identity,
                     reason=decision.reason,
-                    note=f"{type(exc).__name__}: {exc}",
+                    note=_exception_diagnostic(exc),
                 )
             )
             continue
         if outcome.usage:
             input_tokens += outcome.usage.get("input_tokens", 0)
             output_tokens += outcome.usage.get("output_tokens", 0)
+        if outcome.cleanup_error:
+            flagged.append(
+                _VerificationFlag(
+                    identity=identity,
+                    reason="browser session cleanup failed",
+                    note=_exception_diagnostic(outcome.cleanup_error),
+                )
+            )
         if outcome.verified and outcome.model is not None:
             verified_price = outcome.price or current_price
             verified += 1
@@ -461,13 +524,21 @@ async def _run(
                     _VerificationFlag(
                         identity=f"{provider_name} recommendation audit",
                         reason="recommendation discovery failed",
-                        note=f"{type(exc).__name__}: {exc}",
+                        note=_exception_diagnostic(exc),
                     )
                 )
                 continue
             if discovered.usage:
                 input_tokens += discovered.usage.get("input_tokens", 0)
                 output_tokens += discovered.usage.get("output_tokens", 0)
+            if discovered.cleanup_error:
+                flagged.append(
+                    _VerificationFlag(
+                        identity=f"{provider_name} recommendation audit",
+                        reason="browser session cleanup failed",
+                        note=_exception_diagnostic(discovered.cleanup_error),
+                    )
+                )
             if not discovered.verified:
                 flagged.append(
                     _VerificationFlag(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import importlib
+import re
 import threading
 from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime, timedelta
@@ -32,6 +34,7 @@ from cayu import (
 )
 from maintenance.model_catalog import agent_tools as catalog_tools
 from maintenance.model_catalog import browser, local_refresh, refresh, search
+from maintenance.model_catalog import browser_verifier as browser_verifier_module
 from maintenance.model_catalog.agent_tools import ReadPageTool
 from maintenance.model_catalog.browser_verifier import (
     RECOMMENDATION_PAGES,
@@ -76,6 +79,240 @@ def _provider_price(provider_name: str) -> ModelPrice:
 
 def test_bedrock_provider_wide_recommendation_audit_is_disabled() -> None:
     assert "bedrock" not in RECOMMENDATION_PAGES
+
+
+@pytest.mark.parametrize("operation", ["verify", "recommendations"])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_browser_verifier_closes_host_session_and_reports_cleanup(
+    operation, cleanup_fails, monkeypatch
+) -> None:
+    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
+    closed: list[str] = []
+    cleanup_error = RuntimeError("close failed")
+
+    async def fake_verify(model, price, *, session_id):
+        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
+        return VerifyOutcome(verified=True)
+
+    async def fake_recommendations(provider_name, existing_models, *, session_id):
+        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
+        return RecommendationOutcome(verified=True, provider_name=provider_name)
+
+    async def close(session_id):
+        closed.append(session_id)
+        catalog_tools._HOST_BROWSER_SESSIONS.discard(session_id)
+        if cleanup_fails:
+            raise cleanup_error
+
+    monkeypatch.setattr(verifier, "_averify", fake_verify)
+    monkeypatch.setattr(verifier, "_adiscover_recommendations", fake_recommendations)
+    monkeypatch.setattr(browser_verifier_module, "close_host_session", close)
+
+    outcome = asyncio.run(
+        verifier.averify(_provider_model("openai"), _provider_price("openai"))
+        if operation == "verify"
+        else verifier.adiscover_recommendations("openai", ())
+    )
+
+    assert len(closed) == 1
+    assert outcome.cleanup_error is (cleanup_error if cleanup_fails else None)
+
+
+@pytest.mark.parametrize("operation", ["verify", "recommendations"])
+def test_browser_verifier_uses_compact_external_safe_session_ids(operation, monkeypatch) -> None:
+    class CapturingApp:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def run(self, request):
+            self.requests.append(request)
+            if False:
+                yield
+
+    app = CapturingApp()
+    verifier = BrowserVerifier(
+        as_of="2026-08-03",
+        agent_name="nested/path/" + "x" * 300,
+        app=app,
+        max_cost_usd=None,
+    )
+    closed: list[str] = []
+
+    async def close(session_id):
+        closed.append(session_id)
+
+    monkeypatch.setattr(browser_verifier_module, "close_host_session", close)
+
+    asyncio.run(
+        verifier.averify(_provider_model("openai"), _provider_price("openai"))
+        if operation == "verify"
+        else verifier.adiscover_recommendations("openai", ())
+    )
+
+    assert len(app.requests) == 1
+    session_id = app.requests[0].session_id
+    assert re.fullmatch(r"[0-9a-f]{32}", session_id)
+    assert closed == [session_id]
+
+
+def test_refresh_import_does_not_require_unreleased_exception_helper(monkeypatch) -> None:
+    import cayu._exception_groups as public_exception_groups
+
+    monkeypatch.delattr(
+        public_exception_groups,
+        "exception_suppresses_context",
+        raising=False,
+    )
+
+    def reject_unreleased_helper(name: str):
+        if name == "exception_suppresses_context":
+            raise AssertionError("refresh imported an unreleased runtime helper")
+        raise AttributeError(name)
+
+    monkeypatch.setattr(
+        public_exception_groups,
+        "__getattr__",
+        reject_unreleased_helper,
+        raising=False,
+    )
+    assert importlib.reload(refresh) is refresh
+
+
+def test_browser_verifier_preserves_primary_and_cleanup_failures(monkeypatch) -> None:
+    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
+    primary = ValueError("verification failed")
+    cleanup = RuntimeError("close failed")
+
+    async def fail_verify(model, price, *, session_id):
+        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
+        raise primary
+
+    async def fail_close(session_id):
+        catalog_tools._HOST_BROWSER_SESSIONS.discard(session_id)
+        raise cleanup
+
+    monkeypatch.setattr(verifier, "_averify", fail_verify)
+    monkeypatch.setattr(browser_verifier_module, "close_host_session", fail_close)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        asyncio.run(verifier.averify(_provider_model("openai"), _provider_price("openai")))
+
+    assert raised.value.exceptions == (primary, cleanup)
+
+
+def test_browser_verifier_cancellation_waits_for_host_cleanup(monkeypatch) -> None:
+    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
+    primary_started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def blocked_verify(model, price, *, session_id):
+        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
+        primary_started.set()
+        await asyncio.Event().wait()
+
+    async def close(session_id):
+        await asyncio.sleep(0)
+        catalog_tools._HOST_BROWSER_SESSIONS.discard(session_id)
+        cleanup_finished.set()
+
+    monkeypatch.setattr(verifier, "_averify", blocked_verify)
+    monkeypatch.setattr(browser_verifier_module, "close_host_session", close)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            verifier.averify(_provider_model("openai"), _provider_price("openai"))
+        )
+        await primary_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled()
+        assert task.cancelling() == 1
+        assert cleanup_finished.is_set()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("operation", ["verify", "recommendations"])
+def test_browser_verifier_cancellation_preserves_runtime_and_browser_cleanup_failures(
+    operation, monkeypatch
+) -> None:
+    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
+    primary_started = asyncio.Event()
+    runtime_cleanup = RuntimeError("runtime cleanup failed")
+    browser_cleanup = RuntimeError("browser cleanup failed")
+    delivered: list[asyncio.CancelledError] = []
+
+    async def blocked_primary() -> None:
+        primary_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            cancellation.__cause__ = runtime_cleanup
+            delivered.append(cancellation)
+            raise
+
+    async def blocked_verify(model, price, *, session_id):
+        await blocked_primary()
+
+    async def blocked_recommendations(provider_name, existing_models, *, session_id):
+        await blocked_primary()
+
+    async def fail_close(session_id):
+        raise browser_cleanup
+
+    monkeypatch.setattr(verifier, "_averify", blocked_verify)
+    monkeypatch.setattr(verifier, "_adiscover_recommendations", blocked_recommendations)
+    monkeypatch.setattr(browser_verifier_module, "close_host_session", fail_close)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            verifier.averify(_provider_model("openai"), _provider_price("openai"))
+            if operation == "verify"
+            else verifier.adiscover_recommendations("openai", ())
+        )
+        await primary_started.wait()
+        task.cancel("stop")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert raised.value is delivered[0]
+        assert task.cancelled()
+        assert task.cancelling() == 1
+        combined = raised.value.__cause__
+        assert isinstance(combined, BaseExceptionGroup)
+        assert combined.exceptions == (runtime_cleanup, browser_cleanup)
+
+    asyncio.run(exercise())
+
+
+def test_browser_verifier_retains_primary_when_cancelled_during_cleanup(monkeypatch) -> None:
+    verifier = BrowserVerifier(as_of="2026-08-03", app=object(), max_cost_usd=None)
+    primary = RuntimeError("verification failed")
+    cleanup_started = asyncio.Event()
+
+    async def fail_verify(model, price, *, session_id):
+        catalog_tools._HOST_BROWSER_SESSIONS.add(session_id)
+        raise primary
+
+    async def blocked_close(session_id):
+        cleanup_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(verifier, "_averify", fail_verify)
+    monkeypatch.setattr(browser_verifier_module, "close_host_session", blocked_close)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            verifier.averify(_provider_model("openai"), _provider_price("openai"))
+        )
+        await cleanup_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        assert raised.value.__cause__ is primary
+        assert task.cancelled()
+
+    asyncio.run(exercise())
 
 
 def test_direct_bedrock_recommendation_audit_fails_closed() -> None:

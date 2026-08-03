@@ -122,6 +122,22 @@ def read_file_b64_command(path: str) -> str:
     return f"base64 -w0 {shlex.quote(path)}"
 
 
+def close_session_command(session: str) -> str:
+    """Close one named agent-browser session.
+
+    ``close`` is intentionally not part of the per-page command chains: the run-level caller
+    owns the session and may execute several browser tools before releasing it.
+    """
+    if not session:
+        raise ValueError("browser session must not be empty")
+    return f"agent-browser --session {shlex.quote(session)} close"
+
+
+def close_session_host(session: str) -> None:
+    """Close a host-backed named browser session, propagating cleanup errors to its owner."""
+    run_bash_host(close_session_command(session))
+
+
 def run_bash_host(command: str, *, timeout: int = 120) -> str:
     environment = {key: value for key, value in os.environ.items() if key in _HOST_BROWSER_ENV_KEYS}
     completed = subprocess.run(
