@@ -89,6 +89,23 @@ guard.
 
 ## v0.1.0
 
+### Terminal session evidence has one bounded snapshot boundary
+
+The in-memory, SQLite, and PostgreSQL session stores can now load a completed or
+failed session's exact event prefix through its matching terminal event together
+with the attributed transcript, pending publication marker, run/lifecycle
+boundaries, and exact complete-result byte accounting. The optional operation
+rejects active, interrupted, incomplete, contradictory, or oversized evidence
+with stable typed errors and never presents truncation as a complete capture.
+SQL stores preflight bounded counts and conservative stored lengths before
+hydrating payloads; PostgreSQL bounds the full raw JSONB representation,
+including whitespace-heavy JSON string content, under a distinct transport
+policy that can reject JSONB-expanded scientific-notation values without
+changing the canonical limits applied to accepted evidence;
+custom stores must explicitly opt in only when they provide the same guarantees.
+This is the storage foundation for production-session eval promotion; it does
+not yet add promotion, corpus, or dashboard workflows.
+
 ### Remote environment allocation fails closed without exact recovery
 
 Custom remote `EnvironmentFactory` implementations can now declare a stable

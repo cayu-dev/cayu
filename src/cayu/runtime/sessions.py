@@ -21,7 +21,7 @@ from dataclasses import field as dataclass_field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
-from itertools import islice
+from itertools import islice, pairwise
 from typing import Any, ClassVar, Literal
 from uuid import uuid4
 from weakref import ReferenceType, ref
@@ -81,8 +81,10 @@ from cayu.runtime._model_completion_publication import (
 )
 from cayu.runtime._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    TERMINAL_EVENT_TYPES,
     TERMINAL_EVIDENCE_EVENT_TYPES,
     TERMINAL_EVIDENCE_QUERY_LIMIT,
+    TERMINAL_LIFECYCLE_EVENT_TYPES,
     classify_current_terminal_evidence,
 )
 from cayu.runtime.aggregates import (
@@ -3967,6 +3969,286 @@ class TranscriptRecord(BaseModel):
         return copy_message(value)
 
 
+TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS = 10_000
+TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS = 5_000
+TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES = 1024 * 1024
+TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS = 100_000
+TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS = 50_000
+TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES = 8 * 1024 * 1024
+TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES = 128 * 1024 * 1024
+
+_TERMINAL_SESSION_EVIDENCE_INTERACTION_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        EventType.INTERACTION_STARTED,
+        EventType.INTERACTION_RESUMED,
+        EventType.INTERACTION_PAUSED,
+        EventType.INTERACTION_COMPLETED,
+        EventType.INTERACTION_FAILED,
+        EventType.INTERACTION_INTERRUPTED,
+    }
+)
+_TERMINAL_SESSION_EVIDENCE_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        *TERMINAL_EVIDENCE_EVENT_TYPES,
+        *_TERMINAL_SESSION_EVIDENCE_INTERACTION_LIFECYCLE_EVENT_TYPES,
+    }
+)
+
+
+class TerminalSessionEvidenceLimits(BaseModel):
+    """Caller-selected ceilings for one exact terminal-session snapshot."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_events: StrictInt = Field(
+        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
+        ge=1,
+        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS,
+    )
+    max_transcript_records: StrictInt = Field(
+        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS,
+        ge=1,
+        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
+    )
+    max_record_bytes: StrictInt = Field(
+        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
+        ge=1,
+        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
+    )
+    max_total_bytes: StrictInt = Field(
+        default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
+        ge=1,
+        le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
+    )
+
+
+class TerminalSessionEvidenceErrorCode(StrEnum):
+    """Stable reason why a terminal-session snapshot cannot be returned."""
+
+    SESSION_NOT_FOUND = "session_not_found"
+    SESSION_NOT_TERMINAL = "session_not_terminal"
+    SESSION_INTERRUPTED = "session_interrupted"
+    INITIAL_TRANSCRIPT_INCOMPLETE = "initial_transcript_incomplete"
+    TERMINAL_EVENT_MISSING = "terminal_event_missing"
+    TERMINAL_EVENT_CONFLICT = "terminal_event_conflict"
+    TERMINAL_EVENT_DUPLICATE = "terminal_event_duplicate"
+    TERMINAL_PUBLICATION_MARKER_INVALID = "terminal_publication_marker_invalid"
+    TERMINAL_PUBLICATION_MARKER_CONFLICT = "terminal_publication_marker_conflict"
+    EVIDENCE_INCONSISTENT = "evidence_inconsistent"
+    EVENT_LIMIT_EXCEEDED = "event_limit_exceeded"
+    TRANSCRIPT_LIMIT_EXCEEDED = "transcript_limit_exceeded"
+    RECORD_BYTES_EXCEEDED = "record_bytes_exceeded"
+    TOTAL_BYTES_EXCEEDED = "total_bytes_exceeded"
+    TRANSPORT_BYTES_EXCEEDED = "transport_bytes_exceeded"
+
+
+_TERMINAL_SESSION_EVIDENCE_ERROR_MESSAGES = {
+    TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND: "Session does not exist.",
+    TerminalSessionEvidenceErrorCode.SESSION_NOT_TERMINAL: (
+        "Session has not reached a supported terminal state."
+    ),
+    TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED: (
+        "Interrupted sessions are not eligible terminal evidence."
+    ),
+    TerminalSessionEvidenceErrorCode.INITIAL_TRANSCRIPT_INCOMPLETE: (
+        "The authoritative initial transcript was not fully published."
+    ),
+    TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_MISSING: (
+        "The current run has no matching terminal event."
+    ),
+    TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT: (
+        "The current terminal event contradicts the session status."
+    ),
+    TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE: (
+        "The current run has duplicate terminal events."
+    ),
+    TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID: (
+        "The terminal-publication marker is invalid."
+    ),
+    TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT: (
+        "The terminal-publication marker contradicts the terminal event."
+    ),
+    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT: (
+        "Terminal-session evidence contains inconsistent boundaries."
+    ),
+    TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED: (
+        "Terminal-session evidence exceeds the event-count limit."
+    ),
+    TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED: (
+        "Terminal-session evidence exceeds the transcript-count limit."
+    ),
+    TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED: (
+        "Terminal-session evidence contains an oversized record."
+    ),
+    TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED: (
+        "Terminal-session evidence exceeds the total-byte limit."
+    ),
+    TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED: (
+        "Terminal-session evidence exceeds a backend transport safety limit."
+    ),
+}
+
+
+class TerminalSessionEvidenceError(RuntimeError):
+    """Bounded typed failure from ``load_terminal_session_evidence``."""
+
+    def __init__(
+        self,
+        code: TerminalSessionEvidenceErrorCode,
+        *,
+        limit: int | None = None,
+        observed: int | None = None,
+    ) -> None:
+        if not isinstance(code, TerminalSessionEvidenceErrorCode):
+            raise TypeError("code must be a TerminalSessionEvidenceErrorCode.")
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None.")
+        if observed is not None and (type(observed) is not int or observed < 0):
+            raise ValueError("observed must be a non-negative integer or None.")
+        self.code = code
+        self.limit = limit
+        self.observed = observed
+        detail = _TERMINAL_SESSION_EVIDENCE_ERROR_MESSAGES[code]
+        if limit is not None:
+            detail = f"{detail} Limit: {limit}."
+        super().__init__(detail)
+
+
+class TerminalPublicationMarker(BaseModel):
+    """Bounded projection of a still-pending terminal-publication operation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: str
+    run_epoch: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+
+    @field_validator("operation_id")
+    @classmethod
+    def validate_operation_id(cls, value: str) -> str:
+        return require_clean_nonblank(value, "operation_id")
+
+
+class TerminalSessionEvidenceBoundary(BaseModel):
+    """Completeness and working-set metadata for a terminal evidence snapshot."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    first_event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    terminal_event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    transcript_end_index_exclusive: StrictInt = Field(
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    run_epoch: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    event_count: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    transcript_count: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    session_bytes: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    event_bytes: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    transcript_bytes: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+    terminal_publication_marker_bytes: StrictInt = Field(
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
+    largest_record_bytes: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    total_bytes: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    lifecycle_event_sequences: tuple[StrictInt, ...] = ()
+
+    @field_validator("lifecycle_event_sequences")
+    @classmethod
+    def validate_lifecycle_event_sequences(cls, value) -> tuple[int, ...]:
+        sequences = tuple(value)
+        if any(
+            type(sequence) is not int or sequence < 1 or sequence > MAX_DURABLE_JSON_INTEGER
+            for sequence in sequences
+        ):
+            raise ValueError("Lifecycle event sequences must be positive durable integers.")
+        if any(left >= right for left, right in pairwise(sequences)):
+            raise ValueError("Lifecycle event sequences must be strictly increasing.")
+        return sequences
+
+
+class TerminalSessionEvidence(BaseModel):
+    """One exact, bounded store snapshot through a completed or failed run."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    session: Session
+    events: tuple[EventRecord, ...]
+    transcript: tuple[TranscriptRecord, ...]
+    terminal_publication_marker: TerminalPublicationMarker | None = None
+    boundary: TerminalSessionEvidenceBoundary
+
+    @field_validator("session")
+    @classmethod
+    def copy_session(cls, value: Session) -> Session:
+        return copy_session(value)
+
+    @field_validator("events")
+    @classmethod
+    def copy_events(cls, value) -> tuple[EventRecord, ...]:
+        return tuple(record.model_copy(deep=True) for record in value)
+
+    @field_validator("transcript")
+    @classmethod
+    def copy_transcript(cls, value) -> tuple[TranscriptRecord, ...]:
+        return tuple(record.model_copy(deep=True) for record in value)
+
+    @model_validator(mode="after")
+    def validate_boundaries(self) -> TerminalSessionEvidence:
+        if not self.events:
+            raise ValueError("Terminal evidence requires at least one event.")
+        try:
+            _validate_terminal_session_evidence_content(
+                session=self.session,
+                marker=self.terminal_publication_marker,
+                terminal_record=self.events[-1],
+                events=self.events,
+                transcript=self.transcript,
+            )
+            expected_boundary = _measure_terminal_session_evidence(
+                session=self.session,
+                marker=self.terminal_publication_marker,
+                events=self.events,
+                transcript=self.transcript,
+                limits=None,
+            )
+        except TerminalSessionEvidenceError as exc:
+            raise ValueError(str(exc)) from None
+        if self.boundary != expected_boundary:
+            raise ValueError("Terminal evidence boundary metadata does not match its records.")
+        return self
+
+    @property
+    def terminal_event(self) -> EventRecord:
+        """Return the matching terminal event at the snapshot boundary."""
+
+        return self.events[-1]
+
+    @property
+    def lifecycle_events(self) -> tuple[EventRecord, ...]:
+        """Return invocation and interaction lifecycle records in durable order."""
+
+        return tuple(
+            record
+            for record in self.events
+            if record.event.type in _TERMINAL_SESSION_EVIDENCE_LIFECYCLE_EVENT_TYPES
+        )
+
+    @property
+    def initial_interaction_id(self) -> str | None:
+        """Return the first admitted interaction identity, when recorded."""
+
+        return next(
+            (
+                record.event.interaction_id
+                for record in self.events
+                if record.event.type == EventType.INTERACTION_STARTED
+            ),
+            None,
+        )
+
+
 class DeferredInteractionInput(BaseModel):
     """Source messages durably admitted but not yet visible in the transcript."""
 
@@ -4471,6 +4753,7 @@ class SessionStore(ABC):
     supports_mcp_manifest_history: ClassVar[bool] = False
     supports_session_topology: ClassVar[bool] = False
     supports_public_authority_aliases: ClassVar[bool] = False
+    supports_terminal_session_evidence: ClassVar[bool] = False
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
@@ -5274,6 +5557,25 @@ class SessionStore(ABC):
 
         raise NotImplementedError(
             f"{type(self).__name__} does not implement byte-bounded event queries."
+        )
+
+    async def load_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        limits: TerminalSessionEvidenceLimits | None = None,
+    ) -> TerminalSessionEvidence:
+        """Read one exact bounded snapshot through the current terminal event.
+
+        Implementations must resolve terminal status, publication authority,
+        the event cutoff, and the complete attributed transcript in one stable
+        read. Unsupported, incomplete, contradictory, or oversized evidence
+        fails with ``TerminalSessionEvidenceError``; it is never truncated.
+        """
+
+        del session_id, limits
+        raise NotImplementedError(
+            "This SessionStore does not support terminal-session evidence reads."
         )
 
     async def query_latest_interaction_events(
@@ -14593,6 +14895,431 @@ def _checkpoint_with_session_run_operation(
         "run_epoch": next_run_epoch,
     }
     return updated
+
+
+def _copy_terminal_session_evidence_limits(
+    limits: TerminalSessionEvidenceLimits | None,
+) -> TerminalSessionEvidenceLimits:
+    if limits is None:
+        return TerminalSessionEvidenceLimits()
+    if type(limits) is not TerminalSessionEvidenceLimits:
+        raise TypeError("limits must be a TerminalSessionEvidenceLimits or None.")
+    return limits.model_copy(deep=True)
+
+
+def _terminal_session_evidence_marker_from_checkpoint(
+    checkpoint: dict[str, Any] | None,
+) -> TerminalPublicationMarker | None:
+    try:
+        operation = _session_run_operation_from_checkpoint(checkpoint)
+    except (TypeError, ValueError) as exc:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_INVALID
+        ) from exc
+    if operation is None:
+        return None
+    return TerminalPublicationMarker(
+        operation_id=operation.operation_id,
+        run_epoch=operation.run_epoch,
+    )
+
+
+def _terminal_session_evidence_expected_event_type(session: Session) -> EventType:
+    if session.status == SessionStatus.INTERRUPTED:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED)
+    expected = _TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS.get(session.status)
+    if expected not in {EventType.SESSION_COMPLETED, EventType.SESSION_FAILED}:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.SESSION_NOT_TERMINAL)
+    return expected
+
+
+def _classify_terminal_session_evidence_records(
+    *,
+    session: Session,
+    marker: TerminalPublicationMarker | None,
+    newest_evidence_records: Sequence[EventRecord],
+    initial_transcript_pending: bool,
+    pending_session_interrupt: bool,
+) -> EventRecord:
+    """Validate the bounded current-run evidence and return its terminal record.
+
+    ``newest_evidence_records`` contains at most the two newest session
+    lifecycle/terminal records in descending durable-sequence order. Two are
+    sufficient to distinguish a current terminal record, a newer lifecycle
+    boundary, and a duplicate current-run publication.
+    """
+
+    expected_event_type = _terminal_session_evidence_expected_event_type(session)
+    if len(newest_evidence_records) > TERMINAL_EVIDENCE_QUERY_LIMIT:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    if any(left.sequence <= right.sequence for left, right in pairwise(newest_evidence_records)):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    if any(record.event.session_id != session.id for record in newest_evidence_records):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    if initial_transcript_pending:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.INITIAL_TRANSCRIPT_INCOMPLETE
+        )
+    if pending_session_interrupt:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
+        )
+    if marker is not None and marker.run_epoch != session.run_epoch:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
+        )
+
+    events_after_lifecycle: list[EventRecord] = []
+    for record in newest_evidence_records:
+        if record.event.type in {
+            EventType.SESSION_STARTED,
+            EventType.SESSION_RESUMED,
+            EventType.SESSION_FORKED,
+        }:
+            break
+        events_after_lifecycle.append(record)
+
+    current_operation_id = (
+        marker.operation_id
+        if marker is not None
+        else next(
+            (
+                record.event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+                for record in events_after_lifecycle
+            ),
+            None,
+        )
+    )
+    if any(
+        record.event.type != expected_event_type
+        and (record.event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY) == current_operation_id)
+        for record in events_after_lifecycle
+    ):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT)
+    if (
+        marker is not None
+        and events_after_lifecycle
+        and events_after_lifecycle[0].event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+        != marker.operation_id
+    ):
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
+        )
+
+    classification = classify_current_terminal_evidence(
+        evidence_events=tuple(record.event for record in newest_evidence_records),
+        expected_event_type=expected_event_type,
+        run_operation_id=None if marker is None else marker.operation_id,
+        interruption_request_id=None,
+    )
+    if classification.run_operation_conflict:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
+        )
+    if not classification.events:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_MISSING)
+    if len(classification.events) > 1:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE
+        )
+    terminal_event_id = classification.events[0].id
+    for record in newest_evidence_records:
+        if record.event.id == terminal_event_id:
+            return record
+    raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+
+
+def _terminal_session_evidence_record_bytes(value: BaseModel) -> int:
+    return compact_json_utf8_size(value.model_dump(mode="json"))
+
+
+def _validate_terminal_session_evidence_content(
+    *,
+    session: Session,
+    marker: TerminalPublicationMarker | None,
+    terminal_record: EventRecord,
+    events: Sequence[EventRecord],
+    transcript: Sequence[TranscriptRecord],
+) -> None:
+    """Prove that the complete bounded prefix represents one terminal run."""
+
+    expected_event_type = _terminal_session_evidence_expected_event_type(session.status)
+    if not events or (
+        events[-1].sequence != terminal_record.sequence
+        or events[-1].event.id != terminal_record.event.id
+    ):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    if any(left.sequence >= right.sequence for left, right in pairwise(events)) or any(
+        record.event.session_id != session.id for record in events
+    ):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    if any(record.index != index for index, record in enumerate(transcript)):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+
+    current_run_start = 0
+    for index, record in enumerate(events):
+        if record.event.type in TERMINAL_LIFECYCLE_EVENT_TYPES:
+            current_run_start = index + 1
+    current_terminal_records = tuple(
+        record for record in events[current_run_start:] if record.event.type in TERMINAL_EVENT_TYPES
+    )
+    if not current_terminal_records:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_MISSING)
+    if any(record.event.type != expected_event_type for record in current_terminal_records):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_CONFLICT)
+    if len(current_terminal_records) > 1:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE
+        )
+    current_terminal = current_terminal_records[0]
+    if (
+        current_terminal.sequence != terminal_record.sequence
+        or current_terminal.event.id != terminal_record.event.id
+    ):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+
+    operation_id = current_terminal.event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY)
+    if operation_id is not None:
+        try:
+            operation_id = require_clean_nonblank(
+                operation_id,
+                "terminal event session_run_operation_id",
+            )
+        except (TypeError, ValueError) as exc:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+            ) from exc
+    if marker is not None and (
+        marker.run_epoch != session.run_epoch or operation_id != marker.operation_id
+    ):
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TERMINAL_PUBLICATION_MARKER_CONFLICT
+        )
+
+    lifecycle_interaction_ids = {
+        record.event.interaction_id
+        for record in events
+        if record.event.type in _TERMINAL_SESSION_EVIDENCE_INTERACTION_LIFECYCLE_EVENT_TYPES
+        and record.event.interaction_id is not None
+    }
+    if any(
+        record.interaction_id is not None and record.interaction_id not in lifecycle_interaction_ids
+        for record in transcript
+    ):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+
+
+def _terminal_session_evidence_checked_record_bytes(
+    value: BaseModel,
+    *,
+    limits: TerminalSessionEvidenceLimits,
+    prior_total_bytes: int,
+) -> tuple[int, int]:
+    record_bytes = _terminal_session_evidence_record_bytes(value)
+    if record_bytes > limits.max_record_bytes:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
+            limit=limits.max_record_bytes,
+            observed=record_bytes,
+        )
+    total_bytes = prior_total_bytes + record_bytes
+    if total_bytes > limits.max_total_bytes:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
+            limit=limits.max_total_bytes,
+            observed=total_bytes,
+        )
+    return record_bytes, total_bytes
+
+
+_TERMINAL_SESSION_EVIDENCE_TOP_LEVEL_FIELDS = (
+    "session",
+    "events",
+    "transcript",
+    "terminal_publication_marker",
+    "boundary",
+)
+_TERMINAL_SESSION_EVIDENCE_TOP_LEVEL_ENVELOPE_BYTES = (
+    2
+    + len(_TERMINAL_SESSION_EVIDENCE_TOP_LEVEL_FIELDS)
+    - 1
+    + sum(
+        compact_json_utf8_size(field_name) + 1
+        for field_name in _TERMINAL_SESSION_EVIDENCE_TOP_LEVEL_FIELDS
+    )
+)
+
+
+def _terminal_session_evidence_array_bytes(record_bytes: int, record_count: int) -> int:
+    return 2 + record_bytes + max(0, record_count - 1)
+
+
+def _terminal_session_evidence_boundary_with_exact_total(
+    *,
+    session: Session,
+    marker_bytes: int,
+    event_count: int,
+    transcript_count: int,
+    session_bytes: int,
+    event_bytes: int,
+    transcript_bytes: int,
+    largest_record_bytes: int,
+    lifecycle_event_sequences: tuple[int, ...],
+    first_event_sequence: int,
+    terminal_event_sequence: int,
+) -> TerminalSessionEvidenceBoundary:
+    fixed_snapshot_bytes = (
+        _TERMINAL_SESSION_EVIDENCE_TOP_LEVEL_ENVELOPE_BYTES
+        + session_bytes
+        + _terminal_session_evidence_array_bytes(event_bytes, event_count)
+        + _terminal_session_evidence_array_bytes(transcript_bytes, transcript_count)
+        + (marker_bytes if marker_bytes else len("null"))
+    )
+    total_bytes = 1
+    for _ in range(len(str(MAX_DURABLE_JSON_INTEGER)) + 1):
+        boundary = TerminalSessionEvidenceBoundary(
+            first_event_sequence=first_event_sequence,
+            terminal_event_sequence=terminal_event_sequence,
+            transcript_end_index_exclusive=transcript_count,
+            run_epoch=session.run_epoch,
+            event_count=event_count,
+            transcript_count=transcript_count,
+            session_bytes=session_bytes,
+            event_bytes=event_bytes,
+            transcript_bytes=transcript_bytes,
+            terminal_publication_marker_bytes=marker_bytes,
+            largest_record_bytes=largest_record_bytes,
+            total_bytes=total_bytes,
+            lifecycle_event_sequences=lifecycle_event_sequences,
+        )
+        measured_total_bytes = fixed_snapshot_bytes + _terminal_session_evidence_record_bytes(
+            boundary
+        )
+        if measured_total_bytes == total_bytes:
+            return boundary
+        if measured_total_bytes > MAX_DURABLE_JSON_INTEGER:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+            )
+        total_bytes = measured_total_bytes
+    raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+
+
+def _measure_terminal_session_evidence(
+    *,
+    session: Session,
+    marker: TerminalPublicationMarker | None,
+    events: Sequence[EventRecord],
+    transcript: Sequence[TranscriptRecord],
+    limits: TerminalSessionEvidenceLimits | None,
+) -> TerminalSessionEvidenceBoundary:
+    record_total_bytes = 0
+
+    def measure_record(value: BaseModel) -> int:
+        nonlocal record_total_bytes
+        if limits is None:
+            record_bytes = _terminal_session_evidence_record_bytes(value)
+            record_total_bytes += record_bytes
+            return record_bytes
+        record_bytes, record_total_bytes = _terminal_session_evidence_checked_record_bytes(
+            value,
+            limits=limits,
+            prior_total_bytes=record_total_bytes,
+        )
+        return record_bytes
+
+    session_bytes = measure_record(session)
+    largest_record_bytes = session_bytes
+    event_bytes = 0
+    for record in events:
+        record_bytes = measure_record(record)
+        event_bytes += record_bytes
+        largest_record_bytes = max(largest_record_bytes, record_bytes)
+    transcript_bytes = 0
+    for record in transcript:
+        record_bytes = measure_record(record)
+        transcript_bytes += record_bytes
+        largest_record_bytes = max(largest_record_bytes, record_bytes)
+    marker_bytes = 0
+    if marker is not None:
+        marker_bytes = measure_record(marker)
+        largest_record_bytes = max(largest_record_bytes, marker_bytes)
+
+    lifecycle_event_sequences = tuple(
+        record.sequence
+        for record in events
+        if record.event.type in _TERMINAL_SESSION_EVIDENCE_LIFECYCLE_EVENT_TYPES
+    )
+    boundary = _terminal_session_evidence_boundary_with_exact_total(
+        session=session,
+        marker_bytes=marker_bytes,
+        event_count=len(events),
+        transcript_count=len(transcript),
+        session_bytes=session_bytes,
+        event_bytes=event_bytes,
+        transcript_bytes=transcript_bytes,
+        largest_record_bytes=largest_record_bytes,
+        lifecycle_event_sequences=lifecycle_event_sequences,
+        first_event_sequence=events[0].sequence,
+        terminal_event_sequence=events[-1].sequence,
+    )
+    if limits is not None and boundary.total_bytes > limits.max_total_bytes:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
+            limit=limits.max_total_bytes,
+            observed=boundary.total_bytes,
+        )
+    return boundary
+
+
+def _assemble_terminal_session_evidence(
+    *,
+    session: Session,
+    marker: TerminalPublicationMarker | None,
+    terminal_record: EventRecord,
+    events: Sequence[EventRecord],
+    transcript: Sequence[TranscriptRecord],
+    limits: TerminalSessionEvidenceLimits,
+) -> TerminalSessionEvidence:
+    """Apply the backend-neutral completeness and exact-byte contract."""
+
+    limits = _copy_terminal_session_evidence_limits(limits)
+    if len(events) > limits.max_events:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+            limit=limits.max_events,
+            observed=len(events),
+        )
+    if len(transcript) > limits.max_transcript_records:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED,
+            limit=limits.max_transcript_records,
+            observed=len(transcript),
+        )
+    _validate_terminal_session_evidence_content(
+        session=session,
+        marker=marker,
+        terminal_record=terminal_record,
+        events=events,
+        transcript=transcript,
+    )
+    boundary = _measure_terminal_session_evidence(
+        session=session,
+        marker=marker,
+        events=events,
+        transcript=transcript,
+        limits=limits,
+    )
+    # The complete content and its derived boundary were validated and sized
+    # above. Construct a detached result without asking the public model
+    # validator to repeat an O(snapshot) byte walk.
+    return TerminalSessionEvidence.model_construct(
+        session=copy_session(session),
+        events=tuple(record.model_copy(deep=True) for record in events),
+        transcript=tuple(record.model_copy(deep=True) for record in transcript),
+        terminal_publication_marker=(None if marker is None else marker.model_copy(deep=True)),
+        boundary=boundary.model_copy(deep=True),
+    )
 
 
 def _event_with_session_run_operation(

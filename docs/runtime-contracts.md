@@ -634,6 +634,59 @@ deserializing payloads when its cumulative serialized input exceeds the caller's
 byte ceiling. The base store raises `NotImplementedError`; callers must not fall
 back to `query_events(...)` when a pre-hydration byte guarantee is required.
 
+`load_terminal_session_evidence(...)` is the store-local capture boundary for a
+completed or failed session. In one stable snapshot it returns the detached
+`Session`, the exact per-session event prefix ending at the matching
+`session.completed` or `session.failed` record, the complete transcript visible
+from index zero with interaction attribution, any still-pending resumed-run
+publication marker, and a `TerminalSessionEvidenceBoundary`. The boundary
+records the terminal sequence, transcript end index, run epoch, lifecycle-event
+sequences, counts, per-kind record bytes, publication-marker bytes, and the exact
+canonical JSON size of the complete returned evidence object. Events written
+after the terminal record, including trailing hook telemetry, are excluded.
+Checkpoint contents other than the bounded publication-marker projection,
+descendants, files, artifacts, and probes are not part of this operation.
+
+The operation never returns a partial result. Active and interrupted sessions,
+missing or contradictory terminal records, incomplete publication authority,
+invalid marker state, inconsistent attribution, and exceeded limits raise a
+`TerminalSessionEvidenceError` with a stable
+`TerminalSessionEvidenceErrorCode`. Error text does not include stored record
+content. The default and maximum caller-selectable ceilings are:
+
+| Ceiling | Default | Hard maximum |
+| --- | ---: | ---: |
+| Events | 10,000 | 100,000 |
+| Transcript records | 5,000 | 50,000 |
+| One captured source record | 1 MiB | 8 MiB |
+| Complete canonical snapshot | 32 MiB | 128 MiB |
+
+The in-memory implementation owns one lock while it classifies and copies the
+bounded result. SQLite uses one read transaction; PostgreSQL uses a read-only
+repeatable-read transaction. Both SQL implementations project only the bounded
+terminal/checkpoint fields first, scan at most each configured count ceiling
+plus one row using the existing session-order indexes, and apply conservative
+stored-length checks before hydrating payload JSON. PostgreSQL bounds the full
+raw JSONB text representation, including serializer whitespace and whitespace
+inside string values. That transport guard has a separate 3:2 allowance over
+the caller's compact-JSON ceilings. It is an independent PostgreSQL working-set
+policy, not a promise that raw JSONB is at most 3:2 larger than portable JSON:
+JSONB can expand scientific-notation numbers into substantially longer
+fixed-point decimals. PostgreSQL may therefore raise
+`transport_bytes_exceeded` for canonically valid evidence that the memory and
+SQLite stores can return. Callers can distinguish that backend safety failure
+from `record_bytes_exceeded` and `total_bytes_exceeded`; Cayu does not hydrate an
+arbitrarily larger PostgreSQL representation merely to discover its smaller
+canonical size. Every backend applies the same exact compact-JSON calculation
+to any result that passes its pre-hydration guard. After hydration, the complete
+bounded event prefix is revalidated so a terminal contradiction or duplicate
+hidden behind the candidate cutoff cannot be accepted. Consequently a count or
+transport-size rejection has work proportional to the configured ceilings, and
+a successful result has work proportional to the returned snapshot. Custom
+stores must leave `supports_terminal_session_evidence = False` unless they
+implement these snapshot, completeness, ordering, pre-hydration, and limit
+guarantees.
+
 Checkpoint field updates that can race with runtime finalization use `transform_checkpoint(...)`; transcript repair uses `append_transcript_messages_and_transform_checkpoint(...)` when it must update both atomically. Built-in stores execute those transforms while holding their session/checkpoint write boundary (a process-local lock for the in-memory store, an immediate write transaction for SQLite, and a row lock for PostgreSQL). Interruption-aware checkpoint replacements explicitly take the current `pending_session_interrupt` and `pending_interruption_cascade` values—including their absence—from that transactional snapshot, so an older runtime snapshot can neither erase active interruption state nor resurrect cleared state.
 
 ### Durable session steering

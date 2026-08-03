@@ -195,6 +195,25 @@ The same suite/assertion surface supports several modes:
   serializable `Trajectory` already makes a production run replayable; the promotion helper and
   datasets are planned follow-ups.
 
+## Capturing terminal session evidence
+
+The built-in in-memory, SQLite, and PostgreSQL session stores expose
+`load_terminal_session_evidence(session_id, limits=...)` as the safe input
+boundary for future production-session promotion. The operation accepts only a
+coherent completed or failed session and returns one detached, bounded snapshot:
+the session, its durable event prefix through the matching terminal event, its
+attributed transcript, publication-marker state, and exact boundary/count/byte
+metadata, including the complete canonical returned size. It excludes later
+event telemetry and fails with a typed error instead of truncating incomplete,
+contradictory, or oversized evidence.
+
+This operation does not itself create a `Trajectory`, an eval case, or a corpus,
+and it does not execute an eval or add a control-plane route. Those product
+steps build on this storage guarantee; the existing fresh-run, replay, report,
+and comparison workflows are unchanged. See
+[Runtime Contracts](runtime-contracts.md#sessionstore) for the snapshot and
+resource-limit contract.
+
 ## LLM Judges
 
 For *subjective* quality — "is this answer helpful / accurate / on-tone?" — a deterministic
