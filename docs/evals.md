@@ -146,6 +146,9 @@ validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
 case, 16 messages per case, 65,536 characters per message, 262,144 input
 characters per case, 100 sequential trials, and a 3,600-second per-trial timeout.
+Each suite may expand to at most 10,000 published assertion results across all
+of its cases and trials, so every accepted suite fits the complete 32 MiB public
+result graph instead of failing only after execution.
 Unknown fields and assertion kinds fail closed; schema version 1 has no legacy
 compatibility loader.
 
@@ -156,7 +159,11 @@ names and counts, model-step/token counts, and optional currency-local cost
 totals. It carries no session, event, interaction, provider, model, agent,
 environment, payload, tool argument/result, or cost line-item identity. Child,
 output, tool, model-step, and usage completeness are explicit; unavailable or
-limit-exceeded evidence is never represented as a complete observation.
+limit-exceeded evidence is never represented as a complete observation. The
+public projector derives `root_evidence_available` from the durable root session,
+so detached usage fields cannot make a rootless replay conclusive. The compiled
+`EvalAssertion` adapter also preserves the existing explicit complete-synthetic
+context contract used by direct assertions.
 
 When cost evidence is requested, callers inject a trusted local `PriceBook`.
 `pricing_profile_identity(...)` canonicalizes and fingerprints the validated
@@ -164,7 +171,26 @@ book together with Cayu's pricing-semantics version. The evidence and corpus
 carry only that identity and bounded aggregate costs, never the book or its
 provider/model line items. Reordering behavior-equivalent top-level price-book
 entries does not change the identity; changing pricing content or Cayu's pricing
-semantics does.
+semantics does. Every corpus cost assertion must use one of the pricing
+profile's advertised currencies, keeping the complete per-trial cost projection
+inside the profile's 32-currency evidence bound.
+
+`evaluate_assertion_spec(...)` and `evaluate_assertion_specs(...)` are the pure
+portable evaluation boundary: they consume only an `AssertionEvidenceView` and
+return the existing four-state `EvalAssertionResult`. `compile_assertion_spec(...)`
+adapts one allowlisted spec to the existing `EvalAssertion` runner interface.
+Callers inject the `CayuApp` redaction boundary, evidence policy, and optional
+trusted local `PriceBook`; the runner projects one immutable evidence view and
+shares it across every compiled assertion in the trial. Cost assertions may
+share one trusted price-book source; the runner validates each distinct source
+once per trial and rejects any change from its compilation-time fingerprint.
+During a fresh run, the executing `CayuApp` is the authoritative redaction
+boundary; the compiler-supplied
+app is used for offline replay. Existing built-in
+assertions and compiled specs share the same decision functions, so a missing or
+bounded-away observation is `unavailable`, while a complete observed negative is
+`failed`. Tool-order assertions use model-requested transcript order;
+tool-presence/count assertions use calls that actually started.
 
 ## First-party runtime acceptance suite
 

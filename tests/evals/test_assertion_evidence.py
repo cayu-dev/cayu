@@ -196,6 +196,7 @@ def test_public_evidence_is_redacted_alias_free_and_cost_bounded():
         cost_currencies=("USD",),
     )
 
+    assert view.root_evidence_available is True
     assert view.root_status == "completed"
     assert view.child_statuses == ("failed",)
     assert view.child_evidence_state == "complete"
@@ -355,6 +356,7 @@ def test_evidence_ignores_usage_without_a_durable_root():
         evidence_policy=EvaluationEvidencePolicySpec.standard(),
     )
 
+    assert view.root_evidence_available is False
     assert view.root_status is None
     assert view.model_step_evidence_state == "unavailable"
     assert view.model_steps is None

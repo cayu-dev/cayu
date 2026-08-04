@@ -89,7 +89,7 @@ from cayu.evals import (
     write_trajectory_json,
 )
 from cayu.evals.models import WorkspaceFileProbe
-from cayu.evals.runner import _build_child_trajectories
+from cayu.evals.runner import _blocked_assertion_results, _build_child_trajectories
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runtime import InMemorySessionStore, SessionIdentity
 from cayu.runtime.sessions import Session, SessionStatus
@@ -557,6 +557,177 @@ def test_failed_run_with_status_assertion_is_not_overridden():
     assert result.cases[0].status == EvalStatus.PASSED
 
 
+class _InvalidFailedSessionCapabilityAssertion(EvalAssertion):
+    def __init__(self, capability: object) -> None:
+        self.capability = capability
+
+    @property
+    def evaluates_failed_session(self) -> bool:
+        if isinstance(self.capability, Exception):
+            raise self.capability
+        return self.capability  # type: ignore[return-value]
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        return self.passed()
+
+
+@pytest.mark.parametrize(
+    ("capability", "diagnostic"),
+    [
+        (RuntimeError("broken failed-session hook"), "broken failed-session hook"),
+        ("yes", "evaluates_failed_session must return bool"),
+    ],
+)
+def test_failed_session_capability_errors_are_contained(capability, diagnostic):
+    result = asyncio.run(
+        run_eval_suite(
+            _failing_app(),
+            _failing_suite(
+                "invalid-failed-session-capability",
+                [_InvalidFailedSessionCapabilityAssertion(capability)],
+            ),
+        )
+    )
+
+    case = result.cases[0]
+    assert result.status is EvalStatus.ERROR
+    assert case.status is EvalStatus.ERROR
+    assert case.trials[0].status is EvalStatus.ERROR
+    assert case.trials[0].assertions[0].outcome is EvalOutcome.ERROR
+    assert diagnostic in case.error
+
+
+class _RaisingAssertionRevision(EvalAssertion):
+    @property
+    def assertion_revision(self) -> str | None:
+        raise RuntimeError("broken revision hook")
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        return self.passed()
+
+
+class _UnformattableAssertionError(RuntimeError):
+    def __str__(self) -> str:
+        raise RuntimeError("broken exception formatting")
+
+
+class _RaisingUnformattableAssertion(EvalAssertion):
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        raise _UnformattableAssertionError
+
+
+class _UnformattableAssertionName(EvalAssertion):
+    @property
+    def name(self) -> str:
+        raise _UnformattableAssertionError
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        return self.passed()
+
+
+class _UnavailableEvidenceStore(InMemorySessionStore):
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
+        raise NotImplementedError
+
+
+def test_blocked_failed_run_contains_assertion_revision_errors():
+    result = asyncio.run(
+        run_eval_suite(
+            _failing_app(),
+            _failing_suite("broken-revision", [_RaisingAssertionRevision()]),
+        )
+    )
+
+    trial = result.cases[0].trials[0]
+    assert result.status is EvalStatus.ERROR
+    assert trial.status is EvalStatus.ERROR
+    assert trial.assertions[0].outcome is EvalOutcome.ERROR
+    assert trial.assertions[0].assertion_revision is None
+    assert "broken revision hook" in trial.assertions[0].message
+
+
+def test_blocked_unavailable_run_promotes_assertion_revision_errors():
+    app = CayuApp(session_store=_UnavailableEvidenceStore(), enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    case = EvalCase(
+        id="broken-revision",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[_RaisingAssertionRevision()],
+    )
+
+    result = asyncio.run(run_eval_case(app, case, suite_id="suite"))
+
+    trial = result.trials[0]
+    assert result.status is EvalStatus.ERROR
+    assert trial.status is EvalStatus.ERROR
+    assert trial.unavailable_reason is None
+    assert trial.assertions[0].outcome is EvalOutcome.ERROR
+    assert "Assertion identity failed" in trial.error
+    assert "broken revision hook" in trial.assertions[0].message
+
+
+@pytest.mark.parametrize("outcome", [EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE])
+def test_blocked_results_contain_unformattable_identity_errors(outcome):
+    (assertion,) = _blocked_assertion_results([_UnformattableAssertionName()], outcome, "blocked")
+
+    assert assertion.name == "EvalAssertion"
+    assert assertion.outcome is EvalOutcome.ERROR
+    assert assertion.metadata["identity_error"] is True
+    assert assertion.message.count("_UnformattableAssertionError: <exception str() failed>") == 2
+
+
+def test_completed_run_contains_assertion_revision_errors():
+    app = _app_with_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+    )
+    case = EvalCase(
+        id="broken-revision",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[_RaisingAssertionRevision()],
+    )
+
+    result = asyncio.run(run_eval_case(app, case, suite_id="suite"))
+
+    trial = result.trials[0]
+    assert result.status is EvalStatus.ERROR
+    assert trial.status is EvalStatus.ERROR
+    assert trial.assertions[0].outcome is EvalOutcome.ERROR
+    assert "broken revision hook" in trial.assertions[0].message
+
+
+def test_evaluate_assertions_contains_unformattable_extension_errors():
+    results = asyncio.run(evaluate_assertions(Trajectory(), [_RaisingUnformattableAssertion()]))
+
+    assert len(results) == 1
+    assert results[0].outcome is EvalOutcome.ERROR
+    assert (
+        results[0].message
+        == "Assertion raised _UnformattableAssertionError: <exception str() failed>"
+    )
+
+
 class _HangingProvider(ModelProvider):
     name = "hanging"
 
@@ -645,6 +816,34 @@ def test_case_timeout_records_error_instead_of_hanging():
     assert result.status == EvalStatus.ERROR
     assert result.cases[0].status == EvalStatus.ERROR
     assert "timed out after 0.05 seconds" in result.cases[0].trials[0].error
+
+
+def test_case_timeout_contains_assertion_revision_errors():
+    case = EvalCase(
+        id="broken-revision-timeout",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "go")],
+            max_steps=1,
+        ),
+        assertions=[_RaisingAssertionRevision()],
+    )
+
+    result = asyncio.run(
+        run_eval_case(
+            _app_with_provider(_HangingProvider()),
+            case,
+            suite_id="timeout",
+            timeout_seconds=0.01,
+        )
+    )
+
+    trial = result.trials[0]
+    assert result.status is EvalStatus.ERROR
+    assert trial.status is EvalStatus.ERROR
+    assert "timed out after 0.01 seconds" in trial.error
+    assert trial.assertions[0].outcome is EvalOutcome.ERROR
+    assert "broken revision hook" in trial.assertions[0].message
 
 
 def test_case_timeout_does_not_retry_store_load_after_deadline():

@@ -124,9 +124,24 @@ def test_tools_called_in_order_uses_exact_transcript_order_not_event_scheduler_o
     # Parallel execution may start in a different scheduler order. The assertion
     # deliberately ignores it and follows the model-authored transcript parts.
     events = (
-        Event(type=EventType.TOOL_CALL_STARTED, session_id="s", tool_name="read_file"),
-        Event(type=EventType.TOOL_CALL_STARTED, session_id="s", tool_name="search"),
-        Event(type=EventType.TOOL_CALL_STARTED, session_id="s", tool_name="submit"),
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id="s",
+            tool_name="read_file",
+            payload={"tool_call_id": "read-call"},
+        ),
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id="s",
+            tool_name="search",
+            payload={"tool_call_id": "search-call"},
+        ),
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id="s",
+            tool_name="submit",
+            payload={"tool_call_id": "submit-call"},
+        ),
     )
     context = _context(Trajectory(events=events, transcript=transcript))
 
@@ -259,7 +274,9 @@ def test_child_session_completed_filters_direct_children_and_reports_incomplete_
         {"session_id": None, "status": None, "agent_name": None},
     ]
 
-    assert asyncio.run(ChildSessionCompleted(min_count=2).evaluate(context)).passed is True
+    incomplete_match = asyncio.run(ChildSessionCompleted(min_count=2).evaluate(context))
+    assert incomplete_match.outcome is EvalOutcome.UNAVAILABLE
+    assert incomplete_match.score is None
 
     mismatch = asyncio.run(
         ChildSessionCompleted(agent_name="helper", min_count=2).evaluate(context)

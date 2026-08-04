@@ -9,7 +9,30 @@ from typing import Any
 from cayu.artifacts import ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, TextPart, ToolCallPart, ToolResultPart
+from cayu.evals.corpus import (
+    EVIDENCE_MAX_CHILD_SESSIONS,
+    EVIDENCE_MAX_FINAL_OUTPUT_CHARS,
+    EVIDENCE_MAX_MODEL_STEPS,
+    EVIDENCE_MAX_TOOL_CALLS,
+    EVIDENCE_MAX_TOTAL_TOKENS,
+)
+from cayu.evals.evidence import (
+    AssertionCostEvidenceV1,
+    EvidenceState,
+    _canonical_decimal,
+    _project_tool_evidence,
+)
 from cayu.evals.models import EvalAssertionResult, EvalContext, EvalOutcome, ProbeRequirements
+from cayu.evals.portable_evaluation import (
+    _evaluate_child_status,
+    _evaluate_final_output,
+    _evaluate_max_cost,
+    _evaluate_maximum,
+    _evaluate_root_status,
+    _evaluate_tool_called,
+    _evaluate_tools_in_order,
+    _evaluate_usage_recorded,
+)
 from cayu.runtime.costs import PriceBook, SessionCostSummary, estimate_session_cost
 from cayu.runtime.sessions import SessionStatus
 
@@ -20,6 +43,18 @@ class EvalAssertion(ABC):
     @property
     def name(self) -> str:
         return type(self).__name__
+
+    @property
+    def assertion_revision(self) -> str | None:
+        """Stable definition revision carried by results when one exists."""
+
+        return None
+
+    @property
+    def evaluates_failed_session(self) -> bool:
+        """Whether a failed root session is assertion evidence instead of a runner error."""
+
+        return False
 
     @abstractmethod
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
@@ -42,6 +77,7 @@ class EvalAssertion(ABC):
     ) -> EvalAssertionResult:
         return EvalAssertionResult(
             name=self.name,
+            assertion_revision=self.assertion_revision,
             outcome=EvalOutcome.PASSED,
             score=1.0,
             message=message,
@@ -58,6 +94,7 @@ class EvalAssertion(ABC):
     ) -> EvalAssertionResult:
         return EvalAssertionResult(
             name=self.name,
+            assertion_revision=self.assertion_revision,
             outcome=EvalOutcome.FAILED,
             score=0.0,
             message=message,
@@ -74,6 +111,7 @@ class EvalAssertion(ABC):
     ) -> EvalAssertionResult:
         return EvalAssertionResult(
             name=self.name,
+            assertion_revision=self.assertion_revision,
             outcome=EvalOutcome.UNAVAILABLE,
             message=message,
             metadata={} if metadata is None else metadata,
@@ -88,6 +126,7 @@ class EvalAssertion(ABC):
     ) -> EvalAssertionResult:
         return EvalAssertionResult(
             name=self.name,
+            assertion_revision=self.assertion_revision,
             outcome=EvalOutcome.ERROR,
             message=message,
             metadata={} if metadata is None else metadata,
@@ -105,6 +144,7 @@ class EvalAssertion(ABC):
         # threshold, while the continuous score is preserved on the result.
         return EvalAssertionResult(
             name=self.name,
+            assertion_revision=self.assertion_revision,
             score=score,
             threshold=threshold,
             outcome=EvalOutcome.PASSED if score >= threshold else EvalOutcome.FAILED,
@@ -117,17 +157,15 @@ class SessionStatusIs(EvalAssertion):
     def __init__(self, status: SessionStatus | str) -> None:
         self.status = SessionStatus(status)
 
+    @property
+    def evaluates_failed_session(self) -> bool:
+        return True
+
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        actual = context.session.status if context.session is not None else None
-        if actual == self.status:
-            return self.passed(f"Session status is {self.status.value}.")
-        return self.failed(
-            f"Expected session status {self.status.value}, got "
-            f"{actual.value if actual is not None else 'none'}.",
-            metadata={
-                "expected": self.status.value,
-                "actual": actual.value if actual is not None else None,
-            },
+        return _evaluate_root_status(
+            name=self.name,
+            expected=self.status.value,
+            actual=(context.session.status.value if context.session is not None else None),
         )
 
 
@@ -152,6 +190,37 @@ class ChildSessionCompleted(EvalAssertion):
         self.min_count = _nonnegative_int(min_count, "min_count")
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        if not context.root_evidence_available:
+            return _evaluate_child_status(
+                name=self.name,
+                expected=SessionStatus.COMPLETED.value,
+                statuses=(),
+                state="unavailable",
+                minimum=self.min_count,
+                maximum=None,
+            )
+        if self.agent_name is None:
+            retained_children = context.trajectory.children[:EVIDENCE_MAX_CHILD_SESSIONS]
+            statuses = tuple(
+                child.session.status.value
+                for child in retained_children
+                if child.session is not None
+            )
+            if context.trajectory.children_incomplete or len(statuses) != len(retained_children):
+                state: EvidenceState = "unavailable"
+                statuses = ()
+            elif len(context.trajectory.children) > EVIDENCE_MAX_CHILD_SESSIONS:
+                state = "limit_exceeded"
+            else:
+                state = "complete"
+            return _evaluate_child_status(
+                name=self.name,
+                expected=SessionStatus.COMPLETED.value,
+                statuses=statuses,
+                state=state,
+                minimum=self.min_count,
+                maximum=None,
+            )
         observed_children = [
             {
                 "session_id": child.session.id if child.session is not None else None,
@@ -199,11 +268,21 @@ class FinalOutputContains(EvalAssertion):
         self.text = _require_text(text, "text")
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        if self.text in context.final_output:
-            return self.passed("Final output contains expected text.")
-        return self.failed(
-            "Final output did not contain expected text.",
-            metadata={"expected": self.text, "final_output": context.final_output},
+        if not context.root_evidence_available:
+            state: EvidenceState = "unavailable"
+            actual = ""
+        elif len(context.final_output) > EVIDENCE_MAX_FINAL_OUTPUT_CHARS:
+            state = "limit_exceeded"
+            actual = context.final_output[:EVIDENCE_MAX_FINAL_OUTPUT_CHARS]
+        else:
+            state = "complete"
+            actual = context.final_output
+        return _evaluate_final_output(
+            name=self.name,
+            expected=self.text,
+            actual=actual,
+            state=state,
+            contains=True,
         )
 
 
@@ -273,6 +352,8 @@ class EventNotOccurred(EventOccurred):
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         result = await super().evaluate(context)
+        if result.outcome in {EvalOutcome.UNAVAILABLE, EvalOutcome.ERROR}:
+            return result
         if result.passed:
             return self.passed(
                 f"Event {self.event_type} did not occur, as expected.",
@@ -338,20 +419,14 @@ class ToolCalled(EvalAssertion):
         self.max_count = None if max_count is None else _nonnegative_int(max_count, "max_count")
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        count = len(_tool_start_events(context.events, self.tool_name))
-        if count < self.min_count:
-            return self.failed(
-                f"Expected tool {self.tool_name} at least {self.min_count} time(s), got {count}.",
-                metadata={"tool_name": self.tool_name, "count": count},
-            )
-        if self.max_count is not None and count > self.max_count:
-            return self.failed(
-                f"Expected tool {self.tool_name} at most {self.max_count} time(s), got {count}.",
-                metadata={"tool_name": self.tool_name, "count": count},
-            )
-        return self.passed(
-            f"Observed tool {self.tool_name} {count} time(s).",
-            metadata={"tool_name": self.tool_name, "count": count},
+        _, started_tool_names, _, state = _direct_tool_evidence(context)
+        return _evaluate_tool_called(
+            name=self.name,
+            tool_name=self.tool_name,
+            started_tool_names=started_tool_names,
+            state=state,
+            minimum=self.min_count,
+            maximum=self.max_count,
         )
 
 
@@ -361,6 +436,8 @@ class ToolNotCalled(ToolCalled):
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         result = await super().evaluate(context)
+        if result.outcome in {EvalOutcome.UNAVAILABLE, EvalOutcome.ERROR}:
+            return result
         if result.passed:
             return self.passed(
                 f"Tool {self.tool_name} was not called, as expected.",
@@ -388,24 +465,12 @@ class ToolsCalledInOrder(EvalAssertion):
         )
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        actual = tuple(
-            part.tool_name
-            for message in context.transcript
-            for part in message.content
-            if type(part) is ToolCallPart
-        )
-        metadata = {
-            "expected": list(self.tool_names),
-            "actual": list(actual),
-        }
-        if actual == self.tool_names:
-            return self.passed(
-                "Tool calls matched the exact expected transcript order.",
-                metadata=metadata,
-            )
-        return self.failed(
-            "Tool calls did not match the exact expected transcript order.",
-            metadata=metadata,
+        actual, _, _, state = _direct_tool_evidence(context)
+        return _evaluate_tools_in_order(
+            name=self.name,
+            expected=self.tool_names,
+            actual=actual,
+            state=state,
         )
 
 
@@ -463,15 +528,13 @@ class MaxToolCalls(EvalAssertion):
         self.maximum = _nonnegative_int(maximum, "maximum")
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        count = _tool_call_count(context)
-        if count <= self.maximum:
-            return self.passed(
-                f"Tool call count {count} is within limit {self.maximum}.",
-                metadata={"tool_calls": count},
-            )
-        return self.failed(
-            f"Tool call count {count} exceeded limit {self.maximum}.",
-            metadata={"tool_calls": count, "maximum": self.maximum},
+        _, _, count, state = _direct_tool_evidence(context)
+        return _evaluate_maximum(
+            name=self.name,
+            evidence_area="tool call",
+            actual=count,
+            state=state,
+            maximum=self.maximum,
         )
 
 
@@ -485,14 +548,19 @@ class MaxModelSteps(EvalAssertion):
             if context.usage_summary is not None
             else _event_count(context.events, EventType.MODEL_COMPLETED)
         )
-        if count <= self.maximum:
-            return self.passed(
-                f"Model step count {count} is within limit {self.maximum}.",
-                metadata={"model_steps": count},
-            )
-        return self.failed(
-            f"Model step count {count} exceeded limit {self.maximum}.",
-            metadata={"model_steps": count, "maximum": self.maximum},
+        if not context.root_evidence_available:
+            state: EvidenceState = "unavailable"
+            count = None
+        elif count > EVIDENCE_MAX_MODEL_STEPS:
+            state = "limit_exceeded"
+        else:
+            state = "complete"
+        return _evaluate_maximum(
+            name=self.name,
+            evidence_area="model step",
+            actual=count,
+            state=state,
+            maximum=self.maximum,
         )
 
 
@@ -501,18 +569,18 @@ class UsageRecorded(EvalAssertion):
         self.min_total_tokens = _nonnegative_int(min_total_tokens, "min_total_tokens")
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        if context.usage_summary is None:
-            return self.failed("Cannot verify token usage because no usage summary was recorded.")
-        total_tokens = context.usage_summary.usage.total_tokens
-        metadata = {"total_tokens": total_tokens, "minimum": self.min_total_tokens}
-        if total_tokens >= self.min_total_tokens:
-            return self.passed(
-                f"Total tokens {total_tokens} meets minimum {self.min_total_tokens}.",
-                metadata=metadata,
-            )
-        return self.failed(
-            f"Total tokens {total_tokens} is below minimum {self.min_total_tokens}.",
-            metadata=metadata,
+        usage = context.usage_summary if context.root_evidence_available else None
+        total_tokens = None if usage is None else usage.usage.total_tokens
+        state: EvidenceState = (
+            "unavailable"
+            if total_tokens is None
+            else ("limit_exceeded" if total_tokens > EVIDENCE_MAX_TOTAL_TOKENS else "complete")
+        )
+        return _evaluate_usage_recorded(
+            name=self.name,
+            total_tokens=total_tokens,
+            state=state,
+            minimum=self.min_total_tokens,
         )
 
 
@@ -521,17 +589,19 @@ class MaxTotalTokens(EvalAssertion):
         self.maximum = _nonnegative_int(maximum, "maximum")
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        if context.usage_summary is None:
-            return self.failed("Cannot verify total tokens because no usage was recorded.")
-        total = context.usage_summary.usage.total_tokens
-        if total <= self.maximum:
-            return self.passed(
-                f"Total tokens {total} is within limit {self.maximum}.",
-                metadata={"total_tokens": total},
-            )
-        return self.failed(
-            f"Total tokens {total} exceeded limit {self.maximum}.",
-            metadata={"total_tokens": total, "maximum": self.maximum},
+        usage = context.usage_summary if context.root_evidence_available else None
+        total_tokens = None if usage is None else usage.usage.total_tokens
+        state: EvidenceState = (
+            "unavailable"
+            if total_tokens is None
+            else ("limit_exceeded" if total_tokens > EVIDENCE_MAX_TOTAL_TOKENS else "complete")
+        )
+        return _evaluate_maximum(
+            name=self.name,
+            evidence_area="total token",
+            actual=total_tokens,
+            state=state,
+            maximum=self.maximum,
         )
 
 
@@ -548,8 +618,22 @@ class MaxEstimatedCost(EvalAssertion):
         self.currency = currency
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
-        if context.session is None:
-            return self.failed("Cannot estimate cost because no session was created.")
+        model_steps = (
+            context.usage_summary.model_steps
+            if context.usage_summary is not None
+            else _event_count(context.events, EventType.MODEL_COMPLETED)
+        )
+        if (
+            context.session is None
+            or not context.root_evidence_available
+            or model_steps > EVIDENCE_MAX_MODEL_STEPS
+        ):
+            return _evaluate_max_cost(
+                name=self.name,
+                maximum=self.maximum,
+                currency=self.currency,
+                cost=None,
+            )
         # Cost is a pure function of the durable events + pricing, so it reads straight off
         # the trajectory — same estimator the app uses, no live handle required.
         summary = estimate_session_cost(
@@ -558,33 +642,24 @@ class MaxEstimatedCost(EvalAssertion):
             pricing=self.pricing,
             currency=self.currency,
         )
-        actual = summary.total_cost
-        metadata = {
-            "estimated_cost": str(actual),
-            "maximum": str(self.maximum),
-            "priced_model_steps": summary.priced_model_steps,
-            "unpriced_model_steps": summary.unpriced_model_steps,
-        }
-        if summary.unpriced_model_steps > 0:
-            return self.unavailable(
-                "Cannot verify the cost limit because "
-                f"{summary.unpriced_model_steps} model step(s) have no matching pricing.",
-                metadata=metadata,
-                cost_summary=summary,
-            )
-        if actual <= self.maximum:
-            result = self.passed(
-                f"Estimated cost {actual} {self.currency} is within limit {self.maximum}.",
-                metadata=metadata,
-                cost_summary=summary,
-            )
-        else:
-            result = self.failed(
-                f"Estimated cost {actual} {self.currency} exceeded limit {self.maximum}.",
-                metadata=metadata,
-                cost_summary=summary,
-            )
-        return result
+        result = _evaluate_max_cost(
+            name=self.name,
+            maximum=self.maximum,
+            currency=summary.currency,
+            cost=AssertionCostEvidenceV1(
+                currency=summary.currency,
+                total_cost=_canonical_decimal(summary.total_cost),
+                model_steps=summary.model_steps,
+                priced_model_steps=summary.priced_model_steps,
+                unpriced_model_steps=summary.unpriced_model_steps,
+            ),
+        )
+        return EvalAssertionResult.model_validate(
+            {
+                **result.model_dump(mode="python"),
+                "cost_summary": summary,
+            }
+        )
 
 
 class WorkspaceFileExists(EvalAssertion):
@@ -782,10 +857,18 @@ def _tool_start_events(events: tuple[Event, ...], tool_name: str) -> list[Event]
     ]
 
 
-def _tool_call_count(context: EvalContext) -> int:
-    if context.usage_summary is not None:
-        return context.usage_summary.tool_calls
-    return _event_count(context.events, EventType.TOOL_CALL_STARTED)
+def _direct_tool_evidence(
+    context: EvalContext,
+) -> tuple[tuple[str, ...], tuple[str, ...], int | None, EvidenceState]:
+    """Apply the portable tool completeness and cardinality contract to a direct assertion."""
+
+    return _project_tool_evidence(
+        context.trajectory,
+        max_tool_calls=EVIDENCE_MAX_TOOL_CALLS,
+        app=None,
+        root_evidence_available=context.root_evidence_available,
+        allow_event_count_fallback=True,
+    )
 
 
 def _message_text(message: Message) -> str:

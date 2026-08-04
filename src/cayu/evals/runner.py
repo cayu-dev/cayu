@@ -17,7 +17,7 @@ from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
-from cayu.evals.assertions import EvalAssertion, SessionStatusIs
+from cayu.evals.assertions import EvalAssertion
 from cayu.evals.models import (
     WORKSPACE_PROBE_MAX_BYTES,
     EvalAssertionResult,
@@ -68,12 +68,26 @@ class _FreshInterruptedEvidenceUnavailable(RuntimeError):
     """The runner-owned interrupted session could not be reconciled exactly."""
 
 
+def _format_exception_summary(exc: BaseException) -> str:
+    """Render an exception without trusting extension-owned ``__str__`` methods."""
+
+    try:
+        detail = str(exc)
+    except Exception:
+        detail = "<exception str() failed>"
+    exception_type = type(exc).__name__
+    return f"{exception_type}: {detail}" if detail else exception_type
+
+
 def _format_exception(exc: BaseException) -> str:
     # Record the exception type name + traceback, not a bare str(exc): an empty-message error
     # (e.g. KeyError() or a re-raised cancellation) otherwise collapsed to a blank, untraceable
     # eval error string. format_exception's final line already carries "TypeName: message".
-    formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
-    return formatted or f"{type(exc).__name__}: {exc}"
+    try:
+        formatted = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)).strip()
+    except Exception:
+        return _format_exception_summary(exc)
+    return formatted or _format_exception_summary(exc)
 
 
 class EvalCase(BaseModel):
@@ -449,20 +463,26 @@ async def _run_case_once(
                             f"Failed to load terminal eval evidence: {_format_exception(exc)}"
                         )
 
-            # app.run() does not raise on a model/tool failure; it ends the session as
-            # SESSION_FAILED and returns normally. Surface that as an eval ERROR so a
-            # crashed run is never scored as PASSED — unless the case explicitly asserts
-            # on session status, in which case the assertion owns the outcome.
-            if (
-                run_error is None
-                and session is not None
-                and session.status == SessionStatus.FAILED
-                and not any(isinstance(assertion, SessionStatusIs) for assertion in case.assertions)
-            ):
-                run_error = _session_failure_reason(events)
-
             if evidence_complete:
                 try:
+                    # app.run() does not raise on a model/tool failure; it ends the session as
+                    # SESSION_FAILED and returns normally. Surface that as an eval ERROR so a
+                    # crashed run is never scored as PASSED — unless the case explicitly
+                    # asserts on session status, in which case the assertion owns the outcome.
+                    if (
+                        run_error is None
+                        and session is not None
+                        and session.status == SessionStatus.FAILED
+                    ):
+                        failed_session_flags = tuple(
+                            assertion.evaluates_failed_session for assertion in case.assertions
+                        )
+                        if any(type(flag) is not bool for flag in failed_session_flags):
+                            raise TypeError(
+                                "EvalAssertion.evaluates_failed_session must return bool."
+                            )
+                        if not any(failed_session_flags):
+                            run_error = _session_failure_reason(events)
                     final_output = final_output_text(transcript)
                     probe_requirements = _collect_probe_requirements(case.assertions)
                     probes = await _capture_probes(app, session, probe_requirements)
@@ -520,14 +540,29 @@ async def _run_case_once(
                         unavailable_reason,
                     )
                 )
+                identity_error = _assertion_diagnostic(
+                    assertion_results,
+                    EvalOutcome.ERROR,
+                    "Assertion identity failed",
+                )
+                if identity_error is not None:
+                    run_error = identity_error
+                    unavailable_reason = None
             elif trajectory is not None:
                 context = EvalContext(
                     trajectory=trajectory,
                     suite_id=suite_id,
                     case_id=case.id,
                     metadata=case.metadata,
+                    root_evidence_available=trajectory.session is not None,
                 )
-                assertion_results = list(await _evaluate_assertions(case.assertions, context))
+                assertion_results = list(
+                    await _evaluate_assertions(
+                        case.assertions,
+                        context,
+                        runtime_app=app,
+                    )
+                )
                 assertion_error = _assertion_diagnostic(
                     assertion_results,
                     EvalOutcome.ERROR,
@@ -670,6 +705,7 @@ async def evaluate_assertions(
         suite_id=suite_id,
         case_id=case_id,
         metadata=dict(trajectory.metadata),
+        root_evidence_available=trajectory.session is not None,
     )
     return await _evaluate_assertions(tuple(assertions), context)
 
@@ -677,19 +713,49 @@ async def evaluate_assertions(
 async def _evaluate_assertions(
     assertions: Sequence[EvalAssertion],
     context: EvalContext,
+    *,
+    runtime_app: CayuApp | None = None,
 ) -> tuple[EvalAssertionResult, ...]:
+    # Import lazily to keep the public assertion base independent of the
+    # optional portable-corpus adapter.
+    from cayu.evals.portable_assertions import (
+        _CompiledPortableAssertion,
+        _prepare_portable_assertion_evidence,
+    )
+
+    portable_evidence = None
+    portable_evidence_error: Exception | None = None
+    try:
+        portable_evidence = _prepare_portable_assertion_evidence(
+            assertions,
+            context,
+            runtime_app=runtime_app,
+        )
+    except Exception as exc:
+        portable_evidence_error = exc
     results: list[EvalAssertionResult] = []
     for assertion in assertions:
+        assertion_revision: str | None = None
         try:
-            result = assertion.evaluate(context)
-            if inspect.isawaitable(result):
-                result = await result
+            assertion_revision = assertion.assertion_revision
+            if type(assertion) is _CompiledPortableAssertion:
+                if portable_evidence_error is not None:
+                    raise portable_evidence_error
+                if portable_evidence is None:
+                    raise RuntimeError("Compiled assertion evidence was not prepared.")
+                result = assertion.evaluate_evidence(portable_evidence)
+            else:
+                result = assertion.evaluate(context)
+                if inspect.isawaitable(result):
+                    result = await result
             if type(result) is not EvalAssertionResult:
                 raise TypeError("EvalAssertion.evaluate must return EvalAssertionResult.")
             # Assertion extensions can return a validator-bypassed model. Rebuild it
             # inside the protected boundary so replay never exposes an impossible
             # result and fresh runs do not fail later during trial construction.
             result = EvalAssertionResult.model_validate(_model_instance_python_input(result))
+            if assertion_revision is not None and result.assertion_revision != assertion_revision:
+                raise ValueError("Assertion result revision does not match its definition.")
             if result.cost_summary is not None and (
                 context.session is None or result.cost_summary.session_id != context.session.id
             ):
@@ -697,14 +763,45 @@ async def _evaluate_assertions(
             results.append(result)
         except Exception as exc:
             results.append(
-                EvalAssertionResult(
-                    name=assertion.name,
-                    outcome=EvalOutcome.ERROR,
-                    message=f"Assertion raised {type(exc).__name__}: {exc}",
-                    metadata={"error_type": type(exc).__name__},
+                _assertion_error_result(
+                    assertion,
+                    assertion_revision=assertion_revision,
+                    message=f"Assertion raised {_format_exception_summary(exc)}",
+                    error_type=type(exc).__name__,
                 )
             )
     return tuple(results)
+
+
+def _assertion_error_result(
+    assertion: EvalAssertion,
+    *,
+    assertion_revision: str | None,
+    message: str,
+    error_type: str,
+) -> EvalAssertionResult:
+    try:
+        return EvalAssertionResult(
+            name=assertion.name,
+            assertion_revision=assertion_revision,
+            outcome=EvalOutcome.ERROR,
+            message=message,
+            metadata={"error_type": error_type},
+        )
+    except Exception as identity_exc:
+        return EvalAssertionResult(
+            name="EvalAssertion",
+            outcome=EvalOutcome.ERROR,
+            message=(
+                f"{message}; failed to resolve assertion identity: "
+                f"{_format_exception_summary(identity_exc)}"
+            ),
+            metadata={
+                "error_type": error_type,
+                "identity_error": True,
+                "identity_error_type": type(identity_exc).__name__,
+            },
+        )
 
 
 def _blocked_assertion_results(
@@ -714,14 +811,27 @@ def _blocked_assertion_results(
 ) -> tuple[EvalAssertionResult, ...]:
     if outcome not in (EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE):
         raise ValueError("Blocked assertions require an error or unavailable outcome.")
-    return tuple(
-        EvalAssertionResult(
-            name=assertion.name,
-            outcome=outcome,
-            message=message,
-        )
-        for assertion in assertions
-    )
+    results: list[EvalAssertionResult] = []
+    for assertion in assertions:
+        try:
+            result = EvalAssertionResult(
+                name=assertion.name,
+                assertion_revision=assertion.assertion_revision,
+                outcome=outcome,
+                message=message,
+            )
+        except Exception as exc:
+            result = _assertion_error_result(
+                assertion,
+                assertion_revision=None,
+                message=(
+                    "Failed to resolve blocked assertion identity: "
+                    f"{_format_exception_summary(exc)}"
+                ),
+                error_type=type(exc).__name__,
+            )
+        results.append(result)
+    return tuple(results)
 
 
 def _assertion_diagnostic(

@@ -91,6 +91,8 @@ from cayu.evals.models import (
     TrajectoryProbes,
     WorkspaceFileProbe,
 )
+from cayu.evals.portable_assertions import compile_assertion_spec
+from cayu.evals.portable_evaluation import evaluate_assertion_spec, evaluate_assertion_specs
 from cayu.evals.reporting import (
     EvalCaseComparison,
     EvalRunComparison,
@@ -214,9 +216,12 @@ __all__ = [
     "assertion_spec_revision",
     "compare_eval_runs",
     "comparison_to_json",
+    "compile_assertion_spec",
     "eval_corpus_from_json",
     "eval_corpus_to_json",
     "eval_run_to_json",
+    "evaluate_assertion_spec",
+    "evaluate_assertion_specs",
     "evaluate_assertions",
     "final_output_text",
     "load_eval_corpus",

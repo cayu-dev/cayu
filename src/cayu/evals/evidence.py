@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Literal, cast
 
-from pydantic import Field, StrictInt, StrictStr, field_validator, model_validator
+from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from cayu._validation import json_utf8_size_within_limit
 from cayu.core.events import EventType
@@ -128,6 +128,7 @@ class AssertionEvidenceView(_SchemaV1PortableModel):
     revision: StrictStr
     policy_revision: StrictStr
     pricing_profile_fingerprint: StrictStr | None = None
+    root_evidence_available: StrictBool
     root_status: TerminalEvidenceStatus | None = None
     child_statuses: tuple[TerminalEvidenceStatus, ...] = Field(
         max_length=EVIDENCE_MAX_CHILD_SESSIONS
@@ -207,8 +208,20 @@ class AssertionEvidenceView(_SchemaV1PortableModel):
     def validate_contract(self) -> AssertionEvidenceView:
         if self.policy_revision != EvaluationEvidencePolicySpec.standard().revision:
             raise ValueError("Assertion evidence policy revision is not supported.")
-        if self.root_status is None and self.child_evidence_state == "complete":
-            raise ValueError("Child evidence cannot be complete without root evidence.")
+        if not self.root_evidence_available:
+            if self.root_status is not None:
+                raise ValueError("Unavailable root evidence cannot carry a root status.")
+            derived_states = (
+                self.child_evidence_state,
+                self.final_output_state,
+                self.tool_evidence_state,
+                self.model_step_evidence_state,
+                self.usage_evidence_state,
+            )
+            if any(state != "unavailable" for state in derived_states) or self.costs:
+                raise ValueError(
+                    "Unavailable root evidence cannot carry conclusive derived evidence."
+                )
         if self.child_evidence_state == "unavailable" and self.child_statuses:
             raise ValueError("Unavailable child evidence cannot carry observations.")
         if (
@@ -281,17 +294,8 @@ class AssertionEvidenceView(_SchemaV1PortableModel):
             and self.total_tokens <= EVIDENCE_MAX_TOTAL_TOKENS
         ):
             raise ValueError("Limited usage evidence must exceed its declared bound.")
-        if self.root_status is None and any(
-            state != "unavailable"
-            for state in (
-                self.child_evidence_state,
-                self.final_output_state,
-                self.tool_evidence_state,
-                self.model_step_evidence_state,
-                self.usage_evidence_state,
-            )
-        ):
-            raise ValueError("A missing root cannot carry available assertion evidence.")
+        if self.root_status is None and self.costs:
+            raise ValueError("Cost evidence requires a durable root session.")
         if self.pricing_profile_fingerprint is None and self.costs:
             raise ValueError("Cost evidence requires a pricing profile fingerprint.")
         if self.costs and self.model_step_evidence_state != "complete":
@@ -530,11 +534,18 @@ def _build_assertion_evidence_view(
     pricing_snapshot: _ValidatedPricingSnapshot | None,
     cost_currencies: tuple[str, ...],
     app: CayuApp | None,
+    root_evidence_available: bool | None = None,
+    allow_event_count_fallback: bool = False,
+    expected_pricing_profile_fingerprint: str | None = None,
+    bind_pricing_profile: bool = False,
 ) -> AssertionEvidenceView:
     session = trajectory.session
     root_status = None if session is None else session.status.value
+    root_available = (
+        session is not None if root_evidence_available is None else root_evidence_available
+    )
 
-    children_available = session is not None and not trajectory.children_incomplete
+    children_available = root_available and not trajectory.children_incomplete
     retained_children = trajectory.children[: evidence_policy.max_child_sessions]
     if not children_available or any(child.session is None for child in retained_children):
         child_state = "unavailable"
@@ -550,7 +561,7 @@ def _build_assertion_evidence_view(
         )
         child_state = "complete"
 
-    if session is None:
+    if not root_available:
         final_output = ""
         final_output_state: EvidenceState = "unavailable"
     else:
@@ -566,14 +577,19 @@ def _build_assertion_evidence_view(
         trajectory,
         max_tool_calls=evidence_policy.max_tool_calls,
         app=app,
+        root_evidence_available=root_available,
+        allow_event_count_fallback=allow_event_count_fallback,
     )
 
-    # A trajectory without a durable root is missing evidence, even when a
-    # synthetic or partially reconstructed value carries stray usage fields.
-    # This mirrors the public replay boundary and keeps direct and compiled
-    # assertions from assigning different meaning to the same trajectory.
-    usage = trajectory.usage_summary if session is not None else None
-    model_steps = None if usage is None else usage.model_steps
+    # Public projection derives completeness from the durable root. The compiled
+    # EvalAssertion adapter may instead receive an explicitly complete synthetic
+    # context, matching the existing direct-assertion contract.
+    usage = trajectory.usage_summary if root_available else None
+    model_steps = (
+        sum(event.type == EventType.MODEL_COMPLETED for event in trajectory.events)
+        if usage is None and root_available and allow_event_count_fallback
+        else (None if usage is None else usage.model_steps)
+    )
     if model_steps is None:
         model_step_state: EvidenceState = "unavailable"
     elif model_steps > evidence_policy.max_model_steps:
@@ -592,6 +608,8 @@ def _build_assertion_evidence_view(
     pricing_profile_fingerprint = (
         None if pricing_snapshot is None else pricing_snapshot.identity.fingerprint
     )
+    if bind_pricing_profile and pricing_profile_fingerprint != expected_pricing_profile_fingerprint:
+        raise ValueError("Compiled pricing profile changed after assertion compilation.")
     costs: list[AssertionCostEvidenceV1] = []
     if pricing_snapshot is not None and session is not None and model_step_state == "complete":
         events = list(trajectory.events)
@@ -616,6 +634,7 @@ def _build_assertion_evidence_view(
         "schema_version": ASSERTION_EVIDENCE_SCHEMA_VERSION,
         "policy_revision": evidence_policy.revision,
         "pricing_profile_fingerprint": pricing_profile_fingerprint,
+        "root_evidence_available": root_available,
         "root_status": root_status,
         "child_statuses": list(child_statuses),
         "child_evidence_state": child_state,

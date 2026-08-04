@@ -162,6 +162,10 @@ class EvalAssertionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     name: str
+    # Portable assertions set this to the exact content revision they evaluated.
+    # Generic Python assertions leave it unset because they do not necessarily
+    # have a serializable definition contract.
+    assertion_revision: str | None = None
     outcome: EvalOutcome
     # Deterministic checks emit 0.0/1.0 and graded checks retain their continuous
     # score. Unavailable/error outcomes deliberately carry no score.
@@ -197,9 +201,11 @@ class EvalAssertionResult(BaseModel):
 
         return self.outcome == EvalOutcome.PASSED
 
-    @field_validator("name")
+    @field_validator("name", "assertion_revision")
     @classmethod
-    def validate_name(cls, value: str, info) -> str:
+    def validate_identity(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
         return require_clean_nonblank(value, info.field_name)
 
     @field_validator("metadata", mode="before")
@@ -646,6 +652,8 @@ def _aggregate_eval_assertions_strict(
         first = group[0]
         if any(assertion.name != first.name for assertion in group[1:]):
             raise ValueError("Every trial must retain the same ordered assertion contract.")
+        if any(assertion.assertion_revision != first.assertion_revision for assertion in group[1:]):
+            raise ValueError("Every trial must retain the same assertion revision.")
         scored_thresholds = {
             assertion.threshold for assertion in group if assertion.score is not None
         }
@@ -682,6 +690,7 @@ def _aggregate_eval_assertions_strict(
         aggregated.append(
             EvalAssertionResult(
                 name=first.name,
+                assertion_revision=first.assertion_revision,
                 outcome=outcome,
                 score=score,
                 threshold=threshold,
@@ -1108,15 +1117,23 @@ class EvalContext:
     Where `Trajectory` is the serializable run *record*, `EvalContext` is what an assertion's
     `evaluate()` receives — it exposes the trajectory's data (`session` / `events` /
     `transcript` / `usage_summary` / `final_output` / `probes`) plus the `suite_id` / `case_id`
-    / `metadata`, and carries no live `app` handle (assertions run offline). It is also the
-    intended home for future dataset *expectations* (a `reference` of expected values an
-    assertion compares the trajectory against).
+    / `metadata`, and carries no live `app` handle (assertions run offline).
+    `root_evidence_available` is true by default for deliberately synthetic assertion contexts;
+    public replay and fresh-run entry points set it from the durable root session so missing
+    evidence cannot become a conclusive empty observation. It is also the intended home for
+    future dataset *expectations* (a `reference` of expected values an assertion compares the
+    trajectory against).
     """
 
     trajectory: Trajectory
     suite_id: str
     case_id: str
     metadata: dict[str, Any]
+    # Direct assertion unit tests may deliberately use a complete synthetic
+    # trajectory without a durable root session. Public replay/fresh runners set
+    # this false when the root record is absent so an empty observation is never
+    # confused with conclusive negative evidence.
+    root_evidence_available: bool = True
 
     @property
     def session(self) -> Session | None:
