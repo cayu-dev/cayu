@@ -109,6 +109,46 @@ errors, or a comparison detects regressions. `eval report` and `eval compare`
 operate only on the paths supplied to them and do not perform project
 discovery.
 
+## Portable corpus documents
+
+`EvalCorpusDocument` is Cayu's bounded, JSON-portable definition format for
+reusable eval suites and cases. A document describes exactly one trusted
+`target_key`. It contains only user-role text input, bounded trial settings,
+diagnostic source/pricing identities, an explicit evidence policy, and a closed
+set of structural assertion specifications. It cannot contain a `CayuApp`,
+provider/model/environment selection, import path, callback, raw session ID, or
+runtime event payload.
+
+The portable assertion kinds in schema version 1 cover root and child terminal
+status, final-output equality/containment, tool presence/order/count, model-step
+and token limits, recorded usage, and estimated-cost limits. Cost assertions
+require a `PricingProfileIdentityV1`; the identity fingerprints trusted pricing
+used elsewhere and never embeds or authorizes a `PriceBook`.
+
+Corpus documents are definitions, not executable application configuration.
+Parsing one never imports project code or invokes a provider, tool, environment,
+hook, or runtime. A trusted caller resolves `target_key` to local application
+bootstrap code and separately verifies the diagnostic source identity before
+execution.
+
+Use the `.create(...)` factories for `EvalSuiteSpec`, `EvalCaseSpec`, and
+`EvalCorpusDocument`. They validate and canonicalize their inputs and compute
+`sha256:` content revisions. Suite revisions cover reusable suite settings;
+cases reference suites by `suite_id`, so cases from independent corpus fragments
+can be merged without rewriting suite membership. Case, suite, evidence-policy,
+and corpus revisions change whenever their covered content changes;
+`assertion_spec_revision(...)` provides the same identity for one assertion.
+
+`eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
+`load_eval_corpus(...)` enforce schema version 1 and Cayu's durable-JSON rules,
+including duplicate-key, non-finite-number, integer-range, Unicode, and nesting
+validation. Input is rejected before an unbounded read or decode. The hard
+document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
+case, 16 messages per case, 65,536 characters per message, 262,144 input
+characters per case, 100 sequential trials, and a 3,600-second per-trial timeout.
+Unknown fields and assertion kinds fail closed; schema version 1 has no legacy
+compatibility loader.
+
 ## First-party runtime acceptance suite
 
 Cayu ships an importable, hermetic target for exercising runtime-native evals
