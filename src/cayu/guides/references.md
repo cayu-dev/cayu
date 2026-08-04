@@ -113,9 +113,15 @@ or deployment verification.
 ## server
 
 The server extra provides an HTTP control plane over the same application and
-durable stores. Put authentication/authorization at the application boundary,
-run schema migration explicitly, and separate API processes from task workers.
-Test the app factory and auth boundary before deployment.
+durable stores. A generated project's `dev` extra installs it; for trusted local
+inspection run `uv run cayu serve --dev` and open
+`http://127.0.0.1:8000/cayu/`. Use `mount_cayu(..., path="/cayu")` when an
+existing FastAPI product owns the host server; that mount requires
+`AuthenticatedAccess(...)` on any public listener. Do not substitute client-IP
+or forwarded-header checks for authentication. Put authentication/authorization
+at the application boundary, run schema migration explicitly, and separate API
+processes from task workers. Test the app factory and auth boundary before
+deployment.
 
 ## advanced-runtime
 

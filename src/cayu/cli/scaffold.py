@@ -332,7 +332,7 @@ requires-python = ">=3.11"
 dependencies = ["cayu>=__CAYU_VERSION__"]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["cayu[server]>=__CAYU_VERSION__", "pytest"]
 
 [tool.cayu]
 factory = "app:build_app"
@@ -375,6 +375,22 @@ uv run cayu session list
 
 These commands require no model API key. They prove project construction,
 static wiring, a deterministic model response, and its eval.
+
+## Inspect with the local control plane
+
+Cayu's packaged developer/operator control plane reads the same durable stores
+as the project commands. Start it in a separate terminal:
+
+```bash
+uv run cayu serve --dev
+```
+
+Then open `http://127.0.0.1:8000/cayu/`. The explicit `--dev` flag enables
+unauthenticated trusted-local access only. It does not make the control plane
+the application's end-user UI or configure a production deployment.
+Never mount it with unauthenticated open access on a public listener;
+client-IP checks are not authentication. Public or deployed control-plane
+access requires an authenticated access policy.
 
 ## Run with a live provider
 
@@ -460,6 +476,12 @@ This scaffold is for local development. Deployment is a separate task.
 - Authoring details: `uv run cayu guide authoring`.
 - Inspect/check: `uv run cayu inspect --json` and `uv run cayu check --json`.
 - Hermetic proof: `uv run pytest` and `uv run cayu eval run`.
+- Local developer/operator control plane: run `uv run cayu serve --dev` in a separate
+  terminal and open `http://127.0.0.1:8000/cayu/`. This is not the application's
+  end-user UI or a production server configuration.
+- Never mount it with `OpenAccess()` on a public listener.
+- Client-IP and forwarded-header checks are not authentication. Use
+  `AuthenticatedAccess(...)` for any public or deployed control-plane surface.
 - Live execution: `uv run python run.py --message "USER REQUEST"` after configuring a
   provider in `app.configured_provider()`.
 
@@ -571,6 +593,8 @@ def run_new(args: argparse.Namespace) -> int:
     print("  uv run cayu check --json")
     print("  uv run pytest")
     print("  uv run cayu eval run")
+    print("  Local control plane: uv run cayu serve --dev")
+    print("  Open: http://127.0.0.1:8000/cayu/")
     if args.provider is None:
         print("  Live provider: none selected; set CAYU_PROVIDER explicitly before `run.py`.")
     else:

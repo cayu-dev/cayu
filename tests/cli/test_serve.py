@@ -55,6 +55,7 @@ def test_serve_fails_closed_before_building_an_unauthenticated_app(
 def test_serve_discovers_project_and_runs_one_local_process(
     tmp_path: Path,
     monkeypatch,
+    capsys,
 ) -> None:
     project = tmp_path / "project"
     nested = project / "agents" / "reviewer"
@@ -97,8 +98,6 @@ def build_app():
             [
                 "serve",
                 "--dev",
-                "--host",
-                "0.0.0.0",
                 "--port",
                 "9123",
             ]
@@ -107,15 +106,43 @@ def build_app():
     )
 
     server = launched["server"]
-    assert launched["host"] == "0.0.0.0"
+    assert launched["host"] == "127.0.0.1"
     assert launched["port"] == 9123
     assert server.state.cayu_server_config.access.kind == "open"
     assert server.state.cayu_server_config.lifecycle.startup_recovery_statuses is None
     assert (project / "factory-log.txt").read_text(encoding="utf-8") == f"{project}\n"
     assert "serve_project" not in sys.modules
+    assert "Cayu control plane: http://127.0.0.1:9123/cayu/" in capsys.readouterr().out
 
 
-def test_serve_loads_configured_auth_for_the_control_plane(
+def test_serve_rejects_unauthenticated_dev_on_a_non_loopback_host_before_building(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.cayu]\nfactory = "must_not_build:build_app"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "must_not_build.py").write_text(
+        """def build_app():
+    raise AssertionError("unsafe dev bind must fail before factory invocation")
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    sys.modules.pop("must_not_build", None)
+
+    assert main(["serve", "--dev", "--host", "0.0.0.0"]) == 1
+
+    error = capsys.readouterr().err
+    assert "Refusing to expose an unauthenticated control plane" in error
+    assert "loopback host" in error
+    assert "unsafe dev bind" not in error
+    assert "must_not_build" not in sys.modules
+
+
+def test_serve_loads_configured_auth_for_the_control_plane_on_a_public_bind(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -151,9 +178,10 @@ def build_app():
     monkeypatch.chdir(tmp_path)
     sys.modules.pop("protected_project", None)
 
-    assert main(["serve"]) == 0
+    assert main(["serve", "--host", "0.0.0.0"]) == 0
 
     server = launched["server"]
+    assert launched["host"] == "0.0.0.0"
     assert server.state.cayu_server_config.access.kind == "authenticated"
     with TestClient(server) as client:
         assert client.get("/api/health").json() == {"ok": True}

@@ -6,6 +6,7 @@ import argparse
 import importlib
 import sys
 from dataclasses import dataclass
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, cast
 
@@ -66,6 +67,8 @@ def add_serve_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def run_serve(args: argparse.Namespace) -> int:
     try:
+        if args.dev:
+            _require_loopback_dev_host(args.host)
         project = resolve_project(
             command="cayu serve",
             suggest_explicit_target=False,
@@ -107,6 +110,10 @@ def run_serve(args: argparse.Namespace) -> int:
                     f"Serve project startup raised SystemExit with status {status}."
                 ) from exc
             try:
+                print(
+                    "Cayu control plane: "
+                    f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
+                )
                 uvicorn.run(server, host=args.host, port=args.port)
             except SystemExit as exc:
                 return exc.code if isinstance(exc.code, int) else 1
@@ -114,6 +121,19 @@ def run_serve(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+def _require_loopback_dev_host(host: str) -> None:
+    try:
+        is_loopback = ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise ServeError(
+            "Refusing to expose an unauthenticated control plane on a non-loopback host. "
+            "Use --dev with a loopback host such as 127.0.0.1 or ::1, or configure "
+            "authentication before binding publicly."
+        )
 
 
 def _serve_settings(root: Path) -> _ServeSettings:
@@ -216,3 +236,10 @@ def _port(value: str) -> int:
     if not 1 <= port <= 65535:
         raise argparse.ArgumentTypeError("port must be between 1 and 65535.")
     return port
+
+
+def _control_plane_url(host: str, port: int, path: str) -> str:
+    url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    stripped_path = path.strip("/")
+    url_path = "/" if not stripped_path else f"/{stripped_path}/"
+    return f"http://{url_host}:{port}{url_path}"

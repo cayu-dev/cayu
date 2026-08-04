@@ -77,7 +77,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
     assert 'dependencies = ["cayu>=0.1.0"]' in pyproject
     assert 'console = ["cayu[console]"]' not in pyproject
-    assert 'dev = ["pytest"]' in pyproject
+    assert 'dev = ["cayu[server]>=0.1.0", "pytest"]' in pyproject
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
     assert '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"' in pyproject
@@ -93,6 +93,11 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv sync --extra dev" in readme
     assert "uv run cayu eval run" in readme
     assert "uv run cayu session list" in readme
+    assert "uv run cayu serve --dev" in readme
+    assert "http://127.0.0.1:8000/cayu/" in readme
+    assert "developer/operator control plane" in readme
+    assert "Never mount it with unauthenticated open access on a public listener" in readme
+    assert "client-IP checks are not authentication" in readme
     assert "uv run cayu auth openai login" in readme
     assert "CAYU_PROVIDER=openai-subscription" in readme
     assert "CAYU_PROVIDER=anthropic" in readme
@@ -110,6 +115,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     output = capsys.readouterr().out
     assert "uv sync --extra dev" in output
     assert "uv run cayu check --json" in output
+    assert "uv run cayu serve --dev" in output
+    assert "http://127.0.0.1:8000/cayu/" in output
     assert "none selected" in output
 
 
@@ -415,6 +422,12 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "uv run cayu check --json" in instructions
     assert "uv run pytest" in instructions
     assert "uv run cayu eval run" in instructions
+    assert "uv run cayu serve --dev" in instructions
+    assert "http://127.0.0.1:8000/cayu/" in instructions
+    assert "developer/operator control plane" in instructions
+    assert "end-user UI" in instructions
+    assert "Never mount it with `OpenAccess()` on a public listener" in instructions
+    assert "Client-IP and forwarded-header checks are not authentication" in instructions
     assert "cayu eval run evals.agent:build_eval" not in instructions
     assert "Edit the existing agent, test, and eval" in instructions
     assert "Tools are optional" in instructions

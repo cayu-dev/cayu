@@ -48,6 +48,19 @@ def test_package_shipped_authoring_and_diagnostic_guides_are_discoverable(capsys
     assert "registered for that same agent" in authoring
     assert "cannot prove prompt comprehension" in authoring
     assert "cayu guide tool-effects" in authoring
+    assert "uv run cayu serve --dev" in authoring
+    assert "http://127.0.0.1:8000/cayu/" in authoring
+    assert "A deployed control plane still requires configured authentication" in authoring
+    assert "Never use `OpenAccess()` on a public listener" in authoring
+    assert "Client-IP and forwarded-header checks are not authentication" in authoring
+
+    assert main(["guide", "references#server"]) == 0
+    server = capsys.readouterr().out
+    assert "uv run cayu serve --dev" in server
+    assert "http://127.0.0.1:8000/cayu/" in server
+    assert 'mount_cayu(..., path="/cayu")' in server
+    assert "requires `AuthenticatedAccess(...)` on any public listener" in server.replace("\n", " ")
+    assert "Do not substitute client-IP or forwarded-header checks" in server.replace("\n", " ")
 
     assert main(["guide", "diagnostics"]) == 0
     diagnostics = capsys.readouterr().out
