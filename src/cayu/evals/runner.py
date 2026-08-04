@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import ArtifactMetadata
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.evals.assertions import EvalAssertion, SessionStatusIs
 from cayu.evals.models import (
@@ -23,22 +23,35 @@ from cayu.evals.models import (
     EvalAssertionResult,
     EvalCaseResult,
     EvalContext,
+    EvalOutcome,
     EvalRun,
     EvalStatus,
+    EvalTrialResult,
     ProbeRequirements,
     Trajectory,
     TrajectoryProbes,
     WorkspaceFileProbe,
+    aggregate_eval_score,
+    aggregate_eval_status,
 )
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import (
+    TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
+    RunnerObservedEventIdentity,
     RunRequest,
     Session,
     SessionQuery,
     SessionStatus,
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
     copy_run_request,
 )
-from cayu.runtime.usage import SessionUsageSummary, session_usage_summary_payload
+from cayu.runtime.usage import (
+    SessionUsageSummary,
+    session_usage_summary,
+    session_usage_summary_payload,
+)
 
 # Sessions per page when walking the sub-agent tree, and the max pages walked per node. The walk
 # pages past the first 1000 children (rather than silently keeping only the first page) but stays
@@ -54,6 +67,10 @@ class _IncompleteFlag:
 
     def __init__(self) -> None:
         self.value = False
+
+
+class _FreshInterruptedEvidenceUnavailable(RuntimeError):
+    """The runner-owned interrupted session could not be reconciled exactly."""
 
 
 def _format_exception(exc: BaseException) -> str:
@@ -207,8 +224,8 @@ async def run_eval_suite(
         trials=trials,
     )
     completed_at = datetime.now(UTC)
-    status = _run_status(results)
-    score = _average_score(result.score for result in results)
+    status = aggregate_eval_status(result.status for result in results)
+    score = aggregate_eval_score(result.score for result in results)
     return EvalRun(
         run_id=run_id,
         suite_id=suite.id,
@@ -296,34 +313,26 @@ async def run_eval_case(
     timeout_seconds: float | None = None,
     trials: int = 1,
 ) -> EvalCaseResult:
-    """Run one case, optionally `trials` times, aggregating to the mean per-assertion score.
+    """Run one case one or more times and retain every concrete trial.
 
     Every trial receives a fresh concrete session ID; an authored request session ID is never
     reused as concrete state, but remains result provenance and the causal-accounting fallback.
-    `trials=1` (the default) returns the single assertion result without aggregation. `trials>1`
-    reports each assertion's mean score across trials, so a stochastic model whose score wobbles
-    run-to-run settles to a stable average instead of a coin-flip pass/fail.
+    Aggregate fields are deterministic projections of the ordered ``result.trials`` tuple.
+    No trial is selected as a representative and no trial evidence is overwritten.
     """
     _validate_trials(trials, "run_eval_case trials")
     _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
-    if trials == 1:
-        return await _run_case_once(
-            app,
-            case,
-            suite_id=suite_id,
-            retain_trajectory=retain_trajectory,
-            timeout_seconds=timeout_seconds,
-        )
     started_at = datetime.now(UTC)
     trial_results = [
         await _run_case_once(
             app,
             case,
+            trial_number=trial_number,
             suite_id=suite_id,
             retain_trajectory=retain_trajectory,
             timeout_seconds=timeout_seconds,
         )
-        for _ in range(trials)
+        for trial_number in range(1, trials + 1)
     ]
     completed_at = datetime.now(UTC)
     return _aggregate_trials(
@@ -331,7 +340,6 @@ async def run_eval_case(
         trial_results,
         started_at=started_at,
         completed_at=completed_at,
-        retain_trajectory=retain_trajectory,
     )
 
 
@@ -339,17 +347,21 @@ async def _run_case_once(
     app: CayuApp,
     case: EvalCase,
     *,
+    trial_number: int,
     suite_id: str,
     retain_trajectory: bool = False,
     timeout_seconds: float | None = None,
-) -> EvalCaseResult:
+) -> EvalTrialResult:
     started_at = datetime.now(UTC)
-    authored_session_id = case.request.session_id
     trial_request = _isolated_trial_request(case.request)
-    emitted_events: list[Event] = []
+    emitted_root_events: list[RunnerObservedEventIdentity] = []
+    emitted_root_events_truncated = False
     observed_session_id: str | None = None
+    run_drained = False
     session_id: str | None = None
     run_error: str | None = None
+    unavailable_reason: str | None = None
+    evidence_complete = False
     session: Session | None = None
     events: tuple[Event, ...] = ()
     transcript: tuple[Message, ...] = ()
@@ -366,10 +378,21 @@ async def _run_case_once(
         async with asyncio.timeout(timeout_seconds) as deadline:
             try:
                 async for event in app.run(trial_request):
-                    emitted_events.append(event)
                     # Anchor the trial to the first emitted session. If app.run() ever forwards
                     # child-session events, they must not replace the root trial identity.
                     observed_session_id = observed_session_id or event.session_id
+                    if event.session_id == observed_session_id:
+                        if len(emitted_root_events) < TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS:
+                            emitted_root_events.append(
+                                RunnerObservedEventIdentity(
+                                    session_id=event.session_id,
+                                    sequence=event_durable_sequence(event),
+                                    event_type=event.type,
+                                )
+                            )
+                        else:
+                            emitted_root_events_truncated = True
+                run_drained = True
             except TimeoutError as exc:
                 # A provider-originated TimeoutError is an eval run error, not the case
                 # deadline. Deadline expiry arrives as cancellation and is handled below.
@@ -377,19 +400,60 @@ async def _run_case_once(
             except Exception as exc:
                 run_error = _format_exception(exc)
 
-            events = tuple(emitted_events)
             candidate_session_id = observed_session_id or trial_request.session_id
             if candidate_session_id is not None:
                 try:
-                    session = await app.session_store.load(candidate_session_id)
-                    if session is not None:
-                        session_id = candidate_session_id
-                        events, transcript, usage_summary = await _load_session_records(
-                            app, session_id
+                    evidence = await _load_terminal_evidence(app, candidate_session_id)
+                    session_id = candidate_session_id
+                    session, events, transcript, usage_summary = _project_terminal_evidence(
+                        evidence
+                    )
+                    evidence_complete = True
+                except TerminalSessionEvidenceError as exc:
+                    if (
+                        run_error is None
+                        and run_drained
+                        and observed_session_id == candidate_session_id
+                        and exc.code == TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED
+                    ):
+                        try:
+                            (
+                                session,
+                                events,
+                                transcript,
+                                usage_summary,
+                            ) = await _load_fresh_interrupted_evidence(
+                                app,
+                                candidate_session_id,
+                                tuple(emitted_root_events),
+                                emitted_events_truncated=emitted_root_events_truncated,
+                            )
+                            session_id = candidate_session_id
+                            evidence_complete = True
+                        except _FreshInterruptedEvidenceUnavailable as interrupted_exc:
+                            unavailable_reason = (
+                                f"Fresh interrupted evidence unavailable: {interrupted_exc}"
+                            )
+                        except Exception as interrupted_exc:
+                            run_error = (
+                                "Failed to load fresh interrupted eval evidence: "
+                                f"{_format_exception(interrupted_exc)}"
+                            )
+                    elif run_error is None:
+                        unavailable_reason = (
+                            f"Terminal evidence unavailable ({exc.code.value}): {exc}"
+                        )
+                except NotImplementedError:
+                    if run_error is None:
+                        unavailable_reason = (
+                            "Terminal evidence unavailable: the configured session store does "
+                            "not support exact terminal evidence reads."
                         )
                 except Exception as exc:
                     if run_error is None:
-                        run_error = f"Failed to load eval session state: {_format_exception(exc)}"
+                        run_error = (
+                            f"Failed to load terminal eval evidence: {_format_exception(exc)}"
+                        )
 
             # app.run() does not raise on a model/tool failure; it ends the session as
             # SESSION_FAILED and returns normally. Surface that as an eval ERROR so a
@@ -403,62 +467,114 @@ async def _run_case_once(
             ):
                 run_error = _session_failure_reason(events)
 
-            final_output = final_output_text(transcript)
-            probe_requirements = _collect_probe_requirements(case.assertions)
-            probes = await _capture_probes(app, session, probe_requirements)
-            children_incomplete = _IncompleteFlag()
-            children = await _build_child_trajectories(
-                app,
-                session_id,
-                visited={session_id} if session_id is not None else set(),
-                incomplete=children_incomplete,
-            )
-            trajectory = Trajectory(
-                session=session,
-                events=events,
-                transcript=transcript,
-                usage_summary=usage_summary,
-                final_output=final_output,
-                probes=probes,
-                children=children,
-                children_incomplete=children_incomplete.value,
-                metadata=case.metadata,
-            )
-            context = EvalContext(
-                trajectory=trajectory,
-                suite_id=suite_id,
-                case_id=case.id,
-                metadata=case.metadata,
-            )
-            assertion_results = list(await _evaluate_assertions(case.assertions, context))
+            if evidence_complete:
+                try:
+                    final_output = final_output_text(transcript)
+                    probe_requirements = _collect_probe_requirements(case.assertions)
+                    probes = await _capture_probes(app, session, probe_requirements)
+                    children_incomplete = _IncompleteFlag()
+                    children = await _build_child_trajectories(
+                        app,
+                        session_id,
+                        visited={session_id} if session_id is not None else set(),
+                        incomplete=children_incomplete,
+                    )
+                    trajectory = Trajectory(
+                        session=session,
+                        events=events,
+                        transcript=transcript,
+                        usage_summary=usage_summary,
+                        final_output=final_output,
+                        probes=probes,
+                        children=children,
+                        children_incomplete=children_incomplete.value,
+                        metadata=case.metadata,
+                    )
+                    if children_incomplete.value:
+                        evidence_complete = False
+                        if run_error is None:
+                            unavailable_reason = (
+                                "Child-session evidence could not be captured completely."
+                            )
+                except Exception as exc:
+                    # Probe declaration/capture and trajectory construction are part
+                    # of assertion evidence preparation. Public assertion extensions
+                    # must produce an explicit result instead of aborting the suite.
+                    evidence_complete = False
+                    trajectory = None
+                    if run_error is None:
+                        run_error = (
+                            f"Failed to prepare eval assertion evidence: {_format_exception(exc)}"
+                        )
+
+            if run_error is not None:
+                assertion_results = list(
+                    _blocked_assertion_results(case.assertions, EvalOutcome.ERROR, run_error)
+                )
+            elif unavailable_reason is not None:
+                assertion_results = list(
+                    _blocked_assertion_results(
+                        case.assertions,
+                        EvalOutcome.UNAVAILABLE,
+                        unavailable_reason,
+                    )
+                )
+            elif trajectory is not None:
+                context = EvalContext(
+                    trajectory=trajectory,
+                    suite_id=suite_id,
+                    case_id=case.id,
+                    metadata=case.metadata,
+                )
+                assertion_results = list(await _evaluate_assertions(case.assertions, context))
+                assertion_error = _assertion_diagnostic(
+                    assertion_results,
+                    EvalOutcome.ERROR,
+                    "Assertion evaluation failed",
+                )
+                assertion_unavailable = _assertion_diagnostic(
+                    assertion_results,
+                    EvalOutcome.UNAVAILABLE,
+                    "Assertion evidence was unavailable",
+                )
+                if assertion_error is not None:
+                    run_error = assertion_error
+                elif assertion_unavailable is not None:
+                    unavailable_reason = assertion_unavailable
     except TimeoutError as exc:
         if deadline is not None and deadline.expired():
             run_error = f"Eval case timed out after {timeout_seconds} seconds."
         else:
             run_error = _format_exception(exc)
-        # _evaluate_assertions builds its result list incrementally. Never expose a
-        # partial prefix as passing when the case timed out before evaluation completed.
-        assertion_results = []
+        unavailable_reason = None
+        # A timeout may happen after the exact terminal snapshot, probes, and
+        # child tree were fully captured while an assertion was evaluating.
+        # Preserve that completed evidence; the ERROR outcome already records
+        # that evaluation itself did not finish. Earlier lifecycle timeouts have
+        # no completed trajectory and remain evidence-incomplete.
+        evidence_complete = trajectory is not None and not trajectory.children_incomplete
+        # Never expose a partially evaluated assertion prefix after cancellation.
+        assertion_results = list(
+            _blocked_assertion_results(case.assertions, EvalOutcome.ERROR, run_error)
+        )
 
     # A yielded runtime event proves the session was created before a deadline interrupted
-    # state capture. Do not perform any store I/O after the deadline; without an event, the
+    # evidence capture. Do not perform any store I/O after the deadline; without an event, the
     # request UUID remains only a plan and must not be published as a concrete trial ID.
     if session_id is None and observed_session_id is not None:
         session_id = observed_session_id
-    if not events:
-        events = tuple(emitted_events)
     completed_at = datetime.now(UTC)
-    status = _case_status(run_error, assertion_results)
-    return EvalCaseResult(
-        case_id=case.id,
+    status = _trial_status(run_error, unavailable_reason, assertion_results)
+    return EvalTrialResult(
+        trial_number=trial_number,
         status=status,
-        authored_session_id=authored_session_id,
-        trial_session_ids=(session_id,) if session_id is not None else (),
         session_id=session_id,
-        score=_case_score(status, assertion_results),
+        score=_trial_score(status, assertion_results),
         final_output=final_output,
         assertions=tuple(assertion_results),
         error=run_error,
+        unavailable_reason=unavailable_reason,
+        evidence_complete=evidence_complete,
         events_count=len(events),
         usage_summary=session_usage_summary_payload(usage_summary)
         if usage_summary is not None
@@ -466,11 +582,68 @@ async def _run_case_once(
         started_at=started_at,
         completed_at=completed_at,
         duration_ms=_duration_ms(started_at, completed_at),
-        metadata=case.metadata,
-        # The probe-complete trajectory captured during this run, for export/replay. Opt-in so
-        # the default run doesn't retain every case's trajectory (incl. file bytes) in memory.
+        # The probe-complete trajectory captured during this trial, for export/replay. Opt-in so
+        # the default run does not retain every trial's file bytes in memory.
         trajectory=trajectory if retain_trajectory else None,
     )
+
+
+async def _load_terminal_evidence(app: CayuApp, session_id: str) -> TerminalSessionEvidence:
+    if not app.session_store.supports_terminal_session_evidence:
+        raise NotImplementedError
+    return await app.session_store.load_terminal_session_evidence(session_id)
+
+
+async def _load_fresh_interrupted_evidence(
+    app: CayuApp,
+    session_id: str,
+    emitted_events: tuple[RunnerObservedEventIdentity, ...],
+    *,
+    emitted_events_truncated: bool,
+) -> tuple[Session, tuple[Event, ...], tuple[Message, ...], SessionUsageSummary]:
+    """Reconcile one runner-owned, fully drained interruption with durable state.
+
+    Ordinary historical evidence remains completed/failed-only. This narrower path exists for
+    direct Python evals: the runner created a unique session, drained its public event stream,
+    and asks the store to prove the exact bounded snapshot before hydrating it.
+    """
+
+    if emitted_events_truncated:
+        raise _FreshInterruptedEvidenceUnavailable(
+            "the root event stream exceeds the fresh-evidence event limit."
+        )
+    if not emitted_events or any(event.session_id != session_id for event in emitted_events):
+        raise _FreshInterruptedEvidenceUnavailable(
+            "the drained runtime stream contained no root-session events."
+        )
+    if not app.session_store.supports_runner_owned_interrupted_evidence:
+        raise _FreshInterruptedEvidenceUnavailable(
+            "the configured session store does not support exact runner-owned interruptions."
+        )
+    try:
+        evidence = await app.session_store.load_runner_owned_interrupted_evidence(
+            session_id,
+            observed_events=emitted_events,
+        )
+    except (NotImplementedError, TerminalSessionEvidenceError) as exc:
+        detail = (
+            exc.code.value
+            if isinstance(exc, TerminalSessionEvidenceError)
+            else str(exc).strip() or type(exc).__name__
+        )
+        raise _FreshInterruptedEvidenceUnavailable(detail) from exc
+    return _project_terminal_evidence(evidence)
+
+
+def _project_terminal_evidence(
+    evidence: TerminalSessionEvidence,
+) -> tuple[Session, tuple[Event, ...], tuple[Message, ...], SessionUsageSummary]:
+    """Build the root assertion substrate from one exact terminal snapshot."""
+
+    events = tuple(record.event for record in evidence.events)
+    transcript = tuple(record.message for record in evidence.transcript)
+    usage_summary = session_usage_summary(evidence.session.id, list(events))
+    return evidence.session, events, transcript, usage_summary
 
 
 def _isolated_trial_request(request: RunRequest) -> RunRequest:
@@ -529,7 +702,7 @@ async def _evaluate_assertions(
             results.append(
                 EvalAssertionResult(
                     name=assertion.name,
-                    passed=False,
+                    outcome=EvalOutcome.ERROR,
                     message=f"Assertion raised {type(exc).__name__}: {exc}",
                     metadata={"error_type": type(exc).__name__},
                 )
@@ -537,13 +710,32 @@ async def _evaluate_assertions(
     return tuple(results)
 
 
-async def _load_session_records(
-    app: CayuApp, session_id: str
-) -> tuple[tuple[Event, ...], tuple[Message, ...], SessionUsageSummary]:
-    events = tuple(await app.session_store.load_events(session_id))
-    transcript = tuple(await app.session_store.load_transcript(session_id))
-    usage_summary = await app.get_session_usage(session_id)
-    return events, transcript, usage_summary
+def _blocked_assertion_results(
+    assertions: Sequence[EvalAssertion],
+    outcome: EvalOutcome,
+    message: str,
+) -> tuple[EvalAssertionResult, ...]:
+    if outcome not in (EvalOutcome.ERROR, EvalOutcome.UNAVAILABLE):
+        raise ValueError("Blocked assertions require an error or unavailable outcome.")
+    return tuple(
+        EvalAssertionResult(
+            name=assertion.name,
+            outcome=outcome,
+            message=message,
+        )
+        for assertion in assertions
+    )
+
+
+def _assertion_diagnostic(
+    assertions: Sequence[EvalAssertionResult],
+    outcome: EvalOutcome,
+    prefix: str,
+) -> str | None:
+    matching = tuple(assertion for assertion in assertions if assertion.outcome == outcome)
+    if not matching:
+        return None
+    return f"{prefix} in {len(matching)} assertion(s); first: {matching[0].message}"
 
 
 def _collect_probe_requirements(assertions: Sequence[EvalAssertion]) -> ProbeRequirements:
@@ -656,9 +848,18 @@ async def _build_child_trajectories(
             if child_session.id in visited:
                 continue
             visited.add(child_session.id)
-            child = await _load_child_trajectory(app, child_session, visited=visited)
+            child = await _load_child_trajectory(
+                app,
+                child_session,
+                expected_parent_session_id=parent_session_id,
+                visited=visited,
+            )
             if child is not None:
                 children.append(child)
+                if child.children_incomplete and incomplete is not None:
+                    incomplete.value = True
+            elif incomplete is not None:
+                incomplete.value = True
         cursor = result.next_cursor
         if cursor is None:
             return tuple(children)
@@ -673,12 +874,27 @@ async def _load_child_trajectory(
     app: CayuApp,
     session: Session,
     *,
+    expected_parent_session_id: str,
     visited: set[str],
 ) -> Trajectory | None:
     try:
-        events, transcript, usage_summary = await _load_session_records(app, session.id)
+        evidence = await _load_terminal_evidence(app, session.id)
+    except TerminalSessionEvidenceError as exc:
+        if (
+            exc.code != TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED
+            or not app.session_store.supports_runner_owned_interrupted_evidence
+        ):
+            return None
+        try:
+            evidence = await app.session_store.load_runner_owned_interrupted_evidence(
+                session.id,
+                expected_parent_session_id=expected_parent_session_id,
+            )
+        except Exception:
+            return None
     except Exception:
         return None
+    terminal_session, events, transcript, usage_summary = _project_terminal_evidence(evidence)
     # Sub-agent nodes are captured for visibility/serialization; assertions in v1 evaluate
     # against the root case only, so child nodes carry no probe snapshot.
     grandchildren_incomplete = _IncompleteFlag()
@@ -686,7 +902,7 @@ async def _load_child_trajectory(
         app, session.id, visited=visited, incomplete=grandchildren_incomplete
     )
     return Trajectory(
-        session=session,
+        session=terminal_session,
         events=events,
         transcript=transcript,
         usage_summary=usage_summary,
@@ -706,93 +922,20 @@ def _validate_trials(value: int, field_name: str) -> None:
 
 def _aggregate_trials(
     case: EvalCase,
-    results: list[EvalCaseResult],
+    results: list[EvalTrialResult],
     *,
     started_at: datetime,
     completed_at: datetime,
-    retain_trajectory: bool,
 ) -> EvalCaseResult:
-    # Collapse N trial runs of one case into a single result whose per-assertion score is the
-    # mean across trials. Any errored trial keeps the aggregate in ERROR so execution failures
-    # cannot disappear behind assertion-list mismatch handling.
-    n = len(results)
-    errored = [result for result in results if result.status == EvalStatus.ERROR]
-    all_error = all(result.status == EvalStatus.ERROR for result in results)
-    combined_error: str | None = None
-    if errored:
-        errors = [result.error for result in errored if result.error]
-        prefix = f"All {n} trials errored" if all_error else f"{len(errored)} of {n} trials errored"
-        combined_error = f"{prefix}; first: {errors[0]}" if errors else f"{prefix}."
-    aggregated = [] if errored else _aggregate_trial_assertions(results, n)
-    status = _case_status(combined_error, aggregated)
-    score = _case_score(status, aggregated)
-    # The last trial supplies output/trajectory for export; the last concrete trial session
-    # remains the compatibility representative when a later trial created no session.
-    last = results[-1]
-    trial_session_ids = tuple(
-        session_id for result in results for session_id in result.trial_session_ids
-    )
-    representative_session_id = last.session_id or (
-        trial_session_ids[-1] if trial_session_ids else None
-    )
-    metadata = {
-        **case.metadata,
-        "trials": n,
-        "trial_scores": [result.score for result in results],
-        "trial_statuses": [result.status.value for result in results],
-    }
-    return EvalCaseResult(
+    retained = tuple(results)
+    return EvalCaseResult.from_trials(
         case_id=case.id,
-        status=status,
         authored_session_id=case.request.session_id,
-        trial_session_ids=trial_session_ids,
-        session_id=representative_session_id,
-        score=score,
-        final_output=last.final_output,
-        assertions=tuple(aggregated),
-        error=combined_error,
-        events_count=last.events_count,
-        usage_summary=last.usage_summary,
+        trials=retained,
         started_at=started_at,
         completed_at=completed_at,
-        duration_ms=_duration_ms(started_at, completed_at),
-        metadata=metadata,
-        trajectory=last.trajectory if retain_trajectory else None,
+        metadata=case.metadata,
     )
-
-
-def _aggregate_trial_assertions(
-    results: list[EvalCaseResult], trials: int
-) -> list[EvalAssertionResult]:
-    assertion_lists = [result.assertions for result in results]
-    first = assertion_lists[0]
-    # Same case, same assertion list, so every trial yields the same assertions in order. If a
-    # trial diverges (defensive), skip aggregation so the case reports SKIPPED rather than
-    # zipping mismatched assertions together.
-    if not first or not all(len(a) == len(first) for a in assertion_lists):
-        return []
-    aggregated: list[EvalAssertionResult] = []
-    for index in range(len(first)):
-        group = [assertions[index] for assertions in assertion_lists]
-        mean_score = sum(assertion.score for assertion in group) / trials
-        threshold = group[0].threshold
-        bar = threshold if threshold is not None else 1.0
-        pass_count = sum(1 for assertion in group if assertion.passed)
-        aggregated.append(
-            EvalAssertionResult(
-                name=group[0].name,
-                score=mean_score,
-                threshold=threshold,
-                passed=mean_score >= bar,
-                message=f"mean score {mean_score:.3f} over {trials} trials ({pass_count}/{trials} passed)",
-                metadata={
-                    "trials": trials,
-                    "trial_scores": [assertion.score for assertion in group],
-                    "pass_count": pass_count,
-                },
-            )
-        )
-    return aggregated
 
 
 def _validate_timeout_seconds(value: float | None, field_name: str) -> None:
@@ -834,46 +977,42 @@ def final_output_text(transcript: Iterable[Message]) -> str:
     return ""
 
 
-def _case_status(
+def _trial_status(
     run_error: str | None,
+    unavailable_reason: str | None,
     assertions: Sequence[EvalAssertionResult],
 ) -> EvalStatus:
     if run_error is not None:
         return EvalStatus.ERROR
-    # A case that asserts nothing used to pass at score 1.0 — a fail-open default that let an
-    # unfinished case masquerade as green. Record it as SKIPPED so it is visible, not counted.
+    if unavailable_reason is not None:
+        return EvalStatus.UNAVAILABLE
     if not assertions:
         return EvalStatus.SKIPPED
-    if all(assertion.passed for assertion in assertions):
-        return EvalStatus.PASSED
-    return EvalStatus.FAILED
-
-
-def _case_score(status: EvalStatus, assertions: Sequence[EvalAssertionResult]) -> float:
-    if status in (EvalStatus.ERROR, EvalStatus.SKIPPED):
-        return 0.0
-    if not assertions:
-        return 0.0
-    return sum(assertion.score for assertion in assertions) / len(assertions)
-
-
-def _run_status(results: list[EvalCaseResult]) -> EvalStatus:
-    if any(result.status == EvalStatus.ERROR for result in results):
+    outcomes = tuple(assertion.outcome for assertion in assertions)
+    if EvalOutcome.ERROR in outcomes:
         return EvalStatus.ERROR
-    if any(result.status == EvalStatus.FAILED for result in results):
+    if EvalOutcome.UNAVAILABLE in outcomes:
+        return EvalStatus.UNAVAILABLE
+    if EvalOutcome.FAILED in outcomes:
         return EvalStatus.FAILED
-    # A skipped case (zero assertions) is not a pass; surface it at the run level so the
-    # suite is not reported green while a case asserted nothing.
-    if any(result.status == EvalStatus.SKIPPED for result in results):
-        return EvalStatus.SKIPPED
     return EvalStatus.PASSED
 
 
-def _average_score(scores: Iterable[float]) -> float:
-    values = tuple(scores)
-    if not values:
+def _trial_score(
+    status: EvalStatus,
+    assertions: Sequence[EvalAssertionResult],
+) -> float | None:
+    if status in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE):
+        return None
+    if status == EvalStatus.SKIPPED:
         return 0.0
-    return sum(values) / len(values)
+    if not assertions:
+        return 0.0
+    scores = tuple(assertion.score for assertion in assertions)
+    if any(score is None for score in scores):
+        return None
+    numeric = tuple(score for score in scores if score is not None)
+    return sum(numeric) / len(numeric)
 
 
 def _duration_ms(started_at: datetime, completed_at: datetime) -> int:

@@ -9,8 +9,8 @@ from typing import Any
 from cayu.artifacts import ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, TextPart, ToolCallPart, ToolResultPart
-from cayu.evals.models import EvalAssertionResult, EvalContext, ProbeRequirements
-from cayu.runtime.costs import PriceBook, estimate_session_cost
+from cayu.evals.models import EvalAssertionResult, EvalContext, EvalOutcome, ProbeRequirements
+from cayu.runtime.costs import PriceBook, SessionCostSummary, estimate_session_cost
 from cayu.runtime.sessions import SessionStatus
 
 
@@ -38,12 +38,15 @@ class EvalAssertion(ABC):
         message: str = "",
         *,
         metadata: dict[str, Any] | None = None,
+        cost_summary: SessionCostSummary | None = None,
     ) -> EvalAssertionResult:
         return EvalAssertionResult(
             name=self.name,
-            passed=True,
+            outcome=EvalOutcome.PASSED,
+            score=1.0,
             message=message,
             metadata={} if metadata is None else metadata,
+            cost_summary=cost_summary,
         )
 
     def failed(
@@ -51,10 +54,41 @@ class EvalAssertion(ABC):
         message: str,
         *,
         metadata: dict[str, Any] | None = None,
+        cost_summary: SessionCostSummary | None = None,
     ) -> EvalAssertionResult:
         return EvalAssertionResult(
             name=self.name,
-            passed=False,
+            outcome=EvalOutcome.FAILED,
+            score=0.0,
+            message=message,
+            metadata={} if metadata is None else metadata,
+            cost_summary=cost_summary,
+        )
+
+    def unavailable(
+        self,
+        message: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        cost_summary: SessionCostSummary | None = None,
+    ) -> EvalAssertionResult:
+        return EvalAssertionResult(
+            name=self.name,
+            outcome=EvalOutcome.UNAVAILABLE,
+            message=message,
+            metadata={} if metadata is None else metadata,
+            cost_summary=cost_summary,
+        )
+
+    def error(
+        self,
+        message: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> EvalAssertionResult:
+        return EvalAssertionResult(
+            name=self.name,
+            outcome=EvalOutcome.ERROR,
             message=message,
             metadata={} if metadata is None else metadata,
         )
@@ -73,7 +107,7 @@ class EvalAssertion(ABC):
             name=self.name,
             score=score,
             threshold=threshold,
-            passed=score >= threshold,
+            outcome=EvalOutcome.PASSED if score >= threshold else EvalOutcome.FAILED,
             message=message,
             metadata={} if metadata is None else metadata,
         )
@@ -485,15 +519,32 @@ class MaxEstimatedCost(EvalAssertion):
             currency=self.currency,
         )
         actual = summary.total_cost
-        if actual <= self.maximum:
-            return self.passed(
-                f"Estimated cost {actual} {self.currency} is within limit {self.maximum}.",
-                metadata={"estimated_cost": str(actual), "maximum": str(self.maximum)},
+        metadata = {
+            "estimated_cost": str(actual),
+            "maximum": str(self.maximum),
+            "priced_model_steps": summary.priced_model_steps,
+            "unpriced_model_steps": summary.unpriced_model_steps,
+        }
+        if summary.unpriced_model_steps > 0:
+            return self.unavailable(
+                "Cannot verify the cost limit because "
+                f"{summary.unpriced_model_steps} model step(s) have no matching pricing.",
+                metadata=metadata,
+                cost_summary=summary,
             )
-        return self.failed(
-            f"Estimated cost {actual} {self.currency} exceeded limit {self.maximum}.",
-            metadata={"estimated_cost": str(actual), "maximum": str(self.maximum)},
-        )
+        if actual <= self.maximum:
+            result = self.passed(
+                f"Estimated cost {actual} {self.currency} is within limit {self.maximum}.",
+                metadata=metadata,
+                cost_summary=summary,
+            )
+        else:
+            result = self.failed(
+                f"Estimated cost {actual} {self.currency} exceeded limit {self.maximum}.",
+                metadata=metadata,
+                cost_summary=summary,
+            )
+        return result
 
 
 class WorkspaceFileExists(EvalAssertion):

@@ -15,9 +15,11 @@ from cayu import (
     EvalCase,
     EvalCaseResult,
     EvalContext,
+    EvalOutcome,
     EvalRun,
     EvalStatus,
     EvalSuite,
+    EvalTrialResult,
     Event,
     EventType,
     InMemorySessionStore,
@@ -27,6 +29,7 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SessionIdentity,
+    SessionStatus,
     compare_eval_runs,
     run_eval_suite,
 )
@@ -99,8 +102,7 @@ def test_preflight_error_does_not_report_nonexistent_trial_session():
     result = asyncio.run(run_eval_case(_app(), case, suite_id="s"))
 
     assert result.status == EvalStatus.ERROR
-    assert result.session_id is None
-    assert result.trial_session_ids == ()
+    assert result.trials[0].session_id is None
 
 
 def test_eval_trial_anchors_to_first_emitted_session(monkeypatch):
@@ -125,6 +127,14 @@ def test_eval_trial_anchors_to_first_emitted_session(monkeypatch):
         await store.append_event(child.id, child_event)
         yield root_event
         yield child_event
+        await store.update_status(child.id, SessionStatus.COMPLETED)
+        child_terminal_event = Event(type=EventType.SESSION_COMPLETED, session_id=child.id)
+        await store.append_event(child.id, child_terminal_event)
+        yield child_terminal_event
+        await store.update_status(root.id, SessionStatus.COMPLETED)
+        terminal_event = Event(type=EventType.SESSION_COMPLETED, session_id=root.id)
+        await store.append_event(root.id, terminal_event)
+        yield terminal_event
 
     monkeypatch.setattr(app, "run", forwarding_run)
 
@@ -136,8 +146,7 @@ def test_eval_trial_anchors_to_first_emitted_session(monkeypatch):
         )
     )
 
-    assert result.session_id == result.trial_session_ids[0]
-    assert result.session_id != "forwarded-child"
+    assert result.trials[0].session_id != "forwarded-child"
 
 
 class _SequenceScoreAssertion(EvalAssertion):
@@ -174,9 +183,26 @@ def test_zero_assertion_case_is_skipped_not_passed():
 
 def _case_result(case_id: str, status: EvalStatus, score: float) -> EvalCaseResult:
     now = datetime.now(UTC)
-    return EvalCaseResult(
-        case_id=case_id, status=status, score=score, started_at=now, completed_at=now
+    outcome = EvalOutcome.PASSED if status == EvalStatus.PASSED else EvalOutcome.FAILED
+    threshold = 0.0 if outcome == EvalOutcome.PASSED else 1.0
+    trial = EvalTrialResult(
+        trial_number=1,
+        status=status,
+        session_id="session-1",
+        score=score,
+        assertions=(
+            EvalAssertionResult(
+                name="check",
+                outcome=outcome,
+                score=score,
+                threshold=threshold,
+            ),
+        ),
+        evidence_complete=True,
+        started_at=now,
+        completed_at=now,
     )
+    return EvalCaseResult.from_trials(case_id=case_id, trials=(trial,))
 
 
 def _run(status: EvalStatus, score: float, cases: list[EvalCaseResult]) -> EvalRun:
@@ -223,28 +249,25 @@ def test_trials_average_the_per_assertion_score():
     # mean of the four trial scores.
     assert result.assertions[0].score == pytest.approx(0.9)
     assert result.score == pytest.approx(0.9)
-    assert result.metadata["trials"] == 4
-    assert result.metadata["trial_scores"] == pytest.approx([1.0, 0.8, 1.0, 0.8])
-    assert len(result.trial_session_ids) == 4
-    assert len(set(result.trial_session_ids)) == 4
-    assert result.session_id == result.trial_session_ids[-1]
+    assert [trial.score for trial in result.trials] == pytest.approx([1.0, 0.8, 1.0, 0.8])
+    trial_session_ids = [trial.session_id for trial in result.trials]
+    assert len(set(trial_session_ids)) == 4
 
 
-def test_trials_keep_last_concrete_session_when_final_trial_has_none():
+def test_trials_preserve_concrete_and_missing_session_identity_without_representative():
     from cayu.evals.runner import _aggregate_trials
 
     now = datetime.now(UTC)
-    concrete = EvalCaseResult(
-        case_id="partial",
+    concrete = EvalTrialResult(
+        trial_number=1,
         status=EvalStatus.ERROR,
-        trial_session_ids=("concrete-session",),
         session_id="concrete-session",
         error="failed after session creation",
         started_at=now,
         completed_at=now,
     )
-    no_session = EvalCaseResult(
-        case_id="partial",
+    no_session = EvalTrialResult(
+        trial_number=2,
         status=EvalStatus.ERROR,
         error="failed before session creation",
         started_at=now,
@@ -256,11 +279,9 @@ def test_trials_keep_last_concrete_session_when_final_trial_has_none():
         [concrete, no_session],
         started_at=now,
         completed_at=now,
-        retain_trajectory=False,
     )
 
-    assert result.trial_session_ids == ("concrete-session",)
-    assert result.session_id == "concrete-session"
+    assert [trial.session_id for trial in result.trials] == ["concrete-session", None]
 
 
 @pytest.mark.parametrize(
@@ -299,25 +320,26 @@ def test_trials_replace_authored_session_but_preserve_causal_identity_and_isolat
         ):
             pass
         result = await run_eval_case(app, case, suite_id="s", trials=2)
+        trial_session_ids = [trial.session_id for trial in result.trials]
         transcripts = [
-            await app.session_store.load_transcript(session_id)
-            for session_id in result.trial_session_ids
+            await app.session_store.load_transcript(session_id) for session_id in trial_session_ids
         ]
-        sessions = [
-            await app.session_store.load(session_id) for session_id in result.trial_session_ids
-        ]
-        return result, transcripts, sessions
+        sessions = [await app.session_store.load(session_id) for session_id in trial_session_ids]
+        return result, trial_session_ids, transcripts, sessions
 
-    result, transcripts, sessions = asyncio.run(scenario())
+    result, trial_session_ids, transcripts, sessions = asyncio.run(scenario())
 
     assert case.request.session_id == "authored-session"
     assert case.request.causal_budget_id == authored_causal_budget_id
     assert case.request.budget_limits[0].key == budget_key
+    # The runner owns and drains these fresh interruptions, then reconciles their
+    # emitted root-event sequences with durable state before scoring them.
     assert result.status == EvalStatus.PASSED
+    assert result.score == 1.0
+    assert all(trial.evidence_complete for trial in result.trials)
     assert result.authored_session_id == "authored-session"
-    assert len(result.trial_session_ids) == 2
-    assert len(set(result.trial_session_ids)) == 2
-    assert "authored-session" not in result.trial_session_ids
+    assert len(set(trial_session_ids)) == 2
+    assert "authored-session" not in trial_session_ids
     assert all(session is not None for session in sessions)
     effective_causal_budget_id = authored_causal_budget_id or "authored-session"
     assert [session.causal_budget_id for session in sessions if session is not None] == [
@@ -368,17 +390,16 @@ def test_trials_without_authored_identity_default_causal_id_to_concrete_session(
 
     async def scenario():
         result = await run_eval_case(app, case, suite_id="s", trials=2)
-        sessions = [
-            await app.session_store.load(session_id) for session_id in result.trial_session_ids
-        ]
-        return result, sessions
+        trial_session_ids = [trial.session_id for trial in result.trials]
+        sessions = [await app.session_store.load(session_id) for session_id in trial_session_ids]
+        return result, trial_session_ids, sessions
 
-    result, sessions = asyncio.run(scenario())
+    result, trial_session_ids, sessions = asyncio.run(scenario())
 
     assert result.status == EvalStatus.PASSED
     assert all(session is not None for session in sessions)
     assert [session.causal_budget_id for session in sessions if session is not None] == list(
-        result.trial_session_ids
+        trial_session_ids
     )
 
 
@@ -410,15 +431,17 @@ def test_eval_trial_preserves_causal_identity_for_app_budget_policy():
 
     async def scenario():
         result = await run_eval_case(app, case, suite_id="s")
-        assert result.session_id is not None
-        session = await app.session_store.load(result.session_id)
-        events = await app.session_store.load_events(result.session_id)
+        session_id = result.trials[0].session_id
+        assert session_id is not None
+        session = await app.session_store.load(session_id)
+        events = await app.session_store.load_events(session_id)
         return result, session, events
 
     result, session, events = asyncio.run(scenario())
 
     assert result.status == EvalStatus.PASSED
-    assert result.session_id != "authored-session"
+    assert result.trials[0].evidence_complete is True
+    assert result.trials[0].session_id != "authored-session"
     assert session is not None
     assert session.causal_budget_id == "authored-budget"
     assert EventType.BUDGET_CHECKED in [event.type for event in events]
@@ -457,24 +480,23 @@ def test_trials_preserve_partial_execution_errors():
     result = asyncio.run(run_eval_case(app, case, suite_id="s", trials=2))
 
     assert result.status == EvalStatus.ERROR
-    assert result.score == 0.0
+    assert result.score is None
     assert result.error is not None
     assert "1 of 2 trials errored" in result.error
-    assert result.metadata["trial_statuses"] == ["passed", "error"]
+    assert [trial.status for trial in result.trials] == [EvalStatus.PASSED, EvalStatus.ERROR]
 
 
-def test_trials_single_run_skips_aggregation_metadata():
+def test_single_trial_preserves_raw_assertion_and_exposes_aggregate():
     case = EvalCase(
         id="one",
         request=_request(),
         assertions=[_SequenceScoreAssertion([0.7], threshold=0.5)],
     )
     result = asyncio.run(run_eval_case(_app(), case, suite_id="s"))
-    # trials=1 keeps the assertion result verbatim and does not add aggregation metadata.
-    assert result.assertions[0].message == "graded"
-    assert "trials" not in result.metadata
+    assert result.trials[0].assertions[0].message == "graded"
+    assert result.assertions == result.trials[0].assertions
     assert result.authored_session_id is None
-    assert result.trial_session_ids == (result.session_id,)
+    assert result.trials[0].session_id is not None
 
 
 def test_trials_rejects_invalid_values():

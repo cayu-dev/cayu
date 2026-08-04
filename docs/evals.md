@@ -132,8 +132,8 @@ cases are:
 - `subagent_roundtrip` — a foreground direct child with an independent model
   script, completed-child evidence, and parent result use;
 - `usage_accounting` — explicit positive model usage under a token ceiling;
-- `budget_interrupt` — caller-supplied pricing that interrupts the session
-  before a queued side-effect tool starts.
+- `budget_interrupt` — priced caller limits interrupt before a queued external
+  side effect can run, with the complete interruption evidence scored directly;
 
 Every independent workflow has its own named `ScriptedModelProvider`, selected
 through `AgentSpec.provider_name`. An environment factory retained by the app
@@ -147,6 +147,16 @@ promotion, browser behavior, `SIGKILL` recovery, provider billing
 reconciliation, LLM-judged quality, or baseline release gating. Those require
 different dependencies or release policy and should not be inferred from a
 passing hermetic report.
+
+Interrupted sessions remain outside the production terminal-evidence contract
+used by promotion. A direct Python eval can nevertheless score an interruption
+that it created itself: the runner must drain that fresh execution, and an
+opted-in store must atomically match every emitted root event's durable
+sequence and type while applying the same count and canonical byte limits
+before payload hydration.
+Interrupted descendants are accepted only when their direct parent is proven
+inside that fresh execution tree. Any mismatch remains `unavailable`;
+arbitrary historical interrupted sessions never enter through this path.
 
 ## Built-In Assertion Areas
 
@@ -163,6 +173,10 @@ Current assertions cover:
 - estimated-cost ceilings with a supplied price book
 - workspace file existence/content
 - artifact creation
+
+`MaxEstimatedCost` fails closed: if even one observed model step has no matching
+price, its outcome is `unavailable` and the retained cost summary reports both
+priced and unpriced coverage instead of treating the missing price as zero.
 
 ## Workspace isolation
 
@@ -195,6 +209,23 @@ The same suite/assertion surface supports several modes:
   serializable `Trajectory` already makes a production run replayable; the promotion helper and
   datasets are planned follow-ups.
 
+## Results and repeated trials
+
+`run_eval_case(..., trials=N)` executes trials sequentially with a fresh concrete
+session ID each time. `EvalCaseResult.trials` is an ordered tuple of
+`EvalTrialResult` values; every trial retains its own status, session ID, final
+output, assertion outcomes, exact-snapshot usage, assertion-specific cost
+summary, duration, diagnostic, evidence-completeness flag, and optional
+trajectory. Case and run aggregates are reproducible from those retained tuples.
+There is no representative or implicit “last trial.”
+
+Assertion outcomes are `passed`, `failed`, `unavailable`, or `error`. Cases and
+runs add `skipped` for a direct Python case with no assertions. Aggregate status
+precedence is `error` → `unavailable` → `failed` → `skipped` → `passed`.
+Unavailable and error results have `score = null`; aggregation never converts
+them to zero or drops them from an average. A score is emitted only when every
+contributing result is scored.
+
 ## Capturing terminal session evidence
 
 The built-in in-memory, SQLite, and PostgreSQL session stores expose
@@ -207,10 +238,17 @@ metadata, including the complete canonical returned size. It excludes later
 event telemetry and fails with a typed error instead of truncating incomplete,
 contradictory, or oversized evidence.
 
-This operation does not itself create a `Trajectory`, an eval case, or a corpus,
-and it does not execute an eval or add a control-plane route. Those product
-steps build on this storage guarantee; the existing fresh-run, replay, report,
-and comparison workflows are unchanged. See
+After a fresh completed or failed eval drains `CayuApp.run(...)` completely
+(including runtime hooks), the runner uses this operation to build the root
+trajectory and derive usage from the same terminal-bounded event prefix. A
+runner-owned fresh interruption uses the narrower reconciliation described
+above without expanding production-session eligibility. A typed incomplete,
+contradictory, unsupported, or oversized snapshot becomes an `unavailable`
+trial with no score; an unexpected execution/evaluation failure becomes
+`error`. Neither can pass.
+
+This operation does not itself create an eval case or corpus and does not add a
+control-plane route. Those product steps build on this storage guarantee. See
 [Runtime Contracts](runtime-contracts.md#sessionstore) for the snapshot and
 resource-limit contract.
 
@@ -269,10 +307,11 @@ from cayu import (
 
 # 1. Run, asking the runner to retain the probe-complete trajectory it built.
 result = await run_eval_case(app, case, suite_id="suite", retain_trajectory=True)
-assert result.trajectory is not None  # populated because retain_trajectory=True
+trial = result.trials[0]
+assert trial.trajectory is not None  # populated because retain_trajectory=True
 
 # 2. Persist it (opt-in; a plain JSON file you manage — no automatic retention).
-write_trajectory_json(result.trajectory, "run.json")
+write_trajectory_json(trial.trajectory, "run.json")
 
 # 3. Later / elsewhere: reload and re-run the same assertions offline.
 restored = load_trajectory("run.json")
@@ -280,15 +319,16 @@ results = await evaluate_assertions(restored, case.assertions)
 assert all(r.passed for r in results)
 ```
 
-`retain_trajectory` defaults to `False`, so a normal run keeps its existing memory profile
-and the trajectory is dropped after the case. The trajectory is **excluded from the saved
-`EvalRun` JSON** and remains a separate, opt-in export.
+`retain_trajectory` defaults to `False`, so a normal run does not retain trajectory
+payloads after each trial result is built. When enabled, every trial retains its own
+trajectory. Trajectories are **excluded from saved `EvalRun` JSON** and remain separate,
+opt-in exports.
 
-Saved `EvalRun` baselines use schema version `3`. Version 3 stores identity-free aggregate
-usage, preserves counters beyond signed int64 as canonical decimal strings, and applies
-Cayu's durable-JSON contract before an existing output is overwritten and while loading.
-`load_eval_run(...)` rejects missing versions and the prerelease version 1 and 2 formats;
-regenerate those baselines with the current Cayu version.
+Saved `EvalRun` baselines use schema version `4`. Version 4 preserves the complete
+ordered trial graph and explicit outcome/null-score contract. It retains version 3's
+identity-free aggregate usage, canonical large counters, and durable-JSON validation.
+`load_eval_run(...)` rejects missing versions and versions 1–3; regenerate those
+baselines with the current Cayu version. No compatibility loader or migration is used.
 
 Standalone exports use a versioned document envelope. The current trajectory
 schema version is `1`; `load_trajectory(...)` rejects files without that version

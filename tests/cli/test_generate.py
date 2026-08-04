@@ -322,6 +322,8 @@ def test_generate_slice_applies_once_and_passes_public_verification(
     assert 'ANALYZE_DOCUMENT_TOOL_NAME = "analyze_document"' in tool_source
     assert "name=ANALYZE_DOCUMENT_TOOL_NAME" in tool_source
     assert "name=ANALYZE_DOCUMENT_TOOL_NAME" in eval_source
+    assert "SessionInterrupted()" in eval_source
+    assert "EventOccurred(EventType.TOOL_CALL_APPROVAL_REQUESTED)" in eval_source
     assert main(["check", "--json"]) == 0
     diagnostics = json.loads(capsys.readouterr().out)["diagnostics"]
     assert [item["code"] for item in diagnostics] == ["AGENT_GENERATED_TRACER_BULLET_UNFINISHED"]

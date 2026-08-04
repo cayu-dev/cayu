@@ -23,9 +23,11 @@ from cayu import (
     EvalCase,
     EvalCaseResult,
     EvalContext,
+    EvalOutcome,
     EvalRun,
     EvalStatus,
     EvalSuite,
+    EvalTrialResult,
     Event,
     EventNotOccurred,
     EventOccurred,
@@ -85,7 +87,7 @@ from cayu.evals import (
 from cayu.evals.runner import _build_child_trajectories
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runtime import InMemorySessionStore, SessionIdentity
-from cayu.runtime.sessions import Session
+from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.usage import SessionUsageSummary, build_aggregate_usage_metrics
 
 
@@ -120,6 +122,67 @@ def _context(
         metadata=metadata or {},
     )
     return EvalContext(trajectory=trajectory, suite_id="s", case_id="c", metadata=metadata or {})
+
+
+def _trial_result(
+    status: EvalStatus,
+    score: float | None,
+    *,
+    trial_number: int = 1,
+    session_id: str | None = None,
+    error: str | None = None,
+    unavailable_reason: str | None = None,
+) -> EvalTrialResult:
+    now = datetime.now(UTC)
+    if status == EvalStatus.PASSED:
+        assertions = (
+            EvalAssertionResult(
+                name="check",
+                outcome=EvalOutcome.PASSED,
+                score=score,
+                threshold=0.0,
+            ),
+        )
+    elif status == EvalStatus.FAILED:
+        assertions = (
+            EvalAssertionResult(
+                name="check",
+                outcome=EvalOutcome.FAILED,
+                score=score,
+                threshold=1.0,
+            ),
+        )
+    elif status == EvalStatus.ERROR:
+        error = error or "trial error"
+        assertions = (EvalAssertionResult(name="check", outcome=EvalOutcome.ERROR, message=error),)
+    elif status == EvalStatus.UNAVAILABLE:
+        unavailable_reason = unavailable_reason or "evidence unavailable"
+        assertions = (
+            EvalAssertionResult(
+                name="check",
+                outcome=EvalOutcome.UNAVAILABLE,
+                message=unavailable_reason,
+            ),
+        )
+    else:
+        assertions = ()
+    return EvalTrialResult(
+        trial_number=trial_number,
+        status=status,
+        session_id=session_id
+        or (
+            None
+            if status in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE)
+            else f"session-{trial_number}"
+        ),
+        score=score,
+        assertions=assertions,
+        error=error,
+        unavailable_reason=unavailable_reason,
+        evidence_complete=status not in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE),
+        started_at=now,
+        completed_at=now,
+    )
 
 
 class EchoTool(Tool):
@@ -208,8 +271,9 @@ def test_eval_suite_runs_assertions_over_runtime_state(tmp_path):
 
     assert result.status == EvalStatus.PASSED
     assert result.score == 1.0
-    assert result.cases[0].session_id is not None
-    assert result.cases[0].usage_summary["usage"]["total_tokens"] == 7
+    trial = result.cases[0].trials[0]
+    assert trial.session_id is not None
+    assert trial.usage_summary["usage"]["total_tokens"] == 7
 
 
 def test_eval_suite_asserts_tool_trajectory():
@@ -258,7 +322,7 @@ def test_eval_suite_asserts_tool_trajectory():
     result = asyncio.run(run_eval_suite(app, suite))
 
     assert result.status == EvalStatus.PASSED
-    assert result.cases[0].events_count >= 1
+    assert result.cases[0].trials[0].events_count >= 1
 
 
 def test_eval_json_html_and_compare(tmp_path):
@@ -310,15 +374,21 @@ def test_write_html_report_rejects_nonportable_text_before_overwrite(
     run = EvalRun(
         suite_id="s",
         status=EvalStatus.ERROR,
+        score=None,
         cases=(
-            EvalCaseResult(
+            EvalCaseResult.from_trials(
                 case_id="c",
-                status=EvalStatus.ERROR,
-                error=invalid_text,
-                started_at=now,
-                completed_at=now,
+                trials=(
+                    _trial_result(
+                        EvalStatus.ERROR,
+                        None,
+                        error=invalid_text,
+                    ),
+                ),
             ),
         ),
+        started_at=now,
+        completed_at=now,
     )
     path = tmp_path / "report.html"
     path.write_text("existing report", encoding="utf-8")
@@ -454,10 +524,12 @@ class _HangingProvider(ModelProvider):
 
 class _SlowAssertion(EvalAssertion):
     def __init__(self) -> None:
+        self.started = False
         self.completed = False
 
     async def evaluate(self, context):
-        await asyncio.sleep(0.2)
+        self.started = True
+        await asyncio.sleep(1)
         self.completed = True
         return self.passed("Slow assertion completed.")
 
@@ -471,7 +543,7 @@ class _ProviderTimeout(ModelProvider):
 
 
 class _NeverReturningLoadStore(InMemorySessionStore):
-    async def load(self, session_id: str) -> Session | None:
+    async def load_terminal_session_evidence(self, session_id: str, *, limits=None):
         await asyncio.Event().wait()
         return None
 
@@ -529,7 +601,7 @@ def test_case_timeout_records_error_instead_of_hanging():
     )
     assert result.status == EvalStatus.ERROR
     assert result.cases[0].status == EvalStatus.ERROR
-    assert "timed out after 0.05 seconds" in result.cases[0].error
+    assert "timed out after 0.05 seconds" in result.cases[0].trials[0].error
 
 
 def test_case_timeout_does_not_retry_store_load_after_deadline():
@@ -551,9 +623,10 @@ def test_case_timeout_does_not_retry_store_load_after_deadline():
     result = asyncio.run(scenario())
 
     assert result.status == EvalStatus.ERROR
-    assert result.error == "Eval case timed out after 0.01 seconds."
-    assert result.session_id is None
-    assert result.trial_session_ids == ()
+    trial = result.trials[0]
+    assert trial.error == "Eval case timed out after 0.01 seconds."
+    assert trial.session_id is None
+    assert trial.evidence_complete is False
 
 
 def test_case_timeout_bounds_assertion_evaluation():
@@ -577,15 +650,20 @@ def test_case_timeout_bounds_assertion_evaluation():
         assertions=[assertion],
     )
 
-    result = asyncio.run(run_eval_case(app, case, suite_id="timeout", timeout_seconds=0.01))
+    result = asyncio.run(run_eval_case(app, case, suite_id="timeout", timeout_seconds=0.1))
 
     assert result.case_id == "slow-assertion"
     assert result.status == EvalStatus.ERROR
     assert result.authored_session_id == "slow-assertion-session"
-    assert result.session_id != "slow-assertion-session"
-    assert result.trial_session_ids == (result.session_id,)
-    assert result.error == "Eval case timed out after 0.01 seconds."
-    assert result.assertions == ()
+    trial = result.trials[0]
+    assert trial.session_id != "slow-assertion-session"
+    assert trial.error == "Eval case timed out after 0.1 seconds."
+    assert trial.assertions[0].outcome == EvalOutcome.ERROR
+    # Terminal evidence, probes, and children were complete before assertion
+    # evaluation timed out. The error describes evaluation, not missing evidence.
+    assert trial.evidence_complete is True
+    assert trial.events_count > 0
+    assert assertion.started is True
     assert assertion.completed is False
     assert result.completed_at >= result.started_at
     assert result.duration_ms >= 0
@@ -602,7 +680,7 @@ def test_provider_timeout_is_not_misclassified_as_case_deadline():
     )
 
     assert result.status == EvalStatus.ERROR
-    assert result.error == "Session failed: provider stream timed out"
+    assert result.trials[0].error == "Session failed: provider stream timed out"
 
 
 def test_max_concurrency_runs_cases_in_parallel_and_keeps_order():
@@ -642,9 +720,9 @@ def test_run_eval_suite_rejects_invalid_concurrency_and_timeout():
 
 
 def _case_result(case_id, status, score) -> EvalCaseResult:
-    now = datetime.now(UTC)
-    return EvalCaseResult(
-        case_id=case_id, status=status, score=score, started_at=now, completed_at=now
+    return EvalCaseResult.from_trials(
+        case_id=case_id,
+        trials=(_trial_result(status, score),),
     )
 
 
@@ -657,6 +735,21 @@ def test_compare_detects_status_regression():
     cur = _run(EvalStatus.FAILED, 0.0, [_case_result("a", EvalStatus.FAILED, 0.0)])
     comparison = compare_eval_runs(base, cur)
     assert any("status regressed" in item for item in comparison.regressions)
+
+
+def test_compare_detects_failed_to_unavailable_status_regression():
+    base = _run(EvalStatus.FAILED, 0.0, [_case_result("a", EvalStatus.FAILED, 0.0)])
+    cur = _run(
+        EvalStatus.UNAVAILABLE,
+        None,
+        [_case_result("a", EvalStatus.UNAVAILABLE, None)],
+    )
+
+    comparison = compare_eval_runs(base, cur)
+
+    assert any(
+        "status regressed from failed to unavailable" in item for item in comparison.regressions
+    )
 
 
 @pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
@@ -891,9 +984,9 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert EVAL_SCHEMA_VERSION == 3
+    assert EVAL_SCHEMA_VERSION == 4
     assert document["schema_version"] == EVAL_SCHEMA_VERSION
-    usage = document["cases"][0]["usage_summary"]["usage"]
+    usage = document["cases"][0]["trials"][0]["usage_summary"]["usage"]
     assert set(usage) == {
         "cache",
         "input_tokens",
@@ -913,7 +1006,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     assert load_eval_run(output) == result  # round-trips with the new fields
 
 
-@pytest.mark.parametrize("schema_version", [1, 2])
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
 def test_load_eval_run_rejects_prerelease_schema_versions(tmp_path, schema_version):
     run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
     data = json.loads(eval_run_to_json(run))
@@ -962,6 +1055,8 @@ def test_eval_run_durable_json_round_trip(tmp_path):
     run = EvalRun(
         suite_id="s",
         status=EvalStatus.PASSED,
+        score=1.0,
+        cases=(_case_result("a", EvalStatus.PASSED, 1.0),),
         metadata={
             "nested": {
                 "items": [
@@ -999,6 +1094,8 @@ def test_write_eval_run_rejects_nonportable_metadata_before_overwrite(
     run = EvalRun(
         suite_id="s",
         status=EvalStatus.PASSED,
+        score=1.0,
+        cases=(_case_result("a", EvalStatus.PASSED, 1.0),),
         metadata={"nested": {"value": invalid_value}},
     )
 
@@ -1014,6 +1111,8 @@ def test_write_eval_run_revalidates_forged_model_before_overwrite(tmp_path):
     forged = EvalRun(
         suite_id="s",
         status=EvalStatus.PASSED,
+        score=1.0,
+        cases=(_case_result("a", EvalStatus.PASSED, 1.0),),
     ).model_copy(
         update={
             "schema_version": 2,
@@ -1031,16 +1130,16 @@ def test_write_eval_run_revalidates_forged_model_before_overwrite(tmp_path):
     ("source", "expected_code"),
     [
         (
-            '{"schema_version":3,"schema_version":3,"suite_id":"s","status":"passed"}',
+            '{"schema_version":4,"schema_version":4,"suite_id":"s","status":"passed"}',
             "duplicate_json_key",
         ),
         (
-            '{"schema_version":3,"suite_id":"s","status":"passed","metadata":{"value":NaN}}',
+            '{"schema_version":4,"suite_id":"s","status":"passed","metadata":{"value":NaN}}',
             "non_finite_number",
         ),
         (
             (
-                '{"schema_version":3,"suite_id":"s","status":"passed","metadata":{"value":'
+                '{"schema_version":4,"suite_id":"s","status":"passed","metadata":{"value":'
                 f"{MAX_DURABLE_JSON_INTEGER + 1}"
                 "}}"
             ),
@@ -1048,14 +1147,14 @@ def test_write_eval_run_revalidates_forged_model_before_overwrite(tmp_path):
         ),
         (
             (
-                '{"schema_version":3,"suite_id":"s","status":"passed",'
+                '{"schema_version":4,"suite_id":"s","status":"passed",'
                 '"metadata":{"value":"\\u0000"}}'
             ),
             "nul_character",
         ),
         (
             (
-                '{"schema_version":3,"suite_id":"s","status":"passed",'
+                '{"schema_version":4,"suite_id":"s","status":"passed",'
                 '"metadata":{"value":"\\ud800"}}'
             ),
             "unicode_surrogate",
@@ -1071,15 +1170,26 @@ def test_load_eval_run_rejects_nonportable_json(tmp_path, source, expected_code)
         load_eval_run(path)
 
 
-def test_assertion_result_rejects_inconsistent_passed_and_score():
-    # passed must agree with score >= threshold (1.0 when no threshold).
+def test_assertion_result_rejects_inconsistent_outcome_and_score():
     with pytest.raises(ValidationError):
-        EvalAssertionResult(name="x", passed=True, score=0.0)
+        EvalAssertionResult(name="x", outcome=EvalOutcome.PASSED, score=0.0)
     with pytest.raises(ValidationError):
-        EvalAssertionResult(name="x", passed=False, score=0.6, threshold=0.5)
-    # consistent pairs are accepted.
-    assert EvalAssertionResult(name="x", passed=True, score=0.6, threshold=0.5).passed is True
-    assert EvalAssertionResult(name="x", passed=False).score == 0.0
+        EvalAssertionResult(
+            name="x",
+            outcome=EvalOutcome.FAILED,
+            score=0.6,
+            threshold=0.5,
+        )
+    passing = EvalAssertionResult(
+        name="x",
+        outcome=EvalOutcome.PASSED,
+        score=0.6,
+        threshold=0.5,
+    )
+    assert passing.passed is True
+    unavailable = EvalAssertionResult(name="x", outcome=EvalOutcome.UNAVAILABLE)
+    assert unavailable.score is None
+    assert unavailable.passed is False
 
 
 class _GradedAssertion(EvalAssertion):
@@ -1120,18 +1230,26 @@ def test_case_score_reflects_graded_assertion():
     assert result.cases[0].status == EvalStatus.PASSED
 
 
-def test_eval_case_result_normalizes_whitespace_error():
+def test_eval_trial_result_normalizes_whitespace_error():
     # A captured exception string ending in whitespace must not crash result
     # construction (which would abort the whole suite).
     now = datetime.now(UTC)
-    result = EvalCaseResult(
-        case_id="c", status=EvalStatus.ERROR, error="boom\n  ", started_at=now, completed_at=now
+    result = EvalTrialResult(
+        trial_number=1,
+        status=EvalStatus.ERROR,
+        error="boom\n  ",
+        started_at=now,
+        completed_at=now,
     )
     assert result.error == "boom"
-    blank = EvalCaseResult(
-        case_id="c", status=EvalStatus.ERROR, error="   ", started_at=now, completed_at=now
-    )
-    assert blank.error is None
+    with pytest.raises(ValidationError, match="require an error diagnostic"):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.ERROR,
+            error="   ",
+            started_at=now,
+            completed_at=now,
+        )
 
 
 def test_max_total_tokens_fails_when_usage_missing():
@@ -1218,6 +1336,78 @@ def test_max_estimated_cost_accepts_tiered_price_book():
     expected = Decimal(input_tokens) * tier.input_per_million / Decimal(1_000_000)
     assert result.passed is False
     assert result.metadata["estimated_cost"] == str(expected)
+    assert result.cost_summary is not None
+    assert result.cost_summary.total_cost == expected
+    assert result.cost_summary.session_id == "sess_eval"
+    assert EvalAssertionResult.model_validate_json(result.model_dump_json()) == result
+
+
+@pytest.mark.parametrize("include_priced_step", [False, True])
+def test_max_estimated_cost_is_unavailable_when_any_model_step_is_unpriced(
+    include_priced_step: bool,
+):
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name="priced-provider",
+                model="priced-model",
+                input_per_million=Decimal("1"),
+                output_per_million=Decimal("1"),
+            ),
+        )
+    )
+    events = []
+    if include_priced_step:
+        events.append(
+            Event(
+                type=EventType.MODEL_COMPLETED,
+                session_id="sess_eval",
+                payload={
+                    "usage_metrics": {
+                        "provider_name": "priced-provider",
+                        "model": "priced-model",
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                    }
+                },
+            )
+        )
+    events.append(
+        Event(
+            type=EventType.MODEL_COMPLETED,
+            session_id="sess_eval",
+            payload={
+                "usage_metrics": {
+                    "provider_name": "unpriced-provider",
+                    "model": "unpriced-model",
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120,
+                }
+            },
+        )
+    )
+    ctx = _context(
+        session=Session(
+            id="sess_eval",
+            agent_name="agent",
+            provider_name="priced-provider",
+            model="priced-model",
+            causal_budget_id="cb",
+        ),
+        events=tuple(events),
+    )
+
+    result = asyncio.run(MaxEstimatedCost(Decimal("100"), pricing=pricing).evaluate(ctx))
+
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert result.score is None
+    assert result.cost_summary is not None
+    assert result.cost_summary.priced_model_steps == int(include_priced_step)
+    assert result.cost_summary.unpriced_model_steps == 1
+    assert result.metadata["unpriced_model_steps"] == 1
+    assert EvalAssertionResult.model_validate_json(result.model_dump_json()) == result
 
 
 def test_tool_not_called_reports_when_tool_was_called():
@@ -1494,13 +1684,14 @@ def test_eval_case_captures_sub_agent_children():
     result = asyncio.run(run_eval_case(app, case, suite_id="s", retain_trajectory=True))
 
     assert result.status == EvalStatus.PASSED
-    assert result.trajectory is not None
+    trial = result.trials[0]
+    assert trial.trajectory is not None
     # the sub-agent run is captured as a child trajectory with parent linkage + its own data
-    assert len(result.trajectory.children) == 1
-    child = result.trajectory.children[0]
+    assert len(trial.trajectory.children) == 1
+    child = trial.trajectory.children[0]
     assert child.session is not None
     assert child.session.agent_name == "helper"
-    assert child.session.parent_session_id == result.session_id
+    assert child.session.parent_session_id == trial.session_id
     assert child.final_output == "subagent summary done"
 
 
@@ -1524,6 +1715,11 @@ def test_build_child_trajectories_walks_sub_agent_tree():
                 messages=[Message.text("user", "sub")],
             ),
             identity=identity,
+        )
+        await store.update_status("child", SessionStatus.COMPLETED)
+        await store.append_event(
+            "child",
+            Event(type=EventType.SESSION_COMPLETED, session_id="child"),
         )
         return await _build_child_trajectories(app, "parent", visited={"parent"})
 
@@ -1912,19 +2108,20 @@ def test_run_then_save_reload_replay(tmp_path):
     # retain_trajectory=True exposes the probe-complete trajectory; default does not.
     result = asyncio.run(run_eval_case(app, case, suite_id="s", retain_trajectory=True))
     assert result.status == EvalStatus.PASSED
-    assert result.trajectory is not None
-    assert asyncio.run(run_eval_case(app, case, suite_id="s")).trajectory is None
+    trial = result.trials[0]
+    assert trial.trajectory is not None
+    assert asyncio.run(run_eval_case(app, case, suite_id="s")).trials[0].trajectory is None
 
     # save -> reload -> replay against the reloaded trajectory
     path = tmp_path / "trajectory.json"
-    write_trajectory_json(result.trajectory, path)
+    write_trajectory_json(trial.trajectory, path)
     restored = load_trajectory(path)
     replayed = asyncio.run(evaluate_assertions(restored, assertions))
     assert [r.passed for r in replayed] == [True, True]
 
     # the trajectory is excluded from the persisted score-first eval-run JSON
-    run = EvalRun(suite_id="s", status=result.status, cases=(result,))
-    assert "trajectory" not in json.loads(eval_run_to_json(run))["cases"][0]
+    run = EvalRun(suite_id="s", status=result.status, score=result.score, cases=(result,))
+    assert "trajectory" not in json.loads(eval_run_to_json(run))["cases"][0]["trials"][0]
 
 
 @pytest.mark.skipif(
@@ -1975,10 +2172,11 @@ def test_integration_eval_against_gemini(tmp_path):
         (a.name, a.passed, a.message) for a in result.assertions
     ]
     # real runtime state was captured (real usage tokens, a linked session)
-    assert result.session_id is not None
-    assert result.trajectory is not None
-    assert result.trajectory.usage_summary is not None
-    assert result.trajectory.usage_summary.usage.total_tokens > 0
+    trial = result.trials[0]
+    assert trial.session_id is not None
+    assert trial.trajectory is not None
+    assert trial.trajectory.usage_summary is not None
+    assert trial.trajectory.usage_summary.usage.total_tokens > 0
 
 
 def test_format_exception_records_type_and_traceback():
@@ -2018,17 +2216,17 @@ def test_run_case_records_exception_type_when_loading_session_fails(monkeypatch)
     async def _boom(*_args, **_kwargs):
         raise RuntimeError("store offline")
 
-    monkeypatch.setattr(eval_runner, "_load_session_records", _boom)
+    monkeypatch.setattr(eval_runner, "_load_terminal_evidence", _boom)
 
     case = EvalCase(
         id="load-fails",
         request=RunRequest(agent_name="assistant", messages=[Message.text("user", "hi")]),
         assertions=[SessionCompleted()],
     )
-    result = asyncio.run(eval_runner._run_case_once(app, case, suite_id="s"))
+    result = asyncio.run(eval_runner._run_case_once(app, case, trial_number=1, suite_id="s"))
     assert result.status == EvalStatus.ERROR
     assert result.error is not None
-    assert "Failed to load eval session state" in result.error
+    assert "Failed to load terminal eval evidence" in result.error
     assert "RuntimeError" in result.error
 
 
@@ -2119,7 +2317,7 @@ def _seed_parent_with_children(store: InMemorySessionStore, n: int) -> None:
             identity=identity,
         )
         for i in range(n):
-            await store.create(
+            child = await store.create(
                 RunRequest(
                     agent_name="child",
                     session_id=f"child-{i}",
@@ -2127,6 +2325,11 @@ def _seed_parent_with_children(store: InMemorySessionStore, n: int) -> None:
                     messages=[Message.text("user", "sub")],
                 ),
                 identity=identity,
+            )
+            await store.update_status(child.id, SessionStatus.COMPLETED)
+            await store.append_event(
+                child.id,
+                Event(type=EventType.SESSION_COMPLETED, session_id=child.id),
             )
 
     asyncio.run(_seed())

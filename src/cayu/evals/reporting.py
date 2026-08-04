@@ -19,6 +19,7 @@ from cayu._validation import (
 from cayu.evals.models import (
     EVAL_SCHEMA_VERSION,
     TRAJECTORY_SCHEMA_VERSION,
+    EvalOutcome,
     EvalRun,
     EvalStatus,
     Trajectory,
@@ -26,6 +27,14 @@ from cayu.evals.models import (
 from cayu.runtime.usage import aggregate_usage_metrics_from_json_payload
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+_STATUS_SEVERITY = {
+    EvalStatus.PASSED: 0,
+    EvalStatus.SKIPPED: 1,
+    EvalStatus.FAILED: 2,
+    EvalStatus.UNAVAILABLE: 3,
+    EvalStatus.ERROR: 4,
+}
 
 
 class _TrajectoryDocument(BaseModel):
@@ -64,8 +73,8 @@ class EvalRunComparison(BaseModel):
     current_suite_id: str
     baseline_status: EvalStatus
     current_status: EvalStatus
-    baseline_score: StrictFloat
-    current_score: StrictFloat
+    baseline_score: StrictFloat | None = None
+    current_score: StrictFloat | None = None
     regressions: tuple[str, ...] = Field(default_factory=tuple)
     cases: tuple[EvalCaseComparison, ...] = Field(default_factory=tuple)
 
@@ -267,6 +276,7 @@ def render_html_report(run: EvalRun) -> str:
     .badge {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 0.8rem; font-weight: 700; }}
     .passed {{ color: #0f5132; background: #d9f2e3; }}
     .failed {{ color: #842029; background: #f8d7da; }}
+    .unavailable {{ color: #553c00; background: #fff0b3; }}
     .error {{ color: #664d03; background: #fff3cd; }}
     .skipped {{ color: #41505b; background: #e2e8ef; }}
     .case {{ padding: 16px; margin-top: 12px; }}
@@ -281,14 +291,14 @@ def render_html_report(run: EvalRun) -> str:
     <p>Suite <code>{_escape(run.suite_id)}</code> run <code>{_escape(run.run_id)}</code></p>
     <div class="metrics">
       <div class="metric"><strong>{_status_badge(run.status)}</strong><span>Status</span></div>
-      <div class="metric"><strong>{run.score:.2f}</strong><span>Score</span></div>
+      <div class="metric"><strong>{_format_score(run.score)}</strong><span>Score</span></div>
       <div class="metric"><strong>{len(run.cases)}</strong><span>Cases</span></div>
       <div class="metric"><strong>{run.duration_ms} ms</strong><span>Duration</span></div>
     </div>
     <h2>Cases</h2>
     <table>
       <thead>
-        <tr><th>Case</th><th>Status</th><th>Score</th><th>Session</th><th>Assertions</th><th>Error</th></tr>
+        <tr><th>Case</th><th>Status</th><th>Score</th><th>Trials</th><th>Assertions</th><th>Diagnostic</th></tr>
       </thead>
       <tbody>
         {rows}
@@ -315,7 +325,7 @@ def compare_eval_runs(
     `score_tolerance` (>= 0) is the amount a score may drop before it counts as a regression:
     a current score below ``baseline - score_tolerance`` regresses, so a stochastic wobble
     (e.g. 0.83 -> 0.82) inside the tolerance no longer fails a baseline comparison every run.
-    A status regression (PASSED -> not PASSED) is always flagged regardless of tolerance.
+    A move to a more severe status is always flagged regardless of tolerance.
     """
     if type(score_tolerance) not in (int, float) or isinstance(score_tolerance, bool):
         raise TypeError("compare_eval_runs score_tolerance must be a number.")
@@ -351,11 +361,15 @@ def compare_eval_runs(
         if cur is None:
             case_regressions.append("case missing from current run")
         else:
-            if base.status == EvalStatus.PASSED and cur.status != EvalStatus.PASSED:
+            if _STATUS_SEVERITY[cur.status] > _STATUS_SEVERITY[base.status]:
                 case_regressions.append(
                     f"status regressed from {base.status.value} to {cur.status.value}"
                 )
-            if cur.score < base.score - score_tolerance:
+            if (
+                cur.score is not None
+                and base.score is not None
+                and cur.score < base.score - score_tolerance
+            ):
                 case_regressions.append(f"score regressed from {base.score:.2f} to {cur.score:.2f}")
         for item in case_regressions:
             regressions.append(f"{case_id}: {item}")
@@ -370,12 +384,16 @@ def compare_eval_runs(
             )
         )
 
-    if baseline.status == EvalStatus.PASSED and current.status != EvalStatus.PASSED:
+    if _STATUS_SEVERITY[current.status] > _STATUS_SEVERITY[baseline.status]:
         regressions.insert(
             0,
             f"run status regressed from {baseline.status.value} to {current.status.value}",
         )
-    if current.score < baseline.score - score_tolerance:
+    if (
+        current.score is not None
+        and baseline.score is not None
+        and current.score < baseline.score - score_tolerance
+    ):
         regressions.insert(
             0, f"run score regressed from {baseline.score:.2f} to {current.score:.2f}"
         )
@@ -432,7 +450,7 @@ def render_comparison_html(comparison: EvalRunComparison) -> str:
   <main class="page">
     <h1>Cayu Eval Comparison</h1>
     <p>Baseline <code>{_escape(comparison.baseline_run_id)}</code> vs current <code>{_escape(comparison.current_run_id)}</code></p>
-    <p>Score: {comparison.baseline_score:.2f} -> {comparison.current_score:.2f}</p>
+    <p>Score: {_format_score(comparison.baseline_score)} -&gt; {_format_score(comparison.current_score)}</p>
     <h2>Regressions</h2>
     <div class="regressions">{_escape("; ".join(comparison.regressions) or "No regressions detected.")}</div>
     <h2>Cases</h2>
@@ -465,36 +483,73 @@ def _case_row(case: Any) -> str:
         "<tr>"
         f"<td>{_escape(case.case_id)}</td>"
         f"<td>{_status_badge(case.status)}</td>"
-        f"<td>{case.score:.2f}</td>"
-        f"<td>{_escape(case.session_id or '')}</td>"
+        f"<td>{_format_score(case.score)}</td>"
+        f"<td>{len(case.trials)}</td>"
         f"<td>{passed}/{total}</td>"
-        f"<td>{_escape(case.error or '')}</td>"
+        f"<td>{_escape(case.error or case.unavailable_reason or '')}</td>"
         "</tr>"
     )
 
 
 def _assertion_section(case: Any) -> str:
-    assertions = "\n".join(
-        '<div class="assertion">'
-        f"<div>{_status_badge(EvalStatus.PASSED if assertion.passed else EvalStatus.FAILED)}</div>"
-        f"<div><strong>{_escape(assertion.name)}</strong><p>{_escape(assertion.message)}</p>"
-        f"<pre>{_escape(json.dumps(assertion.metadata, indent=2, sort_keys=True))}</pre></div>"
-        "</div>"
-        for assertion in case.assertions
-    )
+    assertions = _assertion_rows(case.assertions)
     if not assertions:
         assertions = "<p>No assertions.</p>"
-    final_output = (
-        f"<h4>Final output</h4><pre>{_escape(case.final_output)}</pre>" if case.final_output else ""
-    )
+    trials = "\n".join(_trial_section(trial) for trial in case.trials)
     return (
         f'<section class="case"><h3>{_escape(case.case_id)}</h3>'
-        f"{final_output}{assertions}</section>"
+        f"<h4>Aggregate assertions</h4>{assertions}<h4>Trials</h4>{trials}</section>"
     )
 
 
-def _status_badge(status: EvalStatus) -> str:
+def _assertion_rows(assertions: Any) -> str:
+    return "\n".join(
+        '<div class="assertion">'
+        f"<div>{_status_badge(assertion.outcome)}</div>"
+        f"<div><strong>{_escape(assertion.name)}</strong><p>{_escape(assertion.message)}</p>"
+        f"<pre>{_escape(json.dumps(_assertion_details(assertion), indent=2, sort_keys=True))}</pre></div>"
+        "</div>"
+        for assertion in assertions
+    )
+
+
+def _assertion_details(assertion: Any) -> dict[str, Any]:
+    details = dict(assertion.metadata)
+    if assertion.cost_summary is not None:
+        details["cost_summary"] = assertion.cost_summary.model_dump(mode="json")
+    return details
+
+
+def _trial_section(trial: Any) -> str:
+    assertions = _assertion_rows(trial.assertions) or "<p>No assertions.</p>"
+    final_output = (
+        f"<h5>Final output</h5><pre>{_escape(trial.final_output)}</pre>"
+        if trial.final_output
+        else ""
+    )
+    diagnostic = trial.error or trial.unavailable_reason
+    diagnostic_html = f"<h5>Diagnostic</h5><pre>{_escape(diagnostic)}</pre>" if diagnostic else ""
+    usage = (
+        f"<h5>Usage</h5><pre>{_escape(json.dumps(trial.usage_summary, indent=2, sort_keys=True))}</pre>"
+        if trial.usage_summary is not None
+        else ""
+    )
+    return (
+        '<div class="case">'
+        f"<h4>Trial {trial.trial_number} · {_status_badge(trial.status)}</h4>"
+        f"<p>Session <code>{_escape(trial.session_id or 'not created')}</code> · "
+        f"score {_format_score(trial.score)} · {trial.duration_ms} ms · "
+        f"evidence {'complete' if trial.evidence_complete else 'incomplete'}</p>"
+        f"{diagnostic_html}{final_output}{usage}<h5>Assertions</h5>{assertions}</div>"
+    )
+
+
+def _status_badge(status: EvalStatus | EvalOutcome) -> str:
     return f'<span class="badge {status.value}">{status.value}</span>'
+
+
+def _format_score(score: float | None) -> str:
+    return "unavailable" if score is None else f"{score:.2f}"
 
 
 def _escape(value: Any) -> str:

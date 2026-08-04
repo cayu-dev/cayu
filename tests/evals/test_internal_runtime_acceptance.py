@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from cayu import EnvironmentFactoryRequest, EvalStatus, run_eval_plan
+from cayu import EnvironmentFactoryRequest, EvalOutcome, EvalStatus, EventType, run_eval_plan
 
 _CASE_IDS = [
     "tool_roundtrip",
@@ -53,8 +53,10 @@ def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(monkeypatch) 
             retain_trajectory=True,
         )
         cases_by_id = {case.case_id: case for case in result.cases}
-        workspace_session_id = cases_by_id["workspace_roundtrip"].trial_session_ids[0]
-        tool_session_id = cases_by_id["tool_roundtrip"].trial_session_ids[0]
+        workspace_session_id = cases_by_id["workspace_roundtrip"].trials[0].session_id
+        tool_session_id = cases_by_id["tool_roundtrip"].trials[0].session_id
+        assert workspace_session_id is not None
+        assert tool_session_id is not None
 
         factory = plan.app.get_environment_factory()
         workspace_environment = await factory.create(
@@ -80,6 +82,14 @@ def test_internal_runtime_acceptance_plan_is_hermetic_and_isolated(monkeypatch) 
     assert result.status is EvalStatus.PASSED
     assert [case.case_id for case in result.cases] == _CASE_IDS
     assert all(case.status is EvalStatus.PASSED for case in result.cases)
+
+    budget_trial = next(case for case in result.cases if case.case_id == "budget_interrupt").trials[
+        0
+    ]
+    assert budget_trial.evidence_complete is True
+    assert budget_trial.trajectory is not None
+    assert budget_trial.trajectory.events[-1].type is EventType.SESSION_INTERRUPTED
+    assert all(assertion.outcome is EvalOutcome.PASSED for assertion in budget_trial.assertions)
 
     assert workspace_environment.environment.workspace is not None
     assert other_environment.environment.workspace is not None

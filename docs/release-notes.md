@@ -106,6 +106,39 @@ custom stores must explicitly opt in only when they provide the same guarantees.
 This is the storage foundation for production-session eval promotion; it does
 not yet add promotion, corpus, or dashboard workflows.
 
+### Eval results preserve every trial and explicit evidence gaps
+
+Repeated eval cases now retain an ordered `EvalTrialResult` for every concrete
+session instead of overwriting case evidence with the last trial. Each trial
+keeps its own output, assertion outcomes, snapshot-derived usage and cost,
+duration, diagnostics, completeness, and optional trajectory; case and run
+aggregates are validated projections of those retained results. Fresh evals
+drain runtime hooks and then read the same bounded terminal snapshot described
+above for completed and failed sessions. Direct Python evals that end
+interrupted remain supported through a narrower runner-owned path: every root
+event's emitted durable sequence and type must match inside the store's same
+bounded snapshot; interrupted descendants additionally prove their direct
+parent in that fresh run tree. This does not make historical interrupted
+sessions eligible for promotion. Incomplete, unsupported, contradictory, or
+oversized evidence is `unavailable`, while execution/evaluation failures are
+`error`. Neither outcome has a numeric score, and aggregate scoring never drops
+it or coerces it to zero. Evidence completeness is independent from assertion
+input availability, so an exact retained trajectory remains complete when, for
+example, a cost assertion lacks pricing.
+
+Third-party session stores that do not opt into
+`supports_terminal_session_evidence` will report fresh eval trials as
+`unavailable` after this upgrade rather than using non-atomic session, event,
+and transcript reads. Store implementations must provide the exact bounded
+operation before those evals can pass. Interrupted evals additionally require
+the narrower `supports_runner_owned_interrupted_evidence` operation; the runner
+does not fall back to generic unbounded event or transcript queries.
+
+Persisted `EvalRun` baselines advance from schema version 3 to version 4 for the
+lossless result graph and explicit assertion outcomes. Versions 1–3 are
+prerelease formats and must be regenerated; Cayu does not migrate or guess at
+their meaning.
+
 ### Remote environment allocation fails closed without exact recovery
 
 Custom remote `EnvironmentFactory` implementations can now declare a stable
