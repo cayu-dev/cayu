@@ -72,6 +72,7 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    RunnerObservedEventIdentity,
     RunRequest,
     RuntimePublicationReceipt,
     RuntimePublicationResult,
@@ -128,6 +129,7 @@ from cayu.runtime.sessions import (
     _copy_mcp_manifest_publication,
     _copy_optional_interaction_admission,
     _copy_queued_interaction_started_event,
+    _copy_runner_owned_interruption_proof,
     _copy_session_event_batch,
     _copy_terminal_session_evidence_limits,
     _copy_transition_interaction_admission,
@@ -189,6 +191,7 @@ from cayu.runtime.sessions import (
     _validate_model_completion_stage_publication,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
+    _validate_runner_observed_event_identity_snapshot,
     _validate_runtime_publication_durable_material,
     _validate_runtime_publication_event_references,
     _validate_runtime_publication_replay_receipt,
@@ -952,6 +955,7 @@ class SQLiteSessionStore(SessionStore):
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
+    supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -5651,8 +5655,49 @@ class SQLiteSessionStore(SessionStore):
         *,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
+        return await self._load_terminal_session_evidence(
+            session_id,
+            limits=limits,
+            observed_interrupted_events=None,
+            expected_interrupted_parent_session_id=None,
+            require_interrupted_proof=False,
+        )
+
+    async def load_runner_owned_interrupted_evidence(
+        self,
+        session_id: str,
+        *,
+        observed_events: tuple[RunnerObservedEventIdentity, ...] | None = None,
+        expected_parent_session_id: str | None = None,
+        limits: TerminalSessionEvidenceLimits | None = None,
+    ) -> TerminalSessionEvidence:
+        return await self._load_terminal_session_evidence(
+            session_id,
+            limits=limits,
+            observed_interrupted_events=observed_events,
+            expected_interrupted_parent_session_id=expected_parent_session_id,
+            require_interrupted_proof=True,
+        )
+
+    async def _load_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        limits: TerminalSessionEvidenceLimits | None,
+        observed_interrupted_events: tuple[RunnerObservedEventIdentity, ...] | None,
+        expected_interrupted_parent_session_id: str | None,
+        require_interrupted_proof: bool,
+    ) -> TerminalSessionEvidence:
         session_id = require_clean_nonblank(session_id, "session_id")
         resolved_limits = _copy_terminal_session_evidence_limits(limits)
+        observed, expected_parent_session_id = _copy_runner_owned_interruption_proof(
+            session_id,
+            observed_events=observed_interrupted_events,
+            expected_parent_session_id=expected_interrupted_parent_session_id,
+            limits=resolved_limits,
+            required=require_interrupted_proof,
+        )
+        allow_interrupted = observed is not None or expected_parent_session_id is not None
         evidence_event_types = tuple(
             str(event_type) for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES
         )
@@ -5698,7 +5743,7 @@ class SQLiteSessionStore(SessionStore):
             try:
                 session_preflight = connection.execute(
                     f"""
-                    SELECT session.status, session.run_epoch,
+                    SELECT session.status, session.run_epoch, session.parent_session_id,
                            ({session_stored_bytes})
                            + COALESCE((
                                SELECT SUM(
@@ -5723,7 +5768,21 @@ class SQLiteSessionStore(SessionStore):
                     raise TerminalSessionEvidenceError(
                         TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                     )
-                _terminal_session_evidence_expected_event_type(session_status)
+                _terminal_session_evidence_expected_event_type(
+                    session_status,
+                    allow_interrupted=allow_interrupted,
+                )
+                if allow_interrupted and session_status != SessionStatus.INTERRUPTED:
+                    raise TerminalSessionEvidenceError(
+                        TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                    )
+                if (
+                    expected_parent_session_id is not None
+                    and session_preflight["parent_session_id"] != expected_parent_session_id
+                ):
+                    raise TerminalSessionEvidenceError(
+                        TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                    )
                 if (
                     int(session_preflight["stored_bytes"])
                     > TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES
@@ -5731,6 +5790,75 @@ class SQLiteSessionStore(SessionStore):
                     raise TerminalSessionEvidenceError(
                         TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
                         limit=limits.max_record_bytes,
+                    )
+
+                if observed is not None:
+                    identity_preflight = connection.execute(
+                        """
+                        WITH bounded_identities AS (
+                            SELECT length(CAST(event_type AS BLOB))
+                                       + length(CAST(sequence AS TEXT)) AS stored_bytes
+                            FROM cayu_events
+                            WHERE session_id = ?
+                            ORDER BY sequence ASC
+                            LIMIT ?
+                        )
+                        SELECT COUNT(*) AS record_count,
+                               COALESCE(MAX(stored_bytes), 0) AS largest_record_bytes,
+                               COALESCE(SUM(stored_bytes), 0) AS total_bytes
+                        FROM bounded_identities
+                        """,
+                        (session_id, limits.max_events + 1),
+                    ).fetchone()
+                    if identity_preflight is None:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    identity_count = int(identity_preflight["record_count"])
+                    if identity_count > limits.max_events:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+                            limit=limits.max_events,
+                            observed=identity_count,
+                        )
+                    if identity_count != len(observed):
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    identity_largest_bytes = int(identity_preflight["largest_record_bytes"])
+                    if identity_largest_bytes > limits.max_record_bytes:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
+                            limit=limits.max_record_bytes,
+                            observed=identity_largest_bytes,
+                        )
+                    identity_total_bytes = int(identity_preflight["total_bytes"])
+                    if identity_total_bytes > limits.max_total_bytes:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
+                            limit=limits.max_total_bytes,
+                            observed=identity_total_bytes,
+                        )
+                    identity_rows = connection.execute(
+                        """
+                        SELECT sequence, event_type
+                        FROM cayu_events
+                        WHERE session_id = ?
+                        ORDER BY sequence ASC
+                        LIMIT ?
+                        """,
+                        (session_id, identity_count),
+                    ).fetchall()
+                    _validate_runner_observed_event_identity_snapshot(
+                        observed,
+                        tuple(
+                            RunnerObservedEventIdentity(
+                                session_id=session_id,
+                                sequence=row["sequence"],
+                                event_type=row["event_type"],
+                            )
+                            for row in identity_rows
+                        ),
                     )
 
                 checkpoint_projection = connection.execute(
@@ -5933,6 +6061,7 @@ class SQLiteSessionStore(SessionStore):
                     newest_evidence_records=newest_evidence_records,
                     initial_transcript_pending=initial_transcript_pending,
                     pending_session_interrupt=pending_session_interrupt,
+                    allow_interrupted=allow_interrupted,
                 )
 
                 event_preflight = connection.execute(
@@ -6061,6 +6190,7 @@ class SQLiteSessionStore(SessionStore):
                     events=events,
                     transcript=transcript,
                     limits=limits,
+                    allow_interrupted=allow_interrupted,
                 )
             except TerminalSessionEvidenceError:
                 raise

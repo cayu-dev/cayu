@@ -19,6 +19,7 @@ from cayu import (
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
     Event,
+    EventQuery,
     EventRecord,
     EventType,
     InMemorySessionStore,
@@ -39,6 +40,7 @@ from cayu import (
 from cayu._validation import compact_json_utf8_size
 from cayu.runtime._terminal_evidence import SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
 from cayu.runtime.sessions import (
+    RunnerObservedEventIdentity,
     _assemble_terminal_session_evidence,
     _classify_terminal_session_evidence_records,
     _event_with_session_run_operation,
@@ -278,6 +280,68 @@ async def _create_running_session(
     )
 
 
+async def _create_interrupted_session(
+    store: SessionStore,
+    *,
+    session_id: str,
+    interaction_id: str,
+    parent_session_id: str | None = None,
+    terminal_payload: dict | None = None,
+) -> tuple[RunnerObservedEventIdentity, ...]:
+    message = Message.text("user", "Exercise runner-owned interrupted evidence.")
+    await store.create(
+        RunRequest(
+            agent_name="assistant",
+            session_id=session_id,
+            parent_session_id=parent_session_id,
+            messages=[message],
+        ),
+        identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        interaction_started_event=Event(
+            id=f"{session_id}-interaction-started",
+            type=EventType.INTERACTION_STARTED,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        ),
+        interaction_source_messages=[message],
+    )
+    await store.replace_initial_transcript_messages(
+        session_id,
+        [message],
+        [message],
+        interaction_id=interaction_id,
+    )
+    await store.publish_interaction_transition(
+        session_id,
+        event=Event(
+            id=f"{session_id}-interaction-interrupted",
+            type=EventType.INTERACTION_INTERRUPTED,
+            session_id=session_id,
+            interaction_id=interaction_id,
+        ),
+        from_statuses={SessionStatus.RUNNING},
+        to_status=SessionStatus.INTERRUPTED,
+    )
+    await store.append_event(
+        session_id,
+        Event(
+            id=f"{session_id}-session-interrupted",
+            type=EventType.SESSION_INTERRUPTED,
+            session_id=session_id,
+            payload={} if terminal_payload is None else terminal_payload,
+        ),
+    )
+    records = await store.query_events(EventQuery(session_id=session_id))
+    return tuple(
+        RunnerObservedEventIdentity(
+            session_id=session_id,
+            sequence=record.sequence,
+            event_type=record.event.type,
+        )
+        for record in records
+    )
+
+
 async def _expect_store_error(
     store: SessionStore,
     session_id: str,
@@ -456,6 +520,76 @@ async def _exercise_store_rejection_contract(store: SessionStore, *, prefix: str
         buried_duplicate_id,
         TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_DUPLICATE,
     )
+
+
+async def _exercise_runner_owned_interrupted_evidence(
+    store: SessionStore,
+    *,
+    prefix: str,
+) -> None:
+    root_id = f"{prefix}-runner-interrupted-root"
+    observed = await _create_interrupted_session(
+        store,
+        session_id=root_id,
+        interaction_id=f"{root_id}-interaction",
+    )
+
+    assert store.supports_runner_owned_interrupted_evidence is True
+    with pytest.raises(TerminalSessionEvidenceError) as ordinary:
+        await store.load_terminal_session_evidence(root_id)
+    assert ordinary.value.code is TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED
+
+    evidence = await store.load_runner_owned_interrupted_evidence(
+        root_id,
+        observed_events=observed,
+    )
+    assert evidence.session.status is SessionStatus.INTERRUPTED
+    assert evidence.events[-1].event.type is EventType.SESSION_INTERRUPTED
+    _assert_exact_snapshot_bytes(evidence)
+
+    forged = list(observed)
+    forged[-1] = RunnerObservedEventIdentity(
+        session_id=root_id,
+        sequence=forged[-1].sequence,
+        event_type=EventType.SESSION_FAILED,
+    )
+    with pytest.raises(TerminalSessionEvidenceError) as mismatched:
+        await store.load_runner_owned_interrupted_evidence(
+            root_id,
+            observed_events=tuple(forged),
+        )
+    assert mismatched.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+
+    with pytest.raises(TerminalSessionEvidenceError) as missing_proof:
+        await store.load_runner_owned_interrupted_evidence(root_id)
+    assert missing_proof.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+    with pytest.raises(TerminalSessionEvidenceError) as ambiguous_proof:
+        await store.load_runner_owned_interrupted_evidence(
+            root_id,
+            observed_events=observed,
+            expected_parent_session_id="another-parent",
+        )
+    assert ambiguous_proof.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+
+    child_id = f"{prefix}-runner-interrupted-child"
+    await _create_interrupted_session(
+        store,
+        session_id=child_id,
+        interaction_id=f"{child_id}-interaction",
+        parent_session_id=root_id,
+    )
+    child_evidence = await store.load_runner_owned_interrupted_evidence(
+        child_id,
+        expected_parent_session_id=root_id,
+    )
+    assert child_evidence.session.parent_session_id == root_id
+    assert child_evidence.session.status is SessionStatus.INTERRUPTED
+    with pytest.raises(TerminalSessionEvidenceError) as wrong_parent:
+        await store.load_runner_owned_interrupted_evidence(
+            child_id,
+            expected_parent_session_id="not-the-runner-owned-parent",
+        )
+    assert wrong_parent.value.code is TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
 
 
 async def _exercise_marker_repair(store: SessionStore, *, prefix: str) -> None:
@@ -1239,6 +1373,7 @@ def test_builtin_terminal_evidence_acceptance_matrix(tmp_path, backend: str) -> 
             store = SQLiteSessionStore(tmp_path / "terminal-evidence-acceptance.sqlite")
         try:
             await _exercise_store_rejection_contract(store, prefix=backend)
+            await _exercise_runner_owned_interrupted_evidence(store, prefix=backend)
             await _exercise_marker_repair(store, prefix=backend)
             await _exercise_atomic_write_races(store, prefix=backend)
             await _exercise_unpaginated_snapshot(store, prefix=backend)
@@ -1369,6 +1504,43 @@ def test_sqlite_terminal_evidence_rejects_an_oversized_terminal_before_hydration
             with pytest.raises(TerminalSessionEvidenceError) as captured:
                 await store.load_terminal_session_evidence(
                     session_id,
+                    limits=TerminalSessionEvidenceLimits(max_record_bytes=1024),
+                )
+            assert captured.value.code is TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED
+            assert hydrated_rows == 0
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_sqlite_runner_interrupted_evidence_rejects_oversized_data_before_hydration(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def run() -> None:
+        store = SQLiteSessionStore(tmp_path / "runner-interrupted-oversized.sqlite")
+        try:
+            session_id = "sqlite-runner-interrupted-oversized"
+            observed = await _create_interrupted_session(
+                store,
+                session_id=session_id,
+                interaction_id=f"{session_id}-interaction",
+                terminal_payload={"diagnostic": "x" * 2048},
+            )
+            hydrated_rows = 0
+            original = sqlite_store_module._event_from_row
+
+            def spy(row):
+                nonlocal hydrated_rows
+                hydrated_rows += 1
+                return original(row)
+
+            monkeypatch.setattr(sqlite_store_module, "_event_from_row", spy)
+            with pytest.raises(TerminalSessionEvidenceError) as captured:
+                await store.load_runner_owned_interrupted_evidence(
+                    session_id,
+                    observed_events=observed,
                     limits=TerminalSessionEvidenceLimits(max_record_bytes=1024),
                 )
             assert captured.value.code is TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED
@@ -1520,6 +1692,7 @@ def test_postgres_terminal_evidence_acceptance_matrix(postgres_dsn: str) -> None
         )
         try:
             await _exercise_store_rejection_contract(store, prefix="postgres")
+            await _exercise_runner_owned_interrupted_evidence(store, prefix="postgres")
             await _exercise_marker_repair(store, prefix="postgres")
             await _exercise_atomic_write_races(store, prefix="postgres")
             await _exercise_unpaginated_snapshot(store, prefix="postgres")
@@ -1624,6 +1797,13 @@ def test_postgres_terminal_evidence_preflight_bounds_whitespace_before_hydration
                 session_id="postgres-whitespace-metadata-preflight",
                 session_metadata={"diagnostic": oversized_whitespace},
             )
+            interrupted_session_id = "postgres-whitespace-interrupted-preflight"
+            interrupted_observed = await _create_interrupted_session(
+                store,
+                session_id=interrupted_session_id,
+                interaction_id=f"{interrupted_session_id}-interaction",
+                terminal_payload={"diagnostic": oversized_whitespace},
+            )
 
             import cayu.storage.postgres as postgres_store_module
 
@@ -1648,6 +1828,17 @@ def test_postgres_terminal_evidence_preflight_bounds_whitespace_before_hydration
                     captured.value.code is TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED
                 )
                 assert hydrated_json_values == 0
+
+            hydrated_json_values = 0
+            with pytest.raises(TerminalSessionEvidenceError) as interrupted:
+                await store.load_runner_owned_interrupted_evidence(
+                    interrupted_session_id,
+                    observed_events=interrupted_observed,
+                )
+            assert (
+                interrupted.value.code is TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED
+            )
+            assert hydrated_json_values == 0
         finally:
             await store.close()
 

@@ -3074,6 +3074,22 @@ class EventRecord(BaseModel):
         return copy_event(value)
 
 
+@dataclass(frozen=True, slots=True)
+class RunnerObservedEventIdentity:
+    """Lightweight identity for one event drained by a runner-owned execution.
+
+    Sequence and type are the stable public/durable identity boundary; public
+    streams intentionally replace private durable event IDs with authority-safe
+    aliases. The eval runner retains this projection instead of full payloads
+    while streaming a fresh run, then the store compares it with the complete
+    append-only event log inside the bounded snapshot used for evidence.
+    """
+
+    session_id: str
+    sequence: int | None
+    event_type: EventType | str
+
+
 class PersistedEventSideEffectStatus(StrEnum):
     PENDING = "pending"
     LEASED = "leased"
@@ -4169,7 +4185,13 @@ class TerminalSessionEvidenceBoundary(BaseModel):
 
 
 class TerminalSessionEvidence(BaseModel):
-    """One exact, bounded store snapshot through a completed or failed run."""
+    """One exact, bounded store snapshot through a terminal run.
+
+    Ordinary terminal-evidence reads remain completed/failed-only. A store may
+    also return this model for an interrupted session through the narrower
+    runner-owned operation, which requires an exact emitted sequence/type match
+    inside the same snapshot.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -4205,6 +4227,7 @@ class TerminalSessionEvidence(BaseModel):
                 terminal_record=self.events[-1],
                 events=self.events,
                 transcript=self.transcript,
+                allow_interrupted=True,
             )
             expected_boundary = _measure_terminal_session_evidence(
                 session=self.session,
@@ -4754,6 +4777,7 @@ class SessionStore(ABC):
     supports_session_topology: ClassVar[bool] = False
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_terminal_session_evidence: ClassVar[bool] = False
+    supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
@@ -5578,6 +5602,30 @@ class SessionStore(ABC):
             "This SessionStore does not support terminal-session evidence reads."
         )
 
+    async def load_runner_owned_interrupted_evidence(
+        self,
+        session_id: str,
+        *,
+        observed_events: tuple[RunnerObservedEventIdentity, ...] | None = None,
+        expected_parent_session_id: str | None = None,
+        limits: TerminalSessionEvidenceLimits | None = None,
+    ) -> TerminalSessionEvidence:
+        """Read one exact interrupted snapshot from a runner-owned execution tree.
+
+        A root read must compare the complete durable event-log identity with
+        ``observed_events``. A descendant read instead proves its direct parent
+        through ``expected_parent_session_id``; the caller must have established
+        that parent as part of the same freshly executed tree. Exactly one proof
+        is required. Implementations must apply record/count/byte limits before
+        hydrating evidence, all inside one stable store snapshot. This optional
+        operation does not broaden ordinary historical terminal-evidence reads.
+        """
+
+        del session_id, observed_events, expected_parent_session_id, limits
+        raise NotImplementedError(
+            "This SessionStore does not support runner-owned interrupted evidence reads."
+        )
+
     async def query_latest_interaction_events(
         self,
         session_id: str,
@@ -6027,6 +6075,7 @@ class InMemorySessionStore(SessionStore):
     supports_session_topology: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
+    supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -9153,18 +9202,89 @@ class InMemorySessionStore(SessionStore):
         *,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
+        return await self._load_terminal_session_evidence(
+            session_id,
+            limits=limits,
+            observed_interrupted_events=None,
+            expected_interrupted_parent_session_id=None,
+            require_interrupted_proof=False,
+        )
+
+    async def load_runner_owned_interrupted_evidence(
+        self,
+        session_id: str,
+        *,
+        observed_events: tuple[RunnerObservedEventIdentity, ...] | None = None,
+        expected_parent_session_id: str | None = None,
+        limits: TerminalSessionEvidenceLimits | None = None,
+    ) -> TerminalSessionEvidence:
+        return await self._load_terminal_session_evidence(
+            session_id,
+            limits=limits,
+            observed_interrupted_events=observed_events,
+            expected_interrupted_parent_session_id=expected_parent_session_id,
+            require_interrupted_proof=True,
+        )
+
+    async def _load_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        limits: TerminalSessionEvidenceLimits | None,
+        observed_interrupted_events: tuple[RunnerObservedEventIdentity, ...] | None,
+        expected_interrupted_parent_session_id: str | None,
+        require_interrupted_proof: bool,
+    ) -> TerminalSessionEvidence:
         session_id = require_clean_nonblank(session_id, "session_id")
         limits = _copy_terminal_session_evidence_limits(limits)
+        observed, expected_parent_session_id = _copy_runner_owned_interruption_proof(
+            session_id,
+            observed_events=observed_interrupted_events,
+            expected_parent_session_id=expected_interrupted_parent_session_id,
+            limits=limits,
+            required=require_interrupted_proof,
+        )
+        allow_interrupted = observed is not None or expected_parent_session_id is not None
         async with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise TerminalSessionEvidenceError(
                     TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND
                 )
-            _terminal_session_evidence_expected_event_type(session.status)
+            _terminal_session_evidence_expected_event_type(
+                session.status,
+                allow_interrupted=allow_interrupted,
+            )
+            if allow_interrupted and session.status != SessionStatus.INTERRUPTED:
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                )
+            if (
+                expected_parent_session_id is not None
+                and session.parent_session_id != expected_parent_session_id
+            ):
+                raise TerminalSessionEvidenceError(
+                    TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                )
             checkpoint = self._checkpoints.get(session_id)
             marker = _terminal_session_evidence_marker_from_checkpoint(checkpoint)
             session_records = self._session_event_records.get(session_id, [])
+            if observed is not None:
+                if len(session_records) != len(observed):
+                    raise TerminalSessionEvidenceError(
+                        TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                    )
+                _validate_runner_observed_event_identity_snapshot(
+                    observed,
+                    tuple(
+                        RunnerObservedEventIdentity(
+                            session_id=record.event.session_id,
+                            sequence=record.sequence,
+                            event_type=record.event.type,
+                        )
+                        for record in session_records
+                    ),
+                )
             newest_evidence_records = tuple(
                 islice(
                     (
@@ -9188,6 +9308,7 @@ class InMemorySessionStore(SessionStore):
                 pending_session_interrupt=(
                     checkpoint is not None and "pending_session_interrupt" in checkpoint
                 ),
+                allow_interrupted=allow_interrupted,
             )
             event_stop = bisect_right(
                 session_records,
@@ -9232,6 +9353,7 @@ class InMemorySessionStore(SessionStore):
                 events=events,
                 transcript=transcript_records,
                 limits=limits,
+                allow_interrupted=allow_interrupted,
             )
 
     def _query_events_unlocked(
@@ -15018,11 +15140,137 @@ def _terminal_session_evidence_marker_from_checkpoint(
     )
 
 
-def _terminal_session_evidence_expected_event_type(status: SessionStatus) -> EventType:
-    if status == SessionStatus.INTERRUPTED:
+def _copy_runner_observed_event_identities(
+    session_id: str,
+    value: tuple[RunnerObservedEventIdentity, ...],
+    *,
+    limits: TerminalSessionEvidenceLimits,
+) -> tuple[RunnerObservedEventIdentity, ...]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    if type(value) is not tuple or not value:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    if len(value) > limits.max_events:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+            limit=limits.max_events,
+            observed=len(value),
+        )
+    copied: list[RunnerObservedEventIdentity] = []
+    identity_total_bytes = 0
+    for identity in value:
+        if type(identity) is not RunnerObservedEventIdentity:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+            )
+        if (
+            identity.session_id != session_id
+            or type(identity.sequence) is not int
+            or identity.sequence < 1
+            or identity.sequence > MAX_DURABLE_JSON_INTEGER
+        ):
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+            )
+        try:
+            event_type = Event(type=identity.event_type, session_id=session_id).type
+        except (TypeError, ValueError) as exc:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+            ) from exc
+        copied.append(
+            RunnerObservedEventIdentity(
+                session_id=session_id,
+                sequence=identity.sequence,
+                event_type=event_type,
+            )
+        )
+        identity_bytes = len(str(event_type).encode("utf-8")) + len(
+            str(identity.sequence).encode("ascii")
+        )
+        if identity_bytes > limits.max_record_bytes:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
+                limit=limits.max_record_bytes,
+                observed=identity_bytes,
+            )
+        identity_total_bytes += identity_bytes
+        if identity_total_bytes > limits.max_total_bytes:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
+                limit=limits.max_total_bytes,
+                observed=identity_total_bytes,
+            )
+    for left, right in pairwise(copied):
+        if left.sequence is None or right.sequence is None or left.sequence >= right.sequence:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+            )
+    return tuple(copied)
+
+
+def _copy_runner_owned_interruption_proof(
+    session_id: str,
+    *,
+    observed_events: tuple[RunnerObservedEventIdentity, ...] | None,
+    expected_parent_session_id: str | None,
+    limits: TerminalSessionEvidenceLimits,
+    required: bool,
+) -> tuple[tuple[RunnerObservedEventIdentity, ...] | None, str | None]:
+    """Validate the mutually exclusive root/descendant ownership proof."""
+
+    if not required:
+        if observed_events is not None or expected_parent_session_id is not None:
+            raise TerminalSessionEvidenceError(
+                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+            )
+        return None, None
+    if (observed_events is None) == (expected_parent_session_id is None):
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    if observed_events is not None:
+        return (
+            _copy_runner_observed_event_identities(
+                session_id,
+                observed_events,
+                limits=limits,
+            ),
+            None,
+        )
+    if expected_parent_session_id is None:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    try:
+        parent_session_id = require_clean_nonblank(
+            expected_parent_session_id,
+            "expected_parent_session_id",
+        )
+    except (TypeError, ValueError) as exc:
+        raise TerminalSessionEvidenceError(
+            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+        ) from exc
+    if parent_session_id == session_id:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+    return None, parent_session_id
+
+
+def _validate_runner_observed_event_identity_snapshot(
+    expected: tuple[RunnerObservedEventIdentity, ...],
+    actual: Sequence[RunnerObservedEventIdentity],
+) -> None:
+    if tuple(actual) != expected:
+        raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
+
+
+def _terminal_session_evidence_expected_event_type(
+    status: SessionStatus,
+    *,
+    allow_interrupted: bool = False,
+) -> EventType:
+    if status == SessionStatus.INTERRUPTED and not allow_interrupted:
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED)
     expected = _TERMINAL_PUBLICATION_EVENT_TYPE_BY_STATUS.get(status)
-    if expected not in {EventType.SESSION_COMPLETED, EventType.SESSION_FAILED}:
+    allowed = {EventType.SESSION_COMPLETED, EventType.SESSION_FAILED}
+    if allow_interrupted:
+        allowed.add(EventType.SESSION_INTERRUPTED)
+    if expected not in allowed:
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.SESSION_NOT_TERMINAL)
     return expected
 
@@ -15036,6 +15284,7 @@ def _classify_terminal_session_evidence_records(
     newest_evidence_records: Sequence[EventRecord],
     initial_transcript_pending: bool,
     pending_session_interrupt: bool,
+    allow_interrupted: bool = False,
 ) -> EventRecord:
     """Validate the bounded current-run evidence and return its terminal record.
 
@@ -15045,7 +15294,10 @@ def _classify_terminal_session_evidence_records(
     boundary, and a duplicate current-run publication.
     """
 
-    expected_event_type = _terminal_session_evidence_expected_event_type(status)
+    expected_event_type = _terminal_session_evidence_expected_event_type(
+        status,
+        allow_interrupted=allow_interrupted,
+    )
     if len(newest_evidence_records) > TERMINAL_EVIDENCE_QUERY_LIMIT:
         raise TerminalSessionEvidenceError(TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT)
     if any(left.sequence <= right.sequence for left, right in pairwise(newest_evidence_records)):
@@ -15141,10 +15393,14 @@ def _validate_terminal_session_evidence_content(
     terminal_record: EventRecord,
     events: Sequence[EventRecord],
     transcript: Sequence[TranscriptRecord],
+    allow_interrupted: bool = False,
 ) -> None:
     """Prove that the complete bounded prefix represents one terminal run."""
 
-    expected_event_type = _terminal_session_evidence_expected_event_type(session.status)
+    expected_event_type = _terminal_session_evidence_expected_event_type(
+        session.status,
+        allow_interrupted=allow_interrupted,
+    )
     if not events or (
         events[-1].sequence != terminal_record.sequence
         or events[-1].event.id != terminal_record.event.id
@@ -15381,6 +15637,7 @@ def _assemble_terminal_session_evidence(
     events: Sequence[EventRecord],
     transcript: Sequence[TranscriptRecord],
     limits: TerminalSessionEvidenceLimits,
+    allow_interrupted: bool = False,
 ) -> TerminalSessionEvidence:
     """Apply the backend-neutral completeness and exact-byte contract."""
 
@@ -15403,6 +15660,7 @@ def _assemble_terminal_session_evidence(
         terminal_record=terminal_record,
         events=events,
         transcript=transcript,
+        allow_interrupted=allow_interrupted,
     )
     boundary = _measure_terminal_session_evidence(
         session=session,

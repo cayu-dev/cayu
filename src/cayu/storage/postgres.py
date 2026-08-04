@@ -143,6 +143,7 @@ from cayu.runtime.sessions import (
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectDelivery,
     PersistedEventSideEffectStatus,
+    RunnerObservedEventIdentity,
     RunRequest,
     RuntimePublicationReceipt,
     RuntimePublicationResult,
@@ -198,6 +199,7 @@ from cayu.runtime.sessions import (
     _copy_mcp_manifest_publication,
     _copy_optional_interaction_admission,
     _copy_queued_interaction_started_event,
+    _copy_runner_owned_interruption_proof,
     _copy_session_event_batch,
     _copy_terminal_session_evidence_limits,
     _copy_transition_interaction_admission,
@@ -259,6 +261,7 @@ from cayu.runtime.sessions import (
     _validate_model_completion_stage_publication,
     _validate_model_completion_stage_repreparation,
     _validate_model_completion_stage_terminal_replay,
+    _validate_runner_observed_event_identity_snapshot,
     _validate_runtime_publication_durable_material,
     _validate_runtime_publication_event_references,
     _validate_runtime_publication_replay_receipt,
@@ -5692,6 +5695,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
+    supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
 
@@ -10645,8 +10649,49 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         *,
         limits: TerminalSessionEvidenceLimits | None = None,
     ) -> TerminalSessionEvidence:
+        return await self._load_terminal_session_evidence(
+            session_id,
+            limits=limits,
+            observed_interrupted_events=None,
+            expected_interrupted_parent_session_id=None,
+            require_interrupted_proof=False,
+        )
+
+    async def load_runner_owned_interrupted_evidence(
+        self,
+        session_id: str,
+        *,
+        observed_events: tuple[RunnerObservedEventIdentity, ...] | None = None,
+        expected_parent_session_id: str | None = None,
+        limits: TerminalSessionEvidenceLimits | None = None,
+    ) -> TerminalSessionEvidence:
+        return await self._load_terminal_session_evidence(
+            session_id,
+            limits=limits,
+            observed_interrupted_events=observed_events,
+            expected_interrupted_parent_session_id=expected_parent_session_id,
+            require_interrupted_proof=True,
+        )
+
+    async def _load_terminal_session_evidence(
+        self,
+        session_id: str,
+        *,
+        limits: TerminalSessionEvidenceLimits | None,
+        observed_interrupted_events: tuple[RunnerObservedEventIdentity, ...] | None,
+        expected_interrupted_parent_session_id: str | None,
+        require_interrupted_proof: bool,
+    ) -> TerminalSessionEvidence:
         session_id = require_clean_nonblank(session_id, "session_id")
         limits = _copy_terminal_session_evidence_limits(limits)
+        observed, expected_parent_session_id = _copy_runner_owned_interruption_proof(
+            session_id,
+            observed_events=observed_interrupted_events,
+            expected_parent_session_id=expected_interrupted_parent_session_id,
+            limits=limits,
+            required=require_interrupted_proof,
+        )
+        allow_interrupted = observed is not None or expected_parent_session_id is not None
         evidence_event_types = [
             str(event_type) for event_type in _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES
         ]
@@ -10706,6 +10751,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         f"""
                             SELECT session.status,
                                    session.run_epoch,
+                                   session.parent_session_id,
                                    ({session_transport_bytes})
                                    + COALESCE((
                                        SELECT SUM(
@@ -10731,13 +10777,98 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise TerminalSessionEvidenceError(
                             TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                         )
-                    _terminal_session_evidence_expected_event_type(session_status)
-                    session_transport_size = int(session_preflight[2])
+                    _terminal_session_evidence_expected_event_type(
+                        session_status,
+                        allow_interrupted=allow_interrupted,
+                    )
+                    if allow_interrupted and session_status != SessionStatus.INTERRUPTED:
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    if (
+                        expected_parent_session_id is not None
+                        and session_preflight[2] != expected_parent_session_id
+                    ):
+                        raise TerminalSessionEvidenceError(
+                            TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                        )
+                    session_transport_size = int(session_preflight[3])
                     if session_transport_size > max_record_transport_bytes:
                         raise TerminalSessionEvidenceError(
                             TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
                             limit=max_record_transport_bytes,
                             observed=session_transport_size,
+                        )
+
+                    if observed is not None:
+                        await cur.execute(
+                            """
+                            WITH bounded_identities AS (
+                                SELECT octet_length(event_type)
+                                           + octet_length(sequence::text) AS transport_bytes
+                                FROM cayu_events
+                                WHERE session_id = %s
+                                ORDER BY sequence ASC
+                                LIMIT %s
+                            )
+                            SELECT COUNT(*),
+                                   COALESCE(MAX(transport_bytes), 0),
+                                   COALESCE(SUM(transport_bytes), 0)
+                            FROM bounded_identities
+                            """,
+                            (session_id, limits.max_events + 1),
+                        )
+                        identity_preflight = await cur.fetchone()
+                        if identity_preflight is None:
+                            raise TerminalSessionEvidenceError(
+                                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                            )
+                        identity_count = int(identity_preflight[0])
+                        if identity_count > limits.max_events:
+                            raise TerminalSessionEvidenceError(
+                                TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+                                limit=limits.max_events,
+                                observed=identity_count,
+                            )
+                        if identity_count != len(observed):
+                            raise TerminalSessionEvidenceError(
+                                TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
+                            )
+                        identity_largest_bytes = int(identity_preflight[1])
+                        if identity_largest_bytes > max_record_transport_bytes:
+                            raise TerminalSessionEvidenceError(
+                                TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+                                limit=max_record_transport_bytes,
+                                observed=identity_largest_bytes,
+                            )
+                        identity_total_bytes = int(identity_preflight[2])
+                        if identity_total_bytes > max_total_transport_bytes:
+                            raise TerminalSessionEvidenceError(
+                                TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+                                limit=max_total_transport_bytes,
+                                observed=identity_total_bytes,
+                            )
+                        await cur.execute(
+                            """
+                            SELECT sequence, event_type
+                            FROM cayu_events
+                            WHERE session_id = %s
+                            ORDER BY sequence ASC
+                            LIMIT %s
+                            """,
+                            (session_id, identity_count),
+                        )
+                        identity_rows = await cur.fetchall()
+                        _validate_runner_observed_event_identity_snapshot(
+                            observed,
+                            tuple(
+                                RunnerObservedEventIdentity(
+                                    session_id=session_id,
+                                    sequence=row[0],
+                                    event_type=row[1],
+                                )
+                                for row in identity_rows
+                            ),
                         )
 
                     await cur.execute(
@@ -10918,6 +11049,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         newest_evidence_records=newest_evidence_records,
                         initial_transcript_pending=initial_transcript_pending,
                         pending_session_interrupt=pending_session_interrupt,
+                        allow_interrupted=allow_interrupted,
                     )
 
                     await cur.execute(
@@ -11051,6 +11183,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         events=events,
                         transcript=transcript,
                         limits=limits,
+                        allow_interrupted=allow_interrupted,
                     )
             except TerminalSessionEvidenceError:
                 raise
