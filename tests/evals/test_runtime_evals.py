@@ -3030,11 +3030,11 @@ def _seed_parent_with_children(store: InMemorySessionStore, n: int) -> None:
 
 
 def test_build_child_trajectories_paginates_past_first_page(monkeypatch):
-    from cayu.evals import runner
+    from cayu.evals import trajectory
     from cayu.evals.runner import _build_child_trajectories, _IncompleteFlag
 
     # A page size of 1 forces the walk to page through the keyset cursor for every child.
-    monkeypatch.setattr(runner, "_CHILD_TRAJECTORY_PAGE_SIZE", 1)
+    monkeypatch.setattr(trajectory, "_CHILD_TRAJECTORY_PAGE_SIZE", 1)
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
     _seed_parent_with_children(store, 3)
@@ -3048,11 +3048,11 @@ def test_build_child_trajectories_paginates_past_first_page(monkeypatch):
 
 
 def test_build_child_trajectories_marks_incomplete_at_page_cap(monkeypatch):
-    from cayu.evals import runner
+    from cayu.evals import trajectory
     from cayu.evals.runner import _build_child_trajectories, _IncompleteFlag
 
-    monkeypatch.setattr(runner, "_CHILD_TRAJECTORY_PAGE_SIZE", 1)
-    monkeypatch.setattr(runner, "_CHILD_TRAJECTORY_MAX_PAGES", 2)
+    monkeypatch.setattr(trajectory, "_CHILD_TRAJECTORY_PAGE_SIZE", 1)
+    monkeypatch.setattr(trajectory, "_CHILD_TRAJECTORY_MAX_PAGES", 2)
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
     _seed_parent_with_children(store, 5)

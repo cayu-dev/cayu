@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import ArtifactMetadata
 from cayu.core.events import Event, EventType, event_durable_sequence
-from cayu.core.messages import Message, MessageRole, TextPart
+from cayu.core.messages import Message
 from cayu.evals.assertions import EvalAssertion, SessionStatusIs
 from cayu.evals.models import (
     WORKSPACE_PROBE_MAX_BYTES,
@@ -36,39 +36,28 @@ from cayu.evals.models import (
     aggregate_eval_score,
     aggregate_eval_status,
 )
+from cayu.evals.trajectory import (
+    _build_child_trajectories,
+    _IncompleteFlag,
+    _load_terminal_evidence,
+    _project_terminal_evidence,
+    final_output_text,
+)
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     RunnerObservedEventIdentity,
     RunRequest,
     Session,
-    SessionQuery,
     SessionStatus,
-    TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     copy_run_request,
 )
 from cayu.runtime.usage import (
     SessionUsageSummary,
-    session_usage_summary,
     session_usage_summary_payload,
 )
-
-# Sessions per page when walking the sub-agent tree, and the max pages walked per node. The walk
-# pages past the first 1000 children (rather than silently keeping only the first page) but stays
-# bounded so a pathological fan-out can't stall the eval; hitting the cap sets children_incomplete.
-_CHILD_TRAJECTORY_PAGE_SIZE = 1000
-_CHILD_TRAJECTORY_MAX_PAGES = 100
-
-
-class _IncompleteFlag:
-    """Node-local, mutable "children were not fully enumerated" signal for the sub-agent walk."""
-
-    __slots__ = ("value",)
-
-    def __init__(self) -> None:
-        self.value = False
 
 
 class _FreshInterruptedEvidenceUnavailable(RuntimeError):
@@ -590,12 +579,6 @@ async def _run_case_once(
     )
 
 
-async def _load_terminal_evidence(app: CayuApp, session_id: str) -> TerminalSessionEvidence:
-    if not app.session_store.supports_terminal_session_evidence:
-        raise NotImplementedError
-    return await app.session_store.load_terminal_session_evidence(session_id)
-
-
 async def _load_fresh_interrupted_evidence(
     app: CayuApp,
     session_id: str,
@@ -635,17 +618,6 @@ async def _load_fresh_interrupted_evidence(
         )
         raise _FreshInterruptedEvidenceUnavailable(detail) from exc
     return _project_terminal_evidence(evidence)
-
-
-def _project_terminal_evidence(
-    evidence: TerminalSessionEvidence,
-) -> tuple[Session, tuple[Event, ...], tuple[Message, ...], SessionUsageSummary]:
-    """Build the root assertion substrate from one exact terminal snapshot."""
-
-    events = tuple(record.event for record in evidence.events)
-    transcript = tuple(record.message for record in evidence.transcript)
-    usage_summary = session_usage_summary(evidence.session.id, list(events))
-    return evidence.session, events, transcript, usage_summary
 
 
 def _isolated_trial_request(request: RunRequest) -> RunRequest:
@@ -830,103 +802,6 @@ async def _capture_probes(
     )
 
 
-async def _build_child_trajectories(
-    app: CayuApp,
-    parent_session_id: str | None,
-    *,
-    visited: set[str],
-    incomplete: _IncompleteFlag | None = None,
-) -> tuple[Trajectory, ...]:
-    # Walk the sub-agent tree by parent linkage so a run's sub-agents are captured in the
-    # trajectory. `visited` guards against cycles / re-visiting a shared id. The walk pages
-    # through the keyset cursor so a parent with more than one page of children is captured in
-    # full; a store error mid-walk or hitting the page cap sets `incomplete` (surfaced on the
-    # node's Trajectory.children_incomplete) instead of being silently swallowed.
-    if parent_session_id is None:
-        return ()
-    children: list[Trajectory] = []
-    cursor: str | None = None
-    for _ in range(_CHILD_TRAJECTORY_MAX_PAGES):
-        try:
-            result = await app.session_store.list_sessions(
-                SessionQuery(
-                    parent_session_id=parent_session_id,
-                    limit=_CHILD_TRAJECTORY_PAGE_SIZE,
-                    cursor=cursor,
-                )
-            )
-        except Exception:
-            if incomplete is not None:
-                incomplete.value = True
-            return tuple(children)
-        for child_session in result.sessions:
-            if child_session.id in visited:
-                continue
-            visited.add(child_session.id)
-            child = await _load_child_trajectory(
-                app,
-                child_session,
-                expected_parent_session_id=parent_session_id,
-                visited=visited,
-            )
-            if child is not None:
-                children.append(child)
-                if child.children_incomplete and incomplete is not None:
-                    incomplete.value = True
-            elif incomplete is not None:
-                incomplete.value = True
-        cursor = result.next_cursor
-        if cursor is None:
-            return tuple(children)
-    # Fell out of the page loop with a cursor still pending: more children remain than the cap
-    # allows us to walk. Mark the capture partial rather than dropping the rest silently.
-    if incomplete is not None:
-        incomplete.value = True
-    return tuple(children)
-
-
-async def _load_child_trajectory(
-    app: CayuApp,
-    session: Session,
-    *,
-    expected_parent_session_id: str,
-    visited: set[str],
-) -> Trajectory | None:
-    try:
-        evidence = await _load_terminal_evidence(app, session.id)
-    except TerminalSessionEvidenceError as exc:
-        if (
-            exc.code != TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED
-            or not app.session_store.supports_runner_owned_interrupted_evidence
-        ):
-            return None
-        try:
-            evidence = await app.session_store.load_runner_owned_interrupted_evidence(
-                session.id,
-                expected_parent_session_id=expected_parent_session_id,
-            )
-        except Exception:
-            return None
-    except Exception:
-        return None
-    terminal_session, events, transcript, usage_summary = _project_terminal_evidence(evidence)
-    # Sub-agent nodes are captured for visibility/serialization; assertions in v1 evaluate
-    # against the root case only, so child nodes carry no probe snapshot.
-    grandchildren_incomplete = _IncompleteFlag()
-    grandchildren = await _build_child_trajectories(
-        app, session.id, visited=visited, incomplete=grandchildren_incomplete
-    )
-    return Trajectory(
-        session=terminal_session,
-        events=events,
-        transcript=transcript,
-        usage_summary=usage_summary,
-        final_output=final_output_text(transcript),
-        children=grandchildren,
-        children_incomplete=grandchildren_incomplete.value,
-    )
-
-
 def _validate_trials(value: int, field_name: str) -> None:
     # bool is an int subclass; reject it so trials=True can't silently mean 1 trial.
     if type(value) is not int:
@@ -970,26 +845,6 @@ def _session_failure_reason(events: Iterable[Event]) -> str:
                 return f"Session failed: {error}"
             return "Session failed."
     return "Session ended in a failed state."
-
-
-def final_output_text(transcript: Iterable[Message]) -> str:
-    """Return the text of the last assistant message in ``transcript``.
-
-    Walks the transcript backwards and returns the concatenated text of the most
-    recent assistant message that produced any text (``""`` if none did — e.g. the
-    run ended on a tool call). Use this to pull an agent's final answer out of a
-    loaded session transcript. ``run_to_completion`` instead reports the last
-    completed model turn observed in the live event stream, which can be empty
-    even when an earlier assistant transcript message had text.
-    """
-    for message in reversed(tuple(transcript)):
-        if message.role != MessageRole.ASSISTANT:
-            continue
-        text_parts = [part.text for part in message.content if type(part) is TextPart]
-        text = "".join(text_parts)
-        if text:
-            return text
-    return ""
 
 
 def _trial_status(
