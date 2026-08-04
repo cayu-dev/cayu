@@ -149,6 +149,23 @@ characters per case, 100 sequential trials, and a 3,600-second per-trial timeout
 Unknown fields and assertion kinds fail closed; schema version 1 has no legacy
 compatibility loader.
 
+Portable assertions consume one immutable `AssertionEvidenceView`, produced by
+`project_assertion_evidence_view(...)` from a validated `Trajectory`. The view
+contains only terminal statuses, bounded redacted final output, requested tool
+names and counts, model-step/token counts, and optional currency-local cost
+totals. It carries no session, event, interaction, provider, model, agent,
+environment, payload, tool argument/result, or cost line-item identity. Child,
+output, tool, model-step, and usage completeness are explicit; unavailable or
+limit-exceeded evidence is never represented as a complete observation.
+
+When cost evidence is requested, callers inject a trusted local `PriceBook`.
+`pricing_profile_identity(...)` canonicalizes and fingerprints the validated
+book together with Cayu's pricing-semantics version. The evidence and corpus
+carry only that identity and bounded aggregate costs, never the book or its
+provider/model line items. Reordering behavior-equivalent top-level price-book
+entries does not change the identity; changing pricing content or Cayu's pricing
+semantics does.
+
 ## First-party runtime acceptance suite
 
 Cayu ships an importable, hermetic target for exercising runtime-native evals

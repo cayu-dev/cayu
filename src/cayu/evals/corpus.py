@@ -30,10 +30,12 @@ from cayu._validation import (
     require_durable_nonblank,
     require_durable_text,
 )
+from cayu.runtime.costs import PriceBook
 
 EVAL_CORPUS_SCHEMA_VERSION = 1
 EVALUATION_EVIDENCE_POLICY_SCHEMA_VERSION = 1
 PRICING_PROFILE_IDENTITY_SCHEMA_VERSION = 1
+PRICING_PROFILE_SEMANTICS_VERSION = 1
 EVALUATION_SOURCE_IDENTITY_SCHEMA_VERSION = 1
 
 EVAL_CORPUS_MAX_BYTES = 8 << 20
@@ -544,10 +546,18 @@ class PricingProfileIdentityV1(_SchemaV1PortableModel):
     """Content identity for trusted pricing, never the actual PriceBook."""
 
     schema_version: Literal[1] = PRICING_PROFILE_IDENTITY_SCHEMA_VERSION
+    pricing_semantics_version: Literal[1] = PRICING_PROFILE_SEMANTICS_VERSION
     fingerprint: StrictStr
     price_book_version: StrictStr
     generated_at: StrictStr
     currencies: tuple[StrictStr, ...] = Field(min_length=1, max_length=32)
+
+    @field_validator("pricing_semantics_version", mode="before")
+    @classmethod
+    def validate_pricing_semantics_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("pricing_semantics_version must be the integer 1.")
+        return value
 
     @field_validator("fingerprint")
     @classmethod
@@ -584,6 +594,89 @@ class PricingProfileIdentityV1(_SchemaV1PortableModel):
         if tuple(cleaned) != tuple(sorted(set(cleaned))):
             raise ValueError("Pricing currencies must be unique and sorted.")
         return tuple(cleaned)
+
+
+def pricing_profile_identity(price_book: PriceBook) -> PricingProfileIdentityV1:
+    """Fingerprint one validated PriceBook without carrying its executable pricing data."""
+
+    if type(price_book) is not PriceBook:
+        raise TypeError("price_book must be an exact PriceBook.")
+    validated = PriceBook.model_validate(_model_python_input(price_book))
+    return _pricing_profile_identity_from_validated_price_book(validated)
+
+
+def _pricing_profile_identity_from_validated_price_book(
+    validated: PriceBook,
+) -> PricingProfileIdentityV1:
+    """Fingerprint one detached, already validated exact PriceBook snapshot."""
+
+    if type(validated) is not PriceBook:
+        raise TypeError("validated must be an exact PriceBook.")
+    ordered = validated.model_copy(
+        update={
+            "prices": tuple(
+                sorted(
+                    validated.prices,
+                    key=lambda price: (
+                        price.provider_name,
+                        price.model,
+                        price.match,
+                        (
+                            ()
+                            if price.pricing_context is None
+                            else price.pricing_context.storage_key()
+                        ),
+                    ),
+                )
+            ),
+            "contextual_pricing_requirements": tuple(
+                sorted(
+                    validated.contextual_pricing_requirements,
+                    key=lambda requirement: requirement.provider_name,
+                )
+            ),
+            "resource_mappings": tuple(
+                sorted(
+                    validated.resource_mappings,
+                    key=lambda mapping: (mapping.provider_name, mapping.resource_id),
+                )
+            ),
+        }
+    )
+    price_book_document = copy_durable_json_object(
+        ordered.model_dump(mode="json"),
+        "price book",
+    )
+    fingerprint_document = {
+        "pricing_semantics_version": PRICING_PROFILE_SEMANTICS_VERSION,
+        "price_book": price_book_document,
+    }
+    if not json_utf8_size_within_limit(fingerprint_document, EVAL_CORPUS_MAX_BYTES):
+        raise ValueError(
+            f"Price book identity input exceeds {EVAL_CORPUS_MAX_BYTES} canonical JSON bytes."
+        )
+    fingerprint = (
+        "sha256:"
+        + hashlib.sha256(
+            canonical_durable_json_bytes(fingerprint_document, "price book identity")
+        ).hexdigest()
+    )
+    currencies = tuple(
+        sorted(
+            {
+                schedule.pricing.currency.upper()
+                for price in validated.prices
+                for schedule in price.schedules
+            }
+        )
+    )
+    return PricingProfileIdentityV1(
+        pricing_semantics_version=PRICING_PROFILE_SEMANTICS_VERSION,
+        fingerprint=fingerprint,
+        price_book_version=validated.price_book_version,
+        generated_at=validated.generated_at,
+        currencies=currencies,
+    )
 
 
 class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):

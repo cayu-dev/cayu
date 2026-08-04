@@ -39,6 +39,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS,
     EVAL_CORPUS_MAX_TRIALS,
     EVAL_CORPUS_SCHEMA_VERSION,
+    PRICING_PROFILE_SEMANTICS_VERSION,
     AssertionSpec,
     ChildStatusAssertionSpec,
     CorpusUserMessageSpec,
@@ -64,6 +65,14 @@ from cayu.evals.corpus import (
     eval_corpus_from_json,
     eval_corpus_to_json,
     load_eval_corpus,
+    pricing_profile_identity,
+)
+from cayu.evals.evidence import (
+    ASSERTION_EVIDENCE_MAX_BYTES,
+    ASSERTION_EVIDENCE_SCHEMA_VERSION,
+    AssertionCostEvidenceV1,
+    AssertionEvidenceView,
+    project_assertion_evidence_view,
 )
 from cayu.evals.judges import LLMJudge
 from cayu.evals.models import (
@@ -116,6 +125,8 @@ from cayu.evals.trajectory import (
 )
 
 __all__ = [
+    "ASSERTION_EVIDENCE_MAX_BYTES",
+    "ASSERTION_EVIDENCE_SCHEMA_VERSION",
     "EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE",
     "EVAL_CORPUS_MAX_BYTES",
     "EVAL_CORPUS_MAX_CASES",
@@ -128,9 +139,12 @@ __all__ = [
     "EVAL_CORPUS_MAX_TRIALS",
     "EVAL_CORPUS_SCHEMA_VERSION",
     "EVAL_SCHEMA_VERSION",
+    "PRICING_PROFILE_SEMANTICS_VERSION",
     "TRAJECTORY_SCHEMA_VERSION",
     "WORKSPACE_PROBE_MAX_BYTES",
     "ArtifactCreated",
+    "AssertionCostEvidenceV1",
+    "AssertionEvidenceView",
     "AssertionSpec",
     "ChildSessionCompleted",
     "ChildStatusAssertionSpec",
@@ -208,6 +222,8 @@ __all__ = [
     "load_eval_corpus",
     "load_eval_run",
     "load_trajectory",
+    "pricing_profile_identity",
+    "project_assertion_evidence_view",
     "render_comparison_html",
     "render_html_report",
     "run_eval_case",

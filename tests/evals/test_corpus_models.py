@@ -48,6 +48,7 @@ def _source(*, evidence_revision: str = "sha256:" + "e" * 64):
 def _pricing() -> PricingProfileIdentityV1:
     return PricingProfileIdentityV1(
         fingerprint="sha256:" + "b" * 64,
+        pricing_semantics_version=1,
         price_book_version="2026-08-05",
         generated_at="2026-08-05T00:00:00Z",
         currencies=("EUR", "USD"),
@@ -495,6 +496,7 @@ def test_corpus_rejects_suites_that_cannot_fit_the_complete_published_graph():
         (
             lambda: PricingProfileIdentityV1(
                 fingerprint="sha256:" + "b" * 64,
+                pricing_semantics_version=1,
                 price_book_version="v1",
                 generated_at="now",
                 currencies=("USD", "EUR"),
