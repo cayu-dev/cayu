@@ -23,7 +23,13 @@ def _context(trajectory: Trajectory) -> EvalContext:
     return EvalContext(trajectory=trajectory, suite_id="suite", case_id="case", metadata={})
 
 
-def _session(session_id: str, agent_name: str, status: SessionStatus) -> Session:
+def _session(
+    session_id: str,
+    agent_name: str,
+    status: SessionStatus,
+    *,
+    parent_session_id: str | None = None,
+) -> Session:
     return Session(
         id=session_id,
         agent_name=agent_name,
@@ -31,6 +37,7 @@ def _session(session_id: str, agent_name: str, status: SessionStatus) -> Session
         model="test-model",
         causal_budget_id="budget",
         status=status,
+        parent_session_id=parent_session_id,
     )
 
 
@@ -159,7 +166,14 @@ def test_child_session_completed_filters_direct_children_and_reports_incomplete_
     completed_other = Trajectory(
         session=_session("child-other", "other", SessionStatus.COMPLETED),
         children=(
-            Trajectory(session=_session("grandchild-completed", "helper", SessionStatus.COMPLETED)),
+            Trajectory(
+                session=_session(
+                    "grandchild-completed",
+                    "helper",
+                    SessionStatus.COMPLETED,
+                    parent_session_id="child-other",
+                )
+            ),
         ),
     )
     context = _context(

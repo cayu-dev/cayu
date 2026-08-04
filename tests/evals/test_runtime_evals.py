@@ -16,6 +16,7 @@ from cayu import (
     AgentSpec,
     ArtifactCreated,
     CayuApp,
+    ChildSessionCompleted,
     Environment,
     EnvironmentSpec,
     EvalAssertion,
@@ -84,6 +85,7 @@ from cayu.evals import (
     run_eval_case,
     write_trajectory_json,
 )
+from cayu.evals.models import WorkspaceFileProbe
 from cayu.evals.runner import _build_child_trajectories
 from cayu.providers import ModelProvider, ModelStreamEvent
 from cayu.runtime import InMemorySessionStore, SessionIdentity
@@ -91,7 +93,13 @@ from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.usage import SessionUsageSummary, build_aggregate_usage_metrics
 
 
-def _session(*, session_id: str = "sess_eval", environment_name: str | None = None) -> Session:
+def _session(
+    *,
+    session_id: str = "sess_eval",
+    environment_name: str | None = None,
+    status: SessionStatus = SessionStatus.PENDING,
+    parent_session_id: str | None = None,
+) -> Session:
     return Session(
         id=session_id,
         agent_name="agent",
@@ -99,6 +107,38 @@ def _session(*, session_id: str = "sess_eval", environment_name: str | None = No
         model="fake-model",
         causal_budget_id="cb",
         environment_name=environment_name,
+        status=status,
+        parent_session_id=parent_session_id,
+    )
+
+
+def _terminal_event(
+    session_id: str,
+    status: SessionStatus = SessionStatus.COMPLETED,
+) -> Event:
+    event_type = {
+        SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+        SessionStatus.FAILED: EventType.SESSION_FAILED,
+        SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+    }[status]
+    return Event(type=event_type, session_id=session_id)
+
+
+def _completed_trajectory(
+    session_id: str,
+    *,
+    parent_session_id: str | None = None,
+    children: tuple[Trajectory, ...] = (),
+) -> Trajectory:
+    return Trajectory(
+        session=_session(
+            session_id=session_id,
+            status=SessionStatus.COMPLETED,
+            parent_session_id=parent_session_id,
+        ),
+        events=(_terminal_event(session_id),),
+        usage_summary=SessionUsageSummary(session_id=session_id),
+        children=children,
     )
 
 
@@ -370,25 +410,15 @@ def test_write_html_report_rejects_nonportable_text_before_overwrite(
     tmp_path,
     invalid_text,
 ):
-    now = datetime.now(UTC)
-    run = EvalRun(
-        suite_id="s",
-        status=EvalStatus.ERROR,
-        score=None,
-        cases=(
+    run = _run(
+        EvalStatus.ERROR,
+        None,
+        [
             EvalCaseResult.from_trials(
                 case_id="c",
-                trials=(
-                    _trial_result(
-                        EvalStatus.ERROR,
-                        None,
-                        error=invalid_text,
-                    ),
-                ),
+                trials=(_trial_result(EvalStatus.ERROR, None, error=invalid_text),),
             ),
-        ),
-        started_at=now,
-        completed_at=now,
+        ],
     )
     path = tmp_path / "report.html"
     path.write_text("existing report", encoding="utf-8")
@@ -726,8 +756,19 @@ def _case_result(case_id, status, score) -> EvalCaseResult:
     )
 
 
-def _run(status, score, cases, *, suite_id="s") -> EvalRun:
-    return EvalRun(suite_id=suite_id, status=status, score=score, cases=tuple(cases))
+def _run(status, score, cases, *, suite_id="s", metadata=None) -> EvalRun:
+    started_at = min(case.started_at for case in cases)
+    completed_at = max(case.completed_at for case in cases)
+    return EvalRun(
+        suite_id=suite_id,
+        status=status,
+        score=score,
+        cases=tuple(cases),
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=int((completed_at - started_at).total_seconds() * 1000),
+        metadata={} if metadata is None else metadata,
+    )
 
 
 def test_compare_detects_status_regression():
@@ -1052,11 +1093,10 @@ def test_load_eval_run_rejects_missing_schema_version(tmp_path):
 
 
 def test_eval_run_durable_json_round_trip(tmp_path):
-    run = EvalRun(
-        suite_id="s",
-        status=EvalStatus.PASSED,
-        score=1.0,
-        cases=(_case_result("a", EvalStatus.PASSED, 1.0),),
+    run = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
         metadata={
             "nested": {
                 "items": [
@@ -1091,11 +1131,10 @@ def test_write_eval_run_rejects_nonportable_metadata_before_overwrite(
 ):
     path = tmp_path / "run.json"
     path.write_text("existing eval run", encoding="utf-8")
-    run = EvalRun(
-        suite_id="s",
-        status=EvalStatus.PASSED,
-        score=1.0,
-        cases=(_case_result("a", EvalStatus.PASSED, 1.0),),
+    run = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
         metadata={"nested": {"value": invalid_value}},
     )
 
@@ -1108,11 +1147,10 @@ def test_write_eval_run_rejects_nonportable_metadata_before_overwrite(
 def test_write_eval_run_revalidates_forged_model_before_overwrite(tmp_path):
     path = tmp_path / "run.json"
     path.write_text("existing eval run", encoding="utf-8")
-    forged = EvalRun(
-        suite_id="s",
-        status=EvalStatus.PASSED,
-        score=1.0,
-        cases=(_case_result("a", EvalStatus.PASSED, 1.0),),
+    forged = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
     ).model_copy(
         update={
             "schema_version": 2,
@@ -1122,6 +1160,25 @@ def test_write_eval_run_revalidates_forged_model_before_overwrite(tmp_path):
 
     with pytest.raises(ValidationError):
         write_eval_run_json(forged, path)
+
+    assert path.read_text(encoding="utf-8") == "existing eval run"
+
+
+def test_write_eval_run_does_not_coerce_models_inside_durable_metadata(tmp_path):
+    path = tmp_path / "run.json"
+    path.write_text("existing eval run", encoding="utf-8")
+    run = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
+    )
+    run.metadata["invalid_model"] = WorkspaceFileProbe(
+        total_bytes=1,
+        sha256="digest",
+    )
+
+    with pytest.raises(ValidationError):
+        write_eval_run_json(run, path)
 
     assert path.read_text(encoding="utf-8") == "existing eval run"
 
@@ -1199,6 +1256,40 @@ class _GradedAssertion(EvalAssertion):
 
     async def evaluate(self, context):
         return self.score_result(self._score, threshold=self._threshold, message="graded")
+
+
+class _ForgedAssertionResult(EvalAssertion):
+    async def evaluate(self, context):
+        valid = self.failed("original failure")
+        return valid.model_copy(update={"outcome": EvalOutcome.PASSED})
+
+
+class _ForgedAssertionMetadata(EvalAssertion):
+    async def evaluate(self, context):
+        result = self.passed("invalid metadata")
+        result.metadata["invalid_model"] = WorkspaceFileProbe(
+            total_bytes=1,
+            sha256="digest",
+        )
+        return result
+
+
+def test_replay_converts_validator_bypassed_assertion_result_to_error():
+    (result,) = asyncio.run(evaluate_assertions(Trajectory(), [_ForgedAssertionResult()]))
+
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
+    assert result.passed is False
+    assert "ValidationError" in result.message
+
+
+def test_replay_does_not_coerce_models_inside_assertion_metadata():
+    (result,) = asyncio.run(evaluate_assertions(Trajectory(), [_ForgedAssertionMetadata()]))
+
+    assert result.outcome is EvalOutcome.ERROR
+    assert result.score is None
+    assert result.passed is False
+    assert "ValidationError" in result.message
 
 
 def test_score_result_derives_pass_from_threshold():
@@ -1462,7 +1553,14 @@ def test_trajectory_json_round_trip(tmp_path):
     # The Trajectory is the serializable replay/export object: probe bytes (base64), a
     # probed-but-absent file (None), nested sub-agent children, and the session all survive.
     trajectory = Trajectory(
-        session=_session(session_id="root", environment_name="local"),
+        session=_session(
+            session_id="root",
+            environment_name="local",
+            status=SessionStatus.COMPLETED,
+        ),
+        events=(_terminal_event("root"),),
+        transcript=(Message.text("assistant", "root output"),),
+        usage_summary=SessionUsageSummary(session_id="root"),
         final_output="root output",
         probes=TrajectoryProbes(
             workspace_available=True,
@@ -1493,6 +1591,558 @@ def test_trajectory_json_round_trip(tmp_path):
     assert restored.metadata == trajectory.metadata
 
 
+def test_trajectory_rejects_cross_session_evidence():
+    session = _session(session_id="root")
+
+    with pytest.raises(ValidationError, match="events must belong"):
+        Trajectory(
+            session=session,
+            events=(Event(type=EventType.MODEL_COMPLETED, session_id="unrelated"),),
+        )
+
+    with pytest.raises(ValidationError, match="usage must belong"):
+        Trajectory(
+            session=session,
+            usage_summary=SessionUsageSummary(session_id="unrelated"),
+        )
+
+    with pytest.raises(ValidationError, match="direct children"):
+        Trajectory(
+            session=session,
+            children=(Trajectory(session=_session(session_id="unrelated")),),
+        )
+
+
+def test_replay_revalidates_forged_trajectory_attribution():
+    valid = Trajectory(
+        session=_session(session_id="root", status=SessionStatus.COMPLETED),
+        events=(_terminal_event("root"),),
+        usage_summary=SessionUsageSummary(session_id="root"),
+    )
+    forged = valid.model_copy(
+        update={"events": (Event(type=EventType.MODEL_COMPLETED, session_id="unrelated"),)}
+    )
+
+    with pytest.raises(ValueError, match="events must belong"):
+        asyncio.run(evaluate_assertions(forged, [EventOccurred(EventType.MODEL_COMPLETED)]))
+
+
+def test_replay_revalidates_forged_trajectory_fields():
+    forged = Trajectory(final_output="done").model_copy(update={"events": (object(),)})
+
+    with pytest.raises(ValidationError):
+        asyncio.run(evaluate_assertions(forged, [FinalOutputContains("done")]))
+
+
+def test_trajectory_export_recomputes_derived_evidence_before_overwrite(tmp_path):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    event = Event(
+        type=EventType.MODEL_COMPLETED,
+        session_id="root",
+        payload={
+            "usage_metrics": {
+                "input_tokens": 2,
+                "output_tokens": 3,
+                "total_tokens": 5,
+            }
+        },
+    )
+    forged = Trajectory(
+        session=_session(session_id="root", status=SessionStatus.COMPLETED),
+        events=(event, _terminal_event("root")),
+        usage_summary=SessionUsageSummary(session_id="root"),
+    )
+
+    with pytest.raises(ValueError, match="usage must match"):
+        write_trajectory_json(forged, path)
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+def test_trial_rejects_retained_trajectory_completeness_mismatch():
+    now = datetime.now(UTC)
+    trajectory = Trajectory(
+        session=_session(session_id="root", status=SessionStatus.COMPLETED),
+        events=(_terminal_event("root"),),
+        usage_summary=SessionUsageSummary(session_id="root"),
+        children_incomplete=True,
+    )
+
+    with pytest.raises(ValidationError, match="evidence_complete must match"):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.SKIPPED,
+            session_id="root",
+            score=0.0,
+            evidence_complete=True,
+            usage_summary=trajectory.usage_summary.model_dump(mode="json"),
+            started_at=now,
+            completed_at=now,
+            trajectory=trajectory,
+        )
+
+
+def test_trial_rejects_incomplete_nested_trajectory_as_complete():
+    now = datetime.now(UTC)
+    child = Trajectory(
+        session=Session(
+            id="child",
+            agent_name="child",
+            provider_name="fake",
+            model="fake-model",
+            causal_budget_id="cb",
+            parent_session_id="root",
+            status=SessionStatus.COMPLETED,
+        ),
+        events=(_terminal_event("child"),),
+        usage_summary=SessionUsageSummary(session_id="child"),
+        children_incomplete=True,
+    )
+    trajectory = Trajectory(
+        session=_session(session_id="root", status=SessionStatus.COMPLETED),
+        events=(_terminal_event("root"),),
+        usage_summary=SessionUsageSummary(session_id="root"),
+        children=(child,),
+    )
+
+    with pytest.raises(ValidationError, match="evidence_complete must match"):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.SKIPPED,
+            session_id="root",
+            score=0.0,
+            evidence_complete=True,
+            usage_summary=trajectory.usage_summary.model_dump(mode="json"),
+            started_at=now,
+            completed_at=now,
+            trajectory=trajectory,
+        )
+
+
+@pytest.mark.parametrize("nonterminal_node", ["root", "child"])
+def test_trajectory_export_rejects_nonterminal_session_before_overwrite(tmp_path, nonterminal_node):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    if nonterminal_node == "root":
+        trajectory = Trajectory(
+            session=_session(session_id="root", status=SessionStatus.RUNNING),
+            usage_summary=SessionUsageSummary(session_id="root"),
+        )
+    else:
+        child = Trajectory(
+            session=Session(
+                id="child",
+                agent_name="child",
+                provider_name="fake",
+                model="fake-model",
+                causal_budget_id="cb",
+                parent_session_id="root",
+                status=SessionStatus.RUNNING,
+            ),
+            usage_summary=SessionUsageSummary(session_id="child"),
+        )
+        trajectory = Trajectory(
+            session=_session(session_id="root", status=SessionStatus.COMPLETED),
+            events=(_terminal_event("root"),),
+            usage_summary=SessionUsageSummary(session_id="root"),
+            children=(child,),
+        )
+
+    with pytest.raises(ValueError, match="terminal session status"):
+        write_trajectory_json(trajectory, path)
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+@pytest.mark.parametrize(
+    ("events", "diagnostic"),
+    [
+        ((), "terminal event"),
+        ((_terminal_event("root", SessionStatus.FAILED),), "match the session status"),
+        (
+            (_terminal_event("root"), _terminal_event("root")),
+            "exactly one current-run terminal event",
+        ),
+        (
+            (
+                _terminal_event("root"),
+                Event(type=EventType.MODEL_STARTED, session_id="root"),
+            ),
+            "match the session status",
+        ),
+    ],
+    ids=["missing", "conflicting", "duplicate", "trailing-event"],
+)
+def test_trajectory_export_rejects_invalid_terminal_boundary_before_overwrite(
+    tmp_path,
+    events,
+    diagnostic,
+):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    trajectory = Trajectory(
+        session=_session(session_id="root", status=SessionStatus.COMPLETED),
+        events=events,
+        usage_summary=SessionUsageSummary(session_id="root"),
+    )
+
+    with pytest.raises(ValueError, match=diagnostic):
+        write_trajectory_json(trajectory, path)
+    with pytest.raises(ValueError, match=diagnostic):
+        asyncio.run(evaluate_assertions(trajectory, [SessionCompleted()]))
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+def test_trajectory_export_validates_nested_terminal_boundary_before_overwrite(tmp_path):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    child = Trajectory(
+        session=Session(
+            id="child",
+            agent_name="child",
+            provider_name="fake",
+            model="fake-model",
+            causal_budget_id="cb",
+            parent_session_id="root",
+            status=SessionStatus.COMPLETED,
+        ),
+        events=(_terminal_event("child", SessionStatus.FAILED),),
+        usage_summary=SessionUsageSummary(session_id="child"),
+    )
+    trajectory = Trajectory(
+        session=_session(session_id="root", status=SessionStatus.COMPLETED),
+        events=(_terminal_event("root"),),
+        usage_summary=SessionUsageSummary(session_id="root"),
+        children=(child,),
+    )
+
+    with pytest.raises(ValueError, match="match the session status"):
+        write_trajectory_json(trajectory, path)
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+def test_trial_rejects_retained_trajectory_with_conflicting_terminal_event():
+    now = datetime.now(UTC)
+    trajectory = Trajectory(
+        session=_session(session_id="root", status=SessionStatus.COMPLETED),
+        events=(_terminal_event("root", SessionStatus.FAILED),),
+        usage_summary=SessionUsageSummary(session_id="root"),
+    )
+
+    with pytest.raises(ValidationError, match="match the session status"):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.SKIPPED,
+            session_id="root",
+            score=0.0,
+            evidence_complete=True,
+            events_count=1,
+            usage_summary=trajectory.usage_summary.model_dump(mode="json"),
+            started_at=now,
+            completed_at=now,
+            trajectory=trajectory,
+        )
+
+
+def test_trial_revalidates_nested_assertion_and_trajectory_instances():
+    now = datetime.now(UTC)
+    valid_assertion = EvalAssertionResult(
+        name="check",
+        outcome=EvalOutcome.PASSED,
+        score=1.0,
+    )
+    forged_assertion = valid_assertion.model_copy(update={"metadata": {"non_durable": {1}}})
+
+    with pytest.raises(ValidationError):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.PASSED,
+            session_id="root",
+            score=1.0,
+            assertions=(forged_assertion,),
+            evidence_complete=True,
+            started_at=now,
+            completed_at=now,
+        )
+
+    valid_trajectory = _completed_trajectory("root")
+    forged_trajectory = valid_trajectory.model_copy(update={"metadata": {"non_durable": {1}}})
+    with pytest.raises(ValidationError):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.SKIPPED,
+            session_id="root",
+            score=0.0,
+            evidence_complete=True,
+            events_count=1,
+            usage_summary=valid_trajectory.usage_summary.model_dump(mode="json"),
+            started_at=now,
+            completed_at=now,
+            trajectory=forged_trajectory,
+        )
+
+
+def _trajectory_document_with_invalid_nested_model(nested_field):
+    trajectory = _completed_trajectory("root")
+    document = trajectory.model_dump(mode="python")
+
+    if nested_field == "session":
+        document["session"] = trajectory.session.model_copy(update={"agent_name": ""})
+    elif nested_field == "event":
+        forged_event = Event(type=EventType.MODEL_STARTED, session_id="root").model_copy(
+            update={"payload": {"non_durable": {1}}}
+        )
+        document["events"] = (forged_event, _terminal_event("root"))
+    elif nested_field == "transcript":
+        document["transcript"] = (
+            Message.text("assistant", "answer").model_copy(update={"content": ()}),
+        )
+    elif nested_field == "usage_summary":
+        document["usage_summary"] = trajectory.usage_summary.model_copy(
+            update={"provider_names": [1]}
+        )
+    elif nested_field == "usage_metrics":
+        usage_document = trajectory.usage_summary.model_dump(mode="python")
+        usage_document["usage"] = build_aggregate_usage_metrics().model_copy(
+            update={"total_tokens": 0.0}
+        )
+        document["usage_summary"] = usage_document
+    elif nested_field == "usage_cache":
+        usage_document = trajectory.usage_summary.model_dump(mode="python")
+        usage_metrics = build_aggregate_usage_metrics().model_dump(mode="python")
+        usage_metrics["cache"] = build_aggregate_usage_metrics().cache.model_copy(
+            update={"read_tokens": 0.0}
+        )
+        usage_document["usage"] = usage_metrics
+        document["usage_summary"] = usage_document
+    elif nested_field == "probes":
+        document["probes"] = TrajectoryProbes().model_copy(
+            update={"workspace_files": {"result.txt": object()}}
+        )
+    elif nested_field == "probe_stat":
+        forged_stat = WorkspaceFileProbe(
+            total_bytes=1,
+            truncated=False,
+            sha256="digest",
+        ).model_copy(update={"total_bytes": -1})
+        document["probes"] = {
+            "workspace_available": True,
+            "workspace_files": {"result.txt": b"a"},
+            "workspace_file_stats": {"result.txt": forged_stat},
+        }
+    elif nested_field == "artifact":
+        forged_artifact = ArtifactMetadata.model_construct(
+            id="artifact",
+            filename="result.txt",
+            size_bytes=-1,
+            scope=ArtifactScope.SESSION,
+            session_id="root",
+        )
+        document["probes"] = {
+            "artifacts_available": True,
+            "artifacts": (forged_artifact,),
+        }
+    elif nested_field == "artifact_metadata":
+        forged_artifact = ArtifactMetadata.model_construct(
+            id="artifact",
+            filename="result.txt",
+            size_bytes=1,
+            scope=ArtifactScope.SESSION,
+            session_id="root",
+            metadata={"invalid_model": TrajectoryProbes()},
+        )
+        document["probes"] = {
+            "artifacts_available": True,
+            "artifacts": (forged_artifact,),
+        }
+    elif nested_field == "child":
+        child = _completed_trajectory("child", parent_session_id="root")
+        forged_child_session = child.session.model_copy(update={"agent_name": ""})
+        document["children"] = (child.model_copy(update={"session": forged_child_session}),)
+    else:  # pragma: no cover - the parametrization above owns this helper's input domain
+        raise AssertionError(f"Unhandled nested field: {nested_field}")
+    return trajectory, document
+
+
+@pytest.mark.parametrize(
+    "nested_field",
+    [
+        "session",
+        "event",
+        "transcript",
+        "usage_summary",
+        "usage_metrics",
+        "usage_cache",
+        "probes",
+        "probe_stat",
+        "artifact",
+        "artifact_metadata",
+        "child",
+    ],
+)
+def test_trajectory_revalidates_nested_model_instances_in_mapping_input(nested_field):
+    _, document = _trajectory_document_with_invalid_nested_model(nested_field)
+
+    with pytest.raises(ValidationError):
+        Trajectory.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    "nested_field",
+    [
+        "event",
+        "usage_metrics",
+        "usage_cache",
+        "probe_stat",
+        "artifact",
+        "artifact_metadata",
+    ],
+)
+def test_trial_revalidates_nested_trajectory_instances_in_mapping_input(nested_field):
+    now = datetime.now(UTC)
+    trajectory, document = _trajectory_document_with_invalid_nested_model(nested_field)
+
+    with pytest.raises(ValidationError):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.SKIPPED,
+            session_id="root",
+            score=0.0,
+            evidence_complete=True,
+            events_count=len(document["events"]),
+            usage_summary=trajectory.usage_summary.model_dump(mode="json"),
+            started_at=now,
+            completed_at=now,
+            trajectory=document,
+        )
+
+
+@pytest.mark.parametrize("durable_field", ["event_payload", "session_metadata", "metadata"])
+def test_trajectory_does_not_coerce_models_inside_durable_json_fields(durable_field):
+    trajectory = _completed_trajectory("root")
+    document = trajectory.model_dump(mode="python")
+    nested_model = TrajectoryProbes()
+
+    if durable_field == "event_payload":
+        terminal_event = _terminal_event("root").model_dump(mode="python")
+        terminal_event["payload"] = {"invalid_model": nested_model}
+        document["events"] = (terminal_event,)
+    elif durable_field == "session_metadata":
+        session = trajectory.session.model_dump(mode="python")
+        session["metadata"] = {"invalid_model": nested_model}
+        document["session"] = session
+    else:
+        document["metadata"] = {"invalid_model": nested_model}
+
+    with pytest.raises(ValidationError):
+        Trajectory.model_validate(document)
+
+
+def test_case_and_run_revalidate_nested_result_instances():
+    trial = _trial_result(EvalStatus.PASSED, 1.0, session_id="root")
+    forged_assertion = trial.assertions[0].model_copy(update={"metadata": {"non_durable": {1}}})
+    forged_trial = trial.model_copy(update={"assertions": (forged_assertion,)})
+
+    with pytest.raises(ValidationError):
+        EvalCaseResult.from_trials(case_id="case", trials=(forged_trial,))
+
+    case = EvalCaseResult.from_trials(case_id="case", trials=(trial,))
+    forged_case = case.model_copy(update={"metadata": {"non_durable": {1}}})
+    with pytest.raises(ValidationError):
+        EvalRun(
+            suite_id="suite",
+            status=EvalStatus.PASSED,
+            score=1.0,
+            cases=(forged_case,),
+            started_at=case.started_at,
+            completed_at=case.completed_at,
+            duration_ms=case.duration_ms,
+        )
+
+    trajectory = _completed_trajectory("retained")
+    retained_trial = EvalTrialResult(
+        trial_number=1,
+        status=EvalStatus.SKIPPED,
+        session_id="retained",
+        score=0.0,
+        evidence_complete=True,
+        events_count=1,
+        usage_summary=trajectory.usage_summary.model_dump(mode="json"),
+        started_at=case.started_at,
+        completed_at=case.completed_at,
+        duration_ms=case.duration_ms,
+        trajectory=trajectory,
+    )
+    retained_case = EvalCaseResult.from_trials(case_id="retained", trials=(retained_trial,))
+    retained_run = EvalRun(
+        suite_id="suite",
+        status=EvalStatus.SKIPPED,
+        score=0.0,
+        cases=(retained_case,),
+        started_at=retained_case.started_at,
+        completed_at=retained_case.completed_at,
+        duration_ms=retained_case.duration_ms,
+    )
+    restored = retained_run.cases[0].trials[0].trajectory
+    assert restored == trajectory
+    assert restored is not trajectory
+
+
+@pytest.mark.parametrize("duplicate_kind", ["event", "child"])
+def test_trajectory_boundaries_reject_duplicate_durable_identities_before_overwrite(
+    tmp_path,
+    duplicate_kind,
+):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    root = _completed_trajectory("root")
+    if duplicate_kind == "event":
+        event = Event(type=EventType.MODEL_STARTED, session_id="root")
+        forged = root.model_copy(
+            update={
+                "events": (
+                    event,
+                    event.model_copy(deep=True),
+                    _terminal_event("root"),
+                )
+            }
+        )
+        assertion = EventOccurred(EventType.MODEL_STARTED, min_count=2)
+        diagnostic = "event IDs must be unique"
+    else:
+        child = _completed_trajectory("child", parent_session_id="root")
+        forged = root.model_copy(update={"children": (child, child.model_copy(deep=True))})
+        assertion = ChildSessionCompleted(min_count=2)
+        diagnostic = "child session IDs must be unique"
+
+    with pytest.raises(ValidationError, match=diagnostic):
+        write_trajectory_json(forged, path)
+    with pytest.raises(ValidationError, match=diagnostic):
+        asyncio.run(evaluate_assertions(forged, [assertion]))
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+def test_trajectory_record_rejects_repeated_session_identity_across_branches(tmp_path):
+    first = _completed_trajectory(
+        "first",
+        parent_session_id="root",
+        children=(_completed_trajectory("shared", parent_session_id="first"),),
+    )
+    second = _completed_trajectory(
+        "second",
+        parent_session_id="root",
+        children=(_completed_trajectory("shared", parent_session_id="second"),),
+    )
+    trajectory = _completed_trajectory("root", children=(first, second))
+
+    with pytest.raises(ValueError, match="session IDs must be unique across"):
+        write_trajectory_json(trajectory, tmp_path / "trajectory.json")
+
+
 @pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
 def test_write_trajectory_rejects_nonportable_metadata_before_overwrite(
     tmp_path,
@@ -1506,6 +2156,50 @@ def test_write_trajectory_rejects_nonportable_metadata_before_overwrite(
             Trajectory(metadata={"nested": {"value": invalid_text}}),
             path,
         )
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+def test_trajectory_boundaries_do_not_coerce_models_inside_durable_metadata(tmp_path):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    trajectory = Trajectory()
+    trajectory.metadata["invalid_model"] = WorkspaceFileProbe(
+        total_bytes=1,
+        sha256="digest",
+    )
+
+    with pytest.raises(ValidationError):
+        write_trajectory_json(trajectory, path)
+    with pytest.raises(ValidationError):
+        asyncio.run(evaluate_assertions(trajectory, ()))
+
+    assert path.read_text(encoding="utf-8") == "existing trajectory"
+
+
+def test_trajectory_boundaries_do_not_coerce_models_inside_transcript_payload(tmp_path):
+    path = tmp_path / "trajectory.json"
+    path.write_text("existing trajectory", encoding="utf-8")
+    trajectory = Trajectory(
+        transcript=(
+            Message.tool_call(
+                tool_call_id="call",
+                tool_name="tool",
+                arguments={},
+            ),
+        )
+    )
+    trajectory.transcript[0].content[0].arguments["invalid_model"] = WorkspaceFileProbe(
+        total_bytes=1,
+        sha256="digest",
+    )
+
+    with pytest.raises(ValidationError):
+        Trajectory(transcript=trajectory.transcript)
+    with pytest.raises(ValidationError):
+        write_trajectory_json(trajectory, path)
+    with pytest.raises(ValidationError):
+        asyncio.run(evaluate_assertions(trajectory, ()))
 
     assert path.read_text(encoding="utf-8") == "existing trajectory"
 
@@ -2120,7 +2814,7 @@ def test_run_then_save_reload_replay(tmp_path):
     assert [r.passed for r in replayed] == [True, True]
 
     # the trajectory is excluded from the persisted score-first eval-run JSON
-    run = EvalRun(suite_id="s", status=result.status, score=result.score, cases=(result,))
+    run = _run(result.status, result.score, [result])
     assert "trajectory" not in json.loads(eval_run_to_json(run))["cases"][0]["trials"][0]
 
 

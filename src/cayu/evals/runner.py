@@ -31,6 +31,8 @@ from cayu.evals.models import (
     Trajectory,
     TrajectoryProbes,
     WorkspaceFileProbe,
+    _model_instance_python_input,
+    _validate_trajectory_record_contract,
     aggregate_eval_score,
     aggregate_eval_status,
 )
@@ -676,6 +678,11 @@ async def evaluate_assertions(
     """
     if type(trajectory) is not Trajectory:
         raise TypeError("evaluate_assertions requires a Trajectory.")
+    # model_copy/model_construct can bypass field and nested-model validation.
+    # Reconstruct the complete public input before applying derived record checks,
+    # then evaluate only against that detached validated copy.
+    trajectory = Trajectory.model_validate(_model_instance_python_input(trajectory))
+    _validate_trajectory_record_contract(trajectory)
     context = EvalContext(
         trajectory=trajectory,
         suite_id=suite_id,
@@ -697,6 +704,14 @@ async def _evaluate_assertions(
                 result = await result
             if type(result) is not EvalAssertionResult:
                 raise TypeError("EvalAssertion.evaluate must return EvalAssertionResult.")
+            # Assertion extensions can return a validator-bypassed model. Rebuild it
+            # inside the protected boundary so replay never exposes an impossible
+            # result and fresh runs do not fail later during trial construction.
+            result = EvalAssertionResult.model_validate(_model_instance_python_input(result))
+            if result.cost_summary is not None and (
+                context.session is None or result.cost_summary.session_id != context.session.id
+            ):
+                raise ValueError("Assertion cost summaries must belong to the trajectory session.")
             results.append(result)
         except Exception as exc:
             results.append(

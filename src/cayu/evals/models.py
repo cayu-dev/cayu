@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from uuid import uuid4
 
 from pydantic import (
@@ -20,13 +20,16 @@ from pydantic import (
 
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
-from cayu.core.events import Event
-from cayu.core.messages import Message
+from cayu.core.events import Event, EventType
+from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.runtime.costs import SessionCostSummary
-from cayu.runtime.sessions import Session
+from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.usage import (
+    AggregateCacheUsageMetrics,
+    AggregateUsageMetrics,
     SessionUsageSummary,
     aggregate_usage_metrics_from_durable_payload,
+    session_usage_summary,
     session_usage_summary_payload,
 )
 
@@ -47,6 +50,88 @@ TRAJECTORY_SCHEMA_VERSION = 1
 # so a multi-GB workspace file can never balloon the trajectory JSON (which base64-encodes bytes)
 # or the in-memory result. Assertions still see the leading window of the file.
 WORKSPACE_PROBE_MAX_BYTES = 1 << 20  # 1 MiB
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _revalidate_model_instance(value: Any, model_type: type[_ModelT]) -> Any:
+    """Rebuild an existing model that may have bypassed its field validators."""
+
+    if isinstance(value, model_type):
+        return model_type.model_validate(_model_instance_python_input(value))
+    return value
+
+
+def _model_instance_python_input(value: BaseModel) -> dict[str, Any]:
+    """Dump a model for validation without dropping excluded nested fields."""
+
+    nested_fields: dict[str, Any] = {}
+    for field_name, field_info in type(value).model_fields.items():
+        field_value = getattr(value, field_name)
+        if field_info.exclude or isinstance(field_value, (BaseModel, Mapping, list, tuple)):
+            nested_fields[field_name] = field_value
+    document = value.model_dump(
+        mode="python",
+        warnings=False,
+        exclude=set(nested_fields),
+    )
+    for field_name, field_value in nested_fields.items():
+        # Mapping fields commonly carry durable JSON. Preserve their raw values
+        # so the owning field validator rejects nested models instead of a dump
+        # silently converting those models into apparently valid JSON objects.
+        document[field_name] = (
+            dict(field_value)
+            if isinstance(field_value, Mapping)
+            else _nested_model_python_input(field_value)
+        )
+    return document
+
+
+def _nested_model_python_input(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return _model_instance_python_input(value)
+    if isinstance(value, list):
+        return [_nested_model_python_input(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_nested_model_python_input(item) for item in value)
+    return value
+
+
+def _revalidate_aggregate_usage_input(value: Any) -> Any:
+    if isinstance(value, AggregateUsageMetrics):
+        return _revalidate_model_instance(value, AggregateUsageMetrics)
+    if not isinstance(value, Mapping):
+        return value
+    document = dict(value)
+    if "cache" in document:
+        document["cache"] = _revalidate_model_instance(
+            document["cache"],
+            AggregateCacheUsageMetrics,
+        )
+    return document
+
+
+def _revalidate_session_usage_summary_input(value: Any) -> Any:
+    if isinstance(value, SessionUsageSummary):
+        return _revalidate_model_instance(value, SessionUsageSummary)
+    if not isinstance(value, Mapping):
+        return value
+    document = dict(value)
+    if "usage" in document:
+        document["usage"] = _revalidate_aggregate_usage_input(document["usage"])
+    return document
+
+
+def _revalidate_model_iterable(value: Any, model_type: type[_ModelT]) -> Any:
+    """Rebuild model instances inside one Pydantic sequence input."""
+
+    if (
+        value is None
+        or isinstance(value, (str, bytes, bytearray, Mapping, BaseModel))
+        or not isinstance(value, Iterable)
+    ):
+        return value
+    return tuple(_revalidate_model_instance(item, model_type) for item in value)
 
 
 class EvalStatus(StrEnum):
@@ -73,7 +158,7 @@ class EvalOutcome(StrEnum):
 
 
 class EvalAssertionResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     name: str
     outcome: EvalOutcome
@@ -127,13 +212,17 @@ class EvalAssertionResult(BaseModel):
         cls,
         value: SessionCostSummary | None,
     ) -> SessionCostSummary | None:
-        return None if value is None else value.model_copy(deep=True)
+        return (
+            None
+            if value is None
+            else SessionCostSummary.model_validate(value.model_dump(mode="python", warnings=False))
+        )
 
 
 class EvalTrialResult(BaseModel):
     """Lossless result for one concrete, independently executed case trial."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     trial_number: StrictInt = Field(ge=1)
     status: EvalStatus
@@ -160,6 +249,11 @@ class EvalTrialResult(BaseModel):
         if value is None:
             return None
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("trajectory", mode="before")
+    @classmethod
+    def revalidate_trajectory(cls, value):
+        return _revalidate_model_instance(value, Trajectory)
 
     @field_validator("error", "unavailable_reason", mode="before")
     @classmethod
@@ -208,10 +302,13 @@ class EvalTrialResult(BaseModel):
         if self.status == EvalStatus.UNAVAILABLE:
             if self.unavailable_reason is None:
                 raise ValueError("unavailable trials require an unavailable_reason.")
-            if self.assertions and not any(
+            if (self.assertions or self.evidence_complete) and not any(
                 assertion.outcome == EvalOutcome.UNAVAILABLE for assertion in self.assertions
             ):
-                raise ValueError("unavailable trials must retain an unavailable assertion outcome.")
+                raise ValueError(
+                    "Complete or assertion-bearing unavailable trials must retain an "
+                    "unavailable assertion outcome."
+                )
         elif self.unavailable_reason is not None:
             raise ValueError("Only unavailable trials can carry an unavailable_reason.")
         if self.status in (EvalStatus.PASSED, EvalStatus.FAILED, EvalStatus.SKIPPED):
@@ -232,6 +329,9 @@ class EvalTrialResult(BaseModel):
         ):
             raise ValueError("Assertion cost summaries must belong to the trial session_id.")
         if self.trajectory is not None:
+            _validate_trajectory_record_contract(self.trajectory)
+            if self.evidence_complete != _trajectory_tree_is_complete(self.trajectory):
+                raise ValueError("evidence_complete must match the retained trajectory child tree.")
             if (
                 self.session_id is None
                 or self.trajectory.session is None
@@ -276,7 +376,7 @@ class EvalTrialResult(BaseModel):
 
 
 class EvalCaseResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     case_id: str
     status: EvalStatus
@@ -304,7 +404,7 @@ class EvalCaseResult(BaseModel):
         completed_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> EvalCaseResult:
-        retained = tuple(trials)
+        retained = tuple(EvalTrialResult.model_validate(trial) for trial in trials)
         if not retained:
             raise ValueError("EvalCaseResult requires at least one trial.")
         case_started_at = started_at or retained[0].started_at
@@ -366,6 +466,11 @@ class EvalCaseResult(BaseModel):
         )
         if self.duration_ms != expected_duration:
             raise ValueError("duration_ms must match started_at and completed_at.")
+        if any(
+            trial.started_at < self.started_at or trial.completed_at > self.completed_at
+            for trial in self.trials
+        ):
+            raise ValueError("Case timing must enclose every retained trial.")
         expected_numbers = tuple(range(1, len(self.trials) + 1))
         if tuple(trial.trial_number for trial in self.trials) != expected_numbers:
             raise ValueError("Trial numbers must be contiguous and match tuple order.")
@@ -389,7 +494,7 @@ class EvalCaseResult(BaseModel):
 
 
 class EvalRun(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
@@ -426,6 +531,11 @@ class EvalRun(BaseModel):
         )
         if self.duration_ms != expected_duration:
             raise ValueError("duration_ms must match started_at and completed_at.")
+        if any(
+            case.started_at < self.started_at or case.completed_at > self.completed_at
+            for case in self.cases
+        ):
+            raise ValueError("Run timing must enclose every retained case.")
         case_ids = tuple(case.case_id for case in self.cases)
         if len(case_ids) != len(set(case_ids)):
             raise ValueError("EvalRun case IDs must be unique.")
@@ -701,6 +811,21 @@ class TrajectoryProbes(BaseModel):
     artifacts_available: StrictBool = False
     artifacts: tuple[ArtifactMetadata, ...] = Field(default_factory=tuple)
 
+    @field_validator("workspace_file_stats", mode="before")
+    @classmethod
+    def revalidate_workspace_file_stats(cls, value):
+        if not isinstance(value, Mapping):
+            return value
+        return {
+            path: _revalidate_model_instance(stat, WorkspaceFileProbe)
+            for path, stat in value.items()
+        }
+
+    @field_validator("artifacts", mode="before")
+    @classmethod
+    def revalidate_artifacts(cls, value):
+        return _revalidate_model_iterable(value, ArtifactMetadata)
+
 
 class Trajectory(BaseModel):
     """The serializable **record** of one completed run — and the eval assertion substrate.
@@ -714,7 +839,7 @@ class Trajectory(BaseModel):
     Distinct from `EvalContext`, which is the assertion's *view* of a Trajectory.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     session: Session | None = None
     events: tuple[Event, ...] = Field(default_factory=tuple)
@@ -727,6 +852,165 @@ class Trajectory(BaseModel):
     # or hitting the page cap — so a partial `children` capture is never mistaken for "no more".
     children_incomplete: StrictBool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("session", mode="before")
+    @classmethod
+    def revalidate_session(cls, value):
+        return _revalidate_model_instance(value, Session)
+
+    @field_validator("events", mode="before")
+    @classmethod
+    def revalidate_events(cls, value):
+        return _revalidate_model_iterable(value, Event)
+
+    @field_validator("transcript", mode="before")
+    @classmethod
+    def revalidate_transcript(cls, value):
+        return _revalidate_model_iterable(value, Message)
+
+    @field_validator("usage_summary", mode="before")
+    @classmethod
+    def revalidate_usage_summary(cls, value):
+        return _revalidate_session_usage_summary_input(value)
+
+    @field_validator("probes", mode="before")
+    @classmethod
+    def revalidate_probes(cls, value):
+        return _revalidate_model_instance(value, TrajectoryProbes)
+
+    @field_validator("children", mode="before")
+    @classmethod
+    def revalidate_children(cls, value):
+        return _revalidate_model_iterable(value, Trajectory)
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def copy_metadata(cls, value):
+        return copy_json_value(value, "metadata")
+
+    @model_validator(mode="after")
+    def validate_session_attribution(self) -> Trajectory:
+        _validate_trajectory_session_attribution(self)
+        return self
+
+
+def _validate_trajectory_session_attribution(trajectory: Trajectory) -> None:
+    event_ids = tuple(event.id for event in trajectory.events)
+    if len(event_ids) != len(set(event_ids)):
+        raise ValueError("Trajectory event IDs must be unique within each session.")
+    child_session_ids = tuple(
+        child.session.id for child in trajectory.children if child.session is not None
+    )
+    if len(child_session_ids) != len(set(child_session_ids)):
+        raise ValueError("Trajectory direct-child session IDs must be unique.")
+    if trajectory.session is None:
+        return
+    session_id = trajectory.session.id
+    if any(event.session_id != session_id for event in trajectory.events):
+        raise ValueError("Trajectory events must belong to the trajectory session.")
+    if trajectory.usage_summary is not None and trajectory.usage_summary.session_id != session_id:
+        raise ValueError("Trajectory usage must belong to the trajectory session.")
+    if any(
+        child.session is not None and child.session.parent_session_id != session_id
+        for child in trajectory.children
+    ):
+        raise ValueError("Trajectory children must be direct children of the trajectory session.")
+
+
+def _validate_trajectory_record_contract(trajectory: Trajectory) -> None:
+    """Validate derived fields before a trajectory is retained, exported, or replayed."""
+
+    _validate_trajectory_record_tree(trajectory, seen_session_ids=set())
+
+
+def _validate_trajectory_record_tree(
+    trajectory: Trajectory,
+    *,
+    seen_session_ids: set[str],
+) -> None:
+    """Validate one node while enforcing globally unique session identity."""
+
+    # Pydantic model_copy/model_construct and nested existing-model inputs can
+    # bypass model validators. Re-run attribution before trusting derived data.
+    _validate_trajectory_session_attribution(trajectory)
+    if trajectory.session is not None:
+        if trajectory.session.id in seen_session_ids:
+            raise ValueError("Trajectory session IDs must be unique across the child tree.")
+        seen_session_ids.add(trajectory.session.id)
+        if trajectory.session.status not in {
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.INTERRUPTED,
+        }:
+            raise ValueError("Session-backed trajectories require a terminal session status.")
+        _validate_trajectory_terminal_boundary(trajectory)
+        if trajectory.usage_summary is None:
+            raise ValueError("A session-backed trajectory requires an exact usage summary.")
+        expected_usage = session_usage_summary(trajectory.session.id, list(trajectory.events))
+        if session_usage_summary_payload(trajectory.usage_summary) != session_usage_summary_payload(
+            expected_usage
+        ):
+            raise ValueError("Trajectory usage must match its retained events.")
+        if trajectory.final_output != _trajectory_final_output_text(trajectory.transcript):
+            raise ValueError("Trajectory final_output must match its retained transcript.")
+    for child in trajectory.children:
+        _validate_trajectory_record_tree(child, seen_session_ids=seen_session_ids)
+
+
+_TRAJECTORY_TERMINAL_EVENT_BY_STATUS = {
+    SessionStatus.COMPLETED: EventType.SESSION_COMPLETED,
+    SessionStatus.FAILED: EventType.SESSION_FAILED,
+    SessionStatus.INTERRUPTED: EventType.SESSION_INTERRUPTED,
+}
+_TRAJECTORY_TERMINAL_EVENT_TYPES = frozenset(_TRAJECTORY_TERMINAL_EVENT_BY_STATUS.values())
+_TRAJECTORY_LIFECYCLE_EVENT_TYPES = frozenset(
+    {
+        EventType.SESSION_STARTED,
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_FORKED,
+    }
+)
+
+
+def _validate_trajectory_terminal_boundary(trajectory: Trajectory) -> None:
+    """Require one status-consistent terminal event for the current run."""
+
+    if trajectory.session is None:
+        return
+    if not trajectory.events:
+        raise ValueError("Session-backed trajectories require a terminal event.")
+    current_run_start = 0
+    for index, event in enumerate(trajectory.events):
+        if event.type in _TRAJECTORY_LIFECYCLE_EVENT_TYPES:
+            current_run_start = index + 1
+    terminal_events = tuple(
+        event
+        for event in trajectory.events[current_run_start:]
+        if event.type in _TRAJECTORY_TERMINAL_EVENT_TYPES
+    )
+    if len(terminal_events) != 1:
+        raise ValueError(
+            "Session-backed trajectories require exactly one current-run terminal event."
+        )
+    expected = _TRAJECTORY_TERMINAL_EVENT_BY_STATUS[trajectory.session.status]
+    if terminal_events[0].type != expected or trajectory.events[-1].type != expected:
+        raise ValueError("Trajectory terminal event must match the session status boundary.")
+
+
+def _trajectory_tree_is_complete(trajectory: Trajectory) -> bool:
+    return not trajectory.children_incomplete and all(
+        _trajectory_tree_is_complete(child) for child in trajectory.children
+    )
+
+
+def _trajectory_final_output_text(transcript: Iterable[Message]) -> str:
+    for message in reversed(tuple(transcript)):
+        if message.role != MessageRole.ASSISTANT:
+            continue
+        text = "".join(part.text for part in message.content if type(part) is TextPart)
+        if text:
+            return text
+    return ""
 
 
 @dataclass(frozen=True)

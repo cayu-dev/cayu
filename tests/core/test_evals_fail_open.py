@@ -206,7 +206,17 @@ def _case_result(case_id: str, status: EvalStatus, score: float) -> EvalCaseResu
 
 
 def _run(status: EvalStatus, score: float, cases: list[EvalCaseResult]) -> EvalRun:
-    return EvalRun(suite_id="s", status=status, score=score, cases=tuple(cases))
+    started_at = min(case.started_at for case in cases)
+    completed_at = max(case.completed_at for case in cases)
+    return EvalRun(
+        suite_id="s",
+        status=status,
+        score=score,
+        cases=tuple(cases),
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=int((completed_at - started_at).total_seconds() * 1000),
+    )
 
 
 def test_score_tolerance_absorbs_stochastic_wobble():

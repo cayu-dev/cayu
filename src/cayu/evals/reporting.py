@@ -23,6 +23,8 @@ from cayu.evals.models import (
     EvalRun,
     EvalStatus,
     Trajectory,
+    _model_instance_python_input,
+    _validate_trajectory_record_contract,
 )
 from cayu.runtime.usage import aggregate_usage_metrics_from_json_payload
 
@@ -95,7 +97,7 @@ def _validated_durable_model_document(
     # A caller can forge an instance with model_copy(update=...) or model_construct().
     # Suppress serializer warnings from that untrusted state; validation below provides
     # the deterministic typed failure before any durable or external write.
-    validated = model_type.model_validate(model.model_dump(mode="python", warnings=False))
+    validated = model_type.model_validate(_model_instance_python_input(model))
     document = copy_durable_json_object(validated.model_dump(mode="json"), field_name)
     return validated, document
 
@@ -174,6 +176,7 @@ def trajectory_to_json(trajectory: Trajectory, *, indent: int | None = 2) -> str
         model_type=Trajectory,
         field_name="trajectory",
     )
+    _validate_trajectory_record_contract(validated)
     document = _TrajectoryDocument(trajectory=validated).model_dump(mode="json")
     durable_document = copy_durable_json_object(document, "trajectory")
     return (
@@ -234,7 +237,11 @@ def load_trajectory(path: str | Path) -> Trajectory:
             f"Trajectory has unsupported schema_version {raw!r}; this cayu supports "
             f"only {TRAJECTORY_SCHEMA_VERSION}. Upgrade cayu or regenerate the trajectory."
         )
-    return _TrajectoryDocument.model_validate(_trajectory_document_python_input(data)).trajectory
+    trajectory = _TrajectoryDocument.model_validate(
+        _trajectory_document_python_input(data)
+    ).trajectory
+    _validate_trajectory_record_contract(trajectory)
+    return trajectory
 
 
 def render_html_report(run: EvalRun) -> str:

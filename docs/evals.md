@@ -152,8 +152,10 @@ Interrupted sessions remain outside the production terminal-evidence contract
 used by promotion. A direct Python eval can nevertheless score an interruption
 that it created itself: the runner must drain that fresh execution, and an
 opted-in store must atomically match every emitted root event's durable
-sequence and type while applying the same count and canonical byte limits
-before payload hydration.
+sequence and type. Before payload hydration, built-in SQL stores apply bounded
+counts and backend-specific working-set guards; evidence that passes those
+guards is then checked against the same exact canonical record and total byte
+limits used by every store.
 Interrupted descendants are accepted only when their direct parent is proven
 inside that fresh execution tree. Any mismatch remains `unavailable`;
 arbitrary historical interrupted sessions never enter through this path.

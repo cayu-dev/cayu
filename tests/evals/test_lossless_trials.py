@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -31,6 +31,7 @@ from cayu import (
     PriceBook,
     RunRequest,
     ScriptedModelProvider,
+    SessionCostSummary,
     eval_run_to_json,
     render_html_report,
     run_eval_case,
@@ -377,6 +378,57 @@ def test_complete_trial_evidence_requires_a_concrete_session():
         )
 
 
+def test_complete_unavailable_trial_requires_an_unavailable_assertion():
+    now = datetime.now(UTC)
+
+    with pytest.raises(ValidationError, match="unavailable assertion outcome"):
+        EvalTrialResult(
+            trial_number=1,
+            status=EvalStatus.UNAVAILABLE,
+            session_id="session-1",
+            score=None,
+            unavailable_reason="pricing unavailable",
+            evidence_complete=True,
+            started_at=now,
+            completed_at=now,
+        )
+
+
+def test_result_timing_must_enclose_retained_children():
+    started_at = datetime.now(UTC)
+    completed_at = started_at + timedelta(seconds=10)
+    trial = EvalTrialResult(
+        trial_number=1,
+        status=EvalStatus.SKIPPED,
+        session_id="session-1",
+        score=0.0,
+        evidence_complete=True,
+        started_at=started_at,
+        completed_at=completed_at,
+        duration_ms=10_000,
+    )
+
+    with pytest.raises(ValidationError, match="Case timing must enclose"):
+        EvalCaseResult.from_trials(
+            case_id="case",
+            trials=(trial,),
+            started_at=started_at + timedelta(seconds=2),
+            completed_at=started_at + timedelta(seconds=3),
+        )
+
+    case = EvalCaseResult.from_trials(case_id="case", trials=(trial,))
+    with pytest.raises(ValidationError, match="Run timing must enclose"):
+        EvalRun(
+            suite_id="suite",
+            status=EvalStatus.SKIPPED,
+            score=0.0,
+            cases=(case,),
+            started_at=started_at + timedelta(seconds=2),
+            completed_at=started_at + timedelta(seconds=3),
+            duration_ms=1_000,
+        )
+
+
 def test_eval_run_rejects_empty_fail_open_result_graph():
     with pytest.raises(ValidationError, match="at least 1"):
         EvalRun(
@@ -577,6 +629,45 @@ def test_typed_terminal_evidence_failure_is_unavailable_not_failed_or_zero():
 class _RaisingAssertion(EvalAssertion):
     async def evaluate(self, context):
         raise RuntimeError("grader unavailable")
+
+
+class _WrongCostOwnerAssertion(EvalAssertion):
+    async def evaluate(self, context):
+        return self.passed(
+            cost_summary=SessionCostSummary(
+                session_id="another-session",
+                currency="USD",
+                model_steps=0,
+                priced_model_steps=0,
+                unpriced_model_steps=0,
+                total_cost=Decimal("0"),
+            )
+        )
+
+
+def test_foreign_assertion_cost_summary_becomes_a_lossless_trial_error():
+    app = _scripted_app(
+        [
+            ModelStreamEvent.text_delta("complete output"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    case = EvalCase(
+        id="foreign-assertion-cost",
+        request=_request(),
+        assertions=[_WrongCostOwnerAssertion()],
+    )
+
+    result = asyncio.run(run_eval_case(app, case, suite_id="suite"))
+    trial = result.trials[0]
+
+    assert result.status is EvalStatus.ERROR
+    assert result.score is None
+    assert trial.status is EvalStatus.ERROR
+    assert trial.score is None
+    assert trial.assertions[0].outcome is EvalOutcome.ERROR
+    assert trial.assertions[0].cost_summary is None
+    assert "trajectory session" in trial.error
 
 
 class _TrialVaryingAssertion(EvalAssertion):
