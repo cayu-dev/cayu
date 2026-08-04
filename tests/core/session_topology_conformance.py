@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from cayu.core import Message
+import pytest
+from pydantic import ValidationError
+
+from cayu.core import Event, EventType, Message
 from cayu.runtime import RunRequest, SessionIdentity, SessionStore
 from cayu.runtime.sessions import (
+    SESSION_LINEAGE_MAX_CHILD_LIMIT,
+    SessionLineageQuery,
     SessionTopologyQuery,
+    decode_session_lineage_cursor,
     decode_session_topology_cursor,
 )
 
@@ -30,6 +36,15 @@ async def _create_session(
             messages=[Message.text("user", session_id)],
         ),
         identity=_identity(),
+    )
+    await store.append_event(
+        session_id,
+        Event(
+            id=f"{session_id}-started",
+            type=EventType.SESSION_STARTED,
+            session_id=session_id,
+            payload={"excluded_from_topology": "x" * 4096},
+        ),
     )
 
 
@@ -101,6 +116,92 @@ async def assert_session_topology_store_conformance(store: SessionStore) -> None
     )
     assert cursor_created_at == focus_branch.children[-1].created_at
     assert cursor_id == "topology-child-b"
+
+    lineage = await store.query_session_lineage(
+        SessionLineageQuery(parent_session_id="topology-focus", limit=2)
+    )
+    assert lineage == await store.query_session_lineage(
+        SessionLineageQuery(parent_session_id="topology-focus", limit=2)
+    )
+    assert [node.id for node in lineage.children] == [
+        "topology-child-a",
+        "topology-child-b",
+    ]
+    assert lineage.has_more is True
+    assert lineage.next_cursor is not None
+    lineage_cursor_created_at, lineage_cursor_id = decode_session_lineage_cursor(
+        lineage.next_cursor,
+        parent_session_id="topology-focus",
+    )
+    assert lineage_cursor_created_at == lineage.children[-1].created_at
+    assert lineage_cursor_id == "topology-child-b"
+    for node in lineage.children:
+        assert set(node.model_dump()) == {
+            "id",
+            "parent_session_id",
+            "created_at",
+            "origin_events",
+        }
+        assert len(node.origin_events) == 1
+        assert node.origin_events[0].event_id == f"{node.id}-started"
+        assert node.origin_events[0].event_type is EventType.SESSION_STARTED
+
+    await store.append_event(
+        "topology-child-a",
+        Event(
+            id="topology-child-a-duplicate-origin",
+            type=EventType.SESSION_STARTED,
+            session_id="topology-child-a",
+        ),
+    )
+    duplicate_origins = await store.query_session_lineage(
+        SessionLineageQuery(parent_session_id="topology-focus", limit=2)
+    )
+    duplicate_child = duplicate_origins.children[0]
+    assert duplicate_child.id == "topology-child-a"
+    assert len(duplicate_child.origin_events) == 2
+
+    lineage_continuation = await store.query_session_lineage(
+        SessionLineageQuery(
+            parent_session_id="topology-focus",
+            cursor=lineage.next_cursor,
+            limit=2,
+        )
+    )
+    assert [node.id for node in lineage_continuation.children] == [
+        "topology-child-c",
+        "topology-child-d",
+    ]
+    assert lineage_continuation.has_more is False
+    assert lineage_continuation.next_cursor is None
+
+    try:
+        await store.query_session_lineage(
+            SessionLineageQuery(
+                parent_session_id="topology-root",
+                cursor=lineage.next_cursor,
+            )
+        )
+    except ValueError as exc:
+        assert "cursor" in str(exc).lower()
+    else:  # pragma: no cover - a backend contract violation
+        raise AssertionError("A lineage cursor was accepted for the wrong parent branch.")
+
+    try:
+        await store.query_session_lineage(SessionLineageQuery(parent_session_id="topology-missing"))
+    except KeyError:
+        pass
+    else:  # pragma: no cover - a backend contract violation
+        raise AssertionError("A missing lineage parent was returned as an empty branch.")
+
+    # Store boundaries must revalidate exact-type Pydantic instances before
+    # touching storage. model_copy() intentionally skips field validation and
+    # is therefore a useful regression probe for forged public inputs.
+    valid_missing_query = SessionLineageQuery(parent_session_id="topology-missing")
+    for invalid_limit in (-2, SESSION_LINEAGE_MAX_CHILD_LIMIT + 1):
+        forged_query = valid_missing_query.model_copy(update={"limit": invalid_limit})
+        with pytest.raises(ValidationError, match="limit"):
+            await store.query_session_lineage(forged_query)
 
     continuation = await store.query_session_topology(
         SessionTopologyQuery(

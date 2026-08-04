@@ -5685,6 +5685,98 @@ def test_session_store_conformance_runtime_publication_first_commit_and_stale_re
     asyncio.run(run())
 
 
+def test_session_store_conformance_runtime_publication_sanitizes_origin_lineage(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            parent_session_id = f"publication-origin-parent-{session_store_case[0]}"
+            child_session_id = f"publication-origin-child-{session_store_case[0]}"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=parent_session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=child_session_id,
+                    parent_session_id=parent_session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+
+            caller_authored_origin = Event(
+                id="caller-authored-session-started",
+                type=EventType.SESSION_STARTED,
+                session_id=child_session_id,
+                payload={"parent_session_id": parent_session_id},
+            )
+            request_template = RuntimePublicationRequest(
+                publication_id="caller-authored-origin-publication",
+                kind="model-step",
+                intent={"purpose": "origin-lineage-conformance"},
+                mutation=RuntimePublicationMutation(),
+                transcript_messages=(),
+                events=(),
+            )
+            # Bypass the request validator deliberately. publish_runtime_publication()
+            # must reconstruct and sanitize the request before digesting or storing it.
+            bypassed_request = request_template.model_copy(
+                update={"events": (caller_authored_origin,)},
+            )
+            assert bypassed_request.events[0].payload["parent_session_id"] == parent_session_id
+
+            published = await store.publish_runtime_publication(
+                child_session_id,
+                request=bypassed_request,
+                expected_statuses={SessionStatus.PENDING},
+                expected_run_epoch=0,
+                expected_transcript_cursor=0,
+            )
+            assert published.replayed is False
+            assert published.receipt.appended_event_ids == (caller_authored_origin.id,)
+
+            store = await _reopen_store(session_store_case, store)
+            records = await store.query_events(
+                EventQuery(
+                    session_id=child_session_id,
+                    event_type=EventType.SESSION_STARTED,
+                    limit=2,
+                )
+            )
+            assert len(records) == 1
+            assert "parent_session_id" not in records[0].event.payload
+
+            equivalent_request = RuntimePublicationRequest(
+                publication_id="caller-authored-origin-publication",
+                kind="model-step",
+                intent={"purpose": "origin-lineage-conformance"},
+                mutation=RuntimePublicationMutation(),
+                transcript_messages=(),
+                events=(caller_authored_origin,),
+            )
+            assert "parent_session_id" not in equivalent_request.events[0].payload
+            replayed = await store.publish_runtime_publication(
+                child_session_id,
+                request=equivalent_request,
+                expected_statuses={SessionStatus.PENDING},
+                expected_run_epoch=0,
+                expected_transcript_cursor=0,
+            )
+            assert replayed.replayed is True
+            assert replayed.receipt == published.receipt
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_reclaimed_partial_publication_has_one_prefix(
     session_store_case,
 ) -> None:

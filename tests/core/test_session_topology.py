@@ -17,6 +17,8 @@ from cayu.runtime.sessions import (
     SESSION_TOPOLOGY_MAX_NODES,
     EventQuery,
     EventQueryResultTooLarge,
+    SessionLineageNode,
+    SessionLineageResult,
     SessionStatus,
     SessionTopologyBranch,
     SessionTopologyCycle,
@@ -26,6 +28,48 @@ from cayu.runtime.sessions import (
     build_session_topology_result,
     decode_session_topology_cursor,
 )
+
+
+def test_session_lineage_page_requires_portable_identifier_order() -> None:
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    with pytest.raises(ValidationError, match="stable creation ordering"):
+        SessionLineageResult(
+            parent_session_id="parent",
+            children=(
+                SessionLineageNode(
+                    id="ä",
+                    parent_session_id="parent",
+                    created_at=created_at,
+                ),
+                SessionLineageNode(
+                    id="Z",
+                    parent_session_id="parent",
+                    created_at=created_at,
+                ),
+            ),
+        )
+
+
+def test_session_lineage_page_rejects_descending_creation_time() -> None:
+    created_at = datetime(2026, 1, 1, tzinfo=UTC)
+
+    with pytest.raises(ValidationError, match="stable creation ordering"):
+        SessionLineageResult(
+            parent_session_id="parent",
+            children=(
+                SessionLineageNode(
+                    id="later",
+                    parent_session_id="parent",
+                    created_at=created_at + timedelta(seconds=1),
+                ),
+                SessionLineageNode(
+                    id="earlier",
+                    parent_session_id="parent",
+                    created_at=created_at,
+                ),
+            ),
+        )
 
 
 def _make_store(

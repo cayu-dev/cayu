@@ -259,7 +259,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_causal_budget_id "
     "ON cayu_sessions(causal_budget_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_sessions_parent_created_id "
-    "ON cayu_sessions(parent_session_id, created_at, id)",
+    'ON cayu_sessions(parent_session_id, created_at, id COLLATE "C")',
     "CREATE INDEX IF NOT EXISTS idx_cayu_session_labels_key_value_session "
     "ON cayu_session_labels(key, value, session_id)",
     "CREATE INDEX IF NOT EXISTS idx_cayu_events_session_order "

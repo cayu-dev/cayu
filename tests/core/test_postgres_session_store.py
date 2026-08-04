@@ -38,6 +38,7 @@ from cayu.runtime import (
     Session,
     SessionDebugState,
     SessionIdentity,
+    SessionLineageQuery,
     SessionOrder,
     SessionQuery,
     SessionRunFenced,
@@ -165,6 +166,65 @@ def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
 
 def test_postgres_session_topology_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_session_topology_store_conformance)
+
+
+def test_postgres_session_lineage_paginates_tied_unicode_identifiers(
+    postgres_dsn: str,
+) -> None:
+    async def ops(store) -> None:
+        import psycopg
+
+        await store.create(
+            RunRequest(agent_name="agent", session_id="unicode-parent", messages=[]),
+            identity=_identity(),
+        )
+        child_ids = ("unicode-a", "unicode-ä", "unicode-z", "unicode-Z")
+        for child_id in child_ids:
+            await store.create(
+                RunRequest(
+                    agent_name="agent",
+                    session_id=child_id,
+                    parent_session_id="unicode-parent",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+
+        tied_at = datetime(2026, 1, 1, tzinfo=UTC)
+        async with await psycopg.AsyncConnection.connect(postgres_dsn) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE cayu_sessions SET created_at = %s WHERE id = ANY(%s)",
+                    (tied_at, list(child_ids)),
+                )
+            await conn.commit()
+
+        complete = await store.query_session_lineage(
+            SessionLineageQuery(parent_session_id="unicode-parent", limit=4)
+        )
+        assert [child.id for child in complete.children] == sorted(child_ids)
+
+        observed: list[str] = []
+        cursor = None
+        while True:
+            page = await store.query_session_lineage(
+                SessionLineageQuery(
+                    parent_session_id="unicode-parent",
+                    cursor=cursor,
+                    limit=1,
+                )
+            )
+            observed.extend(child.id for child in page.children)
+            if not page.has_more:
+                break
+            assert page.next_cursor is not None
+            assert page.next_cursor != cursor
+            cursor = page.next_cursor
+
+        assert observed == [child.id for child in complete.children]
+        assert set(observed) == set(child_ids)
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_public_authority_aliases_are_indexed_and_durable(
@@ -698,15 +758,20 @@ def test_postgres_session_topology_child_query_uses_composite_index(
                           requested.parent_session_id
                       AND (
                           requested.cursor_created_at IS NULL
-                          OR (cayu_sessions.created_at, cayu_sessions.id) >
-                             (requested.cursor_created_at, requested.cursor_id)
+                          OR cayu_sessions.created_at > requested.cursor_created_at
+                          OR (
+                              cayu_sessions.created_at = requested.cursor_created_at
+                              AND cayu_sessions.id COLLATE "C" >
+                                  requested.cursor_id COLLATE "C"
+                          )
                       )
-                    ORDER BY cayu_sessions.created_at ASC, cayu_sessions.id ASC
+                    ORDER BY cayu_sessions.created_at ASC,
+                             cayu_sessions.id COLLATE "C" ASC
                     LIMIT %s
                 ) AS child
                 ORDER BY requested.branch_order ASC,
                          child.created_at ASC,
-                         child.id ASC
+                         child.id COLLATE "C" ASC
                 """,
                 (["topology-plan-parent"], [None], [None], 26),
             )

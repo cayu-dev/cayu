@@ -22,7 +22,7 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
-from cayu.core.events import Event, EventType
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
@@ -43,6 +43,10 @@ from cayu.runtime.sessions import (
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SESSION_INSPECTION_LABEL_LIMIT,
+    SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
+    SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+    SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
+    SESSION_LINEAGE_MAX_TIMESTAMP_BYTES,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES,
     BudgetReservationIdentityConflict,
@@ -81,6 +85,10 @@ from cayu.runtime.sessions import (
     SessionForkActiveModelStageConflict,
     SessionIdentity,
     SessionInspectionIdentity,
+    SessionLineageNode,
+    SessionLineageOrigin,
+    SessionLineageQuery,
+    SessionLineageResult,
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
@@ -208,19 +216,23 @@ from cayu.runtime.sessions import (
     copy_run_request,
     copy_session_aggregate_filter,
     copy_session_identity,
+    copy_session_lineage_query,
     copy_session_query,
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
     copy_usage_rollup_query,
     decode_session_cursor,
+    decode_session_lineage_cursor,
     decode_session_topology_cursor,
     encode_session_cursor,
+    encode_session_lineage_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
     fork_transcript_is_accepted,
     replace_session_user_metadata,
     resolve_interaction_attribution,
+    restore_persisted_origin_lineage_authority,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -847,17 +859,19 @@ _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
 
 def _event_from_row(row: sqlite3.Row) -> Event:
     """Reconstruct an :class:`Event` from its individual cayu_events columns."""
-    return Event(
-        type=row["event_type"],
-        session_id=row["session_id"],
-        interaction_id=row["interaction_id"],
-        id=row["event_id"],
-        timestamp=row["timestamp"],
-        agent_name=row["agent_name"],
-        environment_name=row["environment_name"],
-        workflow_name=row["workflow_name"],
-        tool_name=row["tool_name"],
-        payload=json.loads(row["payload_json"]),
+    return restore_persisted_origin_lineage_authority(
+        Event(
+            type=row["event_type"],
+            session_id=row["session_id"],
+            interaction_id=row["interaction_id"],
+            id=row["event_id"],
+            timestamp=row["timestamp"],
+            agent_name=row["agent_name"],
+            environment_name=row["environment_name"],
+            workflow_name=row["workflow_name"],
+            tool_name=row["tool_name"],
+            payload=json.loads(row["payload_json"]),
+        )
     )
 
 
@@ -954,6 +968,7 @@ class SQLiteSessionStore(SessionStore):
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
+    supports_session_lineage: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
 
@@ -6687,13 +6702,14 @@ class SQLiteSessionStore(SessionStore):
                         _session_topology_node_from_sqlite_row(row)
                     )
 
-            return build_session_topology_result(
+            result = build_session_topology_result(
                 focus=focus,
                 ancestors=ancestors,
                 expanded_parents=expanded_parents,
                 branch_candidates=(candidates_by_parent[parent.id] for parent in expanded_parents),
                 child_limit=query.child_limit,
             )
+            return result
 
         def read_topology(connection: sqlite3.Connection) -> SessionTopologyStoreResult:
             # Multiple point reads plus the batched child query must describe one
@@ -6707,6 +6723,119 @@ class SQLiteSessionStore(SessionStore):
                 connection.rollback()
 
         return await self._run_read(read_topology)
+
+    async def query_session_lineage(
+        self,
+        query: SessionLineageQuery,
+    ) -> SessionLineageResult:
+        query = copy_session_lineage_query(query)
+
+        def read_lineage_snapshot(connection: sqlite3.Connection) -> SessionLineageResult:
+            parent_exists = connection.execute(
+                "SELECT 1 FROM cayu_sessions WHERE id = ?",
+                (query.parent_session_id,),
+            ).fetchone()
+            if parent_exists is None:
+                raise KeyError(f"Session not found: {query.parent_session_id}")
+
+            cursor_clause = ""
+            params: list[object] = [
+                SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+                SESSION_LINEAGE_MAX_TIMESTAMP_BYTES,
+                query.parent_session_id,
+            ]
+            if query.cursor is not None:
+                cursor_created_at, cursor_id = decode_session_lineage_cursor(
+                    query.cursor,
+                    parent_session_id=query.parent_session_id,
+                )
+                formatted_cursor = sqlite_support.format_datetime(cursor_created_at)
+                cursor_clause = "AND (created_at > ? OR (created_at = ? AND id > ?))"
+                params.extend((formatted_cursor, formatted_cursor, cursor_id))
+            params.append(query.limit + 1)
+            rows = connection.execute(
+                f"""
+                SELECT CASE
+                           WHEN length(CAST(id AS BLOB)) <= ? THEN id
+                       END AS id,
+                       CASE
+                           WHEN length(CAST(created_at AS BLOB)) <= ? THEN created_at
+                       END AS created_at
+                FROM cayu_sessions
+                WHERE parent_session_id = ?
+                  {cursor_clause}
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            retained_rows = rows[: query.limit]
+            children: list[SessionLineageNode] = []
+            for row in retained_rows:
+                base = SessionLineageNode(
+                    id=row["id"],
+                    parent_session_id=query.parent_session_id,
+                    created_at=sqlite_support.parse_datetime(row["created_at"]),
+                )
+                origin_rows = connection.execute(
+                    """
+                    SELECT sequence,
+                           CASE
+                               WHEN length(event_id) <= ?
+                                AND length(CAST(event_id AS BLOB)) <= ?
+                               THEN event_id
+                           END AS event_id,
+                           event_type
+                    FROM cayu_events
+                    WHERE session_id = ?
+                      AND event_type IN (?, ?)
+                    ORDER BY sequence ASC
+                    LIMIT ?
+                    """,
+                    (
+                        EVENT_ID_MAX_CHARS,
+                        SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
+                        base.id,
+                        str(EventType.SESSION_STARTED),
+                        str(EventType.SESSION_FORKED),
+                        SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
+                    ),
+                ).fetchall()
+                children.append(
+                    SessionLineageNode(
+                        id=base.id,
+                        parent_session_id=base.parent_session_id,
+                        created_at=base.created_at,
+                        origin_events=tuple(
+                            SessionLineageOrigin(
+                                sequence=origin_row["sequence"],
+                                event_id=origin_row["event_id"],
+                                event_type=EventType(origin_row["event_type"]),
+                            )
+                            for origin_row in origin_rows
+                        ),
+                    )
+                )
+            has_more = len(rows) > len(retained_rows)
+            return SessionLineageResult(
+                parent_session_id=query.parent_session_id,
+                children=tuple(children),
+                next_cursor=(
+                    encode_session_lineage_cursor(query.parent_session_id, children[-1])
+                    if has_more and children
+                    else None
+                ),
+                has_more=has_more,
+            )
+
+        def read_lineage(connection: sqlite3.Connection) -> SessionLineageResult:
+            connection.execute("BEGIN")
+            try:
+                return read_lineage_snapshot(connection)
+            finally:
+                connection.rollback()
+
+        return await self._run_read(read_lineage)
 
     async def aggregate_operational_snapshot(
         self,

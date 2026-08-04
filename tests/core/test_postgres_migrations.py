@@ -90,6 +90,24 @@ def test_revision_twenty_nine_builds_workflow_replay_indexes_concurrently() -> N
     assert all("CREATE INDEX CONCURRENTLY" in index.create_statement for index in indexes.values())
 
 
+def test_revision_thirty_rebuilds_session_lineage_index_with_c_collation() -> None:
+    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[30]
+
+    assert len(indexes) == 1
+    index = indexes[0]
+    assert index.index_name == "idx_cayu_sessions_parent_created_id"
+    assert index.required_key_collations == (None, None, "C")
+    assert index.replace_existing is True
+    assert 'id COLLATE "C"' in index.create_statement
+    required = postgres_storage._required_concurrent_indexes(30)
+    matching = [
+        candidate
+        for candidate in required
+        if candidate.index_name == "idx_cayu_sessions_parent_created_id"
+    ]
+    assert matching == [index]
+
+
 def test_postgres_workflow_replay_is_fenced_atomic_and_indexed(postgres_dsn: str) -> None:
     async def runner() -> None:
         import psycopg
@@ -563,6 +581,22 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             assert all(
                 'id COLLATE "C"' in definition for definition in task_topology_index_definitions
             )
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 30"
+            )
+            assert await cur.fetchone() == ("additive", 28)
+            await cur.execute(
+                """
+                SELECT pg_get_indexdef(index_class.oid)
+                FROM pg_catalog.pg_class AS index_class
+                JOIN pg_catalog.pg_namespace AS namespace
+                  ON namespace.oid = index_class.relnamespace
+                WHERE namespace.nspname = current_schema()
+                  AND index_class.relname = 'idx_cayu_sessions_parent_created_id'
+                """
+            )
+            session_lineage_index_definition = (await cur.fetchone())[0]
+            assert 'id COLLATE "C"' in session_lineage_index_definition
             await cur.execute(
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema = current_schema() "

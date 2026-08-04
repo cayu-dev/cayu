@@ -867,6 +867,7 @@ def test_terminal_session_evidence_limits_publish_bounded_defaults_and_hard_caps
     assert limits.max_transcript_records < TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS
     assert limits.max_record_bytes < TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES
     assert limits.max_total_bytes < TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES
+    assert TerminalSessionEvidenceLimits(max_transcript_records=0).max_transcript_records == 0
 
     for field, value in (
         ("max_events", TERMINAL_SESSION_EVIDENCE_HARD_MAX_EVENTS + 1),
@@ -876,6 +877,7 @@ def test_terminal_session_evidence_limits_publish_bounded_defaults_and_hard_caps
         ),
         ("max_record_bytes", TERMINAL_SESSION_EVIDENCE_HARD_MAX_RECORD_BYTES + 1),
         ("max_total_bytes", TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES + 1),
+        ("max_transcript_records", -1),
         ("max_events", True),
     ):
         with pytest.raises(ValidationError):

@@ -187,6 +187,10 @@ REVISIONS: tuple[Revision, ...] = (
     # attempt-marker lookup. Existing writers already persist every indexed
     # field, so the revision remains additive for revision-28 binaries.
     Revision(revision=29, kind=RevisionKind.ADDITIVE, compatible_from=28),
+    # Rebuild the PostgreSQL direct-child session index with bytewise identifier
+    # collation so its keyset order matches memory, SQLite, and Python validation.
+    # The indexed source columns and write contract are unchanged.
+    Revision(revision=30, kind=RevisionKind.ADDITIVE, compatible_from=28),
 )
 
 #: The revision an empty database is initialized to.

@@ -43,7 +43,7 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.core.billing import BillingIdentity, copy_billing_identity
-from cayu.core.events import Event, EventType
+from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
@@ -115,6 +115,9 @@ from cayu.runtime.sessions import (
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     SESSION_INSPECTION_LABEL_LIMIT,
+    SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
+    SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+    SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
     SESSION_MESSAGE_DELIVERY_BATCH_LIMIT,
     BudgetReservationIdentityConflict,
     CheckpointRootFieldGuard,
@@ -152,6 +155,10 @@ from cayu.runtime.sessions import (
     SessionForkActiveModelStageConflict,
     SessionIdentity,
     SessionInspectionIdentity,
+    SessionLineageNode,
+    SessionLineageOrigin,
+    SessionLineageQuery,
+    SessionLineageResult,
     SessionListResult,
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
@@ -278,19 +285,23 @@ from cayu.runtime.sessions import (
     copy_run_request,
     copy_session_aggregate_filter,
     copy_session_identity,
+    copy_session_lineage_query,
     copy_session_query,
     copy_session_user_metadata,
     copy_transcript_messages,
     copy_transcript_query,
     copy_usage_rollup_query,
     decode_session_cursor,
+    decode_session_lineage_cursor,
     decode_session_topology_cursor,
     encode_session_cursor,
+    encode_session_lineage_cursor,
     enforce_pending_action_result_size,
     filter_transcript_records,
     fork_transcript_is_accepted,
     replace_session_user_metadata,
     resolve_interaction_attribution,
+    restore_persisted_origin_lineage_authority,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -376,7 +387,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 29
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 30
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -1482,6 +1493,7 @@ class _ConcurrentIndexMigration:
     drop_statement: str
     required_key_collations: tuple[str | None, ...] = ()
     unique: bool = False
+    replace_existing: bool = False
 
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
@@ -1874,16 +1886,35 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             ),
         ),
     ),
+    30: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_sessions_parent_created_id",
+            table_name="cayu_sessions",
+            key_definitions=("parent_session_id", "created_at", "id"),
+            predicate_definition=None,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_sessions_parent_created_id "
+                'ON cayu_sessions(parent_session_id, created_at, id COLLATE "C")'
+            ),
+            drop_statement=(
+                "DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_sessions_parent_created_id"
+            ),
+            required_key_collations=(None, None, "C"),
+            replace_existing=True,
+        ),
+    ),
 }
 
 
 def _required_concurrent_indexes(revision: int) -> tuple[_ConcurrentIndexMigration, ...]:
-    return tuple(
-        index
-        for index_revision, indexes in sorted(_CONCURRENT_INDEX_MIGRATIONS.items())
-        if index_revision <= revision
-        for index in indexes
-    )
+    latest_by_name: dict[str, _ConcurrentIndexMigration] = {}
+    for index_revision, indexes in sorted(_CONCURRENT_INDEX_MIGRATIONS.items()):
+        if index_revision > revision:
+            break
+        for index in indexes:
+            latest_by_name[index.index_name] = index
+    return tuple(latest_by_name.values())
 
 
 async def read_schema_state(cur: Any) -> schema.SchemaState:
@@ -2557,6 +2588,7 @@ class _PostgresStoreBase:
                     existing = await self._concurrent_index_state(
                         cur,
                         index,
+                        allow_replacement=True,
                     )
                     if existing == (True, False):
                         return
@@ -2599,6 +2631,8 @@ class _PostgresStoreBase:
         self,
         cur: Any,
         index: _ConcurrentIndexMigration,
+        *,
+        allow_replacement: bool = False,
     ) -> tuple[bool, bool] | None:
         await cur.execute(
             """
@@ -2695,6 +2729,18 @@ class _PostgresStoreBase:
             and bool(row[7]) is index.unique
         )
         if not expected_definition:
+            replaceable_definition = (
+                allow_replacement
+                and index.replace_existing
+                and bool(row[0])
+                and bool(row[2])
+                and bool(row[3])
+                and key_definitions == expected_keys
+                and predicate == expected_predicate
+                and bool(row[7]) is index.unique
+            )
+            if replaceable_definition:
+                return False, bool(row[8])
             columns = ", ".join(
                 (f'{key} COLLATE "{collation}"' if collation is not None else key)
                 for key, collation in zip(
@@ -5694,6 +5740,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
+    supports_session_lineage: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
@@ -11165,7 +11212,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             TerminalSessionEvidenceErrorCode.EVIDENCE_INCONSISTENT
                         )
                     events = tuple(
-                        EventRecord(sequence=row[0], event=Event(**_json_obj(row[1])))
+                        EventRecord(
+                            sequence=row[0],
+                            event=restore_persisted_origin_lineage_authority(
+                                Event(**_json_obj(row[1]))
+                            ),
+                        )
                         for row in event_rows
                     )
                     transcript = tuple(
@@ -11546,19 +11598,22 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                           requested.parent_session_id
                                       AND (
                                           requested.cursor_created_at IS NULL
-                                          OR (cayu_sessions.created_at, cayu_sessions.id) >
-                                             (
-                                                 requested.cursor_created_at,
-                                                 requested.cursor_id
-                                             )
+                                          OR cayu_sessions.created_at >
+                                             requested.cursor_created_at
+                                          OR (
+                                              cayu_sessions.created_at =
+                                                  requested.cursor_created_at
+                                              AND cayu_sessions.id COLLATE "C" >
+                                                  requested.cursor_id COLLATE "C"
+                                          )
                                       )
                                     ORDER BY cayu_sessions.created_at ASC,
-                                             cayu_sessions.id ASC
+                                             cayu_sessions.id COLLATE "C" ASC
                                     LIMIT %s
                                 ) AS child
                                 ORDER BY requested.branch_order ASC,
                                          child.created_at ASC,
-                                         child.id ASC
+                                         child.id COLLATE "C" ASC
                                 """,
                             ),
                             (
@@ -11572,18 +11627,155 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             candidates_by_parent[row[4]].append(
                                 pg_support.session_topology_node_from_row(row)
                             )
+                    result = build_session_topology_result(
+                        focus=focus,
+                        ancestors=ancestors,
+                        expanded_parents=expanded_parents,
+                        branch_candidates=(
+                            candidates_by_parent[parent.id] for parent in expanded_parents
+                        ),
+                        child_limit=query.child_limit,
+                    )
                 await conn.commit()
             except Exception:
                 await conn.rollback()
                 raise
+        return result
 
-        return build_session_topology_result(
-            focus=focus,
-            ancestors=ancestors,
-            expanded_parents=expanded_parents,
-            branch_candidates=(candidates_by_parent[parent.id] for parent in expanded_parents),
-            child_limit=query.child_limit,
-        )
+    async def query_session_lineage(
+        self,
+        query: SessionLineageQuery,
+    ) -> SessionLineageResult:
+        query = copy_session_lineage_query(query)
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                    await cur.execute(
+                        "SELECT 1 FROM cayu_sessions WHERE id = %s",
+                        (query.parent_session_id,),
+                    )
+                    if await cur.fetchone() is None:
+                        raise KeyError(f"Session not found: {query.parent_session_id}")
+
+                    cursor_clause = ""
+                    params: list[object] = [
+                        SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+                        query.parent_session_id,
+                    ]
+                    if query.cursor is not None:
+                        cursor_created_at, cursor_id = decode_session_lineage_cursor(
+                            query.cursor,
+                            parent_session_id=query.parent_session_id,
+                        )
+                        cursor_clause = (
+                            'AND (created_at > %s OR (created_at = %s AND id COLLATE "C" '
+                            '> %s COLLATE "C"))'
+                        )
+                        params.extend((cursor_created_at, cursor_created_at, cursor_id))
+                    params.append(query.limit + 1)
+                    await cur.execute(
+                        f"""
+                        SELECT CASE
+                                   WHEN octet_length(id) <= %s THEN id
+                               END AS id,
+                               created_at
+                        FROM cayu_sessions
+                        WHERE parent_session_id = %s
+                          {cursor_clause}
+                        ORDER BY created_at ASC, id COLLATE "C" ASC
+                        LIMIT %s
+                        """,
+                        params,
+                    )
+                    rows = await cur.fetchall()
+                    retained_rows = rows[: query.limit]
+                    bases = tuple(
+                        SessionLineageNode(
+                            id=row[0],
+                            parent_session_id=query.parent_session_id,
+                            created_at=pg_support.to_utc(row[1]),
+                        )
+                        for row in retained_rows
+                    )
+                    grouped_origins: dict[str, list[SessionLineageOrigin]] = {
+                        base.id: [] for base in bases
+                    }
+                    if bases:
+                        await cur.execute(
+                            """
+                            SELECT requested.session_id, origin.sequence,
+                                   origin.event_id, origin.event_type
+                            FROM unnest(%s::text[]) WITH ORDINALITY AS requested(
+                                session_id,
+                                session_order
+                            )
+                            LEFT JOIN LATERAL (
+                                SELECT sequence,
+                                       CASE
+                                           WHEN length(event_id) <= %s
+                                            AND octet_length(event_id) <= %s
+                                           THEN event_id
+                                       END AS event_id,
+                                       event_type
+                                FROM cayu_events
+                                WHERE cayu_events.session_id = requested.session_id
+                                  AND event_type = ANY(%s)
+                                ORDER BY sequence ASC
+                                LIMIT %s
+                            ) AS origin ON TRUE
+                            ORDER BY requested.session_order ASC, origin.sequence ASC
+                            """,
+                            (
+                                [base.id for base in bases],
+                                EVENT_ID_MAX_CHARS,
+                                SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
+                                [
+                                    str(EventType.SESSION_STARTED),
+                                    str(EventType.SESSION_FORKED),
+                                ],
+                                SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
+                            ),
+                        )
+                        for row in await cur.fetchall():
+                            if row[1] is None:
+                                continue
+                            grouped_origins[row[0]].append(
+                                SessionLineageOrigin(
+                                    sequence=row[1],
+                                    event_id=row[2],
+                                    event_type=EventType(row[3]),
+                                )
+                            )
+                    children = tuple(
+                        SessionLineageNode(
+                            id=base.id,
+                            parent_session_id=base.parent_session_id,
+                            created_at=base.created_at,
+                            origin_events=tuple(grouped_origins[base.id]),
+                        )
+                        for base in bases
+                    )
+                    has_more = len(rows) > len(retained_rows)
+                    result = SessionLineageResult(
+                        parent_session_id=query.parent_session_id,
+                        children=children,
+                        next_cursor=(
+                            encode_session_lineage_cursor(
+                                query.parent_session_id,
+                                children[-1],
+                            )
+                            if has_more and children
+                            else None
+                        ),
+                        has_more=has_more,
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        return result
 
     async def aggregate_operational_snapshot(
         self,

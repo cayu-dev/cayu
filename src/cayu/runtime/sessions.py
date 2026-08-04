@@ -61,6 +61,7 @@ from cayu.core.events import (
     Event,
     EventType,
     copy_event,
+    event_payload_authority_is_runtime_generated,
     event_with_runtime_envelope_authority,
     event_with_runtime_payload_authority,
 )
@@ -1853,7 +1854,12 @@ class RuntimePublicationRequest(BaseModel):
         copied: list[Event] = []
         seen: set[str] = set()
         for event in value:
-            copied_event = copy_event(event)
+            # Runtime publications are a separate atomic persistence path from
+            # append_events(). Apply the same origin-lineage trust boundary here
+            # before the request and event digests are derived. The publication
+            # preparation path reconstructs this model, so this also sanitizes
+            # validator-bypassed model_copy/model_construct inputs before commit.
+            copied_event = _copy_event_for_session_store(event)
             if copied_event.id in seen:
                 raise ValueError(f"Runtime publication event id is duplicated: {copied_event.id}")
             seen.add(copied_event.id)
@@ -4024,7 +4030,7 @@ class TerminalSessionEvidenceLimits(BaseModel):
     )
     max_transcript_records: StrictInt = Field(
         default=TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TRANSCRIPT_RECORDS,
-        ge=1,
+        ge=0,
         le=TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
     )
     max_record_bytes: StrictInt = Field(
@@ -4323,6 +4329,14 @@ SESSION_TOPOLOGY_MAX_CHILD_LIMIT = 100
 SESSION_TOPOLOGY_MAX_NODES = 500
 SESSION_TOPOLOGY_MAX_IDENTIFIER_BYTES = 1024
 SESSION_TOPOLOGY_MAX_CURSOR_BYTES = 4096
+
+SESSION_LINEAGE_DEFAULT_CHILD_LIMIT = 25
+SESSION_LINEAGE_MAX_CHILD_LIMIT = 100
+SESSION_LINEAGE_MAX_IDENTIFIER_BYTES = MAX_SESSION_ID_BYTES
+SESSION_LINEAGE_MAX_EVENT_ID_BYTES = EVENT_ID_MAX_CHARS * 4
+SESSION_LINEAGE_MAX_TIMESTAMP_BYTES = 64
+SESSION_LINEAGE_MAX_CURSOR_BYTES = 8192
+SESSION_LINEAGE_MAX_ORIGIN_EVENTS = 2
 
 
 class SessionTopologyDepthExceeded(ValueError):
@@ -4641,6 +4655,163 @@ class SessionTopologyStoreResult(BaseModel):
         return self
 
 
+class SessionLineageOrigin(BaseModel):
+    """Payload-free durable identity for one session start or fork event."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    event_id: str = Field(max_length=EVENT_ID_MAX_CHARS)
+    event_type: EventType
+
+    @field_validator("event_id")
+    @classmethod
+    def validate_event_id(cls, value: str) -> str:
+        return _bounded_session_topology_text(
+            value,
+            "event_id",
+            max_bytes=SESSION_LINEAGE_MAX_EVENT_ID_BYTES,
+        )
+
+    @field_validator("event_type")
+    @classmethod
+    def validate_event_type(cls, value: EventType) -> EventType:
+        if value not in {EventType.SESSION_STARTED, EventType.SESSION_FORKED}:
+            raise ValueError("Session lineage origins must be session start or fork events.")
+        return value
+
+
+class SessionLineageNode(BaseModel):
+    """Minimal byte-bounded identity used to enumerate one child branch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: str
+    parent_session_id: str
+    created_at: datetime
+    origin_events: tuple[SessionLineageOrigin, ...] = Field(
+        default=(),
+        max_length=SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
+    )
+
+    @field_validator("id", "parent_session_id")
+    @classmethod
+    def validate_identifiers(cls, value: str, info) -> str:
+        return _bounded_session_topology_text(
+            value,
+            info.field_name,
+            max_bytes=SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+        )
+
+    @field_validator("created_at")
+    @classmethod
+    def normalize_created_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("origin_events")
+    @classmethod
+    def copy_origin_events(
+        cls,
+        value: tuple[SessionLineageOrigin, ...],
+    ) -> tuple[SessionLineageOrigin, ...]:
+        return tuple(origin.model_copy(deep=True) for origin in value)
+
+
+class SessionLineageQuery(BaseModel):
+    """One independently pageable, payload-free direct-child lineage read."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True, frozen=True)
+
+    parent_session_id: str
+    cursor: str | None = None
+    limit: StrictInt = Field(
+        default=SESSION_LINEAGE_DEFAULT_CHILD_LIMIT,
+        ge=1,
+        le=SESSION_LINEAGE_MAX_CHILD_LIMIT,
+    )
+
+    @field_validator("parent_session_id")
+    @classmethod
+    def validate_parent_session_id(cls, value: str) -> str:
+        return _bounded_session_topology_text(
+            value,
+            "parent_session_id",
+            max_bytes=SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+        )
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_session_topology_text(
+            value,
+            "cursor",
+            max_bytes=SESSION_LINEAGE_MAX_CURSOR_BYTES,
+        )
+
+
+class SessionLineageResult(BaseModel):
+    """Backend-neutral bounded direct-child lineage page."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    parent_session_id: str
+    children: tuple[SessionLineageNode, ...] = Field(
+        default=(),
+        max_length=SESSION_LINEAGE_MAX_CHILD_LIMIT,
+    )
+    next_cursor: str | None = None
+    has_more: StrictBool = False
+
+    @field_validator("parent_session_id")
+    @classmethod
+    def validate_parent_session_id(cls, value: str) -> str:
+        return _bounded_session_topology_text(
+            value,
+            "parent_session_id",
+            max_bytes=SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+        )
+
+    @field_validator("next_cursor")
+    @classmethod
+    def validate_next_cursor(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_session_topology_text(
+            value,
+            "next_cursor",
+            max_bytes=SESSION_LINEAGE_MAX_CURSOR_BYTES,
+        )
+
+    @model_validator(mode="after")
+    def validate_page(self) -> SessionLineageResult:
+        if self.has_more != (self.next_cursor is not None):
+            raise ValueError("Lineage continuation state and cursor must agree.")
+        child_ids = tuple(child.id for child in self.children)
+        if len(child_ids) != len(set(child_ids)):
+            raise ValueError("A lineage page must not repeat a child session.")
+        if any(child.parent_session_id != self.parent_session_id for child in self.children):
+            raise ValueError("A lineage page contains a contradictory parent edge.")
+        if tuple(self.children) != tuple(
+            sorted(self.children, key=lambda child: (child.created_at, child.id))
+        ):
+            raise ValueError("Lineage children must use stable creation ordering.")
+        if self.next_cursor is not None:
+            cursor_created_at, cursor_id = decode_session_lineage_cursor(
+                self.next_cursor,
+                parent_session_id=self.parent_session_id,
+            )
+            if not self.children or (cursor_created_at, cursor_id) != (
+                self.children[-1].created_at,
+                self.children[-1].id,
+            ):
+                raise ValueError("A lineage cursor must identify the last returned child.")
+        return self
+
+
 class TranscriptQuery(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -4775,6 +4946,7 @@ class SessionStore(ABC):
     supports_usage_aggregates: ClassVar[bool] = False
     supports_mcp_manifest_history: ClassVar[bool] = False
     supports_session_topology: ClassVar[bool] = False
+    supports_session_lineage: ClassVar[bool] = False
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_terminal_session_evidence: ClassVar[bool] = False
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
@@ -5822,6 +5994,22 @@ class SessionStore(ABC):
             "This SessionStore does not support bounded session topology queries."
         )
 
+    async def query_session_lineage(
+        self,
+        query: SessionLineageQuery,
+    ) -> SessionLineageResult:
+        """Load one minimal, byte-bounded direct-child lineage page.
+
+        This optional store-native read is the durable admission boundary for
+        historical trajectory capture. Implementations must project only the
+        bounded structural fields represented by ``SessionLineageNode`` and must
+        not hydrate session display fields or event payloads.
+        """
+
+        raise NotImplementedError(
+            "This SessionStore does not support bounded session lineage queries."
+        )
+
     async def aggregate_operational_snapshot(
         self,
         filters: SessionAggregateFilter | None = None,
@@ -6073,6 +6261,7 @@ class InMemorySessionStore(SessionStore):
     supports_usage_aggregates: ClassVar[bool] = True
     supports_mcp_manifest_history: ClassVar[bool] = True
     supports_session_topology: ClassVar[bool] = True
+    supports_session_lineage: ClassVar[bool] = True
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
@@ -9632,7 +9821,7 @@ class InMemorySessionStore(SessionStore):
                     candidates.append(child)
                 branch_candidates.append(candidates)
 
-            return build_session_topology_result(
+            result = build_session_topology_result(
                 focus=SessionTopologyNode.from_session(focus_session),
                 ancestors=(
                     SessionTopologyNode.from_session(session) for session in ancestor_sessions
@@ -9645,6 +9834,65 @@ class InMemorySessionStore(SessionStore):
                     for candidates in branch_candidates
                 ),
                 child_limit=query.child_limit,
+            )
+            return result
+
+    async def query_session_lineage(
+        self,
+        query: SessionLineageQuery,
+    ) -> SessionLineageResult:
+        query = copy_session_lineage_query(query)
+        async with self._lock:
+            if query.parent_session_id not in self._sessions:
+                raise KeyError(f"Session not found: {query.parent_session_id}")
+            child_keys = self._child_session_keys_by_parent.get(query.parent_session_id, [])
+            start_index = 0
+            if query.cursor is not None:
+                cursor_created_at, cursor_id = decode_session_lineage_cursor(
+                    query.cursor,
+                    parent_session_id=query.parent_session_id,
+                )
+                start_index = bisect_right(child_keys, (cursor_created_at, cursor_id))
+            page_keys = child_keys[start_index : start_index + query.limit + 1]
+            retained_keys = page_keys[: query.limit]
+            children: list[SessionLineageNode] = []
+            for created_at, child_id in retained_keys:
+                child = self._sessions.get(child_id)
+                if child is None or child.parent_session_id != query.parent_session_id:
+                    raise RuntimeError("Inconsistent in-memory session lineage index.")
+                origins = tuple(
+                    islice(
+                        (
+                            SessionLineageOrigin(
+                                sequence=record.sequence,
+                                event_id=record.event.id,
+                                event_type=EventType(record.event.type),
+                            )
+                            for record in self._session_event_records.get(child_id, [])
+                            if record.event.type
+                            in {EventType.SESSION_STARTED, EventType.SESSION_FORKED}
+                        ),
+                        SESSION_LINEAGE_MAX_ORIGIN_EVENTS,
+                    )
+                )
+                children.append(
+                    SessionLineageNode(
+                        id=child.id,
+                        parent_session_id=query.parent_session_id,
+                        created_at=created_at,
+                        origin_events=origins,
+                    )
+                )
+            has_more = len(page_keys) > len(retained_keys)
+            return SessionLineageResult(
+                parent_session_id=query.parent_session_id,
+                children=tuple(children),
+                next_cursor=(
+                    encode_session_lineage_cursor(query.parent_session_id, children[-1])
+                    if has_more and children
+                    else None
+                ),
+                has_more=has_more,
             )
 
     async def aggregate_operational_snapshot(
@@ -13679,6 +13927,58 @@ def _validate_runtime_publication_durable_material(
             )
 
 
+def _origin_lineage_authority_fields(event_type: EventType | str) -> tuple[str, ...]:
+    if event_type == EventType.SESSION_STARTED:
+        return ("parent_session_id",)
+    if event_type == EventType.SESSION_FORKED:
+        return ("parent_session_id", "source_session_id")
+    return ()
+
+
+def _copy_event_for_session_store(event: Event) -> Event:
+    """Strip caller-authored origin linkage before it becomes durable evidence."""
+
+    copied = copy_event(event)
+    authority_fields = _origin_lineage_authority_fields(copied.type)
+    if not authority_fields:
+        return copied
+    payload = copy_durable_json_object(copied.payload, "event payload")
+    changed = False
+    for field_name in authority_fields:
+        value = payload.get(field_name)
+        if type(value) is str and event_payload_authority_is_runtime_generated(
+            copied,
+            field_name=field_name,
+            value=value,
+        ):
+            continue
+        if field_name in payload:
+            payload.pop(field_name)
+            changed = True
+    return copied if not changed else copied.model_copy(update={"payload": payload})
+
+
+def restore_persisted_origin_lineage_authority(event: Event) -> Event:
+    """Restore private authority proven by the built-in store ingestion boundary.
+
+    Every built-in path capable of persisting an origin event routes through
+    :func:`_copy_event_for_session_store`, either as an ordinary event batch or
+    through ``RuntimePublicationRequest``. A retained origin linkage field could
+    therefore only have crossed a persistence boundary with exact runtime
+    authority. SQL serialization does not retain Pydantic private attributes;
+    raw-record decoders use this helper to reconstruct that already-proven
+    provenance without exposing a marker in the public event payload.
+    """
+
+    copied = copy_event(event)
+    fields = tuple(
+        field_name
+        for field_name in _origin_lineage_authority_fields(copied.type)
+        if type(copied.payload.get(field_name)) is str
+    )
+    return event_with_runtime_payload_authority(copied, *fields) if fields else copied
+
+
 def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str, list[Event]]:
     session_id = require_clean_nonblank(session_id, "session_id")
     if type(events) is not list:
@@ -13689,7 +13989,7 @@ def _copy_session_event_batch(session_id: str, events: list[Event]) -> tuple[str
     for event in events:
         if type(event) is not Event:
             raise TypeError("Session events must be Event instances.")
-        copied_event = copy_event(event)
+        copied_event = _copy_event_for_session_store(event)
         if copied_event.session_id != session_id:
             raise ValueError("Event session_id does not match target session.")
         if copied_event.id in seen_event_ids:
@@ -14193,6 +14493,13 @@ def copy_usage_rollup_query(query: UsageRollupQuery) -> UsageRollupQuery:
     if type(query) is not UsageRollupQuery:
         raise TypeError("Usage aggregate queries must be UsageRollupQuery instances.")
     return UsageRollupQuery.model_validate(query.model_dump(mode="python"))
+
+
+def copy_session_lineage_query(query: SessionLineageQuery) -> SessionLineageQuery:
+    """Detach and revalidate a bounded lineage query at the store boundary."""
+    if type(query) is not SessionLineageQuery:
+        raise TypeError("Session lineage queries must be SessionLineageQuery instances.")
+    return SessionLineageQuery.model_validate(query.model_dump(mode="python"))
 
 
 def copy_event_query(query: EventQuery | None) -> EventQuery:
@@ -15970,6 +16277,81 @@ def decode_session_topology_cursor(
         raise ValueError("Invalid session topology cursor.") from exc
     if created_at.tzinfo is None or created_at.utcoffset() is None:
         raise ValueError("Invalid session topology cursor.")
+    return created_at.astimezone(UTC), child_session_id
+
+
+def encode_session_lineage_cursor(
+    parent_session_id: str,
+    node: SessionLineageNode,
+) -> str:
+    """Encode one parent-bound minimal-lineage continuation cursor."""
+
+    parent_session_id = _bounded_session_topology_text(
+        parent_session_id,
+        "parent_session_id",
+        max_bytes=SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+    )
+    if type(node) is not SessionLineageNode:
+        raise TypeError("Session lineage cursors require SessionLineageNode values.")
+    raw = json.dumps(
+        [
+            parent_session_id,
+            node.created_at.astimezone(UTC).isoformat(),
+            node.id,
+        ],
+        separators=(",", ":"),
+    )
+    encoded = base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    if len(encoded) > SESSION_LINEAGE_MAX_CURSOR_BYTES:
+        raise ValueError("Session lineage cursor exceeds its byte limit.")
+    return encoded
+
+
+def decode_session_lineage_cursor(
+    cursor: str,
+    *,
+    parent_session_id: str,
+) -> tuple[datetime, str]:
+    """Decode a minimal-lineage cursor and enforce its parent binding."""
+
+    parent_session_id = _bounded_session_topology_text(
+        parent_session_id,
+        "parent_session_id",
+        max_bytes=SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+    )
+    try:
+        cursor = _bounded_session_topology_text(
+            cursor,
+            "cursor",
+            max_bytes=SESSION_LINEAGE_MAX_CURSOR_BYTES,
+        )
+        encoded = cursor.encode("ascii")
+        raw = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        if base64.urlsafe_b64encode(raw) != encoded:
+            raise ValueError("Non-canonical session lineage cursor.")
+        decoded = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise ValueError("Invalid session lineage cursor.") from exc
+    if (
+        type(decoded) is not list
+        or len(decoded) != 3
+        or type(decoded[0]) is not str
+        or type(decoded[1]) is not str
+        or type(decoded[2]) is not str
+        or decoded[0] != parent_session_id
+    ):
+        raise ValueError("Invalid session lineage cursor.")
+    try:
+        child_session_id = _bounded_session_topology_text(
+            decoded[2],
+            "cursor child_session_id",
+            max_bytes=SESSION_LINEAGE_MAX_IDENTIFIER_BYTES,
+        )
+        created_at = datetime.fromisoformat(decoded[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid session lineage cursor.") from exc
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("Invalid session lineage cursor.")
     return created_at.astimezone(UTC), child_session_id
 
 
