@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import errno
+import hashlib
+import importlib
 import json
 import mimetypes
 import os
@@ -10,14 +12,19 @@ import re
 import shutil
 import stat
 import sys
-from collections.abc import Iterator
+import unicodedata
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 from cayu._filesystem_lock import cooperative_path_lock
+from cayu._task_wait import (
+    await_shielded_task_outcome,
+    unexpected_child_cancellation_error,
+)
 from cayu._validation import (
     copy_durable_json_object,
     require_clean_nonblank,
@@ -47,6 +54,17 @@ _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 4
 _ARTIFACT_LOCK_DIRECTORY_NAME = "cayu-artifact-locks"
+_ARTIFACT_LOCK_SHARD_COUNT = 256
+_ARTIFACT_ROOT_LOCK_DIRECTORY_NAME = "cayu-artifact-root-locks"
+_ARTIFACT_ROOT_PENDING_PREFIX = ".cayu-artifact-root-pending-"
+_SUPPORTS_DURABLE_DIRECTORY_SYNC = os.name != "nt" and hasattr(os, "O_DIRECTORY")
+try:
+    _FCNTL_MODULE = importlib.import_module("fcntl")
+except ImportError:  # pragma: no cover - Windows
+    _FCNTL_MODULE = None
+_DARWIN_FULL_SYNC_COMMAND = (
+    getattr(_FCNTL_MODULE, "F_FULLFSYNC", None) if sys.platform == "darwin" else None
+)
 _SUPPORTS_DIRECTORY_FD = (
     os.open in os.supports_dir_fd
     and os.mkdir in os.supports_dir_fd
@@ -54,6 +72,51 @@ _SUPPORTS_DIRECTORY_FD = (
     and os.stat in os.supports_dir_fd
     and os.stat in os.supports_follow_symlinks
 )
+_ResultT = TypeVar("_ResultT")
+
+
+class _PublishedLocalArtifactError(Exception):
+    """Carry a failure that happened after the final artifact became visible."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def _visible_exception_evidence(error: BaseException) -> BaseException | None:
+    if error.__cause__ is not None:
+        return error.__cause__
+    if error.__context__ is not None and not error.__suppress_context__:
+        return error.__context__
+    return None
+
+
+def _ordered_exception_evidence(
+    authoritative: BaseException,
+    additions: list[BaseException],
+    *,
+    message: str,
+) -> BaseException | None:
+    evidence: list[BaseException] = []
+    for candidate in (_visible_exception_evidence(authoritative), *additions):
+        if candidate is None or candidate is authoritative:
+            continue
+        if any(existing is candidate for existing in evidence):
+            continue
+        evidence.append(candidate)
+    if not evidence:
+        return None
+    if len(evidence) == 1:
+        return evidence[0]
+    return BaseExceptionGroup(message, evidence)
+
+
+def _detach_redundant_cleanup_context(
+    cleanup_error: BaseException,
+    primary_error: BaseException,
+) -> None:
+    if cleanup_error.__cause__ is None and cleanup_error.__context__ is primary_error:
+        cleanup_error.__context__ = None
 
 
 class LocalArtifactStore(ArtifactStore):
@@ -63,10 +126,32 @@ class LocalArtifactStore(ArtifactStore):
         if not isinstance(root, str | PathLike):
             raise TypeError("LocalArtifactStore root must be a string or Path.")
         root_path = Path(root).expanduser().resolve()
-        root_path.mkdir(parents=True, exist_ok=True)
+        initialized_identity: tuple[int, int] | None = None
+        durable_publication_supported = _supports_durable_publication()
+        durable_initialization_required = durable_publication_supported and not root_path.exists()
+        if durable_publication_supported and not durable_initialization_required:
+            try:
+                durable_initialization_required = _root_pending_marker(root_path).exists()
+            except OSError as exc:
+                raise ArtifactStoreUnavailableError(
+                    "Local artifact store root could not be made durable."
+                ) from exc
+        if durable_initialization_required:
+            try:
+                initialized_identity = _initialize_durable_store_root(root_path)
+            except OSError as exc:
+                raise ArtifactStoreUnavailableError(
+                    "Local artifact store root could not be made durable."
+                ) from exc
+        elif not root_path.exists():
+            root_path.mkdir(parents=True, exist_ok=True)
         root_stat = os.stat(root_path, follow_symlinks=False)
         if _is_windows_reparse_point(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
             raise NotADirectoryError(f"Artifact store root is not a directory: {root_path}")
+        if initialized_identity is not None and _stat_identity(root_stat) != initialized_identity:
+            raise ArtifactStoreUnavailableError(
+                "Local artifact store root changed during durable initialization."
+            )
 
         if store_id is None:
             self.id = str(root_path)
@@ -116,22 +201,25 @@ class LocalArtifactStore(ArtifactStore):
             environment_name=environment_name,
             metadata=copied_metadata,
         )
+        _require_durable_publication_support()
         try:
             if artifact_id is None:
-                await asyncio.to_thread(
-                    _write_artifact,
+                await _await_local_mutation(
+                    _write_generated_artifact,
                     self.root,
                     self._root_identity,
                     artifact,
                     content,
+                    operation="Local artifact publication",
                 )
                 return artifact
-            return await asyncio.to_thread(
+            return await _await_local_mutation(
                 _put_deterministic_artifact,
                 self.root,
                 self._root_identity,
                 artifact,
                 content,
+                operation="Deterministic local artifact publication",
             )
         except (ArtifactStoreUnavailableError, TypeError, ValueError):
             raise
@@ -216,8 +304,58 @@ class LocalArtifactStore(ArtifactStore):
             ) from exc
 
 
+async def _await_local_mutation(
+    callback: Callable[..., _ResultT],
+    *args: Any,
+    operation: str,
+) -> _ResultT:
+    """Settle an off-thread filesystem mutation before re-delivering cancellation."""
+
+    task = asyncio.create_task(asyncio.to_thread(callback, *args))
+    outcome = await await_shielded_task_outcome(task)
+    error = outcome.error
+    if isinstance(error, _PublishedLocalArtifactError):
+        error = error.error
+    if isinstance(error, asyncio.CancelledError):
+        error = unexpected_child_cancellation_error(error, operation=operation)
+    cancellation = outcome.cancellation
+    if cancellation is not None:
+        if error is not None:
+            cause = _ordered_exception_evidence(
+                cancellation,
+                [error],
+                message=f"{operation} also failed while caller cancellation was pending.",
+            )
+            cancellation.add_note(f"{operation} also failed while caller cancellation was pending.")
+            if cause is None:  # pragma: no cover - error is non-cancellation evidence
+                raise cancellation
+            raise cancellation from cause
+        raise cancellation
+    if error is not None:
+        raise error
+    return cast("_ResultT", outcome.result)
+
+
 def _new_artifact_id() -> str:
     return f"{_ARTIFACT_ID_PREFIX}{uuid4().hex}"
+
+
+def _artifact_lock_key(artifact_id: str) -> str:
+    digest = hashlib.sha256(artifact_id.encode("ascii")).digest()
+    shard = int.from_bytes(digest[:8], "big") % _ARTIFACT_LOCK_SHARD_COUNT
+    return f"artifact-shard-{shard:03d}"
+
+
+@contextmanager
+def _artifact_ownership_lock(root: Path, artifact_id: str) -> Iterator[None]:
+    """Serialize one artifact through a bounded cross-process lock namespace."""
+
+    with cooperative_path_lock(
+        root,
+        _artifact_lock_key(artifact_id),
+        lock_directory_name=_ARTIFACT_LOCK_DIRECTORY_NAME,
+    ):
+        yield
 
 
 def _validate_artifact_id(value: str) -> str:
@@ -269,6 +407,224 @@ def _validate_limit(value: int | None, field_name: str) -> int | None:
     if value <= 0:
         raise ValueError(f"Artifact {field_name} must be greater than zero.")
     return value
+
+
+def _require_durable_publication_support() -> None:
+    if not _supports_durable_publication():
+        raise ArtifactStoreUnavailableError(
+            "Local artifact publication requires durable directory synchronization, "
+            "which is unavailable on this platform."
+        )
+
+
+def _supports_durable_publication() -> bool:
+    if not _SUPPORTS_DURABLE_DIRECTORY_SYNC:
+        return False
+    return sys.platform != "darwin" or _DARWIN_FULL_SYNC_COMMAND is not None
+
+
+def _create_durable_directory_ancestry(root: Path) -> None:
+    """Create and durably publish each missing root ancestor in order."""
+
+    missing_ancestors: list[Path] = []
+    candidate = root
+    while not candidate.exists():
+        missing_ancestors.append(candidate)
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+
+    _sync_directory_path(candidate)
+    if candidate.parent != candidate:
+        _sync_directory_path(candidate.parent)
+
+    for directory in reversed(missing_ancestors):
+        directory.mkdir(exist_ok=True)
+        current = os.stat(directory, follow_symlinks=False)
+        if _is_windows_reparse_point(current) or not stat.S_ISDIR(current.st_mode):
+            raise NotADirectoryError(f"Artifact store root is not a directory: {directory}")
+        _sync_directory_path(directory, expected_identity=_stat_identity(current))
+        _sync_directory_path(directory.parent)
+
+
+def _root_pending_marker_identity(root: Path) -> bytes:
+    parent = os.stat(root.parent, follow_symlinks=False)
+    normalized_name = unicodedata.normalize("NFC", root.name).casefold()
+    parent_identity = f"{parent.st_dev}:{parent.st_ino}\0".encode("ascii")
+    return parent_identity + os.fsencode(normalized_name)
+
+
+def _root_pending_marker(root: Path) -> Path:
+    digest = hashlib.sha256(_root_pending_marker_identity(root)).hexdigest()
+    return root.parent / f"{_ARTIFACT_ROOT_PENDING_PREFIX}{digest}"
+
+
+def _root_pending_marker_payload(root: Path) -> bytes:
+    return b"cayu.local-artifact-root.pending.v1\n" + _root_pending_marker_identity(root)
+
+
+def _initialize_durable_store_root(root: Path) -> tuple[int, int]:
+    """Finish a recoverable root creation without burdening pre-existing roots."""
+
+    _create_durable_directory_ancestry(root.parent)
+    lock_anchor = Path(root.anchor)
+    with cooperative_path_lock(
+        lock_anchor,
+        str(root),
+        lock_directory_name=_ARTIFACT_ROOT_LOCK_DIRECTORY_NAME,
+    ):
+        marker = _root_pending_marker(root)
+        marker_exists = marker.exists()
+        with _open_artifact_directory(root.parent) as (parent_fd, parent_identity):
+            marker_name = marker.name
+            if marker_exists:
+                _validate_pending_root_marker(
+                    parent_fd,
+                    root.parent,
+                    parent_identity,
+                    marker_name,
+                    root,
+                )
+            else:
+                _create_pending_root_marker(
+                    parent_fd,
+                    root.parent,
+                    parent_identity,
+                    marker_name,
+                    root,
+                )
+            _sync_open_directory(parent_fd, root.parent, parent_identity)
+
+            try:
+                root_stat = _stat_directory_entry(root, parent_fd=parent_fd)
+            except FileNotFoundError:
+                if parent_fd is None:
+                    root.mkdir()
+                else:
+                    os.mkdir(root.name, dir_fd=parent_fd)
+                root_stat = _stat_directory_entry(root, parent_fd=parent_fd)
+            if _is_windows_reparse_point(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
+                raise NotADirectoryError(f"Artifact store root is not a directory: {root}")
+            root_identity = _stat_identity(root_stat)
+            with _open_artifact_directory(root, parent_fd=parent_fd) as (
+                root_fd,
+                opened_root_identity,
+            ):
+                if opened_root_identity != root_identity:
+                    raise ArtifactStoreUnavailableError(
+                        "Local artifact store root changed during initialization."
+                    )
+                _sync_open_directory(root_fd, root, opened_root_identity)
+            _sync_open_directory(parent_fd, root.parent, parent_identity)
+            if parent_fd is None:
+                marker.unlink()
+            else:
+                os.unlink(marker_name, dir_fd=parent_fd)
+            _sync_open_directory(parent_fd, root.parent, parent_identity)
+            return root_identity
+
+
+def _create_pending_root_marker(
+    parent_fd: int | None,
+    parent: Path,
+    parent_identity: tuple[int, int],
+    marker_name: str,
+    root: Path,
+) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+        | _OPEN_NOFOLLOW_FLAG
+    )
+    marker_fd = (
+        os.open(parent / marker_name, flags, 0o600)
+        if parent_fd is None
+        else os.open(marker_name, flags, 0o600, dir_fd=parent_fd)
+    )
+    try:
+        _require_directory_identity(parent_fd, parent, parent_identity)
+        payload = _root_pending_marker_payload(root)
+        written = 0
+        while written < len(payload):
+            chunk_size = os.write(marker_fd, payload[written:])
+            if chunk_size <= 0:
+                raise OSError("Local artifact root pending marker write made no progress.")
+            written += chunk_size
+        _sync_descriptor(marker_fd)
+    finally:
+        os.close(marker_fd)
+
+
+def _validate_pending_root_marker(
+    parent_fd: int | None,
+    parent: Path,
+    parent_identity: tuple[int, int],
+    marker_name: str,
+    root: Path,
+) -> None:
+    marker_fd = _open_artifact_file(
+        parent_fd,
+        parent,
+        parent_identity,
+        marker_name,
+        missing_message="Local artifact root pending marker disappeared.",
+    )
+    try:
+        with os.fdopen(marker_fd, "rb", closefd=False) as file:
+            payload = file.read()
+        expected = _root_pending_marker_payload(root)
+        if not expected.startswith(payload):
+            raise ArtifactStoreUnavailableError("Local artifact root pending marker is invalid.")
+        _sync_descriptor(marker_fd)
+    finally:
+        os.close(marker_fd)
+
+
+def _sync_descriptor(descriptor: int) -> None:
+    if sys.platform != "darwin":
+        os.fsync(descriptor)
+        return
+    if _FCNTL_MODULE is None or _DARWIN_FULL_SYNC_COMMAND is None:
+        raise ArtifactStoreUnavailableError(
+            "Local artifact publication requires F_FULLFSYNC on macOS."
+        )
+    _FCNTL_MODULE.fcntl(descriptor, _DARWIN_FULL_SYNC_COMMAND)
+
+
+def _sync_directory_path(path: Path, *, expected_identity: tuple[int, int] | None = None) -> None:
+    """Open and synchronize one directory without following a replacement link."""
+
+    flags = _OPEN_READ_FLAGS | _OPEN_DIRECTORY_FLAG | _OPEN_NOFOLLOW_FLAG
+    descriptor = os.open(path, flags)
+    try:
+        current = os.fstat(descriptor)
+        if _is_windows_reparse_point(current) or not stat.S_ISDIR(current.st_mode):
+            raise ArtifactStoreUnavailableError(
+                f"Local artifact directory could not be synchronized safely: {path}"
+            )
+        if expected_identity is not None and _stat_identity(current) != expected_identity:
+            raise ArtifactStoreUnavailableError(
+                f"Local artifact directory changed before synchronization: {path}"
+            )
+        _sync_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_open_directory(
+    directory_fd: int | None,
+    path: Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    if directory_fd is None:
+        _sync_directory_path(path, expected_identity=expected_identity)
+        return
+    _require_directory_identity(directory_fd, path, expected_identity)
+    _sync_descriptor(directory_fd)
 
 
 @contextmanager
@@ -334,63 +690,132 @@ def _write_artifact(
     root_identity: tuple[int, int],
     artifact: ArtifactMetadata,
     content: bytes,
-) -> None:
+) -> tuple[int, int]:
     target = _artifact_dir(root, artifact.id)
     staging_name = f"{artifact.id}.staging-{uuid4().hex}"
     staging = root / staging_name
-    with _open_store_root(root, root_identity) as root_fd:
-        try:
-            if root_fd is None:
-                staging.mkdir(mode=0o700, parents=False)
-            else:
-                os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
-        except FileExistsError as exc:  # pragma: no cover - UUID collision
-            raise ArtifactStoreUnavailableError(
-                "Local artifact staging directory already exists."
-            ) from exc
+    published = False
+    try:
+        with _open_store_root(root, root_identity) as root_fd:
+            try:
+                if root_fd is None:
+                    staging.mkdir(mode=0o700, parents=False)
+                else:
+                    os.mkdir(staging_name, mode=0o700, dir_fd=root_fd)
+            except FileExistsError as exc:  # pragma: no cover - UUID collision
+                raise ArtifactStoreUnavailableError(
+                    "Local artifact staging directory already exists."
+                ) from exc
 
-        created_identity = _stat_identity(_stat_directory_entry(staging, parent_fd=root_fd))
-        try:
-            with _open_artifact_directory(staging, parent_fd=root_fd) as (
-                directory_fd,
-                directory_identity,
-            ):
-                _write_artifact_file(
+            created_identity = _stat_identity(_stat_directory_entry(staging, parent_fd=root_fd))
+            try:
+                with _open_artifact_directory(staging, parent_fd=root_fd) as (
                     directory_fd,
-                    staging,
                     directory_identity,
-                    _CONTENT_FILE,
+                ):
+                    _write_artifact_file(
+                        directory_fd,
+                        staging,
+                        directory_identity,
+                        _CONTENT_FILE,
+                        content,
+                    )
+                    metadata_bytes = json.dumps(
+                        artifact.model_dump(mode="json"),
+                        sort_keys=True,
+                        indent=2,
+                    ).encode("utf-8")
+                    _write_artifact_file(
+                        directory_fd,
+                        staging,
+                        directory_identity,
+                        _METADATA_FILE,
+                        metadata_bytes,
+                    )
+                    _sync_open_directory(directory_fd, staging, directory_identity)
+                try:
+                    _rename_directory_no_replace(
+                        staging,
+                        target,
+                        parent_fd=root_fd,
+                    )
+                    published = True
+                    _sync_open_directory(root_fd, root, root_identity)
+                except OSError as exc:
+                    if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                        raise FileExistsError(f"Artifact already exists: {artifact.id}") from exc
+                    raise
+            except BaseException as primary_error:
+                try:
+                    _remove_artifact_directory_if_unchanged(
+                        staging,
+                        created_identity,
+                        parent_fd=root_fd,
+                    )
+                except BaseException as cleanup_error:
+                    _detach_redundant_cleanup_context(cleanup_error, primary_error)
+                    raise ArtifactStoreUnavailableError(
+                        "Local artifact publication failed and staging cleanup also failed."
+                    ) from BaseExceptionGroup(
+                        "Local artifact publication and staging cleanup failures.",
+                        [primary_error, cleanup_error],
+                    )
+                raise
+            return created_identity
+    except BaseException as error:
+        if published:
+            raise _PublishedLocalArtifactError(error) from error
+        raise
+
+
+def _write_generated_artifact(
+    root: Path,
+    root_identity: tuple[int, int],
+    artifact: ArtifactMetadata,
+    content: bytes,
+) -> tuple[int, int]:
+    published_identity: tuple[int, int] | None = None
+    write_error: BaseException | None = None
+    try:
+        with _artifact_ownership_lock(root, artifact.id):
+            try:
+                published_identity = _write_artifact(
+                    root,
+                    root_identity,
+                    artifact,
                     content,
                 )
-                metadata_bytes = json.dumps(
-                    artifact.model_dump(mode="json"),
-                    sort_keys=True,
-                    indent=2,
-                ).encode("utf-8")
-                _write_artifact_file(
-                    directory_fd,
-                    staging,
-                    directory_identity,
-                    _METADATA_FILE,
-                    metadata_bytes,
-                )
-            try:
-                _rename_directory_no_replace(
-                    staging,
-                    target,
-                    parent_fd=root_fd,
-                )
-            except OSError as exc:
-                if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
-                    raise FileExistsError(f"Artifact already exists: {artifact.id}") from exc
-                raise
-        except Exception:
-            _remove_artifact_directory_if_unchanged(
-                staging,
-                created_identity,
-                parent_fd=root_fd,
+            except BaseException as error:
+                # Keep the body outcome until the lock has physically released so
+                # teardown cannot replace publication state or failure evidence.
+                write_error = error
+    except BaseException as lock_error:
+        if isinstance(write_error, _PublishedLocalArtifactError):
+            combined_error = ArtifactStoreUnavailableError(
+                "Local artifact publication and ownership-lock cleanup both failed."
             )
-            raise
+            combined_error.__cause__ = BaseExceptionGroup(
+                "Local artifact publication and ownership-lock cleanup failures.",
+                [write_error.error, lock_error],
+            )
+            raise _PublishedLocalArtifactError(combined_error) from combined_error
+        if write_error is not None:
+            combined_error = ArtifactStoreUnavailableError(
+                "Local artifact publication and ownership-lock cleanup both failed."
+            )
+            combined_error.__cause__ = BaseExceptionGroup(
+                "Local artifact publication and ownership-lock cleanup failures.",
+                [write_error, lock_error],
+            )
+            raise combined_error from combined_error.__cause__
+        if published_identity is not None:
+            raise _PublishedLocalArtifactError(lock_error) from lock_error
+        raise
+    if write_error is not None:
+        raise write_error
+    if published_identity is None:  # pragma: no cover - write returned without an outcome
+        raise AssertionError("Generated artifact publication produced no result.")
+    return published_identity
 
 
 def _put_deterministic_artifact(
@@ -399,11 +824,7 @@ def _put_deterministic_artifact(
     artifact: ArtifactMetadata,
     content: bytes,
 ) -> ArtifactMetadata:
-    with cooperative_path_lock(
-        root,
-        artifact.id,
-        lock_directory_name=_ARTIFACT_LOCK_DIRECTORY_NAME,
-    ):
+    with _artifact_ownership_lock(root, artifact.id):
         for attempt in range(3):
             try:
                 _write_artifact(root, root_identity, artifact, content)
@@ -421,6 +842,7 @@ def _put_deterministic_artifact(
                     )
                     continue
                 _require_matching_artifact(existing, expected=artifact, content=content)
+                _sync_existing_artifact(root, root_identity, artifact.id)
                 return existing.metadata
             else:
                 return artifact
@@ -635,6 +1057,40 @@ def _read_artifact(
     )
 
 
+def _sync_existing_artifact(
+    root: Path,
+    root_identity: tuple[int, int],
+    artifact_id: str,
+) -> None:
+    """Re-establish durability before acknowledging an exact deterministic retry."""
+
+    target = _artifact_dir(root, artifact_id)
+    with (
+        _open_store_root(root, root_identity) as root_fd,
+        _open_artifact_directory(target, parent_fd=root_fd) as (
+            directory_fd,
+            directory_identity,
+        ),
+    ):
+        for filename, missing_message in (
+            (_CONTENT_FILE, f"Artifact content not found: {artifact_id}"),
+            (_METADATA_FILE, f"Artifact metadata not found: {artifact_id}"),
+        ):
+            file_fd = _open_artifact_file(
+                directory_fd,
+                target,
+                directory_identity,
+                filename,
+                missing_message=missing_message,
+            )
+            try:
+                _sync_descriptor(file_fd)
+            finally:
+                os.close(file_fd)
+        _sync_open_directory(directory_fd, target, directory_identity)
+        _sync_open_directory(root_fd, root, root_identity)
+
+
 def _list_artifacts(
     root: Path,
     root_identity: tuple[int, int],
@@ -682,7 +1138,10 @@ def _delete_artifact(
     artifact_id: str,
 ) -> None:
     target = _artifact_dir(root, artifact_id)
-    with _open_store_root(root, root_identity) as root_fd:
+    with (
+        _artifact_ownership_lock(root, target.name),
+        _open_store_root(root, root_identity) as root_fd,
+    ):
         try:
             with _open_artifact_directory(target, parent_fd=root_fd) as (
                 _,
@@ -722,11 +1181,25 @@ def _load_metadata(
         directory_fd,
         directory_identity,
     ):
-        return _load_metadata_from_directory(
+        artifact = _load_metadata_from_directory(
             artifact_dir,
             directory_fd,
             directory_identity,
         )
+        content_fd = _open_artifact_file(
+            directory_fd,
+            artifact_dir,
+            directory_identity,
+            _CONTENT_FILE,
+            missing_message=f"Artifact content not found: {artifact_dir.name}",
+        )
+        try:
+            content_size = os.fstat(content_fd).st_size
+        finally:
+            os.close(content_fd)
+        if content_size != artifact.size_bytes:
+            raise ValueError(f"Artifact content size does not match metadata: {artifact_dir.name}")
+        return artifact
 
 
 def _load_metadata_from_directory(
@@ -909,6 +1382,8 @@ def _write_artifact_file(
         )
         with os.fdopen(file_fd, "wb", closefd=False) as file:
             file.write(content)
+            file.flush()
+            _sync_descriptor(file_fd)
     finally:
         os.close(file_fd)
 
