@@ -10,6 +10,9 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
+_TEMPLATE_TOKEN_RE = re.compile(
+    r"__(?:PROJECT_NAME|AGENT_NAME|CAYU_VERSION|PROVIDER_DISPLAY|PROVIDER_LITERAL)__"
+)
 
 GENERATED_IMPORTS_START = "# <cayu:generated-imports>"
 GENERATED_IMPORTS_END = "# </cayu:generated-imports>"
@@ -223,7 +226,7 @@ _AUTHORING_STATE: str | None = None
 # </cayu:generated-agent-config>
 
 AGENT = AgentSpec(
-    name="__PROJECT_NAME__",
+    name="__AGENT_NAME__",
     model=configured_model(),
     provider_name=configured_provider_name(),
     system_prompt="\\n".join(_SYSTEM_PROMPT_PARTS) or None,
@@ -266,7 +269,7 @@ def test_agent_runs_through_the_runtime() -> None:
         run_to_completion(
             app,
             RunRequest(
-                agent_name="__PROJECT_NAME__",
+                agent_name="__AGENT_NAME__",
                 messages=[Message.text("user", "Handle this request")],
             ),
         )
@@ -312,7 +315,7 @@ def build_eval() -> EvalPlan:
             EvalCase(
                 id="returns-output",
                 request=RunRequest(
-                    agent_name="__PROJECT_NAME__",
+                    agent_name="__AGENT_NAME__",
                     messages=[Message.text("user", "Handle this request")],
                 ),
                 assertions=[
@@ -349,7 +352,8 @@ pythonpath = ["."]
 _README = """# __PROJECT_NAME__
 
 A model-only Cayu agent scaffold. It starts with one agent, one deterministic
-runtime test, and one output eval. Add capabilities only when the job needs them.
+runtime test, and one output eval. Its registered agent identity is
+`__AGENT_NAME__`. Add capabilities only when the job needs them.
 
 ## Application structure
 
@@ -456,6 +460,8 @@ if __name__ == "__main__":
 
 _AGENTS_MD = """# Coding-agent instructions
 
+The registered agent identity is `__AGENT_NAME__`.
+
 Edit the existing agent, test, and eval to implement the user's first requested
 job. Do not retain the starter and add a second agent. Tools are optional: add
 one only for a real capability outside the model, such as reading a repository
@@ -494,7 +500,7 @@ declare `ToolEffect`, and effect metadata does not authorize execution. A
 comprehension or live model behavior.
 
 For the starter's first real tool, run
-`uv run cayu generate tool TOOL_NAME --agent __PROJECT_NAME__ --effect EFFECT`.
+`uv run cayu generate tool TOOL_NAME --agent __AGENT_NAME__ --effect EFFECT`.
 Then replace the generated sample schema, implementation, test, and eval with
 domain behavior; `cayu check` keeps the tracer-bullet warning active until the
 explicit authoring marker is removed.
@@ -513,6 +519,10 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     parser.add_argument("name", help="Project name (also the directory name).")
+    parser.add_argument(
+        "--agent-name",
+        help="Registered first-agent name (default: project name).",
+    )
     parser.add_argument(
         "--dir",
         metavar="DIR",
@@ -536,15 +546,27 @@ def _installed_cayu_version() -> str:
         return "0.1.0"
 
 
-def project_files(name: str, *, provider: str | None = None) -> dict[str, str]:
+def project_files(
+    name: str,
+    *,
+    agent_name: str | None = None,
+    provider: str | None = None,
+) -> dict[str, str]:
+    resolved_agent_name = name if agent_name is None else agent_name
+
     def render(template: str) -> str:
         provider_display = provider or "no live provider"
         provider_literal = "None" if provider is None else json.dumps(provider)
-        return (
-            template.replace("__PROJECT_NAME__", name)
-            .replace("__CAYU_VERSION__", _installed_cayu_version())
-            .replace("__PROVIDER_DISPLAY__", provider_display)
-            .replace("__PROVIDER_LITERAL__", provider_literal)
+        replacements = {
+            "__PROJECT_NAME__": name,
+            "__AGENT_NAME__": resolved_agent_name,
+            "__CAYU_VERSION__": _installed_cayu_version(),
+            "__PROVIDER_DISPLAY__": provider_display,
+            "__PROVIDER_LITERAL__": provider_literal,
+        }
+        return _TEMPLATE_TOKEN_RE.sub(
+            lambda match: replacements[match.group(0)],
+            template,
         )
 
     return {
@@ -572,6 +594,14 @@ def run_new(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    agent_name = name if args.agent_name is None else args.agent_name
+    if not _NAME_RE.fullmatch(agent_name):
+        print(
+            f"error: invalid agent name {agent_name!r} "
+            "(use letters, digits, '-' or '_', starting with a letter).",
+            file=sys.stderr,
+        )
+        return 1
 
     target = Path(args.dir) / name
     if target.exists() and not target.is_dir():
@@ -581,7 +611,11 @@ def run_new(args: argparse.Namespace) -> int:
         print(f"error: {target} already exists and is not empty.", file=sys.stderr)
         return 1
 
-    for rel, content in project_files(name, provider=args.provider).items():
+    for rel, content in project_files(
+        name,
+        agent_name=agent_name,
+        provider=args.provider,
+    ).items():
         path = target / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")

@@ -6,12 +6,92 @@ section that matches the requested behavior.
 
 ## domain-tool
 
-Subclass `Tool`, declare `ToolSpec(input_schema=...)`, and implement
-`async def run(...) -> ToolResult`. The schema should describe properties,
-required fields, and `additionalProperties`; `{}` is valid but unconstrained.
-The public `Tool.schema` property is authoritative at registration. For a fresh
-starter run `cayu generate tool NAME --agent AGENT --effect EFFECT` to create a
-schema, runtime test, eval, and tracer-bullet check loop.
+A native Python tool subclasses `Tool`, declares one immutable `ToolSpec`, and
+implements `async def run(ctx: ToolContext, args: dict) -> ToolResult`.
+
+`ToolSpec` is the registered declaration:
+
+- `name`: required durable tool identity.
+- `description`: model-facing purpose; defaults to an empty string.
+- `input_schema`: JSON Schema for `args`; defaults to unconstrained `{}`. Declare
+  properties, required fields, and `additionalProperties` deliberately.
+- `parallel_safe`: whether Cayu may execute the tool alongside siblings; defaults
+  to `True`.
+- `effect`: replay/mutation classification; defaults to `ToolEffect.EXTERNAL`, but
+  application tools should choose it explicitly with `cayu guide tool-effects`.
+
+The public `Tool.schema` property is authoritative at registration. Override it
+only when the runtime schema is derived rather than the declared
+`ToolSpec.input_schema`. Most subclasses declare `spec` on the class as shown
+below; a dynamically configured subclass may instead pass a `ToolSpec` to the
+inherited constructor. Tool instances expose that declaration through `spec`,
+derive `name` and `description` from it, and expose the effective input schema
+through `schema`.
+
+`ToolContext` carries invocation identity and admitted runtime resources. Cayu
+constructs `ToolContext` for normal runtime execution and supplies the session
+identity, applicable agent/environment/budget identities, JSON `metadata`, and
+the resource handles admitted for that invocation. `session_id` is the only
+required `ToolContext` constructor field. Optional identity fields are
+`agent_name`, `environment_name`, `causal_budget_id`, `workspace_id`,
+`artifact_store_id`, and `idempotency_key`. Depending on the registered
+environment, Cayu may also provide `workspace`, `artifact_store`, `runner`,
+`vault`, `proxy`, and `knowledge_store`. These resource handles may be absent,
+so a tool that requires one must fail clearly when it is `None`. `mcp_servers`
+is always a tuple, and absence is represented by `()`; check whether it is
+empty rather than comparing it with `None`. Do not set the runtime-owned
+secret-capture hooks; they are Cayu wiring rather than tool-author
+configuration.
+
+`ToolResult` has four fields:
+
+- `content`: model-facing durable text; defaults to `""`.
+- `structured`: optional JSON object for workflows and operator surfaces.
+- `artifacts`: JSON object descriptors for durable outputs; defaults to `[]`.
+- `is_error`: whether the tool reports a failed result; defaults to `False`.
+
+Construct a bare unit-test context with
+`ToolContext(session_id="test-session")`. This direct implementation unit test
+needs no application graph:
+
+```python
+import asyncio
+
+from cayu import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
+
+
+class LookupTool(Tool):
+    spec = ToolSpec(
+        name="lookup",
+        description="Look up one reviewed record.",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        effect=ToolEffect.NONE,
+    )
+
+    async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        return ToolResult(
+            content=f"Found {args['query']}",
+            structured={"session_id": ctx.session_id},
+        )
+
+
+tool = LookupTool()
+context = ToolContext(session_id="test-session")
+result = asyncio.run(tool.run(context, {"query": "Cayu"}))
+assert result.content == "Found Cayu"
+assert result.structured == {"session_id": "test-session"}
+```
+
+Calling `run` directly proves the implementation for caller-supplied arguments.
+It does not prove schema validation, policy authorization, runtime resource
+admission, event emission, or model behavior. For a fresh starter run
+`cayu generate tool NAME --agent AGENT --effect EFFECT` to create a schema,
+runtime test, eval, and tracer-bullet check loop through Cayu.
 
 ## approvals
 

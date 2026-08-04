@@ -107,6 +107,41 @@ def test_package_shipped_tool_effect_guide_renders_canonical_decisions(capsys) -
     assert "`cayu check` remains structural" in guidance
 
 
+def test_domain_tool_reference_documents_the_public_authoring_interface(capsys) -> None:
+    assert main(["guide", "references#domain-tool"]) == 0
+    guidance = capsys.readouterr().out
+
+    assert guidance.startswith("## domain-tool")
+    normalized = " ".join(guidance.split())
+    for field in (
+        "`name`",
+        "`description`",
+        "`input_schema`",
+        "`parallel_safe`",
+        "`effect`",
+        "`session_id`",
+        "`content`",
+        "`structured`",
+        "`artifacts`",
+        "`is_error`",
+    ):
+        assert field in guidance
+    assert '`ToolContext(session_id="test-session")`' in guidance
+    assert "the only required `ToolContext` constructor field" in normalized
+    assert "Cayu constructs `ToolContext` for normal runtime execution" in normalized
+    assert "runtime-owned secret-capture hooks" in normalized
+    assert "`mcp_servers` is always a tuple" in normalized
+    assert "absence is represented by `()`" in normalized
+    assert "rather than comparing it with `None`" in normalized
+    assert "`name` and `description`" in normalized
+    assert "pass a `ToolSpec` to the inherited constructor" in normalized
+    assert "asyncio.run(tool.run(context" in guidance
+    assert "does not prove schema validation, policy authorization" in guidance
+    example = re.search(r"```python\n(.*?)```", guidance, re.DOTALL)
+    assert example is not None
+    exec(example.group(1), {})
+
+
 def test_every_cayu_map_row_routes_to_a_package_shipped_local_guide(capsys) -> None:
     assert main(["guide", "authoring"]) == 0
     authoring = capsys.readouterr().out

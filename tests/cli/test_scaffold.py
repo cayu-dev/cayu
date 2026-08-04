@@ -28,6 +28,14 @@ from cayu import (
 from cayu.cli import main
 from cayu.cli.project import project_context
 
+_RESERVED_TEMPLATE_TOKENS = (
+    "__PROJECT_NAME__",
+    "__AGENT_NAME__",
+    "__CAYU_VERSION__",
+    "__PROVIDER_DISPLAY__",
+    "__PROVIDER_LITERAL__",
+)
+
 
 def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> None:
     assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
@@ -449,6 +457,109 @@ def test_cayu_new_uses_supported_hyphenated_project_name_for_the_agent(
     assert 'name="code-review"' in agent_source
 
 
+def test_cayu_new_uses_an_explicit_agent_name_across_the_generated_contract(
+    tmp_path: Path,
+) -> None:
+    assert (
+        main(
+            [
+                "new",
+                "kimi-test-agent",
+                "--agent-name",
+                "code-review-agent",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    project = tmp_path / "kimi-test-agent"
+
+    assert 'name = "kimi-test-agent"' in (project / "pyproject.toml").read_text()
+    assert 'name="code-review-agent"' in (project / "agents" / "agent.py").read_text()
+    assert 'agent_name="code-review-agent"' in (project / "tests" / "test_agent.py").read_text()
+    assert 'agent_name="code-review-agent"' in (project / "evals" / "agent.py").read_text()
+    readme = " ".join((project / "README.md").read_text().split())
+    assert "registered agent identity is `code-review-agent`" in readme
+    instructions = " ".join((project / "AGENTS.md").read_text().split())
+    assert "registered agent identity is `code-review-agent`" in instructions
+    assert "--agent code-review-agent --effect EFFECT" in instructions
+
+    environment = os.environ.copy()
+    for variable in ("CAYU_PROVIDER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        environment.pop(variable, None)
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    test_result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert test_result.returncode == 0, test_result.stdout + test_result.stderr
+    eval_result = subprocess.run(
+        [sys.executable, "-m", "cayu", "eval", "run"],
+        cwd=project,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert eval_result.returncode == 0, eval_result.stdout + eval_result.stderr
+    assert json.loads(eval_result.stdout)["status"] == "passed"
+
+
+@pytest.mark.parametrize("reserved_token", _RESERVED_TEMPLATE_TOKENS)
+def test_cayu_new_preserves_reserved_tokens_in_the_default_agent_identity(
+    tmp_path: Path,
+    reserved_token: str,
+) -> None:
+    project_name = f"project{reserved_token}"
+    assert main(["new", project_name, "--dir", str(tmp_path)]) == 0
+    project = tmp_path / project_name
+
+    assert f'name = "{project_name}"' in (project / "pyproject.toml").read_text()
+    assert f'name="{project_name}"' in (project / "agents" / "agent.py").read_text()
+    assert f'agent_name="{project_name}"' in (project / "tests" / "test_agent.py").read_text()
+    assert f'agent_name="{project_name}"' in (project / "evals" / "agent.py").read_text()
+    readme = " ".join((project / "README.md").read_text().split())
+    assert f"registered agent identity is `{project_name}`" in readme
+    instructions = " ".join((project / "AGENTS.md").read_text().split())
+    assert f"registered agent identity is `{project_name}`" in instructions
+
+
+@pytest.mark.parametrize("reserved_token", _RESERVED_TEMPLATE_TOKENS)
+def test_cayu_new_preserves_reserved_tokens_in_an_explicit_agent_identity(
+    tmp_path: Path,
+    reserved_token: str,
+) -> None:
+    agent_name = f"agent{reserved_token}"
+    assert (
+        main(
+            [
+                "new",
+                "project",
+                "--agent-name",
+                agent_name,
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    project = tmp_path / "project"
+
+    assert 'name = "project"' in (project / "pyproject.toml").read_text()
+    assert f'name="{agent_name}"' in (project / "agents" / "agent.py").read_text()
+    assert f'agent_name="{agent_name}"' in (project / "tests" / "test_agent.py").read_text()
+    assert f'agent_name="{agent_name}"' in (project / "evals" / "agent.py").read_text()
+    readme = " ".join((project / "README.md").read_text().split())
+    assert f"registered agent identity is `{agent_name}`" in readme
+    instructions = " ".join((project / "AGENTS.md").read_text().split())
+    assert f"registered agent identity is `{agent_name}`" in instructions
+
+
 def test_scaffolded_default_eval_runs_from_nested_directory_without_api_keys(
     tmp_path: Path,
     monkeypatch,
@@ -487,3 +598,25 @@ def test_cayu_new_refuses_an_existing_file(tmp_path: Path) -> None:
 def test_cayu_new_rejects_invalid_names(tmp_path: Path) -> None:
     assert main(["new", "../escape", "--dir", str(tmp_path)]) == 1
     assert main(["new", "has space", "--dir", str(tmp_path)]) == 1
+
+
+def test_cayu_new_rejects_an_invalid_explicit_agent_name_before_creating_files(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    assert (
+        main(
+            [
+                "new",
+                "valid-project",
+                "--agent-name",
+                "code review agent",
+                "--dir",
+                str(tmp_path),
+            ]
+        )
+        == 1
+    )
+
+    assert "invalid agent name 'code review agent'" in capsys.readouterr().err
+    assert not (tmp_path / "valid-project").exists()
