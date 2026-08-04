@@ -14,7 +14,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import copy_json_value, require_clean_nonblank
-from cayu.artifacts import ArtifactMetadata
+from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
 from cayu.evals.assertions import EvalAssertion, SessionStatusIs
@@ -752,6 +752,7 @@ async def _capture_probes(
     workspace_available = False
     workspace_files: dict[str, bytes | None] = {}
     workspace_file_stats: dict[str, WorkspaceFileProbe] = {}
+    workspace_unavailable_paths: list[str] = []
     workspace = getattr(env, "workspace", None)
     if requirements.workspace_paths and workspace is not None:
         workspace_available = True
@@ -770,24 +771,32 @@ async def _capture_probes(
                     truncated=truncated,
                     sha256=hashlib.sha256(content).hexdigest(),
                 )
-            except Exception:
-                # Absent/unreadable: record the path as probed-but-missing (None), distinct
-                # from "never probed" (key absent), which the assertion reports differently.
+            except FileNotFoundError:
+                # Confirmed absence is negative evidence. Other failures are retained
+                # separately because they did not observe whether the file exists.
                 workspace_files[path] = None
+            except Exception:
+                workspace_unavailable_paths.append(path)
 
     artifacts_available = False
     artifacts: list[ArtifactMetadata] = []
+    artifact_scopes_captured: list[ArtifactScope] = []
+    artifact_scopes_truncated: list[ArtifactScope] = []
+    artifact_scopes_unavailable: list[ArtifactScope] = []
     artifact_store = getattr(env, "artifact_store", None)
     if requirements.artifact_scopes and artifact_store is not None:
         artifacts_available = True
         seen_ids: set[str] = set()
-        for scope in requirements.artifact_scopes:
+        for scope in sorted(requirements.artifact_scopes, key=str):
             try:
                 listed = await artifact_store.list(scope=scope)
             except Exception:
-                # Degrade like the per-path workspace reads: a store error fails the
-                # affected assertion (it sees no artifacts), never crashes the eval case.
+                artifact_scopes_unavailable.append(scope)
                 continue
+            if listed.truncated:
+                artifact_scopes_truncated.append(scope)
+            else:
+                artifact_scopes_captured.append(scope)
             for artifact in listed.artifacts:
                 if artifact.id not in seen_ids:
                     seen_ids.add(artifact.id)
@@ -797,7 +806,11 @@ async def _capture_probes(
         workspace_available=workspace_available,
         workspace_files=workspace_files,
         workspace_file_stats=workspace_file_stats,
+        workspace_unavailable_paths=tuple(workspace_unavailable_paths),
         artifacts_available=artifacts_available,
+        artifact_scopes_captured=tuple(artifact_scopes_captured),
+        artifact_scopes_truncated=tuple(artifact_scopes_truncated),
+        artifact_scopes_unavailable=tuple(artifact_scopes_unavailable),
         artifacts=tuple(artifacts),
     )
 

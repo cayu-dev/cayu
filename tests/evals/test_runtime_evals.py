@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from datetime import UTC, datetime
@@ -60,6 +61,7 @@ from cayu import (
     ToolNotCalled,
     ToolResult,
     ToolResultContains,
+    ToolsCalledInOrder,
     ToolSpec,
     Trajectory,
     TrajectoryProbes,
@@ -75,7 +77,7 @@ from cayu import (
     write_html_report,
 )
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
-from cayu.artifacts import ArtifactMetadata, ArtifactScope
+from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactScope
 from cayu.cli import main
 from cayu.evals import (
     LLMJudge,
@@ -162,6 +164,15 @@ def _context(
         metadata=metadata or {},
     )
     return EvalContext(trajectory=trajectory, suite_id="s", case_id="c", metadata=metadata or {})
+
+
+def _workspace_stat(content: bytes, *, total_bytes: int | None = None) -> WorkspaceFileProbe:
+    total = len(content) if total_bytes is None else total_bytes
+    return WorkspaceFileProbe(
+        total_bytes=total,
+        truncated=len(content) < total,
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
 
 
 def _trial_result(
@@ -351,6 +362,7 @@ def test_eval_suite_asserts_tool_trajectory():
                 assertions=[
                     SessionCompleted(),
                     ToolCalled("echo"),
+                    ToolsCalledInOrder(["echo"]),
                     ToolArgsContain("echo", {"text": "hi"}),
                     ToolResultContains("echo", "echo: hi"),
                     FinalOutputContains("echoed hi"),
@@ -979,7 +991,11 @@ def test_artifact_created_scope_none_ignores_prior_env_artifact():
     )
     context = _context(
         session=_session(session_id="sess_1", environment_name="local"),
-        probes=TrajectoryProbes(artifacts_available=True, artifacts=(prior,)),
+        probes=TrajectoryProbes(
+            artifacts_available=True,
+            artifact_scopes_captured=(ArtifactScope.SESSION, ArtifactScope.ENVIRONMENT),
+            artifacts=(prior,),
+        ),
     )
     result = asyncio.run(ArtifactCreated(filename="out.txt").evaluate(context))
     assert result.passed is False
@@ -1025,7 +1041,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert EVAL_SCHEMA_VERSION == 4
+    assert EVAL_SCHEMA_VERSION == 5
     assert document["schema_version"] == EVAL_SCHEMA_VERSION
     usage = document["cases"][0]["trials"][0]["usage_summary"]["usage"]
     assert set(usage) == {
@@ -1047,7 +1063,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     assert load_eval_run(output) == result  # round-trips with the new fields
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3])
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4])
 def test_load_eval_run_rejects_prerelease_schema_versions(tmp_path, schema_version):
     run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
     data = json.loads(eval_run_to_json(run))
@@ -1565,7 +1581,9 @@ def test_trajectory_json_round_trip(tmp_path):
         probes=TrajectoryProbes(
             workspace_available=True,
             workspace_files={"a.txt": b"hello", "missing.txt": None},
+            workspace_file_stats={"a.txt": _workspace_stat(b"hello")},
             artifacts_available=True,
+            artifact_scopes_captured=(ArtifactScope.SESSION,),
             artifacts=(
                 ArtifactMetadata(id="art_1", filename="o.txt", size_bytes=5, session_id="root"),
             ),
@@ -2266,7 +2284,7 @@ def test_load_trajectory_rejects_unversioned_preview_export(tmp_path):
         load_trajectory(path)
 
 
-@pytest.mark.parametrize("schema_version", [0, 2, "1", True])
+@pytest.mark.parametrize("schema_version", [0, 1, 3, "2", True])
 def test_load_trajectory_rejects_unsupported_schema_version(tmp_path, schema_version):
     path = tmp_path / "unsupported-trajectory.json"
     path.write_text(
@@ -2290,7 +2308,9 @@ def test_workspace_assertions_read_captured_probes():
     present = _context(
         session=_session(),
         probes=TrajectoryProbes(
-            workspace_available=True, workspace_files={"f.txt": b"hello world"}
+            workspace_available=True,
+            workspace_files={"f.txt": b"hello world"},
+            workspace_file_stats={"f.txt": _workspace_stat(b"hello world")},
         ),
     )
     assert asyncio.run(WorkspaceFileExists("f.txt").evaluate(present)).passed is True
@@ -2305,8 +2325,9 @@ def test_workspace_assertions_read_captured_probes():
 
     no_workspace = _context(session=_session(), probes=TrajectoryProbes(workspace_available=False))
     result = asyncio.run(WorkspaceFileExists("f.txt").evaluate(no_workspace))
-    assert result.passed is False
-    assert "No workspace" in result.message
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert result.score is None
+    assert "not captured" in result.message
 
 
 def test_workspace_assertion_distinguishes_uncaptured_from_absent():
@@ -2314,12 +2335,16 @@ def test_workspace_assertion_distinguishes_uncaptured_from_absent():
     # distinct from a captured-but-absent file (value None -> "not found"/"could not read").
     uncaptured = _context(
         session=_session(),
-        probes=TrajectoryProbes(workspace_available=True, workspace_files={"other.txt": b"x"}),
+        probes=TrajectoryProbes(
+            workspace_available=True,
+            workspace_files={"other.txt": b"x"},
+            workspace_file_stats={"other.txt": _workspace_stat(b"x")},
+        ),
     )
     r_exists = asyncio.run(WorkspaceFileExists("missing.txt").evaluate(uncaptured))
-    assert r_exists.passed is False and "not captured" in r_exists.message
+    assert r_exists.outcome is EvalOutcome.UNAVAILABLE and "not captured" in r_exists.message
     r_contains = asyncio.run(WorkspaceFileContains("missing.txt", "x").evaluate(uncaptured))
-    assert r_contains.passed is False and "not captured" in r_contains.message
+    assert r_contains.outcome is EvalOutcome.UNAVAILABLE and "not captured" in r_contains.message
 
     absent = _context(
         session=_session(),
@@ -2328,6 +2353,141 @@ def test_workspace_assertion_distinguishes_uncaptured_from_absent():
     r_absent = asyncio.run(WorkspaceFileExists("missing.txt").evaluate(absent))
     assert r_absent.passed is False
     assert "not found" in r_absent.message and "not captured" not in r_absent.message
+
+
+def test_historical_probe_assertions_are_unavailable_without_fake_scores():
+    trajectory = _completed_trajectory("historical")
+    assertions = (
+        WorkspaceFileExists("result.txt"),
+        WorkspaceFileContains("result.txt", "done"),
+        ArtifactCreated(filename="result.json"),
+    )
+
+    results = asyncio.run(evaluate_assertions(trajectory, assertions))
+
+    assert [result.outcome for result in results] == [EvalOutcome.UNAVAILABLE] * 3
+    assert [result.score for result in results] == [None, None, None]
+
+
+def test_artifact_assertion_distinguishes_captured_empty_scope_from_missing_evidence():
+    session = _session(session_id="root", environment_name="local")
+    captured_empty = _context(
+        session=session,
+        probes=TrajectoryProbes(
+            artifacts_available=True,
+            artifact_scopes_captured=(ArtifactScope.SESSION,),
+        ),
+    )
+    not_captured = _context(
+        session=session,
+        probes=TrajectoryProbes(
+            artifacts_available=True,
+            artifact_scopes_captured=(ArtifactScope.ENVIRONMENT,),
+        ),
+    )
+    unavailable = _context(
+        session=session,
+        probes=TrajectoryProbes(
+            artifacts_available=True,
+            artifact_scopes_unavailable=(ArtifactScope.SESSION,),
+        ),
+    )
+
+    observed_absence = asyncio.run(ArtifactCreated().evaluate(captured_empty))
+    missing_scope = asyncio.run(ArtifactCreated().evaluate(not_captured))
+    capture_failure = asyncio.run(ArtifactCreated().evaluate(unavailable))
+
+    assert observed_absence.outcome is EvalOutcome.FAILED
+    assert observed_absence.score == 0.0
+    assert missing_scope.outcome is EvalOutcome.UNAVAILABLE
+    assert missing_scope.score is None
+    assert capture_failure.outcome is EvalOutcome.UNAVAILABLE
+    assert capture_failure.score is None
+
+
+def test_workspace_contains_is_unavailable_when_a_truncated_capture_cannot_decide():
+    content = b"prefix"
+    context = _context(
+        session=_session(),
+        probes=TrajectoryProbes(
+            workspace_available=True,
+            workspace_files={"result.txt": content},
+            workspace_file_stats={
+                "result.txt": _workspace_stat(content, total_bytes=len(content) + 100)
+            },
+        ),
+    )
+
+    result = asyncio.run(WorkspaceFileContains("result.txt", "beyond-window").evaluate(context))
+
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert result.score is None
+
+
+def test_workspace_contains_is_unavailable_when_truncation_splits_encoded_text():
+    content = b"prefix\xc3"
+    context = _context(
+        session=_session(),
+        probes=TrajectoryProbes(
+            workspace_available=True,
+            workspace_files={"result.txt": content},
+            workspace_file_stats={
+                "result.txt": _workspace_stat(content, total_bytes=len(content) + 1)
+            },
+        ),
+    )
+
+    result = asyncio.run(WorkspaceFileContains("result.txt", "beyond-window").evaluate(context))
+
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert result.score is None
+    assert "truncated" in result.message
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {
+            "workspace_available": True,
+            "workspace_files": {"result.txt": b"captured"},
+        },
+        {
+            "workspace_available": True,
+            "workspace_files": {"result.txt": None},
+            "workspace_unavailable_paths": ("result.txt",),
+        },
+        {
+            "artifacts_available": True,
+            "artifact_scopes_captured": (ArtifactScope.SESSION,),
+            "artifact_scopes_unavailable": (ArtifactScope.SESSION,),
+        },
+        {
+            "artifacts_available": True,
+            "artifact_scopes_captured": (ArtifactScope.SESSION,),
+            "artifact_scopes_truncated": (ArtifactScope.SESSION,),
+        },
+        {
+            "artifacts_available": True,
+            "artifact_scopes_truncated": (ArtifactScope.SESSION,),
+            "artifact_scopes_unavailable": (ArtifactScope.SESSION,),
+        },
+        {
+            "artifacts_available": True,
+            "artifacts": (
+                ArtifactMetadata(
+                    id="art_unattributed",
+                    filename="result.txt",
+                    size_bytes=1,
+                    scope=ArtifactScope.SESSION,
+                    session_id="root",
+                ),
+            ),
+        },
+    ],
+)
+def test_trajectory_probes_rejects_impossible_capture_provenance(document):
+    with pytest.raises(ValidationError):
+        TrajectoryProbes.model_validate(document)
 
 
 def test_eval_case_captures_sub_agent_children():
@@ -2763,7 +2923,89 @@ def test_capture_probes_survives_artifact_store_error():
         )
     )
     assert probes.artifacts_available is True
+    assert probes.artifact_scopes_captured == ()
+    assert probes.artifact_scopes_unavailable == (ArtifactScope.SESSION,)
     assert probes.artifacts == ()
+    result = asyncio.run(ArtifactCreated().evaluate(_context(session=_session(), probes=probes)))
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert result.score is None
+
+
+def test_capture_probes_preserves_truncated_artifact_listing_as_partial_evidence():
+    from cayu.evals.models import ProbeRequirements
+    from cayu.evals.runner import _capture_probes
+
+    class _TruncatedStore:
+        async def list(self, *, scope=None):
+            return ArtifactListResult(artifacts=(), total_count=2, truncated=True)
+
+    class _FakeApp:
+        def get_environment(self, name):
+            return SimpleNamespace(
+                environment=SimpleNamespace(artifact_store=_TruncatedStore(), workspace=None)
+            )
+
+    probes = asyncio.run(
+        _capture_probes(
+            _FakeApp(),
+            _session(environment_name="local"),
+            ProbeRequirements(artifact_scopes=frozenset({ArtifactScope.SESSION})),
+        )
+    )
+    result = asyncio.run(ArtifactCreated().evaluate(_context(session=_session(), probes=probes)))
+
+    assert probes.artifact_scopes_captured == ()
+    assert probes.artifact_scopes_truncated == (ArtifactScope.SESSION,)
+    assert probes.artifact_scopes_unavailable == ()
+    assert probes.artifacts == ()
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert result.score is None
+
+
+def test_truncated_artifact_listing_can_prove_a_positive_assertion():
+    from cayu.evals.models import ProbeRequirements
+    from cayu.evals.runner import _capture_probes
+
+    retained = ArtifactMetadata(
+        id="art_result",
+        filename="result.json",
+        size_bytes=2,
+        scope=ArtifactScope.SESSION,
+        session_id="sess_eval",
+    )
+
+    class _TruncatedStore:
+        async def list(self, *, scope=None):
+            return ArtifactListResult(
+                artifacts=(retained,),
+                total_count=2,
+                truncated=True,
+            )
+
+    class _FakeApp:
+        def get_environment(self, name):
+            return SimpleNamespace(
+                environment=SimpleNamespace(artifact_store=_TruncatedStore(), workspace=None)
+            )
+
+    session = _session(session_id="sess_eval", environment_name="local")
+    probes = asyncio.run(
+        _capture_probes(
+            _FakeApp(),
+            session,
+            ProbeRequirements(artifact_scopes=frozenset({ArtifactScope.SESSION})),
+        )
+    )
+    result = asyncio.run(
+        ArtifactCreated(filename="result.json").evaluate(_context(session=session, probes=probes))
+    )
+
+    assert probes.artifact_scopes_captured == ()
+    assert probes.artifact_scopes_truncated == (ArtifactScope.SESSION,)
+    assert probes.artifact_scopes_unavailable == ()
+    assert probes.artifacts == (retained,)
+    assert result.outcome is EvalOutcome.PASSED
+    assert result.score == 1.0
 
 
 def test_run_then_save_reload_replay(tmp_path):
@@ -2998,6 +3240,31 @@ def test_capture_probes_missing_file_has_no_stat():
     assert "gone.txt" not in probes.workspace_file_stats
     assert probes.workspace_files["present.txt"] == b"x"
     assert "present.txt" in probes.workspace_file_stats
+
+
+def test_capture_probes_preserves_workspace_read_failure_as_unavailable():
+    from cayu.evals.models import ProbeRequirements
+    from cayu.evals.runner import _capture_probes
+
+    class _UnavailableWorkspace:
+        async def read_bytes(self, path: str, *, max_bytes: int | None = None):
+            raise RuntimeError("workspace backend down")
+
+    probes = asyncio.run(
+        _capture_probes(
+            _probe_app(_UnavailableWorkspace()),
+            _session(environment_name="local"),
+            ProbeRequirements(workspace_paths=frozenset({"result.txt"})),
+        )
+    )
+    result = asyncio.run(
+        WorkspaceFileExists("result.txt").evaluate(_context(session=_session(), probes=probes))
+    )
+
+    assert probes.workspace_files == {}
+    assert probes.workspace_unavailable_paths == ("result.txt",)
+    assert result.outcome is EvalOutcome.UNAVAILABLE
+    assert result.score is None
 
 
 def _seed_parent_with_children(store: InMemorySessionStore, n: int) -> None:

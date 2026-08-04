@@ -134,10 +134,12 @@ operation before those evals can pass. Interrupted evals additionally require
 the narrower `supports_runner_owned_interrupted_evidence` operation; the runner
 does not fall back to generic unbounded event or transcript queries.
 
-Persisted `EvalRun` baselines advance from schema version 3 to version 4 for the
-lossless result graph and explicit assertion outcomes. Versions 1–3 are
-prerelease formats and must be regenerated; Cayu does not migrate or guess at
-their meaning.
+Persisted `EvalRun` baselines advance from schema version 3 to version 5: version
+4 introduced the lossless result graph and explicit assertion outcomes, while
+version 5 records conclusive workspace and artifact capture provenance in every
+retained trajectory. Standalone trajectory documents advance from version 1 to
+version 2 for the same provenance contract. Older prerelease documents must be
+regenerated; Cayu does not migrate or guess at their meaning.
 
 ### Remote environment allocation fails closed without exact recovery
 

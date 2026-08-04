@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from typing import Any
 
@@ -187,7 +187,10 @@ class ChildSessionCompleted(EvalAssertion):
             f"got {matching_count}."
         )
         if context.trajectory.children_incomplete:
-            message += " Child capture is incomplete; additional matching sessions may exist."
+            return self.unavailable(
+                message + " Child capture is incomplete; additional matching sessions may exist.",
+                metadata=metadata,
+            )
         return self.failed(message, metadata=metadata)
 
 
@@ -366,6 +369,43 @@ class ToolNotCalled(ToolCalled):
         return self.failed(
             f"Tool {self.tool_name} was called but was expected not to be.",
             metadata=result.metadata,
+        )
+
+
+class ToolsCalledInOrder(EvalAssertion):
+    """Require exact model-requested tool names in transcript order."""
+
+    def __init__(self, tool_names: Iterable[str]) -> None:
+        if isinstance(tool_names, str | bytes):
+            raise TypeError("tool_names must be an iterable of tool names, not text.")
+        try:
+            values = tuple(tool_names)
+        except TypeError as exc:
+            raise TypeError("tool_names must be an iterable of tool names.") from exc
+        self.tool_names = tuple(
+            _require_text(tool_name, f"tool_names[{index}]")
+            for index, tool_name in enumerate(values)
+        )
+
+    async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        actual = tuple(
+            part.tool_name
+            for message in context.transcript
+            for part in message.content
+            if type(part) is ToolCallPart
+        )
+        metadata = {
+            "expected": list(self.tool_names),
+            "actual": list(actual),
+        }
+        if actual == self.tool_names:
+            return self.passed(
+                "Tool calls matched the exact expected transcript order.",
+                metadata=metadata,
+            )
+        return self.failed(
+            "Tool calls did not match the exact expected transcript order.",
+            metadata=metadata,
         )
 
 
@@ -564,12 +604,15 @@ class WorkspaceFileExists(EvalAssertion):
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         probes = context.probes
         if not probes.workspace_available:
-            return self.failed("No workspace is configured for the eval session.")
-        # A probed path is always a key (None = absent/unreadable); a missing key means the
-        # path was never captured — only reachable when replaying a trajectory against an
-        # assertion whose path the original run didn't probe. Report that distinctly.
+            return self.unavailable("Workspace evidence was not captured for this trajectory.")
+        if self.path in probes.workspace_unavailable_paths:
+            return self.unavailable(f"Workspace path capture was unavailable: {self.path}")
+        # A captured path is always a key (None = observed absent). A missing key means the
+        # original trajectory never probed the assertion's requested path.
         if self.path not in probes.workspace_files:
-            return self.failed(f"Workspace path was not captured in this trajectory: {self.path}")
+            return self.unavailable(
+                f"Workspace path was not captured in this trajectory: {self.path}"
+            )
         if probes.workspace_files[self.path] is None:
             return self.failed(f"Workspace file not found: {self.path}")
         return self.passed(f"Workspace file exists: {self.path}")
@@ -594,21 +637,43 @@ class WorkspaceFileContains(EvalAssertion):
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         probes = context.probes
         if not probes.workspace_available:
-            return self.failed("No workspace is configured for the eval session.")
+            return self.unavailable("Workspace evidence was not captured for this trajectory.")
+        if self.path in probes.workspace_unavailable_paths:
+            return self.unavailable(f"Workspace path capture was unavailable: {self.path}")
         if self.path not in probes.workspace_files:
-            return self.failed(f"Workspace path was not captured in this trajectory: {self.path}")
+            return self.unavailable(
+                f"Workspace path was not captured in this trajectory: {self.path}"
+            )
         content_bytes = probes.workspace_files[self.path]
         if content_bytes is None:
-            return self.failed(f"Could not read workspace file: {self.path}")
+            return self.failed(f"Workspace file not found: {self.path}")
+        stat = probes.workspace_file_stats[self.path]
         try:
             content = content_bytes.decode(self.encoding)
         except Exception as exc:
+            if stat.truncated:
+                return self.unavailable(
+                    f"Workspace file {self.path} was truncated before it could be decoded.",
+                    metadata={
+                        "captured_bytes": len(content_bytes),
+                        "total_bytes": stat.total_bytes,
+                        "error": str(exc),
+                    },
+                )
             return self.failed(
                 f"Could not decode workspace file: {self.path}",
                 metadata={"error": str(exc)},
             )
         if self.text in content:
             return self.passed(f"Workspace file {self.path} contains expected text.")
+        if stat.truncated:
+            return self.unavailable(
+                f"Workspace file {self.path} was truncated before the expected text was found.",
+                metadata={
+                    "captured_bytes": len(content_bytes),
+                    "total_bytes": stat.total_bytes,
+                },
+            )
         return self.failed(
             f"Workspace file {self.path} did not contain expected text.",
             metadata={"expected": self.text},
@@ -636,13 +701,21 @@ class ArtifactCreated(EvalAssertion):
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
         probes = context.probes
         if not probes.artifacts_available:
-            return self.failed("No artifact store is configured for the eval session.")
+            return self.unavailable("Artifact evidence was not captured for this trajectory.")
         session_id = context.session.id if context.session is not None else None
         environment_name = context.session.environment_name if context.session is not None else None
         # scope=None means "an artifact this session created", so it must not match a
         # prior case's ENVIRONMENT-scoped artifact (those persist across cases in the
         # same environment). Request scope=ArtifactScope.ENVIRONMENT explicitly for that.
         scope = ArtifactScope.SESSION if self.scope is None else self.scope
+        if scope in probes.artifact_scopes_unavailable:
+            return self.unavailable(f"Artifact capture was unavailable for scope {scope.value}.")
+        scope_captured = scope in probes.artifact_scopes_captured
+        scope_truncated = scope in probes.artifact_scopes_truncated
+        if not scope_captured and not scope_truncated:
+            return self.unavailable(
+                f"Artifact scope was not captured in this trajectory: {scope.value}"
+            )
         artifacts = [
             artifact
             for artifact in probes.artifacts
@@ -665,6 +738,12 @@ class ArtifactCreated(EvalAssertion):
             return self.passed(
                 f"Observed {count} matching artifact(s).",
                 metadata={"artifact_ids": [artifact.id for artifact in artifacts]},
+            )
+        if scope_truncated:
+            return self.unavailable(
+                f"Artifact listing for scope {scope.value} was truncated before enough "
+                "matching artifacts were observed.",
+                metadata={"count": count, "minimum": self.min_count},
             )
         return self.failed(
             f"Expected at least {self.min_count} matching artifact(s), got {count}.",

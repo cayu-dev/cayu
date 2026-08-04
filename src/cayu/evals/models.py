@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,15 +36,15 @@ from cayu.runtime.usage import (
 
 # Version of the persisted EvalRun JSON shape. Bump this by hand whenever the
 # saved structure changes incompatibly so load_eval_run can reject a baseline
-# written for a different contract instead of silently misreading it. Version 4
-# preserves every trial and represents unavailable/error outcomes without fake
-# zero scores. Earlier prerelease formats are intentionally not migrated.
-EVAL_SCHEMA_VERSION = 4
+# written for a different contract instead of silently misreading it. Version 5
+# adds conclusive workspace/artifact capture provenance to retained trajectories;
+# earlier prerelease formats are intentionally not migrated.
+EVAL_SCHEMA_VERSION = 5
 
 # Version of the standalone trajectory JSON document written by
-# write_trajectory_json. Trajectories were an unversioned preview before v1;
-# load_trajectory intentionally does not guess or migrate those shapes.
-TRAJECTORY_SCHEMA_VERSION = 1
+# write_trajectory_json. Version 2 adds conclusive workspace/artifact capture
+# provenance; load_trajectory intentionally does not guess or migrate older shapes.
+TRAJECTORY_SCHEMA_VERSION = 2
 
 # Cap on the bytes copied out of a probed workspace file into the serialized trajectory. A file
 # larger than this is captured truncated — with its true size and a content hash still recorded —
@@ -498,7 +499,7 @@ class EvalRun(BaseModel):
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
-    schema_version: Literal[4] = EVAL_SCHEMA_VERSION
+    schema_version: Literal[5] = EVAL_SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     suite_id: str
     status: EvalStatus
@@ -800,16 +801,53 @@ class TrajectoryProbes(BaseModel):
     model_config = ConfigDict(extra="forbid", ser_json_bytes="base64", val_json_bytes="base64")
 
     workspace_available: StrictBool = False
-    # path -> file bytes (capped at WORKSPACE_PROBE_MAX_BYTES), or None when the file is
-    # absent/unreadable. A declared path is always a key (so "missing key" means it was never
-    # probed), distinct from a None value.
+    # path -> file bytes (capped at WORKSPACE_PROBE_MAX_BYTES), or None only when absence was
+    # observed. A missing key means the path was never captured; operational failures are
+    # retained separately so neither case becomes false negative evidence.
     workspace_files: dict[str, bytes | None] = Field(default_factory=dict)
-    # path -> stat/hash for each present, readable probed file. A path is absent here when the
-    # file was missing/unreadable (its workspace_files value is None); consult total_bytes /
+    # path -> stat/hash for every captured file. A path is absent here only when the file was
+    # observed missing (its workspace_files value is None); consult total_bytes /
     # truncated to tell a fully-captured file from one whose bytes were truncated to the cap.
     workspace_file_stats: dict[str, WorkspaceFileProbe] = Field(default_factory=dict)
+    workspace_unavailable_paths: tuple[str, ...] = Field(default_factory=tuple)
     artifacts_available: StrictBool = False
+    artifact_scopes_captured: tuple[ArtifactScope, ...] = Field(default_factory=tuple)
+    artifact_scopes_truncated: tuple[ArtifactScope, ...] = Field(default_factory=tuple)
+    artifact_scopes_unavailable: tuple[ArtifactScope, ...] = Field(default_factory=tuple)
     artifacts: tuple[ArtifactMetadata, ...] = Field(default_factory=tuple)
+
+    @field_validator("workspace_unavailable_paths", mode="before")
+    @classmethod
+    def validate_workspace_unavailable_paths(cls, value) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str | bytes) or not isinstance(value, Iterable):
+            raise ValueError("workspace_unavailable_paths must be a sequence of paths.")
+        paths: list[str] = []
+        for index, path in enumerate(value):
+            if type(path) is not str:
+                raise ValueError("workspace_unavailable_paths must contain only strings.")
+            paths.append(require_clean_nonblank(path, f"workspace_unavailable_paths[{index}]"))
+        if len(paths) != len(set(paths)):
+            raise ValueError("workspace_unavailable_paths must not contain duplicates.")
+        return tuple(sorted(paths))
+
+    @field_validator(
+        "artifact_scopes_captured",
+        "artifact_scopes_truncated",
+        "artifact_scopes_unavailable",
+        mode="before",
+    )
+    @classmethod
+    def validate_artifact_scope_sets(cls, value, info) -> tuple[ArtifactScope, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str | bytes) or not isinstance(value, Iterable):
+            raise ValueError(f"{info.field_name} must be a sequence of artifact scopes.")
+        scopes = tuple(ArtifactScope(scope) for scope in value)
+        if len(scopes) != len(set(scopes)):
+            raise ValueError(f"{info.field_name} must not contain duplicates.")
+        return tuple(sorted(scopes, key=str))
 
     @field_validator("workspace_file_stats", mode="before")
     @classmethod
@@ -825,6 +863,56 @@ class TrajectoryProbes(BaseModel):
     @classmethod
     def revalidate_artifacts(cls, value):
         return _revalidate_model_iterable(value, ArtifactMetadata)
+
+    @model_validator(mode="after")
+    def validate_capture_provenance(self) -> TrajectoryProbes:
+        if not self.workspace_available and (
+            self.workspace_files or self.workspace_file_stats or self.workspace_unavailable_paths
+        ):
+            raise ValueError("Unavailable workspace probes cannot carry captured path evidence.")
+        overlap = set(self.workspace_files).intersection(self.workspace_unavailable_paths)
+        if overlap:
+            raise ValueError("A workspace path cannot be both captured and unavailable.")
+        captured_files = {
+            path: content for path, content in self.workspace_files.items() if content is not None
+        }
+        if set(self.workspace_file_stats) != set(captured_files):
+            raise ValueError("Every captured workspace file requires exactly one integrity record.")
+        for path, content in captured_files.items():
+            stat = self.workspace_file_stats[path]
+            captured_bytes = len(content)
+            if stat.total_bytes < captured_bytes:
+                raise ValueError("Workspace file size cannot be smaller than its captured bytes.")
+            if stat.truncated != (captured_bytes < stat.total_bytes):
+                raise ValueError(
+                    "Workspace truncation state does not match its captured byte count."
+                )
+            if stat.sha256 != hashlib.sha256(content).hexdigest():
+                raise ValueError("Workspace file digest does not match its captured bytes.")
+
+        if not self.artifacts_available and (
+            self.artifact_scopes_captured
+            or self.artifact_scopes_truncated
+            or self.artifact_scopes_unavailable
+            or self.artifacts
+        ):
+            raise ValueError("Unavailable artifact probes cannot carry captured scope evidence.")
+        captured_scopes = set(self.artifact_scopes_captured)
+        truncated_scopes = set(self.artifact_scopes_truncated)
+        unavailable_scopes = set(self.artifact_scopes_unavailable)
+        if (
+            captured_scopes.intersection(truncated_scopes)
+            or captured_scopes.intersection(unavailable_scopes)
+            or truncated_scopes.intersection(unavailable_scopes)
+        ):
+            raise ValueError("An artifact scope must have exactly one capture state.")
+        retained_scopes = captured_scopes | truncated_scopes
+        if any(artifact.scope not in retained_scopes for artifact in self.artifacts):
+            raise ValueError("Every retained artifact must belong to a captured or partial scope.")
+        artifact_ids = tuple(artifact.id for artifact in self.artifacts)
+        if len(artifact_ids) != len(set(artifact_ids)):
+            raise ValueError("Captured artifact identities must be unique.")
+        return self
 
 
 class Trajectory(BaseModel):

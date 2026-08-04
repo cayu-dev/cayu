@@ -7,12 +7,16 @@ import pytest
 from cayu import (
     ChildSessionCompleted,
     EvalContext,
+    EvalOutcome,
     Event,
     EventPayloadContains,
     EventType,
+    Message,
     Session,
     SessionStatus,
     SessionUsageSummary,
+    ToolCallPart,
+    ToolsCalledInOrder,
     Trajectory,
     UsageMetrics,
     UsageRecorded,
@@ -93,6 +97,66 @@ def test_event_payload_contains_counts_nested_matches_and_reports_observations_o
         "matching_count": 2,
         "observed_payloads": observed_payloads,
     }
+
+
+def test_tools_called_in_order_uses_exact_transcript_order_not_event_scheduler_order():
+    transcript = (
+        Message.tool_call(
+            calls=[
+                ToolCallPart(
+                    tool_call_id="search-call",
+                    tool_name="search",
+                    arguments={"query": "cayu"},
+                ),
+                ToolCallPart(
+                    tool_call_id="read-call",
+                    tool_name="read_file",
+                    arguments={"path": "README.md"},
+                ),
+            ]
+        ),
+        Message.tool_call(
+            tool_call_id="submit-call",
+            tool_name="submit",
+            arguments={},
+        ),
+    )
+    # Parallel execution may start in a different scheduler order. The assertion
+    # deliberately ignores it and follows the model-authored transcript parts.
+    events = (
+        Event(type=EventType.TOOL_CALL_STARTED, session_id="s", tool_name="read_file"),
+        Event(type=EventType.TOOL_CALL_STARTED, session_id="s", tool_name="search"),
+        Event(type=EventType.TOOL_CALL_STARTED, session_id="s", tool_name="submit"),
+    )
+    context = _context(Trajectory(events=events, transcript=transcript))
+
+    matched = asyncio.run(ToolsCalledInOrder(["search", "read_file", "submit"]).evaluate(context))
+    reordered = asyncio.run(ToolsCalledInOrder(["read_file", "search", "submit"]).evaluate(context))
+    missing = asyncio.run(ToolsCalledInOrder(["search", "read_file"]).evaluate(context))
+    extra = asyncio.run(
+        ToolsCalledInOrder(["search", "read_file", "submit", "archive"]).evaluate(context)
+    )
+
+    assert matched.passed is True
+    assert matched.metadata == {
+        "expected": ["search", "read_file", "submit"],
+        "actual": ["search", "read_file", "submit"],
+    }
+    assert reordered.passed is False
+    assert missing.passed is False
+    assert extra.passed is False
+
+
+def test_tools_called_in_order_accepts_an_exact_empty_trajectory():
+    result = asyncio.run(ToolsCalledInOrder([]).evaluate(_context(Trajectory())))
+    assert result.passed is True
+    assert result.metadata == {"expected": [], "actual": []}
+
+
+@pytest.mark.parametrize("value", ["search", b"search", 1, ["search", ""]])
+def test_tools_called_in_order_rejects_invalid_expectations(value):
+    with pytest.raises((TypeError, ValueError)):
+        ToolsCalledInOrder(value)
 
 
 @pytest.mark.parametrize(
@@ -201,6 +265,8 @@ def test_child_session_completed_filters_direct_children_and_reports_incomplete_
         ChildSessionCompleted(agent_name="helper", min_count=2).evaluate(context)
     )
     assert mismatch.passed is False
+    assert mismatch.outcome is EvalOutcome.UNAVAILABLE
+    assert mismatch.score is None
     assert "incomplete" in mismatch.message.lower()
     assert mismatch.metadata["matching_session_ids"] == ["child-completed"]
     assert mismatch.metadata["children_incomplete"] is True
