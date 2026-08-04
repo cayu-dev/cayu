@@ -35,6 +35,7 @@ from cayu import (
 )
 from cayu.evals import EvalAssertionResult, run_eval_case
 from cayu.providers import ModelStreamEvent
+from cayu.runtime.usage import SessionUsageSummary, session_usage_summary_payload
 
 
 def _app() -> CayuApp:
@@ -199,6 +200,7 @@ def _case_result(case_id: str, status: EvalStatus, score: float) -> EvalCaseResu
             ),
         ),
         evidence_complete=True,
+        usage_summary=session_usage_summary_payload(SessionUsageSummary(session_id="session-1")),
         started_at=now,
         completed_at=now,
     )

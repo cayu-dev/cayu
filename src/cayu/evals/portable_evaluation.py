@@ -129,6 +129,7 @@ def _evaluate_final_output(
             if matched
             else f"Final output did not {comparison.removesuffix('ed')} the expected text."
         ),
+        metadata={"matched": matched},
     )
 
 

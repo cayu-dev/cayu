@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from pydantic import (
     StrictBool,
     StrictFloat,
     StrictInt,
+    StrictStr,
     field_validator,
     model_validator,
 )
@@ -36,10 +38,10 @@ from cayu.runtime.usage import (
 
 # Version of the persisted EvalRun JSON shape. Bump this by hand whenever the
 # saved structure changes incompatibly so load_eval_run can reject a baseline
-# written for a different contract instead of silently misreading it. Version 5
-# adds conclusive workspace/artifact capture provenance to retained trajectories;
+# written for a different contract instead of silently misreading it. Version 7
+# binds portable runs to the corpus contract present before provider dispatch;
 # earlier prerelease formats are intentionally not migrated.
-EVAL_SCHEMA_VERSION = 5
+EVAL_SCHEMA_VERSION = 7
 
 # Version of the standalone trajectory JSON document written by
 # write_trajectory_json. Version 2 adds conclusive workspace/artifact capture
@@ -53,6 +55,9 @@ TRAJECTORY_SCHEMA_VERSION = 2
 WORKSPACE_PROBE_MAX_BYTES = 1 << 20  # 1 MiB
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+_EVAL_CONTENT_REVISION_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
+_EVAL_PORTABLE_ID_PATTERN = re.compile(r"[a-z][a-z0-9._-]{0,127}\Z", re.ASCII)
+_EVAL_RUN_CONTRACT_MAX_CASES = 1_000
 
 
 def _revalidate_model_instance(value: Any, model_type: type[_ModelT]) -> Any:
@@ -325,6 +330,8 @@ class EvalTrialResult(BaseModel):
                 raise ValueError(f"{self.status.value} trials require a concrete session_id.")
         if self.evidence_complete and self.session_id is None:
             raise ValueError("Complete trial evidence requires a concrete session_id.")
+        if self.evidence_complete and self.usage_summary is None:
+            raise ValueError("Complete trial evidence requires an exact usage_summary.")
         if self.usage_summary is not None and (
             self.session_id is None or self.usage_summary["session_id"] != self.session_id
         ):
@@ -500,12 +507,101 @@ class EvalCaseResult(BaseModel):
         return self
 
 
+class EvalCaseContractV1(BaseModel):
+    """One immutable case revision selected before an eval run starts."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    case_id: StrictStr
+    case_revision: StrictStr
+
+    @field_validator("case_id")
+    @classmethod
+    def validate_case_id(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if _EVAL_PORTABLE_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("case_id must be a portable lowercase identifier.")
+        return value
+
+    @field_validator("case_revision")
+    @classmethod
+    def validate_case_revision(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if _EVAL_CONTENT_REVISION_PATTERN.fullmatch(value) is None:
+            raise ValueError("case_revision must be a lowercase sha256 content revision.")
+        return value
+
+
+class EvalRunContractV1(BaseModel):
+    """Portable execution contract fixed before a corpus-backed run dispatches."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
+
+    schema_version: Literal[1] = 1
+    corpus_revision: StrictStr
+    target_key: StrictStr
+    suite_id: StrictStr
+    suite_revision: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None = None
+    trials: StrictInt = Field(ge=1, le=100)
+    timeout_seconds: StrictInt = Field(ge=1, le=3_600)
+    cases: tuple[EvalCaseContractV1, ...] = Field(
+        min_length=1,
+        max_length=_EVAL_RUN_CONTRACT_MAX_CASES,
+    )
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def validate_schema_version_type(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("schema_version must be the integer 1.")
+        return value
+
+    @field_validator("target_key", "suite_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if _EVAL_PORTABLE_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"{info.field_name} must be a portable lowercase identifier.")
+        return value
+
+    @field_validator(
+        "corpus_revision",
+        "suite_revision",
+        "evidence_policy_revision",
+        "pricing_profile_fingerprint",
+    )
+    @classmethod
+    def validate_revision(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        value = require_clean_nonblank(value, info.field_name)
+        if _EVAL_CONTENT_REVISION_PATTERN.fullmatch(value) is None:
+            raise ValueError(f"{info.field_name} must be a lowercase sha256 content revision.")
+        return value
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def revalidate_cases(cls, value):
+        if not isinstance(value, list | tuple):
+            raise ValueError("Eval run contract cases must be an ordered array.")
+        return _revalidate_model_iterable(value, EvalCaseContractV1)
+
+    @model_validator(mode="after")
+    def validate_case_contract(self) -> EvalRunContractV1:
+        case_ids = tuple(case.case_id for case in self.cases)
+        if case_ids != tuple(sorted(set(case_ids))):
+            raise ValueError("Eval run contract cases must be unique and sorted by case_id.")
+        return self
+
+
 class EvalRun(BaseModel):
     model_config = ConfigDict(extra="forbid", revalidate_instances="always")
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
-    schema_version: Literal[5] = EVAL_SCHEMA_VERSION
+    schema_version: Literal[7] = EVAL_SCHEMA_VERSION
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     suite_id: str
     status: EvalStatus
@@ -517,6 +613,7 @@ class EvalRun(BaseModel):
     completed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     duration_ms: StrictInt = Field(default=0, ge=0)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    run_contract: EvalRunContractV1 | None = None
 
     @field_validator("run_id", "suite_id")
     @classmethod
@@ -527,6 +624,11 @@ class EvalRun(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_json_value(value, "metadata")
+
+    @field_validator("run_contract", mode="before")
+    @classmethod
+    def revalidate_run_contract(cls, value):
+        return _revalidate_model_instance(value, EvalRunContractV1)
 
     @model_validator(mode="after")
     def validate_aggregate_contract(self) -> EvalRun:
@@ -546,6 +648,14 @@ class EvalRun(BaseModel):
         case_ids = tuple(case.case_id for case in self.cases)
         if len(case_ids) != len(set(case_ids)):
             raise ValueError("EvalRun case IDs must be unique.")
+        if self.run_contract is not None:
+            if self.run_contract.suite_id != self.suite_id:
+                raise ValueError("EvalRun suite_id must match its run contract.")
+            contract_case_ids = tuple(case.case_id for case in self.run_contract.cases)
+            if tuple(sorted(case_ids)) != contract_case_ids:
+                raise ValueError("EvalRun cases must match its complete run contract.")
+            if any(len(case.trials) != self.run_contract.trials for case in self.cases):
+                raise ValueError("EvalRun trial counts must match its run contract.")
         expected_status = aggregate_eval_status(case.status for case in self.cases)
         expected_score = aggregate_eval_score(case.score for case in self.cases)
         if self.status != expected_status:

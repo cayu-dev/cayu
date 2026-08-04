@@ -428,6 +428,94 @@ def test_evidence_rejects_stale_revision_and_numeric_schema_version():
 
 
 @pytest.mark.parametrize(
+    "trajectory_updates",
+    [
+        {"transcript": (), "final_output": ""},
+        {
+            "events": (
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id="private-root-session",
+                    payload={
+                        "provider_name": "provider-a",
+                        "model": "model-a",
+                        "usage_metrics": {
+                            "provider_name": "provider-a",
+                            "model": "model-a",
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "total_tokens": 15,
+                        },
+                    },
+                ),
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id="private-root-session",
+                    tool_name="different-tool",
+                    payload={"tool_call_id": "private-tool-call"},
+                ),
+                _terminal_event("private-root-session", SessionStatus.COMPLETED),
+            )
+        },
+        {
+            "events": (
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id="private-root-session",
+                    tool_name="lookup-secret-token",
+                    payload={"tool_call_id": "different-call"},
+                ),
+                _terminal_event("private-root-session", SessionStatus.COMPLETED),
+            )
+        },
+    ],
+)
+def test_contradictory_started_tool_evidence_is_unavailable(trajectory_updates):
+    source = _trajectory()
+    data = source.model_dump(mode="python")
+    data.update(trajectory_updates)
+    if "events" in trajectory_updates:
+        data["usage_summary"] = session_usage_summary(
+            "private-root-session",
+            list(data["events"]),
+        )
+    trajectory = Trajectory.model_validate(data)
+    view = project_assertion_evidence_view(
+        CayuApp(enable_logging=False),
+        trajectory,
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+
+    assert view.tool_evidence_state == "unavailable"
+    assert view.requested_tool_names == ()
+    assert view.started_tool_names == ()
+    assert view.tool_calls_started is None
+
+
+def test_requested_tool_without_a_started_event_remains_conclusive():
+    source = _trajectory()
+    data = source.model_dump(mode="python")
+    data["events"] = tuple(
+        event for event in source.events if event.type != EventType.TOOL_CALL_STARTED
+    )
+    data["usage_summary"] = session_usage_summary(
+        "private-root-session",
+        list(data["events"]),
+    )
+    trajectory = Trajectory.model_validate(data)
+    view = project_assertion_evidence_view(
+        CayuApp(enable_logging=False),
+        trajectory,
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+
+    assert view.tool_evidence_state == "complete"
+    assert view.requested_tool_names == ("lookup-secret-token",)
+    assert view.started_tool_names == ()
+    assert view.tool_calls_started == 0
+
+
+@pytest.mark.parametrize(
     ("updates", "match"),
     [
         (
@@ -437,6 +525,13 @@ def test_evidence_rejects_stale_revision_and_numeric_schema_version():
         (
             {"tool_evidence_state": "complete", "tool_calls_started": None},
             "started-call count",
+        ),
+        (
+            {
+                "requested_tool_names": (),
+                "started_tool_names": ("lookup-secret-token",),
+            },
+            "must originate",
         ),
         (
             {"model_step_evidence_state": "limit_exceeded", "model_steps": 1},

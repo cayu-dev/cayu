@@ -178,12 +178,26 @@ operation before those evals can pass. Interrupted evals additionally require
 the narrower `supports_runner_owned_interrupted_evidence` operation; the runner
 does not fall back to generic unbounded event or transcript queries.
 
-Persisted `EvalRun` baselines advance from schema version 3 to version 5: version
+Persisted `EvalRun` baselines advance from schema version 3 to version 7: version
 4 introduced the lossless result graph and explicit assertion outcomes, while
 version 5 records conclusive workspace and artifact capture provenance in every
-retained trajectory. Standalone trajectory documents advance from version 1 to
-version 2 for the same provenance contract. Older prerelease documents must be
-regenerated; Cayu does not migrate or guess at their meaning.
+retained trajectory, and version 6 binds portable assertion results to the exact
+definition revision evaluated. Version 7 can carry the portable corpus execution
+contract a trusted executor fixes before provider dispatch, so a completed run
+cannot be published under different case input, evidence, pricing, or suite settings.
+Contracted saved runs now enforce the exact requested trial count, and complete
+lossless and published trials require their exact aggregate usage so conclusive
+usage observations cannot be detached from their source summary. Portable
+evidence and published results preserve aggregate token totals above signed
+64-bit as canonical decimal strings while marking token assertions beyond their
+declared ceiling unavailable. Rootless trajectories cannot acquire conclusive
+model-step or usage evidence from detached fields, and publication rejects cost
+metadata that contradicts its retained exact cost summary. Raw published-result
+admission also fails closed on malformed branches before any later oversized
+graph can be constructed.
+Standalone trajectory documents advance from version 1 to version 2 for the same provenance
+contract. Older prerelease documents must be regenerated; Cayu does not migrate
+or guess at their meaning.
 
 ### Remote environment allocation fails closed without exact recovery
 

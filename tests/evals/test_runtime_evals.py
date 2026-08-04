@@ -186,6 +186,10 @@ def _trial_result(
     unavailable_reason: str | None = None,
 ) -> EvalTrialResult:
     now = datetime.now(UTC)
+    evidence_complete = status not in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE)
+    resolved_session_id = session_id or (
+        None if status in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE) else f"session-{trial_number}"
+    )
     if status == EvalStatus.PASSED:
         assertions = (
             EvalAssertionResult(
@@ -221,17 +225,17 @@ def _trial_result(
     return EvalTrialResult(
         trial_number=trial_number,
         status=status,
-        session_id=session_id
-        or (
-            None
-            if status in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE)
-            else f"session-{trial_number}"
-        ),
+        session_id=resolved_session_id,
         score=score,
         assertions=assertions,
         error=error,
         unavailable_reason=unavailable_reason,
-        evidence_complete=status not in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE),
+        evidence_complete=evidence_complete,
+        usage_summary=(
+            None
+            if not evidence_complete or resolved_session_id is None
+            else SessionUsageSummary(session_id=resolved_session_id).model_dump(mode="json")
+        ),
         started_at=now,
         completed_at=now,
     )
@@ -1241,7 +1245,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     output = tmp_path / "run.json"
     output.write_text(eval_run_to_json(result), encoding="utf-8")
     document = json.loads(output.read_text(encoding="utf-8"))
-    assert EVAL_SCHEMA_VERSION == 5
+    assert EVAL_SCHEMA_VERSION == 7
     assert document["schema_version"] == EVAL_SCHEMA_VERSION
     usage = document["cases"][0]["trials"][0]["usage_summary"]["usage"]
     assert set(usage) == {
@@ -1263,7 +1267,7 @@ def test_assertion_results_carry_score_and_run_has_schema_version(tmp_path):
     assert load_eval_run(output) == result  # round-trips with the new fields
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3, 4])
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5, 6])
 def test_load_eval_run_rejects_prerelease_schema_versions(tmp_path, schema_version):
     run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
     data = json.loads(eval_run_to_json(run))

@@ -221,7 +221,6 @@ async def run_eval_suite(
         raise ValueError("run_eval_suite max_concurrency must be >= 1.")
     _validate_trials(trials, "run_eval_suite trials")
     _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
-
     run_id = str(uuid4())
     started_at = datetime.now(UTC)
     results = await _run_suite_cases(
@@ -245,6 +244,7 @@ async def run_eval_suite(
         completed_at=completed_at,
         duration_ms=_duration_ms(started_at, completed_at),
         metadata=suite.metadata,
+        run_contract=None,
     )
 
 
@@ -258,6 +258,10 @@ async def run_eval_plan(
 ) -> EvalRun:
     if type(plan) is not EvalPlan:
         raise TypeError("run_eval_plan requires an EvalPlan.")
+    if not isinstance(plan.app, CayuApp):
+        raise TypeError("EvalPlan app must be a CayuApp.")
+    if type(plan.suite) is not EvalSuite:
+        raise TypeError("EvalPlan suite must be an EvalSuite.")
     return await run_eval_suite(
         plan.app,
         plan.suite,

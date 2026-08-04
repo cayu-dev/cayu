@@ -30,6 +30,7 @@ from cayu._validation import (
     require_durable_nonblank,
     require_durable_text,
 )
+from cayu.evals.models import EvalCaseContractV1, EvalRunContractV1
 from cayu.runtime.costs import PriceBook
 
 EVAL_CORPUS_SCHEMA_VERSION = 1
@@ -964,6 +965,12 @@ class EvalCorpusDocument(_SchemaV1PortableModel):
             raise ValueError(
                 "Eval cases reference unknown suites: " + ", ".join(unknown_suites) + "."
             )
+        populated_suites = {case.suite_id for case in self.cases}
+        empty_suites = sorted(known_suites - populated_suites)
+        if empty_suites:
+            raise ValueError(
+                "Eval suites require at least one case: " + ", ".join(empty_suites) + "."
+            )
         trials_by_suite = {suite.id: suite.trial_request.trials for suite in self.suites}
         published_results_by_suite: Counter[str] = Counter()
         for case in self.cases:
@@ -1061,6 +1068,39 @@ class EvalCorpusDocument(_SchemaV1PortableModel):
             "cases": [case.model_dump(mode="json") for case in ordered_cases],
         }
         return cls(revision=_content_revision(document, "eval corpus"), **document)
+
+
+def eval_run_contract_for_corpus(
+    corpus: EvalCorpusDocument,
+    suite_id: str,
+) -> EvalRunContractV1:
+    """Freeze the exact portable contract that must precede suite execution."""
+
+    validated, _ = _validated_model_document(
+        corpus,
+        model_type=EvalCorpusDocument,
+        field_name="eval corpus",
+    )
+    validated_suite_id = _portable_id(suite_id, "suite_id")
+    suite = next((item for item in validated.suites if item.id == validated_suite_id), None)
+    if suite is None:
+        raise ValueError(f"Eval corpus does not contain suite {validated_suite_id!r}.")
+    cases = tuple(case for case in validated.cases if case.suite_id == suite.id)
+    return EvalRunContractV1(
+        corpus_revision=validated.revision,
+        target_key=validated.target_key,
+        suite_id=suite.id,
+        suite_revision=suite.revision,
+        evidence_policy_revision=validated.evidence_policy.revision,
+        pricing_profile_fingerprint=(
+            None if validated.pricing_profile is None else validated.pricing_profile.fingerprint
+        ),
+        trials=suite.trial_request.trials,
+        timeout_seconds=suite.trial_request.timeout_seconds,
+        cases=tuple(
+            EvalCaseContractV1(case_id=case.id, case_revision=case.revision) for case in cases
+        ),
+    )
 
 
 def eval_corpus_to_json(corpus: EvalCorpusDocument) -> str:

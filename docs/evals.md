@@ -138,6 +138,8 @@ cases reference suites by `suite_id`, so cases from independent corpus fragments
 can be merged without rewriting suite membership. Case, suite, evidence-policy,
 and corpus revisions change whenever their covered content changes;
 `assertion_spec_revision(...)` provides the same identity for one assertion.
+Every suite must contain at least one case so every accepted suite has a valid
+execution and publication shape.
 
 `eval_corpus_to_json(...)`, `eval_corpus_from_json(...)`, and
 `load_eval_corpus(...)` enforce schema version 1 and Cayu's durable-JSON rules,
@@ -163,7 +165,12 @@ limit-exceeded evidence is never represented as a complete observation. The
 public projector derives `root_evidence_available` from the durable root session,
 so detached usage fields cannot make a rootless replay conclusive. The compiled
 `EvalAssertion` adapter also preserves the existing explicit complete-synthetic
-context contract used by direct assertions.
+context contract used by direct assertions. Exact aggregate token counts use
+Cayu's canonical nonnegative decimal-string JSON representation; counts above the
+signed-64-bit assertion ceiling remain lossless but are marked `limit_exceeded`
+and cannot produce a scored usage assertion. The serialized evidence view is
+capped at 10 MiB, enough to retain every field at its declared character and
+cardinality ceiling, including four-byte Unicode.
 
 When cost evidence is requested, callers inject a trusted local `PriceBook`.
 `pricing_profile_identity(...)` canonicalizes and fingerprints the validated
@@ -185,12 +192,40 @@ shares it across every compiled assertion in the trial. Cost assertions may
 share one trusted price-book source; the runner validates each distinct source
 once per trial and rejects any change from its compilation-time fingerprint.
 During a fresh run, the executing `CayuApp` is the authoritative redaction
-boundary; the compiler-supplied
-app is used for offline replay. Existing built-in
+boundary; the compiler-supplied app is used for offline replay. Existing built-in
 assertions and compiled specs share the same decision functions, so a missing or
 bounded-away observation is `unavailable`, while a complete observed negative is
 `failed`. Tool-order assertions use model-requested transcript order;
 tool-presence/count assertions use calls that actually started.
+
+`publish_eval_run(...)` is the only public result projection for a portable
+corpus run. It matches the complete internal suite result back to the corpus and
+produces a content-addressed `PublishedEvalRun` containing every case, trial,
+assertion outcome, safe structural detail, duration, and identity-free aggregate
+usage. Every complete trial carries its exact aggregate usage, and conclusive
+usage-derived observations cannot exist without that summary. A publishable run
+carries large aggregate counters in the same canonical decimal-string JSON
+representation as Cayu's other aggregate usage surfaces. Cost observations are
+published only when their allowlisted metadata exactly matches any retained
+`SessionCostSummary`, including currency, total, and the priced/unpriced step
+partition. The run carries the exact corpus, suite, case, evidence-policy,
+pricing-profile, trial-count, and timeout contract fixed before provider dispatch;
+publication rejects an absent or different execution contract. Every internal
+assertion result must also carry the exact corpus assertion revision it evaluated,
+preventing publication under a different expectation. Final-output decisions are
+carried as the shared evaluator's safe boolean observation, and tool-order
+decisions are checked against the complete bounded order retained by evaluation;
+only boolean matches and safe counts cross the publishing boundary.
+Trial, case, and run scores and statuses are rederived from the retained
+published children. Public diagnostics are fixed Cayu-owned codes and messages;
+raw assertion metadata, exception text, final output, trajectories, concrete
+session IDs, and provider/model identity are never copied. Cost results require
+the corpus pricing-profile fingerprint. The closed schema-v1 graph is bounded to
+32 MiB and is the reporting, comparison, and CI substrate for portable corpus
+execution; the lossless `EvalRun` does not cross that publishing boundary.
+The publication model defines and enforces this boundary independently of execution.
+A trusted corpus executor must construct the contract from its resolved local target;
+the unconstrained Python runner cannot accept a caller-supplied publication contract.
 
 ## First-party runtime acceptance suite
 
@@ -485,18 +520,23 @@ payloads after each trial result is built. When enabled, every trial retains its
 trajectory. Trajectories are **excluded from saved `EvalRun` JSON** and remain separate,
 opt-in exports.
 
-Saved `EvalRun` baselines use schema version `4`. Version 4 preserves the complete
-ordered trial graph and explicit outcome/null-score contract. It retains version 3's
-identity-free aggregate usage, canonical large counters, and durable-JSON validation.
-`load_eval_run(...)` rejects missing versions and versions 1–3; regenerate those
-baselines with the current Cayu version. No compatibility loader or migration is used.
+Saved `EvalRun` baselines use schema version `7`. Version 7 preserves the complete
+ordered trial graph, explicit outcome/null-score contract, conclusive-evidence
+state, the exact portable assertion revision behind each result, and the optional
+portable execution contract a trusted executor fixes before dispatch. It retains
+identity-free aggregate usage for every complete trial, canonical large counters,
+and durable-JSON validation. A contracted run must retain exactly the requested
+number of trials for every case.
+`load_eval_run(...)` rejects missing versions and versions 1–6;
+regenerate those baselines with the current Cayu version. No compatibility loader
+or migration is used.
 
 Standalone exports use a versioned document envelope. The current trajectory
-schema version is `1`; `load_trajectory(...)` rejects files without that version
+schema version is `2`; `load_trajectory(...)` rejects files without that version
 or with an unsupported version before validating the trajectory payload. This is an
 intentional clean break from Cayu's earlier unversioned preview exports: they
 are not migrated and must be regenerated. The trajectory schema version is
-independent from `EvalRun.schema_version`. Version 1 applies Cayu's durable-JSON
+independent from `EvalRun.schema_version`. Version 2 applies Cayu's durable-JSON
 contract before writing and while decoding: nonportable text or numbers,
 duplicate object keys, and excessive nesting are rejected before an existing
 export can be overwritten or an imported trajectory can be replayed.

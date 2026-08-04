@@ -45,6 +45,7 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
 )
+from cayu.runtime.usage import SessionUsageSummary
 
 
 def _scripted_app(*batches: list[ModelStreamEvent]) -> CayuApp:
@@ -81,10 +82,12 @@ def _assertion(outcome: EvalOutcome) -> EvalAssertionResult:
 def _trial(number: int, status: EvalStatus) -> EvalTrialResult:
     now = datetime.now(UTC)
     outcome = EvalOutcome(status.value) if status != EvalStatus.SKIPPED else None
+    session_id = f"session-{number}"
+    evidence_complete = status != EvalStatus.UNAVAILABLE
     return EvalTrialResult(
         trial_number=number,
         status=status,
-        session_id=f"session-{number}",
+        session_id=session_id,
         score=(
             None
             if status in (EvalStatus.ERROR, EvalStatus.UNAVAILABLE)
@@ -95,7 +98,12 @@ def _trial(number: int, status: EvalStatus) -> EvalTrialResult:
         assertions=() if outcome is None else (_assertion(outcome),),
         error="execution failed" if status == EvalStatus.ERROR else None,
         unavailable_reason="evidence missing" if status == EvalStatus.UNAVAILABLE else None,
-        evidence_complete=status != EvalStatus.UNAVAILABLE,
+        evidence_complete=evidence_complete,
+        usage_summary=(
+            SessionUsageSummary(session_id=session_id).model_dump(mode="json")
+            if evidence_complete
+            else None
+        ),
         started_at=now,
         completed_at=now,
     )
@@ -404,6 +412,7 @@ def test_result_timing_must_enclose_retained_children():
         session_id="session-1",
         score=0.0,
         evidence_complete=True,
+        usage_summary=SessionUsageSummary(session_id="session-1").model_dump(mode="json"),
         started_at=started_at,
         completed_at=completed_at,
         duration_ms=10_000,

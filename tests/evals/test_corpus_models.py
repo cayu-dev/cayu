@@ -32,6 +32,7 @@ from cayu.evals.corpus import (
     assertion_spec_revision,
     eval_corpus_from_json,
     eval_corpus_to_json,
+    eval_run_contract_for_corpus,
     load_eval_corpus,
 )
 
@@ -248,6 +249,26 @@ def test_content_revisions_cover_semantic_and_descriptive_content():
     )
 
 
+def test_run_contract_freezes_every_execution_relevant_corpus_identity():
+    corpus = _corpus(include_cost=True)
+    contract = eval_run_contract_for_corpus(corpus, "refund-regressions")
+
+    assert contract.corpus_revision == corpus.revision
+    assert contract.target_key == corpus.target_key
+    assert contract.suite_revision == corpus.suites[0].revision
+    assert contract.evidence_policy_revision == corpus.evidence_policy.revision
+    assert contract.pricing_profile_fingerprint == corpus.pricing_profile.fingerprint
+    assert contract.trials == corpus.suites[0].trial_request.trials
+    assert contract.timeout_seconds == corpus.suites[0].trial_request.timeout_seconds
+    assert [(case.case_id, case.case_revision) for case in contract.cases] == [
+        (corpus.cases[0].id, corpus.cases[0].revision)
+    ]
+    assert eval_run_contract_for_corpus(corpus, "refund-regressions") == contract
+
+    with pytest.raises(ValueError, match="does not contain suite"):
+        eval_run_contract_for_corpus(corpus, "missing-suite")
+
+
 def test_assertion_revision_covers_description_and_expectation():
     base = FinalOutputContainsAssertionSpec(id="answer", expected="approved")
     described = FinalOutputContainsAssertionSpec(
@@ -345,6 +366,19 @@ def test_corpus_rejects_duplicate_ids_and_unknown_suite_references():
             evidence_policy=EvaluationEvidencePolicySpec.standard(),
             suites=(suite,),
             cases=(unknown_case,),
+        )
+
+
+def test_corpus_rejects_suites_without_cases():
+    populated = _suite(suite_id="populated", name="Populated")
+    empty = _suite(suite_id="empty", name="Empty")
+
+    with pytest.raises(ValidationError, match="require at least one case: empty"):
+        EvalCorpusDocument.create(
+            target_key="refund-agent",
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+            suites=(populated, empty),
+            cases=(_case(suite_id="populated"),),
         )
 
 
