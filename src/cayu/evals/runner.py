@@ -37,10 +37,13 @@ from cayu.evals.models import (
     aggregate_eval_status,
 )
 from cayu.evals.trajectory import (
+    SessionTrajectoryBounds,
     _build_child_trajectories,
+    _CaptureState,
     _IncompleteFlag,
     _load_terminal_evidence,
     _project_terminal_evidence,
+    _trajectory_from_terminal_evidence,
     final_output_text,
 )
 from cayu.runtime.app import CayuApp
@@ -50,6 +53,7 @@ from cayu.runtime.sessions import (
     RunRequest,
     Session,
     SessionStatus,
+    TerminalSessionEvidence,
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     copy_run_request,
@@ -359,6 +363,7 @@ async def _run_case_once(
     usage_summary: SessionUsageSummary | None = None
     final_output = ""
     trajectory: Trajectory | None = None
+    terminal_evidence: TerminalSessionEvidence | None = None
     assertion_results: list[EvalAssertionResult] = []
     deadline: asyncio.Timeout | None = None
 
@@ -394,10 +399,10 @@ async def _run_case_once(
             candidate_session_id = observed_session_id or trial_request.session_id
             if candidate_session_id is not None:
                 try:
-                    evidence = await _load_terminal_evidence(app, candidate_session_id)
+                    terminal_evidence = await _load_terminal_evidence(app, candidate_session_id)
                     session_id = candidate_session_id
                     session, events, transcript, usage_summary = _project_terminal_evidence(
-                        evidence
+                        terminal_evidence
                     )
                     evidence_complete = True
                 except TerminalSessionEvidenceError as exc:
@@ -408,16 +413,14 @@ async def _run_case_once(
                         and exc.code == TerminalSessionEvidenceErrorCode.SESSION_INTERRUPTED
                     ):
                         try:
-                            (
-                                session,
-                                events,
-                                transcript,
-                                usage_summary,
-                            ) = await _load_fresh_interrupted_evidence(
+                            terminal_evidence = await _load_fresh_interrupted_evidence(
                                 app,
                                 candidate_session_id,
                                 tuple(emitted_root_events),
                                 emitted_events_truncated=emitted_root_events_truncated,
+                            )
+                            session, events, transcript, usage_summary = _project_terminal_evidence(
+                                terminal_evidence
                             )
                             session_id = candidate_session_id
                             evidence_complete = True
@@ -464,18 +467,25 @@ async def _run_case_once(
                     probe_requirements = _collect_probe_requirements(case.assertions)
                     probes = await _capture_probes(app, session, probe_requirements)
                     children_incomplete = _IncompleteFlag()
+                    if terminal_evidence is None:
+                        raise RuntimeError("Exact root evidence was lost before child capture.")
+                    capture_state = _CaptureState(
+                        bounds=SessionTrajectoryBounds(),
+                        strict=False,
+                    )
+                    capture_state.retain(terminal_evidence)
                     children = await _build_child_trajectories(
                         app,
                         session_id,
                         visited={session_id} if session_id is not None else set(),
                         incomplete=children_incomplete,
+                        parent_terminal_sequence=(
+                            terminal_evidence.boundary.terminal_event_sequence
+                        ),
+                        state=capture_state,
                     )
-                    trajectory = Trajectory(
-                        session=session,
-                        events=events,
-                        transcript=transcript,
-                        usage_summary=usage_summary,
-                        final_output=final_output,
+                    trajectory = _trajectory_from_terminal_evidence(
+                        terminal_evidence,
                         probes=probes,
                         children=children,
                         children_incomplete=children_incomplete.value,
@@ -585,7 +595,7 @@ async def _load_fresh_interrupted_evidence(
     emitted_events: tuple[RunnerObservedEventIdentity, ...],
     *,
     emitted_events_truncated: bool,
-) -> tuple[Session, tuple[Event, ...], tuple[Message, ...], SessionUsageSummary]:
+) -> TerminalSessionEvidence:
     """Reconcile one runner-owned, fully drained interruption with durable state.
 
     Ordinary historical evidence remains completed/failed-only. This narrower path exists for
@@ -617,7 +627,7 @@ async def _load_fresh_interrupted_evidence(
             else str(exc).strip() or type(exc).__name__
         )
         raise _FreshInterruptedEvidenceUnavailable(detail) from exc
-    return _project_terminal_evidence(evidence)
+    return evidence
 
 
 def _isolated_trial_request(request: RunRequest) -> RunRequest:

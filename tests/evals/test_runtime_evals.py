@@ -79,6 +79,7 @@ from cayu import (
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.artifacts import ArtifactListResult, ArtifactMetadata, ArtifactScope
 from cayu.cli import main
+from cayu.core.events import event_with_runtime_payload_authority
 from cayu.evals import (
     LLMJudge,
     WorkspaceFileExists,
@@ -2549,6 +2550,73 @@ def test_eval_case_captures_sub_agent_children():
     assert child.final_output == "subagent summary done"
 
 
+def test_eval_case_excludes_child_created_after_root_terminal(monkeypatch):
+    import cayu.evals.runner as eval_runner
+
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("root finished"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="parent", model="fake-model"))
+    original_capture_probes = eval_runner._capture_probes
+
+    async def capture_probes_after_creating_late_child(app, session, requirements):
+        probes = await original_capture_probes(app, session, requirements)
+        assert session is not None
+        child = await store.create(
+            RunRequest(
+                agent_name="child",
+                session_id="child-after-root-terminal",
+                parent_session_id=session.id,
+                messages=[Message.text("user", "late child")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await store.update_status(child.id, SessionStatus.COMPLETED)
+        await store.append_event(
+            child.id,
+            event_with_runtime_payload_authority(
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id=child.id,
+                    payload={"parent_session_id": session.id},
+                ),
+                "parent_session_id",
+            ),
+        )
+        await store.append_event(
+            child.id,
+            Event(type=EventType.SESSION_COMPLETED, session_id=child.id),
+        )
+        return probes
+
+    monkeypatch.setattr(eval_runner, "_capture_probes", capture_probes_after_creating_late_child)
+    case = EvalCase(
+        id="exclude-late-child",
+        request=RunRequest(
+            agent_name="parent",
+            messages=[Message.text("user", "Finish the root run.")],
+        ),
+        assertions=[SessionCompleted()],
+    )
+
+    result = asyncio.run(run_eval_case(app, case, suite_id="s", retain_trajectory=True))
+
+    assert result.status is EvalStatus.PASSED
+    trial = result.trials[0]
+    assert trial.evidence_complete is True
+    assert trial.trajectory is not None
+    assert trial.trajectory.children == ()
+    assert trial.trajectory.children_incomplete is False
+
+
 def test_build_child_trajectories_walks_sub_agent_tree():
     store = InMemorySessionStore()
     app = CayuApp(session_store=store, enable_logging=False)
@@ -2571,6 +2639,17 @@ def test_build_child_trajectories_walks_sub_agent_tree():
             identity=identity,
         )
         await store.update_status("child", SessionStatus.COMPLETED)
+        await store.append_event(
+            "child",
+            event_with_runtime_payload_authority(
+                Event(
+                    type=EventType.SESSION_STARTED,
+                    session_id="child",
+                    payload={"parent_session_id": "parent"},
+                ),
+                "parent_session_id",
+            ),
+        )
         await store.append_event(
             "child",
             Event(type=EventType.SESSION_COMPLETED, session_id="child"),
@@ -3290,6 +3369,17 @@ def _seed_parent_with_children(store: InMemorySessionStore, n: int) -> None:
             await store.update_status(child.id, SessionStatus.COMPLETED)
             await store.append_event(
                 child.id,
+                event_with_runtime_payload_authority(
+                    Event(
+                        type=EventType.SESSION_STARTED,
+                        session_id=child.id,
+                        payload={"parent_session_id": "parent"},
+                    ),
+                    "parent_session_id",
+                ),
+            )
+            await store.append_event(
+                child.id,
                 Event(type=EventType.SESSION_COMPLETED, session_id=child.id),
             )
 
@@ -3347,3 +3437,47 @@ def test_build_child_trajectories_marks_incomplete_on_store_error():
     )
     assert children == ()
     assert flag.value is True
+
+
+def test_build_child_trajectories_keeps_incomplete_state_parent_local():
+    from cayu.evals.trajectory import (
+        SessionTrajectoryBounds,
+        _build_child_trajectories,
+        _CaptureState,
+        _IncompleteFlag,
+    )
+
+    class _ParentSelectiveStore:
+        supports_session_lineage = False
+
+        async def list_sessions(self, query=None):
+            if query.parent_session_id == "unavailable-parent":
+                raise RuntimeError("session backend down")
+            return SimpleNamespace(sessions=(), next_cursor=None)
+
+    async def scenario():
+        app = SimpleNamespace(session_store=_ParentSelectiveStore())
+        state = _CaptureState(bounds=SessionTrajectoryBounds(), strict=False)
+        unavailable = _IncompleteFlag()
+        complete = _IncompleteFlag()
+        unavailable_children = await _build_child_trajectories(
+            app,
+            "unavailable-parent",
+            visited={"unavailable-parent"},
+            incomplete=unavailable,
+            state=state,
+        )
+        complete_children = await _build_child_trajectories(
+            app,
+            "complete-parent",
+            visited={"complete-parent"},
+            incomplete=complete,
+            state=state,
+        )
+        return unavailable_children, unavailable.value, complete_children, complete.value
+
+    unavailable_children, unavailable, complete_children, complete = asyncio.run(scenario())
+    assert unavailable_children == ()
+    assert unavailable is True
+    assert complete_children == ()
+    assert complete is False

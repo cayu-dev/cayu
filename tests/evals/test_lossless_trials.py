@@ -37,6 +37,7 @@ from cayu import (
     run_eval_case,
     run_eval_suite,
 )
+from cayu.core.events import event_with_runtime_payload_authority
 from cayu.evals import runner as runner_module
 from cayu.runtime.sessions import (
     SessionIdentity,
@@ -528,6 +529,17 @@ def test_child_trajectory_captures_runner_owned_interrupted_descendant():
                 [message],
                 interaction_id=interaction_id,
             )
+            origin = Event(
+                id=f"{session_id}-started",
+                type=EventType.SESSION_STARTED,
+                session_id=session_id,
+                payload=(
+                    {} if parent_session_id is None else {"parent_session_id": parent_session_id}
+                ),
+            )
+            if parent_session_id is not None:
+                origin = event_with_runtime_payload_authority(origin, "parent_session_id")
+            await store.append_event(session_id, origin)
             return interaction_id
 
         root_id = "runner-owned-root"

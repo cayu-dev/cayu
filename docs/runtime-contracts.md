@@ -610,6 +610,29 @@ id)`. Custom stores must leave `supports_session_topology = False` unless they
 implement the same snapshot, ordering, corruption detection, node ceiling, and
 parent-bound continuation contract.
 
+Session lineage is a separate optional capability optimized for historical
+trajectory admission. `query_session_lineage(...)` returns one parent-bound,
+independently pageable direct-child branch containing only byte-bounded session
+and parent ids, a normalized creation timestamp, and at most two payload-free
+`(sequence, event_id, event_type)` identities for durable `session.started` or
+`session.forked` records. Built-in durable stores apply identifier, timestamp,
+and event-id ceilings in the database projection before values cross the driver
+boundary; they never select session display fields or event JSON. The
+two-record origin sentinel detects missing or duplicate origins. Pages use
+backend-neutral `(created_at, id)` ordering, where identifiers use Unicode code
+point order; PostgreSQL enforces the equivalent bytewise `C` collation in both
+the keyset query and its supporting index. Custom stores must leave
+`supports_session_lineage = False` unless they provide the same snapshot,
+ordering, pre-hydration bounds, and parent-bound cursor contract.
+Trajectory admission then matches the retained full origin event and requires
+its runtime-owned `parent_session_id` to equal the durable session parent. A
+`session.forked` origin must also carry a matching `source_session_id`; missing
+or contradictory lineage rejects even when the payload-free identity itself is
+stable. Matching caller-authored strings are not runtime authority. Built-in
+stores remove untrusted origin linkage before persistence and reconstruct the
+provenance of retained trusted fields when SQL evidence is decoded. Custom
+terminal-evidence readers must preserve or reconstruct equivalent provenance.
+
 Task topology is an independent optional `TaskStore` capability.
 `query_task_topology(...)` batch-loads tasks attached to a bounded set of
 session IDs and direct children for a bounded set of task-parent IDs. Each
@@ -686,6 +709,22 @@ a successful result has work proportional to the returned snapshot. Custom
 stores must leave `supports_terminal_session_evidence = False` unless they
 implement these snapshot, completeness, ordering, pre-hydration, and limit
 guarantees.
+
+`trajectory_from_session(app, session_id, bounds=...)` composes this primitive
+with bounded session-lineage and terminal-evidence capabilities to reconstruct
+one read-only eval `Trajectory`. Each completed or failed descendant is admitted
+only when its unique durable `session.started` or `session.forked` origin is at
+or before its direct parent's terminal sequence. The entire admitted tree shares
+one caller-bounded retained-session, tree-depth, event, transcript-record,
+record-byte, and canonical total-byte budget. The defaults permit 100 retained
+sessions across 32 levels; callers may raise the session ceiling to 500 or lower
+the depth ceiling, whose hard maximum is 32. Excluded post-terminal children do
+not consume the retained-session budget. A separate hard ceiling of 500 unique
+child candidates bounds the minimal lineage walk across the capture. Cayu
+rechecks the descendant closure and every retained terminal snapshot before
+returning, and reports a typed `SessionTrajectoryError` if the evidence changed
+or cannot be proved complete. The operation does not run or recover sessions and
+does not inspect the current environment for probes.
 
 Checkpoint field updates that can race with runtime finalization use `transform_checkpoint(...)`; transcript repair uses `append_transcript_messages_and_transform_checkpoint(...)` when it must update both atomically. Built-in stores execute those transforms while holding their session/checkpoint write boundary (a process-local lock for the in-memory store, an immediate write transaction for SQLite, and a row lock for PostgreSQL). Interruption-aware checkpoint replacements explicitly take the current `pending_session_interrupt` and `pending_interruption_cascade` values—including their absence—from that transactional snapshot, so an older runtime snapshot can neither erase active interruption state nor resurrect cleared state.
 

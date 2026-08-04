@@ -13,14 +13,14 @@ generated clients together: the server contract advances from version 4 to
 version 6, and the public application manifest and generator plan advance to
 schema version 7.
 
-The storage schema advances from revision 23 to revision 29. Revision 26 is a
+The storage schema advances from revision 23 to revision 30. Revision 26 is a
 deliberate prerelease boundary: migration rejects a populated pre-26 Cayu
 session database instead of attempting to rewrite its durable interaction
 history. Stop all older workers, take an application-consistent backup, and
 recreate populated prerelease Cayu session databases before starting rc5.
 Empty stores migrate normally. Run `cayu storage status` and
 `cayu storage migrate` against every explicitly configured SQLite or PostgreSQL
-session store and budget ledger, then confirm revision 29 with no pending
+session store and budget ledger, then confirm revision 30 with no pending
 migrations. Do not run mixed rc4/rc5 workers.
 
 After deployment, verify `cayu version`, run `cayu check --json`, execute the
@@ -89,6 +89,49 @@ guard.
 
 ## v0.1.0
 
+### Completed production sessions can become eval trajectories
+
+`trajectory_from_session(...)` now reconstructs a completed or failed durable
+session tree as the same serializable `Trajectory` used by fresh runtime-native
+evals. It is a read-only historical-evaluation boundary: it invokes no provider,
+tool, environment, hook, recovery, or store mutation. Descendants are admitted
+from their durable start or fork sequence relative to each parent's terminal
+sequence, so pre-terminal background work is retained and later forks are not.
+Every admitted node must independently satisfy the exact terminal-evidence
+contract, one retained-evidence budget applies to the complete admitted tree,
+and closure changes, contradictory lineage, or a configured tree-depth overflow
+fail with stable typed errors. Node construction validates each captured record
+once and validates the completed tree once, so deep accepted trees do not incur
+quadratic subtree copying.
+Retained start and fork origins must carry the runtime-owned direct parent, and
+fork source identity must agree with that parent, including when a child session
+is promoted directly as the selected root. Matching caller-authored lineage
+text is discarded at built-in store ingestion and cannot satisfy promotion.
+Admission reads a dedicated minimal lineage projection containing only
+pre-hydration-bounded structural identity and payload-free origin identities.
+Session display fields and event JSON are never selected, so a large field or
+event on a later excluded child cannot amplify capture memory or introduce
+backend-specific JSON transport eligibility. The caller's session limit applies
+only to retained evidence; excluded candidates use a separate hard-bounded
+minimal lineage walk. PostgreSQL schema revision 30 rebuilds the existing
+direct-child traversal index with bytewise identifier collation, keeping Unicode
+keyset order identical across PostgreSQL, SQLite, and memory without sacrificing
+the bounded index scan.
+
+Workspace and artifact probes now retain capture provenance. Missing historical,
+uncaptured, operationally unavailable, or truncated evidence that cannot decide
+an assertion produces `unavailable` with no score; only a successfully observed
+missing file or empty artifact scope is negative evidence. A partial artifact
+listing may still prove a positive match from the records it did retain.
+
+The new `ToolsCalledInOrder` assertion checks the exact model-requested tool
+sequence from the durable transcript, independent of parallel scheduler event
+order. Promoted trajectories can be scored with `evaluate_assertions(...)` and
+exported with the existing versioned trajectory JSON helpers. They deliberately
+do not capture current workspace or artifact state, create a corpus, re-execute
+the application, or publish a control-plane route; those product workflows can
+build on this evidence boundary without changing its meaning.
+
 ### Terminal session evidence has one bounded snapshot boundary
 
 The in-memory, SQLite, and PostgreSQL session stores can now load a completed or
@@ -103,8 +146,9 @@ including whitespace-heavy JSON string content, under a distinct transport
 policy that can reject JSONB-expanded scientific-notation values without
 changing the canonical limits applied to accepted evidence;
 custom stores must explicitly opt in only when they provide the same guarantees.
-This is the storage foundation for production-session eval promotion; it does
-not yet add promotion, corpus, or dashboard workflows.
+`trajectory_from_session(...)` now consumes this storage boundary for
+production-session trajectory promotion; corpus and dashboard workflows remain
+separate follow-ups.
 
 ### Eval results preserve every trial and explicit evidence gaps
 

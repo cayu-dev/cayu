@@ -169,6 +169,7 @@ Current assertions cover:
 - transcript text
 - event occurrence and absence
 - tool call counts
+- exact transcript tool-call order
 - tool arguments
 - tool result text
 - model step and token ceilings
@@ -207,9 +208,9 @@ The same suite/assertion surface supports several modes:
   `cayu eval compare`). See [Trajectories & Replay](#trajectories--replay).
 - **Offline** — evaluate a *captured* trajectory (`load_trajectory` → `evaluate_assertions`) with
   no live runtime, on any machine, from a saved JSON file.
-- **Online** *(future)* — score production sessions and promote them into eval cases/datasets. The
-  serializable `Trajectory` already makes a production run replayable; the promotion helper and
-  datasets are planned follow-ups.
+- **Production replay** — promote a completed or failed durable session tree with
+  `trajectory_from_session(...)`, then score or export the resulting `Trajectory` without running
+  the application again. Corpus management and fresh re-execution are planned follow-ups.
 
 ## Results and repeated trials
 
@@ -232,8 +233,8 @@ contributing result is scored.
 
 The built-in in-memory, SQLite, and PostgreSQL session stores expose
 `load_terminal_session_evidence(session_id, limits=...)` as the safe input
-boundary for future production-session promotion. The operation accepts only a
-coherent completed or failed session and returns one detached, bounded snapshot:
+boundary used by production-session trajectory promotion. The operation accepts
+only a coherent completed or failed session and returns one detached, bounded snapshot:
 the session, its durable event prefix through the matching terminal event, its
 attributed transcript, publication-marker state, and exact boundary/count/byte
 metadata, including the complete canonical returned size. It excludes later
@@ -253,6 +254,81 @@ This operation does not itself create an eval case or corpus and does not add a
 control-plane route. Those product steps build on this storage guarantee. See
 [Runtime Contracts](runtime-contracts.md#sessionstore) for the snapshot and
 resource-limit contract.
+
+## Promoting a durable session trajectory
+
+`trajectory_from_session(...)` turns one already-finished production session
+tree into the same `Trajectory` assertion substrate used by fresh eval runs:
+
+```python
+from cayu import (
+    SessionCompleted,
+    ToolsCalledInOrder,
+    evaluate_assertions,
+    trajectory_from_session,
+    write_trajectory_json,
+)
+
+trajectory = await trajectory_from_session(app, session_id)
+outcomes = await evaluate_assertions(
+    trajectory,
+    [SessionCompleted(), ToolsCalledInOrder(["search", "read"])],
+)
+write_trajectory_json(trajectory, "production-session.json")
+```
+
+This is historical evaluation, not re-execution. The operation only reads the
+configured session store. It does not call providers, tools, environments,
+hooks, recovery code, or other application behavior, and it does not write to
+the store. Production probe data is therefore marked unavailable rather than
+read from the app's current environment; assertions that need an uncaptured
+workspace or artifact report `unavailable`.
+
+The root and every admitted descendant must independently be a coherent
+`completed` or `failed` terminal snapshot. A child belongs to the trajectory
+when its first durable `session.started` or `session.forked` event is no later
+than its direct parent's terminal event. A background child that began before
+that boundary remains included even if it finished later; a fork created after
+the boundary is excluded. Every retained origin must also carry the
+runtime-owned `parent_session_id` matching the session record; a
+`session.forked` origin must carry the same `source_session_id`. This validation
+also applies when a non-root session is promoted directly. Matching
+caller-authored text is not authority: built-in stores discard untrusted origin
+linkage at ingestion, and custom terminal-evidence readers must preserve or
+reconstruct equivalent runtime provenance. The same admission rule is applied
+at every level.
+
+Capture fails closed if an admitted node is active, interrupted, incomplete,
+contradictory, oversized, or changes while the tree is being read. One
+`SessionTrajectoryBounds` budget applies across the whole retained tree, with
+default limits of 100 sessions and 32 tree levels, plus the terminal-evidence
+count and byte limits documented under
+[SessionStore](runtime-contracts.md#sessionstore). The caller may raise the
+session limit to 500 and lower the depth limit when needed; Cayu's hard depth
+ceiling is 32. The explicit depth ceiling keeps every accepted tree within the
+serialization and replay envelope of the public recursive `Trajectory` model;
+historical promotion never truncates at that boundary. Stable
+`SessionTrajectoryErrorCode` values let callers classify rejection without
+parsing error text. Repeating the read against unchanged durable state produces
+an equal trajectory. The retained-session limit does not count children excluded
+by the terminal boundary. Lineage discovery has a separate non-configurable
+hard ceiling of 500 unique child candidates across the capture, so extreme
+fan-out remains bounded before admission.
+
+The built-in memory, SQLite, and PostgreSQL stores provide every required read.
+A custom store must implement and advertise exact terminal evidence and bounded
+session lineage. The lineage projection contains only pre-hydration-bounded
+structural identity and payload-free origin-event fingerprints; Cayu does not
+fall back to full topology objects or payload-bearing event reads.
+
+`ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
+additional calls fail. It reads model-requested `ToolCallPart` values in durable
+transcript order rather than scheduler event timing, so parallel tool execution
+does not change the result.
+
+Trajectories may contain prompts, model output, tool arguments/results, and
+session metadata. Export and retention policy remains the application's
+responsibility; Cayu does not automatically publish or retain promoted data.
 
 ## LLM Judges
 
@@ -346,11 +422,14 @@ Replay is faithful for the assertions the run captured: event / transcript / usa
 tool assertions always re-check correctly, and a workspace or artifact assertion replays as long
 as it was part of the original run (its probe was captured then). Replaying with a *new*
 workspace/artifact assertion whose path or scope the original run did **not** probe reports
-"not captured" rather than a real result.
-
-Two v1 simplifications worth knowing: a workspace *existence* probe reads the whole file
-(fine for the small, trusted workspaces evals run against), and a workspace "file not found"
-result reports the path without the underlying OS error string.
+`unavailable` with no score rather than inventing a negative observation. Probe
+capture retains successful and unavailable workspace paths and artifact scopes
+separately. A confirmed missing file or an empty successfully listed artifact
+scope is negative evidence and can fail; a backend error cannot. Workspace file
+content is captured through a byte ceiling. Finding the expected text in that
+window passes, while not finding it in a truncated file is `unavailable` because
+the unseen suffix could still contain the text. A truncated artifact listing is
+also `unavailable`; it is never treated as a complete empty scope.
 
 ## Interop
 

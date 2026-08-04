@@ -70,6 +70,12 @@ from cayu.evals.runner import (
     run_eval_suite,
 )
 from cayu.evals.testing import ScriptedModelProvider, scripted_structured_output
+from cayu.evals.trajectory import (
+    SessionTrajectoryBounds,
+    SessionTrajectoryError,
+    SessionTrajectoryErrorCode,
+    trajectory_from_session,
+)
 
 __all__ = [
     "EVAL_SCHEMA_VERSION",
@@ -106,6 +112,9 @@ __all__ = [
     "SessionFailed",
     "SessionInterrupted",
     "SessionStatusIs",
+    "SessionTrajectoryBounds",
+    "SessionTrajectoryError",
+    "SessionTrajectoryErrorCode",
     "ToolArgsContain",
     "ToolCalled",
     "ToolNotCalled",
@@ -131,6 +140,7 @@ __all__ = [
     "run_eval_plan",
     "run_eval_suite",
     "scripted_structured_output",
+    "trajectory_from_session",
     "trajectory_to_json",
     "write_eval_run_json",
     "write_html_report",
