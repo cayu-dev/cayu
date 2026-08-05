@@ -43,7 +43,7 @@ class WorkspaceCapabilityClaim:
 class WorkspaceCapabilities:
     resource_identity: ResourceIdentityState
     bulk_transfer: WorkspaceCapabilityClaim
-    descriptor_relative_containment: WorkspaceCapabilityClaim
+    path_operation_descriptor_containment: WorkspaceCapabilityClaim
 
 
 @dataclass
@@ -59,7 +59,7 @@ class WorkspaceHarness:
 
 WorkspaceFactory = Callable[[Path, pytest.MonkeyPatch], Awaitable[WorkspaceHarness]]
 BulkTransferProbe = Callable[[WorkspaceHarness], Awaitable[None]]
-DescriptorContainmentProbe = Callable[[WorkspaceHarness, pytest.MonkeyPatch], Awaitable[None]]
+PathOperationContainmentProbe = Callable[[WorkspaceHarness, pytest.MonkeyPatch], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -69,7 +69,7 @@ class WorkspaceConformanceRegistration:
     factory: WorkspaceFactory
     capabilities: WorkspaceCapabilities
     bulk_transfer_probe: BulkTransferProbe | None = None
-    descriptor_containment_probe: DescriptorContainmentProbe | None = None
+    path_operation_containment_probe: PathOperationContainmentProbe | None = None
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -84,11 +84,12 @@ class WorkspaceConformanceRegistration:
                 "Registrations claiming bulk-transfer support require a scenario probe."
             )
         if (
-            self.capabilities.descriptor_relative_containment.state == "supported"
-            and self.descriptor_containment_probe is None
+            self.capabilities.path_operation_descriptor_containment.state == "supported"
+            and self.path_operation_containment_probe is None
         ):
             raise ValueError(
-                "Registrations claiming descriptor-relative containment require a scenario probe."
+                "Registrations claiming descriptor-relative path-operation containment "
+                "require a scenario probe."
             )
 
 

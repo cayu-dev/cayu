@@ -139,6 +139,167 @@ async def _local_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> Worksp
     return WorkspaceHarness(LocalWorkspace(root, workspace_id="conformance-local"), root)
 
 
+def _replace_parent_after_open(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pivot: Path,
+    held: Path,
+    outside: Path,
+    intercept_io_path: Path | None = None,
+    intercept_os_parent: Path | None = None,
+    intercept_unlink_path: Path | None = None,
+) -> None:
+    """Replace ``pivot`` after descriptor traversal, or at legacy pathname use."""
+
+    original_os_open = os.open
+    original_io_open = io.open
+    original_path_unlink = Path.unlink
+    replaced = False
+
+    def replace() -> None:
+        nonlocal replaced
+        if replaced:
+            return
+        pivot.rename(held)
+        pivot.symlink_to(outside, target_is_directory=True)
+        replaced = True
+
+    def instrumented_os_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        candidate = os.fsdecode(path)
+        if dir_fd is not None and candidate == pivot.name and flags & os.O_DIRECTORY:
+            descriptor = original_os_open(path, flags, mode, dir_fd=dir_fd)
+            replace()
+            return descriptor
+        if dir_fd is None and intercept_os_parent is not None:
+            try:
+                Path(candidate).relative_to(intercept_os_parent)
+            except ValueError:
+                pass
+            else:
+                replace()
+        return original_os_open(path, flags, mode, dir_fd=dir_fd)
+
+    def instrumented_io_open(file: object, *args: object, **kwargs: object):
+        if (
+            intercept_io_path is not None
+            and isinstance(file, (str, bytes, os.PathLike))
+            and Path(os.fsdecode(file)) == intercept_io_path
+        ):
+            replace()
+        return original_io_open(file, *args, **kwargs)
+
+    def instrumented_path_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if intercept_unlink_path is not None and path == intercept_unlink_path:
+            replace()
+        original_path_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", instrumented_os_open)
+    monkeypatch.setattr(io, "open", instrumented_io_open)
+    monkeypatch.setattr(Path, "unlink", instrumented_path_unlink)
+
+
+async def _local_path_operation_containment_probe(
+    harness: WorkspaceHarness,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = cast("LocalWorkspace", harness.workspace)
+
+    def prepare(operation: str) -> tuple[Path, Path, Path]:
+        pivot = harness.root / f"{operation}-pivot"
+        pivot.mkdir()
+        (pivot / "file.txt").write_bytes(b"inside-before")
+        outside = harness.root.parent / f"local-{operation}-containment-outside"
+        outside.mkdir()
+        (outside / "file.txt").write_bytes(b"outside-before")
+        held = harness.root.parent / f"local-{operation}-containment-held"
+        return pivot, outside, held
+
+    read_pivot, read_outside, read_held = prepare("read")
+    with monkeypatch.context() as operation_patch:
+        _replace_parent_after_open(
+            operation_patch,
+            pivot=read_pivot,
+            held=read_held,
+            outside=read_outside,
+            intercept_io_path=read_pivot / "file.txt",
+        )
+        result = await workspace.read_bytes("read-pivot/file.txt")
+    assert result.content == b"inside-before"
+    assert (read_held / "file.txt").read_bytes() == b"inside-before"
+    assert (read_outside / "file.txt").read_bytes() == b"outside-before"
+
+    write_pivot, write_outside, write_held = prepare("write")
+    with monkeypatch.context() as operation_patch:
+        _replace_parent_after_open(
+            operation_patch,
+            pivot=write_pivot,
+            held=write_held,
+            outside=write_outside,
+            intercept_os_parent=write_pivot,
+        )
+        await workspace.write_bytes("write-pivot/file.txt", b"inside-after")
+    assert (write_held / "file.txt").read_bytes() == b"inside-after"
+    assert (write_outside / "file.txt").read_bytes() == b"outside-before"
+
+    delete_pivot, delete_outside, delete_held = prepare("delete")
+    with monkeypatch.context() as operation_patch:
+        _replace_parent_after_open(
+            operation_patch,
+            pivot=delete_pivot,
+            held=delete_held,
+            outside=delete_outside,
+            intercept_unlink_path=delete_pivot / "file.txt",
+        )
+        await workspace.delete("delete-pivot/file.txt")
+    assert not (delete_held / "file.txt").exists()
+    assert (delete_outside / "file.txt").read_bytes() == b"outside-before"
+
+
+def _replace_leaf_before_open(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target: Path,
+    held: Path,
+    outside: Path,
+) -> None:
+    original_os_open = os.open
+    original_io_open = io.open
+    replaced = False
+
+    def replace() -> None:
+        nonlocal replaced
+        if replaced:
+            return
+        target.rename(held)
+        target.symlink_to(outside)
+        replaced = True
+
+    def instrumented_os_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is not None and os.fsdecode(path) == target.name and not flags & os.O_DIRECTORY:
+            replace()
+        return original_os_open(path, flags, mode, dir_fd=dir_fd)
+
+    def instrumented_io_open(file: object, *args: object, **kwargs: object):
+        if isinstance(file, (str, bytes, os.PathLike)) and Path(os.fsdecode(file)) == target:
+            replace()
+        return original_io_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", instrumented_os_open)
+    monkeypatch.setattr(io, "open", instrumented_io_open)
+
+
 async def _runner_factory(root: Path, _monkeypatch: pytest.MonkeyPatch) -> WorkspaceHarness:
     runner = LocalRunner(root, inherit_env=False)
     return WorkspaceHarness(
@@ -188,7 +349,7 @@ async def _runner_bulk_transfer_probe(harness: WorkspaceHarness) -> None:
         assert [member.name for member in tar.getmembers()] == ["bulk/a.txt"]
 
 
-async def _runner_descriptor_containment_probe(
+async def _runner_path_operation_containment_probe(
     harness: WorkspaceHarness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -248,9 +409,6 @@ async def _runner_descriptor_containment_probe(
 NOT_ON_WORKSPACE = WorkspaceCapabilityClaim.not_applicable(
     "Bulk tar transfer is an extension of RunnerWorkspace, not the Workspace interface."
 )
-TRUSTED_LOCAL_PATHS = WorkspaceCapabilityClaim.not_applicable(
-    "LocalWorkspace does not claim containment against a hostile co-resident host process."
-)
 NATIVE_LISTING_IS_ADVISORY = WorkspaceCapabilityClaim.not_applicable(
     "The native adapter's listing transport is advisory rather than descriptor-pinned."
 )
@@ -260,7 +418,12 @@ REGISTRATIONS = (
         "local",
         LocalWorkspace,
         _local_factory,
-        WorkspaceCapabilities("stable", NOT_ON_WORKSPACE, TRUSTED_LOCAL_PATHS),
+        WorkspaceCapabilities(
+            "stable",
+            NOT_ON_WORKSPACE,
+            WorkspaceCapabilityClaim.supported(),
+        ),
+        path_operation_containment_probe=_local_path_operation_containment_probe,
     ),
     WorkspaceConformanceRegistration(
         "runner",
@@ -272,7 +435,7 @@ REGISTRATIONS = (
             WorkspaceCapabilityClaim.supported(),
         ),
         bulk_transfer_probe=_runner_bulk_transfer_probe,
-        descriptor_containment_probe=_runner_descriptor_containment_probe,
+        path_operation_containment_probe=_runner_path_operation_containment_probe,
     ),
     WorkspaceConformanceRegistration(
         "e2b",
@@ -396,6 +559,169 @@ def test_local_and_local_runner_workspace_share_conditional_mutation_lock(
         asyncio.run(runner.close())
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor traversal")
+def test_local_workspace_read_rejects_leaf_replaced_by_external_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "file.txt"
+    target.write_bytes(b"inside")
+    held = tmp_path / "held.txt"
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside-secret")
+    workspace = LocalWorkspace(root)
+    _replace_leaf_before_open(
+        monkeypatch,
+        target=target,
+        held=held,
+        outside=outside,
+    )
+
+    with pytest.raises(ValueError, match="escapes the workspace root"):
+        asyncio.run(workspace.read_bytes("file.txt"))
+
+    assert held.read_bytes() == b"inside"
+    assert outside.read_bytes() == b"outside-secret"
+
+
+def test_local_workspace_read_directory_preserves_file_not_found_error(tmp_path: Path) -> None:
+    (tmp_path / "directory").mkdir()
+    workspace = LocalWorkspace(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="Workspace file not found: directory"):
+        asyncio.run(workspace.read_bytes("directory"))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor traversal")
+def test_local_workspace_create_stays_with_opened_parent_during_symlink_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pivot = root / "pivot"
+    pivot.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    held = tmp_path / "held"
+    workspace = LocalWorkspace(root)
+    _replace_parent_after_open(
+        monkeypatch,
+        pivot=pivot,
+        held=held,
+        outside=outside,
+        intercept_os_parent=pivot,
+    )
+
+    result = asyncio.run(workspace.create_bytes("pivot/file.txt", b"created"))
+
+    assert result.operation == "create"
+    assert (held / "file.txt").read_bytes() == b"created"
+    assert not (outside / "file.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor traversal")
+def test_local_workspace_write_create_stays_with_opened_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pivot = root / "pivot"
+    pivot.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    held = tmp_path / "held"
+    workspace = LocalWorkspace(root)
+    _replace_parent_after_open(
+        monkeypatch,
+        pivot=pivot,
+        held=held,
+        outside=outside,
+        intercept_os_parent=pivot,
+    )
+
+    asyncio.run(workspace.write_bytes("pivot/file.txt", b"created"))
+
+    assert (held / "file.txt").read_bytes() == b"created"
+    assert not (outside / "file.txt").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor traversal")
+def test_local_workspace_conditional_replace_stays_with_opened_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pivot = root / "pivot"
+    pivot.mkdir()
+    (pivot / "file.txt").write_bytes(b"inside-before")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file.txt").write_bytes(b"outside-before")
+    held = tmp_path / "held"
+    workspace = LocalWorkspace(root)
+    revision = asyncio.run(workspace.read_bytes("pivot/file.txt")).revision
+    assert revision is not None
+    _replace_parent_after_open(
+        monkeypatch,
+        pivot=pivot,
+        held=held,
+        outside=outside,
+        intercept_io_path=pivot / "file.txt",
+        intercept_os_parent=pivot,
+    )
+
+    result = asyncio.run(
+        workspace.replace_bytes(
+            "pivot/file.txt",
+            b"inside-after",
+            expected_revision=revision,
+        )
+    )
+
+    assert result.operation == "replace"
+    assert (held / "file.txt").read_bytes() == b"inside-after"
+    assert (outside / "file.txt").read_bytes() == b"outside-before"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptor traversal")
+def test_local_workspace_conditional_delete_stays_with_opened_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    pivot = root / "pivot"
+    pivot.mkdir()
+    target = pivot / "file.txt"
+    target.write_bytes(b"inside")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file.txt").write_bytes(b"outside")
+    held = tmp_path / "held"
+    workspace = LocalWorkspace(root)
+    revision = asyncio.run(workspace.read_bytes("pivot/file.txt")).revision
+    assert revision is not None
+    _replace_parent_after_open(
+        monkeypatch,
+        pivot=pivot,
+        held=held,
+        outside=outside,
+        intercept_io_path=target,
+        intercept_unlink_path=target,
+    )
+
+    result = asyncio.run(workspace.delete_if_revision("pivot/file.txt", expected_revision=revision))
+
+    assert result.operation == "delete"
+    assert not (held / "file.txt").exists()
+    assert (outside / "file.txt").read_bytes() == b"outside"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX file modes")
 def test_local_workspace_create_uses_conventional_umask_permissions(tmp_path: Path) -> None:
     workspace = LocalWorkspace(tmp_path)
@@ -469,9 +795,9 @@ def test_workspace_resource_identity_and_capabilities(
         if registration.capabilities.bulk_transfer.state == "supported":
             assert registration.bulk_transfer_probe is not None
             await registration.bulk_transfer_probe(harness)
-        if registration.capabilities.descriptor_relative_containment.state == "supported":
-            assert registration.descriptor_containment_probe is not None
-            await registration.descriptor_containment_probe(harness, monkeypatch)
+        if registration.capabilities.path_operation_descriptor_containment.state == "supported":
+            assert registration.path_operation_containment_probe is not None
+            await registration.path_operation_containment_probe(harness, monkeypatch)
 
     _run_scenario(registration, tmp_path, monkeypatch, scenario)
 

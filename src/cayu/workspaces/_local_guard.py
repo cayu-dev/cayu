@@ -1,0 +1,320 @@
+"""Descriptor-relative containment for path-addressed ``LocalWorkspace`` operations.
+
+The configured root is trusted and opened once per operation. Every component below it is
+opened with ``O_NOFOLLOW`` relative to the preceding directory descriptor, and final reads or
+mutations stay relative to the pinned parent. A hostile same-user process may still access host
+paths directly; this guard only prevents it from redirecting a workspace API operation through
+concurrent symlink replacement.
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import os
+import secrets
+import stat
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from pathlib import Path
+from typing import BinaryIO, NoReturn
+
+from cayu.workspaces.base import WorkspaceRevisionMismatchError
+
+_ESCAPE_ERRNOS = (errno.ELOOP, errno.EMLINK)
+_MISSING_ERRNOS = (errno.ENOENT, errno.ENOTDIR)
+_OPEN_BASE_FLAGS = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+_NONBLOCK_FLAG = getattr(os, "O_NONBLOCK", 0)
+_TEMP_OPEN_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+if hasattr(os, "O_PATH"):
+    _SEARCH_BASE_FLAGS = os.O_PATH | getattr(os, "O_CLOEXEC", 0)
+elif hasattr(os, "O_SEARCH"):
+    _SEARCH_BASE_FLAGS = os.O_SEARCH | getattr(os, "O_CLOEXEC", 0)
+elif sys.platform == "darwin":
+    # CPython does not expose Darwin's O_SEARCH even though the kernel supports it.
+    _SEARCH_BASE_FLAGS = 0x40000000 | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+else:
+    _SEARCH_BASE_FLAGS = _OPEN_BASE_FLAGS
+
+_SUPPORTS_DIR_FD = all(
+    operation in os.supports_dir_fd
+    for operation in (os.open, os.stat, os.mkdir, os.link, os.unlink, os.rename)
+)
+_SUPPORTS_NOFOLLOW_STAT = os.stat in os.supports_follow_symlinks
+_SUPPORTS_NOFOLLOW_LINK = os.link in os.supports_follow_symlinks
+
+
+class _LocalGuardPathError(Exception):
+    def __init__(self, status: str) -> None:
+        self.status = status
+        super().__init__(status)
+
+
+def _require_descriptor_guard_support() -> None:
+    if (
+        not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "fchmod")
+        or not _SUPPORTS_DIR_FD
+        or not _SUPPORTS_NOFOLLOW_STAT
+        or not _SUPPORTS_NOFOLLOW_LINK
+    ):
+        raise RuntimeError(
+            "LocalWorkspace requires POSIX descriptor-relative filesystem primitives."
+        )
+
+
+def _classify_missing(name: str, dir_fd: int) -> str:
+    try:
+        info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return "missing"
+    if stat.S_ISLNK(info.st_mode):
+        return "escape"
+    return "notdir"
+
+
+def _open_directory(name: str, dir_fd: int, *, create: bool) -> int:
+    flags = _SEARCH_BASE_FLAGS | os.O_NOFOLLOW | os.O_DIRECTORY
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in _ESCAPE_ERRNOS:
+            raise _LocalGuardPathError("escape") from exc
+        if exc.errno == errno.ENOENT and create:
+            with suppress(FileExistsError):
+                os.mkdir(name, mode=0o777, dir_fd=dir_fd)
+            return _open_directory(name, dir_fd, create=False)
+        if exc.errno in _MISSING_ERRNOS:
+            raise _LocalGuardPathError(_classify_missing(name, dir_fd)) from exc
+        raise
+
+
+@contextmanager
+def _open_parent(
+    root: Path,
+    relative_path: str,
+    *,
+    create: bool = False,
+) -> Iterator[tuple[int, str]]:
+    _require_descriptor_guard_support()
+    parts = relative_path.split("/")
+    try:
+        root_fd = os.open(
+            root,
+            _SEARCH_BASE_FLAGS | os.O_NOFOLLOW | os.O_DIRECTORY,
+        )
+    except OSError as exc:
+        if exc.errno in _ESCAPE_ERRNOS:
+            raise _LocalGuardPathError("escape") from exc
+        if exc.errno in _MISSING_ERRNOS:
+            raise _LocalGuardPathError("missing") from exc
+        raise
+    current_fd = root_fd
+    try:
+        for name in parts[:-1]:
+            next_fd = _open_directory(name, current_fd, create=create)
+            os.close(current_fd)
+            current_fd = next_fd
+        yield current_fd, parts[-1]
+    finally:
+        os.close(current_fd)
+
+
+def _open_regular(parent_fd: int, name: str) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(
+            name,
+            _OPEN_BASE_FLAGS | _NONBLOCK_FLAG | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        if exc.errno in _ESCAPE_ERRNOS:
+            raise _LocalGuardPathError("escape") from exc
+        if exc.errno in _MISSING_ERRNOS:
+            raise _LocalGuardPathError(_classify_missing(name, parent_fd)) from exc
+        raise
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode):
+        os.close(descriptor)
+        raise _LocalGuardPathError("notfile")
+    return descriptor, info
+
+
+def _identity_at(parent_fd: int, name: str) -> tuple[tuple[str, str, int], int]:
+    descriptor, info = _open_regular(parent_fd, name)
+    digest = hashlib.sha256()
+    size = 0
+    with os.fdopen(descriptor, "rb") as source:
+        while chunk := source.read(1 << 16):
+            digest.update(chunk)
+            size += len(chunk)
+    hexdigest = digest.hexdigest()
+    return (f"sha256:{hexdigest}", hexdigest, size), stat.S_IMODE(info.st_mode)
+
+
+def _inspect_regular_target_mode(parent_fd: int, name: str) -> int | None:
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        raise _LocalGuardPathError("escape")
+    if not stat.S_ISREG(info.st_mode):
+        raise _LocalGuardPathError("notfile")
+    return stat.S_IMODE(info.st_mode)
+
+
+def _write_temp(parent_fd: int, name: str, content: bytes, *, mode: int | None) -> str:
+    descriptor: int | None = None
+    temp_name: str | None = None
+    for _attempt in range(100):
+        candidate = f".{name}.cayu-{secrets.token_hex(12)}"
+        try:
+            descriptor = os.open(candidate, _TEMP_OPEN_FLAGS, 0o666, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        temp_name = candidate
+        break
+    if descriptor is None or temp_name is None:
+        raise OSError("Could not allocate an atomic workspace temporary file.")
+    try:
+        with os.fdopen(descriptor, "wb") as temp:
+            temp.write(content)
+            if mode is not None:
+                os.fchmod(temp.fileno(), mode)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.unlink(temp_name, dir_fd=parent_fd)
+        raise
+    return temp_name
+
+
+def _create_at(parent_fd: int, name: str, content: bytes) -> None:
+    temp_name = _write_temp(parent_fd, name, content, mode=None)
+    try:
+        try:
+            os.link(
+                temp_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise _LocalGuardPathError("escape") from exc
+            raise
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temp_name, dir_fd=parent_fd)
+
+
+def _replace_at(parent_fd: int, name: str, content: bytes, *, mode: int) -> None:
+    temp_name = _write_temp(parent_fd, name, content, mode=mode)
+    try:
+        os.rename(
+            temp_name,
+            name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    finally:
+        with suppress(FileNotFoundError):
+            os.unlink(temp_name, dir_fd=parent_fd)
+
+
+def _raise_workspace_path_error(
+    error: _LocalGuardPathError,
+    relative_path: str,
+) -> NoReturn:
+    if error.status == "escape":
+        raise ValueError("Workspace path escapes the workspace root.") from error
+    if error.status == "notfile":
+        raise IsADirectoryError(f"Workspace path is not a file: {relative_path}") from error
+    raise FileNotFoundError(f"Workspace file not found: {relative_path}") from error
+
+
+@contextmanager
+def open_regular_for_read(root: Path, relative_path: str) -> Iterator[tuple[BinaryIO, int]]:
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, name):
+            descriptor, info = _open_regular(parent_fd, name)
+            with os.fdopen(descriptor, "rb") as file:
+                yield file, info.st_size
+    except _LocalGuardPathError as exc:
+        if exc.status == "notfile":
+            raise FileNotFoundError(f"Workspace file not found: {relative_path}") from exc
+        _raise_workspace_path_error(exc, relative_path)
+
+
+def create_regular(root: Path, relative_path: str, content: bytes) -> None:
+    try:
+        with _open_parent(root, relative_path, create=True) as (parent_fd, name):
+            _create_at(parent_fd, name, content)
+    except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, relative_path)
+
+
+def write_regular(root: Path, relative_path: str, content: bytes) -> None:
+    try:
+        with _open_parent(root, relative_path, create=True) as (parent_fd, name):
+            mode = _inspect_regular_target_mode(parent_fd, name)
+            if mode is None:
+                _create_at(parent_fd, name, content)
+            else:
+                _replace_at(parent_fd, name, content, mode=mode)
+    except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, relative_path)
+
+
+def replace_regular_if_revision(
+    root: Path,
+    relative_path: str,
+    content: bytes,
+    expected_revision: str,
+) -> tuple[str, str, int]:
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, name):
+            before, mode = _identity_at(parent_fd, name)
+            if before[0] != expected_revision:
+                raise WorkspaceRevisionMismatchError(expected_revision, before[0])
+            _replace_at(parent_fd, name, content, mode=mode)
+            return before
+    except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, relative_path)
+
+
+def delete_regular(root: Path, relative_path: str) -> None:
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, name):
+            mode = _inspect_regular_target_mode(parent_fd, name)
+            if mode is not None:
+                os.unlink(name, dir_fd=parent_fd)
+    except _LocalGuardPathError as exc:
+        if exc.status not in {"missing", "notdir"}:
+            _raise_workspace_path_error(exc, relative_path)
+
+
+def delete_regular_if_revision(
+    root: Path,
+    relative_path: str,
+    expected_revision: str,
+) -> tuple[str, str, int]:
+    try:
+        with _open_parent(root, relative_path) as (parent_fd, name):
+            before, _mode = _identity_at(parent_fd, name)
+            if before[0] != expected_revision:
+                raise WorkspaceRevisionMismatchError(expected_revision, before[0])
+            os.unlink(name, dir_fd=parent_fd)
+            return before
+    except _LocalGuardPathError as exc:
+        _raise_workspace_path_error(exc, relative_path)

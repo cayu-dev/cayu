@@ -4008,7 +4008,7 @@ their allocation durability and cleanup obligations.
 ## Workspace
 
 Filesystem boundary. For coding agents this is often a target repo. For document/data agents this may be a working directory where tools create intermediate outputs.
-`LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root.
+`LocalWorkspace` is available for local filesystem-backed work. It resolves paths under one root and rejects path traversal outside that root. Path-addressed reads, creates, replacements, and deletions require POSIX descriptor-relative filesystem primitives. Each operation pins the operator-configured root, opens every component below it with `O_NOFOLLOW` relative to the preceding directory descriptor, and performs the final open, link, rename, or unlink relative to the pinned parent. Concurrent replacement of a checked component therefore cannot redirect a workspace API operation outside the opened root. Writes preserve the existing atomic create/replace behavior and conventional umask-derived creation mode. Platforms without the required primitives fail closed rather than falling back to pathname validation. The configured root ancestry remains trusted, and the cooperative per-path lock serializes Cayu clients but is not a process-isolation boundary. `LocalRunner` code still runs as the host user and may access host paths directly; use a sandbox runner when code itself is untrusted.
 `EFSAccessPointBinding` and `S3FilesAccessPointBinding` mount an exact AWS access
 point at the runner's workspace path using an explicit mount-target IPv4
 address. They flush and unmount before runner lifecycle teardown. These

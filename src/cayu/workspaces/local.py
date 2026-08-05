@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from os import PathLike
 from pathlib import Path
 
 from cayu._validation import require_clean_nonblank
+from cayu.workspaces._local_guard import (
+    create_regular,
+    delete_regular,
+    delete_regular_if_revision,
+    open_regular_for_read,
+    replace_regular_if_revision,
+    write_regular,
+)
 from cayu.workspaces._mutations import (
-    atomic_create,
-    atomic_replace,
     content_identity,
-    file_content_identity,
     mutation_result,
     mutation_result_from_identities,
     workspace_path_lock,
@@ -20,7 +24,6 @@ from cayu.workspaces.base import (
     WorkspaceListResult,
     WorkspaceMutationResult,
     WorkspaceReadResult,
-    WorkspaceRevisionMismatchError,
     _local_resource_key,
     _validate_workspace_relative_path,
     _WorkspaceListCollector,
@@ -65,16 +68,12 @@ class LocalWorkspace(Workspace):
         max_bytes: int | None = None,
     ) -> WorkspaceReadResult:
         relative_path = _validate_workspace_relative_path(path)
-        target = self.resolve(path)
-        if not target.is_file():
-            raise FileNotFoundError(f"Workspace file not found: {path}")
         validated_offset = _validate_offset(offset)
         limit = _validate_limit(max_bytes, "max_bytes")
         return await asyncio.to_thread(
             _read_file_locked,
             self.root,
             relative_path,
-            target,
             validated_offset,
             limit,
         )
@@ -83,20 +82,17 @@ class LocalWorkspace(Workspace):
         if type(content) is not bytes:
             raise TypeError("Workspace write content must be bytes.")
         relative_path = _validate_workspace_relative_path(path)
-        target = self.resolve_no_symlinks(path)
-        await asyncio.to_thread(_write_file, self.root, relative_path, target, content)
+        await asyncio.to_thread(_write_file, self.root, relative_path, content)
 
     async def delete(self, path: str) -> None:
         relative_path = _validate_workspace_relative_path(path)
-        target = self.resolve_no_symlinks(path)
-        await asyncio.to_thread(_delete_file, self.root, relative_path, target)
+        await asyncio.to_thread(_delete_file, self.root, relative_path)
 
     async def create_bytes(self, path: str, content: bytes) -> WorkspaceMutationResult:
         if type(content) is not bytes:
             raise TypeError("Workspace create content must be bytes.")
         relative_path = _validate_workspace_relative_path(path)
-        target = self.resolve_no_symlinks(path)
-        return await asyncio.to_thread(_create_file, self.root, relative_path, target, content)
+        return await asyncio.to_thread(_create_file, self.root, relative_path, content)
 
     async def replace_bytes(
         self,
@@ -109,12 +105,10 @@ class LocalWorkspace(Workspace):
             raise TypeError("Workspace replace content must be bytes.")
         expected_revision = _validate_revision(expected_revision)
         relative_path = _validate_workspace_relative_path(path)
-        target = self.resolve_no_symlinks(path)
         return await asyncio.to_thread(
             _replace_file,
             self.root,
             relative_path,
-            target,
             content,
             expected_revision,
         )
@@ -127,12 +121,10 @@ class LocalWorkspace(Workspace):
     ) -> WorkspaceMutationResult:
         expected_revision = _validate_revision(expected_revision)
         relative_path = _validate_workspace_relative_path(path)
-        target = self.resolve_no_symlinks(path)
         return await asyncio.to_thread(
             _delete_file_if_revision,
             self.root,
             relative_path,
-            target,
             expected_revision,
         )
 
@@ -190,39 +182,33 @@ class LocalWorkspace(Workspace):
         return current
 
 
-def _write_file(root: Path, relative_path: str, path: Path, content: bytes) -> None:
+def _write_file(root: Path, relative_path: str, content: bytes) -> None:
     with workspace_path_lock(root, relative_path):
-        if path.exists():
-            if not path.is_file():
-                raise IsADirectoryError(f"Workspace path is not a file: {path}")
-            atomic_replace(path, content)
-        else:
-            atomic_create(path, content)
+        write_regular(root, relative_path, content)
 
 
-def _delete_file(root: Path, relative_path: str, path: Path) -> None:
+def _delete_file(root: Path, relative_path: str) -> None:
     with workspace_path_lock(root, relative_path):
-        if not path.exists():
-            return
-        if not path.is_file():
-            raise IsADirectoryError(f"Workspace path is not a file: {path}")
-        path.unlink()
+        delete_regular(root, relative_path)
 
 
 def _read_file_locked(
     root: Path,
     relative_path: str,
-    path: Path,
     offset: int,
     max_bytes: int | None,
 ) -> WorkspaceReadResult:
     with workspace_path_lock(root, relative_path):
-        return _read_file(path, offset, max_bytes)
+        return _read_file(root, relative_path, offset, max_bytes)
 
 
-def _read_file(path: Path, offset: int, max_bytes: int | None) -> WorkspaceReadResult:
-    with path.open("rb") as file:
-        total_bytes = os.fstat(file.fileno()).st_size
+def _read_file(
+    root: Path,
+    relative_path: str,
+    offset: int,
+    max_bytes: int | None,
+) -> WorkspaceReadResult:
+    with open_regular_for_read(root, relative_path) as (file, total_bytes):
         if offset > total_bytes:
             raise ValueError("Workspace read offset cannot exceed file size.")
         file.seek(offset)
@@ -239,42 +225,35 @@ def _read_file(path: Path, offset: int, max_bytes: int | None) -> WorkspaceReadR
     )
 
 
-def _create_file(
-    root: Path, relative_path: str, path: Path, content: bytes
-) -> WorkspaceMutationResult:
+def _create_file(root: Path, relative_path: str, content: bytes) -> WorkspaceMutationResult:
     with workspace_path_lock(root, relative_path):
-        atomic_create(path, content)
+        create_regular(root, relative_path, content)
         return mutation_result("create", before=None, after=content)
 
 
 def _replace_file(
     root: Path,
     relative_path: str,
-    path: Path,
     content: bytes,
     expected_revision: str,
 ) -> WorkspaceMutationResult:
     with workspace_path_lock(root, relative_path):
-        before = file_content_identity(path)
-        actual_revision = before[0]
-        if actual_revision != expected_revision:
-            raise WorkspaceRevisionMismatchError(expected_revision, actual_revision)
-        atomic_replace(path, content)
+        before = replace_regular_if_revision(
+            root,
+            relative_path,
+            content,
+            expected_revision,
+        )
         return mutation_result_from_identities("replace", before=before, after=content)
 
 
 def _delete_file_if_revision(
     root: Path,
     relative_path: str,
-    path: Path,
     expected_revision: str,
 ) -> WorkspaceMutationResult:
     with workspace_path_lock(root, relative_path):
-        before = file_content_identity(path)
-        actual_revision = before[0]
-        if actual_revision != expected_revision:
-            raise WorkspaceRevisionMismatchError(expected_revision, actual_revision)
-        path.unlink()
+        before = delete_regular_if_revision(root, relative_path, expected_revision)
         return mutation_result_from_identities("delete", before=before, after=None)
 
 
