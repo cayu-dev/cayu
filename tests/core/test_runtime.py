@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
+import httpx
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -21914,48 +21915,45 @@ def test_cayu_app_retries_provider_exception_and_keeps_transcript_clean():
 def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class StreamingResponse:
-        status_code = 200
-
+    class StreamingBody(httpx.AsyncByteStream):
         def __init__(self, *, idle: bool) -> None:
             self.idle = idle
 
-        async def aiter_lines(self):
+        async def __aiter__(self):
             if self.idle:
                 yield (
-                    'data: {"id":"chat-1","object":"chat.completion.chunk",'
-                    '"model":"fake-model","choices":[{"index":0,'
-                    '"delta":{"content":"partial answer"},"finish_reason":null}]}'
+                    b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                    b'"model":"fake-model","choices":[{"index":0,'
+                    b'"delta":{"content":"partial answer"},"finish_reason":null}]}'
+                    b"\n\n"
                 )
-                yield ""
                 # Block until the real idle deadline cancels this pending read.
                 # A fixed sleep made the successful retry race a 1 ms deadline
                 # under slower event-loop schedulers (notably CI on Python 3.14).
                 await asyncio.Event().wait()
             yield (
-                'data: {"id":"chat-1","object":"chat.completion.chunk",'
-                '"model":"fake-model","choices":[{"index":0,'
-                '"delta":{"content":"ok"},"finish_reason":null}]}'
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{"content":"ok"},"finish_reason":null}]}'
+                b"\n\n"
             )
-            yield ""
             yield (
-                'data: {"id":"chat-1","object":"chat.completion.chunk",'
-                '"model":"fake-model","choices":[{"index":0,'
-                '"delta":{},"finish_reason":"stop"}]}'
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{},"finish_reason":"stop"}]}'
+                b"\n\n"
             )
-            yield ""
-            yield "data: [DONE]"
-            yield ""
+            yield b"data: [DONE]\n\n"
 
     class StreamContext:
-        def __init__(self, response: StreamingResponse) -> None:
+        def __init__(self, response: httpx.Response) -> None:
             self.response = response
 
-        async def __aenter__(self) -> StreamingResponse:
+        async def __aenter__(self) -> httpx.Response:
             return self.response
 
         async def __aexit__(self, *args: Any) -> None:
-            return None
+            await self.response.aclose()
 
     class FlakyHttpClient:
         calls = 0
@@ -21965,7 +21963,14 @@ def test_cayu_app_retries_typed_http_sse_idle_timeout_and_keeps_transcript_clean
 
         def stream(self, *args: Any, **kwargs: Any) -> StreamContext:
             type(self).calls += 1
-            return StreamContext(StreamingResponse(idle=type(self).calls == 1))
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=StreamingBody(idle=type(self).calls == 1),
+                request=request,
+            )
+            return StreamContext(response)
 
         async def aclose(self) -> None:
             self.is_closed = True

@@ -10,6 +10,7 @@ from cayu._validation import (
     copy_json_value,
     escape_json_pointer_segment,
     require_clean_nonblank,
+    require_finite,
     unescape_json_pointer_segment,
 )
 from cayu.artifacts import (
@@ -37,15 +38,18 @@ from cayu.embeddings import (
 )
 from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._credential_boundary import (
+    aclosing_provider_stream,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
+    _trusted_sse_retry_after_s,
     aclose_transport,
     copy_headers,
     credential_safe_error_event,
+    credential_safe_post_completion_failure,
     credential_safe_provider_exception,
     credential_sanitization_values,
     optional_error_string,
@@ -284,8 +288,9 @@ class HttpxOpenAITransport:
             raise_context_overflow=_raise_openai_context_overflow_if_applicable,
             api_error_from_response=_openai_api_error_from_response,
         )
-        async for event in events:
-            yield event
+        async with aclosing_provider_stream(events):
+            async for event in events:
+                yield event
 
 
 class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
@@ -334,9 +339,12 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
         self.timeout_s = float(timeout_s)
         if type(stream_idle_timeout_s) not in {int, float}:
             raise TypeError("stream_idle_timeout_s must be a number.")
+        stream_idle_timeout_s = require_finite(
+            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        )
         if stream_idle_timeout_s <= 0:
             raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
+        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         self.extra_headers = _copy_headers(extra_headers)
         self.reasoning_state = _validate_reasoning_state(reasoning_state)
@@ -348,16 +356,23 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
     ) -> AsyncIterator[ModelStreamEvent]:
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: OpenAIContextOverflowError | None = None
+        post_completion_failure: ModelProviderError | None = None
         error_event: ModelStreamEvent | None = None
+        completion_emitted = False
         try:
             payload = build_openai_payload(
                 request, stream=True, reasoning_state=self.reasoning_state
             )
             yielded_any = False
             try:
-                async for event in self._consume(payload):
-                    yielded_any = True
-                    yield event
+                events = self._consume(payload)
+                async with aclosing_provider_stream(events):
+                    async for event in events:
+                        yielded_any = True
+                        completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                        yield event
+                        if completion_emitted:
+                            break
                 return
             except OpenAIAPIError as exc:
                 recoverable = (
@@ -371,8 +386,13 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             recovery_payload = build_openai_payload(
                 request, stream=True, reasoning_state=self.reasoning_state, chain=False
             )
-            async for event in self._consume(recovery_payload):
-                yield event
+            events = self._consume(recovery_payload)
+            async with aclosing_provider_stream(events):
+                async for event in events:
+                    completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                    yield event
+                    if completion_emitted:
+                        break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
@@ -383,39 +403,59 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
                 ),
             )
         except ModelContextOverflowError as exc:
-            # Overflow must reach runtime recovery as a typed exception; an
-            # error event would flatten it into unrecoverable message text.
-            safe = credential_safe_provider_exception(
-                exc,
-                provider_label="OpenAI",
-                provider_name="openai",
-                credential_values=credential_sanitization_values(
-                    self.api_key,
-                    extra_headers=self.extra_headers,
-                ),
+            credential_values = credential_sanitization_values(
+                self.api_key,
+                extra_headers=self.extra_headers,
             )
-            overflow_failure = OpenAIContextOverflowError(
-                str(safe),
-                status_code=safe.status_code,
-                error_type=safe.error_type,
-                error_code=safe.error_code,
-                request_id=safe.request_id,
-                response_body=None,
-            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="OpenAI",
+                    provider_name="openai",
+                    credential_values=credential_values,
+                )
+            else:
+                # Overflow must reach runtime recovery as a typed exception; an
+                # error event would flatten it into unrecoverable message text.
+                safe = credential_safe_provider_exception(
+                    exc,
+                    provider_label="OpenAI",
+                    provider_name="openai",
+                    credential_values=credential_values,
+                )
+                overflow_failure = OpenAIContextOverflowError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    response_body=None,
+                )
         except Exception as exc:
-            error_event = credential_safe_error_event(
-                exc,
-                provider_label="OpenAI",
-                provider_name="openai",
-                credential_values=credential_sanitization_values(
-                    self.api_key,
-                    extra_headers=self.extra_headers,
-                ),
+            credential_values = credential_sanitization_values(
+                self.api_key,
+                extra_headers=self.extra_headers,
             )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="OpenAI",
+                    provider_name="openai",
+                    credential_values=credential_values,
+                )
+            else:
+                error_event = credential_safe_error_event(
+                    exc,
+                    provider_label="OpenAI",
+                    provider_name="openai",
+                    credential_values=credential_values,
+                )
         if cancellation is not None:
             raise cancellation from None
         if overflow_failure is not None:
             raise overflow_failure from None
+        if post_completion_failure is not None:
+            raise post_completion_failure from None
         if error_event is not None:
             yield error_event
 
@@ -523,8 +563,10 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
             timeout_s=self.timeout_s,
             stream_idle_timeout_s=self.stream_idle_timeout_s,
         )
-        async for event in openai_stream_events(raw_events, reasoning_state=self.reasoning_state):
-            yield event
+        events = openai_stream_events(raw_events, reasoning_state=self.reasoning_state)
+        async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+            async for event in events:
+                yield event
 
     async def aclose(self) -> None:
         """Close the transport's shared HTTP client, if it owns one."""
@@ -1314,6 +1356,7 @@ def _stream_response_object(event: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
+    retry_after_s = _trusted_sse_retry_after_s(event)
     event_type = event.get("type")
     if event_type == "response.failed":
         response = _stream_response_object(event)
@@ -1322,11 +1365,13 @@ def _openai_stream_error_exception(event: Mapping[str, Any]) -> OpenAIAPIError:
             response if error is None else error,
             safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
             request_id=optional_error_string(response.get("request_id")),
+            retry_after_s=retry_after_s,
         )
     return _openai_error_value_exception(
         event,
         safe_message=f"OpenAI streaming error: {OMITTED_PROVIDER_ERROR_BODY}",
         request_id=optional_error_string(event.get("request_id")),
+        retry_after_s=retry_after_s,
     )
 
 
@@ -1335,6 +1380,7 @@ def _openai_error_value_exception(
     *,
     safe_message: str,
     request_id: str | None,
+    retry_after_s: float | None = None,
 ) -> OpenAIAPIError:
     error_mapping = error if isinstance(error, Mapping) else {}
     error_type = optional_error_string(error_mapping.get("type"))
@@ -1342,7 +1388,12 @@ def _openai_error_value_exception(
     param = optional_error_string(error_mapping.get("param"))
     resolved_request_id = request_id or optional_error_string(error_mapping.get("request_id"))
     raw_message = optional_error_string(error_mapping.get("message"))
-    if _is_openai_context_overflow(code=error_code, message=raw_message):
+    if _is_openai_context_overflow(
+        status_code=None,
+        error_type=error_type,
+        code=error_code,
+        message=raw_message,
+    ):
         return OpenAIContextOverflowError(
             "OpenAI model context overflow",
             error_type=error_type,
@@ -1350,14 +1401,77 @@ def _openai_error_value_exception(
             request_id=resolved_request_id,
             response_body=None,
         )
+    status_code, retryable = _openai_retry_metadata(
+        transport_status_code=None,
+        error_type=error_type,
+        error_code=error_code,
+    )
     return OpenAIAPIError(
         safe_message,
+        status_code=status_code,
         error_type=error_type,
         error_code=error_code,
         param=param,
         request_id=resolved_request_id,
+        retryable=retryable,
+        retry_after_s=retry_after_s,
         response_body=None,
     )
+
+
+_STALE_CHAIN_ERROR_CODE = "previous_response_not_found"
+_STALE_CHAIN_PARAM = "previous_response_id"
+
+
+_OPENAI_ERROR_TYPE_CLASSIFICATION = {
+    "authentication_error": (401, False),
+    "invalid_request_error": (400, False),
+    "not_found_error": (404, False),
+    "permission_error": (403, False),
+    "rate_limit_error": (429, True),
+    "server_error": (500, True),
+}
+_OPENAI_ERROR_CODE_CLASSIFICATION = {
+    "bad_request": (400, False),
+    "context_length_exceeded": (400, False),
+    "internal_error": (500, True),
+    "previous_response_not_found": (404, False),
+    "rate_limit_exceeded": (429, True),
+    "server_error": (500, True),
+}
+
+
+def _openai_retry_metadata(
+    *,
+    transport_status_code: int | None,
+    error_type: str | None,
+    error_code: str | None,
+) -> tuple[int | None, bool | None]:
+    """Classify recognized HTTP/stream identities; conflicts fail closed."""
+    # OpenAI reports an expired previous response as a 404 while retaining the
+    # broad ``invalid_request_error`` envelope.  The specific stale-chain code
+    # is authoritative for this documented combination; other recognized
+    # type/code disagreements remain conflicts.
+    if error_type == "invalid_request_error" and error_code == _STALE_CHAIN_ERROR_CODE:
+        classification = _OPENAI_ERROR_CODE_CLASSIFICATION[_STALE_CHAIN_ERROR_CODE]
+    else:
+        classifications = {
+            classification
+            for classification in (
+                _OPENAI_ERROR_TYPE_CLASSIFICATION.get(error_type or ""),
+                _OPENAI_ERROR_CODE_CLASSIFICATION.get(error_code or ""),
+            )
+            if classification is not None
+        }
+        if not classifications:
+            return transport_status_code, None
+        if len(classifications) != 1:
+            return transport_status_code, False
+        classification = next(iter(classifications))
+    canonical_status, retryable = classification
+    if transport_status_code is not None and transport_status_code != canonical_status:
+        return transport_status_code, False
+    return canonical_status, retryable
 
 
 def _stream_output_index(event: Mapping[str, Any]) -> int:
@@ -1945,13 +2059,21 @@ def _openai_api_error_from_response(
         error = raw_error if isinstance(raw_error, Mapping) else decoded
         raw_request_id = decoded.get("request_id")
         request_id = raw_request_id if isinstance(raw_request_id, str) else None
+    error_type = optional_error_string(error.get("type"))
+    error_code = optional_error_string(error.get("code"))
+    status_code, retryable = _openai_retry_metadata(
+        transport_status_code=response.status_code,
+        error_type=error_type,
+        error_code=error_code,
+    )
     return OpenAIAPIError(
         message,
-        status_code=response.status_code,
-        error_type=optional_error_string(error.get("type")),
-        error_code=optional_error_string(error.get("code")),
+        status_code=status_code,
+        error_type=error_type,
+        error_code=error_code,
         param=optional_error_string(error.get("param")),
         request_id=optional_error_string(request_id),
+        retryable=retryable,
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )
@@ -1983,7 +2105,12 @@ def _raise_openai_context_overflow_from_error(
     code = optional_error_string(error.get("code"))
     error_type = optional_error_string(error.get("type"))
     message = optional_error_string(error.get("message"))
-    if not _is_openai_context_overflow(code=code, message=message):
+    if not _is_openai_context_overflow(
+        status_code=status_code,
+        error_type=error_type,
+        code=code,
+        message=message,
+    ):
         return
     raise OpenAIContextOverflowError(
         "OpenAI model context overflow",
@@ -1995,7 +2122,25 @@ def _raise_openai_context_overflow_from_error(
     )
 
 
-def _is_openai_context_overflow(*, code: str | None, message: str | None) -> bool:
+def _is_openai_context_overflow(
+    *,
+    status_code: int | None,
+    error_type: str | None,
+    code: str | None,
+    message: str | None,
+) -> bool:
+    classifications = {
+        classification[0]
+        for classification in (
+            _OPENAI_ERROR_TYPE_CLASSIFICATION.get(error_type or ""),
+            _OPENAI_ERROR_CODE_CLASSIFICATION.get(code or ""),
+        )
+        if classification is not None
+    }
+    if status_code is not None:
+        classifications.add(status_code)
+    if classifications and classifications != {400}:
+        return False
     if code == "context_length_exceeded":
         return True
     if message is None:
@@ -2013,25 +2158,35 @@ def _safe_error_json(decoded: Mapping[str, Any]) -> str:
     return safe_error_json(decoded, include_request_id=True)
 
 
-_STALE_CHAIN_ERROR_CODE = "previous_response_not_found"
-_STALE_CHAIN_PARAM = "previous_response_id"
-
-
 def _is_stale_chain_error(exc: Exception) -> bool:
-    """Classify a stale server-side chain from typed error identity.
+    """Classify a stale server-side chain from coherent typed error identity.
 
     OpenAI reports a stale/expired ``previous_response_id`` as HTTP 404 with
     ``code: "previous_response_not_found"`` (``param: "previous_response_id"``).
-    Classification reads only the structured fields captured on
-    `OpenAIAPIError` — never message text — so unrelated errors that merely
-    mention the field (e.g. a 400 for combining it with ``conversation``) are
-    not misclassified as recoverable.
+    Recovery requires that positive 404 evidence and rejects recognized type or
+    code identities that conflict with it.  Classification never reads message
+    text, so unrelated errors that merely mention the field (e.g. a 400 for
+    combining it with ``conversation``) are not misclassified as recoverable.
     """
     if not isinstance(exc, OpenAIAPIError):
         return False
-    if exc.error_code == _STALE_CHAIN_ERROR_CODE:
-        return True
-    return exc.status_code == 404 and exc.param == _STALE_CHAIN_PARAM
+    if exc.status_code != 404:
+        return False
+    if exc.error_code != _STALE_CHAIN_ERROR_CODE and exc.param != _STALE_CHAIN_PARAM:
+        return False
+    if exc.param is not None and exc.param != _STALE_CHAIN_PARAM:
+        return False
+
+    type_classification = _OPENAI_ERROR_TYPE_CLASSIFICATION.get(exc.error_type or "")
+    if (
+        type_classification is not None
+        and exc.error_type != "invalid_request_error"
+        and type_classification[0] != 404
+    ):
+        return False
+
+    code_classification = _OPENAI_ERROR_CODE_CLASSIFICATION.get(exc.error_code or "")
+    return code_classification is None or code_classification[0] == 404
 
 
 def _validate_reasoning_state(value: str) -> str:

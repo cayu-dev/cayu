@@ -2927,12 +2927,23 @@ explicitly allowlisted error type/code. Arbitrary provider-authored identity
 strings and request IDs are omitted; numeric status, retryability, retry delay,
 and fixed classifications needed for overflow or stale-chain recovery remain.
 OpenAI, Chat Completions, Vertex, and Anthropic HTTP errors also preserve valid
-`Retry-After` delta-seconds and HTTP-date headers as `retry_after_s`; the runtime
-uses that delay in preference to exponential backoff, capped by
-`RetryPolicy.max_delay_s`. An SSE stream that produces no events before its idle
-deadline is normalized to a typed retryable provider error. Malformed SSE/JSON
-and provider protocol errors remain terminal and are not converted into
-transport retries.
+`Retry-After` delta-seconds and HTTP-date headers as `retry_after_s`, including
+an in-band error carried by a successful HTTP stream. This delay comes only
+from the trusted response header, never an event JSON field; the runtime uses
+it in preference to exponential backoff, capped by `RetryPolicy.max_delay_s`.
+Structured in-band stream errors use the same retry contract:
+Anthropic-shaped overload/rate-limit/API/timeout identities map to
+529/429/500/504, and OpenAI-shaped server/rate-limit identities map to 500/429.
+Known permanent identities are explicitly non-retryable; absent or unrecognized
+authoritative identities and conflicting recognized identities never become
+retryable from message text. A recognized identity that conflicts with context
+overflow likewise cannot become context-recoverable from message text. An SSE
+stream that receives no bytes or decoded lines before its idle deadline is
+normalized to a typed retryable provider error. Every non-empty response chunk
+and received line resets that idle deadline, while one incomplete line/event
+has a separate retryable duration ceiling. Malformed
+SSE/JSON, provider protocol errors, and event size/line-limit failures remain
+terminal and are not converted into transport retries.
 When retries are enabled, provider-derived `model.text.delta`, `model.error`,
 and `model.completed` events include `step`, `attempt`, and `max_attempts` so
 SSE consumers, dashboards, and replay tools can distinguish failed-attempt
@@ -3016,11 +3027,26 @@ experimental local-testing path, not a documented OpenAI Platform API or a
 hosted multi-user authentication mechanism. See
 [`docs/openai-subscription.md`](openai-subscription.md).
 
-Configure OpenAI transport timeouts on the provider. `timeout_s` controls ordinary HTTP transport timeouts; `stream_idle_timeout_s` controls how long a streaming response may go without a parsed provider event before Cayu treats the model step as stalled:
+Configure OpenAI transport timeouts on the provider. `timeout_s` controls
+ordinary HTTP transport timeouts; `stream_idle_timeout_s` controls how long a
+streaming response may go without any received response bytes or SSE line
+before Cayu treats the model step as stalled:
 
 ```python
 OpenAIProvider(timeout_s=600, stream_idle_timeout_s=300)
 ```
+
+The bundled HTTP transports also bound one unterminated SSE event to 16 MiB,
+4,096 event lines, and four times the configured idle timeout. These are
+internal transport-safety ceilings, not provider constructor options. The byte
+ceiling is applied while consuming raw response chunks, before an unterminated
+line can accumulate without limit. Bundled transports request identity content
+encoding and reject compressed successful SSE responses before reading their
+bodies, so HTTP decompression cannot allocate beyond this boundary first. A
+compressed HTTP error body is likewise left unread, while its authoritative
+status and safe `Retry-After` header remain available for retry classification.
+Custom transports that yield already-decoded events own their corresponding
+wire-level limits.
 
 `ChatCompletionsProvider` targets OpenAI-compatible
 `/v1/chat/completions` services rather than the Responses API. Its `base_url`

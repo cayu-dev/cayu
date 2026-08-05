@@ -13,7 +13,8 @@ import json
 import math
 import os
 import ssl
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, aclosing, suppress
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -23,9 +24,21 @@ import certifi
 import httpx
 
 from cayu._exception_state import exception_state_contains
-from cayu._validation import require_clean_nonblank, require_nonblank
-from cayu.providers._credential_boundary import credential_safe_provider_cancellation
-from cayu.providers._sse import SseIdleTimeoutError, aiter_sse_json_events
+from cayu._validation import require_clean_nonblank, require_finite, require_nonblank
+from cayu.providers._credential_boundary import (
+    ProviderStreamCleanupError,
+    aclosing_provider_stream,
+    credential_safe_provider_cancellation,
+    stream_cleanup_cancelled_after_provider_failure,
+)
+from cayu.providers._sse import (
+    DEFAULT_SSE_MAX_EVENT_BYTES,
+    SseEventLimitError,
+    SseEventTimeoutError,
+    SseIdleTimeoutError,
+    _aiter_bounded_sse_lines,
+    aiter_sse_json_events,
+)
 from cayu.providers.base import (
     ModelContextOverflowError,
     ModelProviderError,
@@ -35,9 +48,137 @@ from cayu.providers.base import (
 from cayu.vaults.redaction import SecretRedactor
 
 MAX_PROVIDER_ERROR_BODY_CHARS = 2_000
+MAX_PROVIDER_ERROR_BODY_BYTES = 64 * 1024
 OMITTED_PROVIDER_ERROR_BODY = "[provider response body omitted]"
 _PROVIDER_CA_BUNDLE_ENV = "CAYU_PROVIDER_CA_BUNDLE"
 _ApiErrorFromResponse = Callable[[httpx.Response, str, float | None], Exception]
+_RaiseContextOverflowFromStatus = Callable[[int], None]
+
+
+class _TrustedSseJsonEvent(dict[str, Any]):
+    """Decoded SSE dict carrying Cayu-owned HTTP response metadata."""
+
+    def __init__(self, event: Mapping[str, Any], *, retry_after_s: float | None) -> None:
+        super().__init__(event)
+        self._retry_after_s = retry_after_s
+
+
+def _trusted_sse_retry_after_s(event: Mapping[str, Any]) -> float | None:
+    """Return response-header delay only for the exact internal SSE envelope."""
+    if type(event) is not _TrustedSseJsonEvent:
+        return None
+    return event._retry_after_s
+
+
+def _identity_sse_headers(headers: Mapping[str, str]) -> dict[str, str]:
+    """Override content negotiation so SSE bounds always see identity bytes."""
+    identity_headers = {
+        name: value for name, value in headers.items() if name.lower() != "accept-encoding"
+    }
+    identity_headers["Accept-Encoding"] = "identity"
+    return identity_headers
+
+
+def _response_uses_identity_encoding(response: httpx.Response) -> bool:
+    content_encoding = response.headers.get("content-encoding")
+    return content_encoding is None or content_encoding.strip().lower() == "identity"
+
+
+async def _read_bounded_identity_error_response(
+    response: httpx.Response,
+    *,
+    idle_timeout_s: float,
+    max_duration_s: float,
+) -> httpx.Response | None:
+    """Read a small identity body, or leave provider classification status-only."""
+
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_bytes = int(content_length)
+        except ValueError:
+            declared_bytes = -1
+        if declared_bytes > MAX_PROVIDER_ERROR_BODY_BYTES:
+            return None
+
+    # Preserve compatibility with bounded, already-buffered responses supplied
+    # by custom clients and test doubles. Bundled ``AsyncClient.stream``
+    # responses reach the incremental path below instead.
+    if response.is_stream_consumed:
+        try:
+            buffered_body = response.content
+        except httpx.ResponseNotRead:
+            return None
+        if len(buffered_body) > MAX_PROVIDER_ERROR_BODY_BYTES:
+            return None
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=buffered_body,
+        )
+
+    body = bytearray()
+    iterator = _aiter_unclosed_response_bytes(response)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max_duration_s
+    while True:
+        remaining = min(idle_timeout_s, deadline - loop.time())
+        if remaining <= 0:
+            return None
+        try:
+            async with asyncio.timeout(remaining):
+                chunk = await iterator.__anext__()
+        except StopAsyncIteration:
+            break
+        except TimeoutError:
+            return None
+        except httpx.RequestError:
+            # The response status is already authoritative. A body read
+            # failure must not replace (for example) HTTP 401 with a retryable
+            # connection classification.
+            return None
+        if len(body) + len(chunk) > MAX_PROVIDER_ERROR_BODY_BYTES:
+            return None
+        body.extend(chunk)
+    return httpx.Response(
+        status_code=response.status_code,
+        headers=response.headers,
+        content=bytes(body),
+    )
+
+
+async def _aiter_unclosed_response_bytes(
+    response: httpx.Response,
+) -> AsyncGenerator[bytes, None]:
+    """Yield raw identity bytes while leaving closure to the owned context."""
+
+    if response.is_stream_consumed:
+        raise httpx.StreamConsumed()
+    if response.is_closed:
+        raise httpx.StreamClosed()
+    if not isinstance(response.stream, httpx.AsyncByteStream):
+        raise RuntimeError("Attempted to call an async iterator on a sync stream.")
+    response.is_stream_consumed = True
+    try:
+        async for chunk in response.stream:
+            yield chunk
+    except httpx.RequestError as exc:
+        # Match ``Response.aiter_raw()`` by retaining request context on read
+        # failures without inheriting its implicit response-close behavior.
+        with suppress(RuntimeError):
+            exc.request = response.request
+        raise
+
+
+async def _aiter_owned_stream_response(
+    response_context: AbstractAsyncContextManager[httpx.Response],
+) -> AsyncIterator[httpx.Response]:
+    """Yield one HTTP response whose context exit is owned by stream cleanup."""
+
+    async with response_context as response:
+        yield response
+
+
 _TRUSTED_HTTPX_REQUEST_ERROR_TYPES: dict[type[httpx.RequestError], str] = {
     httpx.CloseError: "CloseError",
     httpx.ConnectError: "ConnectError",
@@ -59,22 +200,35 @@ _TRUSTED_HTTPX_REQUEST_ERROR_TYPES: dict[type[httpx.RequestError], str] = {
     httpx.WriteError: "WriteError",
     httpx.WriteTimeout: "WriteTimeout",
 }
-_SAFE_INTERNAL_PROVIDER_ERROR_TYPES = frozenset(_TRUSTED_HTTPX_REQUEST_ERROR_TYPES.values())
+_SAFE_INTERNAL_PROVIDER_ERROR_TYPES = frozenset(
+    {
+        *_TRUSTED_HTTPX_REQUEST_ERROR_TYPES.values(),
+        "ProviderStreamCleanupError",
+        "SseEventLimitError",
+        "SseEventTimeoutError",
+        "SseIdleTimeoutError",
+    }
+)
 _SAFE_PROVIDER_ERROR_TYPES = {
     "anthropic": frozenset(
         {
+            "api_error",
             "authentication_error",
+            "billing_error",
+            "conflict_error",
             "invalid_request_error",
             "not_found_error",
             "overloaded_error",
             "permission_error",
             "rate_limit_error",
             "request_too_large",
+            "timeout_error",
         }
     ),
     "chat_completions": frozenset(
         {
             "authentication_error",
+            "context_length_exceeded",
             "error",
             "invalid_request_error",
             "not_found_error",
@@ -86,6 +240,7 @@ _SAFE_PROVIDER_ERROR_TYPES = {
     "openai": frozenset(
         {
             "authentication_error",
+            "context_length_exceeded",
             "error",
             "invalid_request_error",
             "not_found_error",
@@ -103,10 +258,17 @@ _SAFE_PROVIDER_ERROR_TYPES = {
             "RESOURCE_EXHAUSTED",
             "UNAUTHENTICATED",
             "UNAVAILABLE",
+            "api_error",
+            "authentication_error",
+            "billing_error",
+            "conflict_error",
             "invalid_request_error",
+            "not_found_error",
             "overloaded_error",
+            "permission_error",
             "rate_limit_error",
             "request_too_large",
+            "timeout_error",
         }
     ),
 }
@@ -160,7 +322,10 @@ _SAFE_PROVIDER_EXCEPTION_TYPE_NAMES = frozenset(
         "OpenAIError",
         "OpenAIProtocolError",
         "OpenAISubscriptionAuthError",
+        "ProviderStreamCleanupError",
         "RuntimeError",
+        "SseEventLimitError",
+        "SseEventTimeoutError",
         "SseIdleTimeoutError",
         "VertexAPIError",
         "VertexContextOverflowError",
@@ -310,6 +475,7 @@ async def stream_sse_json_events(
     protocol_error: type[Exception],
     error_response_text: Callable[[httpx.Response], str],
     raise_context_overflow: Callable[[httpx.Response], None] | None = None,
+    raise_context_overflow_from_status: _RaiseContextOverflowFromStatus | None = None,
     api_error_from_response: _ApiErrorFromResponse | None = None,
 ) -> AsyncIterator[Mapping[str, Any]]:
     """POST a streaming JSON payload and yield decoded SSE data objects.
@@ -318,47 +484,106 @@ async def stream_sse_json_events(
     response is opened and closed per call. ``api_error_from_response`` mirrors
     :func:`post_json`: adapters can build a structured error (typed status/code
     fields) while the shared layer supplies the parsed ``Retry-After`` delay.
+    ``raise_context_overflow_from_status`` is reserved for provider statuses
+    that are authoritative when the response body cannot be read safely.
     """
+    error_body_idle_timeout_s = require_finite(
+        float(stream_idle_timeout_s),
+        "stream_idle_timeout_s",
+    )
+    if error_body_idle_timeout_s <= 0:
+        raise ValueError("stream_idle_timeout_s must be greater than zero.")
+    request_timeout_s = float(timeout_s)
+    error_body_max_duration_s = (
+        min(request_timeout_s, error_body_idle_timeout_s * 2)
+        if math.isfinite(request_timeout_s) and request_timeout_s > 0
+        else error_body_idle_timeout_s * 2
+    )
     timeout = httpx.Timeout(timeout_s, read=None)
     try:
-        async with client.stream(
+        response_context = client.stream(
             "POST",
             url,
-            headers=dict(headers),
+            headers=_identity_sse_headers(headers),
             json=dict(payload),
             timeout=timeout,
-        ) as response:
+        )
+        responses = _aiter_owned_stream_response(response_context)
+        async with aclosing_provider_stream(responses):
+            response = await anext(responses)
             if response.status_code >= 400:
-                # Read the streamed error body while the response is still open.
-                # Otherwise error_response_text touches an unread streaming body
-                # and raises httpx.ResponseNotRead, masking the real API error
-                # (e.g. HTTP 404 from a wrong endpoint).
-                await response.aread()
-                if raise_context_overflow is not None:
-                    raise_context_overflow(response)
+                identity_encoding = _response_uses_identity_encoding(response)
+                error_response: httpx.Response | None = None
+                if identity_encoding:
+                    # Preserve structured identity only when the complete body
+                    # arrives within fixed byte, idle, and duration ceilings.
+                    error_response = await _read_bounded_identity_error_response(
+                        response,
+                        idle_timeout_s=error_body_idle_timeout_s,
+                        max_duration_s=error_body_max_duration_s,
+                    )
+                    if error_response is not None and raise_context_overflow is not None:
+                        raise_context_overflow(error_response)
+                if error_response is None and raise_context_overflow_from_status is not None:
+                    # Only classifiers explicitly wired for status-only
+                    # evidence may run here. Unsupported, oversized, or stalled
+                    # bodies remain undecoded, so body-dependent identities fail
+                    # closed.
+                    raise_context_overflow_from_status(response.status_code)
                 message = (
                     f"{request_label} request failed with HTTP "
                     f"{response.status_code}: "
-                    f"{error_response_text(response)}"
+                    f"{error_response_text(error_response) if error_response is not None else OMITTED_PROVIDER_ERROR_BODY}"
                 )
+                if error_response is None:
+                    # The HTTP status and Retry-After header are authoritative
+                    # even when a provider or intermediary supplied a body Cayu
+                    # could not safely read. Do not decode that body.
+                    raise api_error(
+                        message,
+                        status_code=response.status_code,
+                        retry_after_s=retry_after_seconds(response),
+                    )
                 raise _response_api_error(
-                    response,
+                    error_response,
                     message,
                     api_error=api_error,
                     api_error_from_response=api_error_from_response,
                 )
-            async for event in aiter_sse_json_events(
-                response.aiter_lines(),
-                idle_timeout_s=stream_idle_timeout_s,
-                provider_label=response_label,
-                protocol_error=protocol_error,
-            ):
-                yield event
-    except SseIdleTimeoutError as exc:
+            if not _response_uses_identity_encoding(response):
+                raise protocol_error(
+                    f"{response_label} SSE response used unsupported content encoding."
+                )
+            retry_after_s = retry_after_seconds(response)
+            # ``Response.aiter_raw()`` auto-closes on clean EOF, which would
+            # run arbitrary transport cleanup inside the read iterator instead
+            # of the response-context owner surrounding this block.
+            response_bytes = _aiter_unclosed_response_bytes(response)
+            async with aclosing(response_bytes):
+                bounded_lines = _aiter_bounded_sse_lines(
+                    response_bytes,
+                    max_line_bytes=DEFAULT_SSE_MAX_EVENT_BYTES,
+                    provider_label=response_label,
+                    emit_byte_activity=True,
+                )
+                async for event in aiter_sse_json_events(
+                    bounded_lines,
+                    idle_timeout_s=stream_idle_timeout_s,
+                    provider_label=response_label,
+                    protocol_error=protocol_error,
+                ):
+                    yield _TrustedSseJsonEvent(event, retry_after_s=retry_after_s)
+    except (SseIdleTimeoutError, SseEventTimeoutError) as exc:
         raise api_error(
             str(exc),
             error_type=type(exc).__name__,
             retryable=True,
+        ) from exc
+    except SseEventLimitError as exc:
+        raise api_error(
+            str(exc),
+            error_type=type(exc).__name__,
+            retryable=False,
         ) from exc
     except httpx.RequestError as exc:
         raise _request_api_error(
@@ -651,6 +876,8 @@ def credential_safe_error_event(
                 payload["retryable"] = exc.retryable
             if type(exc.retry_after_s) in {int, float}:
                 payload["retry_after_s"] = exc.retry_after_s
+        if isinstance(exc, ProviderStreamCleanupError):
+            payload["stream_cleanup_failed"] = True
         return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
     if isinstance(exc, ModelProviderError):
         safe_exception = credential_safe_provider_exception(
@@ -666,6 +893,8 @@ def credential_safe_error_event(
         )
         payload = dict(event.payload)
         payload["error_type"] = safe_provider_exception_type_name(exc)
+        if isinstance(exc, ProviderStreamCleanupError):
+            payload["stream_cleanup_failed"] = True
         event = ModelStreamEvent(type=event.type, payload=payload)
     else:
         event = ModelStreamEvent(
@@ -679,6 +908,44 @@ def credential_safe_error_event(
     if type(redacted) is not dict:  # pragma: no cover - SecretRedactor contract guard
         raise AssertionError("provider error payload redaction returned a non-object")
     return ModelStreamEvent(type=event.type, payload=redacted)
+
+
+def credential_safe_post_completion_failure(
+    exc: Exception,
+    *,
+    provider_label: str,
+    provider_name: str,
+    credential_values: Sequence[str],
+    safe_message: str | None = None,
+) -> ModelProviderError:
+    """Detach a terminal failure raised after a provider completion event.
+
+    The runtime owns durable completion publication and accounting once it has
+    observed ``completed``. Propagate a credential-safe exception instead of a
+    second stream event so that existing post-completion handling can preserve
+    usage without authorizing another provider dispatch.
+    """
+
+    safe = credential_safe_provider_exception(
+        exc,
+        provider_label=provider_label,
+        provider_name=provider_name,
+        credential_values=credential_values,
+        safe_message=safe_message,
+    )
+    if isinstance(safe, ProviderStreamCleanupError):
+        return safe
+    return ModelProviderError(
+        str(safe),
+        provider=provider_name,
+        status_code=safe.status_code,
+        error_type=safe.error_type,
+        error_code=safe.error_code,
+        request_id=safe.request_id,
+        retryable=False,
+        retry_after_s=safe.retry_after_s,
+        response_body=None,
+    )
 
 
 def credential_safe_provider_exception(
@@ -735,6 +1002,13 @@ def credential_safe_provider_exception(
     }
     if isinstance(exc, ModelContextOverflowError):
         return ModelContextOverflowError(message, **common)
+    if isinstance(exc, ProviderStreamCleanupError):
+        return ProviderStreamCleanupError(
+            message,
+            **common,
+            retryable=False,
+            retry_after_s=source.retry_after_s if source is not None else None,
+        )
     return ModelProviderError(
         message,
         **common,
@@ -795,6 +1069,9 @@ def sanitize_provider_cancellation(
     safe = credential_safe_provider_cancellation(
         message,
         preserve_empty_artifacts=had_artifacts,
+        stream_cleanup_cancelled_after_failure=(
+            stream_cleanup_cancelled_after_provider_failure(exc)
+        ),
     )
     safe.__cause__ = None
     safe.__context__ = None
@@ -802,12 +1079,14 @@ def sanitize_provider_cancellation(
 
 
 __all__ = [
+    "MAX_PROVIDER_ERROR_BODY_BYTES",
     "MAX_PROVIDER_ERROR_BODY_CHARS",
     "OMITTED_PROVIDER_ERROR_BODY",
     "SharedAsyncClient",
     "aclose_transport",
     "copy_headers",
     "credential_safe_error_event",
+    "credential_safe_post_completion_failure",
     "credential_safe_provider_exception",
     "credential_sanitization_values",
     "exception_message",

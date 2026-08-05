@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from collections.abc import Mapping
 from typing import Any
 
@@ -13,6 +14,8 @@ from cayu import (
     CayuApp,
     EventType,
     Message,
+    RecentTurnsContextPolicy,
+    RetryPolicy,
     RunRequest,
     StructuredOutputSpec,
 )
@@ -28,7 +31,7 @@ from cayu.providers import (
     VertexProtocolError,
     VertexProvider,
 )
-from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
 from cayu.providers.vertex import (
     VERTEX_OAUTH_SCOPE,
     _import_google,
@@ -399,6 +402,7 @@ async def test_httpx_vertex_transport_wraps_gcp_error_envelope(
     )
     assert exc_info.value.status_code == 403
     assert exc_info.value.error_type == "PERMISSION_DENIED"
+    assert exc_info.value.retryable is False
 
 
 @pytest.mark.anyio
@@ -701,7 +705,26 @@ async def test_vertex_provider_streams_sse_events_incrementally() -> None:
 
 
 @pytest.mark.anyio
-async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors() -> None:
+@pytest.mark.parametrize(
+    ("error_type", "expected_status", "expected_retryable"),
+    [
+        pytest.param("api_error", 500, True, id="api"),
+        pytest.param("authentication_error", 401, False, id="authentication"),
+        pytest.param("billing_error", 402, False, id="billing"),
+        pytest.param("conflict_error", 409, False, id="conflict"),
+        pytest.param("invalid_request_error", 400, False, id="invalid-request"),
+        pytest.param("not_found_error", 404, False, id="not-found"),
+        pytest.param("overloaded_error", 529, True, id="overloaded"),
+        pytest.param("permission_error", 403, False, id="permission"),
+        pytest.param("rate_limit_error", 429, True, id="rate-limit"),
+        pytest.param("timeout_error", 504, True, id="timeout"),
+    ],
+)
+async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors(
+    error_type: str,
+    expected_status: int,
+    expected_retryable: bool,
+) -> None:
     secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
     transport = StreamingRecordingTransport(
         event_batches=[
@@ -710,8 +733,8 @@ async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors() -> 
                     "type": "error",
                     "request_id": "req_vertex_cutoff",
                     "error": {
-                        "type": "overloaded_error",
-                        "code": "overloaded",
+                        "type": error_type,
+                        "code": "provider_code",
                         "message": "x" * (MAX_PROVIDER_ERROR_BODY_CHARS - 10) + secret,
                     },
                 }
@@ -726,9 +749,28 @@ async def test_vertex_provider_stream_error_event_uses_vertex_typed_errors() -> 
     assert events[0].payload["error"] == "VertexAPIError: Vertex provider failed"
     assert events[0].payload["error_type"] == "VertexAPIError"
     assert events[0].payload["provider"] == "vertex"
-    assert events[0].payload["provider_error_type"] == "overloaded_error"
+    assert events[0].payload["status_code"] == expected_status
+    assert events[0].payload["provider_error_type"] == error_type
+    assert events[0].payload["retryable"] is expected_retryable
     rendered = repr([event.model_dump(mode="json") for event in events])
     assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+
+
+@pytest.mark.anyio
+async def test_vertex_provider_stream_error_preserves_trusted_retry_after() -> None:
+    raw_event = _TrustedSseJsonEvent(
+        {"type": "error", "error": {"type": "api_error"}},
+        retry_after_s=4.5,
+    )
+    transport = StreamingRecordingTransport(event_batches=[[raw_event]])
+    provider = _provider(transport)
+
+    events = [event async for event in provider.stream(_request())]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["status_code"] == 500
+    assert events[0].payload["retryable"] is True
+    assert events[0].payload["retry_after_s"] == 4.5
 
 
 @pytest.mark.anyio
@@ -841,15 +883,17 @@ async def test_vertex_provider_rejects_invalid_token_count_response() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [400, 413])
 async def test_httpx_vertex_transport_classifies_prompt_too_long(
     monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            400,
+            status_code,
             json={
                 "error": {
-                    "code": 400,
+                    "code": status_code,
                     "status": "INVALID_ARGUMENT",
                     "message": "prompt is too long: 250000 tokens > 200000 maximum",
                 }
@@ -864,9 +908,179 @@ async def test_httpx_vertex_transport_classifies_prompt_too_long(
 
     assert isinstance(exc_info.value, ModelContextOverflowError)
     assert exc_info.value.provider == "vertex"
-    assert exc_info.value.status_code == 400
+    assert exc_info.value.status_code == status_code
     assert exc_info.value.error_type == "INVALID_ARGUMENT"
     assert exc_info.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_runtime_recovers_from_compressed_vertex_413_without_reading_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ResponseBody(httpx.AsyncByteStream):
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+            self.yielded = False
+            self.closed = False
+
+        async def __aiter__(self):
+            self.yielded = True
+            yield self.content
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    compressed_body = ResponseBody(
+        gzip.compress(b'{"error":{"status":"INVALID_ARGUMENT","message":"request too large"}}')
+    )
+    success_body = ResponseBody(
+        b'data: {"type":"message_start","message":{"id":"msg_v1",'
+        b'"model":"claude-sonnet-4-6","usage":{"input_tokens":1}}}\n\n'
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"text","text":""}}\n\n'
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"text_delta","text":"ok"}}\n\n'
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+        b'"usage":{"output_tokens":1}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(
+                413,
+                headers={
+                    "content-encoding": "gzip",
+                    "content-type": "application/json",
+                },
+                stream=compressed_body,
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=success_body,
+            request=request,
+        )
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
+    app = CayuApp(enable_logging=False)
+    app.register_provider(_provider(HttpxVertexTransport()), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            )
+        )
+    ]
+
+    assert calls == 2
+    assert not compressed_body.yielded
+    assert compressed_body.closed
+    assert success_body.yielded
+    assert success_body.closed
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_OVERFLOW_DETECTED,
+            EventType.CONTEXT_OVERFLOW_RECOVERING,
+            EventType.CONTEXT_OVERFLOW_FAILED,
+            EventType.SESSION_COMPLETED,
+        }
+    ] == [
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_OVERFLOW_RECOVERING,
+        EventType.SESSION_COMPLETED,
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "expected_public_type", "expected_retryable"),
+    [
+        pytest.param("UNAUTHENTICATED", "UNAUTHENTICATED", False, id="authentication"),
+        pytest.param("FUTURE_STATUS", None, None, id="unknown"),
+        pytest.param(True, None, None, id="boolean"),
+        pytest.param("", None, None, id="blank"),
+    ],
+)
+async def test_runtime_does_not_recover_from_conflicting_vertex_413(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: Any,
+    expected_public_type: str | None,
+    expected_retryable: bool | None,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            413,
+            headers={"content-type": "application/json"},
+            json={
+                "error": {
+                    "code": 413,
+                    "status": error_type,
+                    "message": "denied",
+                }
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
+    app = CayuApp(
+        enable_logging=False,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(_provider(HttpxVertexTransport()), default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="claude-sonnet-4-6"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_conflicting_vertex_413_{error_type}",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            )
+        )
+    ]
+
+    assert calls == 1
+    assert not {
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_OVERFLOW_RECOVERING,
+        EventType.MODEL_RETRY,
+    }.intersection(event.type for event in events)
+    model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    assert len(model_errors) == 1
+    assert model_errors[0].payload["status_code"] == 413
+    assert model_errors[0].payload.get("provider_error_type") == expected_public_type
+    assert model_errors[0].payload.get("retryable") is expected_retryable
+    assert events[-1].type == EventType.SESSION_FAILED
 
 
 @pytest.mark.anyio
@@ -888,7 +1102,86 @@ async def test_httpx_vertex_transport_populates_typed_error_fields(
 
     assert exc_info.value.status_code == 429
     assert exc_info.value.error_type == "RESOURCE_EXHAUSTED"
+    assert exc_info.value.retryable is True
     assert exc_info.value.retry_after_s == 4.0
+
+
+@pytest.mark.anyio
+async def test_httpx_vertex_transport_defers_unknown_error_identity_to_http_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "error": {
+                    "code": 500,
+                    "status": "FUTURE_TRANSIENT_STATUS",
+                    "message": "future failure",
+                }
+            },
+        )
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
+    with pytest.raises(VertexAPIError) as exc_info:
+        await HttpxVertexTransport().create_message(
+            url=_VERTEX_URL, headers={}, payload={"a": 1}, timeout_s=10.0
+        )
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.error_type == "FUTURE_TRANSIENT_STATUS"
+    assert exc_info.value.retryable is None
+
+
+@pytest.mark.anyio
+async def test_runtime_does_not_retry_conflicting_buffered_vertex_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            500,
+            headers={"retry-after": "4"},
+            json={
+                "error": {
+                    "code": 500,
+                    "status": "UNAUTHENTICATED",
+                    "message": "denied",
+                }
+            },
+        )
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _mock_client_factory(handler))
+    app = CayuApp(
+        enable_logging=False,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(_provider(HttpxVertexTransport()), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="claude-sonnet-4-6"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_conflicting_buffered_vertex_identity",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+    ]
+
+    assert calls == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    assert len(model_errors) == 1
+    assert model_errors[0].payload["status_code"] == 500
+    assert model_errors[0].payload["provider_error_type"] == "UNAUTHENTICATED"
+    assert model_errors[0].payload["retryable"] is False
+    assert model_errors[0].payload["retry_after_s"] == 4.0
+    assert events[-1].type == EventType.SESSION_FAILED
 
 
 def test_vertex_provider_rejects_invalid_stream_idle_timeout() -> None:

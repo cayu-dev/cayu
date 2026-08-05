@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlencode, urlsplit
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_finite
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -24,13 +24,18 @@ from cayu.core.messages import (
     ToolResultPart,
 )
 from cayu.providers._api_keys import resolve_api_key
-from cayu.providers._credential_boundary import detach_provider_stream_traceback
+from cayu.providers._credential_boundary import (
+    aclosing_provider_stream,
+    detach_provider_stream_traceback,
+)
 from cayu.providers._http import (
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
+    _trusted_sse_retry_after_s,
     aclose_transport,
     copy_headers,
     credential_safe_error_event,
+    credential_safe_post_completion_failure,
     credential_safe_provider_exception,
     credential_sanitization_values,
     optional_error_string,
@@ -48,6 +53,7 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    ModelStreamEventType,
     UsageDialect,
     copy_usage_dialect,
 )
@@ -209,9 +215,11 @@ class HttpxChatCompletionsTransport:
             protocol_error=ChatCompletionsProtocolError,
             error_response_text=_safe_error_response_text,
             raise_context_overflow=_raise_chat_context_overflow_if_applicable,
+            api_error_from_response=_chat_api_error_from_response,
         )
-        async for event in events:
-            yield event
+        async with aclosing_provider_stream(events):
+            async for event in events:
+                yield event
 
 
 class ChatCompletionsProvider(ModelProvider):
@@ -300,9 +308,12 @@ class ChatCompletionsProvider(ModelProvider):
         self.timeout_s = float(timeout_s)
         if type(stream_idle_timeout_s) not in {int, float}:
             raise TypeError("stream_idle_timeout_s must be a number.")
+        stream_idle_timeout_s = require_finite(
+            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        )
         if stream_idle_timeout_s <= 0:
             raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
+        self.stream_idle_timeout_s = stream_idle_timeout_s
         # A caller-supplied transport manages its own scheme policy; the default
         # transport inherits allow_http so a local http endpoint actually connects.
         self.transport = (
@@ -337,7 +348,9 @@ class ChatCompletionsProvider(ModelProvider):
     ) -> AsyncIterator[ModelStreamEvent]:
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: ChatCompletionsContextOverflowError | None = None
+        post_completion_failure: ModelProviderError | None = None
         error_event: ModelStreamEvent | None = None
+        completion_emitted = False
         try:
             payload = build_chat_completions_payload(
                 request,
@@ -354,8 +367,15 @@ class ChatCompletionsProvider(ModelProvider):
                 timeout_s=self.timeout_s,
                 stream_idle_timeout_s=self.stream_idle_timeout_s,
             )
-            async for event in chat_completions_stream_events(raw_events):
-                yield event
+            events = chat_completions_stream_events(raw_events)
+            async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+                # Chat completion is synthesized only after the raw stream
+                # terminates. Exhaust the translator so a deferred transport-
+                # cleanup failure reaches runtime after the completion event.
+                async for event in events:
+                    if event.type == ModelStreamEventType.COMPLETED:
+                        completion_emitted = True
+                    yield event
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
@@ -366,39 +386,59 @@ class ChatCompletionsProvider(ModelProvider):
                 ),
             )
         except ModelContextOverflowError as exc:
-            # Overflow must reach runtime recovery as a typed exception; an
-            # error event would flatten it into unrecoverable message text.
-            safe = credential_safe_provider_exception(
-                exc,
-                provider_label="Chat Completions",
-                provider_name="chat_completions",
-                credential_values=credential_sanitization_values(
-                    self.api_key,
-                    extra_headers=self.extra_headers,
-                ),
+            credential_values = credential_sanitization_values(
+                self.api_key,
+                extra_headers=self.extra_headers,
             )
-            overflow_failure = ChatCompletionsContextOverflowError(
-                str(safe),
-                status_code=safe.status_code,
-                error_type=safe.error_type,
-                error_code=safe.error_code,
-                request_id=safe.request_id,
-                response_body=None,
-            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="Chat Completions",
+                    provider_name="chat_completions",
+                    credential_values=credential_values,
+                )
+            else:
+                # Overflow must reach runtime recovery as a typed exception; an
+                # error event would flatten it into unrecoverable message text.
+                safe = credential_safe_provider_exception(
+                    exc,
+                    provider_label="Chat Completions",
+                    provider_name="chat_completions",
+                    credential_values=credential_values,
+                )
+                overflow_failure = ChatCompletionsContextOverflowError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    response_body=None,
+                )
         except Exception as exc:
-            error_event = credential_safe_error_event(
-                exc,
-                provider_label="Chat Completions",
-                provider_name="chat_completions",
-                credential_values=credential_sanitization_values(
-                    self.api_key,
-                    extra_headers=self.extra_headers,
-                ),
+            credential_values = credential_sanitization_values(
+                self.api_key,
+                extra_headers=self.extra_headers,
             )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="Chat Completions",
+                    provider_name="chat_completions",
+                    credential_values=credential_values,
+                )
+            else:
+                error_event = credential_safe_error_event(
+                    exc,
+                    provider_label="Chat Completions",
+                    provider_name="chat_completions",
+                    credential_values=credential_values,
+                )
         if cancellation is not None:
             raise cancellation from None
         if overflow_failure is not None:
             raise overflow_failure from None
+        if post_completion_failure is not None:
+            raise post_completion_failure from None
         if error_event is not None:
             yield error_event
 
@@ -515,8 +555,31 @@ async def chat_completions_stream_events(
     model: str | None = None
     finish_reason: str | None = None
     usage: Any = None
+    post_terminal_failure: BaseException | None = None
 
-    async for event in events:
+    iterator = events.__aiter__()
+    while True:
+        try:
+            event = await iterator.__anext__()
+        except StopAsyncIteration:
+            break
+        except asyncio.CancelledError as exc:
+            # Preserve real task cancellation without losing authoritative
+            # completion evidence already carried by a finish reason. Runtime
+            # publishes the completion before restoring the same cancellation.
+            if finish_reason is None:
+                raise
+            post_terminal_failure = exc
+            break
+        except Exception as exc:
+            # A finish reason is authoritative completion evidence. Preserve
+            # the accumulated response and usage when the real HTTP iterator
+            # fails while closing after that terminal chunk; the provider will
+            # surface this failure only after runtime has observed COMPLETED.
+            if finish_reason is None:
+                raise
+            post_terminal_failure = exc
+            break
         if not isinstance(event, Mapping):
             raise ChatCompletionsProtocolError(
                 "Chat Completions stream event must be a JSON object."
@@ -536,7 +599,10 @@ async def chat_completions_stream_events(
         # otherwise trigger downstream.
         error = event.get("error")
         if error is not None:
-            failure = _stream_error_chunk_exception(error)
+            failure = _stream_error_chunk_exception(
+                error,
+                retry_after_s=_trusted_sse_retry_after_s(event),
+            )
             # The exported parser is itself a public exception boundary. Do
             # not retain the raw provider envelope in traceback frame locals.
             error = None
@@ -613,9 +679,19 @@ async def chat_completions_stream_events(
     if provider_state:
         completed_payload["provider_state"] = provider_state
     yield ModelStreamEvent.completed(completed_payload)
+    if post_terminal_failure is not None:
+        failure = post_terminal_failure
+        post_terminal_failure = None
+        event = {}
+        del iterator, events
+        raise failure from None
 
 
-def _stream_error_chunk_exception(error: Any) -> ChatCompletionsError:
+def _stream_error_chunk_exception(
+    error: Any,
+    *,
+    retry_after_s: float | None = None,
+) -> ChatCompletionsError:
     """Build the typed exception for a mid-stream ``{"error": ...}`` chunk.
 
     The error is surfaced as a context-overflow error when its code/type/message
@@ -627,7 +703,12 @@ def _stream_error_chunk_exception(error: Any) -> ChatCompletionsError:
     message = optional_error_string(error_mapping.get("message"))
     request_id = optional_error_string(error_mapping.get("request_id"))
     safe_message = f"Chat Completions stream reported an error: {OMITTED_PROVIDER_ERROR_BODY}"
-    if _is_chat_context_overflow(status_code=0, error_type=error_type, code=code, message=message):
+    if _is_chat_context_overflow(
+        status_code=None,
+        error_type=error_type,
+        code=code,
+        message=message,
+    ):
         return ChatCompletionsContextOverflowError(
             safe_message,
             error_type=error_type,
@@ -635,13 +716,63 @@ def _stream_error_chunk_exception(error: Any) -> ChatCompletionsError:
             request_id=request_id,
             response_body=None,
         )
+    status_code, retryable = _chat_retry_metadata(
+        transport_status_code=None,
+        error_type=error_type,
+        error_code=code,
+    )
     return ChatCompletionsAPIError(
         safe_message,
+        status_code=status_code,
         error_type=error_type,
         error_code=code,
         request_id=request_id,
+        retryable=retryable,
+        retry_after_s=retry_after_s,
         response_body=None,
     )
+
+
+_CHAT_ERROR_TYPE_CLASSIFICATION = {
+    "authentication_error": (401, False),
+    "context_length_exceeded": (400, False),
+    "invalid_request_error": (400, False),
+    "not_found_error": (404, False),
+    "permission_error": (403, False),
+    "rate_limit_error": (429, True),
+    "server_error": (500, True),
+}
+_CHAT_ERROR_CODE_CLASSIFICATION = {
+    "context_length_exceeded": (400, False),
+    "internal_error": (500, True),
+    "rate_limit_exceeded": (429, True),
+    "server_error": (500, True),
+}
+
+
+def _chat_retry_metadata(
+    *,
+    transport_status_code: int | None,
+    error_type: str | None,
+    error_code: str | None,
+) -> tuple[int | None, bool | None]:
+    """Classify recognized HTTP/stream identities; conflicts fail closed."""
+    classifications = {
+        classification
+        for classification in (
+            _CHAT_ERROR_TYPE_CLASSIFICATION.get(error_type or ""),
+            _CHAT_ERROR_CODE_CLASSIFICATION.get(error_code or ""),
+        )
+        if classification is not None
+    }
+    if not classifications:
+        return transport_status_code, None
+    if len(classifications) != 1:
+        return transport_status_code, False
+    canonical_status, retryable = next(iter(classifications))
+    if transport_status_code is not None and transport_status_code != canonical_status:
+        return transport_status_code, False
+    return canonical_status, retryable
 
 
 def _tool_call_names_function(tool_call: Mapping[str, Any]) -> bool:
@@ -1131,6 +1262,40 @@ def _format_error_json(decoded: Any) -> str | None:
     return safe_error_json(decoded)
 
 
+def _chat_api_error_from_response(
+    response: httpx.Response,
+    message: str,
+    retry_after_s: float | None,
+) -> ChatCompletionsAPIError:
+    """Build a buffered error with the same typed identity rules as streaming."""
+
+    decoded = response_json_object(response)
+    error: Mapping[str, Any] = {}
+    if decoded is not None:
+        raw_error = decoded.get("error")
+        error = raw_error if isinstance(raw_error, Mapping) else decoded
+    error_type = optional_error_string(error.get("type"))
+    error_code = optional_error_string(error.get("code"))
+    status_code, retryable = _chat_retry_metadata(
+        transport_status_code=response.status_code,
+        error_type=error_type,
+        error_code=error_code,
+    )
+    request_id = optional_error_string(error.get("request_id"))
+    if request_id is None and decoded is not None:
+        request_id = optional_error_string(decoded.get("request_id"))
+    return ChatCompletionsAPIError(
+        message,
+        status_code=status_code,
+        error_type=error_type,
+        error_code=error_code,
+        request_id=request_id,
+        retryable=retryable,
+        retry_after_s=retry_after_s,
+        response_body=_safe_error_response_text(response),
+    )
+
+
 def _raise_chat_context_overflow_if_applicable(response: httpx.Response) -> None:
     decoded = response_json_object(response)
     if decoded is None:
@@ -1161,11 +1326,32 @@ def _raise_chat_context_overflow_if_applicable(response: httpx.Response) -> None
 
 def _is_chat_context_overflow(
     *,
-    status_code: int,
+    status_code: int | None,
     error_type: str | None,
     code: str | None,
     message: str | None,
 ) -> bool:
+    structured_statuses = {
+        classification[0]
+        for classification in (
+            _CHAT_ERROR_TYPE_CLASSIFICATION.get(error_type or ""),
+            _CHAT_ERROR_CODE_CLASSIFICATION.get(code or ""),
+        )
+        if classification is not None
+    }
+    # Structured type/code identities are authoritative. Only a coherent 400
+    # identity can support context recovery; message text must not override a
+    # recognized transient, authentication, permission, or rate-limit failure.
+    if len(structured_statuses) > 1 or (structured_statuses and structured_statuses != {400}):
+        return False
+    if status_code is not None:
+        # Some compatible providers (notably Gemini) report context overflow as
+        # an otherwise-unclassified HTTP 500/504. Preserve that compatibility,
+        # but reject a transport status that conflicts with a structured 400.
+        if status_code not in {400, 500, 504}:
+            return False
+        if structured_statuses and status_code not in structured_statuses:
+            return False
     if code == "context_length_exceeded":
         return True
     if error_type == "context_length_exceeded":

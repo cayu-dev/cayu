@@ -8,10 +8,13 @@ from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_r
 
 from cayu._exception_groups import iter_exception_tree
 from cayu.providers._credential_boundary import (
+    ProviderStreamCleanupError,
+    aclosing_provider_stream,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import sanitize_provider_cancellation
+from cayu.providers.base import ModelProviderError
 
 
 class _FailingCloseStream:
@@ -37,6 +40,11 @@ class _CancellationGroupCloseStream(_FailingCloseStream):
             "provider cleanup cancelled",
             [asyncio.CancelledError()],
         )
+
+
+class _CancelledCloseStream(_FailingCloseStream):
+    async def aclose(self) -> None:
+        raise asyncio.CancelledError("provider child cleanup cancelled")
 
 
 class _GroupedCloseStream(_FailingCloseStream):
@@ -105,6 +113,129 @@ async def test_detached_provider_stream_closes_its_source_on_early_close() -> No
 
 
 @pytest.mark.anyio
+async def test_aclosing_provider_stream_fails_closed_and_retains_primary_identity() -> None:
+    source = _FailingCloseStream()
+    primary = ModelProviderError(
+        "authoritative provider failure",
+        provider="test-provider",
+        status_code=500,
+        error_type="server_error",
+        error_code="internal_error",
+        retryable=True,
+    )
+
+    with pytest.raises(ProviderStreamCleanupError) as exc_info:
+        async with aclosing_provider_stream(source):
+            raise primary
+
+    assert exc_info.value is not primary
+    assert exc_info.value.provider == "test-provider"
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.error_type == "server_error"
+    assert exc_info.value.error_code == "internal_error"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert_cayu_traceback_does_not_retain(exc_info.value, primary)
+    assert_cayu_traceback_does_not_retain(exc_info.value, source)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "primary",
+    [
+        pytest.param(KeyboardInterrupt("primary interrupt"), id="keyboard-interrupt"),
+        pytest.param(SystemExit("primary exit"), id="system-exit"),
+        pytest.param(
+            BaseExceptionGroup(
+                "primary fatal group",
+                [RuntimeError("ordinary child"), KeyboardInterrupt("fatal child")],
+            ),
+            id="fatal-group",
+        ),
+    ],
+)
+async def test_aclosing_provider_stream_preserves_primary_fatal_signal(
+    primary: BaseException,
+) -> None:
+    source = _FailingCloseStream()
+
+    with pytest.raises(type(primary)) as exc_info:
+        async with aclosing_provider_stream(source):
+            raise primary
+
+    assert exc_info.value is primary
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert str(exc_info.value.__cause__) == "provider cleanup failure"
+
+
+@pytest.mark.anyio
+async def test_aclosing_provider_stream_preserves_new_task_cancellation() -> None:
+    close_started = asyncio.Event()
+
+    class BlockingCloseStream(_FailingCloseStream):
+        async def aclose(self) -> None:
+            close_started.set()
+            await asyncio.Event().wait()
+
+    primary = RuntimeError("authoritative provider failure")
+
+    async def consume() -> None:
+        async with aclosing_provider_stream(BlockingCloseStream()):
+            raise primary
+
+    task = asyncio.create_task(consume())
+    await close_started.wait()
+    task.cancel()
+    assert task.cancelling() == 1
+
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        await task
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+
+    assert cancellation is not None
+    assert cancellation.__cause__ is primary
+    assert task.cancelled()
+
+
+@pytest.mark.anyio
+async def test_aclosing_provider_stream_reclassifies_cleanup_only_child_cancellation() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    cancellation_baseline = task.cancelling()
+
+    with pytest.raises(ProviderStreamCleanupError) as exc_info:
+        async with aclosing_provider_stream(_CancelledCloseStream()):
+            pass
+
+    assert exc_info.value.provider == "unknown"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert task.cancelling() == cancellation_baseline
+    assert not task.cancelled()
+
+
+@pytest.mark.anyio
+async def test_aclosing_provider_stream_reclassifies_cleanup_only_failure() -> None:
+    source = _FailingCloseStream()
+
+    with pytest.raises(ProviderStreamCleanupError) as exc_info:
+        async with aclosing_provider_stream(source):
+            pass
+
+    assert str(exc_info.value) == "Provider stream cleanup failed."
+    assert exc_info.value.provider == "unknown"
+    assert exc_info.value.error_type == "ProviderStreamCleanupError"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert_cayu_traceback_does_not_retain(exc_info.value, source)
+
+
+@pytest.mark.anyio
 async def test_detached_provider_stream_does_not_mask_provider_failure_during_close() -> None:
     @detach_provider_stream_traceback
     def stream() -> AsyncIterator[str]:
@@ -128,6 +259,29 @@ async def test_detached_provider_stream_reports_early_close_failure() -> None:
 
     with pytest.raises(RuntimeError, match="Provider stream cleanup failed"):
         await events.aclose()
+
+
+@pytest.mark.anyio
+async def test_detached_provider_stream_reclassifies_cleanup_only_child_cancellation() -> None:
+    @detach_provider_stream_traceback
+    def stream() -> AsyncIterator[str]:
+        return _CancelledCloseStream()
+
+    events = stream()
+    assert await anext(events) == "started"
+    task = asyncio.current_task()
+    assert task is not None
+    cancellation_baseline = task.cancelling()
+
+    with pytest.raises(ProviderStreamCleanupError) as exc_info:
+        await events.aclose()
+
+    assert exc_info.value.provider == "unknown"
+    assert exc_info.value.retryable is False
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert task.cancelling() == cancellation_baseline
+    assert not task.cancelled()
 
 
 @pytest.mark.anyio

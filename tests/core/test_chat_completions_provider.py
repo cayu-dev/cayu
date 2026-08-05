@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import httpx
 import pytest
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
+import cayu.providers.chat_completions as chat_completions_module
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
     CayuApp,
     ChatCompletionsProvider,
+    Event,
+    EventType,
     FileAttachmentKind,
+    InMemorySessionStore,
     Message,
+    RecentTurnsContextPolicy,
+    RetryPolicy,
     RunRequest,
     file_attachment,
 )
@@ -32,9 +38,13 @@ from cayu.providers import (
     UsageDialect,
     build_chat_completions_payload,
 )
-from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.chat_completions import chat_completions_stream_events
+
+
+async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
+    return [event async for event in app.run(request)]
 
 
 class RecordingTransport:
@@ -942,6 +952,44 @@ async def test_chat_completions_stream_events_tolerates_repeated_finish_reason()
 
 
 @pytest.mark.anyio
+async def test_chat_stream_preserves_completion_before_real_cancellation() -> None:
+    tail_started = asyncio.Event()
+    collected: list[Any] = []
+
+    async def raw_events():
+        yield _text_chunk("hello")
+        yield _finish_chunk("stop")
+        yield _usage_chunk({"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3})
+        tail_started.set()
+        await asyncio.Event().wait()
+
+    async def collect() -> None:
+        async for event in chat_completions_stream_events(raw_events()):
+            collected.append(event)
+
+    task = asyncio.create_task(collect())
+    await asyncio.wait_for(tail_started.wait(), timeout=1)
+    task.cancel("cancel after finish reason")
+    assert task.cancelling() == 1
+
+    with pytest.raises(asyncio.CancelledError, match="cancel after finish reason"):
+        await task
+
+    assert task.cancelled()
+    assert task.cancelling() == 1
+    assert [event.type for event in collected] == [
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    completion = collected[-1]
+    assert completion.payload["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+    }
+
+
+@pytest.mark.anyio
 async def test_chat_completions_stream_events_rejects_conflicting_finish_reasons() -> None:
     async def raw_events():
         yield _finish_chunk("stop")
@@ -976,7 +1024,70 @@ async def test_chat_completions_stream_events_raises_on_mid_stream_error_chunk()
     assert exc_info.value.error_type == "server_error"
     assert exc_info.value.error_code == "internal_error"
     assert exc_info.value.request_id == "req_stream_error"
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.retryable is True
     assert exc_info.value.response_body is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "error_code", "expected_status", "expected_retryable"),
+    [
+        pytest.param("rate_limit_error", "rate_limit_exceeded", 429, True, id="rate-limit"),
+        pytest.param("permission_error", None, 403, False, id="permission"),
+        pytest.param("future_error", "future_code", None, None, id="unknown"),
+        pytest.param("permission_error", "internal_error", None, False, id="conflict"),
+    ],
+)
+async def test_chat_stream_error_classifies_only_consistent_known_identity(
+    error_type: str,
+    error_code: str | None,
+    expected_status: int | None,
+    expected_retryable: bool | None,
+) -> None:
+    async def raw_events():
+        yield {
+            "error": {
+                "type": error_type,
+                "code": error_code,
+                "message": "server_error rate_limit_error permission_error",
+            }
+        }
+
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert exc_info.value.status_code == expected_status
+    assert exc_info.value.retryable is expected_retryable
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "error_code"),
+    [
+        pytest.param("server_error", None, id="server-type"),
+        pytest.param(None, "internal_error", id="internal-code"),
+    ],
+)
+async def test_chat_context_message_does_not_override_transient_identity(
+    error_type: str | None,
+    error_code: str | None,
+) -> None:
+    async def raw_events():
+        yield {
+            "error": {
+                "type": error_type,
+                "code": error_code,
+                "message": "This model's maximum context length was exceeded.",
+            }
+        }
+
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert not isinstance(exc_info.value, ChatCompletionsContextOverflowError)
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.retryable is True
 
 
 @pytest.mark.anyio
@@ -1017,6 +1128,30 @@ async def test_chat_completions_stream_error_omits_raw_message_at_old_cutoff(
     assert exc_info.value.error_code == "internal_error"
     assert exc_info.value.request_id == "req_cutoff"
     assert_cayu_traceback_does_not_retain(exc_info.value, raw_event)
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_error_preserves_trusted_retry_after() -> None:
+    raw_event = _TrustedSseJsonEvent(
+        {
+            "error": {
+                "type": "server_error",
+                "code": "server_error",
+                "message": "temporary provider failure",
+            }
+        },
+        retry_after_s=6.0,
+    )
+
+    async def raw_events():
+        yield raw_event
+
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.retryable is True
+    assert exc_info.value.retry_after_s == 6.0
 
 
 @pytest.mark.anyio
@@ -1074,6 +1209,84 @@ async def test_chat_completions_stream_events_mid_stream_error_context_overflow(
     assert secret not in repr((str(exc_info.value), vars(exc_info.value)))
     assert exc_info.value.error_code == "context_length_exceeded"
     assert exc_info.value.response_body is None
+
+
+@pytest.mark.anyio
+async def test_chat_completions_provider_rejects_conflicting_context_identity() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "error": {
+                        "type": "authentication_error",
+                        "code": "context_length_exceeded",
+                        "message": "This model's maximum context length was exceeded.",
+                    }
+                }
+            ]
+        ]
+    )
+    provider = ChatCompletionsProvider(api_key="test-key", transport=transport)
+
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(model="test-model", messages=[Message.text("user", "hello")])
+        )
+    ]
+
+    assert len(transport.calls) == 1
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["retryable"] is False
+    assert events[0].payload["provider_error_type"] == "authentication_error"
+    assert events[0].payload["provider_error_code"] == "context_length_exceeded"
+
+
+@pytest.mark.anyio
+async def test_runtime_retries_chat_transient_identity_instead_of_context_recovery() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "error": {
+                        "type": "server_error",
+                        "code": "internal_error",
+                        "message": "This model's maximum context length was exceeded.",
+                    }
+                }
+            ],
+            [_text_chunk("recovered"), _finish_chunk("stop")],
+        ]
+    )
+    provider = ChatCompletionsProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="test-model"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            )
+        )
+    ]
+
+    event_types = [event.type for event in events]
+    assert len(transport.calls) == 2
+    assert EventType.MODEL_RETRY in event_types
+    retry_event = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert retry_event.payload["status_code"] == 500
+    assert retry_event.payload["reason"] == "http_status"
+    assert EventType.CONTEXT_OVERFLOW_DETECTED not in event_types
+    assert EventType.CONTEXT_OVERFLOW_RECOVERING not in event_types
+    assert events[-1].type == EventType.SESSION_COMPLETED
 
 
 @pytest.mark.anyio
@@ -1531,6 +1744,94 @@ async def test_chat_completions_transport_classifies_gemini_context_too_long(
     assert exc_info.value.error_type == "INTERNAL"
 
 
+@pytest.mark.parametrize(
+    ("status_code", "error_type", "error_code", "expected_retryable"),
+    [
+        pytest.param(401, "authentication_error", None, False, id="permanent"),
+        pytest.param(500, "server_error", "server_error", True, id="transient"),
+        pytest.param(500, "future_error", "future_code", None, id="unknown"),
+        pytest.param(500, "authentication_error", "server_error", False, id="body-conflict"),
+        pytest.param(429, "server_error", "server_error", False, id="status-conflict"),
+    ],
+)
+def test_chat_http_error_uses_stream_identity_classification(
+    status_code: int,
+    error_type: str,
+    error_code: str | None,
+    expected_retryable: bool | None,
+) -> None:
+    response = httpx.Response(
+        status_code,
+        headers={"content-type": "application/json", "retry-after": "4"},
+        json={"error": {"type": error_type, "code": error_code}},
+    )
+
+    error = chat_completions_module._chat_api_error_from_response(
+        response,
+        "Chat Completions failed",
+        4.0,
+    )
+
+    assert error.status_code == status_code
+    assert error.error_type == error_type
+    assert error.error_code == error_code
+    assert error.retryable is expected_retryable
+    assert error.retry_after_s == 4.0
+
+
+@pytest.mark.anyio
+async def test_chat_transport_rejects_conflicting_http_context_identity(monkeypatch) -> None:
+    class ResponseContext:
+        async def __aenter__(self) -> httpx.Response:
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return httpx.Response(
+                401,
+                request=request,
+                json={
+                    "error": {
+                        "type": "authentication_error",
+                        "code": "context_length_exceeded",
+                        "message": "This model's maximum context length was exceeded.",
+                    }
+                },
+            )
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+            timeout: Any = None,
+        ) -> ResponseContext:
+            del method, url, headers, json, timeout
+            return ResponseContext()
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", FailingClient)
+
+    stream = HttpxChatCompletionsTransport().stream_chat_completions(
+        url="https://example.test/v1/chat/completions",
+        headers={},
+        payload={},
+        timeout_s=1,
+        stream_idle_timeout_s=1,
+    )
+    with pytest.raises(ChatCompletionsAPIError) as exc_info:
+        await stream.__anext__()
+
+    assert not isinstance(exc_info.value, ChatCompletionsContextOverflowError)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.retryable is False
+
+
 @pytest.mark.anyio
 async def test_chat_completions_transport_does_not_classify_quota_exhausted(
     monkeypatch,
@@ -1666,3 +1967,533 @@ async def test_sse_comment_heartbeats_refresh_idle_timer() -> None:
         )
     ]
     assert events == [{"ok": True}]
+
+
+def test_cayu_app_bounds_active_http_error_body_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StreamingBody(httpx.AsyncByteStream):
+        def __init__(self, *, error_body: bool) -> None:
+            self.error_body = error_body
+            self.closed = False
+
+        async def __aiter__(self):
+            if self.error_body:
+                while True:
+                    await asyncio.sleep(0.001)
+                    yield b"x"
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            )
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class StreamContext:
+        def __init__(self, response: httpx.Response) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> httpx.Response:
+            return self.response
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.response.aclose()
+
+    class BoundedErrorHttpClient:
+        calls = 0
+        bodies: list[StreamingBody] = []
+
+        def __init__(self, **_kwargs: Any) -> None:
+            self.is_closed = False
+
+        def stream(self, method: str, url: str, **_kwargs: Any) -> StreamContext:
+            type(self).calls += 1
+            if type(self).calls == 2:
+                assert type(self).bodies[0].closed
+            body = StreamingBody(error_body=type(self).calls == 1)
+            type(self).bodies.append(body)
+            request = httpx.Request(method, url)
+            return StreamContext(
+                httpx.Response(
+                    500 if body.error_body else 200,
+                    headers={"content-type": "application/json"}
+                    if body.error_body
+                    else {"content-type": "text/event-stream"},
+                    stream=body,
+                    request=request,
+                )
+            )
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", BoundedErrorHttpClient)
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        timeout_s=0.02,
+        stream_idle_timeout_s=0.01,
+    )
+    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run() -> list[Event]:
+        return await asyncio.wait_for(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_bounded_active_http_error_body",
+                    messages=[Message.text("user", "hi")],
+                ),
+            ),
+            timeout=1.0,
+        )
+
+    events = asyncio.run(run())
+
+    assert BoundedErrorHttpClient.calls == 2
+    assert all(body.closed for body in BoundedErrorHttpClient.bodies)
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert retry.payload["status_code"] == 500
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.parametrize(
+    "close_failure",
+    [None, "delayed_success", "runtime_error", "child_cancellation"],
+    ids=[
+        "close_succeeds",
+        "close_delays_retry",
+        "close_runtime_error",
+        "close_child_cancellation",
+    ],
+)
+def test_cayu_app_resolves_in_band_error_stream_before_retry_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    close_failure: str | None,
+) -> None:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class StreamingBody(httpx.AsyncByteStream):
+        def __init__(self, *, fail_in_band: bool) -> None:
+            self.fail_in_band = fail_in_band
+            self.closed = False
+
+        async def __aiter__(self):
+            if self.fail_in_band:
+                yield (
+                    b'data: {"error":{"type":"server_error",'
+                    b'"code":"internal_error","message":"temporary failure"}}\n\n'
+                )
+                # This tail must never retain the connection after the parser
+                # classifies the preceding in-band failure.
+                await asyncio.Event().wait()
+                yield b""  # pragma: no cover
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            )
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self) -> None:
+            self.closed = True
+            if self.fail_in_band and close_failure == "delayed_success":
+                close_started.set()
+                await release_close.wait()
+            if self.fail_in_band and close_failure == "runtime_error":
+                raise RuntimeError("provider byte stream close failed")
+            if self.fail_in_band and close_failure == "child_cancellation":
+                raise asyncio.CancelledError("provider child cleanup cancelled")
+
+    class StreamContext:
+        def __init__(self, response: httpx.Response) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> httpx.Response:
+            return self.response
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.response.aclose()
+
+    class SequencedHttpClient:
+        calls = 0
+        bodies: list[StreamingBody] = []
+
+        def __init__(self, **_kwargs: Any) -> None:
+            self.is_closed = False
+
+        def stream(self, *_args: Any, **_kwargs: Any) -> StreamContext:
+            type(self).calls += 1
+            if type(self).calls == 2:
+                assert close_failure in {None, "delayed_success"}
+                assert type(self).bodies[0].closed
+            body = StreamingBody(fail_in_band=type(self).calls == 1)
+            type(self).bodies.append(body)
+            request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+            return StreamContext(
+                httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=body,
+                    request=request,
+                )
+            )
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    class RetainingTransport:
+        def __init__(self) -> None:
+            self.delegate = HttpxChatCompletionsTransport()
+            self.streams: list[AsyncIterator[Mapping[str, Any]]] = []
+
+        def stream_chat_completions(self, **kwargs: Any) -> AsyncIterator[Mapping[str, Any]]:
+            stream = self.delegate.stream_chat_completions(**kwargs)
+            # Keep an external reference so CPython async-generator finalization
+            # cannot make an omitted explicit close accidentally pass this test.
+            self.streams.append(stream)
+            return stream
+
+        async def aclose(self) -> None:
+            await self.delegate.aclose()
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", SequencedHttpClient)
+    transport = RetainingTransport()
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        stream_idle_timeout_s=1.0,
+        transport=transport,
+    )
+    app = CayuApp(retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0))
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run() -> tuple[list[Event], int, bool]:
+        consumer = asyncio.create_task(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_in_band_stream_close_before_retry",
+                    messages=[Message.text("user", "hi")],
+                ),
+            )
+        )
+        if close_failure == "delayed_success":
+            await asyncio.wait_for(close_started.wait(), timeout=0.5)
+            await asyncio.sleep(0)
+            assert SequencedHttpClient.calls == 1
+            release_close.set()
+        events = await consumer
+        return events, consumer.cancelling(), consumer.cancelled()
+
+    events, consumer_cancelling, consumer_cancelled = asyncio.run(run())
+
+    assert SequencedHttpClient.bodies[0].closed
+    assert consumer_cancelling == 0
+    assert not consumer_cancelled
+    if close_failure in {"runtime_error", "child_cancellation"}:
+        assert SequencedHttpClient.calls == 1
+        assert len(transport.streams) == 1
+        assert EventType.MODEL_RETRY not in {event.type for event in events}
+        model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+        assert len(model_errors) == 1
+        assert model_errors[0].payload["error_type"] == "ProviderStreamCleanupError"
+        assert model_errors[0].payload["status_code"] == 500
+        assert model_errors[0].payload["provider_error_type"] == "server_error"
+        assert model_errors[0].payload["provider_error_code"] == "internal_error"
+        assert model_errors[0].payload["stream_cleanup_failed"] is True
+        assert model_errors[0].payload["retryable"] is False
+        assert events[-1].type == EventType.SESSION_FAILED
+        return
+
+    assert SequencedHttpClient.calls == 2
+    assert len(transport.streams) == 2
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert retry.payload["status_code"] == 500
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.parametrize("termination", ["done", "eof"], ids=["done_marker", "clean_eof"])
+def test_cayu_app_preserves_chat_http_completion_before_response_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    termination: str,
+) -> None:
+    class CompletingBody(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+            self.close_started = asyncio.Event()
+            self.close_finalized = asyncio.Event()
+
+        async def __aiter__(self):
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            )
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[],"usage":'
+                b'{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\n'
+            )
+            if termination == "done":
+                yield b"data: [DONE]\n\n"
+
+        async def aclose(self) -> None:
+            self.closed = True
+            self.close_started.set()
+            try:
+                raise httpx.CloseError("completed response close failed")
+            finally:
+                self.close_finalized.set()
+
+    class StreamContext:
+        def __init__(self, response: httpx.Response) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> httpx.Response:
+            return self.response
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.response.aclose()
+
+    class CompletingHttpClient:
+        calls = 0
+        bodies: list[CompletingBody] = []
+
+        def __init__(self, **_kwargs: Any) -> None:
+            self.is_closed = False
+
+        def stream(self, method: str, url: str, **_kwargs: Any) -> StreamContext:
+            type(self).calls += 1
+            body = CompletingBody()
+            type(self).bodies.append(body)
+            return StreamContext(
+                httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=body,
+                    request=httpx.Request(method, url),
+                )
+            )
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", CompletingHttpClient)
+    store = InMemorySessionStore()
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        stream_idle_timeout_s=1.0,
+    )
+    app = CayuApp(
+        session_store=store,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    session_id = f"sess_chat_http_completion_cleanup_{termination}"
+
+    async def run() -> list[Event]:
+        events = await _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+        await asyncio.wait_for(
+            CompletingHttpClient.bodies[0].close_finalized.wait(),
+            timeout=0.5,
+        )
+        return events
+
+    events = asyncio.run(run())
+    transcript = asyncio.run(store.load_transcript(session_id))
+    durable_events = asyncio.run(store.load_events(session_id))
+
+    assert CompletingHttpClient.calls == 1
+    body = CompletingHttpClient.bodies[0]
+    assert body.closed
+    assert body.close_started.is_set()
+    assert body.close_finalized.is_set()
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    assert EventType.MODEL_ERROR not in {event.type for event in events}
+    model_completions = [
+        event for event in durable_events if event.type == EventType.MODEL_COMPLETED
+    ]
+    assert len(model_completions) == 1
+    completion = model_completions[0]
+    assert completion.payload["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+    }
+    assert completion.payload["usage_metrics"]["input_tokens"] == 2
+    assert completion.payload["usage_metrics"]["output_tokens"] == 1
+    assert completion.payload["usage_metrics"]["total_tokens"] == 3
+    assert completion.payload["step_classification"]["type"] == "failed"
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert [message.role for message in transcript] == ["user"]
+
+
+def test_cayu_app_preserves_chat_http_completion_before_real_tail_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body_created = asyncio.Event()
+
+    class BlockingTailBody(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+            self.tail_started = asyncio.Event()
+            self.tail_cancelled = asyncio.Event()
+
+        async def __aiter__(self):
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+            )
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[{"index":0,'
+                b'"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            yield (
+                b'data: {"id":"chat-1","object":"chat.completion.chunk",'
+                b'"model":"fake-model","choices":[],"usage":'
+                b'{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\n'
+            )
+            self.tail_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.tail_cancelled.set()
+                raise
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class StreamContext:
+        def __init__(self, response: httpx.Response) -> None:
+            self.response = response
+
+        async def __aenter__(self) -> httpx.Response:
+            return self.response
+
+        async def __aexit__(self, *args: Any) -> None:
+            await self.response.aclose()
+
+    class BlockingHttpClient:
+        calls = 0
+        bodies: list[BlockingTailBody] = []
+
+        def __init__(self, **_kwargs: Any) -> None:
+            self.is_closed = False
+
+        def stream(self, method: str, url: str, **_kwargs: Any) -> StreamContext:
+            type(self).calls += 1
+            body = BlockingTailBody()
+            type(self).bodies.append(body)
+            body_created.set()
+            return StreamContext(
+                httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=body,
+                    request=httpx.Request(method, url),
+                )
+            )
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", BlockingHttpClient)
+    session_id = "sess_chat_http_completion_tail_cancel"
+    store = InMemorySessionStore()
+    app = CayuApp(
+        session_store=store,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(
+        ChatCompletionsProvider(
+            api_key="test-key",
+            base_url="https://example.test/v1",
+            transport=HttpxChatCompletionsTransport(),
+            stream_idle_timeout_s=1.0,
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run() -> tuple[list[Event], list[Message], asyncio.Task[list[Event]]]:
+        task = asyncio.create_task(
+            _collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hi")],
+                ),
+            )
+        )
+        await asyncio.wait_for(body_created.wait(), timeout=1)
+        body = BlockingHttpClient.bodies[0]
+        await asyncio.wait_for(body.tail_started.wait(), timeout=1)
+        task.cancel("cancel after Chat Completions finish reason")
+        assert task.cancelling() == 1
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="Chat Completions provider request cancelled",
+        ):
+            await task
+        return await store.load_events(session_id), await store.load_transcript(session_id), task
+
+    durable_events, transcript, task = asyncio.run(run())
+
+    assert BlockingHttpClient.calls == 1
+    body = BlockingHttpClient.bodies[0]
+    assert body.tail_cancelled.is_set()
+    assert body.closed
+    assert task.cancelled()
+    assert task.cancelling() == 0
+    assert EventType.MODEL_RETRY not in {event.type for event in durable_events}
+    completions = [event for event in durable_events if event.type == EventType.MODEL_COMPLETED]
+    assert len(completions) == 1
+    completion = completions[0]
+    assert completion.payload["usage"] == {
+        "prompt_tokens": 2,
+        "completion_tokens": 1,
+        "total_tokens": 3,
+    }
+    assert completion.payload["usage_metrics"]["input_tokens"] == 2
+    assert completion.payload["usage_metrics"]["output_tokens"] == 1
+    assert completion.payload["usage_metrics"]["total_tokens"] == 3
+    assert completion.payload["step_classification"]["type"] == "failed"
+    assert [message.role for message in transcript] == ["user"]

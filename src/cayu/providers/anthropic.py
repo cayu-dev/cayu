@@ -6,7 +6,7 @@ import re
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_json_value, require_clean_nonblank, require_finite
 from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
@@ -24,15 +24,18 @@ from cayu.core.messages import (
 )
 from cayu.providers._api_keys import resolve_api_key
 from cayu.providers._credential_boundary import (
+    aclosing_provider_stream,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
     OMITTED_PROVIDER_ERROR_BODY,
     SharedAsyncClient,
+    _trusted_sse_retry_after_s,
     aclose_transport,
     copy_headers,
     credential_safe_error_event,
+    credential_safe_post_completion_failure,
     credential_safe_provider_exception,
     credential_sanitization_values,
     json_error_text,
@@ -56,6 +59,7 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    ModelStreamEventType,
     UsageDialect,
 )
 from cayu.providers.cache import (
@@ -258,10 +262,12 @@ class HttpxAnthropicTransport:
             protocol_error=AnthropicProtocolError,
             error_response_text=_safe_error_response_text,
             raise_context_overflow=_raise_anthropic_context_overflow_if_applicable,
+            raise_context_overflow_from_status=_raise_anthropic_context_overflow_from_status,
             api_error_from_response=_anthropic_api_error_from_response,
         )
-        async for event in events:
-            yield event
+        async with aclosing_provider_stream(events):
+            async for event in events:
+                yield event
 
     async def _post_json(
         self,
@@ -366,9 +372,12 @@ class AnthropicProvider(ModelProvider):
         self.timeout_s = float(timeout_s)
         if type(stream_idle_timeout_s) not in {int, float}:
             raise TypeError("stream_idle_timeout_s must be a number.")
+        stream_idle_timeout_s = require_finite(
+            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        )
         if stream_idle_timeout_s <= 0:
             raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
+        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.transport = transport if transport is not None else HttpxAnthropicTransport()
         self.extra_headers = _copy_headers(extra_headers)
         if cache_policy is not None and type(cache_policy) is not CachePolicy:
@@ -388,7 +397,9 @@ class AnthropicProvider(ModelProvider):
         headers: dict[str, str] | None = None
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: AnthropicContextOverflowError | None = None
+        post_completion_failure: ModelProviderError | None = None
         error_event: ModelStreamEvent | None = None
+        completion_emitted = False
         try:
             resolved_api_key = await self._resolve_api_key()
             headers = self._headers(resolved_api_key)
@@ -409,7 +420,10 @@ class AnthropicProvider(ModelProvider):
                     timeout_s=self.timeout_s,
                 )
                 for event in anthropic_response_events(response):
+                    completion_emitted = event.type == ModelStreamEventType.COMPLETED
                     yield event
+                    if completion_emitted:
+                        break
             else:
                 payload["stream"] = True
                 raw_events = stream_transport(
@@ -419,8 +433,13 @@ class AnthropicProvider(ModelProvider):
                     timeout_s=self.timeout_s,
                     stream_idle_timeout_s=self.stream_idle_timeout_s,
                 )
-                async for event in anthropic_stream_events(raw_events):
-                    yield event
+                events = anthropic_stream_events(raw_events)
+                async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+                    async for event in events:
+                        completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                        yield event
+                        if completion_emitted:
+                            break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
@@ -431,46 +450,68 @@ class AnthropicProvider(ModelProvider):
                 ),
             )
         except ModelContextOverflowError as exc:
-            # Overflow must reach runtime recovery as a typed exception; an
-            # error event would flatten it into unrecoverable message text.
-            safe = credential_safe_provider_exception(
-                exc,
-                provider_label="Anthropic",
-                provider_name="anthropic",
-                credential_values=credential_sanitization_values(
-                    resolved_api_key,
-                    extra_headers=self.extra_headers,
-                ),
+            credential_values = credential_sanitization_values(
+                resolved_api_key,
+                extra_headers=self.extra_headers,
             )
-            overflow_failure = AnthropicContextOverflowError(
-                str(safe),
-                status_code=safe.status_code,
-                error_type=safe.error_type,
-                error_code=safe.error_code,
-                request_id=safe.request_id,
-                response_body=None,
-            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="Anthropic",
+                    provider_name="anthropic",
+                    credential_values=credential_values,
+                )
+            else:
+                # Overflow must reach runtime recovery as a typed exception; an
+                # error event would flatten it into unrecoverable message text.
+                safe = credential_safe_provider_exception(
+                    exc,
+                    provider_label="Anthropic",
+                    provider_name="anthropic",
+                    credential_values=credential_values,
+                )
+                overflow_failure = AnthropicContextOverflowError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    response_body=None,
+                )
         except Exception as exc:
-            error_event = credential_safe_error_event(
-                exc,
-                provider_label="Anthropic",
-                provider_name="anthropic",
-                credential_values=credential_sanitization_values(
-                    resolved_api_key,
-                    extra_headers=self.extra_headers,
-                ),
-                unresolved_message=(
-                    "Anthropic credential use denied by credential proxy."
-                    if isinstance(exc, _AnthropicCredentialProxyDeniedError)
-                    else None
-                ),
+            credential_values = credential_sanitization_values(
+                resolved_api_key,
+                extra_headers=self.extra_headers,
             )
+            unresolved_message = (
+                "Anthropic credential use denied by credential proxy."
+                if isinstance(exc, _AnthropicCredentialProxyDeniedError)
+                else None
+            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="Anthropic",
+                    provider_name="anthropic",
+                    credential_values=credential_values,
+                    safe_message=unresolved_message,
+                )
+            else:
+                error_event = credential_safe_error_event(
+                    exc,
+                    provider_label="Anthropic",
+                    provider_name="anthropic",
+                    credential_values=credential_values,
+                    unresolved_message=unresolved_message,
+                )
         resolved_api_key = None
         headers = None
         if cancellation is not None:
             raise cancellation from None
         if overflow_failure is not None:
             raise overflow_failure from None
+        if post_completion_failure is not None:
+            raise post_completion_failure from None
         if error_event is not None:
             yield error_event
 
@@ -1077,6 +1118,11 @@ async def anthropic_stream_events(
             raw_error = event.get("error")
             error = raw_error if isinstance(raw_error, Mapping) else {}
             error_type = optional_error_string(error.get("type"))
+            error_code = optional_error_string(error.get("code"))
+            retry_after_s = _trusted_sse_retry_after_s(event)
+            request_id = optional_error_string(event.get("request_id")) or optional_error_string(
+                error.get("request_id")
+            )
             error_message = optional_error_string(error.get("message"))
             safe_message = f"{provider_label} streaming error: {OMITTED_PROVIDER_ERROR_BODY}"
             if _is_anthropic_stream_error_context_overflow(
@@ -1092,10 +1138,20 @@ async def anthropic_stream_events(
                     safe_message,
                     error_type=error_type,
                 )
+            _enrich_anthropic_stream_failure(
+                failure,
+                error_type=error_type,
+                error_code=error_code,
+                request_id=request_id,
+                retry_after_s=retry_after_s,
+            )
             # The exported parser serves both Anthropic and Vertex. Clear the
             # untrusted envelope and source iterator before exposing failure.
             raw_error = None
             error = {}
+            error_code = None
+            request_id = None
+            retry_after_s = None
             error_message = None
             event = {}
             del events
@@ -1117,6 +1173,72 @@ def _is_anthropic_stream_error_context_overflow(
     if error_type != "invalid_request_error" or message is None:
         return False
     return _anthropic_overflow_message(message)
+
+
+_ANTHROPIC_ERROR_STATUS = {
+    "api_error": 500,
+    "authentication_error": 401,
+    "billing_error": 402,
+    "conflict_error": 409,
+    "invalid_request_error": 400,
+    "not_found_error": 404,
+    "overloaded_error": 529,
+    "permission_error": 403,
+    "rate_limit_error": 429,
+    "request_too_large": 413,
+    "timeout_error": 504,
+}
+_ANTHROPIC_RETRYABLE_ERRORS = frozenset(
+    {
+        "api_error",
+        "overloaded_error",
+        "rate_limit_error",
+        "timeout_error",
+    }
+)
+
+
+def _anthropic_retry_metadata(
+    *,
+    transport_status_code: int | None,
+    error_type: str | None,
+) -> tuple[int | None, bool | None]:
+    """Classify recognized HTTP/stream identities; conflicts fail closed."""
+
+    canonical_status = _ANTHROPIC_ERROR_STATUS.get(error_type or "")
+    if canonical_status is None:
+        return transport_status_code, None
+    if transport_status_code is not None and transport_status_code != canonical_status:
+        return transport_status_code, False
+    return canonical_status, error_type in _ANTHROPIC_RETRYABLE_ERRORS
+
+
+def _enrich_anthropic_stream_failure(
+    failure: Exception,
+    *,
+    error_type: str | None,
+    error_code: str | None,
+    request_id: str | None,
+    retry_after_s: float | None = None,
+) -> None:
+    """Attach trusted structured stream metadata without widening legacy factories."""
+    if not isinstance(failure, ModelProviderError):
+        return
+    status_code, retryable = _anthropic_retry_metadata(
+        transport_status_code=failure.status_code,
+        error_type=error_type,
+    )
+    if status_code is not None:
+        if failure.status_code is None:
+            failure.status_code = status_code
+        if failure.retryable is None:
+            failure.retryable = retryable
+    if failure.error_code is None and error_code is not None:
+        failure.error_code = require_clean_nonblank(error_code, "error_code")
+    if failure.request_id is None and request_id is not None:
+        failure.request_id = require_clean_nonblank(request_id, "request_id")
+    if failure.retry_after_s is None and retry_after_s is not None:
+        failure.retry_after_s = retry_after_s
 
 
 def _anthropic_input_tokens_from_count_response(response: Mapping[str, Any]) -> int:
@@ -1396,13 +1518,33 @@ def _format_error_json(decoded: Any) -> str | None:
 def _raise_anthropic_context_overflow_if_applicable(response: httpx.Response) -> None:
     decoded = response_json_object(response)
     if decoded is None:
+        _raise_anthropic_context_overflow_from_status(response.status_code)
         return
-    error = decoded.get("error")
+    raw_error = decoded.get("error")
+    if isinstance(raw_error, Mapping):
+        error = raw_error
+        identity_missing = "type" not in error
+    elif response.status_code == 413:
+        # Anthropic's standard envelope nests the identity under ``error``.
+        # Inspect a flat identity only to prevent a readable conflicting 413
+        # from being mistaken for status-only overflow evidence.
+        error = decoded
+        identity_missing = "error" not in decoded and (
+            "type" not in error or optional_error_string(error.get("type")) == "error"
+        )
+    else:
+        return
     request_id = decoded.get("request_id")
-    if not isinstance(error, Mapping):
-        return
     error_type = optional_error_string(error.get("type"))
     message = optional_error_string(error.get("message"))
+    if response.status_code == 413 and identity_missing:
+        raise AnthropicContextOverflowError(
+            "Anthropic model context overflow",
+            status_code=response.status_code,
+            error_type="request_too_large",
+            request_id=request_id if isinstance(request_id, str) else None,
+            response_body=_safe_error_response_text(response),
+        )
     if not _is_anthropic_context_overflow(
         status_code=response.status_code,
         error_type=error_type,
@@ -1415,6 +1557,17 @@ def _raise_anthropic_context_overflow_if_applicable(response: httpx.Response) ->
         error_type=error_type,
         request_id=request_id if isinstance(request_id, str) else None,
         response_body=_safe_error_response_text(response),
+    )
+
+
+def _raise_anthropic_context_overflow_from_status(status_code: int) -> None:
+    """Classify the canonical unread request-too-large response by status."""
+    if status_code != 413:
+        return
+    raise AnthropicContextOverflowError(
+        "Anthropic model context overflow",
+        status_code=status_code,
+        error_type="request_too_large",
     )
 
 
@@ -1435,12 +1588,18 @@ def _anthropic_api_error_from_response(
     if decoded is not None:
         raw_error = decoded.get("error")
         error = raw_error if isinstance(raw_error, Mapping) else decoded
+    error_type = optional_error_string(error.get("type"))
+    status_code, retryable = _anthropic_retry_metadata(
+        transport_status_code=response.status_code,
+        error_type=error_type,
+    )
     return AnthropicAPIError(
         message,
-        status_code=response.status_code,
-        error_type=optional_error_string(error.get("type")),
+        status_code=status_code,
+        error_type=error_type,
         error_code=optional_error_string(error.get("code")),
         request_id=optional_error_string(response.headers.get("request-id")),
+        retryable=retryable,
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )

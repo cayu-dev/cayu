@@ -28,14 +28,17 @@ from urllib.parse import urlencode
 
 import httpx
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import require_clean_nonblank, require_finite
 from cayu.providers._credential_boundary import (
+    ProviderStreamCleanupError,
+    aclosing_provider_stream,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
 )
 from cayu.providers._http import (
     aclose_transport,
     copy_headers,
+    credential_safe_post_completion_failure,
     credential_sanitization_values,
     safe_provider_exception_type_name,
     sanitize_provider_cancellation,
@@ -640,9 +643,12 @@ class OpenAISubscriptionProvider(ModelProvider):
         self.timeout_s = float(timeout_s)
         if type(stream_idle_timeout_s) not in {int, float}:
             raise TypeError("stream_idle_timeout_s must be a number.")
+        stream_idle_timeout_s = require_finite(
+            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        )
         if stream_idle_timeout_s <= 0:
             raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
+        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.transport = transport if transport is not None else HttpxOpenAITransport()
         self.extra_headers = copy_headers(
             extra_headers,
@@ -667,7 +673,9 @@ class OpenAISubscriptionProvider(ModelProvider):
         credentials: OpenAISubscriptionCredentials | None = None
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: ModelContextOverflowError | None = None
+        post_completion_failure: ModelProviderError | None = None
         error_event: ModelStreamEvent | None = None
+        completion_emitted = False
         try:
             credentials = await self.auth.credentials()
             payload = build_openai_payload(request, stream=True, reasoning_state="inline")
@@ -678,8 +686,13 @@ class OpenAISubscriptionProvider(ModelProvider):
                 timeout_s=self.timeout_s,
                 stream_idle_timeout_s=self.stream_idle_timeout_s,
             )
-            async for event in openai_stream_events(raw_events, reasoning_state="inline"):
-                yield event
+            events = openai_stream_events(raw_events, reasoning_state="inline")
+            async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+                async for event in events:
+                    completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                    yield event
+                    if completion_emitted:
+                        break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
@@ -691,22 +704,48 @@ class OpenAISubscriptionProvider(ModelProvider):
                 safe_message="OpenAI subscription request cancelled.",
             )
         except ModelContextOverflowError as exc:
-            overflow_failure = _safe_subscription_context_overflow(
-                exc,
-                credentials,
-                extra_header_values=tuple(self.extra_headers.values()),
-            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="OpenAI subscription",
+                    provider_name="openai",
+                    credential_values=credential_sanitization_values(
+                        *_subscription_credential_values(credentials),
+                        extra_headers=self.extra_headers,
+                    ),
+                    safe_message="OpenAI subscription provider failed.",
+                )
+            else:
+                overflow_failure = _safe_subscription_context_overflow(
+                    exc,
+                    credentials,
+                    extra_header_values=tuple(self.extra_headers.values()),
+                )
         except Exception as exc:
-            error_event = _safe_subscription_error_event(
-                exc,
-                credentials,
-                extra_header_values=tuple(self.extra_headers.values()),
-            )
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="OpenAI subscription",
+                    provider_name="openai",
+                    credential_values=credential_sanitization_values(
+                        *_subscription_credential_values(credentials),
+                        extra_headers=self.extra_headers,
+                    ),
+                    safe_message="OpenAI subscription provider failed.",
+                )
+            else:
+                error_event = _safe_subscription_error_event(
+                    exc,
+                    credentials,
+                    extra_header_values=tuple(self.extra_headers.values()),
+                )
         credentials = None
         if cancellation is not None:
             raise cancellation from None
         if overflow_failure is not None:
             raise overflow_failure from None
+        if post_completion_failure is not None:
+            raise post_completion_failure from None
         if error_event is not None:
             yield error_event
 
@@ -1014,6 +1053,8 @@ def _safe_subscription_error_event(
         retry_after_s = getattr(exc, "retry_after_s", None)
         if type(retry_after_s) in {int, float}:
             payload["retry_after_s"] = retry_after_s
+    if isinstance(exc, ProviderStreamCleanupError):
+        payload["stream_cleanup_failed"] = True
     return ModelStreamEvent(type=ModelStreamEventType.ERROR, payload=payload)
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from collections.abc import Mapping
 from typing import Any
 
@@ -7,6 +8,7 @@ import httpx
 import pytest
 from tests.provider_traceback_assertions import assert_cayu_traceback_does_not_retain
 
+import cayu.providers.anthropic as anthropic_module
 from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
@@ -14,8 +16,11 @@ from cayu import (
     CacheBreakpoint,
     CachePolicy,
     CayuApp,
+    EventType,
     FileAttachmentKind,
     Message,
+    RecentTurnsContextPolicy,
+    RetryPolicy,
     RunRequest,
     file_attachment,
 )
@@ -36,7 +41,7 @@ from cayu.providers import (
     anthropic_stream_events,
     build_anthropic_payload,
 )
-from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
+from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
 from cayu.providers.cache import resolve_cache_policy
 from cayu.vaults import SecretRef, StaticVault
 
@@ -926,12 +931,47 @@ async def test_httpx_anthropic_transport_populates_typed_retry_fields(monkeypatc
     assert error.status_code == 429
     assert error.error_type == "rate_limit_error"
     assert error.request_id == "req_rate_limited"
+    assert error.retryable is True
     assert error.retry_after_s == 12.0
     # Typed fields survive into the error-event payload used for retry
     # classification and observability.
     payload = error.error_payload_fields()
     assert payload["status_code"] == 429
+    assert payload["retryable"] is True
     assert payload["retry_after_s"] == 12.0
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type", "expected_retryable"),
+    [
+        pytest.param(401, "authentication_error", False, id="permanent"),
+        pytest.param(500, "api_error", True, id="transient"),
+        pytest.param(500, "future_error", None, id="unknown"),
+        pytest.param(500, "authentication_error", False, id="status-permanent-conflict"),
+        pytest.param(429, "api_error", False, id="status-transient-conflict"),
+    ],
+)
+def test_anthropic_http_error_uses_stream_identity_classification(
+    status_code: int,
+    error_type: str,
+    expected_retryable: bool | None,
+) -> None:
+    response = httpx.Response(
+        status_code,
+        headers={"content-type": "application/json", "retry-after": "4"},
+        json={"type": "error", "error": {"type": error_type}},
+    )
+
+    error = anthropic_module._anthropic_api_error_from_response(
+        response,
+        "Anthropic failed",
+        4.0,
+    )
+
+    assert error.status_code == status_code
+    assert error.error_type == error_type
+    assert error.retryable is expected_retryable
+    assert error.retry_after_s == 4.0
 
 
 @pytest.mark.anyio
@@ -994,6 +1034,227 @@ async def test_httpx_anthropic_transport_classifies_request_too_large(monkeypatc
     assert exc_info.value.error_type == "request_too_large"
     assert exc_info.value.request_id == "req_context"
     assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("content_encoding", "error_body_content", "expected_body_read"),
+    [
+        pytest.param(
+            "gzip",
+            gzip.compress(
+                b'{"type":"error","error":{"type":"request_too_large",'
+                b'"message":"Request exceeds the maximum allowed number of bytes."}}'
+            ),
+            False,
+            id="compressed-body-unread",
+        ),
+        pytest.param(None, b"{}", True, id="identity-body-without-error-identity"),
+        pytest.param(
+            None,
+            b'{"type":"error"}',
+            True,
+            id="identity-body-with-envelope-only",
+        ),
+    ],
+)
+async def test_runtime_recovers_from_anthropic_413_without_requiring_body_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    content_encoding: str | None,
+    error_body_content: bytes,
+    expected_body_read: bool,
+) -> None:
+    class ResponseBody(httpx.AsyncByteStream):
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+            self.yielded = False
+            self.closed = False
+
+        async def __aiter__(self):
+            self.yielded = True
+            yield self.content
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    error_body = ResponseBody(error_body_content)
+    success_body = ResponseBody(
+        b'data: {"type":"message_start","message":{"id":"msg_1",'
+        b'"model":"claude-test","usage":{"input_tokens":1}}}\n\n'
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"text","text":""}}\n\n'
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"text_delta","text":"ok"}}\n\n'
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+        b'"usage":{"output_tokens":1}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            headers = {"content-type": "application/json"}
+            if content_encoding is not None:
+                headers["content-encoding"] = content_encoding
+            return httpx.Response(
+                413,
+                headers=headers,
+                stream=error_body,
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=success_body,
+            request=request,
+        )
+
+    real_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        del args
+        kwargs.pop("verify", None)
+        kwargs.pop("timeout", None)
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", client_factory)
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        AnthropicProvider(api_key="test-key", transport=HttpxAnthropicTransport()),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="claude-test"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            )
+        )
+    ]
+
+    assert calls == 2
+    assert error_body.yielded is expected_body_read
+    assert error_body.closed
+    assert success_body.yielded
+    assert success_body.closed
+    assert [
+        event.type
+        for event in events
+        if event.type
+        in {
+            EventType.CONTEXT_OVERFLOW_DETECTED,
+            EventType.CONTEXT_OVERFLOW_RECOVERING,
+            EventType.CONTEXT_OVERFLOW_FAILED,
+            EventType.SESSION_COMPLETED,
+        }
+    ] == [
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_OVERFLOW_RECOVERING,
+        EventType.SESSION_COMPLETED,
+    ]
+    detected = next(event for event in events if event.type == EventType.CONTEXT_OVERFLOW_DETECTED)
+    assert detected.payload["provider"] == "anthropic"
+    assert detected.payload["status_code"] == 413
+    assert detected.payload["provider_error_type"] == "request_too_large"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "expected_public_type", "expected_retryable"),
+    [
+        pytest.param(
+            "authentication_error",
+            "authentication_error",
+            False,
+            id="authentication",
+        ),
+        pytest.param("future_error", None, None, id="unknown"),
+        pytest.param(True, None, None, id="boolean"),
+        pytest.param("", None, None, id="blank"),
+    ],
+)
+async def test_runtime_does_not_recover_from_conflicting_anthropic_413(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: Any,
+    expected_public_type: str | None,
+    expected_retryable: bool | None,
+) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            413,
+            headers={"content-type": "application/json"},
+            json={
+                "type": "error",
+                "error": {"type": error_type, "message": "denied"},
+                "request_id": "req_conflicting_413",
+            },
+            request=request,
+        )
+
+    real_client = httpx.AsyncClient
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        del args
+        kwargs.pop("verify", None)
+        kwargs.pop("timeout", None)
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", client_factory)
+    app = CayuApp(
+        enable_logging=False,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(
+        AnthropicProvider(api_key="test-key", transport=HttpxAnthropicTransport()),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="claude-test"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"sess_conflicting_anthropic_413_{error_type}",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            )
+        )
+    ]
+
+    assert calls == 1
+    assert not {
+        EventType.CONTEXT_OVERFLOW_DETECTED,
+        EventType.CONTEXT_OVERFLOW_RECOVERING,
+        EventType.MODEL_RETRY,
+    }.intersection(event.type for event in events)
+    model_errors = [event for event in events if event.type == EventType.MODEL_ERROR]
+    assert len(model_errors) == 1
+    assert model_errors[0].payload["status_code"] == 413
+    assert model_errors[0].payload.get("provider_error_type") == expected_public_type
+    assert model_errors[0].payload.get("retryable") is expected_retryable
+    assert events[-1].type == EventType.SESSION_FAILED
 
 
 @pytest.mark.anyio
@@ -1556,9 +1817,128 @@ async def test_anthropic_provider_stream_error_event_yields_typed_error() -> Non
     assert emitted[0].payload["error"] == "AnthropicAPIError: Anthropic provider failed"
     assert emitted[0].payload["error_type"] == "AnthropicAPIError"
     assert emitted[0].payload["provider"] == "anthropic"
+    assert emitted[0].payload["status_code"] == 529
     assert emitted[0].payload["provider_error_type"] == "overloaded_error"
+    assert emitted[0].payload["retryable"] is True
     rendered = repr([event.model_dump(mode="json") for event in emitted])
     assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "expected_status"),
+    [
+        pytest.param("api_error", 500, id="api"),
+        pytest.param("overloaded_error", 529, id="overloaded"),
+        pytest.param("rate_limit_error", 429, id="rate-limit"),
+        pytest.param("timeout_error", 504, id="timeout"),
+    ],
+)
+async def test_runtime_retries_transient_anthropic_stream_error_then_completes(
+    error_type: str,
+    expected_status: int,
+) -> None:
+    transport = StreamingRecordingTransport(
+        [
+            [
+                {
+                    "type": "message_start",
+                    "message": {"id": "msg_failed", "model": "claude-test", "usage": {}},
+                },
+                {"type": "error", "error": {"type": error_type}},
+            ],
+            [
+                {
+                    "type": "message_start",
+                    "message": {"id": "msg_retry", "model": "claude-test", "usage": {}},
+                },
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "recovered"},
+                },
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+                {"type": "message_stop"},
+            ],
+        ]
+    )
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="claude-test"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            )
+        )
+    ]
+
+    assert len(transport.calls) == 2
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["status_code"] == expected_status
+    assert model_error.payload["provider_error_type"] == error_type
+    assert model_error.payload["retryable"] is True
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert retry.payload["status_code"] == expected_status
+    assert retry.payload["reason"] == "http_status"
+    discarded = next(event for event in events if event.type == EventType.MODEL_ATTEMPT_DISCARDED)
+    assert discarded.payload["status_code"] == expected_status
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "expected_status"),
+    [
+        pytest.param("authentication_error", 401, id="authentication"),
+        pytest.param("billing_error", 402, id="billing"),
+        pytest.param("conflict_error", 409, id="conflict"),
+        pytest.param("invalid_request_error", 400, id="invalid-request"),
+        pytest.param("not_found_error", 404, id="not-found"),
+        pytest.param("permission_error", 403, id="permission"),
+    ],
+)
+async def test_runtime_does_not_retry_permanent_anthropic_stream_error(
+    error_type: str,
+    expected_status: int,
+) -> None:
+    transport = StreamingRecordingTransport([[{"type": "error", "error": {"type": error_type}}]])
+    provider = AnthropicProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="claude-test"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            )
+        )
+    ]
+
+    assert len(transport.calls) == 1
+    assert EventType.MODEL_RETRY not in [event.type for event in events]
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["status_code"] == expected_status
+    assert model_error.payload["provider_error_type"] == error_type
+    assert model_error.payload["retryable"] is False
+    assert events[-1].type == EventType.SESSION_FAILED
 
 
 @pytest.mark.anyio
@@ -1592,8 +1972,62 @@ async def test_anthropic_stream_error_omits_raw_message_at_old_cutoff(
     assert str(exc_info.value) == ("Anthropic streaming error: [provider response body omitted]")
     assert not any(secret[:size] in rendered for size in range(8, len(secret) + 1))
     assert exc_info.value.error_type == "overloaded_error"
+    assert exc_info.value.error_code == "overloaded"
+    assert exc_info.value.request_id == "req_anthropic_parser"
+    assert exc_info.value.status_code == 529
+    assert exc_info.value.retryable is True
     assert exc_info.value.response_body is None
     assert_cayu_traceback_does_not_retain(exc_info.value, raw_event)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "expected_status", "expected_retryable"),
+    [
+        pytest.param("api_error", 500, True, id="api"),
+        pytest.param("authentication_error", 401, False, id="authentication"),
+        pytest.param("billing_error", 402, False, id="billing"),
+        pytest.param("conflict_error", 409, False, id="conflict"),
+        pytest.param("invalid_request_error", 400, False, id="invalid-request"),
+        pytest.param("not_found_error", 404, False, id="not-found"),
+        pytest.param("overloaded_error", 529, True, id="overloaded"),
+        pytest.param("permission_error", 403, False, id="permission"),
+        pytest.param("rate_limit_error", 429, True, id="rate-limit"),
+        pytest.param("request_too_large", 413, False, id="request-too-large"),
+        pytest.param("timeout_error", 504, True, id="timeout"),
+        pytest.param("future_error", None, None, id="unknown"),
+    ],
+)
+async def test_anthropic_stream_error_classifies_only_known_typed_identity(
+    error_type: str,
+    expected_status: int | None,
+    expected_retryable: bool | None,
+) -> None:
+    raw_event = {
+        "type": "error",
+        "error": {"type": error_type, "message": "provider-authored detail"},
+    }
+
+    with pytest.raises(AnthropicAPIError) as exc_info:
+        [event async for event in anthropic_stream_events(_aiter_events([raw_event]))]
+
+    assert exc_info.value.status_code == expected_status
+    assert exc_info.value.retryable is expected_retryable
+
+
+@pytest.mark.anyio
+async def test_anthropic_stream_error_preserves_trusted_retry_after() -> None:
+    raw_event = _TrustedSseJsonEvent(
+        {"type": "error", "error": {"type": "overloaded_error"}},
+        retry_after_s=8.5,
+    )
+
+    with pytest.raises(AnthropicAPIError) as exc_info:
+        [event async for event in anthropic_stream_events(_aiter_events([raw_event]))]
+
+    assert exc_info.value.status_code == 529
+    assert exc_info.value.retryable is True
+    assert exc_info.value.retry_after_s == 8.5
 
 
 @pytest.mark.anyio

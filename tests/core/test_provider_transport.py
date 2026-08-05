@@ -10,58 +10,735 @@ error messages, and the shared URL validation.
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import ssl
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import certifi
 import httpx
 import pytest
 
+from cayu import Message
 from cayu.providers import (
     AnthropicAPIError,
     AnthropicError,
+    AnthropicProvider,
     ChatCompletionsAPIError,
     ChatCompletionsError,
     ChatCompletionsProtocolError,
+    ChatCompletionsProvider,
     HttpxAnthropicTransport,
     HttpxChatCompletionsTransport,
     HttpxOpenAITransport,
     HttpxVertexTransport,
     ModelProviderError,
+    ModelRequest,
+    ModelStreamEventType,
     OpenAIAPIError,
     OpenAIError,
     OpenAIProtocolError,
+    OpenAIProvider,
+    OpenAISubscriptionProvider,
     VertexAPIError,
     VertexError,
+    VertexProvider,
 )
+from cayu.providers._credential_boundary import ProviderStreamCleanupError
 from cayu.providers._http import (
     SharedAsyncClient,
+    _trusted_sse_retry_after_s,
     credential_safe_error_event,
     new_async_client,
     retry_after_seconds,
+    stream_sse_json_events,
     validate_base_url,
     validate_url,
 )
-from cayu.providers._sse import SseIdleTimeoutError, aiter_sse_json_events
+from cayu.providers._sse import (
+    SseEventLimitError,
+    SseEventTimeoutError,
+    SseIdleTimeoutError,
+    _aiter_bounded_sse_lines,
+    aiter_sse_json_events,
+)
+from cayu.providers.openai_subscription import OpenAISubscriptionCredentials
 
 
-class _StreamingResponse:
-    """Minimal streaming-response stub for the shared SSE transport path."""
-
-    status_code = 200
-
+class _LineByteStream(httpx.AsyncByteStream):
     def __init__(self, lines: list[str], *, heartbeat_sleep_s: float = 0.0) -> None:
         self._lines = lines
         self._heartbeat_sleep_s = heartbeat_sleep_s
+        self.closed = False
 
-    async def aiter_lines(self):
+    async def __aiter__(self):
         for line in self._lines:
             if self._heartbeat_sleep_s:
                 await asyncio.sleep(self._heartbeat_sleep_s)
-            yield line
+            yield (line + "\n").encode("utf-8")
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _StreamingResponse(httpx.Response):
+    """Real HTTPX response backed by a controlled asynchronous byte stream."""
+
+    def __init__(self, lines: list[str], *, heartbeat_sleep_s: float = 0.0) -> None:
+        self.byte_stream = _LineByteStream(
+            lines,
+            heartbeat_sleep_s=heartbeat_sleep_s,
+        )
+        super().__init__(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=self.byte_stream,
+            request=httpx.Request("POST", "https://provider.example/v1/stream"),
+        )
+
+
+class _ChunkedByteStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.yielded_chunks = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            self.yielded_chunks += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _DelayedChunkStream(_ChunkedByteStream):
+    def __init__(self, chunks: list[bytes], *, delay_s: float) -> None:
+        super().__init__(chunks)
+        self._delay_s = delay_s
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            await asyncio.sleep(self._delay_s)
+            self.yielded_chunks += 1
+            yield chunk
+
+
+class _BlockingByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.finalized = asyncio.Event()
+        self.closed = False
+
+    async def __aiter__(self):
+        try:
+            self.started.set()
+            await asyncio.Event().wait()
+            yield b""  # pragma: no cover
+        finally:
+            self.finalized.set()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _BlockingAfterEventByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b'data: {"ok": true}\n\n'
+        await asyncio.Event().wait()
+        yield b""  # pragma: no cover
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _ClosableEventStream:
+    def __init__(self, event: Mapping[str, Any]) -> None:
+        self._event = event
+        self._yielded = False
+        self.closed = False
+
+    def __aiter__(self) -> _ClosableEventStream:
+        return self
+
+    async def __anext__(self) -> Mapping[str, Any]:
+        if not self._yielded:
+            self._yielded = True
+            return self._event
+        await asyncio.Event().wait()
+        raise StopAsyncIteration  # pragma: no cover
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _FiniteFailingCloseEventStream:
+    def __init__(self, events: list[Mapping[str, Any]]) -> None:
+        self._events = iter(events)
+        self.closed = False
+
+    def __aiter__(self) -> _FiniteFailingCloseEventStream:
+        return self
+
+    async def __anext__(self) -> Mapping[str, Any]:
+        try:
+            return next(self._events)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        self.closed = True
+        raise RuntimeError("provider stream close failed")
+
+
+class _EndlessByteStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.yielded_chunks = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        while True:
+            await asyncio.sleep(0.001)
+            self.yielded_chunks += 1
+            yield b"x"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _HeartbeatTailEventStream:
+    def __init__(self, completed_event: Mapping[str, Any]) -> None:
+        self._completed_event = completed_event
+        self._yielded_completion = False
+        self.tail_reads = 0
+        self.closed = False
+
+    def __aiter__(self) -> _HeartbeatTailEventStream:
+        return self
+
+    async def __anext__(self) -> Mapping[str, Any]:
+        if not self._yielded_completion:
+            self._yielded_completion = True
+            return self._completed_event
+        self.tail_reads += 1
+        await asyncio.sleep(0.01)
+        return {"type": "ping"}
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _ClosableProviderTransport:
+    def __init__(self, source: Any) -> None:
+        self.source = source
+
+    def stream_response_events(self, **_kwargs: Any) -> Any:
+        return self.source
+
+    def stream_chat_completions(self, **_kwargs: Any) -> Any:
+        return self.source
+
+    def stream_message_events(self, **_kwargs: Any) -> Any:
+        return self.source
+
+
+class _StaticSubscriptionAuth:
+    async def credentials(self) -> OpenAISubscriptionCredentials:
+        return OpenAISubscriptionCredentials(
+            access_token="subscription-access",
+            refresh_token="subscription-refresh",
+            expires_at=2_000_000_000,
+        )
+
+
+class _UnusedSubscriptionAuth:
+    async def credentials(self) -> Any:  # pragma: no cover - construction-only test seam
+        raise AssertionError("credentials must not be resolved during provider construction")
+
+
+def _successful_raw_stream_events(provider_name: str) -> list[Mapping[str, Any]]:
+    if provider_name in {"openai", "openai_subscription"}:
+        return [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "response-1",
+                    "model": "test-model",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 2, "output_tokens": 1},
+                },
+            }
+        ]
+    if provider_name == "chat_completions":
+        return [
+            {
+                "id": "chat-1",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                },
+            }
+        ]
+    if provider_name in {"anthropic", "vertex"}:
+        return [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "message-1",
+                    "model": "test-model",
+                    "usage": {"input_tokens": 2},
+                },
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+    raise AssertionError(f"Unhandled provider: {provider_name}")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("transport_factory", "method_name", "patch_target"),
+    [
+        pytest.param(
+            HttpxOpenAITransport,
+            "stream_response_events",
+            "cayu.providers.openai.stream_sse_json_events",
+            id="openai",
+        ),
+        pytest.param(
+            HttpxChatCompletionsTransport,
+            "stream_chat_completions",
+            "cayu.providers.chat_completions.stream_sse_json_events",
+            id="chat-completions",
+        ),
+        pytest.param(
+            HttpxAnthropicTransport,
+            "stream_message_events",
+            "cayu.providers.anthropic.stream_sse_json_events",
+            id="anthropic",
+        ),
+        pytest.param(
+            HttpxVertexTransport,
+            "stream_message_events",
+            "cayu.providers.vertex.stream_sse_json_events",
+            id="vertex",
+        ),
+    ],
+)
+async def test_http_transport_pass_through_closes_shared_sse_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+    transport_factory: Callable[[], Any],
+    method_name: str,
+    patch_target: str,
+) -> None:
+    source = _ClosableEventStream({"ok": True})
+    monkeypatch.setattr(patch_target, lambda **_kwargs: source)
+    transport = transport_factory()
+    events = getattr(transport, method_name)(
+        url="https://provider.example/v1/stream",
+        headers={},
+        payload={},
+        timeout_s=1.0,
+        stream_idle_timeout_s=1.0,
+    )
+
+    assert await anext(events) == {"ok": True}
+    await events.aclose()
+
+    assert source.closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "provider_name",
+    [
+        "openai",
+        "chat_completions",
+        "anthropic",
+        "vertex",
+        "openai_subscription",
+    ],
+)
+async def test_provider_closes_translator_and_raw_stream_on_abandonment(
+    provider_name: str,
+) -> None:
+    if provider_name in {"openai", "openai_subscription"}:
+        raw_event = {"type": "response.output_text.delta", "delta": "hello"}
+    elif provider_name == "chat_completions":
+        raw_event = {
+            "id": "chat-1",
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {"content": "hello"}, "finish_reason": None}],
+        }
+    elif provider_name in {"anthropic", "vertex"}:
+        raw_event = {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": "hello"},
+        }
+    else:  # pragma: no cover - guarded by the parameter list
+        raise AssertionError(f"Unhandled provider: {provider_name}")
+    source = _ClosableEventStream(raw_event)
+    transport = _ClosableProviderTransport(source)
+
+    if provider_name == "openai":
+        provider = OpenAIProvider(api_key="test-key", transport=transport)
+    elif provider_name == "chat_completions":
+        provider = ChatCompletionsProvider(api_key="test-key", transport=transport)
+    elif provider_name == "anthropic":
+        provider = AnthropicProvider(api_key="test-key", transport=transport)
+    elif provider_name == "vertex":
+        provider = VertexProvider(
+            project_id="test-project",
+            region="us-east5",
+            credentials=SimpleNamespace(valid=True, token="test-token"),
+            transport=transport,
+        )
+    elif provider_name == "openai_subscription":
+        provider = OpenAISubscriptionProvider(
+            auth=_StaticSubscriptionAuth(),
+            transport=transport,
+        )
+    else:  # pragma: no cover - guarded by the parameter list
+        raise AssertionError(f"Unhandled provider: {provider_name}")
+    events = provider.stream(
+        ModelRequest(
+            model="test-model",
+            messages=[Message.text("user", "hello")],
+        )
+    )
+    event = await anext(events)
+    assert event.delta == "hello"
+
+    await events.aclose()
+
+    assert source.closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "provider_name",
+    [
+        "openai",
+        "chat_completions",
+        "anthropic",
+        "vertex",
+        "openai_subscription",
+    ],
+)
+async def test_provider_preserves_completed_before_stream_cleanup_failure(
+    provider_name: str,
+) -> None:
+    source = _FiniteFailingCloseEventStream(_successful_raw_stream_events(provider_name))
+    transport = _ClosableProviderTransport(source)
+
+    if provider_name == "openai":
+        provider = OpenAIProvider(api_key="test-key", transport=transport)
+    elif provider_name == "chat_completions":
+        provider = ChatCompletionsProvider(api_key="test-key", transport=transport)
+    elif provider_name == "anthropic":
+        provider = AnthropicProvider(api_key="test-key", transport=transport)
+    elif provider_name == "vertex":
+        provider = VertexProvider(
+            project_id="test-project",
+            region="us-east5",
+            credentials=SimpleNamespace(valid=True, token="test-token"),
+            transport=transport,
+        )
+    elif provider_name == "openai_subscription":
+        provider = OpenAISubscriptionProvider(
+            auth=_StaticSubscriptionAuth(),
+            transport=transport,
+        )
+    else:  # pragma: no cover - guarded by the parameter list
+        raise AssertionError(f"Unhandled provider: {provider_name}")
+
+    events = []
+    with pytest.raises(ProviderStreamCleanupError) as exc_info:
+        async for event in provider.stream(
+            ModelRequest(
+                model="test-model",
+                messages=[Message.text("user", "hello")],
+            )
+        ):
+            events.append(event)
+
+    assert source.closed
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert events[0].payload["usage"] is not None
+    expected_provider = "openai" if provider_name == "openai_subscription" else provider_name
+    assert exc_info.value.provider == expected_provider
+    assert exc_info.value.error_type == "ProviderStreamCleanupError"
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_public_provider_closes_task_affine_custom_stream_in_owner_task() -> None:
+    class TaskAffineEventStream:
+        def __init__(self) -> None:
+            self._events = iter(_successful_raw_stream_events("openai"))
+            self.owner: asyncio.Task[Any] | None = None
+            self.closed = False
+
+        def __aiter__(self) -> TaskAffineEventStream:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            task = asyncio.current_task()
+            assert task is not None
+            if self.owner is None:
+                self.owner = task
+            assert task is self.owner
+            try:
+                return next(self._events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+        async def aclose(self) -> None:
+            assert asyncio.current_task() is self.owner
+            self.closed = True
+
+    source = TaskAffineEventStream()
+    provider = OpenAIProvider(
+        api_key="test-key",
+        transport=_ClosableProviderTransport(source),
+    )
+
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="test-model",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+    ]
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert source.closed
+
+
+@pytest.mark.anyio
+async def test_provider_closes_without_reading_post_completion_heartbeat_tail() -> None:
+    source = _HeartbeatTailEventStream(_successful_raw_stream_events("openai")[0])
+    provider = OpenAIProvider(
+        api_key="test-key",
+        transport=_ClosableProviderTransport(source),
+    )
+
+    async def collect() -> list[Any]:
+        return [
+            event
+            async for event in provider.stream(
+                ModelRequest(
+                    model="test-model",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        ]
+
+    events = await asyncio.wait_for(collect(), timeout=0.5)
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert source.closed
+    assert source.tail_reads == 0
+
+
+@pytest.mark.anyio
+async def test_provider_close_failure_fails_closed_with_primary_error_identity() -> None:
+    class FailingCloseEventStream(_ClosableEventStream):
+        async def aclose(self) -> None:
+            self.closed = True
+            raise RuntimeError("secondary stream close failure")
+
+    source = FailingCloseEventStream(
+        {
+            "error": {
+                "type": "server_error",
+                "code": "internal_error",
+                "message": "temporary provider failure",
+            }
+        }
+    )
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        transport=_ClosableProviderTransport(source),
+    )
+
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="test-model",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+    ]
+
+    assert source.closed
+    assert len(events) == 1
+    assert events[0].payload["error_type"] == "ProviderStreamCleanupError"
+    assert events[0].payload["status_code"] == 500
+    assert events[0].payload["provider_error_type"] == "server_error"
+    assert events[0].payload["provider_error_code"] == "internal_error"
+    assert events[0].payload["stream_cleanup_failed"] is True
+    assert events[0].payload["retryable"] is False
+
+
+@pytest.mark.anyio
+async def test_subscription_close_failure_uses_the_same_terminal_cleanup_shape() -> None:
+    class FailingCloseEventStream(_ClosableEventStream):
+        async def aclose(self) -> None:
+            self.closed = True
+            raise RuntimeError("secondary subscription stream close failure")
+
+    source = FailingCloseEventStream(
+        {
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": "server_error",
+                    "code": "internal_error",
+                    "message": "temporary provider failure",
+                }
+            },
+        }
+    )
+    provider = OpenAISubscriptionProvider(
+        auth=_StaticSubscriptionAuth(),
+        transport=_ClosableProviderTransport(source),
+    )
+
+    events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="test-model",
+                messages=[Message.text("user", "hello")],
+            )
+        )
+    ]
+
+    assert source.closed
+    assert len(events) == 1
+    assert events[0].payload["error_type"] == "ProviderStreamCleanupError"
+    assert events[0].payload["status_code"] == 500
+    assert events[0].payload["provider_error_type"] == "server_error"
+    assert events[0].payload["provider_error_code"] == "internal_error"
+    assert events[0].payload["stream_cleanup_failed"] is True
+    assert events[0].payload["retryable"] is False
+
+
+@pytest.mark.anyio
+async def test_provider_preserves_real_cancellation_during_in_band_error_cleanup() -> None:
+    close_started = asyncio.Event()
+    credential = "provider-close-cancellation-secret-canary"
+
+    class BlockingCloseEventStream(_ClosableEventStream):
+        async def aclose(self) -> None:
+            close_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError(f"close transformed cancellation near {credential}") from None
+
+    source = BlockingCloseEventStream(
+        {
+            "error": {
+                "type": "server_error",
+                "code": "internal_error",
+                "message": f"temporary provider failure near {credential}",
+            }
+        }
+    )
+    provider = ChatCompletionsProvider(
+        api_key=credential,
+        transport=_ClosableProviderTransport(source),
+    )
+
+    async def consume() -> None:
+        async for _ in provider.stream(
+            ModelRequest(
+                model="test-model",
+                messages=[Message.text("user", "hello")],
+            )
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await close_started.wait()
+    task.cancel()
+    assert task.cancelling() == 1
+
+    cancellation: asyncio.CancelledError | None = None
+    try:
+        await task
+    except asyncio.CancelledError as exc:
+        cancellation = exc
+
+    assert cancellation is not None
+    assert task.cancelled()
+    assert cancellation.args == ("Chat Completions provider request cancelled",)
+    assert credential not in repr(cancellation)
+    assert getattr(cancellation, "__notes__", ()) == [
+        "Provider stream cleanup was cancelled after a provider operation failure."
+    ]
+    assert cancellation.__cause__ is None
+    assert cancellation.__context__ is None
+
+
+async def _stream_mock_sse(
+    stream: httpx.AsyncByteStream,
+    *,
+    headers: Mapping[str, str] | None = None,
+    stream_idle_timeout_s: float = 1.0,
+) -> list[Mapping[str, Any]]:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream", **dict(headers or {})},
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        return [
+            event
+            async for event in stream_sse_json_events(
+                client=client,
+                url="https://provider.example/v1/stream",
+                headers={},
+                payload={},
+                timeout_s=1.0,
+                stream_idle_timeout_s=stream_idle_timeout_s,
+                request_label="OpenAI API",
+                response_label="OpenAI",
+                api_error=OpenAIAPIError,
+                protocol_error=OpenAIProtocolError,
+                error_response_text=lambda response: response.text,
+            )
+        ]
 
 
 @pytest.mark.parametrize(
@@ -102,6 +779,29 @@ def test_provider_error_projection_omits_arbitrary_identity_strings(
     assert "request_id" not in event.payload
     assert secret not in repr(event.payload)
     assert secret[:16] not in repr(event.payload)
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    ["SseIdleTimeoutError", "SseEventTimeoutError", "SseEventLimitError"],
+)
+def test_provider_error_projection_preserves_fixed_sse_classification(error_type: str) -> None:
+    error = ModelProviderError(
+        "fixed SSE failure",
+        provider="openai",
+        error_type=error_type,
+        retryable=error_type != "SseEventLimitError",
+    )
+
+    event = credential_safe_error_event(
+        error,
+        provider_label="OpenAI",
+        provider_name="openai",
+        credential_values=("provider-credential",),
+    )
+
+    assert event.payload["provider_error_type"] == error_type
+    assert event.payload["retryable"] is (error_type != "SseEventLimitError")
 
 
 @pytest.mark.parametrize("credential_values", [(), ("provider-credential",)])
@@ -249,7 +949,7 @@ class _StreamContext:
         return self._response
 
     async def __aexit__(self, *args: Any) -> None:
-        return None
+        await self._response.aclose()
 
 
 def _client_factory(response: _StreamingResponse) -> type:
@@ -453,6 +1153,519 @@ async def test_chat_completions_transport_survives_keepalive_heartbeats(monkeypa
     assert events == [{"ok": True}]
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"])
+async def test_bounded_sse_lines_preserve_framing_and_exact_utf8_limit(
+    line_ending: bytes,
+) -> None:
+    encoded_line = 'data: {"value":"é"}'.encode()
+    payload = encoded_line + line_ending + line_ending
+    chunks = [payload[:7], payload[7:-1], payload[-1:]]
+
+    lines = [
+        line
+        async for line in _aiter_bounded_sse_lines(
+            _iter_byte_chunks(chunks),
+            max_line_bytes=len(encoded_line),
+            provider_label="OpenAI",
+        )
+    ]
+
+    assert lines == ['data: {"value":"é"}', ""]
+
+
+@pytest.mark.anyio
+async def test_bounded_sse_lines_retain_replacement_decoding() -> None:
+    lines = [
+        line
+        async for line in _aiter_bounded_sse_lines(
+            _iter_byte_chunks([b"data: bad-\xff", b"\n"]),
+            max_line_bytes=32,
+            provider_label="OpenAI",
+        )
+    ]
+
+    assert lines == ["data: bad-\ufffd"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r"])
+async def test_bounded_sse_lines_tokenize_dense_delimiters_cooperatively(
+    line_ending: bytes,
+) -> None:
+    progressed = asyncio.Event()
+
+    async def mark_scheduled_progress() -> None:
+        progressed.set()
+
+    marker = asyncio.create_task(mark_scheduled_progress())
+    line_count = 0
+    try:
+        async for line in _aiter_bounded_sse_lines(
+            _iter_byte_chunks([line_ending * (64 * 1024)]),
+            max_line_bytes=16,
+            provider_label="OpenAI",
+        ):
+            assert line == ""
+            line_count += 1
+
+        assert line_count == 64 * 1024
+        assert progressed.is_set()
+    finally:
+        await marker
+
+
+@pytest.mark.anyio
+async def test_http_sse_bounds_unterminated_line_before_line_accumulation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cayu.providers._http.DEFAULT_SSE_MAX_EVENT_BYTES", 16)
+    stream = _ChunkedByteStream([b"data", b": 12", b"3456", b"7890", b"more", b"unread"])
+
+    with pytest.raises(OpenAIAPIError) as captured:
+        await _stream_mock_sse(stream)
+
+    assert captured.value.error_type == "SseEventLimitError"
+    assert captured.value.retryable is False
+    assert isinstance(captured.value.__cause__, SseEventLimitError)
+    assert "SSE line exceeded the 16-byte limit" in str(captured.value.__cause__)
+    assert stream.yielded_chunks == 5
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_rejects_compression_before_reading_expanding_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cayu.providers._http.DEFAULT_SSE_MAX_EVENT_BYTES", 16)
+    compressed = gzip.compress(b"x" * 17)
+    stream = _ChunkedByteStream([compressed])
+
+    with pytest.raises(OpenAIProtocolError, match="unsupported content encoding"):
+        await _stream_mock_sse(stream, headers={"content-encoding": "gzip"})
+
+    assert stream.yielded_chunks == 0
+    assert stream.closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [429, 500])
+async def test_http_sse_classifies_compressed_error_without_reading_body(
+    status_code: int,
+) -> None:
+    compressed = gzip.compress(b'{"error":{"message":"temporary failure"}}')
+    stream = _ChunkedByteStream([compressed])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            headers={
+                "content-encoding": "gzip",
+                "content-type": "application/json",
+                "retry-after": "7.5",
+            },
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=1.0,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            # Accessing text would require reading and decoding the body. This
+            # callback must remain unused for unsupported content encodings.
+            error_response_text=lambda response: response.text,
+        )
+        with pytest.raises(OpenAIAPIError) as captured:
+            await events.__anext__()
+
+    error = captured.value
+    assert error.status_code == status_code
+    assert error.retry_after_s == 7.5
+    assert error.response_body is None
+    assert stream.yielded_chunks == 0
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_fails_closed_when_error_response_close_fails() -> None:
+    class FailingCloseByteStream(_ChunkedByteStream):
+        async def aclose(self) -> None:
+            self.closed = True
+            raise httpx.CloseError("provider error response close failed")
+
+    stream = FailingCloseByteStream([b"compressed body must remain unread"])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            headers={
+                "content-encoding": "gzip",
+                "content-type": "application/json",
+            },
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=1.0,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=lambda response: response.text,
+        )
+        with pytest.raises(ProviderStreamCleanupError) as captured:
+            await events.__anext__()
+
+    assert captured.value.status_code == 401
+    assert captured.value.retryable is False
+    assert stream.yielded_chunks == 0
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_bounds_identity_error_body_before_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("cayu.providers._http.MAX_PROVIDER_ERROR_BODY_BYTES", 16)
+    stream = _ChunkedByteStream([b"x" * 17])
+    body_accessed = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"content-type": "application/json", "retry-after": "7.5"},
+            stream=stream,
+            request=request,
+        )
+
+    def error_response_text(response: httpx.Response) -> str:
+        nonlocal body_accessed
+        body_accessed = True
+        return response.text
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=1.0,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=error_response_text,
+        )
+        with pytest.raises(OpenAIAPIError) as captured:
+            await events.__anext__()
+
+    error = captured.value
+    assert error.status_code == 429
+    assert error.retry_after_s == 7.5
+    assert error.response_body is None
+    assert not body_accessed
+    assert stream.yielded_chunks == 1
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_bounds_active_never_ending_identity_error_body() -> None:
+    stream = _EndlessByteStream()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            headers={"content-type": "application/json", "retry-after": "3"},
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=0.02,
+            stream_idle_timeout_s=0.01,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=lambda response: response.text,
+        )
+        with pytest.raises(OpenAIAPIError) as captured:
+            await asyncio.wait_for(events.__anext__(), timeout=0.5)
+
+    error = captured.value
+    assert error.status_code == 500
+    assert error.retry_after_s == 3.0
+    assert error.response_body is None
+    assert stream.yielded_chunks > 0
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_bounds_stalled_identity_error_body_by_idle_timeout() -> None:
+    stream = _BlockingByteStream()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            503,
+            headers={"content-type": "application/json", "retry-after": "2"},
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=0.01,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=lambda response: response.text,
+        )
+        with pytest.raises(OpenAIAPIError) as captured:
+            await asyncio.wait_for(events.__anext__(), timeout=0.5)
+
+    error = captured.value
+    assert error.status_code == 503
+    assert error.retry_after_s == 2.0
+    assert error.response_body is None
+    assert stream.started.is_set()
+    assert stream.finalized.is_set()
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_error_body_reader_propagates_real_task_cancellation() -> None:
+    stream = _BlockingByteStream()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            headers={"content-type": "application/json"},
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=1.0,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=lambda response: response.text,
+        )
+        task = asyncio.create_task(events.__anext__())
+        await stream.started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelling() == 1
+        assert task.cancelled()
+
+    assert stream.finalized.is_set()
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_preserves_error_status_when_identity_body_read_fails() -> None:
+    class FailingByteStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def __aiter__(self):
+            raise httpx.ReadError("error response body disconnected")
+            yield b""  # pragma: no cover
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    stream = FailingByteStream()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            headers={"content-type": "application/json"},
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=1.0,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=lambda response: response.text,
+        )
+        with pytest.raises(OpenAIAPIError) as captured:
+            await events.__anext__()
+
+    assert captured.value.status_code == 401
+    assert captured.value.response_body is None
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_forces_identity_encoding_case_insensitively() -> None:
+    stream = _ChunkedByteStream([b'data: {"ok": true}\n\n'])
+    requested_headers: httpx.Headers | None = None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requested_headers
+        requested_headers = request.headers
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "identity"},
+            stream=stream,
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = [
+            event
+            async for event in stream_sse_json_events(
+                client=client,
+                url="https://provider.example/v1/stream",
+                headers={"aCcEpT-EnCoDiNg": "gzip", "X-Test": "kept"},
+                payload={},
+                timeout_s=1.0,
+                stream_idle_timeout_s=1.0,
+                request_label="OpenAI API",
+                response_label="OpenAI",
+                api_error=OpenAIAPIError,
+                protocol_error=OpenAIProtocolError,
+                error_response_text=lambda response: response.text,
+            )
+        ]
+
+    assert events == [{"ok": True}]
+    assert requested_headers is not None
+    assert requested_headers.get_list("accept-encoding") == ["identity"]
+    assert requested_headers["x-test"] == "kept"
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_preserves_only_trusted_success_retry_after_metadata() -> None:
+    stream = _ChunkedByteStream([b'data: {"retry_after_s": 999, "ok": true}\n\n'])
+
+    events = await _stream_mock_sse(stream, headers={"retry-after": "7.5"})
+
+    assert events == [{"retry_after_s": 999, "ok": True}]
+    assert json.loads(json.dumps(events[0])) == {"retry_after_s": 999, "ok": True}
+    assert _trusted_sse_retry_after_s(events[0]) == 7.5
+    assert _trusted_sse_retry_after_s({"retry_after_s": 999}) is None
+
+
+@pytest.mark.anyio
+async def test_http_sse_counts_fragmented_raw_bytes_as_idle_activity() -> None:
+    payload = b'data: {"ok": true}\n\n'
+    stream = _DelayedChunkStream(
+        [payload[:4], payload[4:8], payload[8:12], payload[12:16], payload[16:]],
+        delay_s=0.02,
+    )
+
+    events = await _stream_mock_sse(stream, stream_idle_timeout_s=0.05)
+
+    assert events == [{"ok": True}]
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_bounds_continuously_progressing_partial_line_by_duration() -> None:
+    stream = _DelayedChunkStream([b"x"] * 12, delay_s=0.02)
+
+    with pytest.raises(OpenAIAPIError) as captured:
+        await _stream_mock_sse(stream, stream_idle_timeout_s=0.05)
+
+    assert captured.value.retryable is True
+    assert captured.value.error_type == "SseEventTimeoutError"
+    assert isinstance(captured.value.__cause__, SseEventTimeoutError)
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_yields_small_event_without_waiting_for_more_bytes() -> None:
+    stream = _BlockingAfterEventByteStream()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream, request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        events = stream_sse_json_events(
+            client=client,
+            url="https://provider.example/v1/stream",
+            headers={},
+            payload={},
+            timeout_s=1.0,
+            stream_idle_timeout_s=1.0,
+            request_label="OpenAI API",
+            response_label="OpenAI",
+            api_error=OpenAIAPIError,
+            protocol_error=OpenAIProtocolError,
+            error_response_text=lambda response: response.text,
+        )
+
+        assert await asyncio.wait_for(events.__anext__(), timeout=0.1) == {"ok": True}
+        await events.aclose()
+
+    assert stream.closed
+
+
+@pytest.mark.anyio
+async def test_http_sse_byte_reader_propagates_real_task_cancellation() -> None:
+    stream = _BlockingByteStream()
+    task = asyncio.create_task(_stream_mock_sse(stream))
+    await stream.started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelling() == 1
+    assert task.cancelled()
+    assert stream.finalized.is_set()
+    assert stream.closed
+
+
 @pytest.mark.parametrize(
     ("transport_type", "stream_method", "api_error_type"),
     [
@@ -525,6 +1738,60 @@ async def test_http_sse_protocol_errors_remain_permanent(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
+async def test_http_sse_event_limit_is_a_typed_nonretryable_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def limited_events(*args: Any, **kwargs: Any):
+        raise SseEventLimitError("OpenAI SSE event exceeded its fixed limit.")
+        yield  # pragma: no cover
+
+    response = _StreamingResponse([])
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+    monkeypatch.setattr("cayu.providers._http.aiter_sse_json_events", limited_events)
+
+    stream = HttpxOpenAITransport().stream_response_events(
+        url="https://api.openai.com/v1/responses",
+        headers={},
+        payload={},
+        timeout_s=1.0,
+        stream_idle_timeout_s=1.0,
+    )
+    with pytest.raises(OpenAIAPIError) as captured:
+        await stream.__anext__()
+
+    assert captured.value.retryable is False
+    assert captured.value.error_type == "SseEventLimitError"
+    assert isinstance(captured.value.__cause__, SseEventLimitError)
+
+
+@pytest.mark.anyio
+async def test_http_sse_event_timeout_is_a_typed_retryable_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def timed_out_events(*args: Any, **kwargs: Any):
+        raise SseEventTimeoutError("OpenAI SSE event exceeded its duration limit.")
+        yield  # pragma: no cover
+
+    response = _StreamingResponse([])
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", _client_factory(response))
+    monkeypatch.setattr("cayu.providers._http.aiter_sse_json_events", timed_out_events)
+
+    stream = HttpxOpenAITransport().stream_response_events(
+        url="https://api.openai.com/v1/responses",
+        headers={},
+        payload={},
+        timeout_s=1.0,
+        stream_idle_timeout_s=1.0,
+    )
+    with pytest.raises(OpenAIAPIError) as captured:
+        await stream.__anext__()
+
+    assert captured.value.retryable is True
+    assert captured.value.error_type == "SseEventTimeoutError"
+    assert isinstance(captured.value.__cause__, SseEventTimeoutError)
+
+
+@pytest.mark.anyio
 async def test_sse_parser_rejects_nonpositive_idle_timeout() -> None:
     async def lines():
         yield ""
@@ -539,6 +1806,260 @@ async def test_sse_parser_rejects_nonpositive_idle_timeout() -> None:
                 protocol_error=OpenAIProtocolError,
             )
         ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        pytest.param("idle_timeout_s", float("nan"), id="idle-nan"),
+        pytest.param("idle_timeout_s", float("inf"), id="idle-infinity"),
+        pytest.param("max_event_duration_s", float("nan"), id="duration-nan"),
+        pytest.param("max_event_duration_s", float("inf"), id="duration-infinity"),
+    ],
+)
+async def test_sse_parser_rejects_non_finite_timeouts(
+    field_name: str,
+    value: float,
+) -> None:
+    async def lines():
+        yield ""
+
+    idle_timeout_s = value if field_name == "idle_timeout_s" else 1.0
+    max_event_duration_s = value if field_name == "max_event_duration_s" else None
+    with pytest.raises(ValueError, match=field_name):
+        [
+            event
+            async for event in aiter_sse_json_events(
+                lines(),
+                idle_timeout_s=idle_timeout_s,
+                max_event_duration_s=max_event_duration_s,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "provider_factory"),
+    [
+        (
+            "openai",
+            lambda value: OpenAIProvider(api_key="test-key", stream_idle_timeout_s=value),
+        ),
+        (
+            "anthropic",
+            lambda value: AnthropicProvider(api_key="test-key", stream_idle_timeout_s=value),
+        ),
+        (
+            "chat_completions",
+            lambda value: ChatCompletionsProvider(api_key="test-key", stream_idle_timeout_s=value),
+        ),
+        (
+            "vertex",
+            lambda value: VertexProvider(
+                project_id="test-project",
+                credentials=SimpleNamespace(valid=True, token="test-token"),
+                stream_idle_timeout_s=value,
+            ),
+        ),
+        (
+            "openai_subscription",
+            lambda value: OpenAISubscriptionProvider(
+                auth=_UnusedSubscriptionAuth(), stream_idle_timeout_s=value
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="infinity"),
+    ],
+)
+def test_public_sse_providers_reject_non_finite_idle_timeout(
+    provider_name: str,
+    provider_factory: Callable[[float], object],
+    value: float,
+) -> None:
+    del provider_name
+    with pytest.raises(ValueError, match="stream_idle_timeout_s"):
+        provider_factory(value)
+
+
+@pytest.mark.anyio
+async def test_sse_parser_counts_every_received_line_as_idle_activity() -> None:
+    async def lines():
+        yield 'data: {"value":'
+        await asyncio.sleep(0.04)
+        yield "data: 1"
+        await asyncio.sleep(0.04)
+        yield "data: }"
+        await asyncio.sleep(0.04)
+        yield ""
+
+    events = [
+        event
+        async for event in aiter_sse_json_events(
+            lines(),
+            idle_timeout_s=0.1,
+            provider_label="OpenAI",
+            protocol_error=OpenAIProtocolError,
+        )
+    ]
+
+    assert events == [{"value": 1}]
+
+
+@pytest.mark.anyio
+async def test_sse_parser_does_not_count_downstream_processing_as_idle_time() -> None:
+    stream = aiter_sse_json_events(
+        _iter_lines(['data: {"value": 1}', "", 'data: {"value": 2}', ""]),
+        idle_timeout_s=0.01,
+        provider_label="OpenAI",
+        protocol_error=OpenAIProtocolError,
+    )
+
+    assert await stream.__anext__() == {"value": 1}
+    await asyncio.sleep(0.02)
+    assert await stream.__anext__() == {"value": 2}
+
+
+@pytest.mark.anyio
+async def test_sse_parser_does_not_relabel_source_timeout_as_its_idle_deadline() -> None:
+    source_error = TimeoutError("source-owned timeout")
+
+    async def lines():
+        raise source_error
+        yield ""  # pragma: no cover
+
+    with pytest.raises(TimeoutError, match="source-owned timeout") as captured:
+        [
+            event
+            async for event in aiter_sse_json_events(
+                lines(),
+                idle_timeout_s=1.0,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
+
+    assert captured.value is source_error
+
+
+@pytest.mark.anyio
+async def test_sse_parser_event_duration_does_not_reset_with_activity() -> None:
+    async def lines():
+        yield 'data: {"value":'
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+            yield "data: 1"
+
+    with pytest.raises(SseEventTimeoutError, match="did not finish one SSE event"):
+        [
+            event
+            async for event in aiter_sse_json_events(
+                lines(),
+                idle_timeout_s=0.03,
+                max_event_duration_s=0.05,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
+
+
+@pytest.mark.anyio
+async def test_sse_parser_enforces_utf8_byte_limit_at_exact_boundary() -> None:
+    line = 'data: {"value":"é"}'
+    encoded_size = len(line.encode("utf-8"))
+
+    events = [
+        event
+        async for event in aiter_sse_json_events(
+            _iter_lines([line, ""]),
+            idle_timeout_s=1.0,
+            max_event_bytes=encoded_size,
+            provider_label="OpenAI",
+            protocol_error=OpenAIProtocolError,
+        )
+    ]
+    assert events == [{"value": "é"}]
+
+    with pytest.raises(SseEventLimitError, match=f"{encoded_size - 1}-byte limit"):
+        [
+            event
+            async for event in aiter_sse_json_events(
+                _iter_lines([line, ""]),
+                idle_timeout_s=1.0,
+                max_event_bytes=encoded_size - 1,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
+
+
+@pytest.mark.anyio
+async def test_sse_parser_enforces_event_line_limit_at_exact_boundary() -> None:
+    lines = ['data: {"value":', "data: 1}", ""]
+    events = [
+        event
+        async for event in aiter_sse_json_events(
+            _iter_lines(lines),
+            idle_timeout_s=1.0,
+            max_event_lines=2,
+            provider_label="OpenAI",
+            protocol_error=OpenAIProtocolError,
+        )
+    ]
+    assert events == [{"value": 1}]
+
+    with pytest.raises(SseEventLimitError, match="2-line limit"):
+        [
+            event
+            async for event in aiter_sse_json_events(
+                _iter_lines(["event: response", *lines]),
+                idle_timeout_s=1.0,
+                max_event_lines=2,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
+
+
+@pytest.mark.anyio
+async def test_sse_parser_propagates_real_task_cancellation() -> None:
+    read_started = asyncio.Event()
+    source_finalized = asyncio.Event()
+
+    async def lines():
+        try:
+            read_started.set()
+            await asyncio.Event().wait()
+            yield ""  # pragma: no cover
+        finally:
+            source_finalized.set()
+
+    async def consume() -> list[Mapping[str, Any]]:
+        return [
+            event
+            async for event in aiter_sse_json_events(
+                lines(),
+                idle_timeout_s=1.0,
+                provider_label="OpenAI",
+                protocol_error=OpenAIProtocolError,
+            )
+        ]
+
+    task = asyncio.create_task(consume())
+    await read_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelling() == 1
+    assert task.cancelled()
+    assert source_finalized.is_set()
 
 
 @pytest.mark.anyio
@@ -704,6 +2225,11 @@ async def test_shared_async_client_is_lazy_and_recreates_after_close(monkeypatch
     second = shared.get()
     assert second is not first
     assert Client.constructed == 2
+
+
+async def _iter_byte_chunks(chunks: list[bytes]):
+    for chunk in chunks:
+        yield chunk
 
 
 async def _iter_lines(lines: list[str]):

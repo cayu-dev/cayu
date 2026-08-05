@@ -5,8 +5,9 @@ import importlib
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import require_clean_nonblank, require_finite
 from cayu.providers._credential_boundary import (
+    aclosing_provider_stream,
     detach_provider_call_traceback,
     detach_provider_stream_traceback,
 )
@@ -14,6 +15,7 @@ from cayu.providers._http import (
     SharedAsyncClient,
     aclose_transport,
     credential_safe_error_event,
+    credential_safe_post_completion_failure,
     credential_safe_provider_exception,
     json_error_text,
     optional_error_string,
@@ -41,6 +43,7 @@ from cayu.providers.base import (
     ModelProviderError,
     ModelRequest,
     ModelStreamEvent,
+    ModelStreamEventType,
     UsageDialect,
 )
 
@@ -217,10 +220,12 @@ class HttpxVertexTransport:
             protocol_error=VertexProtocolError,
             error_response_text=_safe_error_response_text,
             raise_context_overflow=_raise_vertex_context_overflow_if_applicable,
+            raise_context_overflow_from_status=_raise_vertex_context_overflow_from_status,
             api_error_from_response=_vertex_api_error_from_response,
         )
-        async for event in events:
-            yield event
+        async with aclosing_provider_stream(events):
+            async for event in events:
+                yield event
 
     async def _post_json(
         self,
@@ -299,9 +304,12 @@ class VertexProvider(ModelProvider):
         self.timeout_s = float(timeout_s)
         if type(stream_idle_timeout_s) not in {int, float}:
             raise TypeError("stream_idle_timeout_s must be a number.")
+        stream_idle_timeout_s = require_finite(
+            float(stream_idle_timeout_s), "stream_idle_timeout_s"
+        )
         if stream_idle_timeout_s <= 0:
             raise ValueError("stream_idle_timeout_s must be greater than zero.")
-        self.stream_idle_timeout_s = float(stream_idle_timeout_s)
+        self.stream_idle_timeout_s = stream_idle_timeout_s
         self.credentials = _resolve_credentials(
             credentials=credentials,
             service_account_info=service_account_info,
@@ -322,7 +330,9 @@ class VertexProvider(ModelProvider):
         token: str | None = None
         cancellation: asyncio.CancelledError | None = None
         overflow_failure: VertexContextOverflowError | None = None
+        post_completion_failure: ModelProviderError | None = None
         error_event: ModelStreamEvent | None = None
+        completion_emitted = False
         try:
             payload = build_anthropic_payload(
                 request,
@@ -342,7 +352,10 @@ class VertexProvider(ModelProvider):
                     timeout_s=self.timeout_s,
                 )
                 for event in anthropic_response_events(response):
+                    completion_emitted = event.type == ModelStreamEventType.COMPLETED
                     yield event
+                    if completion_emitted:
+                        break
             else:
                 payload["stream"] = True
                 raw_events = stream_transport(
@@ -359,8 +372,12 @@ class VertexProvider(ModelProvider):
                     protocol_error=VertexProtocolError,
                     context_overflow_error=VertexContextOverflowError,
                 )
-                async for event in events:
-                    yield event
+                async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
+                    async for event in events:
+                        completion_emitted = event.type == ModelStreamEventType.COMPLETED
+                        yield event
+                        if completion_emitted:
+                            break
         except asyncio.CancelledError as exc:
             cancellation = sanitize_provider_cancellation(
                 exc,
@@ -368,34 +385,54 @@ class VertexProvider(ModelProvider):
                 credential_values=(token,) if token is not None else (),
             )
         except ModelContextOverflowError as exc:
-            # Overflow must reach runtime recovery as a typed exception; an
-            # error event would flatten it into unrecoverable message text.
-            safe = credential_safe_provider_exception(
-                exc,
-                provider_label="Vertex",
-                provider_name="vertex",
-                credential_values=(token,) if token is not None else (),
-            )
-            overflow_failure = VertexContextOverflowError(
-                str(safe),
-                status_code=safe.status_code,
-                error_type=safe.error_type,
-                error_code=safe.error_code,
-                request_id=safe.request_id,
-                response_body=None,
-            )
+            credential_values = (token,) if token is not None else ()
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="Vertex",
+                    provider_name="vertex",
+                    credential_values=credential_values,
+                )
+            else:
+                # Overflow must reach runtime recovery as a typed exception; an
+                # error event would flatten it into unrecoverable message text.
+                safe = credential_safe_provider_exception(
+                    exc,
+                    provider_label="Vertex",
+                    provider_name="vertex",
+                    credential_values=credential_values,
+                )
+                overflow_failure = VertexContextOverflowError(
+                    str(safe),
+                    status_code=safe.status_code,
+                    error_type=safe.error_type,
+                    error_code=safe.error_code,
+                    request_id=safe.request_id,
+                    response_body=None,
+                )
         except Exception as exc:
-            error_event = credential_safe_error_event(
-                exc,
-                provider_label="Vertex",
-                provider_name="vertex",
-                credential_values=(token,) if token is not None else (),
-            )
+            credential_values = (token,) if token is not None else ()
+            if completion_emitted:
+                post_completion_failure = credential_safe_post_completion_failure(
+                    exc,
+                    provider_label="Vertex",
+                    provider_name="vertex",
+                    credential_values=credential_values,
+                )
+            else:
+                error_event = credential_safe_error_event(
+                    exc,
+                    provider_label="Vertex",
+                    provider_name="vertex",
+                    credential_values=credential_values,
+                )
         token = None
         if cancellation is not None:
             raise cancellation from None
         if overflow_failure is not None:
             raise overflow_failure from None
+        if post_completion_failure is not None:
+            raise post_completion_failure from None
         if error_event is not None:
             yield error_event
 
@@ -612,28 +649,95 @@ def _decoded_gcp_error(response: httpx.Response) -> Mapping[str, Any] | None:
 def _raise_vertex_context_overflow_if_applicable(response: httpx.Response) -> None:
     error = _decoded_gcp_error(response)
     if error is None:
+        _raise_vertex_context_overflow_from_status(response.status_code)
         return
+    error_type = optional_error_string(error.get("status"))
+    identity_missing = "status" not in error
     raw_message = error.get("message")
     message = raw_message if isinstance(raw_message, str) else None
-    if not _is_vertex_context_overflow(status_code=response.status_code, message=message):
+    if not _is_vertex_context_overflow(
+        status_code=response.status_code,
+        error_type=error_type,
+        identity_missing=identity_missing,
+        message=message,
+    ):
         return
     raise VertexContextOverflowError(
         "Vertex model context overflow",
         status_code=response.status_code,
-        error_type=optional_error_string(error.get("status")),
+        error_type=error_type,
         response_body=_safe_error_response_text(response),
     )
 
 
-def _is_vertex_context_overflow(*, status_code: int, message: str | None) -> bool:
+def _raise_vertex_context_overflow_from_status(status_code: int) -> None:
+    """Classify overflow only when the unread HTTP status is authoritative."""
+    if status_code != 413:
+        return
+    raise VertexContextOverflowError(
+        "Vertex model context overflow",
+        status_code=status_code,
+    )
+
+
+def _is_vertex_context_overflow(
+    *,
+    status_code: int,
+    error_type: str | None,
+    identity_missing: bool,
+    message: str | None,
+) -> bool:
     # Vertex proxies the Anthropic Messages API, so an oversized request comes
     # back as HTTP 400 INVALID_ARGUMENT carrying the Anthropic overflow message
     # (or as a request-entity-too-large 413 at the GCP front end).
     if status_code == 413:
-        return True
+        if identity_missing:
+            return True
+        return (
+            error_type == "INVALID_ARGUMENT"
+            and message is not None
+            and _anthropic_overflow_message(message)
+        )
     if status_code != 400 or message is None:
         return False
     return _anthropic_overflow_message(message)
+
+
+_VERTEX_ERROR_STATUS = {
+    "ABORTED": 409,
+    "ALREADY_EXISTS": 409,
+    "CANCELLED": 499,
+    "DATA_LOSS": 500,
+    "DEADLINE_EXCEEDED": 504,
+    "FAILED_PRECONDITION": 400,
+    "INTERNAL": 500,
+    "INVALID_ARGUMENT": 400,
+    "NOT_FOUND": 404,
+    "OK": 200,
+    "OUT_OF_RANGE": 400,
+    "PERMISSION_DENIED": 403,
+    "RESOURCE_EXHAUSTED": 429,
+    "UNKNOWN": 500,
+    "UNAUTHENTICATED": 401,
+    "UNAVAILABLE": 503,
+    "UNIMPLEMENTED": 501,
+}
+_VERTEX_RETRYABLE_STATUSES = frozenset({429, 500, 503, 504})
+
+
+def _vertex_retry_metadata(
+    *,
+    transport_status_code: int,
+    error_type: str | None,
+) -> tuple[int, bool | None]:
+    """Classify recognized GCP identities; status conflicts fail closed."""
+
+    canonical_status = _VERTEX_ERROR_STATUS.get(error_type or "")
+    if canonical_status is None:
+        return transport_status_code, None
+    if transport_status_code != canonical_status:
+        return transport_status_code, False
+    return canonical_status, canonical_status in _VERTEX_RETRYABLE_STATUSES
 
 
 def _vertex_api_error_from_response(
@@ -648,10 +752,16 @@ def _vertex_api_error_from_response(
     instead of reparsing the flattened message text.
     """
     error = _decoded_gcp_error(response) or {}
+    error_type = optional_error_string(error.get("status"))
+    status_code, retryable = _vertex_retry_metadata(
+        transport_status_code=response.status_code,
+        error_type=error_type,
+    )
     return VertexAPIError(
         message,
-        status_code=response.status_code,
-        error_type=optional_error_string(error.get("status")),
+        status_code=status_code,
+        error_type=error_type,
+        retryable=retryable,
         retry_after_s=retry_after_s,
         response_body=_safe_error_response_text(response),
     )

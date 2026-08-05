@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -13,9 +15,14 @@ from cayu import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
     AgentSpec,
     CayuApp,
+    Event,
+    EventType,
     FileAttachmentKind,
+    InMemorySessionStore,
     Message,
+    RecentTurnsContextPolicy,
     ResumeRequest,
+    RetryPolicy,
     RunRequest,
     file_attachment,
 )
@@ -45,6 +52,10 @@ from cayu.providers import (
 from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.openai import openai_stream_events
+
+
+async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
+    return [event async for event in app.run(request)]
 
 
 class RecordingTransport:
@@ -2030,6 +2041,8 @@ async def test_openai_stream_events_extracts_response_failed_error() -> None:
     assert exc_info.value.error_code == "server_error"
     assert exc_info.value.param == "input"
     assert exc_info.value.request_id == "req_stream"
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.retryable is True
     assert exc_info.value.response_body is None
 
 
@@ -2052,6 +2065,57 @@ async def test_openai_stream_events_extracts_top_level_error_event() -> None:
     assert exc_info.value.error_type == "error"
     assert exc_info.value.error_code == "rate_limit_exceeded"
     assert exc_info.value.request_id == "req_top_level"
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "error_code", "expected_status", "expected_retryable"),
+    [
+        pytest.param("authentication_error", None, 401, False, id="authentication"),
+        pytest.param("invalid_request_error", "bad_request", 400, False, id="request"),
+        pytest.param(
+            "invalid_request_error",
+            "previous_response_not_found",
+            404,
+            False,
+            id="stale-chain",
+        ),
+        pytest.param("future_error", "future_code", None, None, id="unknown"),
+        pytest.param("authentication_error", "server_error", None, False, id="conflict"),
+        pytest.param(
+            "authentication_error",
+            "previous_response_not_found",
+            None,
+            False,
+            id="stale-chain-conflict",
+        ),
+    ],
+)
+async def test_openai_stream_error_classifies_only_consistent_known_identity(
+    error_type: str,
+    error_code: str | None,
+    expected_status: int | None,
+    expected_retryable: bool | None,
+) -> None:
+    async def raw_events():
+        yield {
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": error_type,
+                    "code": error_code,
+                    "message": "server_error overloaded authentication_error",
+                }
+            },
+        }
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        [event async for event in openai_stream_events(raw_events())]
+
+    assert exc_info.value.status_code == expected_status
+    assert exc_info.value.retryable is expected_retryable
 
 
 @pytest.mark.anyio
@@ -2132,6 +2196,270 @@ async def test_openai_provider_stream_omits_cutoff_secret_fragment() -> None:
     assert events[0].payload["provider_error_type"] == "server_error"
     assert events[0].payload["provider_error_code"] == "internal_error"
     assert "request_id" not in events[0].payload
+
+
+@pytest.mark.anyio
+async def test_runtime_retries_openai_stream_server_error_then_completes() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "server_error",
+                            "code": "server_error",
+                            "message": "temporary provider failure",
+                        }
+                    },
+                }
+            ],
+            [
+                {"type": "response.output_text.delta", "delta": "recovered"},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_retry",
+                        "model": "gpt-test",
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_retry",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": "recovered",
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "usage": {},
+                    },
+                },
+            ],
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            )
+        )
+    ]
+
+    assert len(transport.calls) == 2
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert retry.payload["status_code"] == 500
+    assert retry.payload["reason"] == "http_status"
+    discarded = next(event for event in events if event.type == EventType.MODEL_ATTEMPT_DISCARDED)
+    assert discarded.payload["status_code"] == 500
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.anyio
+async def test_runtime_honors_bounded_retry_after_from_successful_http_stream() -> None:
+    requests: list[httpx.Request] = []
+    response_events = [
+        {
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "type": "server_error",
+                    "code": "server_error",
+                    "message": "temporary provider failure",
+                }
+            },
+        },
+        _completed_sse("resp_retry_after"),
+    ]
+
+    class ResponseStream(httpx.AsyncByteStream):
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        async def __aiter__(self):
+            yield self._body
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        event = response_events[len(requests) - 1]
+        body = f"data: {json.dumps(event)}\n\n".encode()
+        headers = {"retry-after": "120"} if len(requests) == 1 else {}
+        return httpx.Response(
+            200,
+            headers=headers,
+            stream=ResponseStream(body),
+            request=request,
+        )
+
+    http_transport = HttpxOpenAITransport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        http_transport._client._client = client
+        provider = OpenAIProvider(api_key="test-key", transport=http_transport)
+        app = CayuApp()
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                    max_steps=1,
+                    retry_policy=RetryPolicy(
+                        max_attempts=2,
+                        initial_delay_s=0.0,
+                        max_delay_s=0.01,
+                    ),
+                )
+            )
+        ]
+
+    assert len(requests) == 2
+    assert all(request.headers["accept-encoding"] == "identity" for request in requests)
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["retry_after_s"] == 120.0
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert retry.payload["delay_seconds"] == 0.01
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status_code", [429, 500])
+async def test_runtime_retries_compressed_http_error_without_reading_body(
+    status_code: int,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    class ResponseStream(httpx.AsyncByteStream):
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+            self.yielded_chunks = 0
+
+        async def __aiter__(self):
+            self.yielded_chunks += 1
+            yield self._body
+
+    compressed_stream = ResponseStream(
+        gzip.compress(b'{"error":{"message":"temporary provider failure"}}')
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(
+                status_code,
+                headers={
+                    "content-encoding": "gzip",
+                    "content-type": "application/json",
+                    "retry-after": "120",
+                },
+                stream=compressed_stream,
+                request=request,
+            )
+        body = f"data: {json.dumps(_completed_sse('resp_compressed_retry'))}\n\n".encode()
+        return httpx.Response(
+            200,
+            stream=ResponseStream(body),
+            request=request,
+        )
+
+    http_transport = HttpxOpenAITransport()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        http_transport._client._client = client
+        provider = OpenAIProvider(api_key="test-key", transport=http_transport)
+        app = CayuApp()
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="gpt-test"))
+
+        events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    messages=[Message.text("user", "hello")],
+                    max_steps=1,
+                    retry_policy=RetryPolicy(
+                        max_attempts=2,
+                        initial_delay_s=0.0,
+                        max_delay_s=0.01,
+                    ),
+                )
+            )
+        ]
+
+    assert len(requests) == 2
+    assert compressed_stream.yielded_chunks == 0
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["status_code"] == status_code
+    assert model_error.payload["retry_after_s"] == 120.0
+    retry = next(event for event in events if event.type == EventType.MODEL_RETRY)
+    assert retry.payload["status_code"] == status_code
+    assert retry.payload["reason"] == "http_status"
+    assert retry.payload["delay_seconds"] == 0.01
+    assert events[-1].type == EventType.SESSION_COMPLETED
+
+
+@pytest.mark.anyio
+async def test_runtime_does_not_recover_conflicting_openai_context_identity() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "authentication_error",
+                            "code": "context_length_exceeded",
+                            "message": "This model's maximum context length was exceeded.",
+                        }
+                    },
+                }
+            ]
+        ]
+    )
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    app = CayuApp()
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="gpt-test"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = [
+        event
+        async for event in app.run(
+            RunRequest(
+                agent_name="assistant",
+                messages=[Message.text("user", "hello")],
+                max_steps=1,
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            )
+        )
+    ]
+
+    assert len(transport.calls) == 1
+    assert EventType.MODEL_RETRY not in [event.type for event in events]
+    assert EventType.CONTEXT_OVERFLOW_RECOVERING not in [event.type for event in events]
+    model_error = next(event for event in events if event.type == EventType.MODEL_ERROR)
+    assert model_error.payload["retryable"] is False
+    assert model_error.payload["provider_error_type"] == "authentication_error"
+    assert model_error.payload["provider_error_code"] == "context_length_exceeded"
+    assert events[-1].type == EventType.SESSION_FAILED
 
 
 def test_openai_response_events_rejects_unsupported_output_item() -> None:
@@ -2503,6 +2831,51 @@ async def test_httpx_openai_transport_classifies_context_overflow(monkeypatch) -
     assert exc_info.value.error_code == "context_length_exceeded"
     assert exc_info.value.request_id == "req_context"
     assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+
+
+@pytest.mark.anyio
+async def test_httpx_openai_transport_rejects_conflicting_context_identity(monkeypatch) -> None:
+    class FailingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, Any],
+            timeout: Any = None,
+        ) -> httpx.Response:
+            del headers, json, timeout
+            request = httpx.Request("POST", url)
+            response = httpx.Response(
+                401,
+                request=request,
+                json={
+                    "error": {
+                        "type": "authentication_error",
+                        "code": "context_length_exceeded",
+                        "message": "This model's maximum context length was exceeded.",
+                    }
+                },
+            )
+            raise httpx.HTTPStatusError("unauthorized", request=request, response=response)
+
+    monkeypatch.setattr("cayu.providers._http.httpx.AsyncClient", FailingClient)
+
+    with pytest.raises(OpenAIAPIError) as exc_info:
+        await HttpxOpenAITransport().create_response(
+            url="https://api.openai.com/v1/responses",
+            headers={},
+            payload={},
+            timeout_s=1,
+        )
+
+    assert not isinstance(exc_info.value, OpenAIContextOverflowError)
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.error_type == "authentication_error"
+    assert exc_info.value.error_code == "context_length_exceeded"
 
 
 @pytest.mark.anyio
@@ -2910,12 +3283,135 @@ async def test_server_mode_does_not_recover_non_stale_previous_response_error() 
     assert any(e.type.name == "ERROR" for e in events)
 
 
+@pytest.mark.anyio
+async def test_server_mode_does_not_recover_conflicting_stale_chain_identity() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "authentication_error",
+                            "code": "previous_response_not_found",
+                            "param": "previous_response_id",
+                            "message": "Conflicting error identity.",
+                        }
+                    },
+                }
+            ]
+        ]
+    )
+    provider = OpenAIProvider(api_key="k", reasoning_state="server", transport=transport)
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ProviderStatePart(
+                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                    )
+                ],
+            ),
+            Message.text("user", "second"),
+        ],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert len(transport.calls) == 1
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["retryable"] is False
+    assert events[0].payload["provider_error_type"] == "authentication_error"
+    assert events[0].payload["provider_error_code"] == "previous_response_not_found"
+
+
+@pytest.mark.anyio
+async def test_server_mode_recovers_from_in_band_stale_chain_identity() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "previous_response_not_found",
+                            "param": "previous_response_id",
+                            "message": "Previous response not found.",
+                        }
+                    },
+                }
+            ],
+            [_completed_sse("resp_new")],
+        ]
+    )
+    provider = OpenAIProvider(api_key="k", reasoning_state="server", transport=transport)
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ProviderStatePart(
+                        provider="openai", state={"type": "response_ref", "id": "resp_prev"}
+                    )
+                ],
+            ),
+            Message.text("user", "second"),
+        ],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["payload"]["previous_response_id"] == "resp_prev"
+    assert "previous_response_id" not in transport.calls[1]["payload"]
+    assert events[-1].type == ModelStreamEventType.COMPLETED
+
+
 def test_is_stale_chain_error_uses_typed_identity_not_message_text() -> None:
     assert openai_module._is_stale_chain_error(
-        OpenAIAPIError("chain gone", error_code="previous_response_not_found")
+        OpenAIAPIError(
+            "chain gone",
+            status_code=404,
+            error_type="invalid_request_error",
+            error_code="previous_response_not_found",
+        )
     )
     assert openai_module._is_stale_chain_error(
         OpenAIAPIError("chain gone", status_code=404, param="previous_response_id")
+    )
+    # A stale code without the provider's 404 classification is insufficient.
+    assert not openai_module._is_stale_chain_error(
+        OpenAIAPIError("chain gone", error_code="previous_response_not_found")
+    )
+    # Recognized identities that contradict a stale 404 fail closed.
+    assert not openai_module._is_stale_chain_error(
+        OpenAIAPIError(
+            "chain gone",
+            status_code=404,
+            error_type="authentication_error",
+            error_code="previous_response_not_found",
+            param="previous_response_id",
+        )
+    )
+    assert not openai_module._is_stale_chain_error(
+        OpenAIAPIError(
+            "chain gone",
+            status_code=404,
+            error_code="server_error",
+            param="previous_response_id",
+        )
+    )
+    assert not openai_module._is_stale_chain_error(
+        OpenAIAPIError(
+            "chain gone",
+            status_code=404,
+            error_code="previous_response_not_found",
+            param="api_key",
+        )
     )
     # Message text alone no longer classifies: only structured identity does.
     assert not openai_module._is_stale_chain_error(
@@ -2962,6 +3458,7 @@ def test_openai_api_error_from_response_captures_typed_identity() -> None:
     assert error.error_code == "previous_response_not_found"
     assert error.param == "previous_response_id"
     assert error.request_id == "req_123"
+    assert error.retryable is False
     assert error.retry_after_s == 3.5
     assert openai_module._is_stale_chain_error(error)
 
@@ -2979,7 +3476,39 @@ def test_openai_api_error_from_response_tolerates_non_json_body() -> None:
     assert error.error_type is None
     assert error.error_code is None
     assert error.param is None
+    assert error.retryable is None
     assert not openai_module._is_stale_chain_error(error)
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type", "error_code", "expected_retryable"),
+    [
+        pytest.param(401, "authentication_error", None, False, id="permanent"),
+        pytest.param(500, "server_error", "server_error", True, id="transient"),
+        pytest.param(500, "future_error", "future_code", None, id="unknown"),
+        pytest.param(500, "authentication_error", "server_error", False, id="body-conflict"),
+        pytest.param(429, "server_error", "server_error", False, id="status-conflict"),
+    ],
+)
+def test_openai_http_error_uses_stream_identity_classification(
+    status_code: int,
+    error_type: str,
+    error_code: str | None,
+    expected_retryable: bool | None,
+) -> None:
+    response = httpx.Response(
+        status_code,
+        headers={"content-type": "application/json", "retry-after": "4"},
+        json={"error": {"type": error_type, "code": error_code}},
+    )
+
+    error = openai_module._openai_api_error_from_response(response, "OpenAI failed", 4.0)
+
+    assert error.status_code == status_code
+    assert error.error_type == error_type
+    assert error.error_code == error_code
+    assert error.retryable is expected_retryable
+    assert error.retry_after_s == 4.0
 
 
 @pytest.mark.anyio
@@ -3020,3 +3549,122 @@ def test_server_recovery_payload_drops_chain_and_provider_state():
     assert "first" in texts and "second" in texts
     types = [item.get("type") for item in payload["input"]]
     assert "reasoning" not in types and "response_ref" not in types
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["cleanup", "post_completion_provider", "post_completion_overflow"],
+)
+def test_cayu_app_preserves_completion_and_closes_without_reading_tail(
+    failure_kind: str,
+) -> None:
+    class CompletedThenFailureStream:
+        def __init__(self) -> None:
+            self._index = 0
+            self.closed = False
+            self.tail_reads = 0
+
+        def __aiter__(self) -> CompletedThenFailureStream:
+            return self
+
+        async def __anext__(self) -> Mapping[str, Any]:
+            self._index += 1
+            if self._index == 1:
+                return {"type": "response.output_text.delta", "delta": "ok"}
+            if self._index == 2:
+                return {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response-1",
+                        "model": "fake-model",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {"input_tokens": 2, "output_tokens": 1},
+                    },
+                }
+            if self._index == 3 and failure_kind.startswith("post_completion_"):
+                self.tail_reads += 1
+                error = (
+                    {
+                        "type": "invalid_request_error",
+                        "code": "context_length_exceeded",
+                        "message": "context overflow after completion",
+                    }
+                    if failure_kind == "post_completion_overflow"
+                    else {
+                        "type": "server_error",
+                        "code": "server_error",
+                        "message": "retryable failure after completion",
+                    }
+                )
+                return {
+                    "type": "response.failed",
+                    "response": {"error": error},
+                }
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.closed = True
+            if failure_kind == "cleanup":
+                raise RuntimeError("provider stream close failed")
+
+    class CompletingTransport:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.source = CompletedThenFailureStream()
+
+        def stream_response_events(self, **_kwargs: Any) -> CompletedThenFailureStream:
+            self.calls += 1
+            return self.source
+
+    store = InMemorySessionStore()
+    transport = CompletingTransport()
+    provider = OpenAIProvider(api_key="test-key", transport=transport)
+    app = CayuApp(
+        session_store=store,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    session_id = f"sess_completion_cleanup_{failure_kind}"
+    events = asyncio.run(
+        _collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hi")],
+            ),
+        )
+    )
+    transcript = asyncio.run(store.load_transcript(session_id))
+    durable_events = asyncio.run(store.load_events(session_id))
+
+    assert transport.calls == 1
+    assert transport.source.closed
+    assert transport.source.tail_reads == 0
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    assert EventType.MODEL_ERROR not in {event.type for event in events}
+    model_completions = [
+        event for event in durable_events if event.type == EventType.MODEL_COMPLETED
+    ]
+    assert len(model_completions) == 1
+    completion = model_completions[0]
+    assert completion.payload["usage"] == {
+        "input_tokens": 2,
+        "output_tokens": 1,
+    }
+    assert completion.payload["usage_metrics"]["input_tokens"] == 2
+    assert completion.payload["usage_metrics"]["output_tokens"] == 1
+    assert completion.payload["usage_metrics"]["total_tokens"] == 3
+    if failure_kind == "cleanup":
+        assert completion.payload["step_classification"]["type"] == "failed"
+        assert events[-1].type == EventType.SESSION_FAILED
+        assert [message.role for message in transcript] == ["user"]
+        return
+
+    assert completion.payload["step_classification"]["type"] == "final"
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert transcript[-1] == Message.text("assistant", "ok")
