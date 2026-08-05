@@ -454,25 +454,41 @@ portable promotion only: normal Cayu sessions and direct Python evals retain all
 of those capabilities, while runtime tool calls, artifacts, and admitted child
 agents remain eligible. Tool calls and child status remain available as portable
 assertion evidence; corpus v1 does not silently infer replay input or an artifact
-assertion from uncaptured state.
+assertion from uncaptured state. Caller-driven approval, resume, queued-input, and
+later-interaction phases are checked recursively across every admitted descendant,
+not only on the root.
 
 The initial-input boundary is a single versioned runtime-attested fact emitted by
 new runs and preserved by the built-in stores. Caller-authored copies are stripped
-before persistence. The marker and its private interpretation are intentionally
-absent from serialized trajectories, so a detached or older trajectory cannot
-guess which transcript messages were caller input; it fails closed as
+before persistence. SQL revision 31 also stores an explicit runtime-ownership proof
+bit. Revision 31 is a breaking schema boundary because pre-31 readers would expose
+the unknown marker as ordinary event payload; mixed-version operation is rejected.
+Rows written before migration retain a false proof bit, so payload presence alone
+never grants authority. The marker binds the exact transcript start index, message
+count, and canonical SHA-256 digest of the redacted request messages. Promotion
+verifies the complete marker facts and their selected messages against a recursively
+revalidated trajectory before accepting input. A domain-separated capture
+fingerprint commits the finalized public trajectory together with the marker's
+private start, count, message digest, redaction mode, and output mode, so neither side
+can be changed independently. The marker and its private interpretation are
+intentionally absent from serialized trajectories, so a detached or older trajectory
+cannot guess which
+transcript messages were caller input; it fails closed as
 `input_evidence_unavailable` instead. Multiple text parts reject because their
 provider-specific boundaries cannot be represented exactly by corpus v1's single
-text field. The resulting sanitized input and redaction fact carry one exact
-content revision.
+text field. The resulting sanitized input and redaction fact carry one exact content
+revision.
 
 `build_promotion_candidate(...)` applies that eligibility boundary and produces
 one immutable `PromotionCandidateV1`: the sanitized input, standard public
 assertion evidence, evidence policy, optional pricing identity, diagnostic
 `PromotionSourceV1`, one suite, one case, and stable warning codes. Source
 provenance records the application release ID and diagnostic app-manifest
-schema/fingerprint; it is useful for review but is not executable authority or a
-claim that the application can be rebuilt from the corpus alone.
+schema/fingerprint together with the selected source agent, sanitized-input
+revision, and redaction fact; it is useful for review but is not executable
+authority or a claim that the application can be rebuilt from the corpus alone.
+Warning codes are derived from those captured facts and the evidence status;
+callers cannot remove or invent them.
 
 Every new candidate starts with one `root_status` assertion expecting
 `completed`, even when the captured source failed. The failure is therefore a
@@ -480,21 +496,35 @@ regression to fix rather than a golden failed result. The case and suite are
 ordinary corpus specs: an author may recreate them with their `.create(...)`
 factories to edit names, trial settings, input, or assertions, then recreate the
 candidate to obtain exact new content revisions. The default case ID is derived
-from the target key, diagnostic source identity, and public-safe evidence
-revision. It stays fixed across descriptive edits and contains no raw session ID.
+from the target key, captured sanitized-input revision, diagnostic source
+identity, and public-safe evidence revision. It stays fixed across candidate
+edits and contains no raw session ID.
 Candidate configuration labels are rejected if the application redactor detects
-a workload secret.
+a workload secret. This boundary includes the target-derived suite identity and
+every persisted pricing-profile identity string.
 
 `score_promotion_candidate(...)` evaluates the reviewed case against that same
 captured evidence through `evaluate_assertion_specs(...)`; it does not introduce
 a second scorer. Before scoring, it rechecks the target, release, app manifest,
-promotion eligibility, evidence policy, and public evidence revision. A changed
-snapshot requires a new candidate. Only currencies requested by edited cost
-assertions are reprojected, and supplied pricing must match the candidate's exact
-`PricingProfileIdentityV1`. Missing or partially unpriced cost evidence produces
-an `unavailable` assertion and a null score—it cannot pass. The returned
+selected source agent, promotion eligibility, exact sanitized-input revision and
+redaction fact, evidence policy, public evidence revision, and redaction-safe
+configuration identity. A changed snapshot, source-agent mapping, sanitized
+source input, or relevant redaction result requires a new candidate. Only
+currencies requested by edited cost assertions are reprojected, and supplied
+pricing must match the candidate's exact `PricingProfileIdentityV1`. Missing or
+partially unpriced cost evidence produces an `unavailable` assertion and a null
+score—it cannot pass. The returned
 `CapturedRunScoreV1` contains bounded published assertion details and content
 revisions, never raw assertion metadata, exception text, or session identity.
+
+After review, `corpus_from_promotion_candidate(...)` constructs the exact
+one-suite, one-case `EvalCorpusDocument`; `export_promotion_corpus(...)` returns
+its canonical UTF-8 JSON bytes. Export revalidates every candidate, source,
+policy, pricing, suite, case, assertion, and content revision through the corpus
+factories. Cost assertions without a compatible pricing-profile identity reject.
+Preview evidence, warnings, app internals, runtime configuration, and session
+identity are not corpus fields. The same valid candidate produces byte-identical
+output across processes.
 
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable

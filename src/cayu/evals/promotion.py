@@ -24,6 +24,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
     CorpusUserMessageSpec,
     EvalCaseSpec,
+    EvalCorpusDocument,
     EvalSuiteSpec,
     EvaluationEvidencePolicySpec,
     EvaluationSourceIdentityV1,
@@ -41,15 +42,16 @@ from cayu.evals.corpus import (
     _sha256_hex,
     _sha256_revision,
     assertion_spec_revision,
+    eval_corpus_to_json,
     pricing_profile_identity,
 )
+from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
 from cayu.evals.models import (
     Trajectory,
     _model_instance_python_input,
     _trajectory_promotion_capture_sha256,
     _validate_trajectory_record_contract,
 )
-from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
 from cayu.evals.portable_evaluation import evaluate_assertion_specs
 from cayu.evals.published import (
     PublishedAssertionResult,
@@ -688,8 +690,13 @@ def _validated_trajectory_for_promotion(trajectory: Trajectory) -> Trajectory:
         ):
             raise TypeError("promotion capture digest is malformed")
 
+        # Convert the complete tree to plain field input once. Passing nested
+        # Trajectory instances back through `revalidate_instances="always"`
+        # would repeatedly rebuild accepted subtrees at each ancestor.
         validated = Trajectory.model_validate(_model_instance_python_input(trajectory))
         _validate_trajectory_record_contract(validated)
+        # Reattach the candidate facts only to the freshly revalidated instance
+        # used to recompute the binding. A mismatch discards this local object.
         validated._initial_input_message_start_index = start_index
         validated._initial_input_message_count = count
         validated._initial_input_messages_sha256 = messages_sha256
@@ -788,7 +795,11 @@ def _promotable_run_input_from_validated(
         raise _promotion_error(SessionPromotionErrorCode.INPUT_MESSAGE_COUNT_UNSUPPORTED)
     if input_start_index < 0:
         raise _promotion_error(SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT)
-    source_messages = _initial_source_messages(trajectory, input_count, input_start_index)
+    source_messages = _initial_source_messages(
+        trajectory,
+        input_count,
+        input_start_index,
+    )
     input_messages_sha256 = trajectory.initial_input_messages_sha256
     if input_messages_sha256 is None:
         raise _promotion_error(SessionPromotionErrorCode.INPUT_EVIDENCE_UNAVAILABLE)
@@ -1171,3 +1182,29 @@ def score_promotion_candidate(
         evidence=scored_evidence,
         assertions=published_results,
     )
+
+
+def corpus_from_promotion_candidate(
+    candidate: PromotionCandidateV1,
+) -> EvalCorpusDocument:
+    """Build the exact one-case corpus represented by a reviewed candidate."""
+
+    validated_candidate = _validate_exact_model(
+        candidate,
+        PromotionCandidateV1,
+        "candidate",
+    )
+    return EvalCorpusDocument.create(
+        target_key=validated_candidate.target_key,
+        evidence_policy=validated_candidate.evidence_policy,
+        pricing_profile=validated_candidate.pricing_profile,
+        suites=(validated_candidate.suite,),
+        cases=(validated_candidate.case,),
+    )
+
+
+def export_promotion_corpus(candidate: PromotionCandidateV1) -> bytes:
+    """Return canonical UTF-8 corpus bytes for one reviewed candidate."""
+
+    corpus = corpus_from_promotion_candidate(candidate)
+    return eval_corpus_to_json(corpus).encode("utf-8")

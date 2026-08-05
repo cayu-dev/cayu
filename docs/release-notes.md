@@ -13,14 +13,14 @@ generated clients together: the server contract advances from version 4 to
 version 6, and the public application manifest and generator plan advance to
 schema version 7.
 
-The storage schema advances from revision 23 to revision 30. Revision 26 is a
+The storage schema advances from revision 23 to revision 31. Revision 26 is a
 deliberate prerelease boundary: migration rejects a populated pre-26 Cayu
 session database instead of attempting to rewrite its durable interaction
 history. Stop all older workers, take an application-consistent backup, and
 recreate populated prerelease Cayu session databases before starting rc5.
 Empty stores migrate normally. Run `cayu storage status` and
 `cayu storage migrate` against every explicitly configured SQLite or PostgreSQL
-session store and budget ledger, then confirm revision 30 with no pending
+session store and budget ledger, then confirm revision 31 with no pending
 migrations. Do not run mixed rc4/rc5 workers.
 
 After deployment, verify `cayu version`, run `cayu check --json`, execute the
@@ -126,11 +126,10 @@ listing may still prove a positive match from the records it did retain.
 
 The new `ToolsCalledInOrder` assertion checks the exact model-requested tool
 sequence from the durable transcript, independent of parallel scheduler event
-order. Promoted trajectories can be scored with `evaluate_assertions(...)` and
-exported with the existing versioned trajectory JSON helpers. They deliberately
-do not capture current workspace or artifact state, create a corpus, re-execute
-the application, or publish a control-plane route; those product workflows can
-build on this evidence boundary without changing its meaning.
+order. The trajectory capture operation deliberately does not read current
+workspace or artifact state, re-execute the application, or publish a
+control-plane route. The reviewable corpus-promotion layer described below
+builds on this immutable evidence boundary without changing its meaning.
 
 ### Terminal session evidence has one bounded snapshot boundary
 
@@ -147,8 +146,30 @@ policy that can reject JSONB-expanded scientific-notation values without
 changing the canonical limits applied to accepted evidence;
 custom stores must explicitly opt in only when they provide the same guarantees.
 `trajectory_from_session(...)` now consumes this storage boundary for
-production-session trajectory promotion; corpus and dashboard workflows remain
-separate follow-ups.
+production-session trajectory capture. Revision 31 stores an explicit SQL proof
+bit for runtime-attested fresh-input markers and raises the compatibility floor to
+31. Pre-31 readers do not know that the marker is private and would expose it as
+ordinary event payload, so mixed-version operation and app-only rollback are
+rejected. Rows written before migration receive a false proof bit and cannot gain
+runtime authority from payload text alone. Control-plane persistence and dashboard
+workflows remain separate follow-ups.
+
+### Production sessions produce reviewable portable eval candidates
+
+`build_promotion_candidate(...)` projects an eligible terminal trajectory into
+one bounded, redacted, identity-free candidate containing caller input, public
+assertion evidence, a default editable regression case, and the source app,
+release, evidence-policy, and optional pricing fingerprints. The runtime marker
+binds the exact caller-input transcript range and its canonical message digest;
+missing, altered, or caller-authored attribution fails closed before promotion.
+Approval continuations, resumes, later input, structured output, non-user roles,
+and non-text input remain explicit unsupported cases rather than being silently
+rewritten into a different replay contract.
+
+Candidates can be rescored against the captured evidence, converted to the
+existing portable corpus model, and exported as deterministic UTF-8 JSON. This
+release does not automatically publish the candidate, execute the exported
+corpus, or add control-plane routes; those remain explicit subsequent steps.
 
 ### Eval results preserve every trial and explicit evidence gaps
 

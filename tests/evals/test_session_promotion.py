@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from tests.core.postgres_contention_support import drop_cayu_tables
@@ -40,10 +45,14 @@ from cayu import (
     ToolResultPart,
     Trajectory,
     build_promotion_candidate,
+    corpus_from_promotion_candidate,
+    eval_corpus_from_json,
+    export_promotion_corpus,
     file_attachment,
     promotable_run_input,
     score_promotion_candidate,
     scripted_structured_output,
+    session_usage_summary,
     trajectory_from_session,
 )
 from cayu.evals.models import _trajectory_promotion_capture_sha256
@@ -254,7 +263,7 @@ def _assert_rejection(
     assert captured.value.code is expected
 
 
-def _runtime_attested_trajectory_copy(trajectory, **update):
+def _runtime_attested_trajectory_copy(trajectory: Trajectory, **update) -> Trajectory:
     """Construct one internally attested fixture after deliberate public-state edits."""
 
     copied = trajectory.model_copy(update=update)
@@ -277,6 +286,50 @@ def _event_before_terminal(trajectory, event_type: EventType):
     )
 
 
+def _completed_child_tree(
+    trajectory: Trajectory,
+    event_type: EventType | None = None,
+) -> Trajectory:
+    """Build a contract-valid completed child, optionally with one extra event."""
+
+    assert trajectory.session is not None
+    child_id = "promotion-child"
+    child_events = tuple(
+        event.model_copy(
+            update={
+                "id": f"child-{event.id}",
+                "session_id": child_id,
+            }
+        )
+        for event in trajectory.events
+    )
+    if event_type is not None:
+        extra_event = Event(
+            id=f"child-extra-{event_type.value}",
+            type=event_type,
+            session_id=child_id,
+            interaction_id=(
+                "child-later-interaction" if event_type is EventType.INTERACTION_STARTED else None
+            ),
+        )
+        child_events = (*child_events[:-1], extra_event, child_events[-1])
+    child = trajectory.model_copy(
+        deep=True,
+        update={
+            "session": trajectory.session.model_copy(
+                update={
+                    "id": child_id,
+                    "parent_session_id": trajectory.session.id,
+                }
+            ),
+            "events": child_events,
+            "usage_summary": session_usage_summary(child_id, list(child_events)),
+            "children": (),
+        },
+    )
+    return _runtime_attested_trajectory_copy(trajectory, children=(child,))
+
+
 def test_promotable_input_survives_every_builtin_store_and_restart(promotion_store_case):
     async def scenario():
         store = await _open_store(promotion_store_case)
@@ -296,7 +349,10 @@ def test_promotable_input_survives_every_builtin_store_and_restart(promotion_sto
         return trajectory, promoted
 
     trajectory, promoted = asyncio.run(scenario())
+    assert trajectory.initial_input_message_start_index == 1
     assert trajectory.initial_input_message_count == 2
+    assert trajectory.initial_input_messages_sha256 is not None
+    assert len(trajectory.initial_input_messages_sha256) == 64
     assert trajectory.structured_output_requested is False
     assert trajectory.input_redactions_applied is False
     assert all(
@@ -853,6 +909,103 @@ def test_long_target_key_uses_a_bounded_deterministic_suite_id():
     assert len(candidate.suite.id) <= 128
 
 
+def test_promotion_export_is_canonical_across_processes_and_omits_preview_evidence():
+    async def scenario():
+        return await _run_trajectory(
+            InMemorySessionStore(),
+            session_id="private-export-session",
+        )
+
+    app, trajectory = asyncio.run(scenario())
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-export",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        source_label="Exported regression",
+    )
+    corpus = corpus_from_promotion_candidate(candidate)
+    exported = export_promotion_corpus(candidate)
+    assert eval_corpus_from_json(exported.decode("utf-8")) == corpus
+    assert exported.endswith(b"\n")
+    assert b"private-export-session" not in exported
+    assert b"captured answer" not in exported
+    assert b'"warnings"' not in exported
+    assert b'"source_label"' not in exported
+
+    repo_root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    source_path = str(repo_root / "src")
+    existing_python_path = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        source_path if not existing_python_path else source_path + os.pathsep + existing_python_path
+    )
+    script = (
+        "import sys\n"
+        "from cayu import PromotionCandidateV1, export_promotion_corpus\n"
+        "candidate = PromotionCandidateV1.model_validate_json(sys.stdin.read())\n"
+        "sys.stdout.buffer.write(export_promotion_corpus(candidate))\n"
+    )
+    process = subprocess.run(
+        [sys.executable, "-c", script],
+        input=candidate.model_dump_json(),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=30,
+        env=environment,
+        cwd=repo_root,
+    )
+    assert process.stdout.encode("utf-8") == exported
+
+    probe = Path(__file__).with_name("promotion_determinism_probe.py")
+    probe_outputs = tuple(
+        subprocess.run(
+            [sys.executable, str(probe)],
+            capture_output=True,
+            check=True,
+            timeout=30,
+            env=environment,
+            cwd=repo_root,
+        ).stdout
+        for _ in range(2)
+    )
+    assert probe_outputs[0] == probe_outputs[1]
+    independent_document = json.loads(probe_outputs[0])
+    assert independent_document["candidate"]["revision"].startswith("sha256:")
+    assert independent_document["score"]["revision"].startswith("sha256:")
+    assert independent_document["corpus"].endswith("\n")
+
+    cost_case = type(candidate.case).create(
+        id=candidate.case.id,
+        suite_id=candidate.case.suite_id,
+        name=candidate.case.name,
+        description=candidate.case.description,
+        source=candidate.case.source,
+        input=candidate.case.input,
+        assertions=(
+            *candidate.case.assertions,
+            MaxEstimatedCostAssertionSpec(
+                id="missing-price",
+                maximum="1",
+                currency="USD",
+            ),
+        ),
+    )
+    unpriced_candidate = PromotionCandidateV1.create(
+        target_key=candidate.target_key,
+        source=candidate.source,
+        evidence_policy=candidate.evidence_policy,
+        evidence=candidate.evidence,
+        suite=candidate.suite,
+        case=cost_case,
+    )
+    with pytest.raises(ValueError, match="Cost assertions require a pricing profile"):
+        export_promotion_corpus(unpriced_candidate)
+
+
 def test_descriptive_label_and_pricing_do_not_change_default_case_identity():
     async def scenario():
         return await _run_trajectory(InMemorySessionStore())
@@ -1050,6 +1203,13 @@ def test_promotion_rejects_source_mismatch_and_incomplete_descendants():
         SessionPromotionErrorCode.DESCENDANT_EVIDENCE_UNSUPPORTED,
     )
 
+    promoted = promotable_run_input(
+        app,
+        _completed_child_tree(trajectory),
+        source_agent_name="assistant",
+    )
+    assert [message.text for message in promoted.messages] == ["promote this run"]
+
 
 def test_runtime_attested_structured_output_is_ineligible_without_event_guessing():
     async def scenario():
@@ -1117,17 +1277,26 @@ def test_promotion_rejects_multiple_text_parts_instead_of_changing_replay_input(
     )
 
 
-def test_caller_system_input_without_runtime_bootstrap_uses_role_rejection():
+def test_caller_system_input_without_runtime_bootstrap_uses_role_rejection(
+    promotion_store_case,
+):
     async def scenario():
-        return await _run_trajectory(
-            InMemorySessionStore(),
-            messages=[Message.text("system", "caller-authored system state")],
-            agent_system_prompt=None,
-            fail=True,
-        )
+        store = await _open_store(promotion_store_case)
+        try:
+            return await _run_trajectory(
+                store,
+                messages=[Message.text("system", "caller-authored system state")],
+                agent_system_prompt=None,
+                fail=False,
+            )
+        finally:
+            await _close_store(store)
 
     app, trajectory = asyncio.run(scenario())
-    assert [message.role for message in trajectory.transcript] == [MessageRole.SYSTEM]
+    assert [message.role for message in trajectory.transcript] == [
+        MessageRole.SYSTEM,
+        MessageRole.ASSISTANT,
+    ]
     _assert_rejection(
         app,
         trajectory,
@@ -1193,7 +1362,9 @@ def test_caller_authored_input_markers_are_stripped_across_builtin_stores(
                 session_id=session_id,
                 payload={
                     "agent_name": "assistant",
-                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: "v1:1:original:text",
+                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                        "v1:0:1:original:text:sha256:" + "0" * 64
+                    ),
                 },
             ),
         )
@@ -1233,6 +1404,7 @@ def test_caller_authored_input_markers_are_stripped_across_builtin_stores(
     app, trajectory, durable_started = asyncio.run(scenario())
     assert SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY not in durable_started.payload
     assert trajectory.initial_input_message_count is None
+    assert trajectory.initial_input_messages_sha256 is None
     assert trajectory.structured_output_requested is None
     assert trajectory.input_redactions_applied is None
     _assert_rejection(
@@ -1240,6 +1412,156 @@ def test_caller_authored_input_markers_are_stripped_across_builtin_stores(
         trajectory,
         SessionPromotionErrorCode.INPUT_EVIDENCE_UNAVAILABLE,
     )
+
+
+def test_sql_input_contract_requires_persisted_runtime_proof(promotion_store_case):
+    kind, tmp_path, postgres_dsn = promotion_store_case
+    if kind == "memory":
+        pytest.skip("In-memory authority stays attached to the Event instance.")
+
+    async def scenario():
+        store = await _open_store(promotion_store_case)
+        _app, trusted = await _run_trajectory(store)
+        assert trusted.initial_input_message_count == 1
+        await _close_store(store)
+
+        if kind == "sqlite":
+            import sqlite3
+
+            connection = sqlite3.connect(tmp_path / "session-promotion.sqlite")
+            try:
+                proof = connection.execute(
+                    "SELECT input_contract_runtime_owned FROM cayu_events "
+                    "WHERE session_id = ? AND event_type = 'session.started'",
+                    ("promotion-root",),
+                ).fetchone()
+                assert proof == (1,)
+                connection.execute(
+                    "UPDATE cayu_events SET input_contract_runtime_owned = 0 "
+                    "WHERE session_id = ? AND event_type = 'session.started'",
+                    ("promotion-root",),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            store = SQLiteSessionStore(tmp_path / "session-promotion.sqlite")
+        else:
+            import psycopg
+
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as connection,
+                connection.cursor() as cursor,
+            ):
+                await cursor.execute(
+                    "SELECT input_contract_runtime_owned FROM cayu_events "
+                    "WHERE session_id = %s AND event_type = 'session.started'",
+                    ("promotion-root",),
+                )
+                assert await cursor.fetchone() == (True,)
+                await cursor.execute(
+                    "UPDATE cayu_events SET input_contract_runtime_owned = FALSE "
+                    "WHERE session_id = %s AND event_type = 'session.started'",
+                    ("promotion-root",),
+                )
+                await connection.commit()
+            store = PostgresSessionStore(
+                postgres_dsn,
+                min_size=1,
+                max_size=4,
+                schema_mode=SchemaMode.CREATE,
+            )
+
+        try:
+            reloaded_app = CayuApp(session_store=store, enable_logging=False)
+            untrusted = await trajectory_from_session(reloaded_app, "promotion-root")
+            return reloaded_app, untrusted
+        finally:
+            await _close_store(store)
+
+    app, trajectory = asyncio.run(scenario())
+    assert trajectory.initial_input_message_start_index is None
+    assert trajectory.initial_input_message_count is None
+    assert trajectory.initial_input_messages_sha256 is None
+    _assert_rejection(
+        app,
+        trajectory,
+        SessionPromotionErrorCode.INPUT_EVIDENCE_UNAVAILABLE,
+    )
+
+
+def test_sqlite_ordinary_event_batch_skips_input_contract_proof_updates(tmp_path):
+    async def scenario() -> list[str]:
+        store = SQLiteSessionStore(tmp_path / "ordinary-events.sqlite")
+        try:
+            session_id = "ordinary-event-batch"
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            )
+            statements: list[str] = []
+            store._connection.set_trace_callback(statements.append)
+            try:
+                await store.append_events(
+                    session_id,
+                    [
+                        Event(
+                            id=f"ordinary-event-{index}",
+                            type=EventType.MODEL_TEXT_DELTA,
+                            session_id=session_id,
+                            payload={"delta": "x"},
+                        )
+                        for index in range(32)
+                    ],
+                )
+            finally:
+                store._connection.set_trace_callback(None)
+            return statements
+        finally:
+            await store.close()
+
+    statements = asyncio.run(scenario())
+    proof_updates = [
+        statement
+        for statement in statements
+        if "UPDATE cayu_events" in statement and "input_contract_runtime_owned" in statement
+    ]
+    assert proof_updates == []
+
+
+def test_postgres_ordinary_event_batch_skips_input_contract_proof_update():
+    class RecordingCursor:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def execute(self, statement, params) -> None:
+            del params
+            self.statements.append(str(statement))
+
+    async def scenario() -> list[str]:
+        cursor = RecordingCursor()
+        await PostgresSessionStore._enqueue_persisted_event_side_effects(
+            cursor,
+            "ordinary-event-batch",
+            [
+                Event(
+                    id=f"ordinary-event-{index}",
+                    type=EventType.MODEL_TEXT_DELTA,
+                    session_id="ordinary-event-batch",
+                    payload={"delta": "x"},
+                )
+                for index in range(32)
+            ],
+        )
+        return cursor.statements
+
+    statements = asyncio.run(scenario())
+    assert len(statements) == 1
+    assert "INSERT INTO cayu_persisted_event_side_effects" in statements[0]
+    assert "UPDATE cayu_events" not in statements[0]
 
 
 @pytest.mark.parametrize(
@@ -1268,6 +1590,30 @@ def test_promotion_rejects_nonportable_runtime_phases_with_stable_codes(
     async def scenario():
         app, trajectory = await _run_trajectory(InMemorySessionStore())
         return app, _event_before_terminal(trajectory, event_type)
+
+    app, trajectory = asyncio.run(scenario())
+    _assert_rejection(app, trajectory, expected)
+
+
+@pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [
+        (
+            EventType.TOOL_CALL_APPROVAL_REQUESTED,
+            SessionPromotionErrorCode.APPROVAL_CONTINUATION_UNSUPPORTED,
+        ),
+        (EventType.SESSION_RESUMED, SessionPromotionErrorCode.SESSION_RESUME_UNSUPPORTED),
+        (EventType.SESSION_MESSAGE_QUEUED, SessionPromotionErrorCode.QUEUED_INPUT_UNSUPPORTED),
+        (
+            EventType.INTERACTION_STARTED,
+            SessionPromotionErrorCode.LATER_INTERACTION_UNSUPPORTED,
+        ),
+    ],
+)
+def test_promotion_rejects_nonportable_phases_in_descendants(event_type, expected):
+    async def scenario():
+        app, trajectory = await _run_trajectory(InMemorySessionStore())
+        return app, _completed_child_tree(trajectory, event_type)
 
     app, trajectory = asyncio.run(scenario())
     _assert_rejection(app, trajectory, expected)
@@ -1334,8 +1680,10 @@ def test_serialized_trajectory_cannot_forge_runtime_input_attestation():
     app, trajectory = asyncio.run(scenario())
     restored = type(trajectory).model_validate(trajectory.model_dump(mode="python"))
     assert restored.initial_input_message_count is None
+    assert restored.initial_input_messages_sha256 is None
     assert restored.structured_output_requested is None
     assert restored.input_redactions_applied is None
+    assert restored._promotion_capture_sha256 is None
     _assert_rejection(
         app,
         restored,
