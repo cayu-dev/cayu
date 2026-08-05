@@ -648,6 +648,65 @@ class SessionDebugState(StrEnum):
     INTERRUPTION = "interruption"
 
 
+SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY = "input_contract"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInputContractEvidence:
+    """Runtime-owned facts needed to identify replayable fresh input."""
+
+    message_start_index: int
+    message_count: int
+    redactions_applied: bool
+    structured_output_requested: bool
+    messages_sha256: str
+
+
+def parse_session_input_contract_evidence(value: object) -> SessionInputContractEvidence:
+    """Parse one canonical versioned fresh-input contract marker."""
+
+    if type(value) is not str:
+        raise ValueError("input_contract must be a canonical string.")
+    parts = value.split(":")
+    if len(parts) != 7 or parts[0] != "v1" or parts[5] != "sha256":
+        raise ValueError("input_contract must use the supported v1 format.")
+    raw_start_index, raw_count, redaction_mode, output_mode, _, messages_sha256 = parts[1:]
+    max_integer = str(MAX_DURABLE_JSON_INTEGER)
+    parsed_integers: list[int] = []
+    for raw_value, field_name in (
+        (raw_start_index, "message start index"),
+        (raw_count, "message count"),
+    ):
+        if (
+            not raw_value
+            or not raw_value.isascii()
+            or not raw_value.isdecimal()
+            or (len(raw_value) > 1 and raw_value.startswith("0"))
+        ):
+            raise ValueError(f"input_contract {field_name} must be canonical.")
+        if len(raw_value) > len(max_integer) or (
+            len(raw_value) == len(max_integer) and raw_value > max_integer
+        ):
+            raise ValueError(f"input_contract {field_name} exceeds the durable integer limit.")
+        parsed_integers.append(int(raw_value))
+    start_index, count = parsed_integers
+    if redaction_mode not in {"original", "redacted"}:
+        raise ValueError("input_contract redaction mode is unsupported.")
+    if output_mode not in {"text", "structured"}:
+        raise ValueError("input_contract output mode is unsupported.")
+    if len(messages_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in messages_sha256
+    ):
+        raise ValueError("input_contract message digest must be lowercase SHA-256.")
+    return SessionInputContractEvidence(
+        message_start_index=start_index,
+        message_count=count,
+        redactions_applied=redaction_mode == "redacted",
+        structured_output_requested=output_mode == "structured",
+        messages_sha256=messages_sha256,
+    )
+
+
 def _empty_run_request_authority() -> frozenset[tuple[str, str]]:
     return frozenset()
 
@@ -692,6 +751,7 @@ class RunRequest(BaseModel):
     _runtime_generated_authority: frozenset[tuple[str, str]] = PrivateAttr(
         default_factory=_empty_run_request_authority
     )
+    _input_redactions_applied: bool = PrivateAttr(default=False)
 
     @field_validator("messages")
     @classmethod
@@ -766,6 +826,43 @@ class RunRequest(BaseModel):
         if self.task_worker_id is not None and self.task_id is None:
             raise ValueError("RunRequest.task_worker_id requires task_id.")
         return self
+
+
+def session_input_messages_sha256(messages: Sequence[Message]) -> str:
+    """Hash the exact canonical messages crossing the fresh-run input boundary."""
+
+    if type(messages) not in {list, tuple}:
+        raise TypeError("messages must be a list or tuple.")
+    document: list[dict[str, Any]] = []
+    for message in messages:
+        if type(message) is not Message:
+            raise TypeError("messages must contain exact Message instances.")
+        document.append(message.model_dump(mode="json"))
+    return sha256(canonical_durable_json_bytes(document, "messages")).hexdigest()
+
+
+def session_input_contract_evidence(
+    request: RunRequest,
+    *,
+    message_start_index: int,
+) -> str:
+    """Return the canonical runtime-owned fresh-input contract for one request."""
+
+    if type(request) is not RunRequest:
+        raise TypeError("request must be an exact RunRequest.")
+    if type(message_start_index) is not int:
+        raise TypeError("message_start_index must be an integer.")
+    if not 0 <= message_start_index <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("message_start_index exceeds the durable integer limit.")
+    if len(request.messages) > MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("messages exceeds the durable message-count limit.")
+    redaction_mode = "redacted" if request._input_redactions_applied else "original"
+    output_mode = "structured" if request.structured_output is not None else "text"
+    messages_sha256 = session_input_messages_sha256(request.messages)
+    return (
+        f"v1:{message_start_index}:{len(request.messages)}:{redaction_mode}:"
+        f"{output_mode}:sha256:{messages_sha256}"
+    )
 
 
 class ResumeRequest(BaseModel):
@@ -10853,6 +10950,7 @@ def copy_run_request(request: RunRequest) -> RunRequest:
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
     copied._runtime_generated_authority = request._runtime_generated_authority
+    copied._input_redactions_applied = request._input_redactions_applied
     return copied
 
 
@@ -14154,19 +14252,22 @@ def _validate_runtime_publication_durable_material(
             )
 
 
-def _origin_lineage_authority_fields(event_type: EventType | str) -> tuple[str, ...]:
+def _persisted_event_authority_fields(event_type: EventType | str) -> tuple[str, ...]:
     if event_type == EventType.SESSION_STARTED:
-        return ("parent_session_id",)
+        return (
+            "parent_session_id",
+            SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+        )
     if event_type == EventType.SESSION_FORKED:
         return ("parent_session_id", "source_session_id")
     return ()
 
 
 def _copy_event_for_session_store(event: Event) -> Event:
-    """Strip caller-authored origin linkage before it becomes durable evidence."""
+    """Strip caller-authored durable authority before persistence."""
 
     copied = copy_event(event)
-    authority_fields = _origin_lineage_authority_fields(copied.type)
+    authority_fields = _persisted_event_authority_fields(copied.type)
     if not authority_fields:
         return copied
     payload = copy_durable_json_object(copied.payload, "event payload")
@@ -14185,12 +14286,31 @@ def _copy_event_for_session_store(event: Event) -> Event:
     return copied if not changed else copied.model_copy(update={"payload": payload})
 
 
-def restore_persisted_origin_lineage_authority(event: Event) -> Event:
+def _event_input_contract_is_runtime_owned(event: Event) -> bool:
+    """Return whether one sanitized event carries the runtime-owned input marker."""
+
+    if type(event) is not Event:
+        raise TypeError("event must be an exact Event.")
+    if event.type != EventType.SESSION_STARTED:
+        return False
+    marker = event.payload.get(SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY)
+    return type(marker) is str and event_payload_authority_is_runtime_generated(
+        event,
+        field_name=SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+        value=marker,
+    )
+
+
+def restore_persisted_event_authority(
+    event: Event,
+    *,
+    input_contract_runtime_owned: bool = False,
+) -> Event:
     """Restore private authority proven by the built-in store ingestion boundary.
 
-    Every built-in path capable of persisting an origin event routes through
+    Every built-in path capable of persisting an authoritative event field routes through
     :func:`_copy_event_for_session_store`, either as an ordinary event batch or
-    through ``RuntimePublicationRequest``. A retained origin linkage field could
+    through ``RuntimePublicationRequest``. A retained authority field could
     therefore only have crossed a persistence boundary with exact runtime
     authority. SQL serialization does not retain Pydantic private attributes;
     raw-record decoders use this helper to reconstruct that already-proven
@@ -14198,10 +14318,15 @@ def restore_persisted_origin_lineage_authority(event: Event) -> Event:
     """
 
     copied = copy_event(event)
+    if type(input_contract_runtime_owned) is not bool:
+        raise TypeError("input_contract_runtime_owned must be a bool.")
     fields = tuple(
         field_name
-        for field_name in _origin_lineage_authority_fields(copied.type)
+        for field_name in _persisted_event_authority_fields(copied.type)
         if type(copied.payload.get(field_name)) is str
+        and (
+            field_name != SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY or input_contract_runtime_owned
+        )
     )
     return event_with_runtime_payload_authority(copied, *fields) if fields else copied
 

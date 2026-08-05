@@ -439,6 +439,33 @@ session lineage. The lineage projection contains only pre-hydration-bounded
 structural identity and payload-free origin-event fingerprints; Cayu does not
 fall back to full topology objects or payload-bearing event reads.
 
+`promotable_run_input(app, trajectory, source_agent_name=...)` is the narrower
+automatic portable-corpus boundary. It returns a bounded, redacted
+`PromotableRunInputV1` only when the configured source agent matches and the
+captured tree is complete and quiescent. The root and all descendants may be
+completed or failed; a failed run remains useful as a regression to fix.
+
+Schema v1 accepts exactly one fresh invocation containing one or more
+caller-supplied user messages with exactly one text part per message. It rejects
+resumes, approval continuations, queued or later input, structured output,
+caller-supplied system/assistant/tool messages, and file or other structured parts
+with stable `SessionPromotionErrorCode` values. These rules affect automatic
+portable promotion only: normal Cayu sessions and direct Python evals retain all
+of those capabilities, while runtime tool calls, artifacts, and admitted child
+agents remain eligible. Tool calls and child status remain available as portable
+assertion evidence; corpus v1 does not silently infer replay input or an artifact
+assertion from uncaptured state.
+
+The initial-input boundary is a single versioned runtime-attested fact emitted by
+new runs and preserved by the built-in stores. Caller-authored copies are stripped
+before persistence. The marker and its private interpretation are intentionally
+absent from serialized trajectories, so a detached or older trajectory cannot
+guess which transcript messages were caller input; it fails closed as
+`input_evidence_unavailable` instead. Multiple text parts reject because their
+provider-specific boundaries cannot be represented exactly by corpus v1's single
+text field. The resulting sanitized input and redaction fact carry one exact
+content revision.
+
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable
 transcript order rather than scheduler event timing, so parallel tool execution

@@ -96,6 +96,13 @@ from cayu.evals.models import (
 )
 from cayu.evals.portable_assertions import compile_assertion_spec
 from cayu.evals.portable_evaluation import evaluate_assertion_spec, evaluate_assertion_specs
+from cayu.evals.promotion import (
+    PROMOTABLE_RUN_INPUT_SCHEMA_VERSION,
+    PromotableRunInputV1,
+    SessionPromotionError,
+    SessionPromotionErrorCode,
+    promotable_run_input,
+)
 from cayu.evals.published import (
     PUBLISHED_EVAL_MAX_BYTES,
     PUBLISHED_EVAL_SCHEMA_VERSION,
@@ -167,6 +174,7 @@ __all__ = [
     "EVAL_CORPUS_SCHEMA_VERSION",
     "EVAL_SCHEMA_VERSION",
     "PRICING_PROFILE_SEMANTICS_VERSION",
+    "PROMOTABLE_RUN_INPUT_SCHEMA_VERSION",
     "PUBLISHED_EVAL_MAX_BYTES",
     "PUBLISHED_EVAL_SCHEMA_VERSION",
     "TRAJECTORY_SCHEMA_VERSION",
@@ -216,6 +224,7 @@ __all__ = [
     "MaxTotalTokensAssertionSpec",
     "PricingProfileIdentityV1",
     "ProbeRequirements",
+    "PromotableRunInputV1",
     "PublishedAssertionDetail",
     "PublishedAssertionResult",
     "PublishedChildStatusDetail",
@@ -239,6 +248,8 @@ __all__ = [
     "SessionCompleted",
     "SessionFailed",
     "SessionInterrupted",
+    "SessionPromotionError",
+    "SessionPromotionErrorCode",
     "SessionStatusIs",
     "SessionTrajectoryBounds",
     "SessionTrajectoryError",
@@ -276,6 +287,7 @@ __all__ = [
     "load_trajectory",
     "pricing_profile_identity",
     "project_assertion_evidence_view",
+    "promotable_run_input",
     "publish_eval_run",
     "render_comparison_html",
     "render_html_report",

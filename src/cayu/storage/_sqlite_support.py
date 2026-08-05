@@ -181,6 +181,8 @@ _BASELINE_DDL = """
         workflow_name TEXT,
         tool_name TEXT,
         payload_json TEXT NOT NULL,
+        input_contract_runtime_owned INTEGER NOT NULL DEFAULT 0
+            CHECK (input_contract_runtime_owned IN (0, 1)),
         pending_action_lookup_key TEXT,
         pending_action_projection_json TEXT,
         pending_action_projection_bytes INTEGER,
@@ -1324,6 +1326,13 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
         ("cayu_transcript_messages", "interaction_id", "TEXT"),
         ("cayu_sessions", "transcript_seq", "INTEGER NOT NULL DEFAULT 0"),
         ("cayu_transcript_messages", "session_order", "INTEGER"),
+    ),
+    31: (
+        (
+            "cayu_events",
+            "input_contract_runtime_owned",
+            "INTEGER NOT NULL DEFAULT 0 CHECK (input_contract_runtime_owned IN (0, 1))",
+        ),
     ),
 }
 

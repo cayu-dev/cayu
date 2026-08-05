@@ -68,6 +68,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         tool_name TEXT,
         payload JSONB NOT NULL,
         event JSONB NOT NULL,
+        input_contract_runtime_owned BOOLEAN NOT NULL DEFAULT FALSE,
         pending_action_lookup_key TEXT,
         pending_action_projection JSONB,
         pending_action_projection_bytes BIGINT,

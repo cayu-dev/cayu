@@ -1926,7 +1926,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 27"):
@@ -1988,6 +1988,14 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name = 'cayu_public_authority_alias_keys'"
         ).fetchone()
+        input_contract_proof_revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 31"
+        ).fetchone()
+        input_contract_proof_column = connection.execute(
+            'SELECT name, type, "notnull", dflt_value '
+            "FROM pragma_table_info('cayu_events') "
+            "WHERE name = 'input_contract_runtime_owned'"
+        ).fetchone()
         task_session_topology_index = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_cayu_tasks_session_created_id'"
@@ -2019,6 +2027,13 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     assert public_authority_revision == ("breaking", 28)
     assert public_authority_table == ("cayu_public_authority_aliases",)
     assert public_authority_keys_table == ("cayu_public_authority_alias_keys",)
+    assert input_contract_proof_revision == ("breaking", 31)
+    assert input_contract_proof_column == (
+        "input_contract_runtime_owned",
+        "INTEGER",
+        1,
+        "0",
+    )
     assert task_session_topology_index == ("idx_cayu_tasks_session_created_id",)
     assert task_parent_topology_index == ("idx_cayu_tasks_parent_created_id",)
     assert legacy_writer_trigger is None
@@ -2052,7 +2067,7 @@ def test_sqlite_session_store_rejects_populated_revision_thirteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2098,7 +2113,7 @@ def test_sqlite_session_store_rejects_populated_revision_fourteen_database(tmp_p
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
         SQLiteSessionStore(db_path)
 
     with pytest.raises(schema_migrations.SchemaTooOld, match="clean prerelease break"):
@@ -2137,7 +2152,7 @@ def test_sqlite_revision_seventeen_requires_session_operation_migration(tmp_path
     finally:
         connection.close()
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 29"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
         SQLiteSessionStore(db_path)
 
     migrated = SQLiteSessionStore(
@@ -2594,6 +2609,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (28, 28),
         (29, 28),
         (30, 28),
+        (31, 31),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

@@ -191,6 +191,10 @@ REVISIONS: tuple[Revision, ...] = (
     # collation so its keyset order matches memory, SQLite, and Python validation.
     # The indexed source columns and write contract are unchanged.
     Revision(revision=30, kind=RevisionKind.ADDITIVE, compatible_from=28),
+    # Runtime-attested fresh-input markers add a private event-payload field and
+    # an explicit SQL proof bit. Pre-31 readers do not remove that marker at the
+    # public projection boundary, so they must not share a revision-31 database.
+    Revision(revision=31, kind=RevisionKind.BREAKING, compatible_from=31),
 )
 
 #: The revision an empty database is initialized to.

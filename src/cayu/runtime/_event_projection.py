@@ -60,6 +60,7 @@ class EventPayloadPolicy:
     owned_keys: frozenset[str] = frozenset()
     owned_nested_paths: frozenset[tuple[str, ...]] = frozenset()
     authority_keys: frozenset[str] = frozenset()
+    internal_authority_keys: frozenset[str] = frozenset()
     public_authority_keys: frozenset[str] = frozenset()
     aliased_authority_keys: frozenset[str] = frozenset()
     nested_authority_paths: frozenset[tuple[str, ...]] = frozenset()
@@ -73,6 +74,12 @@ class EventPayloadPolicy:
             raise ValueError("Event authority keys must also be owned keys.")
         if not self.public_authority_keys <= self.authority_keys:
             raise ValueError("Public event authority keys must also be authority keys.")
+        if not self.internal_authority_keys <= self.authority_keys:
+            raise ValueError("Internal event authority keys must also be authority keys.")
+        if self.internal_authority_keys & (
+            self.public_authority_keys | self.aliased_authority_keys
+        ):
+            raise ValueError("Internal event authority cannot be public or aliased.")
         if not self.aliased_authority_keys <= self.authority_keys:
             raise ValueError("Aliased event authority keys must also be authority keys.")
         if self.public_authority_keys & self.aliased_authority_keys:
@@ -396,6 +403,7 @@ def _policy(
     *owned_keys: str,
     owned_nested_paths: Collection[tuple[str, ...]] = (),
     authority_keys: Collection[str] = (),
+    internal_authority_keys: Collection[str] = (),
     public_authority_keys: Collection[str] = (),
     aliased_authority_keys: Collection[str] = (),
     nested_authority_paths: Collection[tuple[str, ...]] = (),
@@ -416,6 +424,7 @@ def _policy(
         # rejected or renamed under short-secret key collisions.
         owned_nested_paths=(frozenset(owned_nested_paths) | nested_authority | nested_untrusted),
         authority_keys=authority,
+        internal_authority_keys=frozenset(internal_authority_keys),
         public_authority_keys=frozenset(public_authority_keys),
         aliased_authority_keys=frozenset(aliased_authority_keys),
         nested_authority_paths=nested_authority,
@@ -435,6 +444,7 @@ def _observed_policy(
     *,
     owned_nested_paths: Collection[tuple[str, ...]] = (),
     authority_keys: Collection[str] = (),
+    internal_authority_keys: Collection[str] = (),
     public_authority_keys: Collection[str] = (),
     aliased_authority_keys: Collection[str] = (),
     nested_authority_paths: Collection[tuple[str, ...]] = (),
@@ -461,6 +471,7 @@ def _observed_policy(
         *owned,
         owned_nested_paths=owned_nested_paths,
         authority_keys=explicit_authority,
+        internal_authority_keys=internal_authority_keys,
         public_authority_keys=public_authority_keys,
         aliased_authority_keys=aliased_authority_keys,
         nested_authority_paths=nested_authority_paths,
@@ -1408,7 +1419,9 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "environment_factory_release",
     }
     policies[EventType.SESSION_STARTED] = _observed_policy(
-        "agent_name parent_session_id traceparent tracestate"
+        "agent_name input_contract parent_session_id traceparent tracestate",
+        authority_keys={"input_contract"},
+        internal_authority_keys={"input_contract"},
     )
     policies[EventType.SESSION_RESUMED] = _observed_policy(
         "agent_name appended_messages approval_id decision dispatch_id expired input_id "
@@ -2163,6 +2176,9 @@ def _project_runtime_event(
     )
     for key in policy.authority_keys:
         if key not in redacted_payload or redacted_payload[key] is None:
+            continue
+        if key in policy.internal_authority_keys:
+            redacted_payload.pop(key)
             continue
         if key in policy.public_authority_keys:
             continue

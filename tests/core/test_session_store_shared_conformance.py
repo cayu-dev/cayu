@@ -141,6 +141,7 @@ from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.sessions import (
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
     PersistedEventSideEffectDelivery,
     _checkpoint_with_session_run_operation,
@@ -5782,7 +5783,7 @@ def test_session_store_conformance_runtime_publication_first_commit_and_stale_re
     asyncio.run(run())
 
 
-def test_session_store_conformance_runtime_publication_sanitizes_origin_lineage(
+def test_session_store_conformance_runtime_publication_sanitizes_caller_authority(
     session_store_case,
 ) -> None:
     async def run() -> None:
@@ -5812,7 +5813,12 @@ def test_session_store_conformance_runtime_publication_sanitizes_origin_lineage(
                 id="caller-authored-session-started",
                 type=EventType.SESSION_STARTED,
                 session_id=child_session_id,
-                payload={"parent_session_id": parent_session_id},
+                payload={
+                    "parent_session_id": parent_session_id,
+                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: (
+                        "v1:0:1:original:text:sha256:" + "0" * 64
+                    ),
+                },
             )
             request_template = RuntimePublicationRequest(
                 publication_id="caller-authored-origin-publication",
@@ -5849,6 +5855,7 @@ def test_session_store_conformance_runtime_publication_sanitizes_origin_lineage(
             )
             assert len(records) == 1
             assert "parent_session_id" not in records[0].event.payload
+            assert SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY not in records[0].event.payload
 
             equivalent_request = RuntimePublicationRequest(
                 publication_id="caller-authored-origin-publication",
@@ -5859,6 +5866,10 @@ def test_session_store_conformance_runtime_publication_sanitizes_origin_lineage(
                 events=(caller_authored_origin,),
             )
             assert "parent_session_id" not in equivalent_request.events[0].payload
+            assert (
+                SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY
+                not in equivalent_request.events[0].payload
+            )
             replayed = await store.publish_runtime_publication(
                 child_session_id,
                 request=equivalent_request,

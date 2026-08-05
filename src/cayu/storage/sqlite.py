@@ -6,7 +6,7 @@ import hmac
 import json
 import math
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar, cast
@@ -145,6 +145,7 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+    _event_input_contract_is_runtime_owned,
     _initial_transcript_pending_checkpoint,
     _interaction_transition_receipt_record,
     _interaction_transition_storage_key,
@@ -232,7 +233,7 @@ from cayu.runtime.sessions import (
     fork_transcript_is_accepted,
     replace_session_user_metadata,
     resolve_interaction_attribution,
-    restore_persisted_origin_lineage_authority,
+    restore_persisted_event_authority,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -281,7 +282,7 @@ from cayu.storage import migrations as schema
 
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
-_SQLITE_SESSION_MIN_REQUIRED_REVISION = 29
+_SQLITE_SESSION_MIN_REQUIRED_REVISION = 31
 _SQLITE_TASK_TOPOLOGY_MIN_REQUIRED_REVISION = 27
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
@@ -811,6 +812,7 @@ _EVENT_COLUMN_NAMES: tuple[str, ...] = (
     "workflow_name",
     "tool_name",
     "payload_json",
+    "input_contract_runtime_owned",
 )
 
 # Keep this predicate text aligned with the revision-17 partial index. SQLite
@@ -833,7 +835,13 @@ _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
 
 def _event_from_row(row: sqlite3.Row) -> Event:
     """Reconstruct an :class:`Event` from its individual cayu_events columns."""
-    return restore_persisted_origin_lineage_authority(
+    input_contract_runtime_owned = row["input_contract_runtime_owned"]
+    if type(input_contract_runtime_owned) is not int or input_contract_runtime_owned not in {
+        0,
+        1,
+    }:
+        raise ValueError("Stored input-contract authority proof is malformed.")
+    return restore_persisted_event_authority(
         Event(
             type=row["event_type"],
             session_id=row["session_id"],
@@ -845,7 +853,8 @@ def _event_from_row(row: sqlite3.Row) -> Event:
             workflow_name=row["workflow_name"],
             tool_name=row["tool_name"],
             payload=json.loads(row["payload_json"]),
-        )
+        ),
+        input_contract_runtime_owned=input_contract_runtime_owned == 1,
     )
 
 
@@ -886,10 +895,30 @@ def _persisted_event_side_effect_delivery_from_row(
 def _enqueue_persisted_event_side_effects(
     connection: sqlite3.Connection,
     session_id: str,
-    event_ids: list[str],
+    events: Sequence[Event],
 ) -> None:
-    if not event_ids:
+    if not events:
         return
+    event_ids: list[str] = []
+    runtime_owned_input_contract_event_ids: list[str] = []
+    for event in events:
+        event_ids.append(event.id)
+        if _event_input_contract_is_runtime_owned(event):
+            runtime_owned_input_contract_event_ids.append(event.id)
+    # Rows predating revision 31 may contain caller-authored payload text but
+    # cannot carry the proof bit, so that text remains untrusted after migration.
+    if runtime_owned_input_contract_event_ids:
+        connection.executemany(
+            """
+            UPDATE cayu_events
+            SET input_contract_runtime_owned = 1
+            WHERE session_id = ?
+              AND event_id = ?
+              AND event_type = 'session.started'
+              AND json_type(payload_json, '$.input_contract') = 'text'
+            """,
+            [(session_id, event_id) for event_id in runtime_owned_input_contract_event_ids],
+        )
     connection.executemany(
         """
         INSERT INTO cayu_persisted_event_side_effects (
@@ -1602,7 +1631,7 @@ class SQLiteSessionStore(SessionStore):
                         _enqueue_persisted_event_side_effects(
                             self._connection,
                             session.id,
-                            [started_event.id],
+                            [started_event],
                         )
                         self._connection.execute(
                             "INSERT INTO cayu_deferred_interaction_inputs "
@@ -2385,7 +2414,7 @@ class SQLiteSessionStore(SessionStore):
                         _enqueue_persisted_event_side_effects(
                             self._connection,
                             session_id,
-                            [started_event.id],
+                            [started_event],
                         )
                     if defer_source:
                         self._connection.execute(
@@ -2749,7 +2778,7 @@ class SQLiteSessionStore(SessionStore):
                 _enqueue_persisted_event_side_effects(
                     connection,
                     session_id,
-                    [copied_event.id],
+                    [copied_event],
                 )
                 transitioned = _load_session(connection, session_id)
                 if transitioned is None:
@@ -2915,7 +2944,7 @@ class SQLiteSessionStore(SessionStore):
                     _enqueue_persisted_event_side_effects(
                         connection,
                         session_id,
-                        [event.id for event in copied_events],
+                        copied_events,
                     )
             except sqlite3.IntegrityError as exc:
                 existing_event_id = _first_existing_event_id(
@@ -3018,7 +3047,7 @@ class SQLiteSessionStore(SessionStore):
                 _enqueue_persisted_event_side_effects(
                     connection,
                     session_id,
-                    [copied_event.id],
+                    [copied_event],
                 )
                 connection.commit()
                 return True
@@ -3155,7 +3184,7 @@ class SQLiteSessionStore(SessionStore):
                 _enqueue_persisted_event_side_effects(
                     connection,
                     session_id,
-                    [event.id for event in copied_events],
+                    copied_events,
                 )
                 updated_at = sqlite_support.format_datetime(datetime.now(UTC))
                 for key, baseline in updates.items():
@@ -3585,7 +3614,7 @@ class SQLiteSessionStore(SessionStore):
                 _enqueue_persisted_event_side_effects(
                     connection,
                     request.session_id,
-                    [accepted_event.id],
+                    [accepted_event],
                 )
                 _touch_session_activity(connection, request.session_id, accepted_at)
                 connection.commit()
@@ -3869,7 +3898,7 @@ class SQLiteSessionStore(SessionStore):
                 _enqueue_persisted_event_side_effects(
                     connection,
                     session_id,
-                    [event.id for event in persisted_events],
+                    persisted_events,
                 )
                 _touch_session_activity(connection, session_id, delivered_at)
                 remaining_mode_sql = (
@@ -5114,7 +5143,7 @@ class SQLiteSessionStore(SessionStore):
                     _enqueue_persisted_event_side_effects(
                         connection,
                         session_id,
-                        [event.id for event in request.events],
+                        request.events,
                     )
                 connection.execute(
                     """
@@ -5427,7 +5456,7 @@ class SQLiteSessionStore(SessionStore):
                     _enqueue_persisted_event_side_effects(
                         connection,
                         session_id,
-                        [event.id for event in copied_events],
+                        copied_events,
                     )
                 if operation_commit_guard is not None:
                     operation_commit_guard()

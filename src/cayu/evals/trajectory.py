@@ -14,10 +14,12 @@ from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.evals.models import (
     Trajectory,
     TrajectoryProbes,
+    _trajectory_promotion_capture_sha256,
     _validate_trajectory_record_contract,
 )
 from cayu.runtime.app import CayuApp
 from cayu.runtime.sessions import (
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_EVENTS,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_RECORD_BYTES,
     TERMINAL_SESSION_EVIDENCE_DEFAULT_MAX_TOTAL_BYTES,
@@ -27,6 +29,7 @@ from cayu.runtime.sessions import (
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TOTAL_BYTES,
     TERMINAL_SESSION_EVIDENCE_HARD_MAX_TRANSCRIPT_RECORDS,
     Session,
+    SessionInputContractEvidence,
     SessionLineageNode,
     SessionLineageOrigin,
     SessionLineageQuery,
@@ -36,6 +39,7 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidenceError,
     TerminalSessionEvidenceErrorCode,
     TerminalSessionEvidenceLimits,
+    parse_session_input_contract_evidence,
 )
 from cayu.runtime.usage import SessionUsageSummary, session_usage_summary
 
@@ -420,10 +424,26 @@ def _project_terminal_evidence(
 ) -> tuple[Session, tuple[Event, ...], tuple[Message, ...], SessionUsageSummary]:
     """Build one trajectory node's assertion substrate from exact terminal evidence."""
 
-    events = tuple(record.event for record in evidence.events)
+    events = tuple(_trajectory_event(record.event) for record in evidence.events)
     transcript = tuple(record.message for record in evidence.transcript)
     usage_summary = session_usage_summary(evidence.session.id, list(events))
     return evidence.session, events, transcript, usage_summary
+
+
+def _trajectory_event(event: Event) -> Event:
+    """Remove runtime-only promotion facts from the serializable trajectory."""
+
+    if (
+        event.type != EventType.SESSION_STARTED
+        or SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY not in event.payload
+    ):
+        return event
+    payload = {
+        key: value
+        for key, value in event.payload.items()
+        if key != SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY
+    }
+    return event.model_copy(update={"payload": payload})
 
 
 def _trajectory_from_terminal_evidence(
@@ -449,6 +469,10 @@ def _trajectory_from_terminal_evidence(
             session_id=evidence.session.id,
             parent_session_id=evidence.session.parent_session_id,
         ) from exc
+    if trajectory.initial_input_message_count is not None:
+        # Bind only the finalized root. Hashing each subtree while recursive
+        # capture unwinds would revisit deep descendants once per ancestor.
+        trajectory._promotion_capture_sha256 = _trajectory_promotion_capture_sha256(trajectory)
     return trajectory
 
 
@@ -487,6 +511,13 @@ def _trajectory_node_from_terminal_evidence(
             session_id=evidence.session.id,
             parent_session_id=evidence.session.parent_session_id,
         ) from exc
+    input_contract = _attested_initial_input_contract(evidence)
+    if input_contract is not None:
+        node._initial_input_message_start_index = input_contract.message_start_index
+        node._initial_input_message_count = input_contract.message_count
+        node._initial_input_messages_sha256 = input_contract.messages_sha256
+        node._input_redactions_applied = input_contract.redactions_applied
+        node._structured_output_requested = input_contract.structured_output_requested
     # `node` and every child were independently validated from exact evidence.
     # The root-level record-contract pass below checks all cross-node invariants.
     return node.model_copy(
@@ -495,6 +526,30 @@ def _trajectory_node_from_terminal_evidence(
             "children_incomplete": children_incomplete,
         }
     )
+
+
+def _attested_initial_input_contract(
+    evidence: TerminalSessionEvidence,
+) -> SessionInputContractEvidence | None:
+    """Return only runtime-owned fresh-input attribution from exact evidence."""
+
+    started = tuple(
+        record.event for record in evidence.events if record.event.type == EventType.SESSION_STARTED
+    )
+    if len(started) != 1:
+        return None
+    event = started[0]
+    raw_contract = event.payload.get(SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY)
+    if type(raw_contract) is not str or not event_payload_authority_is_runtime_generated(
+        event,
+        field_name=SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+        value=raw_contract,
+    ):
+        return None
+    try:
+        return parse_session_input_contract_evidence(raw_contract)
+    except ValueError:
+        return None
 
 
 async def trajectory_from_session(

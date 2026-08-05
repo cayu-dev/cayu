@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -214,6 +214,7 @@ from cayu.runtime.sessions import (
     _current_session_run_epoch,
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
+    _event_input_contract_is_runtime_owned,
     _initial_transcript_pending_checkpoint,
     _interaction_transition_receipt_record,
     _interaction_transition_storage_key,
@@ -301,7 +302,7 @@ from cayu.runtime.sessions import (
     fork_transcript_is_accepted,
     replace_session_user_metadata,
     resolve_interaction_attribution,
-    restore_persisted_origin_lineage_authority,
+    restore_persisted_event_authority,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -387,7 +388,7 @@ from cayu.storage.memory import (
 _SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7363_686D & 0x7FFF_FFFF_FFFF_FFFF
 _SCHEMA_ADVISORY_LOCK_POLL_SECONDS = 0.25
 _POSTGRES_MIN_REQUIRED_REVISION = 18
-_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 30
+_POSTGRES_SESSION_MIN_REQUIRED_REVISION = 31
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _PENDING_ACTION_LOOKUP_INDEX_PREDICATE_SQL = """
     event_type IN (
@@ -1052,6 +1053,10 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
             retired_key_ids JSONB NOT NULL CHECK (jsonb_typeof(retired_key_ids) = 'array')
         )
         """,
+    ),
+    31: (
+        "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS "
+        "input_contract_runtime_owned BOOLEAN NOT NULL DEFAULT FALSE",
     ),
 }
 
@@ -6345,7 +6350,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await self._enqueue_persisted_event_side_effects(
                             cur,
                             session.id,
-                            [started_event.id],
+                            [started_event],
                         )
                         await cur.execute(
                             "INSERT INTO cayu_deferred_interaction_inputs "
@@ -7094,7 +7099,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             await self._enqueue_persisted_event_side_effects(
                                 cur,
                                 session_id,
-                                [started_event.id],
+                                [started_event],
                             )
                         if defer_source:
                             await cur.execute(
@@ -7369,7 +7374,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
-                        [copied_event.id],
+                        [copied_event],
                     )
                     transitioned = await self._load(cur, session_id)
                     if transitioned is None:
@@ -7756,7 +7761,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
-                        [event.id for event in copied_events],
+                        copied_events,
                     )
                 await conn.commit()
             except UniqueViolation as exc:
@@ -7900,7 +7905,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
-                        [copied_event.id],
+                        [copied_event],
                     )
                 await conn.commit()
                 return True
@@ -8078,7 +8083,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
-                        [event.id for event in copied_events],
+                        copied_events,
                     )
                     for key, baseline in updates.items():
                         await cur.execute(
@@ -8124,10 +8129,30 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     async def _enqueue_persisted_event_side_effects(
         cur: Any,
         session_id: str,
-        event_ids: list[str],
+        events: Sequence[Event],
     ) -> None:
-        if not event_ids:
+        if not events:
             return
+        event_ids: list[str] = []
+        runtime_owned_input_contract_event_ids: list[str] = []
+        for event in events:
+            event_ids.append(event.id)
+            if _event_input_contract_is_runtime_owned(event):
+                runtime_owned_input_contract_event_ids.append(event.id)
+        # Presence alone is not authority: rows predating revision 31 may contain
+        # caller-authored payload text but cannot carry this proof bit.
+        if runtime_owned_input_contract_event_ids:
+            await cur.execute(
+                """
+                UPDATE cayu_events
+                SET input_contract_runtime_owned = TRUE
+                WHERE session_id = %s
+                  AND event_id = ANY(%s)
+                  AND event_type = 'session.started'
+                  AND jsonb_typeof(payload -> 'input_contract') = 'string'
+                """,
+                (session_id, runtime_owned_input_contract_event_ids),
+            )
         await cur.execute(
             """
             INSERT INTO cayu_persisted_event_side_effects (
@@ -8558,7 +8583,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         request.session_id,
-                        [accepted_event.id],
+                        [accepted_event],
                     )
                     await cur.execute(
                         f"SELECT {_SESSION_MESSAGE_QUEUE_COLUMNS} "
@@ -8881,7 +8906,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     await self._enqueue_persisted_event_side_effects(
                         cur,
                         session_id,
-                        [event.id for event in persisted_events],
+                        persisted_events,
                     )
                     mode_clause = (
                         "delivery_mode IN ('next_turn', 'on_idle')"
@@ -10159,7 +10184,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await self._enqueue_persisted_event_side_effects(
                             cur,
                             session_id,
-                            [event.id for event in request.events],
+                            request.events,
                         )
                     await cur.execute(
                         """
@@ -10473,7 +10498,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await self._enqueue_persisted_event_side_effects(
                             cur,
                             session_id,
-                            [event.id for event in copied_events],
+                            copied_events,
                         )
                     if operation_commit_guard is not None:
                         operation_commit_guard()
@@ -11183,7 +11208,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
                     await cur.execute(
                         """
-                        SELECT sequence, event
+                        SELECT sequence, event, input_contract_runtime_owned
                         FROM cayu_events
                         WHERE session_id = %s AND sequence <= %s
                         ORDER BY sequence ASC
@@ -11208,8 +11233,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     events = tuple(
                         EventRecord(
                             sequence=row[0],
-                            event=restore_persisted_origin_lineage_authority(
-                                Event(**_json_obj(row[1]))
+                            event=restore_persisted_event_authority(
+                                Event(**_json_obj(row[1])),
+                                input_contract_runtime_owned=row[2],
                             ),
                         )
                         for row in event_rows

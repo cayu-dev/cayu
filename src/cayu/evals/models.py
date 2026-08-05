@@ -4,8 +4,9 @@ import hashlib
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from enum import Enum, StrEnum
 from typing import Any, Literal, TypeVar
 from uuid import uuid4
 
@@ -13,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -21,7 +23,11 @@ from pydantic import (
     model_validator,
 )
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    copy_json_value,
+    require_clean_nonblank,
+)
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType
 from cayu.core.messages import Message, MessageRole, TextPart
@@ -1059,6 +1065,42 @@ class Trajectory(BaseModel):
     # or hitting the page cap — so a partial `children` capture is never mistaken for "no more".
     children_incomplete: StrictBool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
+    _initial_input_message_start_index: int | None = PrivateAttr(default=None)
+    _initial_input_message_count: int | None = PrivateAttr(default=None)
+    _initial_input_messages_sha256: str | None = PrivateAttr(default=None)
+    _input_redactions_applied: bool | None = PrivateAttr(default=None)
+    _structured_output_requested: bool | None = PrivateAttr(default=None)
+    _promotion_capture_sha256: str | None = PrivateAttr(default=None)
+
+    @property
+    def initial_input_message_start_index(self) -> int | None:
+        """Runtime-attested transcript index where fresh-run caller input begins."""
+
+        return self._initial_input_message_start_index
+
+    @property
+    def initial_input_message_count(self) -> int | None:
+        """Runtime-attested fresh-run input count, absent from serialized trajectories."""
+
+        return self._initial_input_message_count
+
+    @property
+    def initial_input_messages_sha256(self) -> str | None:
+        """Runtime-attested fresh-run input digest, absent from serialized trajectories."""
+
+        return self._initial_input_messages_sha256
+
+    @property
+    def structured_output_requested(self) -> bool | None:
+        """Runtime-attested structured-output mode, absent from serialized trajectories."""
+
+        return self._structured_output_requested
+
+    @property
+    def input_redactions_applied(self) -> bool | None:
+        """Runtime-attested input-redaction mode, absent from serialized trajectories."""
+
+        return self._input_redactions_applied
 
     @field_validator("session", mode="before")
     @classmethod
@@ -1099,6 +1141,125 @@ class Trajectory(BaseModel):
     def validate_session_attribution(self) -> Trajectory:
         _validate_trajectory_session_attribution(self)
         return self
+
+
+def _trajectory_public_sha256(trajectory: Trajectory) -> str:
+    """Fingerprint every public field without materializing the complete tree again."""
+
+    if type(trajectory) is not Trajectory:
+        raise TypeError("trajectory must be an exact Trajectory.")
+    digest = hashlib.sha256()
+
+    def framed(marker: bytes, value: bytes = b"") -> None:
+        digest.update(marker)
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    def visit(value: Any) -> None:
+        if value is None:
+            framed(b"n")
+            return
+        if type(value) is bool:
+            framed(b"b", b"1" if value else b"0")
+            return
+        if isinstance(value, Enum):
+            enum_type = type(value)
+            framed(b"e", f"{enum_type.__module__}.{enum_type.__qualname__}".encode())
+            visit(value.value)
+            return
+        if type(value) is int:
+            framed(b"i", str(value).encode("ascii"))
+            return
+        if type(value) is float:
+            framed(b"f", value.hex().encode("ascii"))
+            return
+        if type(value) is Decimal:
+            framed(b"d", str(value).encode("ascii"))
+            return
+        if type(value) is str:
+            framed(b"s", value.encode("utf-8"))
+            return
+        if type(value) is bytes:
+            framed(b"y", value)
+            return
+        if type(value) is datetime:
+            framed(b"z", f"{value.isoformat()}:{value.fold}".encode("ascii"))
+            return
+        if type(value) is date:
+            framed(b"a", value.isoformat().encode("ascii"))
+            return
+        if isinstance(value, BaseModel):
+            model_type = type(value)
+            framed(b"m", f"{model_type.__module__}.{model_type.__qualname__}".encode())
+            framed(b"#", len(model_type.model_fields).to_bytes(8, "big"))
+            for field_name in model_type.model_fields:
+                framed(b"k", field_name.encode("utf-8"))
+                visit(getattr(value, field_name))
+            return
+        if isinstance(value, list | tuple):
+            framed(b"l" if isinstance(value, list) else b"t", len(value).to_bytes(8, "big"))
+            for item in value:
+                visit(item)
+            return
+        if isinstance(value, Mapping):
+            if any(type(key) is not str for key in value):
+                raise TypeError("trajectory mappings must use string keys")
+            framed(b"o", len(value).to_bytes(8, "big"))
+            for key in sorted(value):
+                framed(b"k", key.encode("utf-8"))
+                visit(value[key])
+            return
+        raise TypeError(f"Unsupported trajectory value type: {type(value).__name__}.")
+
+    visit(trajectory)
+    return digest.hexdigest()
+
+
+def _trajectory_promotion_capture_sha256(trajectory: Trajectory) -> str:
+    """Bind one public trajectory to its complete private promotion attestation."""
+
+    if type(trajectory) is not Trajectory:
+        raise TypeError("trajectory must be an exact Trajectory.")
+    start_index = trajectory.initial_input_message_start_index
+    message_count = trajectory.initial_input_message_count
+    messages_sha256 = trajectory.initial_input_messages_sha256
+    redactions_applied = trajectory.input_redactions_applied
+    structured_output_requested = trajectory.structured_output_requested
+    if (
+        type(start_index) is not int
+        or not 0 <= start_index <= MAX_DURABLE_JSON_INTEGER
+        or type(message_count) is not int
+        or not 0 <= message_count <= MAX_DURABLE_JSON_INTEGER
+    ):
+        raise ValueError("trajectory promotion input bounds are malformed")
+    if (
+        type(messages_sha256) is not str
+        or len(messages_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in messages_sha256)
+    ):
+        raise ValueError("trajectory promotion input digest is malformed")
+    if type(redactions_applied) is not bool or type(structured_output_requested) is not bool:
+        raise TypeError("trajectory promotion modes are malformed")
+
+    digest = hashlib.sha256()
+
+    def framed(label: bytes, value: bytes) -> None:
+        digest.update(len(label).to_bytes(2, "big"))
+        digest.update(label)
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    framed(b"domain", b"cayu.trajectory-promotion-capture.v1")
+    framed(b"public-trajectory-sha256", bytes.fromhex(_trajectory_public_sha256(trajectory)))
+    framed(b"message-start-index", str(start_index).encode("ascii"))
+    framed(b"message-count", str(message_count).encode("ascii"))
+    framed(b"messages-sha256", bytes.fromhex(messages_sha256))
+    framed(b"redactions-applied", b"1" if redactions_applied else b"0")
+    framed(
+        b"structured-output-requested",
+        b"1" if structured_output_requested else b"0",
+    )
+    return digest.hexdigest()
 
 
 def _validate_trajectory_session_attribution(trajectory: Trajectory) -> None:

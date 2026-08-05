@@ -69,6 +69,16 @@ def test_additive_revision_inherits_floor_breaking_raises_it():
     assert breaking.compatible_from == breaking.revision  # breaking floors at itself
 
 
+def test_revision_thirty_one_rejects_pre_input_contract_readers() -> None:
+    state = m.SchemaState(revision=31, compatible_from=31)
+
+    # Pre-31 readers do not know that input_contract is a private runtime marker
+    # and would expose it as ordinary event payload.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 31"):
+        m.validate(state, app_latest=30, app_min_supported=30)
+    m.validate(state, app_latest=31, app_min_supported=31)
+
+
 def test_revision_fourteen_remains_compatible_with_older_binaries() -> None:
     m.validate(
         m.SchemaState(revision=14, compatible_from=10),

@@ -263,6 +263,7 @@ from cayu.runtime.sessions import (
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
+    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     EnqueueSessionMessageResult,
@@ -313,6 +314,7 @@ from cayu.runtime.sessions import (
     copy_run_request,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
+    session_input_contract_evidence,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -2960,7 +2962,13 @@ class SessionEngine:
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
                 start_event_type=EventType.SESSION_STARTED,
-                start_event_payload={"agent_name": registered_agent.spec.name},
+                start_event_payload={
+                    "agent_name": registered_agent.spec.name,
+                    SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
+                        request,
+                        message_start_index=len(messages) - len(request.messages),
+                    ),
+                },
                 start_task_on_enter=not pre_run_task_started,
             )
         except BaseException as exc:
@@ -8034,6 +8042,15 @@ class SessionEngine:
                     )
                     if expected is not None and start_event.payload.get(field_name) == expected
                 )
+                if (
+                    start_event_type is EventType.SESSION_STARTED
+                    and type(start_event.payload.get(SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY))
+                    is str
+                ):
+                    lineage_fields = (
+                        *lineage_fields,
+                        SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
+                    )
                 if lineage_fields:
                     start_event = event_with_runtime_payload_authority(
                         start_event,

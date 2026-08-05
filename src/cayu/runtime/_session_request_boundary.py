@@ -105,13 +105,14 @@ def prepare_run_request(
             raise ValueError(
                 "labels contain a workload secret and cannot be used as durable session authority."
             )
-    return request.model_copy(
+    redacted_messages = redact_messages(
+        request.messages,
+        redactor=redactor,
+        field_name="messages",
+    )
+    prepared = request.model_copy(
         update={
-            "messages": redact_messages(
-                request.messages,
-                redactor=redactor,
-                field_name="messages",
-            ),
+            "messages": redacted_messages,
             "metadata": redact_json_object(
                 request.metadata,
                 field_name="metadata",
@@ -119,6 +120,11 @@ def prepare_run_request(
             ),
         },
     )
+    prepared._input_redactions_applied = request._input_redactions_applied or any(
+        original != redacted
+        for original, redacted in zip(request.messages, redacted_messages, strict=True)
+    )
+    return prepared
 
 
 def prepare_resume_request(
