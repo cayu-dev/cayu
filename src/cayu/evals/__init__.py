@@ -97,10 +97,13 @@ from cayu.evals.models import (
 from cayu.evals.portable_assertions import compile_assertion_spec
 from cayu.evals.portable_evaluation import evaluate_assertion_spec, evaluate_assertion_specs
 from cayu.evals.promotion import (
+    CAPTURED_RUN_SCORE_MAX_BYTES,
+    CAPTURED_RUN_SCORE_SCHEMA_VERSION,
     PROMOTABLE_RUN_INPUT_SCHEMA_VERSION,
     PROMOTION_CANDIDATE_MAX_BYTES,
     PROMOTION_CANDIDATE_SCHEMA_VERSION,
     PROMOTION_SOURCE_SCHEMA_VERSION,
+    CapturedRunScoreV1,
     PromotableRunInputV1,
     PromotionCandidateV1,
     PromotionSourceV1,
@@ -109,6 +112,7 @@ from cayu.evals.promotion import (
     SessionPromotionErrorCode,
     build_promotion_candidate,
     promotable_run_input,
+    score_promotion_candidate,
 )
 from cayu.evals.published import (
     PUBLISHED_EVAL_MAX_BYTES,
@@ -168,6 +172,8 @@ from cayu.evals.trajectory import (
 __all__ = [
     "ASSERTION_EVIDENCE_MAX_BYTES",
     "ASSERTION_EVIDENCE_SCHEMA_VERSION",
+    "CAPTURED_RUN_SCORE_MAX_BYTES",
+    "CAPTURED_RUN_SCORE_SCHEMA_VERSION",
     "EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE",
     "EVAL_CORPUS_MAX_BYTES",
     "EVAL_CORPUS_MAX_CASES",
@@ -193,6 +199,7 @@ __all__ = [
     "AssertionCostEvidenceV1",
     "AssertionEvidenceView",
     "AssertionSpec",
+    "CapturedRunScoreV1",
     "ChildSessionCompleted",
     "ChildStatusAssertionSpec",
     "CorpusUserMessageSpec",
@@ -308,6 +315,7 @@ __all__ = [
     "run_eval_case",
     "run_eval_plan",
     "run_eval_suite",
+    "score_promotion_candidate",
     "scripted_structured_output",
     "trajectory_from_session",
     "trajectory_to_json",

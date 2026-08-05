@@ -485,6 +485,17 @@ revision. It stays fixed across descriptive edits and contains no raw session ID
 Candidate configuration labels are rejected if the application redactor detects
 a workload secret.
 
+`score_promotion_candidate(...)` evaluates the reviewed case against that same
+captured evidence through `evaluate_assertion_specs(...)`; it does not introduce
+a second scorer. Before scoring, it rechecks the target, release, app manifest,
+promotion eligibility, evidence policy, and public evidence revision. A changed
+snapshot requires a new candidate. Only currencies requested by edited cost
+assertions are reprojected, and supplied pricing must match the candidate's exact
+`PricingProfileIdentityV1`. Missing or partially unpriced cost evidence produces
+an `unavailable` assertion and a null score—it cannot pass. The returned
+`CapturedRunScoreV1` contains bounded published assertion details and content
+revisions, never raw assertion metadata, exception text, or session identity.
+
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable
 transcript order rather than scheduler event timing, so parallel tool execution

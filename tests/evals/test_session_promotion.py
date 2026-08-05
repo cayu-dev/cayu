@@ -15,6 +15,7 @@ from cayu import (
     EventType,
     FilePart,
     InMemorySessionStore,
+    MaxEstimatedCostAssertionSpec,
     Message,
     MessageRole,
     ModelPrice,
@@ -37,9 +38,11 @@ from cayu import (
     StructuredOutputSpec,
     TextPart,
     ToolResultPart,
+    Trajectory,
     build_promotion_candidate,
     file_attachment,
     promotable_run_input,
+    score_promotion_candidate,
     scripted_structured_output,
     trajectory_from_session,
 )
@@ -47,6 +50,7 @@ from cayu.evals.models import _trajectory_promotion_capture_sha256
 from cayu.runtime.sessions import (
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     parse_session_input_contract_evidence,
+    session_input_messages_sha256,
 )
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -58,6 +62,24 @@ class _FailingModelProvider(ModelProvider):
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
         yield ModelStreamEvent.error("captured failure")
+
+
+class _RepeatableModelProvider(ModelProvider):
+    name = "fake"
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        del request
+        yield ModelStreamEvent.text_delta("same answer")
+        yield ModelStreamEvent.completed(
+            {
+                "finish_reason": "stop",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
 
 
 def test_versioned_input_contract_parser_rejects_noncanonical_markers():
@@ -161,7 +183,16 @@ async def _run_trajectory(
         provider = ScriptedModelProvider(
             [
                 ModelStreamEvent.text_delta("captured answer"),
-                ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "total_tokens": 15,
+                        },
+                    }
+                ),
             ],
             name="fake",
         )
@@ -183,6 +214,34 @@ async def _run_trajectory(
     ):
         pass
     return app, await trajectory_from_session(app, session_id)
+
+
+async def _run_repeatable_trajectories(
+    runs: tuple[tuple[str, str, str], ...],
+) -> tuple[CayuApp, dict[str, Trajectory]]:
+    app = CayuApp(session_store=InMemorySessionStore(), enable_logging=False)
+    app.register_provider(_RepeatableModelProvider(), default=True)
+    for agent_name in sorted({agent_name for _, agent_name, _ in runs}):
+        app.register_agent(
+            AgentSpec(
+                name=agent_name,
+                model="fake-model",
+                system_prompt="Same prompt.",
+            )
+        )
+
+    trajectories: dict[str, Trajectory] = {}
+    for session_id, agent_name, input_text in runs:
+        async for _ in app.run(
+            RunRequest(
+                agent_name=agent_name,
+                session_id=session_id,
+                messages=[Message.text("user", input_text)],
+            )
+        ):
+            pass
+        trajectories[session_id] = await trajectory_from_session(app, session_id)
+    return app, trajectories
 
 
 def _assert_rejection(
@@ -252,6 +311,227 @@ def test_promotable_input_survives_every_builtin_store_and_restart(promotion_sto
     assert promoted.redactions_applied is False
     assert promoted.to_run_input_spec().messages == promoted.messages
 
+    forged = promoted.model_copy(update={"revision": "sha256:" + "0" * 64})
+    with pytest.raises(ValueError, match="revision does not match"):
+        type(promoted).model_validate(forged.model_dump(mode="python"))
+
+
+def test_promotion_rejects_copied_trajectory_with_replaced_attested_input():
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore())
+
+    app, trajectory = asyncio.run(scenario())
+    transcript = list(trajectory.transcript)
+    source_index = next(
+        index for index, message in enumerate(transcript) if message.role is MessageRole.USER
+    )
+    transcript[source_index] = Message.text("user", "forged caller input")
+    changed = trajectory.model_copy(update={"transcript": tuple(transcript)})
+
+    assert changed.initial_input_messages_sha256 == trajectory.initial_input_messages_sha256
+    _assert_rejection(
+        app,
+        changed,
+        SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT,
+    )
+    with pytest.raises(SessionPromotionError) as captured:
+        build_promotion_candidate(
+            app,
+            changed,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-forged-input",
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        )
+    assert captured.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
+
+
+def test_promotion_capture_binds_the_selected_input_range_across_every_entry_point():
+    async def scenario():
+        return await _run_trajectory(
+            InMemorySessionStore(),
+            messages=[
+                Message.text("user", "first retained input"),
+                Message.text("user", "second silently dropped"),
+            ],
+        )
+
+    app, trajectory = asyncio.run(scenario())
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-attestation-range",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    start_index = trajectory.initial_input_message_start_index
+    assert start_index is not None
+    for selected_offset in (0, 1):
+        selected_start = start_index + selected_offset
+        forged = trajectory.model_copy(
+            update={
+                "_initial_input_message_start_index": selected_start,
+                "_initial_input_message_count": 1,
+                "_initial_input_messages_sha256": session_input_messages_sha256(
+                    trajectory.transcript[selected_start : selected_start + 1]
+                ),
+            }
+        )
+        assert forged.initial_input_message_start_index == selected_start
+        assert forged.initial_input_message_count == 1
+        assert forged._promotion_capture_sha256 == trajectory._promotion_capture_sha256
+
+        _assert_rejection(
+            app,
+            forged,
+            SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT,
+        )
+        with pytest.raises(SessionPromotionError) as candidate_error:
+            build_promotion_candidate(
+                app,
+                forged,
+                target_key="assistant",
+                source_agent_name="assistant",
+                application_release_id="release-attestation-range",
+                evidence_policy=EvaluationEvidencePolicySpec.standard(),
+            )
+        assert candidate_error.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
+        with pytest.raises(SessionPromotionError) as score_error:
+            score_promotion_candidate(
+                app,
+                forged,
+                candidate,
+                target_key="assistant",
+                source_agent_name="assistant",
+                application_release_id="release-attestation-range",
+            )
+        assert score_error.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    [
+        ("_input_redactions_applied", True),
+        ("_structured_output_requested", True),
+    ],
+)
+def test_promotion_capture_binds_private_input_modes(field_name, changed_value):
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore())
+
+    app, trajectory = asyncio.run(scenario())
+    changed = trajectory.model_copy(update={field_name: changed_value})
+    assert getattr(changed, field_name) is changed_value
+    assert changed._promotion_capture_sha256 == trajectory._promotion_capture_sha256
+
+    _assert_rejection(
+        app,
+        changed,
+        SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT,
+    )
+
+
+def test_promotion_rejects_attestation_transplanted_between_same_input_captures():
+    async def scenario():
+        return await _run_repeatable_trajectories(
+            (
+                ("attestation-donor", "assistant", "same production input"),
+                ("detached-target", "assistant", "same production input"),
+            )
+        )
+
+    app, trajectories = asyncio.run(scenario())
+    donor = trajectories["attestation-donor"]
+    target = trajectories["detached-target"]
+    candidate = build_promotion_candidate(
+        app,
+        target,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-attestation-transplant",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    detached_target = Trajectory.model_validate(target.model_dump(mode="python"))
+    assert detached_target.initial_input_message_count is None
+    transplanted = donor.model_copy(
+        update={
+            field_name: getattr(detached_target, field_name)
+            for field_name in Trajectory.model_fields
+        }
+    )
+    assert transplanted.session is not None
+    assert transplanted.session.id == "detached-target"
+    assert transplanted.initial_input_messages_sha256 == donor.initial_input_messages_sha256
+
+    _assert_rejection(
+        app,
+        transplanted,
+        SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT,
+    )
+    with pytest.raises(SessionPromotionError) as candidate_error:
+        build_promotion_candidate(
+            app,
+            transplanted,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-attestation-transplant",
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        )
+    assert candidate_error.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
+    with pytest.raises(SessionPromotionError) as score_error:
+        score_promotion_candidate(
+            app,
+            transplanted,
+            candidate,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-attestation-transplant",
+        )
+    assert score_error.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
+
+
+def test_promotion_rejects_malformed_copied_trajectory_as_invalid():
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore())
+
+    app, trajectory = asyncio.run(scenario())
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-malformed-trajectory",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    malformed = trajectory.model_copy(update={"transcript": ("not-a-message",)})
+
+    _assert_rejection(
+        app,
+        malformed,
+        SessionPromotionErrorCode.INVALID_TRAJECTORY,
+    )
+    with pytest.raises(SessionPromotionError) as captured:
+        build_promotion_candidate(
+            app,
+            malformed,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-malformed-trajectory",
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        )
+    assert captured.value.code is SessionPromotionErrorCode.INVALID_TRAJECTORY
+    with pytest.raises(SessionPromotionError) as score_error:
+        score_promotion_candidate(
+            app,
+            malformed,
+            candidate,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-malformed-trajectory",
+        )
+    assert score_error.value.code is SessionPromotionErrorCode.INVALID_TRAJECTORY
+
 
 def test_failed_session_input_is_still_eligible_for_a_regression_case():
     async def scenario():
@@ -279,6 +559,17 @@ def test_failed_session_input_is_still_eligible_for_a_regression_case():
     default_assertion = candidate.case.assertions[0]
     assert type(default_assertion) is RootStatusAssertionSpec
     assert default_assertion.expected == "completed"
+    score = score_promotion_candidate(
+        app,
+        trajectory,
+        candidate,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-failed",
+    )
+    assert score.status == "failed"
+    assert score.score == 0.0
+    assert score.assertions[0].outcome == "failed"
 
 
 def test_candidate_projection_is_deterministic_editable_and_identity_free():
@@ -318,16 +609,92 @@ def test_candidate_projection_is_deterministic_editable_and_identity_free():
     assert candidate.suite.id == "assistant.regressions"
     serialized = candidate.model_dump_json()
     assert "private-session-must-not-leak" not in serialized
+    score = score_promotion_candidate(
+        app,
+        trajectory,
+        candidate,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+    )
+    repeated_score = score_promotion_candidate(
+        app,
+        trajectory,
+        candidate,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+    )
+    assert score == repeated_score
+    assert score.status == "passed"
+    assert score.score == 1.0
+    assert "private-session-must-not-leak" not in score.model_dump_json()
+    changed_trajectory = trajectory.model_copy(
+        update={
+            "transcript": (
+                *trajectory.transcript[:-1],
+                Message.text("assistant", "changed after preview"),
+            ),
+            "final_output": "changed after preview",
+        }
+    )
+    _assert_rejection(
+        app,
+        changed_trajectory,
+        SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT,
+    )
+    with pytest.raises(SessionPromotionError) as changed_candidate_error:
+        build_promotion_candidate(
+            app,
+            changed_trajectory,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-2026-08-05",
+            evidence_policy=policy,
+        )
+    assert (
+        changed_candidate_error.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
+    )
+    with pytest.raises(SessionPromotionError) as changed_evidence_error:
+        score_promotion_candidate(
+            app,
+            changed_trajectory,
+            candidate,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-2026-08-05",
+        )
+    assert (
+        changed_evidence_error.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
+    )
+
+    changed_transcript = list(trajectory.transcript)
+    assert changed_transcript[1].role is MessageRole.USER
+    changed_transcript[1] = Message.text("user", "changed after preview")
+    changed_input = trajectory.model_copy(update={"transcript": tuple(changed_transcript)})
+    with pytest.raises(SessionPromotionError) as changed_input_error:
+        score_promotion_candidate(
+            app,
+            changed_input,
+            candidate,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-2026-08-05",
+        )
+    assert changed_input_error.value.code is SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT
 
     restored = PromotionCandidateV1.model_validate_json(serialized)
     assert restored == candidate
+    edited_input = type(candidate.case.input)(
+        messages=(type(candidate.case.input.messages[0])(text="operator-edited replay input"),)
+    )
     edited_case = type(candidate.case).create(
         id=candidate.case.id,
         suite_id=candidate.case.suite_id,
         name="Operator-edited regression",
         description=candidate.case.description,
         source=candidate.case.source,
-        input=candidate.case.input,
+        input=edited_input,
         assertions=candidate.case.assertions,
     )
     edited = PromotionCandidateV1.create(
@@ -342,10 +709,25 @@ def test_candidate_projection_is_deterministic_editable_and_identity_free():
     assert edited.case.id == candidate.case.id
     assert edited.case.revision != candidate.case.revision
     assert edited.revision != candidate.revision
+    edited_score = score_promotion_candidate(
+        app,
+        trajectory,
+        edited,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+    )
+    assert edited_score.status == "passed"
 
     forged_revision = candidate.model_copy(update={"revision": "sha256:" + "0" * 64})
     with pytest.raises(ValueError, match="revision does not match"):
         PromotionCandidateV1.model_validate(forged_revision.model_dump(mode="python"))
+
+    forged_warning = candidate.model_copy(
+        update={"warnings": (PromotionWarningCode.SOURCE_RUN_FAILED,)}
+    )
+    with pytest.raises(ValueError, match="warnings do not match"):
+        PromotionCandidateV1.model_validate(forged_warning.model_dump(mode="python"))
 
     contradictory_source = candidate.source.model_copy(
         update={"evidence_revision": "sha256:" + "0" * 64}
@@ -360,6 +742,98 @@ def test_candidate_projection_is_deterministic_editable_and_identity_free():
             suite=candidate.suite,
             case=candidate.case,
         )
+
+
+def test_scoring_rejects_a_changed_application_redaction_boundary():
+    async def scenario():
+        app, trajectory = await _run_trajectory(InMemorySessionStore())
+        changed_app, _ = await _run_trajectory(
+            InMemorySessionStore(),
+            session_id="redaction-control",
+            messages=[Message.text("user", "unrelated control input")],
+            secret_redactor=SecretRedactor("promote this run"),
+        )
+        return app, changed_app, trajectory
+
+    app, changed_app, trajectory = asyncio.run(scenario())
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-redaction-boundary",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+
+    assert app.describe() == changed_app.describe()
+    with pytest.raises(ValueError, match="input evidence changed"):
+        score_promotion_candidate(
+            changed_app,
+            trajectory,
+            candidate,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-redaction-boundary",
+        )
+
+
+def test_scoring_rejects_a_different_source_agent_with_equal_evidence():
+    async def scenario():
+        return await _run_repeatable_trajectories(
+            (
+                ("session-agent-a", "agent-a", "same input"),
+                ("session-agent-b", "agent-b", "same input"),
+            )
+        )
+
+    app, trajectories = asyncio.run(scenario())
+    candidate = build_promotion_candidate(
+        app,
+        trajectories["session-agent-a"],
+        target_key="shared-target",
+        source_agent_name="agent-a",
+        application_release_id="release",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    assert candidate.source.source_agent_name == "agent-a"
+
+    with pytest.raises(ValueError, match="source agent does not match"):
+        score_promotion_candidate(
+            app,
+            trajectories["session-agent-b"],
+            candidate,
+            target_key="shared-target",
+            source_agent_name="agent-b",
+            application_release_id="release",
+        )
+
+
+def test_different_captured_inputs_get_distinct_default_case_ids():
+    async def scenario():
+        return await _run_repeatable_trajectories(
+            (
+                ("first-session", "agent", "first input"),
+                ("second-session", "agent", "second input"),
+            )
+        )
+
+    app, trajectories = asyncio.run(scenario())
+    candidates = tuple(
+        build_promotion_candidate(
+            app,
+            trajectories[session_id],
+            target_key="shared-target",
+            source_agent_name="agent",
+            application_release_id="release",
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        )
+        for session_id in ("first-session", "second-session")
+    )
+
+    assert candidates[0].evidence == candidates[1].evidence
+    assert candidates[0].source.input_revision != candidates[1].source.input_revision
+    assert candidates[0].case.id != candidates[1].case.id
+    assert candidates[0].case.revision != candidates[1].case.revision
 
 
 def test_long_target_key_uses_a_bounded_deterministic_suite_id():
@@ -407,6 +881,84 @@ def test_descriptive_label_and_pricing_do_not_change_default_case_identity():
     assert described.case.name == "Refund approval regression"
     assert described.pricing_profile is not None
     assert described.source.pricing_profile_fingerprint == described.pricing_profile.fingerprint
+
+
+def test_captured_cost_scoring_requires_the_reviewed_pricing_profile():
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore())
+
+    app, trajectory = asyncio.run(scenario())
+    pricing = _price_book()
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-priced",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        pricing=pricing,
+    )
+    priced_case = type(candidate.case).create(
+        id=candidate.case.id,
+        suite_id=candidate.case.suite_id,
+        name=candidate.case.name,
+        description=candidate.case.description,
+        source=candidate.case.source,
+        input=candidate.case.input,
+        assertions=(
+            *candidate.case.assertions,
+            MaxEstimatedCostAssertionSpec(
+                id="cost-budget",
+                maximum="1",
+                currency="USD",
+            ),
+        ),
+    )
+    priced_candidate = PromotionCandidateV1.create(
+        target_key=candidate.target_key,
+        source=candidate.source,
+        evidence_policy=candidate.evidence_policy,
+        pricing_profile=candidate.pricing_profile,
+        evidence=candidate.evidence,
+        suite=candidate.suite,
+        case=priced_case,
+    )
+    scored = score_promotion_candidate(
+        app,
+        trajectory,
+        priced_candidate,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-priced",
+        pricing=pricing,
+    )
+    assert scored.status == "passed"
+    assert scored.score == 1.0
+    assert candidate.pricing_profile is not None
+    assert scored.pricing_profile_fingerprint == candidate.pricing_profile.fingerprint
+
+    missing_pricing = score_promotion_candidate(
+        app,
+        trajectory,
+        priced_candidate,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-priced",
+    )
+    assert missing_pricing.status == "unavailable"
+    assert missing_pricing.score is None
+    assert missing_pricing.assertions[-1].outcome == "unavailable"
+
+    with pytest.raises(ValueError, match="pricing profile no longer matches"):
+        score_promotion_candidate(
+            app,
+            trajectory,
+            priced_candidate,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="release-priced",
+            pricing=_price_book(input_rate="2"),
+        )
 
 
 @pytest.mark.parametrize(

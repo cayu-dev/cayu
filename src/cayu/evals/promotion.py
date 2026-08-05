@@ -6,18 +6,28 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypeVar
 
-from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictFloat,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from cayu._validation import canonical_durable_json_bytes, json_utf8_size_within_limit
 from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.evals.corpus import (
+    EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
     EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
     CorpusUserMessageSpec,
     EvalCaseSpec,
     EvalSuiteSpec,
     EvaluationEvidencePolicySpec,
     EvaluationSourceIdentityV1,
+    MaxEstimatedCostAssertionSpec,
     PricingProfileIdentityV1,
     RootStatusAssertionSpec,
     RunInputSpec,
@@ -30,6 +40,7 @@ from cayu.evals.corpus import (
     _SchemaV1PortableModel,
     _sha256_hex,
     _sha256_revision,
+    assertion_spec_revision,
     pricing_profile_identity,
 )
 from cayu.evals.models import (
@@ -39,6 +50,14 @@ from cayu.evals.models import (
     _validate_trajectory_record_contract,
 )
 from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
+from cayu.evals.portable_evaluation import evaluate_assertion_specs
+from cayu.evals.published import (
+    PublishedAssertionResult,
+    PublishedStatus,
+    _published_assertion,
+    _published_score,
+    _published_status_from_outcomes,
+)
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook
 from cayu.runtime.sessions import SessionStatus, session_input_messages_sha256
@@ -47,6 +66,8 @@ PROMOTABLE_RUN_INPUT_SCHEMA_VERSION = 1
 PROMOTION_SOURCE_SCHEMA_VERSION = 1
 PROMOTION_CANDIDATE_SCHEMA_VERSION = 1
 PROMOTION_CANDIDATE_MAX_BYTES = 16 << 20
+CAPTURED_RUN_SCORE_SCHEMA_VERSION = 1
+CAPTURED_RUN_SCORE_MAX_BYTES = 2 << 20
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -335,6 +356,142 @@ class PromotionCandidateV1(_SchemaV1PortableModel):
             suite=validated_suite,
             case=validated_case,
             warnings=warnings,
+        )
+
+
+class CapturedRunScoreV1(_SchemaV1PortableModel):
+    """Bounded public score for an edited candidate against its captured evidence."""
+
+    schema_version: Literal[1] = CAPTURED_RUN_SCORE_SCHEMA_VERSION
+    revision: StrictStr
+    candidate_revision: StrictStr
+    case_id: StrictStr
+    case_revision: StrictStr
+    evidence_revision: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None = None
+    status: PublishedStatus
+    score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
+    assertions: tuple[PublishedAssertionResult, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    )
+
+    @field_validator(
+        "revision",
+        "candidate_revision",
+        "case_revision",
+        "evidence_revision",
+        "evidence_policy_revision",
+        "pricing_profile_fingerprint",
+    )
+    @classmethod
+    def validate_revision_shape(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("case_id")
+    @classmethod
+    def validate_case_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("assertions", mode="before")
+    @classmethod
+    def validate_assertions_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> CapturedRunScoreV1:
+        expected_status = _published_status_from_outcomes(
+            assertion.outcome for assertion in self.assertions
+        )
+        expected_score = _published_score(assertion.score for assertion in self.assertions)
+        if self.status != expected_status or self.score != expected_score:
+            raise ValueError("Captured score aggregates do not match its assertions.")
+        assertion_ids = tuple(assertion.assertion_id for assertion in self.assertions)
+        if len(assertion_ids) != len(set(assertion_ids)):
+            raise ValueError("Captured score assertion IDs must be unique.")
+        if not json_utf8_size_within_limit(self, CAPTURED_RUN_SCORE_MAX_BYTES):
+            raise ValueError(
+                f"Captured score exceeds {CAPTURED_RUN_SCORE_MAX_BYTES} canonical JSON bytes."
+            )
+        expected_revision = _content_revision(
+            self.model_dump(mode="json"),
+            "captured run score",
+        )
+        if self.revision != expected_revision:
+            raise ValueError("Captured score revision does not match its content.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        candidate: PromotionCandidateV1,
+        evidence: AssertionEvidenceView,
+        assertions: Sequence[PublishedAssertionResult],
+    ) -> CapturedRunScoreV1:
+        validated_candidate = _validate_exact_model(
+            candidate,
+            PromotionCandidateV1,
+            "candidate",
+        )
+        validated_evidence = _validate_exact_model(evidence, AssertionEvidenceView, "evidence")
+        ordered_assertion_input = _ordered_sequence_argument(assertions, "assertions")
+        validated_assertions = tuple(
+            _validate_exact_model(assertion, PublishedAssertionResult, "assertions")
+            for assertion in ordered_assertion_input
+        )
+        expected_contract = tuple(
+            (spec.id, assertion_spec_revision(spec)) for spec in validated_candidate.case.assertions
+        )
+        actual_contract = tuple(
+            (assertion.assertion_id, assertion.assertion_revision)
+            for assertion in validated_assertions
+        )
+        if actual_contract != expected_contract:
+            raise ValueError("Captured score assertions do not match the candidate case.")
+        if validated_evidence.policy_revision != validated_candidate.evidence_policy.revision:
+            raise ValueError("Captured score evidence uses a different evidence policy.")
+        candidate_pricing_fingerprint = (
+            None
+            if validated_candidate.pricing_profile is None
+            else validated_candidate.pricing_profile.fingerprint
+        )
+        if validated_evidence.pricing_profile_fingerprint not in {
+            None,
+            candidate_pricing_fingerprint,
+        }:
+            raise ValueError("Captured score evidence uses a different pricing profile.")
+        status = _published_status_from_outcomes(
+            assertion.outcome for assertion in validated_assertions
+        )
+        score = _published_score(assertion.score for assertion in validated_assertions)
+        document = {
+            "schema_version": CAPTURED_RUN_SCORE_SCHEMA_VERSION,
+            "candidate_revision": validated_candidate.revision,
+            "case_id": validated_candidate.case.id,
+            "case_revision": validated_candidate.case.revision,
+            "evidence_revision": validated_evidence.revision,
+            "evidence_policy_revision": validated_evidence.policy_revision,
+            "pricing_profile_fingerprint": validated_evidence.pricing_profile_fingerprint,
+            "status": status,
+            "score": score,
+            "assertions": [assertion.model_dump(mode="json") for assertion in validated_assertions],
+        }
+        return cls(
+            schema_version=CAPTURED_RUN_SCORE_SCHEMA_VERSION,
+            revision=_content_revision(document, "captured run score"),
+            candidate_revision=validated_candidate.revision,
+            case_id=validated_candidate.case.id,
+            case_revision=validated_candidate.case.revision,
+            evidence_revision=validated_evidence.revision,
+            evidence_policy_revision=validated_evidence.policy_revision,
+            pricing_profile_fingerprint=validated_evidence.pricing_profile_fingerprint,
+            status=status,
+            score=score,
+            assertions=validated_assertions,
         )
 
 
@@ -880,4 +1037,137 @@ def build_promotion_candidate(
         evidence=evidence,
         suite=suite,
         case=case,
+    )
+
+
+def score_promotion_candidate(
+    app: CayuApp,
+    trajectory: Trajectory,
+    candidate: PromotionCandidateV1,
+    *,
+    target_key: str,
+    source_agent_name: str,
+    application_release_id: str,
+    pricing: PriceBook | None = None,
+    project_root: str | Path | None = None,
+) -> CapturedRunScoreV1:
+    """Score one reviewed candidate through the existing portable assertion engine."""
+
+    if not isinstance(app, CayuApp):
+        raise TypeError("app must be a CayuApp.")
+    validated_trajectory = _validated_trajectory_for_promotion(trajectory)
+    validated_candidate = _validate_exact_model(
+        candidate,
+        PromotionCandidateV1,
+        "candidate",
+    )
+    validated_target_key = _safe_portable_id(app, target_key, "target_key")
+    if validated_candidate.target_key != validated_target_key:
+        raise ValueError("Promotion candidate target does not match the configured target.")
+    safe_source_agent_name = _safe_candidate_text(
+        app,
+        source_agent_name,
+        "source_agent_name",
+        max_chars=256,
+    )
+    if validated_candidate.source.source_agent_name != safe_source_agent_name:
+        raise ValueError(
+            "Promotion candidate source agent does not match the configured source agent."
+        )
+    safe_release_id = _safe_candidate_text(
+        app,
+        application_release_id,
+        "application_release_id",
+        max_chars=256,
+    )
+    if validated_candidate.source.application_release_id != safe_release_id:
+        raise ValueError("Promotion candidate release does not match the configured release.")
+    current_run_input = _promotable_run_input_from_validated(
+        app,
+        validated_trajectory,
+        source_agent_name=safe_source_agent_name,
+    )
+    if (
+        validated_candidate.source.input_revision != current_run_input.revision
+        or validated_candidate.source.input_redactions_applied
+        != current_run_input.redactions_applied
+    ):
+        raise ValueError("Promotion candidate input evidence changed; build a new candidate.")
+    if validated_candidate.source.source_label is not None:
+        _safe_candidate_text(
+            app,
+            validated_candidate.source.source_label,
+            "source_label",
+            max_chars=256,
+        )
+    _safe_portable_id(app, validated_candidate.suite.id, "suite.id")
+    _safe_candidate_text(
+        app,
+        validated_candidate.suite.name,
+        "suite.name",
+        max_chars=256,
+    )
+    _safe_pricing_profile_identity(app, validated_candidate.pricing_profile)
+    manifest = app.describe(project_root=project_root)
+    if (
+        validated_candidate.source.app_manifest_schema_version != manifest.schema_version
+        or validated_candidate.source.app_manifest_fingerprint != manifest.fingerprint
+    ):
+        raise ValueError("Promotion candidate app manifest no longer matches the application.")
+    baseline_evidence = project_assertion_evidence_view(
+        app,
+        validated_trajectory,
+        evidence_policy=validated_candidate.evidence_policy,
+    )
+    if baseline_evidence != validated_candidate.evidence:
+        raise ValueError("Promotion candidate evidence changed; build a new candidate.")
+
+    if pricing is None:
+        validated_pricing = None
+    else:
+        pricing_identity = _safe_pricing_profile_identity(
+            app,
+            pricing_profile_identity(pricing),
+        )
+        if validated_candidate.pricing_profile is None:
+            raise ValueError("Promotion candidate does not declare a pricing profile.")
+        if pricing_identity != validated_candidate.pricing_profile:
+            raise ValueError("Promotion candidate pricing profile no longer matches.")
+        validated_pricing = pricing
+    cost_currencies = tuple(
+        sorted(
+            {
+                assertion.currency
+                for assertion in validated_candidate.case.assertions
+                if type(assertion) is MaxEstimatedCostAssertionSpec
+            }
+        )
+    )
+    scored_evidence = (
+        baseline_evidence
+        if not cost_currencies
+        else project_assertion_evidence_view(
+            app,
+            validated_trajectory,
+            evidence_policy=validated_candidate.evidence_policy,
+            pricing=validated_pricing,
+            cost_currencies=cost_currencies,
+        )
+    )
+    internal_results = evaluate_assertion_specs(
+        validated_candidate.case.assertions,
+        scored_evidence,
+    )
+    published_results = tuple(
+        _published_assertion(spec, result)
+        for spec, result in zip(
+            validated_candidate.case.assertions,
+            internal_results,
+            strict=True,
+        )
+    )
+    return CapturedRunScoreV1.create(
+        candidate=validated_candidate,
+        evidence=scored_evidence,
+        assertions=published_results,
     )
