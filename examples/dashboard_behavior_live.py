@@ -1998,13 +1998,15 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     await expect(
         bedrock_breakdown.get_by_text("Billing Identity Breakdown", exact=True)
     ).to_be_visible()
-    coverage = bedrock_breakdown.get_by_test_id("usage-billing-identity-coverage")
-    await expect(coverage.get_by_text("Identified steps", exact=True)).to_be_visible()
-    await expect(coverage.get_by_text("Evaluated steps", exact=True)).to_be_visible()
-    await expect(coverage.get_by_text("Without identity", exact=True)).to_be_visible()
-    await expect(bedrock_breakdown.get_by_test_id("usage-billing-identity-gap")).to_contain_text(
-        "Billing identity is missing for 4 of 5 evaluated model steps"
-    )
+    identity_counts = bedrock_breakdown.get_by_test_id("usage-billing-identity-counts")
+    await expect(
+        identity_counts.get_by_text("Steps with commercial identity", exact=True)
+    ).to_be_visible()
+    await expect(identity_counts.get_by_text("Evaluated steps", exact=True)).to_be_visible()
+    await expect(identity_counts.get_by_text("1", exact=True)).to_be_visible()
+    await expect(identity_counts.get_by_text("5", exact=True)).to_be_visible()
+    await expect(identity_counts.get_by_text("Without identity", exact=True)).to_have_count(0)
+    await expect(bedrock_breakdown.get_by_test_id("usage-billing-identity-gap")).to_have_count(0)
     bedrock_row = bedrock_breakdown.get_by_role("row").filter(
         has_text="global.anthropic.claude-sonnet-4-6"
     )
@@ -2016,12 +2018,8 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     no_identity_query = urlencode({"provider_name": PROVIDER_NAME})
     await page.goto(f"{base_url}/cayu/usage?{no_identity_query}", wait_until="networkidle")
     no_identity_breakdown = page.get_by_test_id("usage-billing-breakdown")
-    await expect(no_identity_breakdown).to_contain_text(
-        "No billing identity was reported. Evaluated model-step count: 2."
-    )
-    await expect(
-        no_identity_breakdown.get_by_test_id("usage-billing-identity-gap")
-    ).to_contain_text("Billing identity is missing for 2 of 2 evaluated model steps")
+    await expect(no_identity_breakdown).to_have_count(0)
+    await expect(page.get_by_text(re.compile(r"Billing identity is missing for"))).to_have_count(0)
 
     await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
 

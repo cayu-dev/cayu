@@ -21,20 +21,34 @@ export type BillingCostRow = {
   missingReason: string | null
 }
 
-export type BillingIdentityCoverage = {
-  evaluated: string
-  identified: string
-  missing: string
-}
+export type BillingIdentityBreakdownState =
+  | { kind: "not-applicable" }
+  | { kind: "inconsistent"; hasIdentityDetail: boolean }
+  | {
+      kind: "available"
+      evaluated: string
+      identityBearing: string
+      hasIdentityDetail: boolean
+    }
 
-export function billingIdentityCoverage(cost: UsageCostRollup): BillingIdentityCoverage | null {
+export function billingIdentityBreakdownState(
+  cost: UsageCostRollup,
+): BillingIdentityBreakdownState {
   const evaluated = nonnegativeInteger(cost.evaluated_model_steps)
-  const identified = nonnegativeInteger(cost.billing_breakdown.identified_model_steps)
-  if (evaluated === null || identified === null || identified > evaluated) return null
+  const breakdown = cost.billing_breakdown
+  const identityBearing = nonnegativeInteger(breakdown.identified_model_steps)
+  const hasIdentityDetail = breakdown.groups.length > 0 || breakdown.remainder !== null
+  if (evaluated === null || identityBearing === null || identityBearing > evaluated) {
+    return { kind: "inconsistent", hasIdentityDetail }
+  }
+  if (identityBearing === 0n && !hasIdentityDetail && breakdown.accuracy.kind === "exact") {
+    return { kind: "not-applicable" }
+  }
   return {
+    kind: "available",
     evaluated: evaluated.toString(),
-    identified: identified.toString(),
-    missing: (evaluated - identified).toString(),
+    identityBearing: identityBearing.toString(),
+    hasIdentityDetail,
   }
 }
 

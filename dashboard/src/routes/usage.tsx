@@ -27,7 +27,7 @@ import {
 import { Textarea } from "../components/ui/textarea"
 import { retryAggregateRequest } from "../lib/aggregate-query"
 import { fetchUsageRollup, type UsageRollup } from "../lib/api"
-import { billingCostRows, billingIdentityCoverage } from "../lib/billing-breakdown"
+import { billingCostRows, billingIdentityBreakdownState } from "../lib/billing-breakdown"
 import { dashboardConfig } from "../lib/config"
 import { formatCount, formatDateTime, formatDecimal } from "../lib/format"
 import type {
@@ -600,49 +600,41 @@ function BillingIdentityBreakdown({ cost }: { cost: UsageCostRollup | null }) {
   if (!cost) return null
   const breakdown = cost.billing_breakdown
   const rows = billingCostRows(breakdown.groups)
-  const coverage = billingIdentityCoverage(cost)
-  const hasIdentityDetail = rows.length > 0 || breakdown.remainder !== null
+  const state = billingIdentityBreakdownState(cost)
+  if (state.kind === "not-applicable") return null
   return (
     <div data-testid="usage-billing-breakdown">
       <DataCard
         title="Billing Identity Breakdown"
-        description="Bounded commercial identity for identified pricing inputs. Coverage is reported separately; Bedrock regions, profiles, and tiers remain distinct while other provider evidence stays excluded."
+        description="Bounded optional commercial identity for pricing inputs that carry it. Bedrock regions, profiles, and tiers remain distinct while other provider evidence stays excluded."
         actions={<AccuracyBadge accuracy={breakdown.accuracy} />}
       >
         <div
-          className="grid gap-3 border-b border-border p-4 sm:grid-cols-3"
-          data-testid="usage-billing-identity-coverage"
+          className="grid gap-3 border-b border-border p-4 sm:grid-cols-2"
+          data-testid="usage-billing-identity-counts"
         >
           <div>
-            <div className="text-xs uppercase text-muted-foreground">Identified steps</div>
+            <div className="text-xs uppercase text-muted-foreground">
+              Steps with commercial identity
+            </div>
             <div className="mt-1 text-xl font-semibold">
-              {formatCount(coverage?.identified ?? breakdown.identified_model_steps)}
+              {formatCount(
+                state.kind === "available"
+                  ? state.identityBearing
+                  : breakdown.identified_model_steps,
+              )}
             </div>
           </div>
           <div>
             <div className="text-xs uppercase text-muted-foreground">Evaluated steps</div>
             <div className="mt-1 text-xl font-semibold">
-              {formatCount(coverage?.evaluated ?? cost.evaluated_model_steps)}
-            </div>
-          </div>
-          <div>
-            <div className="text-xs uppercase text-muted-foreground">Without identity</div>
-            <div className="mt-1 text-xl font-semibold">
-              {coverage ? formatCount(coverage.missing) : "—"}
+              {formatCount(
+                state.kind === "available" ? state.evaluated : cost.evaluated_model_steps,
+              )}
             </div>
           </div>
         </div>
-        {coverage && coverage.missing !== "0" && (
-          <div
-            className="border-b border-border bg-chart-1/5 px-4 py-3 text-sm text-chart-1"
-            data-testid="usage-billing-identity-gap"
-          >
-            Billing identity is missing for {formatCount(coverage.missing)} of{" "}
-            {formatCount(coverage.evaluated)} evaluated model steps. Missing steps are not
-            represented in this table, but remain in the aggregate usage and cost accounting above.
-          </div>
-        )}
-        {!coverage && (
+        {state.kind === "inconsistent" && (
           <div className="border-b border-border bg-destructive/5 px-4 py-3 text-sm text-destructive">
             Billing identity coverage is unavailable because the returned counters are inconsistent.
           </div>
@@ -655,7 +647,7 @@ function BillingIdentityBreakdown({ cost }: { cost: UsageCostRollup | null }) {
             )}
           </div>
         )}
-        {hasIdentityDetail ? (
+        {state.hasIdentityDetail ? (
           <>
             <Table>
               <TableHeader>
@@ -733,11 +725,13 @@ function BillingIdentityBreakdown({ cost }: { cost: UsageCostRollup | null }) {
           </>
         ) : (
           <StateMessage>
-            {coverage?.evaluated === "0"
+            {state.kind === "available" && state.evaluated === "0"
               ? "No model steps were evaluated for pricing in this scope."
-              : `No billing identity was reported. Evaluated model-step count: ${formatCount(
-                  coverage?.evaluated ?? cost.evaluated_model_steps,
-                )}.`}
+              : `No retained billing identity detail was returned for ${formatCount(
+                  state.kind === "available"
+                    ? state.identityBearing
+                    : breakdown.identified_model_steps,
+                )} identity-bearing model steps.`}
           </StateMessage>
         )}
       </DataCard>

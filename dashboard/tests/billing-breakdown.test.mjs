@@ -1,7 +1,7 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { billingCostRows, billingIdentityCoverage } from "../src/lib/billing-breakdown.ts"
+import { billingCostRows, billingIdentityBreakdownState } from "../src/lib/billing-breakdown.ts"
 
 function billingGroup(identity, { priced = true, cost = "1.25", reason = null } = {}) {
   return {
@@ -123,50 +123,154 @@ test("billing rows do not discard retained identities from other providers", () 
   assert.equal(rows[1]?.identity.source_region, "us-east-1")
 })
 
-test("billing identity coverage remains exact beyond JavaScript's safe integer range", () => {
+test("billing identity breakdown is not applicable to priced steps without identities", () => {
   assert.deepEqual(
-    billingIdentityCoverage({
-      evaluated_model_steps: "9007199254740993",
-      billing_breakdown: { identified_model_steps: "2" },
+    billingIdentityBreakdownState({
+      evaluated_model_steps: "1",
+      priced_model_steps: "1",
+      unpriced_model_steps: "0",
+      unevaluated_model_steps: "0",
+      billing_breakdown: {
+        identified_model_steps: "0",
+        groups: [],
+        remainder: null,
+        accuracy: { kind: "exact", limit: null, reason: null },
+      },
+    }),
+    { kind: "not-applicable" },
+  )
+})
+
+test("mixed billing identity detail reports only identity-bearing steps", () => {
+  assert.deepEqual(
+    billingIdentityBreakdownState({
+      evaluated_model_steps: "5",
+      billing_breakdown: {
+        identified_model_steps: "1",
+        groups: [
+          billingGroup({
+            provider_name: "bedrock",
+            resource_id: "global.anthropic.claude-sonnet-4-6",
+            request_evidence: { source_region: "us-east-1" },
+            completion_evidence: {},
+          }),
+        ],
+        remainder: null,
+        accuracy: { kind: "exact", limit: null, reason: null },
+      },
     }),
     {
-      evaluated: "9007199254740993",
-      identified: "2",
-      missing: "9007199254740991",
+      kind: "available",
+      evaluated: "5",
+      identityBearing: "1",
+      hasIdentityDetail: true,
     },
   )
 })
 
-test("billing identity coverage distinguishes complete and absent identity reporting", () => {
+test("truncated billing identity detail remains available for its accuracy notice", () => {
   assert.deepEqual(
-    billingIdentityCoverage({
-      evaluated_model_steps: "2",
-      billing_breakdown: { identified_model_steps: "2" },
-    }),
-    { evaluated: "2", identified: "2", missing: "0" },
-  )
-  assert.deepEqual(
-    billingIdentityCoverage({
+    billingIdentityBreakdownState({
       evaluated_model_steps: "3",
-      billing_breakdown: { identified_model_steps: "0" },
+      billing_breakdown: {
+        identified_model_steps: "3",
+        groups: [
+          billingGroup({
+            provider_name: "bedrock",
+            resource_id: "global.anthropic.claude-sonnet-4-6",
+            request_evidence: { source_region: "us-east-1" },
+            completion_evidence: {},
+          }),
+        ],
+        remainder: {
+          group_count: "2",
+          model_steps: "2",
+          priced_model_steps: "2",
+          unpriced_model_steps: "0",
+        },
+        accuracy: {
+          kind: "truncated",
+          limit: 1,
+          reason: "Billing identity groups exceed group_limit.",
+        },
+      },
     }),
-    { evaluated: "3", identified: "0", missing: "3" },
+    {
+      kind: "available",
+      evaluated: "3",
+      identityBearing: "3",
+      hasIdentityDetail: true,
+    },
   )
 })
 
-test("billing identity coverage rejects inconsistent response counters", () => {
-  assert.equal(
-    billingIdentityCoverage({
+test("truncated zero-identity breakdown remains available for its accuracy notice", () => {
+  assert.deepEqual(
+    billingIdentityBreakdownState({
       evaluated_model_steps: "1",
-      billing_breakdown: { identified_model_steps: "2" },
+      billing_breakdown: {
+        identified_model_steps: "0",
+        groups: [],
+        remainder: null,
+        accuracy: {
+          kind: "truncated",
+          limit: 20,
+          reason: "Billing identity input detail exceeded its bounded collection limit.",
+        },
+      },
     }),
-    null,
+    {
+      kind: "available",
+      evaluated: "1",
+      identityBearing: "0",
+      hasIdentityDetail: false,
+    },
   )
-  assert.equal(
-    billingIdentityCoverage({
-      evaluated_model_steps: "not-an-integer",
-      billing_breakdown: { identified_model_steps: "0" },
+})
+
+test("billing identity state remains exact beyond JavaScript's safe integer range", () => {
+  assert.deepEqual(
+    billingIdentityBreakdownState({
+      evaluated_model_steps: "9007199254740993",
+      billing_breakdown: {
+        identified_model_steps: "2",
+        groups: [],
+        remainder: null,
+        accuracy: { kind: "exact", limit: null, reason: null },
+      },
     }),
-    null,
+    {
+      kind: "available",
+      evaluated: "9007199254740993",
+      identityBearing: "2",
+      hasIdentityDetail: false,
+    },
+  )
+})
+
+test("billing identity state exposes inconsistent response counters", () => {
+  assert.deepEqual(
+    billingIdentityBreakdownState({
+      evaluated_model_steps: "1",
+      billing_breakdown: {
+        identified_model_steps: "2",
+        groups: [],
+        remainder: null,
+        accuracy: { kind: "exact", limit: null, reason: null },
+      },
+    }),
+    { kind: "inconsistent", hasIdentityDetail: false },
+  )
+  assert.deepEqual(
+    billingIdentityBreakdownState({
+      evaluated_model_steps: "not-an-integer",
+      billing_breakdown: {
+        identified_model_steps: "0",
+        groups: [],
+        remainder: null,
+        accuracy: { kind: "exact", limit: null, reason: null },
+      },
+    }),
+    { kind: "inconsistent", hasIdentityDetail: false },
   )
 })
