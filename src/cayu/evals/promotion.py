@@ -1,19 +1,36 @@
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Sequence
 from enum import StrEnum
-from typing import Literal
+from pathlib import Path
+from typing import Literal, TypeVar
 
-from pydantic import Field, StrictBool, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator, model_validator
 
+from cayu._validation import canonical_durable_json_bytes, json_utf8_size_within_limit
 from cayu.core.events import EventType
 from cayu.core.messages import Message, MessageRole, TextPart
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
     CorpusUserMessageSpec,
+    EvalCaseSpec,
+    EvalSuiteSpec,
+    EvaluationEvidencePolicySpec,
+    EvaluationSourceIdentityV1,
+    PricingProfileIdentityV1,
+    RootStatusAssertionSpec,
     RunInputSpec,
     _bounded_durable_text,
+    _content_revision,
+    _model_python_input,
+    _ordered_sequence_argument,
     _ordered_sequence_input,
+    _portable_id,
     _SchemaV1PortableModel,
+    _sha256_hex,
+    _sha256_revision,
+    pricing_profile_identity,
 )
 from cayu.evals.models import (
     Trajectory,
@@ -21,21 +38,40 @@ from cayu.evals.models import (
     _trajectory_promotion_capture_sha256,
     _validate_trajectory_record_contract,
 )
+from cayu.evals.evidence import AssertionEvidenceView, project_assertion_evidence_view
 from cayu.runtime.app import CayuApp
+from cayu.runtime.costs import PriceBook
 from cayu.runtime.sessions import SessionStatus, session_input_messages_sha256
 
 PROMOTABLE_RUN_INPUT_SCHEMA_VERSION = 1
+PROMOTION_SOURCE_SCHEMA_VERSION = 1
+PROMOTION_CANDIDATE_SCHEMA_VERSION = 1
+PROMOTION_CANDIDATE_MAX_BYTES = 16 << 20
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+
+
+def _validate_exact_model(value: _ModelT, model_type: type[_ModelT], field_name: str) -> _ModelT:
+    if type(value) is not model_type:
+        raise TypeError(f"{field_name} must be an exact {model_type.__name__}.")
+    return model_type.model_validate(_model_python_input(value))
 
 
 class PromotableRunInputV1(_SchemaV1PortableModel):
     """Sanitized, text-only caller input proven to belong to one fresh invocation."""
 
     schema_version: Literal[1] = PROMOTABLE_RUN_INPUT_SCHEMA_VERSION
+    revision: StrictStr
     messages: tuple[CorpusUserMessageSpec, ...] = Field(
         min_length=1,
         max_length=EVAL_CORPUS_MAX_MESSAGES_PER_CASE,
     )
     redactions_applied: StrictBool = False
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision_shape(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
 
     @field_validator("messages", mode="before")
     @classmethod
@@ -45,11 +81,260 @@ class PromotableRunInputV1(_SchemaV1PortableModel):
     @model_validator(mode="after")
     def validate_run_input_contract(self) -> PromotableRunInputV1:
         RunInputSpec(messages=self.messages)
+        expected = _content_revision(self.model_dump(mode="json"), "promotable run input")
+        if self.revision != expected:
+            raise ValueError("Promotable run input revision does not match its content.")
         return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        messages: Sequence[CorpusUserMessageSpec],
+        redactions_applied: bool = False,
+    ) -> PromotableRunInputV1:
+        ordered_messages = _ordered_sequence_argument(messages, "messages")
+        validated_messages = tuple(
+            _validate_exact_model(message, CorpusUserMessageSpec, "messages")
+            for message in ordered_messages
+        )
+        RunInputSpec(messages=validated_messages)
+        if type(redactions_applied) is not bool:
+            raise TypeError("redactions_applied must be a bool.")
+        document = {
+            "schema_version": PROMOTABLE_RUN_INPUT_SCHEMA_VERSION,
+            "messages": [message.model_dump(mode="json") for message in validated_messages],
+            "redactions_applied": redactions_applied,
+        }
+        return cls(
+            schema_version=PROMOTABLE_RUN_INPUT_SCHEMA_VERSION,
+            revision=_content_revision(document, "promotable run input"),
+            messages=validated_messages,
+            redactions_applied=redactions_applied,
+        )
 
     def to_run_input_spec(self) -> RunInputSpec:
         return RunInputSpec.model_validate(
             {"messages": [message.model_dump(mode="json") for message in self.messages]}
+        )
+
+
+class PromotionWarningCode(StrEnum):
+    """Stable, non-blocking fact surfaced with one editable candidate."""
+
+    INPUT_REDACTED = "input_redacted"
+    SOURCE_RUN_FAILED = "source_run_failed"
+
+
+class PromotionSourceV1(_SchemaV1PortableModel):
+    """Safe diagnostic capture provenance without executable or session authority."""
+
+    schema_version: Literal[1] = PROMOTION_SOURCE_SCHEMA_VERSION
+    source_agent_name: StrictStr
+    application_release_id: StrictStr
+    app_manifest_schema_version: StrictStr
+    app_manifest_fingerprint: StrictStr
+    input_revision: StrictStr
+    input_redactions_applied: StrictBool
+    evidence_revision: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None = None
+    source_label: StrictStr | None = None
+
+    @field_validator("source_agent_name", "application_release_id")
+    @classmethod
+    def validate_source_identity(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("app_manifest_schema_version")
+    @classmethod
+    def validate_manifest_schema_version(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=32,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("source_label")
+    @classmethod
+    def validate_source_label(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @field_validator("app_manifest_fingerprint")
+    @classmethod
+    def validate_manifest_fingerprint(cls, value: str, info) -> str:
+        return _sha256_hex(value, info.field_name)
+
+    @field_validator(
+        "evidence_revision",
+        "evidence_policy_revision",
+        "input_revision",
+        "pricing_profile_fingerprint",
+    )
+    @classmethod
+    def validate_content_revision(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    def case_source(self) -> EvaluationSourceIdentityV1:
+        """Return the corpus-native subset persisted with the promoted case."""
+
+        return EvaluationSourceIdentityV1(
+            application_release_id=self.application_release_id,
+            app_manifest_schema_version=self.app_manifest_schema_version,
+            app_manifest_fingerprint=self.app_manifest_fingerprint,
+            evidence_revision=self.evidence_revision,
+        )
+
+
+def _promotion_warnings(
+    source: PromotionSourceV1,
+    evidence: AssertionEvidenceView,
+) -> tuple[PromotionWarningCode, ...]:
+    warnings: list[PromotionWarningCode] = []
+    if source.input_redactions_applied:
+        warnings.append(PromotionWarningCode.INPUT_REDACTED)
+    if evidence.root_status == SessionStatus.FAILED.value:
+        warnings.append(PromotionWarningCode.SOURCE_RUN_FAILED)
+    return tuple(sorted(warnings, key=lambda warning: warning.value))
+
+
+class PromotionCandidateV1(_SchemaV1PortableModel):
+    """One deterministic, editable case candidate and its public-safe evidence."""
+
+    schema_version: Literal[1] = PROMOTION_CANDIDATE_SCHEMA_VERSION
+    revision: StrictStr
+    target_key: StrictStr
+    source: PromotionSourceV1
+    evidence_policy: EvaluationEvidencePolicySpec
+    pricing_profile: PricingProfileIdentityV1 | None = None
+    evidence: AssertionEvidenceView
+    suite: EvalSuiteSpec
+    case: EvalCaseSpec
+    warnings: tuple[PromotionWarningCode, ...] = Field(max_length=2)
+
+    @field_validator("target_key")
+    @classmethod
+    def validate_target_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision_shape(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def validate_warnings_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> PromotionCandidateV1:
+        if self.source.evidence_revision != self.evidence.revision:
+            raise ValueError("Promotion source and evidence revisions do not match.")
+        if self.source.evidence_policy_revision != self.evidence_policy.revision:
+            raise ValueError("Promotion source and evidence-policy revisions do not match.")
+        if self.evidence.policy_revision != self.evidence_policy.revision:
+            raise ValueError("Promotion evidence and evidence-policy revisions do not match.")
+        expected_pricing_fingerprint = (
+            None if self.pricing_profile is None else self.pricing_profile.fingerprint
+        )
+        if self.source.pricing_profile_fingerprint != expected_pricing_fingerprint:
+            raise ValueError("Promotion source and pricing-profile identities do not match.")
+        if self.evidence.pricing_profile_fingerprint not in {
+            None,
+            expected_pricing_fingerprint,
+        }:
+            raise ValueError("Promotion evidence uses a different pricing profile.")
+        if self.case.source != self.source.case_source():
+            raise ValueError("Promotion case source does not match candidate provenance.")
+        if self.case.suite_id != self.suite.id:
+            raise ValueError("Promotion case must reference the candidate suite.")
+        expected_warnings = _promotion_warnings(self.source, self.evidence)
+        if self.warnings != expected_warnings:
+            raise ValueError("Promotion warnings do not match captured source facts.")
+        if not json_utf8_size_within_limit(self, PROMOTION_CANDIDATE_MAX_BYTES):
+            raise ValueError(
+                f"Promotion candidate exceeds {PROMOTION_CANDIDATE_MAX_BYTES} canonical JSON bytes."
+            )
+        expected = _content_revision(self.model_dump(mode="json"), "promotion candidate")
+        if self.revision != expected:
+            raise ValueError("Promotion candidate revision does not match its content.")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        target_key: str,
+        source: PromotionSourceV1,
+        evidence_policy: EvaluationEvidencePolicySpec,
+        evidence: AssertionEvidenceView,
+        suite: EvalSuiteSpec,
+        case: EvalCaseSpec,
+        pricing_profile: PricingProfileIdentityV1 | None = None,
+    ) -> PromotionCandidateV1:
+        validated_target_key = _portable_id(target_key, "target_key")
+        validated_source = _validate_exact_model(source, PromotionSourceV1, "source")
+        validated_policy = _validate_exact_model(
+            evidence_policy,
+            EvaluationEvidencePolicySpec,
+            "evidence_policy",
+        )
+        validated_evidence = _validate_exact_model(evidence, AssertionEvidenceView, "evidence")
+        validated_suite = _validate_exact_model(suite, EvalSuiteSpec, "suite")
+        validated_case = _validate_exact_model(case, EvalCaseSpec, "case")
+        validated_pricing = (
+            None
+            if pricing_profile is None
+            else _validate_exact_model(
+                pricing_profile,
+                PricingProfileIdentityV1,
+                "pricing_profile",
+            )
+        )
+        warnings = _promotion_warnings(validated_source, validated_evidence)
+        document = {
+            "schema_version": PROMOTION_CANDIDATE_SCHEMA_VERSION,
+            "target_key": validated_target_key,
+            "source": validated_source.model_dump(mode="json"),
+            "evidence_policy": validated_policy.model_dump(mode="json"),
+            "pricing_profile": (
+                None if validated_pricing is None else validated_pricing.model_dump(mode="json")
+            ),
+            "evidence": validated_evidence.model_dump(mode="json"),
+            "suite": validated_suite.model_dump(mode="json"),
+            "case": validated_case.model_dump(mode="json"),
+            "warnings": [warning.value for warning in warnings],
+        }
+        return cls(
+            schema_version=PROMOTION_CANDIDATE_SCHEMA_VERSION,
+            revision=_content_revision(document, "promotion candidate"),
+            target_key=validated_target_key,
+            source=validated_source,
+            evidence_policy=validated_policy,
+            pricing_profile=validated_pricing,
+            evidence=validated_evidence,
+            suite=validated_suite,
+            case=validated_case,
+            warnings=warnings,
         )
 
 
@@ -354,7 +639,7 @@ def _promotable_run_input_from_validated(
         raise _promotion_error(SessionPromotionErrorCode.INPUT_EVIDENCE_INCONSISTENT)
     messages, redactions_applied = _sanitized_user_messages(app, source_messages)
     try:
-        return PromotableRunInputV1(
+        return PromotableRunInputV1.create(
             messages=messages,
             redactions_applied=(redactions_applied or bool(trajectory.input_redactions_applied)),
         )
@@ -377,4 +662,222 @@ def promotable_run_input(
         app,
         validated_trajectory,
         source_agent_name=source_agent_name,
+    )
+
+
+def _safe_candidate_text(
+    app: CayuApp,
+    value: str,
+    field_name: str,
+    *,
+    max_chars: int,
+) -> str:
+    validated = _bounded_durable_text(
+        value,
+        field_name,
+        max_chars=max_chars,
+        nonblank=True,
+        clean=True,
+    )
+    try:
+        redacted = app.redact_json(validated)
+    except Exception as exc:
+        raise ValueError(
+            f"{field_name} could not cross the application redaction boundary."
+        ) from exc
+    if type(redacted) is not str or redacted != validated:
+        raise ValueError(f"{field_name} contains a workload secret.")
+    return validated
+
+
+def _safe_portable_id(app: CayuApp, value: str, field_name: str) -> str:
+    validated = _portable_id(value, field_name)
+    return _safe_candidate_text(
+        app,
+        validated,
+        field_name,
+        max_chars=128,
+    )
+
+
+def _safe_pricing_profile_identity(
+    app: CayuApp,
+    identity: PricingProfileIdentityV1 | None,
+) -> PricingProfileIdentityV1 | None:
+    if identity is None:
+        return None
+    validated = _validate_exact_model(
+        identity,
+        PricingProfileIdentityV1,
+        "pricing_profile",
+    )
+    _safe_candidate_text(
+        app,
+        validated.price_book_version,
+        "pricing_profile.price_book_version",
+        max_chars=256,
+    )
+    _safe_candidate_text(
+        app,
+        validated.generated_at,
+        "pricing_profile.generated_at",
+        max_chars=256,
+    )
+    for index, currency in enumerate(validated.currencies):
+        _safe_candidate_text(
+            app,
+            currency,
+            f"pricing_profile.currencies[{index}]",
+            max_chars=16,
+        )
+    return validated
+
+
+def _default_suite_id(target_key: str) -> str:
+    readable = f"{target_key}.regressions"
+    if len(readable) <= 128:
+        return readable
+    digest = hashlib.sha256(target_key.encode("ascii")).hexdigest()
+    return f"regressions-{digest}"
+
+
+def _default_case_id(
+    target_key: str,
+    source: EvaluationSourceIdentityV1,
+    input_revision: str,
+) -> str:
+    identity = {
+        "target_key": target_key,
+        "source": source.model_dump(mode="json"),
+        "input_revision": _sha256_revision(input_revision, "input_revision"),
+    }
+    digest = hashlib.sha256(
+        canonical_durable_json_bytes(identity, "promotion case identity")
+    ).hexdigest()
+    return f"case-{digest}"
+
+
+def build_promotion_candidate(
+    app: CayuApp,
+    trajectory: Trajectory,
+    *,
+    target_key: str,
+    source_agent_name: str,
+    application_release_id: str,
+    evidence_policy: EvaluationEvidencePolicySpec,
+    pricing: PriceBook | None = None,
+    source_label: str | None = None,
+    project_root: str | Path | None = None,
+) -> PromotionCandidateV1:
+    """Build one deterministic, public-safe candidate from eligible terminal evidence."""
+
+    if not isinstance(app, CayuApp):
+        raise TypeError("app must be a CayuApp.")
+    validated_trajectory = _validated_trajectory_for_promotion(trajectory)
+    validated_target_key = _safe_portable_id(app, target_key, "target_key")
+    safe_source_agent_name = _safe_candidate_text(
+        app,
+        source_agent_name,
+        "source_agent_name",
+        max_chars=256,
+    )
+    validated_policy = _validate_exact_model(
+        evidence_policy,
+        EvaluationEvidencePolicySpec,
+        "evidence_policy",
+    )
+    safe_release_id = _safe_candidate_text(
+        app,
+        application_release_id,
+        "application_release_id",
+        max_chars=256,
+    )
+    safe_source_label = (
+        None
+        if source_label is None
+        else _safe_candidate_text(
+            app,
+            source_label,
+            "source_label",
+            max_chars=256,
+        )
+    )
+    run_input = _promotable_run_input_from_validated(
+        app,
+        validated_trajectory,
+        source_agent_name=safe_source_agent_name,
+    )
+    evidence = project_assertion_evidence_view(
+        app,
+        validated_trajectory,
+        evidence_policy=validated_policy,
+    )
+    manifest = app.describe(project_root=project_root)
+    pricing_profile = _safe_pricing_profile_identity(
+        app,
+        None if pricing is None else pricing_profile_identity(pricing),
+    )
+    source = PromotionSourceV1(
+        source_agent_name=safe_source_agent_name,
+        application_release_id=safe_release_id,
+        app_manifest_schema_version=manifest.schema_version,
+        app_manifest_fingerprint=manifest.fingerprint,
+        input_revision=run_input.revision,
+        input_redactions_applied=run_input.redactions_applied,
+        evidence_revision=evidence.revision,
+        evidence_policy_revision=validated_policy.revision,
+        pricing_profile_fingerprint=(
+            None if pricing_profile is None else pricing_profile.fingerprint
+        ),
+        source_label=safe_source_label,
+    )
+    case_source = source.case_source()
+    suite_id = _safe_portable_id(
+        app,
+        _default_suite_id(validated_target_key),
+        "suite.id",
+    )
+    suite_name = _safe_candidate_text(
+        app,
+        f"{validated_target_key} regressions",
+        "suite.name",
+        max_chars=256,
+    )
+    suite = EvalSuiteSpec.create(
+        id=suite_id,
+        name=suite_name,
+        description="Regression cases promoted from bounded Cayu production evidence.",
+    )
+    case_id = _default_case_id(
+        validated_target_key,
+        case_source,
+        source.input_revision,
+    )
+    case = EvalCaseSpec.create(
+        id=case_id,
+        suite_id=suite.id,
+        name=(
+            safe_source_label
+            if safe_source_label is not None
+            else f"Captured regression {case_id.removeprefix('case-')[:12]}"
+        ),
+        description="Editable regression candidate derived from public-safe captured evidence.",
+        source=case_source,
+        input=run_input.to_run_input_spec(),
+        assertions=(
+            RootStatusAssertionSpec(
+                id="session-completed",
+                description="The regression must complete successfully.",
+                expected="completed",
+            ),
+        ),
+    )
+    return PromotionCandidateV1.create(
+        target_key=validated_target_key,
+        source=source,
+        evidence_policy=validated_policy,
+        pricing_profile=pricing_profile,
+        evidence=evidence,
+        suite=suite,
+        case=case,
     )

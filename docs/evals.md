@@ -466,6 +466,25 @@ provider-specific boundaries cannot be represented exactly by corpus v1's single
 text field. The resulting sanitized input and redaction fact carry one exact
 content revision.
 
+`build_promotion_candidate(...)` applies that eligibility boundary and produces
+one immutable `PromotionCandidateV1`: the sanitized input, standard public
+assertion evidence, evidence policy, optional pricing identity, diagnostic
+`PromotionSourceV1`, one suite, one case, and stable warning codes. Source
+provenance records the application release ID and diagnostic app-manifest
+schema/fingerprint; it is useful for review but is not executable authority or a
+claim that the application can be rebuilt from the corpus alone.
+
+Every new candidate starts with one `root_status` assertion expecting
+`completed`, even when the captured source failed. The failure is therefore a
+regression to fix rather than a golden failed result. The case and suite are
+ordinary corpus specs: an author may recreate them with their `.create(...)`
+factories to edit names, trial settings, input, or assertions, then recreate the
+candidate to obtain exact new content revisions. The default case ID is derived
+from the target key, diagnostic source identity, and public-safe evidence
+revision. It stays fixed across descriptive edits and contains no raw session ID.
+Candidate configuration labels are rejected if the application redactor detects
+a workload secret.
+
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable
 transcript order rather than scheduler event timing, so parallel tool execution

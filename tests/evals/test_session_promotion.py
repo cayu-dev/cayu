@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from decimal import Decimal
 
 import pytest
 from tests.core.postgres_contention_support import drop_cayu_tables
@@ -9,16 +10,22 @@ from tests.core.postgres_contention_support import drop_cayu_tables
 from cayu import (
     AgentSpec,
     CayuApp,
+    EvaluationEvidencePolicySpec,
     Event,
     EventType,
     FilePart,
     InMemorySessionStore,
     Message,
     MessageRole,
+    ModelPrice,
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
     PostgresSessionStore,
+    PriceBook,
+    PromotionCandidateV1,
+    PromotionWarningCode,
+    RootStatusAssertionSpec,
     RunRequest,
     ScriptedModelProvider,
     SessionIdentity,
@@ -30,6 +37,7 @@ from cayu import (
     StructuredOutputSpec,
     TextPart,
     ToolResultPart,
+    build_promotion_candidate,
     file_attachment,
     promotable_run_input,
     scripted_structured_output,
@@ -80,6 +88,22 @@ def test_versioned_input_contract_parser_rejects_noncanonical_markers():
     ):
         with pytest.raises(ValueError):
             parse_session_input_contract_evidence(invalid)
+
+
+def _price_book(*, input_rate: str = "1", currency: str = "USD") -> PriceBook:
+    return PriceBook(
+        price_book_version="2026-08-05",
+        generated_at="2026-08-05T00:00:00Z",
+        prices=(
+            ModelPrice.fixed(
+                provider_name="fake",
+                model="fake-model",
+                input_per_million=Decimal(input_rate),
+                output_per_million=Decimal("2"),
+                currency=currency,
+            ),
+        ),
+    )
 
 
 @pytest.fixture(params=("memory", "sqlite", "postgres"))
@@ -224,6 +248,7 @@ def test_promotable_input_survives_every_builtin_store_and_restart(promotion_sto
         "first request",
         "second request",
     ]
+    assert promoted.revision.startswith("sha256:")
     assert promoted.redactions_applied is False
     assert promoted.to_run_input_spec().messages == promoted.messages
 
@@ -238,6 +263,224 @@ def test_failed_session_input_is_still_eligible_for_a_regression_case():
     assert trajectory.session.status == SessionStatus.FAILED
     promoted = promotable_run_input(app, trajectory, source_agent_name="assistant")
     assert [message.text for message in promoted.messages] == ["promote this run"]
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-failed",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    assert candidate.warnings == (PromotionWarningCode.SOURCE_RUN_FAILED,)
+    forged = candidate.model_copy(update={"warnings": ()})
+    with pytest.raises(ValueError, match="warnings do not match"):
+        PromotionCandidateV1.model_validate(forged.model_dump(mode="python"))
+    assert len(candidate.case.assertions) == 1
+    default_assertion = candidate.case.assertions[0]
+    assert type(default_assertion) is RootStatusAssertionSpec
+    assert default_assertion.expected == "completed"
+
+
+def test_candidate_projection_is_deterministic_editable_and_identity_free():
+    async def scenario():
+        return await _run_trajectory(
+            InMemorySessionStore(),
+            session_id="private-session-must-not-leak",
+        )
+
+    app, trajectory = asyncio.run(scenario())
+    policy = EvaluationEvidencePolicySpec.standard()
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+        evidence_policy=policy,
+    )
+    repeated = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+        evidence_policy=policy,
+    )
+    assert repeated == candidate
+    assert repeated.revision == candidate.revision
+    captured_input = promotable_run_input(app, trajectory, source_agent_name="assistant")
+    assert candidate.source.input_revision == captured_input.revision
+    assert candidate.source.input_redactions_applied is False
+    assert candidate.source.evidence_revision == candidate.evidence.revision
+    assert candidate.source.evidence_policy_revision == policy.revision
+    assert candidate.case.source == candidate.source.case_source()
+    assert candidate.case.suite_id == candidate.suite.id
+    assert candidate.suite.id == "assistant.regressions"
+    serialized = candidate.model_dump_json()
+    assert "private-session-must-not-leak" not in serialized
+
+    restored = PromotionCandidateV1.model_validate_json(serialized)
+    assert restored == candidate
+    edited_case = type(candidate.case).create(
+        id=candidate.case.id,
+        suite_id=candidate.case.suite_id,
+        name="Operator-edited regression",
+        description=candidate.case.description,
+        source=candidate.case.source,
+        input=candidate.case.input,
+        assertions=candidate.case.assertions,
+    )
+    edited = PromotionCandidateV1.create(
+        target_key=candidate.target_key,
+        source=candidate.source,
+        evidence_policy=candidate.evidence_policy,
+        pricing_profile=candidate.pricing_profile,
+        evidence=candidate.evidence,
+        suite=candidate.suite,
+        case=edited_case,
+    )
+    assert edited.case.id == candidate.case.id
+    assert edited.case.revision != candidate.case.revision
+    assert edited.revision != candidate.revision
+
+    forged_revision = candidate.model_copy(update={"revision": "sha256:" + "0" * 64})
+    with pytest.raises(ValueError, match="revision does not match"):
+        PromotionCandidateV1.model_validate(forged_revision.model_dump(mode="python"))
+
+    contradictory_source = candidate.source.model_copy(
+        update={"evidence_revision": "sha256:" + "0" * 64}
+    )
+    with pytest.raises(ValueError, match="source and evidence revisions"):
+        PromotionCandidateV1.create(
+            target_key=candidate.target_key,
+            source=contradictory_source,
+            evidence_policy=candidate.evidence_policy,
+            pricing_profile=candidate.pricing_profile,
+            evidence=candidate.evidence,
+            suite=candidate.suite,
+            case=candidate.case,
+        )
+
+
+def test_long_target_key_uses_a_bounded_deterministic_suite_id():
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore())
+
+    app, trajectory = asyncio.run(scenario())
+    candidate = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="a" * 128,
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+    )
+    assert candidate.suite.id.startswith("regressions-")
+    assert len(candidate.suite.id) <= 128
+
+
+def test_descriptive_label_and_pricing_do_not_change_default_case_identity():
+    async def scenario():
+        return await _run_trajectory(InMemorySessionStore())
+
+    app, trajectory = asyncio.run(scenario())
+    policy = EvaluationEvidencePolicySpec.standard()
+    plain = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+        evidence_policy=policy,
+    )
+    described = build_promotion_candidate(
+        app,
+        trajectory,
+        target_key="assistant",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-05",
+        evidence_policy=policy,
+        pricing=_price_book(),
+        source_label="Refund approval regression",
+    )
+    assert described.case.id == plain.case.id
+    assert described.case.name == "Refund approval regression"
+    assert described.pricing_profile is not None
+    assert described.source.pricing_profile_fingerprint == described.pricing_profile.fingerprint
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["target_key", "source_agent_name", "application_release_id", "source_label"],
+)
+def test_candidate_diagnostic_text_rejects_workload_secrets(field_name):
+    secret = "assistant" if field_name == "source_agent_name" else "candidate-diagnostic-secret"
+
+    async def scenario():
+        app, trajectory = await _run_trajectory(
+            InMemorySessionStore(),
+            secret_redactor=(None if field_name == "source_agent_name" else SecretRedactor(secret)),
+        )
+        if field_name == "source_agent_name":
+            app = CayuApp(
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+        return app, trajectory
+
+    app, trajectory = asyncio.run(scenario())
+    target_key = "assistant"
+    if field_name == "target_key":
+        target_key = secret
+    elif field_name == "source_agent_name":
+        target_key = "safe-target"
+    source_agent_name = secret if field_name == "source_agent_name" else "assistant"
+    with pytest.raises(ValueError, match="workload secret"):
+        build_promotion_candidate(
+            app,
+            trajectory,
+            target_key=target_key,
+            source_agent_name=source_agent_name,
+            application_release_id=(
+                secret if field_name == "application_release_id" else "safe-release"
+            ),
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+            source_label=secret if field_name == "source_label" else None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "secret"),
+    [
+        ("price_book_version", "private-pricing-identity"),
+        ("generated_at", "private-pricing-identity"),
+        ("currency", "ZZZ"),
+    ],
+)
+def test_candidate_pricing_identity_rejects_workload_secrets(field_name, secret):
+
+    async def scenario():
+        return await _run_trajectory(
+            InMemorySessionStore(),
+            secret_redactor=SecretRedactor(secret),
+        )
+
+    app, trajectory = asyncio.run(scenario())
+    if field_name == "currency":
+        pricing = _price_book(currency=secret)
+    else:
+        pricing = _price_book()
+        pricing = pricing.model_copy(update={field_name: secret})
+    with pytest.raises(ValueError, match="workload secret"):
+        build_promotion_candidate(
+            app,
+            trajectory,
+            target_key="assistant",
+            source_agent_name="assistant",
+            application_release_id="safe-release",
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+            pricing=pricing,
+        )
 
 
 def test_promotion_rejects_source_mismatch_and_incomplete_descendants():
