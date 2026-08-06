@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from cayu import (
+    AgentSpec,
+    CorpusTarget,
+    CorpusUserMessageSpec,
+    EvalCaseSpec,
+    EvalCorpusDocument,
+    EvalPlan,
+    EvalSuiteSpec,
+    EvaluationEvidencePolicySpec,
+    EvaluationSourceIdentityV1,
+    FinalOutputEqualsAssertionSpec,
+    Message,
+    ModelStreamEvent,
+    RunInputSpec,
+    RunRequest,
+    ScriptedModelProvider,
+    TrialRequestSpec,
+    eval_corpus_to_json,
+    load_corpus_execution_result,
+    load_eval_corpus,
+)
+from cayu.cli import main
+from cayu.runtime.app import CayuApp
+
+
+def _source() -> EvaluationSourceIdentityV1:
+    return EvaluationSourceIdentityV1(
+        application_release_id="captured-release",
+        app_manifest_schema_version="7",
+        app_manifest_fingerprint="a" * 64,
+        evidence_revision="sha256:" + "e" * 64,
+    )
+
+
+def _corpus(*, suite_id: str = "refunds", case_id: str = "refund-approved"):
+    suite = EvalSuiteSpec.create(
+        id=suite_id,
+        name=suite_id.title(),
+        trial_request=TrialRequestSpec(trials=1, timeout_seconds=30),
+    )
+    case = EvalCaseSpec.create(
+        id=case_id,
+        suite_id=suite_id,
+        name=case_id.title(),
+        source=_source(),
+        input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Review refund."),)),
+        assertions=(FinalOutputEqualsAssertionSpec(id="answer", expected="Approved"),),
+    )
+    return EvalCorpusDocument.create(
+        target_key="refund-agent",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        suites=(suite,),
+        cases=(case,),
+    )
+
+
+def build_corpus_eval_plan() -> EvalPlan:
+    app = CayuApp(enable_logging=False)
+    app.register_provider(
+        ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("Approved"),
+                ModelStreamEvent.completed(
+                    {
+                        "finish_reason": "stop",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    }
+                ),
+            ]
+        ),
+        default=True,
+    )
+    app.register_agent(AgentSpec(name="agent", model="fixture-model"))
+    return EvalPlan(
+        corpus_target=CorpusTarget(
+            key="refund-agent",
+            app=app,
+            request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
+            bootstrap_messages=(Message.text("system", "Follow policy."),),
+            application_release_id="release-2026-08-06",
+        )
+    )
+
+
+def test_eval_run_executes_downloaded_corpus_and_writes_safe_json_and_html(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    corpus_path = tmp_path / "corpus.json"
+    result_path = tmp_path / "result.json"
+    html_path = tmp_path / "result.html"
+    corpus_path.write_text(eval_corpus_to_json(_corpus()), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = main(
+        [
+            "eval",
+            "run",
+            f"{__name__}:build_corpus_eval_plan",
+            "--corpus",
+            str(corpus_path),
+            "--output",
+            str(result_path),
+            "--html-output",
+            str(html_path),
+        ]
+    )
+
+    result = load_corpus_execution_result(result_path)
+    assert exit_code == 0
+    assert result.run.status == "passed"
+    assert result.run.suite_id == "refunds"
+    assert result.target.application_release_id == "release-2026-08-06"
+    assert html_path.read_text(encoding="utf-8").startswith("<!doctype html>")
+    serialized = result_path.read_text(encoding="utf-8")
+    assert "session_id" not in serialized
+    assert '"final_output":' not in serialized
+    assert '"text": "Approved"' in serialized
+
+
+def test_eval_corpus_validate_inspect_and_atomic_merge_commands(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    merged = tmp_path / "merged.json"
+    inspection = tmp_path / "inspection.json"
+    first.write_text(eval_corpus_to_json(_corpus()), encoding="utf-8")
+    second.write_text(
+        eval_corpus_to_json(_corpus(suite_id="accounts", case_id="account-approved")),
+        encoding="utf-8",
+    )
+
+    assert main(["eval", "validate", str(first)]) == 0
+    assert "Valid eval corpus sha256:" in capsys.readouterr().out
+    assert (
+        main(
+            [
+                "eval",
+                "inspect",
+                str(first),
+                "--json",
+                "--output",
+                str(inspection),
+            ]
+        )
+        == 0
+    )
+    assert json.loads(inspection.read_text(encoding="utf-8"))["suite_count"] == 1
+    assert main(["eval", "merge", str(merged), str(first), str(second)]) == 0
+    capsys.readouterr()
+    assert tuple(suite.id for suite in load_eval_corpus(merged).suites) == (
+        "accounts",
+        "refunds",
+    )
+
+
+def test_eval_run_requires_explicit_suite_for_multi_suite_corpus(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    first = _corpus()
+    second = _corpus(suite_id="accounts", case_id="account-approved")
+    corpus_path = tmp_path / "multi.json"
+    from cayu import merge_eval_corpora
+
+    corpus_path.write_text(
+        eval_corpus_to_json(merge_eval_corpora((first, second))),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "eval",
+            "run",
+            f"{__name__}:build_corpus_eval_plan",
+            "--corpus",
+            str(corpus_path),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["error"]["code"] == "EVAL_COMMAND_FAILED"
+    assert "--suite is required" in payload["error"]["message"]
+
+
+def test_corpus_commands_reject_output_paths_that_would_overwrite_inputs(tmp_path, capsys):
+    corpus_path = tmp_path / "evals.json"
+    original = eval_corpus_to_json(_corpus())
+    corpus_path.write_text(original, encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "validate",
+                str(corpus_path),
+                "--output",
+                str(corpus_path),
+            ]
+        )
+        == 1
+    )
+    assert "must not overwrite corpus input" in capsys.readouterr().err
+    assert corpus_path.read_text(encoding="utf-8") == original
+
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_corpus_eval_plan",
+                "--corpus",
+                str(corpus_path),
+                "--output",
+                str(corpus_path),
+            ]
+        )
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "must not overwrite --corpus" in captured.out + captured.err
+    assert corpus_path.read_text(encoding="utf-8") == original
+
+    destination = tmp_path / "merged.json"
+    assert (
+        main(
+            [
+                "eval",
+                "merge",
+                str(destination),
+                str(corpus_path),
+                "--output",
+                str(destination),
+            ]
+        )
+        == 1
+    )
+    assert "must not overwrite merge destination" in capsys.readouterr().err
+    assert not destination.exists()
+
+
+def test_eval_run_rejects_colliding_json_and_html_outputs_before_execution(
+    tmp_path,
+    capsys,
+):
+    corpus_path = tmp_path / "evals.json"
+    output_path = tmp_path / "result"
+    corpus_path.write_text(eval_corpus_to_json(_corpus()), encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_corpus_eval_plan",
+                "--corpus",
+                str(corpus_path),
+                "--output",
+                str(output_path),
+                "--html-output",
+                str(output_path),
+            ]
+        )
+        == 1
+    )
+
+    captured = capsys.readouterr()
+    assert "must use different files" in captured.out + captured.err
+    assert not output_path.exists()

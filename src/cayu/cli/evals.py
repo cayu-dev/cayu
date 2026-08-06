@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import inspect
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,16 +13,26 @@ from cayu.cli._output import add_output_options
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals import (
+    CorpusExecutionResult,
+    CorpusTarget,
+    EvalCorpusDocument,
     EvalPlan,
+    EvalRun,
     EvalStatus,
     EvalSuite,
     compare_eval_runs,
     comparison_to_json,
+    corpus_execution_result_to_json,
+    eval_corpus_inspection_to_json,
     eval_run_to_json,
+    inspect_eval_corpus,
+    load_eval_corpus,
     load_eval_run,
+    merge_eval_corpus_files,
     render_comparison_html,
+    render_corpus_execution_html,
     render_html_report,
-    run_eval_suite,
+    run_eval_plan,
 )
 from cayu.runtime.app import CayuApp
 
@@ -49,18 +60,35 @@ def add_eval_parser(subparsers: Any) -> None:
         "target",
         nargs="?",
         help=(
-            "Python target that returns EvalPlan, (CayuApp, EvalSuite), or an object "
-            "with app and suite attributes. Defaults to [tool.cayu].eval_target."
+            "Python target that returns a direct-suite or corpus-target EvalPlan. "
+            "Defaults to [tool.cayu].eval_target."
         ),
     )
     add_output_options(run, formats=("json",))
     run.add_argument("--html-output", metavar="FILE", help="Also write an HTML report to FILE.")
     run.add_argument(
+        "--corpus",
+        metavar="FILE",
+        help="Run a portable corpus through the target's trusted CorpusTarget.",
+    )
+    run.add_argument(
+        "--suite",
+        metavar="SUITE_ID",
+        help="Corpus suite to run (optional only when the corpus has one suite).",
+    )
+    run.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=1,
+        metavar="COUNT",
+        help="Maximum concurrently executing cases (default: 1).",
+    )
+    run.add_argument(
         "--case-timeout-seconds",
         type=float,
         default=None,
         metavar="SECONDS",
-        help="Limit each eval case to SECONDS (default: no timeout).",
+        help="Limit each direct-suite case to SECONDS; corpus timeouts are declared in JSON.",
     )
 
     report = inner.add_parser(
@@ -93,6 +121,43 @@ def add_eval_parser(subparsers: Any) -> None:
         help="Allowed score drop before a regression is flagged (default: 0.0).",
     )
 
+    validate = inner.add_parser(
+        "validate",
+        help="Validate a portable eval corpus.",
+        description=(
+            "Validate one bounded portable eval corpus without loading an application target."
+        ),
+    )
+    validate.add_argument("corpus", metavar="CORPUS_JSON")
+    add_output_options(validate, formats=("json", "table"), default="table")
+
+    inspect_parser = inner.add_parser(
+        "inspect",
+        help="Inspect a validated portable eval corpus.",
+        description=(
+            "Show the target, suites, cases, assertions, and expanded result count for one "
+            "validated corpus."
+        ),
+    )
+    inspect_parser.add_argument("corpus", metavar="CORPUS_JSON")
+    add_output_options(inspect_parser, formats=("json", "table"), default="table")
+
+    merge = inner.add_parser(
+        "merge",
+        help="Atomically merge portable eval corpora.",
+        description=(
+            "Validate and merge compatible corpus files, then atomically replace the destination."
+        ),
+    )
+    merge.add_argument("destination", metavar="DESTINATION_JSON")
+    merge.add_argument("inputs", nargs="+", metavar="CORPUS_JSON")
+    merge.add_argument(
+        "--replace-conflicts",
+        action="store_true",
+        help="Replace same-ID content conflicts in command-line order.",
+    )
+    add_output_options(merge, formats=("json", "table"), default="table")
+
 
 def run_eval_command(args: argparse.Namespace) -> int:
     try:
@@ -102,6 +167,12 @@ def run_eval_command(args: argparse.Namespace) -> int:
             return _report(args)
         if args.eval_command == "compare":
             return _compare(args)
+        if args.eval_command == "validate":
+            return _validate_corpus(args)
+        if args.eval_command == "inspect":
+            return _inspect_corpus(args)
+        if args.eval_command == "merge":
+            return _merge_corpora(args)
     except Exception as exc:
         if getattr(args, "output_format", None) == "json":
             print(
@@ -127,17 +198,55 @@ async def _run(args: argparse.Namespace) -> int:
         else f"Configured eval target from {project.root / 'pyproject.toml'}"
     )
     with project_context(project.root):
-        plan = await _load_eval_plan(project.target, label=label)
-        run = await run_eval_suite(
-            plan.app,
-            plan.suite,
-            case_timeout_seconds=args.case_timeout_seconds,
+        # Relative eval paths are interpreted from the resolved project root,
+        # so collision checks must run in that same filesystem context.
+        _reject_output_path_aliases(
+            outputs=(
+                ("--output", args.output),
+                ("--html-output", args.html_output),
+            ),
+            protected=(("--corpus", args.corpus),),
         )
-        output = eval_run_to_json(run)
-        _write_or_print(output, args.output)
+        plan = await _load_eval_plan(project.target, label=label)
+        if args.corpus is None:
+            if plan.corpus_target is not None:
+                raise ValueError("Corpus EvalPlan execution requires --corpus FILE.")
+            if args.suite is not None:
+                raise ValueError("--suite requires --corpus FILE.")
+            run = await run_eval_plan(
+                plan,
+                max_concurrency=args.max_concurrency,
+                case_timeout_seconds=args.case_timeout_seconds,
+            )
+            if type(run) is not EvalRun:
+                raise TypeError("Direct EvalPlan returned an unexpected corpus result.")
+            output = eval_run_to_json(run)
+            _write_or_print(output, args.output)
+            if args.html_output is not None:
+                Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
+            return 0 if run.status == EvalStatus.PASSED else 1
+
+        if plan.corpus_target is None:
+            raise ValueError("--corpus requires an EvalPlan configured with corpus_target.")
+        if args.case_timeout_seconds is not None:
+            raise ValueError("Corpus timeout comes from the corpus; omit --case-timeout-seconds.")
+        corpus = load_eval_corpus(args.corpus)
+        suite_id = _selected_suite_id(corpus, args.suite)
+        result = await run_eval_plan(
+            plan,
+            corpus=corpus,
+            suite_id=suite_id,
+            max_concurrency=args.max_concurrency,
+        )
+        if type(result) is not CorpusExecutionResult:
+            raise TypeError("Corpus EvalPlan returned an unexpected direct result.")
+        _write_or_print(corpus_execution_result_to_json(result), args.output)
         if args.html_output is not None:
-            Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
-        return 0 if run.status == EvalStatus.PASSED else 1
+            Path(args.html_output).write_text(
+                render_corpus_execution_html(result),
+                encoding="utf-8",
+            )
+        return 0 if result.run.status == "passed" else 1
 
 
 async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:
@@ -183,20 +292,117 @@ def _compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_corpus(args: argparse.Namespace) -> int:
+    _reject_output_path_aliases(
+        outputs=(("--output", args.output),),
+        protected=(("corpus input", args.corpus),),
+    )
+    inspection = inspect_eval_corpus(load_eval_corpus(args.corpus))
+    output = (
+        eval_corpus_inspection_to_json(inspection)
+        if args.output_format == "json"
+        else f"Valid eval corpus {inspection.revision}\n"
+    )
+    _write_or_print(output, args.output)
+    return 0
+
+
+def _inspect_corpus(args: argparse.Namespace) -> int:
+    _reject_output_path_aliases(
+        outputs=(("--output", args.output),),
+        protected=(("corpus input", args.corpus),),
+    )
+    inspection = inspect_eval_corpus(load_eval_corpus(args.corpus))
+    output = (
+        eval_corpus_inspection_to_json(inspection)
+        if args.output_format == "json"
+        else _corpus_inspection_table(inspection)
+    )
+    _write_or_print(output, args.output)
+    return 0
+
+
+def _merge_corpora(args: argparse.Namespace) -> int:
+    _reject_output_path_aliases(
+        outputs=(("--output", args.output),),
+        protected=(
+            ("merge destination", args.destination),
+            *(("merge input", path) for path in args.inputs),
+        ),
+    )
+    corpus = merge_eval_corpus_files(
+        args.destination,
+        tuple(args.inputs),
+        replace_conflicts=args.replace_conflicts,
+    )
+    inspection = inspect_eval_corpus(corpus)
+    output = (
+        eval_corpus_inspection_to_json(inspection)
+        if args.output_format == "json"
+        else _corpus_inspection_table(inspection)
+    )
+    _write_or_print(output, args.output)
+    return 0
+
+
+def _selected_suite_id(corpus: EvalCorpusDocument, requested: str | None) -> str:
+    if requested is not None:
+        if not any(suite.id == requested for suite in corpus.suites):
+            raise ValueError(f"Eval corpus does not contain suite {requested!r}.")
+        return requested
+    if len(corpus.suites) != 1:
+        choices = ", ".join(suite.id for suite in corpus.suites)
+        raise ValueError(f"--suite is required; available corpus suites: {choices}.")
+    return corpus.suites[0].id
+
+
+def _corpus_inspection_table(inspection: Any) -> str:
+    lines = [
+        f"Corpus: {inspection.revision}",
+        f"Target: {inspection.target_key}",
+        f"Suites: {inspection.suite_count}",
+        f"Cases: {inspection.case_count}",
+        f"Assertions: {inspection.assertion_count}",
+        f"Expanded results: {inspection.expanded_assertion_result_count}",
+        "",
+    ]
+    lines.extend(
+        f"{suite.id}: {suite.case_count} case(s), {suite.assertion_count} assertion(s), "
+        f"{suite.trials} trial(s), {suite.timeout_seconds}s timeout"
+        for suite in inspection.suites
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _coerce_plan(value: Any) -> EvalPlan:
-    if isinstance(value, EvalPlan):
-        return value
+    if type(value) is EvalPlan:
+        if value.corpus_target is not None:
+            return EvalPlan(corpus_target=value.corpus_target)
+        return _validate_plan(value.app, value.suite)
     if isinstance(value, tuple | list) and len(value) == 2:
         app, suite = value
         return _validate_plan(app, suite)
     app = getattr(value, "app", None)
     suite = getattr(value, "suite", None)
+    corpus_target = getattr(value, "corpus_target", None)
+    if (app is not None or suite is not None) and corpus_target is not None:
+        raise ValueError("Eval target cannot configure direct and corpus modes together.")
     if app is not None or suite is not None:
         return _validate_plan(app, suite)
-    if isinstance(value, dict) and {"app", "suite"} <= set(value):
-        return _validate_plan(value["app"], value["suite"])
+    if corpus_target is not None:
+        return _validate_corpus_plan(corpus_target)
+    if isinstance(value, dict):
+        has_direct = "app" in value or "suite" in value
+        has_corpus = "corpus_target" in value
+        if has_direct and has_corpus:
+            raise ValueError("Eval target cannot configure direct and corpus modes together.")
+        if has_direct:
+            return _validate_plan(value.get("app"), value.get("suite"))
+        if has_corpus:
+            return _validate_corpus_plan(value["corpus_target"])
     raise TypeError(
-        "Eval target must return EvalPlan, (CayuApp, EvalSuite), or app/suite attributes."
+        "Eval target must return EvalPlan, (CayuApp, EvalSuite), app/suite attributes, "
+        "or a corpus_target attribute."
     )
 
 
@@ -208,8 +414,50 @@ def _validate_plan(app: Any, suite: Any) -> EvalPlan:
     return EvalPlan(app=app, suite=suite)
 
 
+def _validate_corpus_plan(target: Any) -> EvalPlan:
+    if type(target) is not CorpusTarget:
+        raise TypeError("Eval plan corpus_target must be an exact CorpusTarget.")
+    return EvalPlan(corpus_target=target)
+
+
 def _write_or_print(content: str, path: str | None) -> None:
     if path is None:
         print(content, end="")
         return
     Path(path).write_text(content, encoding="utf-8")
+
+
+def _reject_output_path_aliases(
+    *,
+    outputs: tuple[tuple[str, str | None], ...],
+    protected: tuple[tuple[str, str | None], ...],
+) -> None:
+    selected_outputs = tuple((label, path) for label, path in outputs if path is not None)
+    for index, (label, path) in enumerate(selected_outputs):
+        for other_label, other_path in selected_outputs[index + 1 :]:
+            if _paths_alias(path, other_path):
+                raise ValueError(f"{label} and {other_label} must use different files.")
+        for protected_label, protected_path in protected:
+            if protected_path is not None and _paths_alias(path, protected_path):
+                raise ValueError(f"{label} must not overwrite {protected_label}.")
+
+
+def _paths_alias(first: str, second: str) -> bool:
+    first_path = Path(first)
+    second_path = Path(second)
+    try:
+        if (
+            first_path.exists()
+            and second_path.exists()
+            and os.path.samefile(
+                first_path,
+                second_path,
+            )
+        ):
+            return True
+    except OSError:
+        pass
+    try:
+        return first_path.resolve(strict=False) == second_path.resolve(strict=False)
+    except OSError:
+        return Path(os.path.abspath(first_path)) == Path(os.path.abspath(second_path))
