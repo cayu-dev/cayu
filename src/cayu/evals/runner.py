@@ -8,7 +8,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -62,6 +62,10 @@ from cayu.runtime.usage import (
     SessionUsageSummary,
     session_usage_summary_payload,
 )
+
+if TYPE_CHECKING:
+    from cayu.evals.corpus import EvalCorpusDocument
+    from cayu.evals.execution import CorpusExecutionResult, CorpusTarget
 
 
 class _FreshInterruptedEvidenceUnavailable(RuntimeError):
@@ -184,8 +188,29 @@ class EvalSuite(BaseModel):
 
 @dataclass(frozen=True)
 class EvalPlan:
-    app: CayuApp
-    suite: EvalSuite
+    """Trusted project eval entry point in exactly one execution mode."""
+
+    app: CayuApp | None = None
+    suite: EvalSuite | None = None
+    corpus_target: CorpusTarget | None = None
+
+    def __post_init__(self) -> None:
+        from cayu.evals.execution import CorpusTarget
+
+        direct_configured = self.app is not None or self.suite is not None
+        corpus_configured = self.corpus_target is not None
+        if direct_configured == corpus_configured:
+            raise ValueError(
+                "EvalPlan requires exactly one mode: app with suite, or corpus_target."
+            )
+        if direct_configured:
+            if not isinstance(self.app, CayuApp):
+                raise TypeError("EvalPlan app must be a CayuApp.")
+            if type(self.suite) is not EvalSuite:
+                raise TypeError("EvalPlan suite must be an exact EvalSuite.")
+            return
+        if type(self.corpus_target) is not CorpusTarget:
+            raise TypeError("EvalPlan corpus_target must be an exact CorpusTarget.")
 
 
 async def run_eval_suite(
@@ -193,6 +218,7 @@ async def run_eval_suite(
     suite: EvalSuite,
     *,
     retain_trajectory: bool = False,
+    retain_final_output: bool = True,
     max_concurrency: int = 1,
     case_timeout_seconds: float | None = None,
     trials: int = 1,
@@ -210,6 +236,10 @@ async def run_eval_suite(
     `trials` runs each case N times and reports the mean per-assertion score, so a
     stochastic model whose score wobbles (e.g. 0.83 -> 0.82) settles to a stable
     average instead of flipping a baseline comparison on every run.
+
+    `retain_final_output=False` discards raw trial output after assertions have
+    evaluated. It cannot be combined with trajectory retention because a retained
+    trajectory must remain lossless.
     """
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
@@ -219,6 +249,10 @@ async def run_eval_suite(
         raise TypeError("run_eval_suite max_concurrency must be an int.")
     if max_concurrency < 1:
         raise ValueError("run_eval_suite max_concurrency must be >= 1.")
+    if type(retain_final_output) is not bool:
+        raise TypeError("run_eval_suite retain_final_output must be a bool.")
+    if not retain_final_output and retain_trajectory:
+        raise ValueError("run_eval_suite cannot discard final output while retaining trajectories.")
     _validate_trials(trials, "run_eval_suite trials")
     _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
     run_id = str(uuid4())
@@ -227,6 +261,7 @@ async def run_eval_suite(
         app,
         suite,
         retain_trajectory=retain_trajectory,
+        retain_final_output=retain_final_output,
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
         trials=trials,
@@ -251,24 +286,44 @@ async def run_eval_suite(
 async def run_eval_plan(
     plan: EvalPlan,
     *,
+    corpus: EvalCorpusDocument | None = None,
+    suite_id: str | None = None,
     retain_trajectory: bool = False,
     max_concurrency: int = 1,
     case_timeout_seconds: float | None = None,
-    trials: int = 1,
-) -> EvalRun:
+    trials: int | None = None,
+) -> EvalRun | CorpusExecutionResult:
     if type(plan) is not EvalPlan:
         raise TypeError("run_eval_plan requires an EvalPlan.")
-    if not isinstance(plan.app, CayuApp):
-        raise TypeError("EvalPlan app must be a CayuApp.")
-    if type(plan.suite) is not EvalSuite:
-        raise TypeError("EvalPlan suite must be an EvalSuite.")
+    if plan.corpus_target is not None:
+        from cayu.evals.corpus import EvalCorpusDocument
+        from cayu.evals.execution import run_corpus_suite
+
+        if type(corpus) is not EvalCorpusDocument:
+            raise TypeError("Corpus EvalPlan execution requires an exact EvalCorpusDocument.")
+        if suite_id is None:
+            raise ValueError("Corpus EvalPlan execution requires suite_id.")
+        if retain_trajectory:
+            raise ValueError("Corpus EvalPlan execution never publishes raw trajectories.")
+        if case_timeout_seconds is not None or trials is not None:
+            raise ValueError("Corpus trial count and timeout come only from the corpus contract.")
+        return await run_corpus_suite(
+            plan.corpus_target,
+            corpus,
+            suite_id,
+            max_concurrency=max_concurrency,
+        )
+    if corpus is not None or suite_id is not None:
+        raise ValueError("Direct EvalPlan execution does not accept corpus or suite_id.")
+    if not isinstance(plan.app, CayuApp) or type(plan.suite) is not EvalSuite:
+        raise TypeError("Direct EvalPlan requires a CayuApp and exact EvalSuite.")
     return await run_eval_suite(
         plan.app,
         plan.suite,
         retain_trajectory=retain_trajectory,
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
-        trials=trials,
+        trials=1 if trials is None else trials,
     )
 
 
@@ -277,6 +332,7 @@ async def _run_suite_cases(
     suite: EvalSuite,
     *,
     retain_trajectory: bool,
+    retain_final_output: bool,
     max_concurrency: int,
     case_timeout_seconds: float | None,
     trials: int,
@@ -288,6 +344,7 @@ async def _run_suite_cases(
                 case,
                 suite_id=suite.id,
                 retain_trajectory=retain_trajectory,
+                retain_final_output=retain_final_output,
                 timeout_seconds=case_timeout_seconds,
                 trials=trials,
             )
@@ -307,6 +364,7 @@ async def _run_suite_cases(
                 case,
                 suite_id=suite.id,
                 retain_trajectory=retain_trajectory,
+                retain_final_output=retain_final_output,
                 timeout_seconds=case_timeout_seconds,
                 trials=trials,
             )
@@ -323,6 +381,7 @@ async def run_eval_case(
     *,
     suite_id: str,
     retain_trajectory: bool = False,
+    retain_final_output: bool = True,
     timeout_seconds: float | None = None,
     trials: int = 1,
 ) -> EvalCaseResult:
@@ -333,6 +392,10 @@ async def run_eval_case(
     Aggregate fields are deterministic projections of the ordered ``result.trials`` tuple.
     No trial is selected as a representative and no trial evidence is overwritten.
     """
+    if type(retain_final_output) is not bool:
+        raise TypeError("run_eval_case retain_final_output must be a bool.")
+    if not retain_final_output and retain_trajectory:
+        raise ValueError("run_eval_case cannot discard final output while retaining trajectories.")
     _validate_trials(trials, "run_eval_case trials")
     _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
     started_at = datetime.now(UTC)
@@ -343,6 +406,7 @@ async def run_eval_case(
             trial_number=trial_number,
             suite_id=suite_id,
             retain_trajectory=retain_trajectory,
+            retain_final_output=retain_final_output,
             timeout_seconds=timeout_seconds,
         )
         for trial_number in range(1, trials + 1)
@@ -363,6 +427,7 @@ async def _run_case_once(
     trial_number: int,
     suite_id: str,
     retain_trajectory: bool = False,
+    retain_final_output: bool = True,
     timeout_seconds: float | None = None,
 ) -> EvalTrialResult:
     started_at = datetime.now(UTC)
@@ -610,7 +675,7 @@ async def _run_case_once(
         status=status,
         session_id=session_id,
         score=_trial_score(status, assertion_results),
-        final_output=final_output,
+        final_output=final_output if retain_final_output else "",
         assertions=tuple(assertion_results),
         error=run_error,
         unavailable_reason=unavailable_reason,

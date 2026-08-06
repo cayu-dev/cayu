@@ -1095,6 +1095,9 @@ def eval_run_contract_for_corpus(
     if suite is None:
         raise ValueError(f"Eval corpus does not contain suite {validated_suite_id!r}.")
     cases = tuple(case for case in validated.cases if case.suite_id == suite.id)
+    uses_pricing = any(
+        assertion.kind == "max_estimated_cost" for case in cases for assertion in case.assertions
+    )
     return EvalRunContractV1(
         corpus_revision=validated.revision,
         target_key=validated.target_key,
@@ -1102,7 +1105,9 @@ def eval_run_contract_for_corpus(
         suite_revision=suite.revision,
         evidence_policy_revision=validated.evidence_policy.revision,
         pricing_profile_fingerprint=(
-            None if validated.pricing_profile is None else validated.pricing_profile.fingerprint
+            validated.pricing_profile.fingerprint
+            if uses_pricing and validated.pricing_profile is not None
+            else None
         ),
         trials=suite.trial_request.trials,
         timeout_seconds=suite.trial_request.timeout_seconds,

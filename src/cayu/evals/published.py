@@ -1030,9 +1030,7 @@ def publish_eval_run(corpus: EvalCorpusDocument, run: EvalRun) -> PublishedEvalR
         "suite_id": suite.id,
         "suite_revision": suite.revision,
         "evidence_policy_revision": corpus.evidence_policy.revision,
-        "pricing_profile_fingerprint": (
-            None if corpus.pricing_profile is None else corpus.pricing_profile.fingerprint
-        ),
+        "pricing_profile_fingerprint": expected_run_contract.pricing_profile_fingerprint,
         "status": status,
         "score": _published_score(case.score for case in cases),
         "cases": cases,

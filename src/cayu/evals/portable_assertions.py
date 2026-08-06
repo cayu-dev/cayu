@@ -8,6 +8,7 @@ from cayu.evals.corpus import (
     AssertionSpec,
     EvaluationEvidencePolicySpec,
     MaxEstimatedCostAssertionSpec,
+    PricingProfileIdentityV1,
     RootStatusAssertionSpec,
     _validated_assertion_spec,
     assertion_spec_revision,
@@ -260,4 +261,50 @@ def compile_assertion_spec(
         app=app,
         evidence_policy=evidence_policy,
         pricing_binding=pricing_binding,
+    )
+
+
+def _compile_corpus_assertion_specs(
+    specs: Sequence[AssertionSpec],
+    *,
+    app: CayuApp,
+    evidence_policy: EvaluationEvidencePolicySpec,
+    trusted_pricing: PriceBook | None,
+    expected_pricing_profile: PricingProfileIdentityV1 | None,
+) -> tuple[EvalAssertion, ...]:
+    """Compile one corpus suite with a single shared pricing binding."""
+
+    if not isinstance(app, CayuApp):
+        raise TypeError("app must be a CayuApp.")
+    if trusted_pricing is not None and type(trusted_pricing) is not PriceBook:
+        raise TypeError("trusted_pricing must be an exact PriceBook or None.")
+    if expected_pricing_profile is not None and (
+        type(expected_pricing_profile) is not PricingProfileIdentityV1
+    ):
+        raise TypeError(
+            "expected_pricing_profile must be an exact PricingProfileIdentityV1 or None."
+        )
+
+    validated_specs = tuple(_validated_assertion_spec(spec) for spec in specs)
+    uses_pricing = any(type(spec) is MaxEstimatedCostAssertionSpec for spec in validated_specs)
+    pricing_binding = _NO_PRICING
+    if uses_pricing:
+        if trusted_pricing is None:
+            raise ValueError("Eval corpus pricing profile does not match the trusted CorpusTarget.")
+        trusted_identity = pricing_profile_identity(trusted_pricing)
+        if trusted_identity != expected_pricing_profile:
+            raise ValueError("Eval corpus pricing profile does not match the trusted CorpusTarget.")
+        pricing_binding = _CompiledPricingBinding(
+            source=trusted_pricing,
+            fingerprint=trusted_identity.fingerprint,
+        )
+
+    return tuple(
+        _CompiledPortableAssertion(
+            spec,
+            app=app,
+            evidence_policy=evidence_policy,
+            pricing_binding=pricing_binding,
+        )
+        for spec in validated_specs
     )
