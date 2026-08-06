@@ -51,6 +51,11 @@ function capabilities() {
         read: operation(false, "not_configured"),
         mutate: operation(false, "unsupported"),
       },
+      evaluation_promotion: {
+        configured: true,
+        read: operation(true),
+        mutate: operation(false, "unsupported"),
+      },
     },
     mutations: {
       session_execution: operation(true),
@@ -77,6 +82,21 @@ test("capability requirements resolve surface reads, surface mutations, and muta
       operation: "mutate",
     }),
     operation(false, "unsupported"),
+  )
+  assert.equal(
+    resolveDashboardCapability(snapshot, {
+      kind: "surface",
+      surface: "evaluation_promotion",
+    }).enabled,
+    true,
+  )
+  assert.equal(
+    resolveDashboardCapability(snapshot, {
+      kind: "surface",
+      surface: "evaluation_promotion",
+      operation: "mutate",
+    }).enabled,
+    false,
   )
   assert.deepEqual(
     resolveDashboardCapability(snapshot, {

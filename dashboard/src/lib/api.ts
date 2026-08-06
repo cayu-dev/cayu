@@ -18,6 +18,9 @@ import type {
   ArtifactReadResponse,
   ArtifactsResponse,
   EnvironmentsResponse,
+  EvaluationPromotionDraft,
+  EvaluationPromotionExportRequest,
+  EvaluationPromotionPreviewResponse,
   GetArtifactApiArtifactsArtifactIdGetData,
   GetArtifactContentApiArtifactsArtifactIdContentGetData,
   GetContractApiContractGetResponse,
@@ -147,6 +150,9 @@ export type KnowledgePendingQuery = NonNullable<
 >
 export type SSEEvent = SseEventEnvelope
 export type SessionInterrupt = InterruptSessionBody
+export type EvaluationPromotionPreview = EvaluationPromotionPreviewResponse
+export type EvaluationPromotionCandidateDraft = EvaluationPromotionDraft
+export type EvaluationPromotionExport = EvaluationPromotionExportRequest
 
 type ErrorEnvelope = {
   detail?: unknown
@@ -178,7 +184,7 @@ function queryString(query: Record<string, unknown> = {}): string {
   return encoded ? `?${encoded}` : ""
 }
 
-async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function requestResponse(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers)
   if (!headers.has("Accept")) {
     headers.set("Accept", "application/json")
@@ -194,6 +200,11 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   if (!res.ok) {
     await throwResponseError(res)
   }
+  return res
+}
+
+async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await requestResponse(path, init)
   return res.json() as Promise<T>
 }
 
@@ -342,6 +353,47 @@ export async function fetchSessionTopology(
 
 export async function fetchSession(id: string): Promise<SessionDetail> {
   return requestJson<SessionDetail>(`/sessions/${encodeURIComponent(id)}`)
+}
+
+export async function previewEvaluationPromotion(
+  sessionId: string,
+  draft?: EvaluationPromotionCandidateDraft,
+  signal?: AbortSignal,
+): Promise<EvaluationPromotionPreview> {
+  return requestJson<EvaluationPromotionPreview>(
+    `/evals/promotion/sessions/${encodeURIComponent(sessionId)}/preview`,
+    {
+      method: "POST",
+      body: JSON.stringify({ draft: draft ?? null }),
+      signal,
+    },
+  )
+}
+
+export async function exportEvaluationPromotion(
+  sessionId: string,
+  body: EvaluationPromotionExport,
+  signal?: AbortSignal,
+): Promise<{ blob: Blob; filename: string }> {
+  const response = await requestResponse(
+    `/evals/promotion/sessions/${encodeURIComponent(sessionId)}/export`,
+    {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal,
+    },
+  )
+  return {
+    blob: await response.blob(),
+    filename: evaluationPromotionFilename(response.headers.get("content-disposition")),
+  }
+}
+
+function evaluationPromotionFilename(contentDisposition: string | null): string {
+  const match = /^attachment; filename="([a-z][a-z0-9._-]{0,127}\.eval\.json)"$/.exec(
+    contentDisposition ?? "",
+  )
+  return match?.[1] ?? "cayu-eval-corpus.json"
 }
 
 export async function updateSessionLabels(
