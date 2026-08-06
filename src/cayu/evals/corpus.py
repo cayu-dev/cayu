@@ -60,7 +60,10 @@ EVIDENCE_MAX_FINAL_OUTPUT_CHARS = 65_536
 EVIDENCE_MAX_CHILD_SESSIONS = 500
 EVIDENCE_MAX_TOOL_CALLS = 4_096
 EVIDENCE_MAX_MODEL_STEPS = 4_096
-EVIDENCE_MAX_TOTAL_TOKENS = 2**63 - 1
+# Eval corpora cross browser and other IEEE-754 JSON boundaries. Keep every
+# numeric token counter exactly representable; larger durable usage is reported
+# as limit-exceeded evidence instead of being silently rounded in transit.
+EVIDENCE_MAX_TOTAL_TOKENS = 2**53 - 1
 
 _PORTABLE_ID_PATTERN = re.compile(r"[a-z][a-z0-9._-]{0,127}\Z", re.ASCII)
 _SHA256_REVISION_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z", re.ASCII)
@@ -694,7 +697,7 @@ class EvaluationEvidencePolicySpec(_SchemaV1PortableModel):
     max_child_sessions: Literal[500] = EVIDENCE_MAX_CHILD_SESSIONS
     max_tool_calls: Literal[4096] = EVIDENCE_MAX_TOOL_CALLS
     max_model_steps: Literal[4096] = EVIDENCE_MAX_MODEL_STEPS
-    max_total_tokens: Literal[9223372036854775807] = 9223372036854775807
+    max_total_tokens: Literal[9007199254740991] = EVIDENCE_MAX_TOTAL_TOKENS
 
     @field_validator(
         "include_event_payloads",

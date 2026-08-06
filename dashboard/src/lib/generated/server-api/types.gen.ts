@@ -2385,7 +2385,7 @@ export type EvaluationEvidencePolicySpec = {
     /**
      * Max Total Tokens
      */
-    max_total_tokens?: 9223372036854776000;
+    max_total_tokens?: 9007199254740991;
     /**
      * Revision
      */

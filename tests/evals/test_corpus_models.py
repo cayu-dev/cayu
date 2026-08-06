@@ -9,6 +9,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_MESSAGE_CHARS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_SCHEMA_VERSION,
+    EVIDENCE_MAX_TOTAL_TOKENS,
     ChildStatusAssertionSpec,
     CorpusUserMessageSpec,
     EvalCaseSpec,
@@ -179,6 +180,19 @@ def test_every_portable_assertion_kind_round_trips_through_a_case():
         "max_total_tokens",
         "max_estimated_cost",
     )
+
+
+def test_portable_token_bound_is_exact_across_ieee_754_json_boundaries():
+    policy = EvaluationEvidencePolicySpec.standard()
+
+    assert EVIDENCE_MAX_TOTAL_TOKENS == 2**53 - 1
+    assert policy.max_total_tokens == EVIDENCE_MAX_TOTAL_TOKENS
+    assert int(float(policy.max_total_tokens)) == policy.max_total_tokens
+    with pytest.raises(ValidationError):
+        MaxTotalTokensAssertionSpec(
+            id="lossy-token-budget",
+            maximum=EVIDENCE_MAX_TOTAL_TOKENS + 1,
+        )
 
 
 def test_ordered_portable_inputs_reject_unordered_python_containers():
