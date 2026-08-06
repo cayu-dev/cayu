@@ -1524,6 +1524,118 @@ export type ArtifactsResponse = {
 };
 
 /**
+ * AssertionCostEvidenceV1
+ *
+ * One currency-local aggregate with no provider, model, or line-item identity.
+ */
+export type AssertionCostEvidenceV1 = {
+    /**
+     * Currency
+     */
+    currency: string;
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Priced Model Steps
+     */
+    priced_model_steps: number;
+    /**
+     * Total Cost
+     */
+    total_cost: string;
+    /**
+     * Unpriced Model Steps
+     */
+    unpriced_model_steps: number;
+};
+
+/**
+ * AssertionEvidenceView
+ *
+ * The bounded, alias-free data consumed by every portable assertion.
+ */
+export type AssertionEvidenceView = {
+    /**
+     * Child Evidence State
+     */
+    child_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Child Statuses
+     */
+    child_statuses: Array<'completed' | 'failed' | 'interrupted'>;
+    /**
+     * Costs
+     */
+    costs: Array<AssertionCostEvidenceV1>;
+    /**
+     * Final Output
+     */
+    final_output: string;
+    /**
+     * Final Output State
+     */
+    final_output_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Model Step Evidence State
+     */
+    model_step_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Model Steps
+     */
+    model_steps?: number | null;
+    /**
+     * Policy Revision
+     */
+    policy_revision: string;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Requested Tool Names
+     */
+    requested_tool_names: Array<string>;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Root Evidence Available
+     */
+    root_evidence_available: boolean;
+    /**
+     * Root Status
+     */
+    root_status?: 'completed' | 'failed' | 'interrupted' | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Started Tool Names
+     */
+    started_tool_names: Array<string>;
+    /**
+     * Tool Calls Started
+     */
+    tool_calls_started?: number | null;
+    /**
+     * Tool Evidence State
+     */
+    tool_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Total Tokens
+     */
+    total_tokens?: string | null;
+    /**
+     * Usage Evidence State
+     */
+    usage_evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
+};
+
+/**
  * BillingIdentity
  *
  * Provider-neutral commercial identity and possible pricing contexts.
@@ -1656,6 +1768,58 @@ export type CapabilityOperation = {
      * Unavailable Reason
      */
     unavailable_reason?: 'not_configured' | 'unsupported' | null;
+};
+
+/**
+ * CapturedRunScoreV1
+ *
+ * Bounded public score for an edited candidate against its captured evidence.
+ */
+export type CapturedRunScoreV1 = {
+    /**
+     * Assertions
+     */
+    assertions: Array<PublishedAssertionResult>;
+    /**
+     * Candidate Revision
+     */
+    candidate_revision: string;
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * Evidence Revision
+     */
+    evidence_revision: string;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
 };
 
 /**
@@ -1813,6 +1977,36 @@ export type CheckpointCompatibilityEvidence = {
 };
 
 /**
+ * ChildStatusAssertionSpec
+ */
+export type ChildStatusAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Expected
+     */
+    expected: 'completed' | 'failed';
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'child_status';
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Min Count
+     */
+    min_count?: number;
+};
+
+/**
  * ClientGenerationContract
  */
 export type ClientGenerationContract = {
@@ -1919,11 +2113,28 @@ export type ControlPlaneMutationCapabilities = {
 export type ControlPlaneSurfaceCapabilities = {
     artifacts: OptionalSurfaceCapability;
     dashboard: OptionalSurfaceCapability;
+    evaluation_promotion: OptionalSurfaceCapability;
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
     workflow?: OptionalSurfaceCapability | null;
+};
+
+/**
+ * CorpusUserMessageSpec
+ *
+ * One portable user-role text message; no structured or executable input.
+ */
+export type CorpusUserMessageSpec = {
+    /**
+     * Role
+     */
+    role?: 'user';
+    /**
+     * Text
+     */
+    text: string;
 };
 
 /**
@@ -2071,9 +2282,290 @@ export type EnvironmentsResponse = {
 };
 
 /**
+ * EvalCaseSpec
+ *
+ * One portable request and deterministic expectation set.
+ */
+export type EvalCaseSpec = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    input: RunInputSpec;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    source: EvaluationSourceIdentityV1;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+};
+
+/**
+ * EvalSuiteSpec
+ *
+ * Reusable execution settings; case membership remains mergeable by suite_id.
+ */
+export type EvalSuiteSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    trial_request?: TrialRequestSpec;
+};
+
+/**
+ * EvaluationEvidencePolicySpec
+ *
+ * Complete v1 omission, redaction, and cardinality behavior.
+ */
+export type EvaluationEvidencePolicySpec = {
+    /**
+     * Event Projection
+     */
+    event_projection?: 'runtime_public_alias_free_v1';
+    /**
+     * Include Event Payloads
+     */
+    include_event_payloads?: false;
+    /**
+     * Include Tool Arguments
+     */
+    include_tool_arguments?: false;
+    /**
+     * Include Tool Results
+     */
+    include_tool_results?: false;
+    /**
+     * Include Transcript Text
+     */
+    include_transcript_text?: false;
+    /**
+     * Max Child Sessions
+     */
+    max_child_sessions?: 500;
+    /**
+     * Max Final Output Chars
+     */
+    max_final_output_chars?: 65536;
+    /**
+     * Max Model Steps
+     */
+    max_model_steps?: 4096;
+    /**
+     * Max Tool Calls
+     */
+    max_tool_calls?: 4096;
+    /**
+     * Max Total Tokens
+     */
+    max_total_tokens?: 9223372036854776000;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * EvaluationPromotionCaseDraft
+ *
+ * Complete authority-free case fields editable in one preview.
+ */
+export type EvaluationPromotionCaseDraft = {
+    /**
+     * Assertions
+     */
+    assertions: Array<RootStatusAssertionSpec | ChildStatusAssertionSpec | FinalOutputEqualsAssertionSpec | FinalOutputContainsAssertionSpec | ToolCalledAssertionSpec | ToolsCalledInOrderAssertionSpec | MaxToolCallsAssertionSpec | MaxModelStepsAssertionSpec | UsageRecordedAssertionSpec | MaxTotalTokensAssertionSpec | MaxEstimatedCostAssertionSpec>;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    input: RunInputSpec;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+};
+
+/**
+ * EvaluationPromotionDraft
+ *
+ * Complete editable projection based on one previewed evidence revision.
+ */
+export type EvaluationPromotionDraft = {
+    case: EvaluationPromotionCaseDraft;
+    /**
+     * Expected Baseline Revision
+     */
+    expected_baseline_revision: string;
+    suite: EvaluationPromotionSuiteDraft;
+};
+
+/**
+ * EvaluationPromotionExportRequest
+ */
+export type EvaluationPromotionExportRequest = {
+    candidate: PromotionCandidateV1;
+    /**
+     * Expected Candidate Revision
+     */
+    expected_candidate_revision: string;
+};
+
+/**
+ * EvaluationPromotionPreviewRequest
+ */
+export type EvaluationPromotionPreviewRequest = {
+    draft?: EvaluationPromotionDraft | null;
+};
+
+/**
+ * EvaluationPromotionPreviewResponse
+ */
+export type EvaluationPromotionPreviewResponse = {
+    /**
+     * Baseline Revision
+     */
+    baseline_revision: string;
+    candidate: PromotionCandidateV1;
+    captured_score: CapturedRunScoreV1;
+};
+
+/**
+ * EvaluationPromotionSuiteDraft
+ *
+ * Complete authority-free suite fields editable in one preview.
+ */
+export type EvaluationPromotionSuiteDraft = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    trial_request: TrialRequestSpec;
+};
+
+/**
+ * EvaluationSourceIdentityV1
+ *
+ * Diagnostic capture provenance without runtime or session authority.
+ */
+export type EvaluationSourceIdentityV1 = {
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * App Manifest Schema Version
+     */
+    app_manifest_schema_version: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Evidence Revision
+     */
+    evidence_revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
  * EventOrder
  */
 export type EventOrder = 'sequence_asc' | 'sequence_desc';
+
+/**
+ * FinalOutputContainsAssertionSpec
+ */
+export type FinalOutputContainsAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Expected
+     */
+    expected: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'final_output_contains';
+};
+
+/**
+ * FinalOutputEqualsAssertionSpec
+ */
+export type FinalOutputEqualsAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Expected
+     */
+    expected: string;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'final_output_equals';
+};
 
 /**
  * HTTPValidationError
@@ -2216,6 +2708,98 @@ export type ListSessionsResponse = {
      * Total Count
      */
     total_count?: number | null;
+};
+
+/**
+ * MaxEstimatedCostAssertionSpec
+ */
+export type MaxEstimatedCostAssertionSpec = {
+    /**
+     * Currency
+     */
+    currency?: string;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'max_estimated_cost';
+    /**
+     * Maximum
+     */
+    maximum: string;
+};
+
+/**
+ * MaxModelStepsAssertionSpec
+ */
+export type MaxModelStepsAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'max_model_steps';
+    /**
+     * Maximum
+     */
+    maximum: number;
+};
+
+/**
+ * MaxToolCallsAssertionSpec
+ */
+export type MaxToolCallsAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'max_tool_calls';
+    /**
+     * Maximum
+     */
+    maximum: number;
+};
+
+/**
+ * MaxTotalTokensAssertionSpec
+ */
+export type MaxTotalTokensAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'max_total_tokens';
+    /**
+     * Maximum
+     */
+    maximum: number;
 };
 
 /**
@@ -2605,6 +3189,38 @@ export type PricingContextSelector = {
 };
 
 /**
+ * PricingProfileIdentityV1
+ *
+ * Content identity for trusted pricing, never the actual PriceBook.
+ */
+export type PricingProfileIdentityV1 = {
+    /**
+     * Currencies
+     */
+    currencies: Array<string>;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Generated At
+     */
+    generated_at: string;
+    /**
+     * Price Book Version
+     */
+    price_book_version: string;
+    /**
+     * Pricing Semantics Version
+     */
+    pricing_semantics_version?: 1;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
  * PricingResourceMapping
  *
  * Map one opaque provider resource to an explicit pricing model.
@@ -2625,6 +3241,95 @@ export type PricingResourceMapping = {
 };
 
 /**
+ * PromotionCandidateV1
+ *
+ * One deterministic, editable case candidate and its public-safe evidence.
+ */
+export type PromotionCandidateV1 = {
+    case: EvalCaseSpec;
+    evidence: AssertionEvidenceView;
+    evidence_policy: EvaluationEvidencePolicySpec;
+    pricing_profile?: PricingProfileIdentityV1 | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    source: PromotionSourceV1;
+    suite: EvalSuiteSpec;
+    /**
+     * Target Key
+     */
+    target_key: string;
+    /**
+     * Warnings
+     */
+    warnings: Array<PromotionWarningCode>;
+};
+
+/**
+ * PromotionSourceV1
+ *
+ * Safe diagnostic capture provenance without executable or session authority.
+ */
+export type PromotionSourceV1 = {
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * App Manifest Schema Version
+     */
+    app_manifest_schema_version: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * Evidence Revision
+     */
+    evidence_revision: string;
+    /**
+     * Input Redactions Applied
+     */
+    input_redactions_applied: boolean;
+    /**
+     * Input Revision
+     */
+    input_revision: string;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Source Agent Name
+     */
+    source_agent_name: string;
+    /**
+     * Source Label
+     */
+    source_label?: string | null;
+};
+
+/**
+ * PromotionWarningCode
+ *
+ * Stable, non-blocking fact surfaced with one editable candidate.
+ */
+export type PromotionWarningCode = 'input_redacted' | 'source_run_failed';
+
+/**
  * Provenance
  *
  * Where model or pricing facts came from and when they were checked.
@@ -2642,6 +3347,284 @@ export type Provenance = {
      * Url
      */
     url: string;
+};
+
+/**
+ * PublishedAssertionResult
+ */
+export type PublishedAssertionResult = {
+    /**
+     * Assertion Id
+     */
+    assertion_id: string;
+    /**
+     * Assertion Revision
+     */
+    assertion_revision: string;
+    /**
+     * Code
+     */
+    code: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Detail
+     */
+    detail: ({
+        kind: 'root_status';
+    } & PublishedRootStatusDetail) | ({
+        kind: 'child_status';
+    } & PublishedChildStatusDetail) | ({
+        kind: 'final_output_equals';
+    } & PublishedFinalOutputEqualsDetail) | ({
+        kind: 'final_output_contains';
+    } & PublishedFinalOutputContainsDetail) | ({
+        kind: 'tool_called';
+    } & PublishedToolCalledDetail) | ({
+        kind: 'tools_called_in_order';
+    } & PublishedToolsCalledInOrderDetail) | ({
+        kind: 'max_tool_calls';
+    } & PublishedMaxToolCallsDetail) | ({
+        kind: 'max_model_steps';
+    } & PublishedMaxModelStepsDetail) | ({
+        kind: 'usage_recorded';
+    } & PublishedUsageRecordedDetail) | ({
+        kind: 'max_total_tokens';
+    } & PublishedMaxTotalTokensDetail) | ({
+        kind: 'max_estimated_cost';
+    } & PublishedMaxEstimatedCostDetail);
+    /**
+     * Message
+     */
+    message: string;
+    /**
+     * Outcome
+     */
+    outcome: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Score
+     */
+    score?: number | null;
+};
+
+/**
+ * PublishedChildStatusDetail
+ */
+export type PublishedChildStatusDetail = {
+    /**
+     * Expected
+     */
+    expected: 'completed' | 'failed';
+    /**
+     * Kind
+     */
+    kind?: 'child_status';
+    /**
+     * Matching Count
+     */
+    matching_count?: number | null;
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Min Count
+     */
+    min_count: number;
+};
+
+/**
+ * PublishedFinalOutputContainsDetail
+ */
+export type PublishedFinalOutputContainsDetail = {
+    /**
+     * Kind
+     */
+    kind?: 'final_output_contains';
+    /**
+     * Matched
+     */
+    matched?: boolean | null;
+};
+
+/**
+ * PublishedFinalOutputEqualsDetail
+ */
+export type PublishedFinalOutputEqualsDetail = {
+    /**
+     * Kind
+     */
+    kind?: 'final_output_equals';
+    /**
+     * Matched
+     */
+    matched?: boolean | null;
+};
+
+/**
+ * PublishedMaxEstimatedCostDetail
+ */
+export type PublishedMaxEstimatedCostDetail = {
+    /**
+     * Currency
+     */
+    currency: string;
+    /**
+     * Estimated Cost
+     */
+    estimated_cost?: string | null;
+    /**
+     * Kind
+     */
+    kind?: 'max_estimated_cost';
+    /**
+     * Maximum
+     */
+    maximum: string;
+    /**
+     * Priced Model Steps
+     */
+    priced_model_steps?: number | null;
+    /**
+     * Unpriced Model Steps
+     */
+    unpriced_model_steps?: number | null;
+};
+
+/**
+ * PublishedMaxModelStepsDetail
+ */
+export type PublishedMaxModelStepsDetail = {
+    /**
+     * Actual
+     */
+    actual?: number | null;
+    /**
+     * Kind
+     */
+    kind?: 'max_model_steps';
+    /**
+     * Maximum
+     */
+    maximum: number;
+};
+
+/**
+ * PublishedMaxToolCallsDetail
+ */
+export type PublishedMaxToolCallsDetail = {
+    /**
+     * Actual
+     */
+    actual?: number | null;
+    /**
+     * Kind
+     */
+    kind?: 'max_tool_calls';
+    /**
+     * Maximum
+     */
+    maximum: number;
+};
+
+/**
+ * PublishedMaxTotalTokensDetail
+ */
+export type PublishedMaxTotalTokensDetail = {
+    /**
+     * Actual
+     */
+    actual?: number | null;
+    /**
+     * Kind
+     */
+    kind?: 'max_total_tokens';
+    /**
+     * Maximum
+     */
+    maximum: number;
+};
+
+/**
+ * PublishedRootStatusDetail
+ */
+export type PublishedRootStatusDetail = {
+    /**
+     * Actual
+     */
+    actual?: 'completed' | 'failed' | 'interrupted' | null;
+    /**
+     * Expected
+     */
+    expected: 'completed' | 'failed';
+    /**
+     * Kind
+     */
+    kind?: 'root_status';
+};
+
+/**
+ * PublishedToolCalledDetail
+ */
+export type PublishedToolCalledDetail = {
+    /**
+     * Kind
+     */
+    kind?: 'tool_called';
+    /**
+     * Matching Count
+     */
+    matching_count?: number | null;
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Min Count
+     */
+    min_count: number;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
+ * PublishedToolsCalledInOrderDetail
+ */
+export type PublishedToolsCalledInOrderDetail = {
+    /**
+     * Actual Count
+     */
+    actual_count?: number | null;
+    /**
+     * Expected Count
+     */
+    expected_count: number;
+    /**
+     * Kind
+     */
+    kind?: 'tools_called_in_order';
+    /**
+     * Matched
+     */
+    matched?: boolean | null;
+};
+
+/**
+ * PublishedUsageRecordedDetail
+ */
+export type PublishedUsageRecordedDetail = {
+    /**
+     * Actual
+     */
+    actual?: number | null;
+    /**
+     * Kind
+     */
+    kind?: 'usage_recorded';
+    /**
+     * Minimum
+     */
+    minimum: number;
 };
 
 /**
@@ -2763,6 +3746,28 @@ export type RetryPolicy = {
 };
 
 /**
+ * RootStatusAssertionSpec
+ */
+export type RootStatusAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Expected
+     */
+    expected: 'completed' | 'failed';
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'root_status';
+};
+
+/**
  * RunBody
  */
 export type RunBody = {
@@ -2806,6 +3811,18 @@ export type RunBody = {
     session_id?: string | null;
     structured_output?: StructuredOutputSpec | null;
     thinking?: ThinkingConfig | null;
+};
+
+/**
+ * RunInputSpec
+ *
+ * The authority-free user input supplied after a trusted local bootstrap.
+ */
+export type RunInputSpec = {
+    /**
+     * Messages
+     */
+    messages: Array<CorpusUserMessageSpec>;
 };
 
 /**
@@ -3850,6 +4867,36 @@ export type ToolApprovalRecoveryBody = {
 export type ToolApprovalRecoveryOutcome = 'completed' | 'failed';
 
 /**
+ * ToolCalledAssertionSpec
+ */
+export type ToolCalledAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'tool_called';
+    /**
+     * Max Count
+     */
+    max_count?: number | null;
+    /**
+     * Min Count
+     */
+    min_count?: number;
+    /**
+     * Tool Name
+     */
+    tool_name: string;
+};
+
+/**
  * ToolRoundRecoveryBody
  *
  * Body for recovering a crashed ordinary tool call with an operator outcome.
@@ -3914,6 +4961,28 @@ export type ToolRoundRecoveryBody = {
 };
 
 /**
+ * ToolsCalledInOrderAssertionSpec
+ */
+export type ToolsCalledInOrderAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'tools_called_in_order';
+    /**
+     * Tool Names
+     */
+    tool_names: Array<string>;
+};
+
+/**
  * TranscriptSummary
  */
 export type TranscriptSummary = {
@@ -3921,6 +4990,22 @@ export type TranscriptSummary = {
      * Total Messages
      */
     total_messages: number;
+};
+
+/**
+ * TrialRequestSpec
+ *
+ * Sequential, bounded fresh-evaluation execution settings.
+ */
+export type TrialRequestSpec = {
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds?: number;
+    /**
+     * Trials
+     */
+    trials?: number;
 };
 
 /**
@@ -4208,6 +5293,28 @@ export type UsageCurrencyCost = {
      * Total Cost
      */
     total_cost: string;
+};
+
+/**
+ * UsageRecordedAssertionSpec
+ */
+export type UsageRecordedAssertionSpec = {
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Kind
+     */
+    kind?: 'usage_recorded';
+    /**
+     * Min Total Tokens
+     */
+    min_total_tokens?: number;
 };
 
 /**
@@ -5005,6 +6112,96 @@ export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses = {
 };
 
 export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponse = GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses[keyof GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses];
+
+export type ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostData = {
+    body: EvaluationPromotionExportRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/promotion/sessions/{session_id}/export';
+};
+
+export type ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostErrors = {
+    /**
+     * The submitted candidate contains unsafe or inconsistent editable data.
+     */
+    400: unknown;
+    /**
+     * The requested source session does not exist.
+     */
+    404: unknown;
+    /**
+     * The source is ineligible, changed, or no longer matches the preview.
+     */
+    409: unknown;
+    /**
+     * The encoded promotion request or bounded evidence exceeds its limit.
+     */
+    413: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostError = ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostErrors[keyof ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostErrors];
+
+export type ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostData = {
+    body: EvaluationPromotionPreviewRequest;
+    path: {
+        /**
+         * Session Id
+         */
+        session_id: string;
+    };
+    query?: never;
+    url: '/api/evals/promotion/sessions/{session_id}/preview';
+};
+
+export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostErrors = {
+    /**
+     * The submitted candidate contains unsafe or inconsistent editable data.
+     */
+    400: unknown;
+    /**
+     * The requested source session does not exist.
+     */
+    404: unknown;
+    /**
+     * The source is ineligible, changed, or no longer matches the preview.
+     */
+    409: unknown;
+    /**
+     * The encoded promotion request or bounded evidence exceeds its limit.
+     */
+    413: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostError = PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostErrors[keyof PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostErrors];
+
+export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvaluationPromotionPreviewResponse;
+};
+
+export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponse = PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses[keyof PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses];
 
 export type HealthApiHealthGetData = {
     body?: never;

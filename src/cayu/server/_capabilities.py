@@ -29,6 +29,8 @@ class ControlPlaneCapabilitySnapshot:
     dashboard_pricing_configured: bool
     session_usage_aggregates_supported: bool
     session_topology_supported: bool
+    evaluation_promotion_configured: bool
+    evaluation_promotion_supported: bool
 
     def project(
         self,
@@ -91,6 +93,10 @@ class ControlPlaneCapabilitySnapshot:
                     read_supported=self.session_usage_aggregates_supported,
                     mutation_supported=False,
                 ),
+                evaluation_promotion=_evaluation_promotion_surface(
+                    self.evaluation_promotion_configured,
+                    supported=self.evaluation_promotion_supported,
+                ),
             ),
             mutations=ControlPlaneMutationCapabilities(
                 session_execution=_operation(True),
@@ -111,6 +117,8 @@ def inspect_control_plane_capabilities(
     dashboard_pricing_configured: bool,
     session_usage_aggregates_supported: bool,
     session_topology_supported: bool,
+    evaluation_promotion_configured: bool = False,
+    evaluation_promotion_supported: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -121,11 +129,15 @@ def inspect_control_plane_capabilities(
         ("dashboard_pricing_configured", dashboard_pricing_configured),
         ("session_usage_aggregates_supported", session_usage_aggregates_supported),
         ("session_topology_supported", session_topology_supported),
+        ("evaluation_promotion_configured", evaluation_promotion_configured),
+        ("evaluation_promotion_supported", evaluation_promotion_supported),
     ):
         if type(value) is not bool:
             raise TypeError(f"{field_name} must be a bool.")
     if dashboard_pricing_configured and not dashboard_configured:
         raise ValueError("Dashboard pricing cannot be configured when the dashboard is disabled.")
+    if evaluation_promotion_supported and not evaluation_promotion_configured:
+        raise ValueError("Evaluation promotion support requires complete configuration.")
 
     return ControlPlaneCapabilitySnapshot(
         cayu_version=_cayu_distribution_version(),
@@ -135,6 +147,8 @@ def inspect_control_plane_capabilities(
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_usage_aggregates_supported,
         session_topology_supported=session_topology_supported,
+        evaluation_promotion_configured=evaluation_promotion_configured,
+        evaluation_promotion_supported=evaluation_promotion_supported,
     )
 
 
@@ -177,4 +191,20 @@ def _optional_surface(
             if mutation_supported
             else _operation(False, unavailable_reason="unsupported")
         ),
+    )
+
+
+def _evaluation_promotion_surface(
+    configured: bool,
+    *,
+    supported: bool,
+) -> OptionalSurfaceCapability:
+    enabled = configured and supported
+    unavailable_reason: Literal["not_configured", "unsupported"] = (
+        "not_configured" if not configured else "unsupported"
+    )
+    return OptionalSurfaceCapability(
+        configured=configured,
+        read=_operation(enabled, unavailable_reason=unavailable_reason),
+        mutate=_operation(enabled, unavailable_reason=unavailable_reason),
     )

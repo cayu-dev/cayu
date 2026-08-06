@@ -53,6 +53,7 @@ from cayu.server.config import (
     CorsConfig,
     DashboardConfig,
     DocsConfig,
+    EvaluationPromotionConfig,
     OpenAccess,
     ServerAccessConfig,
     ServerApiConfig,
@@ -622,6 +623,7 @@ class ServerSettings(BaseSettings):
     docs: DocsSettings = Field(default_factory=DocsSettings)
     cors: CorsSettings = Field(default_factory=CorsSettings)
     lifecycle: ServerLifecycleSettings = Field(default_factory=ServerLifecycleSettings)
+    evaluation_promotion: EvaluationPromotionConfig | None = None
 
     @classmethod
     def model_validate_json(
@@ -656,6 +658,7 @@ class ServerSettings(BaseSettings):
                 ("access",),
                 ("dashboard", "access"),
                 ("dashboard", "runtime_config"),
+                ("evaluation_promotion",),
             ),
         )
 
@@ -737,6 +740,7 @@ class ServerSettings(BaseSettings):
                     self.lifecycle.interruption_shutdown_grace_seconds
                 ),
             ),
+            evaluation_promotion=self.evaluation_promotion,
         )
 
 

@@ -36,6 +36,7 @@ from typing import Any
 
 from cayu._validation import require_clean_nonblank, thaw_json_value
 from cayu.runtime.app import CayuApp
+from cayu.runtime.costs import PriceBook
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest
 
 try:
@@ -53,6 +54,7 @@ try:
         CorsConfig,
         DashboardConfig,
         DocsConfig,
+        EvaluationPromotionConfig,
         OpenAccess,
         ServerAccessConfig,
         ServerApiConfig,
@@ -61,8 +63,9 @@ try:
         auth_dependency_for,
         normalize_api_path,
         normalize_dashboard_path,
+        normalize_dashboard_runtime_config,
     )
-    from cayu.server.contracts import SERVER_API_PREFIX
+    from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
     from cayu.server.routes import create_router
     from cayu.server.sse import event_to_sse_data
     from cayu.server.static import DashboardStaticFiles
@@ -92,6 +95,7 @@ __all__ = [
     "DashboardConfig",
     "DashboardStaticFiles",
     "DocsConfig",
+    "EvaluationPromotionConfig",
     "OpenAccess",
     "ServerAccessConfig",
     "ServerApiConfig",
@@ -123,6 +127,13 @@ _ALLOWED_FASTAPI_OPTIONS = frozenset(
         "version",
     }
 )
+
+
+def _configured_dashboard_price_book(config: Mapping[str, Any]) -> PriceBook | None:
+    value = config.get("priceBook")
+    if value is None:
+        return None
+    return validate_usage_rollup_price_book(value)
 
 
 def create_server(
@@ -265,9 +276,18 @@ def create_server(
     knowledge_store = app.knowledge_store
     control_plane_path = resolved_config.api.path
     if resolved_config.api.enabled:
+        resolved_dashboard_runtime_config = dict(
+            thaw_json_value(resolved_config.dashboard.runtime_config)
+        )
         pricing_metadata = (
-            dashboard_pricing_metadata(resolved_config.dashboard.runtime_config)
+            dashboard_pricing_metadata(resolved_dashboard_runtime_config)
             if resolved_config.dashboard.enabled
+            else None
+        )
+        evaluation_promotion_pricing = (
+            _configured_dashboard_price_book(resolved_dashboard_runtime_config)
+            if resolved_config.dashboard.enabled
+            and resolved_config.evaluation_promotion is not None
             else None
         )
         router = create_router(
@@ -289,6 +309,8 @@ def create_server(
             ),
             docs_enabled=resolved_config.docs.enabled,
             dashboard_pricing_metadata=pricing_metadata,
+            evaluation_promotion=resolved_config.evaluation_promotion,
+            evaluation_promotion_pricing=evaluation_promotion_pricing,
         )
         server.include_router(router)
 
@@ -350,6 +372,7 @@ def mount_cayu(
     dashboard_dir: str | Path | None = None,
     access: ServerAccessConfig,
     dashboard_config: dict[str, Any] | None = None,
+    evaluation_promotion: EvaluationPromotionConfig | None = None,
     replay_idle_timeout_s: float = DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     event_side_effect_startup_timeout_seconds: float = (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
@@ -377,19 +400,25 @@ def mount_cayu(
     authorization and storage isolation.
 
     ``dashboard_config`` must be a JSON object. Cayu validates and copies it
-    before modifying the host application.
+    before modifying the host application. ``evaluation_promotion`` remains
+    disabled unless a complete configuration is supplied and requires
+    authenticated ``access``.
     """
     auth = auth_dependency_for(access)
     mount_path = normalize_dashboard_path(path, field_name="path")
     api_path = _join_public_paths(mount_path, "api")
     prepared_dashboard: tuple[str, DashboardStaticFiles] | None = None
+    resolved_dashboard_config = normalize_dashboard_runtime_config(
+        {} if dashboard_config is None else dashboard_config,
+        field_name="dashboard_config",
+    )
     if dashboard:
         prepared_dashboard = _prepare_dashboard_mount(
             dashboard_dir=dashboard_dir,
             dashboard_path=mount_path,
             auth=auth,
             api_base_url=api_path,
-            dashboard_config=dashboard_config,
+            dashboard_config=resolved_dashboard_config,
         )
         if prepared_dashboard is None:
             raise _dashboard_assets_unavailable_error(
@@ -431,6 +460,12 @@ def mount_cayu(
         docs_enabled=None,
         dashboard_pricing_metadata=(
             None if prepared_dashboard is None else prepared_dashboard[1].dashboard_pricing_metadata
+        ),
+        evaluation_promotion=evaluation_promotion,
+        evaluation_promotion_pricing=(
+            None
+            if prepared_dashboard is None or evaluation_promotion is None
+            else _configured_dashboard_price_book(resolved_dashboard_config)
         ),
     )
 

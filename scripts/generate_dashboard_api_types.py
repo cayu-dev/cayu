@@ -43,10 +43,26 @@ def main() -> int:
 
 
 def _openapi_json() -> str:
-    from cayu import CayuApp
-    from cayu.server import ServerConfig, create_server
+    from cayu import AgentSpec, CayuApp
+    from cayu.server import EvaluationPromotionConfig, ServerConfig, create_server
 
-    server = create_server(CayuApp(), config=ServerConfig.local_development())
+    app = CayuApp()
+    app.register_agent(AgentSpec(name="assistant", model="schema-only"))
+
+    def schema_auth(_request):
+        return {"subject": "schema-generator"}
+
+    server = create_server(
+        app,
+        config=ServerConfig.protected(
+            schema_auth,
+            evaluation_promotion=EvaluationPromotionConfig(
+                target_key="schema",
+                source_agent_name="assistant",
+                application_release_id="schema",
+            ),
+        ),
+    )
     return json.dumps(server.openapi(), indent=2, sort_keys=True) + "\n"
 
 

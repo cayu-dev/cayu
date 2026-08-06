@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import json
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal, cast
@@ -13,6 +14,7 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    StrictStr,
     StringConstraints,
     field_validator,
     model_validator,
@@ -20,6 +22,17 @@ from pydantic import (
 
 from cayu._validation import json_utf8_size_within_limit, require_unicode_scalar_text
 from cayu.core.events import EVENT_ID_MAX_CHARS
+from cayu.evals.corpus import (
+    EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    AssertionSpec,
+    RunInputSpec,
+    TrialRequestSpec,
+)
+from cayu.evals.promotion import (
+    PROMOTION_CANDIDATE_MAX_BYTES,
+    CapturedRunScoreV1,
+    PromotionCandidateV1,
+)
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -89,6 +102,7 @@ MAX_CONTROL_PLANE_METADATA_MEMBERS = 1024
 MAX_CONTROL_PLANE_METADATA_NESTING = 32
 MAX_CONTROL_PLANE_PROMPT_BYTES = 64 * 1024
 MAX_CONTROL_PLANE_REQUEST_BYTES = 1024 * 1024
+MAX_EVALUATION_PROMOTION_REQUEST_BYTES = PROMOTION_CANDIDATE_MAX_BYTES + (64 * 1024)
 MAX_EXECUTION_TOPOLOGY_EDGES = 1500
 
 SessionTopologyIdentifier = Annotated[
@@ -770,6 +784,7 @@ class ControlPlaneSurfaceCapabilities(ApiBaseModel):
     artifacts: OptionalSurfaceCapability
     usage: OptionalSurfaceCapability
     pricing: OptionalSurfaceCapability
+    evaluation_promotion: OptionalSurfaceCapability
 
 
 class ControlPlaneMutationCapabilities(ApiBaseModel):
@@ -801,6 +816,81 @@ class ControlPlaneCapabilities(ApiBaseModel):
     actor: ServerContractActor | None
     surfaces: ControlPlaneSurfaceCapabilities
     mutations: ControlPlaneMutationCapabilities
+
+
+PromotionPortableId = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[a-z][a-z0-9._-]{0,127}$",
+    ),
+]
+
+
+class EvaluationPromotionSuiteDraft(ApiBaseModel):
+    """Complete authority-free suite fields editable in one preview."""
+
+    id: PromotionPortableId
+    name: StrictStr = Field(min_length=1, max_length=256)
+    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+    trial_request: TrialRequestSpec
+
+
+class EvaluationPromotionCaseDraft(ApiBaseModel):
+    """Complete authority-free case fields editable in one preview."""
+
+    id: PromotionPortableId
+    suite_id: PromotionPortableId
+    name: StrictStr = Field(min_length=1, max_length=256)
+    description: StrictStr | None = Field(default=None, min_length=1, max_length=2_048)
+    input: RunInputSpec
+    assertions: tuple[AssertionSpec, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    )
+
+
+class EvaluationPromotionDraft(ApiBaseModel):
+    """Complete editable projection bound to one server-owned promotion baseline."""
+
+    expected_baseline_revision: StrictStr = Field(min_length=71, max_length=71)
+    suite: EvaluationPromotionSuiteDraft
+    case: EvaluationPromotionCaseDraft
+
+
+class EvaluationPromotionPreviewRequest(ApiBaseModel):
+    draft: EvaluationPromotionDraft | None = None
+
+
+class EvaluationPromotionPreviewResponse(ApiBaseModel):
+    baseline_revision: StrictStr = Field(min_length=71, max_length=71)
+    candidate: PromotionCandidateV1
+    captured_score: CapturedRunScoreV1
+
+
+class EvaluationPromotionExportRequest(ApiBaseModel):
+    expected_candidate_revision: StrictStr = Field(min_length=71, max_length=71)
+    candidate: PromotionCandidateV1
+
+    @field_validator("candidate", mode="before")
+    @classmethod
+    def validate_json_candidate(cls, value: object) -> PromotionCandidateV1 | object:
+        if type(value) is PromotionCandidateV1:
+            return value
+        if isinstance(value, Mapping):
+            return PromotionCandidateV1.model_validate_json(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            )
+        return value
+
+
+EVALUATION_PROMOTION_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: {"description": "The submitted candidate contains unsafe or inconsistent editable data."},
+    404: {"description": "The requested source session does not exist."},
+    409: {"description": "The source is ineligible, changed, or no longer matches the preview."},
+    413: {"description": "The encoded promotion request or bounded evidence exceeds its limit."},
+}
 
 
 class VersioningContract(ApiBaseModel):

@@ -214,6 +214,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
+        "evaluation_promotion": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+        },
     }
     assert body["capabilities"]["mutations"] == {
         "session_execution": {"enabled": True, "unavailable_reason": None},
@@ -278,7 +283,14 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
     ]
     assert capabilities["actor"] == {"subject": "operator-a", "tenant": "tenant-a"}
     assert "must-not-appear" not in response.text
-    for surface in capabilities["surfaces"].values():
+    for name, surface in capabilities["surfaces"].items():
+        if name == "evaluation_promotion":
+            assert surface == {
+                "configured": False,
+                "read": {"enabled": False, "unavailable_reason": "not_configured"},
+                "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+            }
+            continue
         assert surface["configured"] is True
         assert surface["read"] == {"enabled": True, "unavailable_reason": None}
     assert capabilities["surfaces"]["artifacts"]["mutate"] == {

@@ -3704,6 +3704,9 @@
         "dashboard": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
+        "evaluation_promotion": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
         "pricing": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
@@ -3733,7 +3736,8 @@
         "reviewed_knowledge",
         "artifacts",
         "usage",
-        "pricing"
+        "pricing",
+        "evaluation_promotion"
       ],
       "title": "ControlPlaneSurfaceCapabilities",
       "type": "object"

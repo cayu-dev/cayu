@@ -19,6 +19,7 @@ from cayu.server import (
     CorsConfig,
     DashboardConfig,
     DocsConfig,
+    EvaluationPromotionConfig,
     OpenAccess,
     ServerApiConfig,
     ServerConfig,
@@ -82,6 +83,49 @@ def test_protected_profile_preserves_custom_auth_without_serializing_it() -> Non
     assert "dependency" not in config.model_dump()["access"]
     assert "dependency" not in config.model_dump_json()
     assert config.safe_summary()["access"] == "authenticated"
+
+
+def test_evaluation_promotion_is_default_off_and_requires_authenticated_api() -> None:
+    promotion = EvaluationPromotionConfig(
+        target_key="support.regressions",
+        source_agent_name="assistant",
+        application_release_id="release-2026-08-06",
+    )
+
+    assert promotion.evidence_policy == promotion.evidence_policy.standard()
+    assert ServerConfig.protected(_auth).evaluation_promotion is None
+    configured = ServerConfig.protected(_auth, evaluation_promotion=promotion)
+    assert configured.evaluation_promotion == promotion
+    assert configured.safe_summary()["evaluation_promotion"] == {"configured": True}
+    assert "support.regressions" not in json.dumps(configured.safe_summary())
+
+    with pytest.raises(ValidationError, match="authenticated API access"):
+        ServerConfig(access=OpenAccess(), evaluation_promotion=promotion)
+    with pytest.raises(ValidationError, match="requires api.enabled"):
+        ServerConfig.protected(
+            _auth,
+            api=ServerApiConfig(enabled=False),
+            dashboard=DashboardConfig(enabled=False),
+            evaluation_promotion=promotion,
+        )
+
+
+def test_evaluation_promotion_configuration_is_complete_and_redacts_invalid_input() -> None:
+    secret = "promotion-config-secret-must-not-appear"
+
+    with pytest.raises(ValidationError) as exc_info:
+        EvaluationPromotionConfig(
+            target_key="Invalid Target",
+            source_agent_name=secret,
+            application_release_id="release",
+        )
+    assert secret not in str(exc_info.value)
+
+    with pytest.raises(ValidationError, match="source_agent_name"):
+        EvaluationPromotionConfig(
+            target_key="support",
+            application_release_id="release",
+        )
 
 
 def test_dashboard_may_use_a_distinct_explicit_access_policy() -> None:

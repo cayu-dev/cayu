@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 from unicodedata import category as unicode_category
 from urllib.parse import quote
 from uuid import uuid4
@@ -63,6 +63,20 @@ from cayu.core.events import (
 )
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
+from cayu.evals.corpus import EvalCaseSpec, EvalSuiteSpec
+from cayu.evals.models import Trajectory
+from cayu.evals.promotion import (
+    PromotionCandidateV1,
+    SessionPromotionError,
+    build_promotion_candidate,
+    export_promotion_corpus,
+    score_promotion_candidate,
+)
+from cayu.evals.trajectory import (
+    SessionTrajectoryError,
+    SessionTrajectoryErrorCode,
+    trajectory_from_session,
+)
 from cayu.runtime._binding_cleanup import is_containable_cleanup_error
 from cayu.runtime._event_projection import (
     PUBLIC_EVENT_ID_PREFIX,
@@ -136,6 +150,7 @@ from cayu.runtime.sessions import (
     SessionTopologyNode,
     SessionTopologyQuery,
     SessionTopologyStoreResult,
+    TerminalSessionEvidenceErrorCode,
     TranscriptQuery,
     UsageRollupQuery,
     decode_session_cursor,
@@ -175,18 +190,20 @@ from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server._capabilities import inspect_control_plane_capabilities
 from cayu.server._diagnostics import inspect_system_diagnostics
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
-from cayu.server.config import normalize_api_path
+from cayu.server.config import EvaluationPromotionConfig, normalize_api_path
 from cayu.server.contracts import (
     AGGREGATE_ENDPOINT_RESPONSES,
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
+    EVALUATION_PROMOTION_ENDPOINT_RESPONSES,
     MAX_CONTROL_PLANE_METADATA_BYTES,
     MAX_CONTROL_PLANE_METADATA_MEMBERS,
     MAX_CONTROL_PLANE_METADATA_NESTING,
     MAX_CONTROL_PLANE_PROMPT_BYTES,
     MAX_CONTROL_PLANE_REQUEST_BYTES,
+    MAX_EVALUATION_PROMOTION_REQUEST_BYTES,
     MAX_SESSION_TOPOLOGY_REQUEST_BYTES,
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
     MAX_USAGE_ROLLUP_REQUEST_BYTES,
@@ -207,6 +224,10 @@ from cayu.server.contracts import (
     CausalBudgetSummaryResponse,
     ClientGenerationContract,
     EnvironmentsResponse,
+    EvaluationPromotionDraft,
+    EvaluationPromotionExportRequest,
+    EvaluationPromotionPreviewRequest,
+    EvaluationPromotionPreviewResponse,
     HealthResponse,
     ListSessionEventsResponse,
     ListSessionInteractionsResponse,
@@ -421,6 +442,15 @@ class _BoundedControlPlaneRequestRoute(_BoundedPrivateJsonBodyRoute):
     max_request_bytes = MAX_CONTROL_PLANE_REQUEST_BYTES
     invalid_request_detail = "Invalid control-plane request."
     oversized_request_detail = "Control-plane request exceeds the server byte limit."
+    reject_duplicate_json_keys = True
+
+
+class _BoundedEvaluationPromotionRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound complete canonical candidates before JSON parsing or validation."""
+
+    max_request_bytes = MAX_EVALUATION_PROMOTION_REQUEST_BYTES
+    invalid_request_detail = "Invalid evaluation promotion request."
+    oversized_request_detail = "Evaluation promotion request exceeds the server byte limit."
     reject_duplicate_json_keys = True
 
 
@@ -2978,6 +3008,8 @@ def create_router(
     dashboard_access_authenticated: bool | None = None,
     docs_enabled: bool | None = None,
     dashboard_pricing_metadata: tuple[str, str] | None = None,
+    evaluation_promotion: EvaluationPromotionConfig | None = None,
+    evaluation_promotion_pricing: PriceBook | None = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -3013,6 +3045,10 @@ def create_router(
         dashboard_pricing_metadata: Validated default catalog version and opaque
             generation provenance. Values that exceed diagnostic bounds are
             omitted from the response.
+        evaluation_promotion: Complete authenticated captured-session promotion
+            policy. When absent, no promotion route or enabled capability exists.
+        evaluation_promotion_pricing: Optional already-validated dashboard price
+            book reused for captured cost evidence.
     """
 
     if (
@@ -3024,9 +3060,38 @@ def create_router(
         raise ValueError("replay_idle_timeout_s must be a finite positive number.")
     replay_idle_timeout_s = float(replay_idle_timeout_s)
 
+    if evaluation_promotion is not None:
+        if type(evaluation_promotion) is not EvaluationPromotionConfig:
+            raise TypeError("evaluation_promotion must be an EvaluationPromotionConfig or None.")
+        if auth is None:
+            raise ValueError("evaluation_promotion requires authenticated API access.")
+        if evaluation_promotion.source_agent_name not in cayu_app.list_agents():
+            raise ValueError("evaluation_promotion.source_agent_name is not registered.")
+        promotion_identity = {
+            "target_key": evaluation_promotion.target_key,
+            "source_agent_name": evaluation_promotion.source_agent_name,
+            "application_release_id": evaluation_promotion.application_release_id,
+        }
+        try:
+            redacted_promotion_identity = cayu_app.redact_json(promotion_identity)
+        except Exception as exc:
+            raise ValueError(
+                "evaluation_promotion identity could not cross the application redaction boundary."
+            ) from exc
+        if redacted_promotion_identity != promotion_identity:
+            raise ValueError("evaluation_promotion identity contains a workload secret.")
+    if (
+        evaluation_promotion_pricing is not None
+        and type(evaluation_promotion_pricing) is not PriceBook
+    ):
+        raise TypeError("evaluation_promotion_pricing must be a PriceBook or None.")
+    if evaluation_promotion is None and evaluation_promotion_pricing is not None:
+        raise ValueError("evaluation_promotion_pricing requires evaluation_promotion.")
+
     api_prefix = normalize_api_path(api_path, field_name="api_path")
     router = APIRouter(prefix=api_prefix)
     bounded_control_plane_router = APIRouter(route_class=_BoundedControlPlaneRequestRoute)
+    bounded_evaluation_promotion_router = APIRouter(route_class=_BoundedEvaluationPromotionRoute)
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
         dashboard_configured=dashboard_configured,
@@ -3035,6 +3100,12 @@ def create_router(
         dashboard_pricing_configured=dashboard_pricing_configured,
         session_usage_aggregates_supported=session_store.supports_usage_aggregates,
         session_topology_supported=session_store.supports_session_topology,
+        evaluation_promotion_configured=evaluation_promotion is not None,
+        evaluation_promotion_supported=(
+            evaluation_promotion is not None
+            and session_store.supports_terminal_session_evidence
+            and session_store.supports_session_lineage
+        ),
     )
     if dashboard_access_authenticated is None and dashboard_configured:
         dashboard_access_authenticated = auth is not None
@@ -3283,6 +3354,162 @@ def create_router(
             after_terminal_publication_uncertain=after_terminal_publication_uncertain,
         )
 
+    def _promotion_error_detail(
+        code: str,
+        message: str,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, str]:
+        detail = {"code": code, "message": message}
+        if reason is not None:
+            detail["reason"] = reason
+        return detail
+
+    def _raise_promotion_trajectory_error(exc: SessionTrajectoryError) -> NoReturn:
+        terminal_code = exc.terminal_code
+        reason = terminal_code.value if terminal_code is not None else exc.code.value
+        if terminal_code is TerminalSessionEvidenceErrorCode.SESSION_NOT_FOUND:
+            status_code = 404
+            code = "session_not_found"
+        elif terminal_code in {
+            TerminalSessionEvidenceErrorCode.EVENT_LIMIT_EXCEEDED,
+            TerminalSessionEvidenceErrorCode.TRANSCRIPT_LIMIT_EXCEEDED,
+            TerminalSessionEvidenceErrorCode.RECORD_BYTES_EXCEEDED,
+            TerminalSessionEvidenceErrorCode.TOTAL_BYTES_EXCEEDED,
+            TerminalSessionEvidenceErrorCode.TRANSPORT_BYTES_EXCEEDED,
+        } or exc.code in {
+            SessionTrajectoryErrorCode.SESSION_LIMIT_EXCEEDED,
+            SessionTrajectoryErrorCode.DEPTH_LIMIT_EXCEEDED,
+        }:
+            status_code = 413
+            code = "evidence_limit_exceeded"
+        else:
+            status_code = 409
+            code = "source_ineligible"
+        raise HTTPException(
+            status_code=status_code,
+            detail=_promotion_error_detail(code, str(exc), reason=reason),
+        ) from exc
+
+    async def _load_promotion_baseline(
+        public_session_id: str,
+    ) -> tuple[Trajectory, PromotionCandidateV1]:
+        assert evaluation_promotion is not None
+        private_session_id = await _resolve_public_session_id(public_session_id)
+        try:
+            trajectory = await trajectory_from_session(cayu_app, private_session_id)
+        except SessionTrajectoryError as exc:
+            _raise_promotion_trajectory_error(exc)
+        try:
+            candidate = build_promotion_candidate(
+                cayu_app,
+                trajectory,
+                target_key=evaluation_promotion.target_key,
+                source_agent_name=evaluation_promotion.source_agent_name,
+                application_release_id=evaluation_promotion.application_release_id,
+                evidence_policy=evaluation_promotion.evidence_policy,
+                pricing=evaluation_promotion_pricing,
+            )
+        except SessionPromotionError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=_promotion_error_detail(
+                    "source_ineligible",
+                    str(exc),
+                    reason=exc.code.value,
+                ),
+            ) from exc
+        return trajectory, candidate
+
+    def _promotion_candidate_from_draft(
+        baseline: PromotionCandidateV1,
+        draft: EvaluationPromotionDraft,
+    ) -> PromotionCandidateV1:
+        if draft.expected_baseline_revision != baseline.revision:
+            raise HTTPException(
+                status_code=409,
+                detail=_promotion_error_detail(
+                    "preview_stale",
+                    "The promotion baseline changed; preview the session again.",
+                ),
+            )
+        _require_safe_promotion_document(
+            draft.model_dump(mode="json"),
+            code="draft_rejected",
+            failure_subject="The edited candidate",
+        )
+        try:
+            suite = EvalSuiteSpec.create(
+                id=draft.suite.id,
+                name=draft.suite.name,
+                description=draft.suite.description,
+                trial_request=draft.suite.trial_request,
+            )
+            case = EvalCaseSpec.create(
+                id=draft.case.id,
+                suite_id=draft.case.suite_id,
+                name=draft.case.name,
+                description=draft.case.description,
+                source=baseline.source.case_source(),
+                input=draft.case.input,
+                assertions=draft.case.assertions,
+            )
+            return PromotionCandidateV1.create(
+                target_key=baseline.target_key,
+                source=baseline.source,
+                evidence_policy=baseline.evidence_policy,
+                pricing_profile=baseline.pricing_profile,
+                evidence=baseline.evidence,
+                suite=suite,
+                case=case,
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=_promotion_error_detail(
+                    "draft_rejected",
+                    "The edited candidate violates the promotion contract.",
+                ),
+            ) from exc
+
+    def _require_safe_promotion_document(
+        document: dict[str, Any],
+        *,
+        code: str,
+        failure_subject: str,
+    ) -> None:
+        try:
+            redacted_document = cayu_app.redact_json(document)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=_promotion_error_detail(
+                    code,
+                    f"{failure_subject} could not cross the application redaction boundary.",
+                ),
+            ) from exc
+        if redacted_document != document:
+            raise HTTPException(
+                status_code=400,
+                detail=_promotion_error_detail(
+                    code,
+                    f"{failure_subject} contains a workload secret.",
+                ),
+            )
+
+    def _promotion_server_fields_match(
+        candidate: PromotionCandidateV1,
+        baseline: PromotionCandidateV1,
+    ) -> bool:
+        return (
+            candidate.target_key == baseline.target_key
+            and candidate.source == baseline.source
+            and candidate.evidence_policy == baseline.evidence_policy
+            and candidate.pricing_profile == baseline.pricing_profile
+            and candidate.evidence == baseline.evidence
+            and candidate.warnings == baseline.warnings
+        )
+
     @router.get(
         "/contract",
         response_model=ServerContractResponse,
@@ -3307,6 +3534,118 @@ def create_router(
                 artifacts_configured=cayu_app.has_registered_artifact_store(),
             ),
         )
+
+    if evaluation_promotion is not None:
+
+        @bounded_evaluation_promotion_router.post(
+            "/evals/promotion/sessions/{session_id}/preview",
+            response_model=EvaluationPromotionPreviewResponse,
+            responses=EVALUATION_PROMOTION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def preview_evaluation_promotion(
+            session_id: str,
+            body: EvaluationPromotionPreviewRequest,
+        ) -> EvaluationPromotionPreviewResponse:
+            trajectory, baseline = await _load_promotion_baseline(session_id)
+            candidate = (
+                baseline
+                if body.draft is None
+                else _promotion_candidate_from_draft(baseline, body.draft)
+            )
+            try:
+                captured_score = score_promotion_candidate(
+                    cayu_app,
+                    trajectory,
+                    candidate,
+                    target_key=evaluation_promotion.target_key,
+                    source_agent_name=evaluation_promotion.source_agent_name,
+                    application_release_id=evaluation_promotion.application_release_id,
+                    pricing=evaluation_promotion_pricing,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "preview_stale",
+                        "The captured evidence changed; preview the session again.",
+                    ),
+                ) from exc
+            return EvaluationPromotionPreviewResponse(
+                baseline_revision=baseline.revision,
+                candidate=candidate,
+                captured_score=captured_score,
+            )
+
+        @bounded_evaluation_promotion_router.post(
+            "/evals/promotion/sessions/{session_id}/export",
+            responses=EVALUATION_PROMOTION_ENDPOINT_RESPONSES,
+            dependencies=protected,
+            response_class=Response,
+        )
+        async def export_evaluation_promotion(
+            session_id: str,
+            body: EvaluationPromotionExportRequest,
+        ) -> Response:
+            if body.expected_candidate_revision != body.candidate.revision:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "preview_stale",
+                        "The candidate changed after preview; preview it again before export.",
+                    ),
+                )
+            _require_safe_promotion_document(
+                body.candidate.model_dump(mode="json"),
+                code="candidate_rejected",
+                failure_subject="The candidate",
+            )
+            trajectory, baseline = await _load_promotion_baseline(session_id)
+            if not _promotion_server_fields_match(body.candidate, baseline):
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "preview_stale",
+                        "The captured evidence or configured promotion identity changed.",
+                    ),
+                )
+            try:
+                score_promotion_candidate(
+                    cayu_app,
+                    trajectory,
+                    body.candidate,
+                    target_key=evaluation_promotion.target_key,
+                    source_agent_name=evaluation_promotion.source_agent_name,
+                    application_release_id=evaluation_promotion.application_release_id,
+                    pricing=evaluation_promotion_pricing,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_promotion_error_detail(
+                        "preview_stale",
+                        "The candidate is no longer exportable; preview it again.",
+                    ),
+                ) from exc
+            try:
+                corpus_bytes = export_promotion_corpus(body.candidate)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=_promotion_error_detail(
+                        "candidate_rejected",
+                        "The candidate cannot be exported as a portable corpus.",
+                    ),
+                ) from exc
+            return Response(
+                content=corpus_bytes,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{evaluation_promotion.target_key}.eval.json"'
+                    )
+                },
+            )
 
     @router.get(
         "/system/diagnostics",
@@ -6162,4 +6501,5 @@ def create_router(
         return {"ok": True}
 
     router.include_router(bounded_control_plane_router)
+    router.include_router(bounded_evaluation_promotion_router)
     return router

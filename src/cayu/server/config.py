@@ -30,6 +30,7 @@ from cayu._validation import (
     require_unicode_scalar_text,
     thaw_json_value,
 )
+from cayu.evals.corpus import EvaluationEvidencePolicySpec
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
 from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
 
@@ -51,12 +52,14 @@ _GENERATED_DOCS_PATHS = frozenset(
 )
 _HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _PERCENT_ENCODED_OCTET_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_EVALUATION_TARGET_KEY_RE = re.compile(r"[a-z][a-z0-9._-]{0,127}\Z", re.ASCII)
 
 __all__ = [
     "AuthenticatedAccess",
     "CorsConfig",
     "DashboardConfig",
     "DocsConfig",
+    "EvaluationPromotionConfig",
     "OpenAccess",
     "ServerAccessConfig",
     "ServerApiConfig",
@@ -279,6 +282,48 @@ class DashboardConfig(BaseModel):
         return dict(thaw_json_value(value))
 
 
+class EvaluationPromotionConfig(BaseModel):
+    """Authenticated, stateless captured-session promotion policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    target_key: str
+    source_agent_name: str
+    application_release_id: str
+    evidence_policy: EvaluationEvidencePolicySpec = Field(
+        default_factory=EvaluationEvidencePolicySpec.standard
+    )
+
+    @field_validator("target_key")
+    @classmethod
+    def validate_target_key(cls, value: str) -> str:
+        value = require_clean_nonblank(value, "evaluation_promotion.target_key")
+        require_unicode_scalar_text(value, "evaluation_promotion.target_key")
+        if _EVALUATION_TARGET_KEY_RE.fullmatch(value) is None:
+            raise ValueError(
+                "evaluation_promotion.target_key must start with a lowercase ASCII letter and "
+                "contain only lowercase ASCII letters, digits, '.', '_', or '-'."
+            )
+        return value
+
+    @field_validator("source_agent_name", "application_release_id")
+    @classmethod
+    def validate_identity_text(cls, value: str, info) -> str:
+        if len(value) > 256:
+            raise ValueError(
+                f"evaluation_promotion.{info.field_name} cannot exceed 256 characters."
+            )
+        value = require_clean_nonblank(value, f"evaluation_promotion.{info.field_name}")
+        return require_unicode_scalar_text(value, f"evaluation_promotion.{info.field_name}")
+
+    @field_validator("evidence_policy", mode="before")
+    @classmethod
+    def copy_evidence_policy(cls, value: object) -> EvaluationEvidencePolicySpec:
+        if type(value) is EvaluationEvidencePolicySpec:
+            value = value.model_dump(mode="python", round_trip=True, warnings="none")
+        return EvaluationEvidencePolicySpec.model_validate(value)
+
+
 class DocsConfig(BaseModel):
     """FastAPI OpenAPI and interactive documentation exposure."""
 
@@ -389,6 +434,7 @@ class ServerConfig(BaseModel):
     access: ServerAccessConfig
     api: ServerApiConfig = Field(default_factory=ServerApiConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    evaluation_promotion: EvaluationPromotionConfig | None = None
     docs: DocsConfig = Field(default_factory=DocsConfig)
     cors: CorsConfig = Field(default_factory=CorsConfig)
     lifecycle: ServerLifecycleConfig = Field(default_factory=ServerLifecycleConfig)
@@ -433,6 +479,11 @@ class ServerConfig(BaseModel):
             raise ValueError("dashboard.path must not live inside api.path.")
         if self.dashboard.enabled and not self.api.enabled:
             raise ValueError("dashboard.enabled requires api.enabled so the dashboard can operate.")
+        if self.evaluation_promotion is not None:
+            if not self.api.enabled:
+                raise ValueError("evaluation_promotion requires api.enabled.")
+            if not isinstance(self.access, AuthenticatedAccess):
+                raise ValueError("evaluation_promotion requires authenticated API access.")
         if (
             self.dashboard.enabled
             and self.docs.enabled
@@ -475,6 +526,7 @@ class ServerConfig(BaseModel):
         docs: DocsConfig | None = None,
         cors: CorsConfig | None = None,
         lifecycle: ServerLifecycleConfig | None = None,
+        evaluation_promotion: EvaluationPromotionConfig | None = None,
     ) -> ServerConfig:
         """Build a protected configuration around an application auth dependency."""
 
@@ -486,6 +538,7 @@ class ServerConfig(BaseModel):
             docs=docs or DocsConfig(),
             cors=cors or CorsConfig(),
             lifecycle=lifecycle or ServerLifecycleConfig(),
+            evaluation_promotion=evaluation_promotion,
         )
 
     def safe_summary(self) -> dict[str, Any]:
@@ -502,6 +555,7 @@ class ServerConfig(BaseModel):
                 "path": self.dashboard.path,
                 "access": dashboard_access.kind,
             },
+            "evaluation_promotion": {"configured": self.evaluation_promotion is not None},
             "docs": {"enabled": self.docs.enabled},
             "cors": {
                 "allowed_origins": list(self.cors.allowed_origins),

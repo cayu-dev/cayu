@@ -48,6 +48,24 @@ def test_settings_load_nested_environment_configuration(monkeypatch) -> None:
     assert config.lifecycle.replay_idle_timeout_s == 45.0
 
 
+def test_settings_load_complete_default_off_evaluation_promotion(monkeypatch) -> None:
+    monkeypatch.setenv("CAYU_SERVER_ACCESS__MODE", "basic")
+    monkeypatch.setenv("CAYU_SERVER_ACCESS__USERNAME", "operator")
+    monkeypatch.setenv("CAYU_SERVER_ACCESS__PASSWORD", "resolved-password")
+    monkeypatch.setenv("CAYU_SERVER_EVALUATION_PROMOTION__TARGET_KEY", "support.regressions")
+    monkeypatch.setenv("CAYU_SERVER_EVALUATION_PROMOTION__SOURCE_AGENT_NAME", "assistant")
+    monkeypatch.setenv(
+        "CAYU_SERVER_EVALUATION_PROMOTION__APPLICATION_RELEASE_ID",
+        "release-2026-08-06",
+    )
+
+    config = ServerSettings(_env_file=None).to_config()
+
+    assert config.evaluation_promotion is not None
+    assert config.evaluation_promotion.target_key == "support.regressions"
+    assert config.evaluation_promotion.evidence_policy.schema_version == 1
+
+
 def test_settings_allow_nested_runtime_configuration_keys(monkeypatch) -> None:
     monkeypatch.setenv("CAYU_SERVER_ACCESS__MODE", "open")
     monkeypatch.setenv(
