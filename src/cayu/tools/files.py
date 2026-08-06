@@ -44,6 +44,7 @@ from cayu.tools._redaction import (
 )
 from cayu.workspaces import (
     Workspace,
+    WorkspaceReadOffsetError,
     WorkspaceReadResult,
     WorkspaceRevisionMismatchError,
     validate_list_pattern,
@@ -342,6 +343,10 @@ async def _read_workspace_file(
         return _missing_workspace_result()
     content_type = _guess_workspace_content_type(path)
     if _is_workspace_file_attachment_content_type(content_type):
+        if offset != 0:
+            return invalid_tool_arguments_result(
+                ValueError("Tool argument `offset` is only valid for workspace text files.")
+            )
         try:
             result = await _read_workspace_bytes(
                 workspace,
@@ -351,10 +356,6 @@ async def _read_workspace_file(
             )
         except _WorkspaceFileNotFoundError:
             return _missing_workspace_file_result("Read", path)
-        if offset != 0:
-            return invalid_tool_arguments_result(
-                ValueError("Tool argument `offset` is only valid for workspace text files.")
-            )
         return await _read_workspace_file_attachment(
             ctx,
             path=path,
@@ -382,6 +383,11 @@ async def _read_workspace_file(
         captured = await await_revision_stable_secret_output(ctx, read_window)
     except _WorkspaceFileNotFoundError:
         return _missing_workspace_file_result("Read", path)
+    except WorkspaceReadOffsetError as exc:
+        return _invalid_workspace_read_offset_result(
+            offset=offset,
+            total_bytes=exc.total_bytes,
+        )
     if captured is None:
         return unstable_secret_redaction_result()
     (result, redaction_overlap, fetch_offset), capture_snapshot = captured
@@ -524,6 +530,11 @@ def _utf8_workspace_page(
     requested_offset: int,
     max_bytes: int,
 ) -> tuple[bytes, int | None] | ToolResult:
+    if requested_offset > result.total_bytes:
+        return _invalid_workspace_read_offset_result(
+            offset=requested_offset,
+            total_bytes=result.total_bytes,
+        )
     start = requested_offset - result.offset
     available = result.content[start:]
     if available and available[0] & 0xC0 == 0x80:
@@ -564,6 +575,15 @@ def _utf8_workspace_page(
         )
     end = requested_offset + len(page)
     return page, end if end < result.total_bytes else None
+
+
+def _invalid_workspace_read_offset_result(*, offset: int, total_bytes: int) -> ToolResult:
+    return invalid_tool_arguments_result(
+        ValueError(
+            f"Tool argument `offset` ({offset}) cannot exceed workspace file size "
+            f"({total_bytes} bytes)."
+        )
+    )
 
 
 def _guess_workspace_content_type(path: str) -> str:

@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING
 from cayu.runners import ExecCommand
 from cayu.workspaces.base import (
     WorkspaceMutationResult,
+    WorkspaceReadOffsetError,
     WorkspaceRevisionMismatchError,
 )
 
@@ -64,6 +65,7 @@ _STATUS_ISDIR = "isdir"
 _STATUS_HARDLINK = "hardlink"
 _STATUS_UNSUPPORTED = "unsupported"
 _STATUS_EXISTS = "exists"
+_STATUS_OFFSET = "offset"
 _STATUS_STALE = "stale"
 
 _READ_OUTPUT_HEADROOM_BYTES = 4096
@@ -71,7 +73,8 @@ _READ_OUTPUT_HEADROOM_BYTES = 4096
 
 # The program below runs inside the guest. It communicates over a tiny
 # protocol: exit code 0 with a first stdout line of "ok[ <size>]", "enoent",
-# "escape", "notfile", "notdir", "isdir", "hardlink", or "unsupported"; any
+# "escape", "notfile", "notdir", "isdir", "hardlink", "offset <size>", or
+# "unsupported"; any
 # non-zero exit is an operational error whose detail is on stderr. Read
 # payloads are base64 on stdout after the status line; write payloads are
 # base64 on stdin.
@@ -577,7 +580,7 @@ def main():
                 limit = int(sys.argv[5])
                 leaf_fd, info = open_guarded_regular(leaf_name, parent_fd)
                 if offset > info.st_size:
-                    raise ValueError("Workspace read offset cannot exceed file size.")
+                    finish(f"offset {info.st_size}")
                 os.lseek(leaf_fd, offset, os.SEEK_SET)
                 chunks = []
                 remaining = limit
@@ -678,6 +681,10 @@ async def guard_read(
     )
     if status in {_STATUS_ENOENT, _STATUS_NOTFILE, _STATUS_NOTDIR}:
         raise FileNotFoundError(f"Workspace file not found: {original_path}")
+    if status.startswith(f"{_STATUS_OFFSET} "):
+        total_bytes = status.partition(" ")[2]
+        if total_bytes.isdigit():
+            raise WorkspaceReadOffsetError(offset, int(total_bytes))
     _raise_common_status(status, mode="read", backend=backend, original_path=original_path)
     total_bytes, revision, digest = _parse_ok_read(
         status, backend=backend, original_path=original_path

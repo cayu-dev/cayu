@@ -877,6 +877,58 @@ def test_read_file_pages_text_and_only_complete_snapshot_has_revision(tmp_path):
     assert suffix.structured["revision"] is None
 
 
+@pytest.mark.parametrize("offset", [5, 8])
+def test_read_file_rejects_workspace_text_offset_past_eof(tmp_path, offset):
+    (tmp_path / "tiny.txt").write_text("tiny")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "tiny.txt", "offset": offset}))
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+
+
+def test_read_file_accepts_workspace_text_offset_at_eof(tmp_path):
+    (tmp_path / "tiny.txt").write_text("tiny")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "tiny.txt", "offset": 4}))
+
+    assert result.is_error is False
+    assert result.content.endswith("[/read_file metadata]\n")
+    assert result.structured["bytes"] == 0
+    assert result.structured["total_bytes"] == 4
+    assert result.structured["offset"] == 4
+    assert result.structured["next_offset"] is None
+    assert result.structured["truncated"] is False
+
+
+def test_read_file_preserves_unrelated_workspace_value_error(tmp_path):
+    class FailingWorkspace(LocalWorkspace):
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            raise ValueError("backend invariant failed")
+
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=FailingWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    with pytest.raises(ValueError, match="backend invariant failed"):
+        asyncio.run(ReadFileTool().run(ctx, {"path": "tiny.txt"}))
+
+
 def test_read_file_pages_preserve_literal_redaction_marker_without_active_secrets(tmp_path):
     content = f"abc{REDACTED_SECRET}xyz"
     (tmp_path / "notes.txt").write_text(content)
@@ -1451,6 +1503,33 @@ def test_read_file_snapshots_workspace_pdf_as_artifact_attachment(tmp_path):
     assert result.structured["attachment_artifact_id"] == result.structured["snapshot_artifact_id"]
     assert result.artifacts[0]["artifact_id"] == result.structured["snapshot_artifact_id"]
     assert result.artifacts[0]["kind"] == "document"
+
+
+def test_read_file_rejects_attachment_offset_before_workspace_read(tmp_path):
+    class ReadCountingWorkspace(LocalWorkspace):
+        def __init__(self, root):
+            super().__init__(root, workspace_id="local")
+            self.read_count = 0
+
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            self.read_count += 1
+            return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
+    workspace = ReadCountingWorkspace(tmp_path)
+    asyncio.run(workspace.write_bytes("tiny.png", TINY_PNG_BYTES))
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "tiny.png", "offset": 1}))
+
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert workspace.read_count == 0
 
 
 def test_read_file_returns_not_found_error_for_missing_workspace_attachment(tmp_path):

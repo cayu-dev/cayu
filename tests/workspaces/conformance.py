@@ -13,7 +13,11 @@ from examples._workspace_conformance import (
     verify_portable_workspace_round_trip,
 )
 
-from cayu.workspaces import Workspace, WorkspaceRevisionMismatchError
+from cayu.workspaces import (
+    Workspace,
+    WorkspaceReadOffsetError,
+    WorkspaceRevisionMismatchError,
+)
 
 CapabilityState = Literal["supported", "not_applicable"]
 ResourceIdentityState = Literal["stable", "indeterminate"]
@@ -167,6 +171,25 @@ async def verify_paging_and_conditional_mutations(workspace: Workspace) -> None:
     assert suffix.next_offset is None
     assert suffix.revision is None
     assert suffix.sha256 is None
+
+    eof = await workspace.read_bytes(
+        "conditional.txt",
+        offset=len(original),
+        max_bytes=1,
+    )
+    assert eof.content == b""
+    assert eof.offset == len(original)
+    assert eof.total_bytes == len(original)
+    assert eof.truncated is False
+
+    with pytest.raises(WorkspaceReadOffsetError) as raised:
+        await workspace.read_bytes(
+            "conditional.txt",
+            offset=len(original) + 1,
+            max_bytes=1,
+        )
+    assert raised.value.offset == len(original) + 1
+    assert raised.value.total_bytes == len(original)
 
     full = await workspace.read_bytes("conditional.txt", max_bytes=10)
     digest = hashlib.sha256(original).hexdigest()

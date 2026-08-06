@@ -89,6 +89,15 @@ class WorkspaceReadResult:
         )
 
 
+class WorkspaceReadOffsetError(ValueError):
+    """A workspace read requested a byte offset beyond the current file size."""
+
+    def __init__(self, offset: int, total_bytes: int) -> None:
+        self.offset = offset
+        self.total_bytes = total_bytes
+        super().__init__(f"Workspace read offset {offset} cannot exceed file size {total_bytes}.")
+
+
 WorkspaceMutationOperation = Literal["create", "replace", "delete"]
 
 
@@ -334,7 +343,8 @@ class Workspace(ABC):
 
         Complete offset-zero snapshots expose an opaque revision suitable for a
         later conditional mutation. Backends must not expose a revision for a
-        partial page.
+        partial page. An offset equal to the current file size returns an empty
+        page; an offset beyond it raises ``WorkspaceReadOffsetError``.
         """
 
     @abstractmethod

@@ -892,6 +892,7 @@ from cayu.workspaces import (
     Workspace,
     WorkspaceListResult,
     WorkspaceMutationResult,
+    WorkspaceReadOffsetError,
     WorkspaceReadResult,
     WorkspaceRevisionMismatchError,
 )
@@ -1652,6 +1653,7 @@ __all__ = [
     "WorkspaceListResult",
     "WorkspaceMountError",
     "WorkspaceMutationResult",
+    "WorkspaceReadOffsetError",
     "WorkspaceReadResult",
     "WorkspaceRevisionMismatchError",
     "WorkspaceSnapshot",

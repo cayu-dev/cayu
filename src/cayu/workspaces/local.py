@@ -23,6 +23,7 @@ from cayu.workspaces.base import (
     Workspace,
     WorkspaceListResult,
     WorkspaceMutationResult,
+    WorkspaceReadOffsetError,
     WorkspaceReadResult,
     _local_resource_key,
     _validate_workspace_relative_path,
@@ -210,7 +211,7 @@ def _read_file(
 ) -> WorkspaceReadResult:
     with open_regular_for_read(root, relative_path) as (file, total_bytes):
         if offset > total_bytes:
-            raise ValueError("Workspace read offset cannot exceed file size.")
+            raise WorkspaceReadOffsetError(offset, total_bytes)
         file.seek(offset)
         content = file.read() if max_bytes is None else file.read(max_bytes)
     complete = offset == 0 and len(content) == total_bytes
