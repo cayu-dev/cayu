@@ -310,6 +310,23 @@ class ReadFileTool(Tool):
         raise AssertionError("unreachable")
 
 
+class _WorkspaceFileNotFoundError(RuntimeError):
+    pass
+
+
+async def _read_workspace_bytes(
+    workspace: Workspace,
+    path: str,
+    *,
+    offset: int = 0,
+    max_bytes: int | None = None,
+) -> WorkspaceReadResult:
+    try:
+        return await workspace.read_bytes(path, offset=offset, max_bytes=max_bytes)
+    except FileNotFoundError as exc:
+        raise _WorkspaceFileNotFoundError from exc
+
+
 async def _read_workspace_file(
     ctx: ToolContext,
     *,
@@ -325,7 +342,15 @@ async def _read_workspace_file(
         return _missing_workspace_result()
     content_type = _guess_workspace_content_type(path)
     if _is_workspace_file_attachment_content_type(content_type):
-        result = await workspace.read_bytes(path, offset=offset, max_bytes=max_bytes)
+        try:
+            result = await _read_workspace_bytes(
+                workspace,
+                path,
+                offset=offset,
+                max_bytes=max_bytes,
+            )
+        except _WorkspaceFileNotFoundError:
+            return _missing_workspace_file_result("Read", path)
         if offset != 0:
             return invalid_tool_arguments_result(
                 ValueError("Tool argument `offset` is only valid for workspace text files.")
@@ -345,14 +370,18 @@ async def _read_workspace_file(
         redaction_overlap = redactor.pagination_overlap_utf8_bytes
         fetch_offset = max(0, offset - redaction_overlap - 3)
         prefix_bytes = offset - fetch_offset
-        result = await workspace.read_bytes(
+        result = await _read_workspace_bytes(
+            workspace,
             path,
             offset=fetch_offset,
             max_bytes=prefix_bytes + max_bytes + redaction_overlap + 4,
         )
         return result, redaction_overlap, fetch_offset
 
-    captured = await await_revision_stable_secret_output(ctx, read_window)
+    try:
+        captured = await await_revision_stable_secret_output(ctx, read_window)
+    except _WorkspaceFileNotFoundError:
+        return _missing_workspace_file_result("Read", path)
     if captured is None:
         return unstable_secret_redaction_result()
     (result, redaction_overlap, fetch_offset), capture_snapshot = captured
@@ -573,6 +602,8 @@ async def _read_workspace_file_attachment(
             initial_result=initial_result,
             max_source_bytes=source_cap,
         )
+    except _WorkspaceFileNotFoundError:
+        return _missing_workspace_file_result("Read", path)
     except WorkspaceFileChangedError as exc:
         return _binary_workspace_file_result(
             path=path,
@@ -637,7 +668,7 @@ async def _read_full_workspace_attachment(
     workspace = _require_workspace(ctx)
     if workspace is None:
         raise RuntimeError("Workspace disappeared while reading workspace file attachment.")
-    result = await workspace.read_bytes(path, max_bytes=max_source_bytes)
+    result = await _read_workspace_bytes(workspace, path, max_bytes=max_source_bytes)
     if (
         not initial_result.truncated
         and not result.truncated
@@ -1450,7 +1481,7 @@ class EditFileTool(Tool):
         except WorkspaceRevisionMismatchError as exc:
             return _stale_mutation_result("Edit", path, exc)
         except FileNotFoundError:
-            return _missing_mutation_target_result("Edit", path)
+            return _missing_workspace_file_result("Edit", path)
         after_sha256 = mutation.after_sha256
         summary = (
             f"Edited {path}: {len(edits)} edit(s), {replacement_count} replacement(s), "
@@ -1570,7 +1601,7 @@ class DeleteFileTool(Tool):
         except WorkspaceRevisionMismatchError as exc:
             return _stale_mutation_result("Delete", path, exc)
         except FileNotFoundError:
-            return _missing_mutation_target_result("Delete", path)
+            return _missing_workspace_file_result("Delete", path)
         return ToolResult(
             content=f"Deleted {path} ({len(read.content)} bytes).",
             structured={
@@ -1682,7 +1713,7 @@ class WriteFileTool(Tool):
         except WorkspaceRevisionMismatchError as exc:
             return _stale_mutation_result("Write", path, exc)
         except FileNotFoundError:
-            return _missing_mutation_target_result("Write", path)
+            return _missing_workspace_file_result("Write", path)
         return ToolResult(
             content=f"Wrote {len(encoded)} bytes to {path}.",
             structured={
@@ -1971,7 +2002,7 @@ def _stale_mutation_result(
     )
 
 
-def _missing_mutation_target_result(operation: str, path: str) -> ToolResult:
+def _missing_workspace_file_result(operation: str, path: str) -> ToolResult:
     return ToolResult(
         content=f"{operation} refused: workspace file not found: {path}.",
         structured={"path": path, "reason": "not_found"},

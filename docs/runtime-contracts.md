@@ -3291,6 +3291,12 @@ The first built-in tools are:
 - `read_knowledge`: expand bounded chunks from a returned knowledge entry
 - `remember_knowledge`: propose a new knowledge entry through the active knowledge store, subject to application write policy
 
+A path-addressed `read_file` whose workspace target is missing returns a recoverable
+tool error for both text and native attachment reads: `is_error=true`, model-facing
+text `Read refused: workspace file not found: <path>.`, and structured output
+`{"path": <path>, "reason": "not_found"}`. Other workspace exceptions retain their
+operational meaning and are not mapped to `not_found`.
+
 These tools are ordinary `Tool` implementations. They prove the environment-service contract but do not make file or command access mandatory for all agents.
 
 Default built-in tool caps are intentionally large enough for normal coding work but small enough to protect model context and runtime memory:

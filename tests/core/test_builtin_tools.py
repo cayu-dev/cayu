@@ -837,6 +837,19 @@ def test_write_file_overwrite_refuses_missing_and_invalid_revision(tmp_path):
     assert invalid.structured == {"error": "invalid_arguments"}
 
 
+def test_read_file_returns_not_found_error_for_missing_workspace_text(tmp_path):
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "missing.txt"}))
+
+    assert result.content == "Read refused: workspace file not found: missing.txt."
+    assert result.structured == {"path": "missing.txt", "reason": "not_found"}
+    assert result.is_error is True
+
+
 def test_read_file_pages_text_and_only_complete_snapshot_has_revision(tmp_path):
     (tmp_path / "notes.txt").write_text("abcdef")
     ctx = ToolContext(
@@ -1438,6 +1451,55 @@ def test_read_file_snapshots_workspace_pdf_as_artifact_attachment(tmp_path):
     assert result.structured["attachment_artifact_id"] == result.structured["snapshot_artifact_id"]
     assert result.artifacts[0]["artifact_id"] == result.structured["snapshot_artifact_id"]
     assert result.artifacts[0]["kind"] == "document"
+
+
+def test_read_file_returns_not_found_error_for_missing_workspace_attachment(tmp_path):
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "missing.pdf"}))
+
+    assert result.content == "Read refused: workspace file not found: missing.pdf."
+    assert result.structured == {"path": "missing.pdf", "reason": "not_found"}
+    assert result.is_error is True
+
+
+def test_read_file_returns_not_found_error_when_workspace_attachment_disappears(tmp_path):
+    class DisappearingWorkspace(LocalWorkspace):
+        def __init__(self, root):
+            super().__init__(root, workspace_id="local")
+            self.read_count = 0
+
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            self.read_count += 1
+            if self.read_count == 2:
+                raise FileNotFoundError(path)
+            return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = DisappearingWorkspace(workspace_root)
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+    asyncio.run(workspace.write_bytes("invoice.pdf", _tiny_pdf_bytes()))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "invoice.pdf"}))
+
+    assert result.content == "Read refused: workspace file not found: invoice.pdf."
+    assert result.structured == {"path": "invoice.pdf", "reason": "not_found"}
+    assert result.is_error is True
 
 
 def test_read_file_forwards_pages_for_workspace_pdf_snapshot(tmp_path):
