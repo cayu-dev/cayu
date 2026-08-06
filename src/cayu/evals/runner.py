@@ -36,6 +36,12 @@ from cayu.evals.models import (
     aggregate_eval_score,
     aggregate_eval_status,
 )
+from cayu.evals.result_contract import (
+    EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
+    EvalTrialDiagnosticCode,
+    EvalTrialOutputPreviewV1,
+    _EvalTrialPublicData,
+)
 from cayu.evals.trajectory import (
     SessionTrajectoryBounds,
     _build_child_trajectories,
@@ -65,6 +71,7 @@ from cayu.runtime.usage import (
 
 if TYPE_CHECKING:
     from cayu.evals.corpus import EvalCorpusDocument
+    from cayu.evals.evidence import AssertionEvidenceView
     from cayu.evals.execution import CorpusExecutionResult, CorpusTarget
 
 
@@ -241,6 +248,56 @@ async def run_eval_suite(
     evaluated. It cannot be combined with trajectory retention because a retained
     trajectory must remain lossless.
     """
+    run, _ = await _run_eval_suite(
+        app,
+        suite,
+        retain_trajectory=retain_trajectory,
+        retain_final_output=retain_final_output,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
+        public_output_preview_bytes=None,
+    )
+    return run
+
+
+async def _run_eval_suite_with_public_projection(
+    app: CayuApp,
+    suite: EvalSuite,
+    *,
+    max_concurrency: int,
+    case_timeout_seconds: float | None,
+    trials: int,
+    output_preview_bytes: int,
+) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]]]:
+    """Run a corpus suite and return its separate runner-owned public sidecar."""
+
+    run, public_data = await _run_eval_suite(
+        app,
+        suite,
+        retain_trajectory=False,
+        retain_final_output=False,
+        max_concurrency=max_concurrency,
+        case_timeout_seconds=case_timeout_seconds,
+        trials=trials,
+        public_output_preview_bytes=output_preview_bytes,
+    )
+    if public_data is None:
+        raise RuntimeError("Corpus execution lost its runner-owned public projection.")
+    return run, public_data
+
+
+async def _run_eval_suite(
+    app: CayuApp,
+    suite: EvalSuite,
+    *,
+    retain_trajectory: bool,
+    retain_final_output: bool,
+    max_concurrency: int,
+    case_timeout_seconds: float | None,
+    trials: int,
+    public_output_preview_bytes: int | None,
+) -> tuple[EvalRun, dict[str, tuple[_EvalTrialPublicData, ...]] | None]:
     if not isinstance(app, CayuApp):
         raise TypeError("run_eval_suite requires a CayuApp.")
     if type(suite) is not EvalSuite:
@@ -253,11 +310,17 @@ async def run_eval_suite(
         raise TypeError("run_eval_suite retain_final_output must be a bool.")
     if not retain_final_output and retain_trajectory:
         raise ValueError("run_eval_suite cannot discard final output while retaining trajectories.")
+    if public_output_preview_bytes is not None and retain_final_output:
+        raise ValueError("run_eval_suite public output projection requires final-output disposal.")
+    _validate_public_output_preview_bytes(
+        public_output_preview_bytes,
+        "run_eval_suite public_output_preview_bytes",
+    )
     _validate_trials(trials, "run_eval_suite trials")
     _validate_timeout_seconds(case_timeout_seconds, "run_eval_suite case_timeout_seconds")
     run_id = str(uuid4())
     started_at = datetime.now(UTC)
-    results = await _run_suite_cases(
+    results, public_data_by_case = await _run_suite_cases(
         app,
         suite,
         retain_trajectory=retain_trajectory,
@@ -265,21 +328,25 @@ async def run_eval_suite(
         max_concurrency=max_concurrency,
         case_timeout_seconds=case_timeout_seconds,
         trials=trials,
+        public_output_preview_bytes=public_output_preview_bytes,
     )
     completed_at = datetime.now(UTC)
     status = aggregate_eval_status(result.status for result in results)
     score = aggregate_eval_score(result.score for result in results)
-    return EvalRun(
-        run_id=run_id,
-        suite_id=suite.id,
-        status=status,
-        score=score,
-        cases=tuple(results),
-        started_at=started_at,
-        completed_at=completed_at,
-        duration_ms=_duration_ms(started_at, completed_at),
-        metadata=suite.metadata,
-        run_contract=None,
+    return (
+        EvalRun(
+            run_id=run_id,
+            suite_id=suite.id,
+            status=status,
+            score=score,
+            cases=tuple(results),
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=_duration_ms(started_at, completed_at),
+            metadata=suite.metadata,
+            run_contract=None,
+        ),
+        public_data_by_case,
     )
 
 
@@ -336,10 +403,14 @@ async def _run_suite_cases(
     max_concurrency: int,
     case_timeout_seconds: float | None,
     trials: int,
-) -> list[EvalCaseResult]:
+    public_output_preview_bytes: int | None,
+) -> tuple[
+    list[EvalCaseResult],
+    dict[str, tuple[_EvalTrialPublicData, ...]] | None,
+]:
     if max_concurrency == 1:
-        return [
-            await run_eval_case(
+        executions = [
+            await _run_eval_case(
                 app,
                 case,
                 suite_id=suite.id,
@@ -347,19 +418,31 @@ async def _run_suite_cases(
                 retain_final_output=retain_final_output,
                 timeout_seconds=case_timeout_seconds,
                 trials=trials,
+                public_output_preview_bytes=public_output_preview_bytes,
             )
             for case in suite.cases
         ]
+        results = [result for result, _ in executions]
+        if public_output_preview_bytes is None:
+            return results, None
+        public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] = {}
+        for case, (_, public_data) in zip(suite.cases, executions, strict=True):
+            if public_data is None:
+                raise RuntimeError("Corpus case execution lost its public projection.")
+            public_data_by_case[case.id] = public_data
+        return results, public_data_by_case
 
     # Fill a positional slot per case so results keep suite order regardless of
     # completion order. run_eval_case never raises for a failed run (it records an
     # ERROR result), so a TaskGroup abort only happens on a genuine programming error.
-    slots: list[EvalCaseResult | None] = [None] * len(suite.cases)
+    slots: list[tuple[EvalCaseResult, tuple[_EvalTrialPublicData, ...] | None] | None] = [
+        None
+    ] * len(suite.cases)
     semaphore = asyncio.Semaphore(max_concurrency)
 
     async def _run_slot(index: int, case: EvalCase) -> None:
         async with semaphore:
-            slots[index] = await run_eval_case(
+            slots[index] = await _run_eval_case(
                 app,
                 case,
                 suite_id=suite.id,
@@ -367,12 +450,24 @@ async def _run_suite_cases(
                 retain_final_output=retain_final_output,
                 timeout_seconds=case_timeout_seconds,
                 trials=trials,
+                public_output_preview_bytes=public_output_preview_bytes,
             )
 
     async with asyncio.TaskGroup() as group:
         for index, case in enumerate(suite.cases):
             group.create_task(_run_slot(index, case))
-    return [result for result in slots if result is not None]
+    executions = [execution for execution in slots if execution is not None]
+    if len(executions) != len(slots):
+        raise RuntimeError("Concurrent eval execution lost a case result.")
+    results = [result for result, _ in executions]
+    if public_output_preview_bytes is None:
+        return results, None
+    public_data_by_case = {}
+    for case, (_, public_data) in zip(suite.cases, executions, strict=True):
+        if public_data is None:
+            raise RuntimeError("Corpus case execution lost its public projection.")
+        public_data_by_case[case.id] = public_data
+    return results, public_data_by_case
 
 
 async def run_eval_case(
@@ -392,15 +487,45 @@ async def run_eval_case(
     Aggregate fields are deterministic projections of the ordered ``result.trials`` tuple.
     No trial is selected as a representative and no trial evidence is overwritten.
     """
+    result, _ = await _run_eval_case(
+        app,
+        case,
+        suite_id=suite_id,
+        retain_trajectory=retain_trajectory,
+        retain_final_output=retain_final_output,
+        timeout_seconds=timeout_seconds,
+        trials=trials,
+        public_output_preview_bytes=None,
+    )
+    return result
+
+
+async def _run_eval_case(
+    app: CayuApp,
+    case: EvalCase,
+    *,
+    suite_id: str,
+    retain_trajectory: bool,
+    retain_final_output: bool,
+    timeout_seconds: float | None,
+    trials: int,
+    public_output_preview_bytes: int | None,
+) -> tuple[EvalCaseResult, tuple[_EvalTrialPublicData, ...] | None]:
     if type(retain_final_output) is not bool:
         raise TypeError("run_eval_case retain_final_output must be a bool.")
     if not retain_final_output and retain_trajectory:
         raise ValueError("run_eval_case cannot discard final output while retaining trajectories.")
+    if public_output_preview_bytes is not None and retain_final_output:
+        raise ValueError("run_eval_case public output projection requires final-output disposal.")
+    _validate_public_output_preview_bytes(
+        public_output_preview_bytes,
+        "run_eval_case public_output_preview_bytes",
+    )
     _validate_trials(trials, "run_eval_case trials")
     _validate_timeout_seconds(timeout_seconds, "run_eval_case timeout_seconds")
     started_at = datetime.now(UTC)
-    trial_results = [
-        await _run_case_once(
+    trial_executions = [
+        await _run_case_once_with_public_projection(
             app,
             case,
             trial_number=trial_number,
@@ -408,15 +533,28 @@ async def run_eval_case(
             retain_trajectory=retain_trajectory,
             retain_final_output=retain_final_output,
             timeout_seconds=timeout_seconds,
+            public_output_preview_bytes=public_output_preview_bytes,
         )
         for trial_number in range(1, trials + 1)
     ]
+    trial_results = [result for result, _ in trial_executions]
+    trial_public_data: tuple[_EvalTrialPublicData, ...] | None = None
+    if public_output_preview_bytes is not None:
+        retained_public_data: list[_EvalTrialPublicData] = []
+        for _, public_data in trial_executions:
+            if public_data is None:
+                raise RuntimeError("Corpus trial execution lost its public projection.")
+            retained_public_data.append(public_data)
+        trial_public_data = tuple(retained_public_data)
     completed_at = datetime.now(UTC)
-    return _aggregate_trials(
-        case,
-        trial_results,
-        started_at=started_at,
-        completed_at=completed_at,
+    return (
+        _aggregate_trials(
+            case,
+            trial_results,
+            started_at=started_at,
+            completed_at=completed_at,
+        ),
+        trial_public_data,
     )
 
 
@@ -430,6 +568,30 @@ async def _run_case_once(
     retain_final_output: bool = True,
     timeout_seconds: float | None = None,
 ) -> EvalTrialResult:
+    result, _ = await _run_case_once_with_public_projection(
+        app,
+        case,
+        trial_number=trial_number,
+        suite_id=suite_id,
+        retain_trajectory=retain_trajectory,
+        retain_final_output=retain_final_output,
+        timeout_seconds=timeout_seconds,
+        public_output_preview_bytes=None,
+    )
+    return result
+
+
+async def _run_case_once_with_public_projection(
+    app: CayuApp,
+    case: EvalCase,
+    *,
+    trial_number: int,
+    suite_id: str,
+    retain_trajectory: bool = False,
+    retain_final_output: bool = True,
+    timeout_seconds: float | None = None,
+    public_output_preview_bytes: int | None = None,
+) -> tuple[EvalTrialResult, _EvalTrialPublicData | None]:
     started_at = datetime.now(UTC)
     trial_request = _isolated_trial_request(case.request)
     emitted_root_events: list[RunnerObservedEventIdentity] = []
@@ -448,6 +610,8 @@ async def _run_case_once(
     trajectory: Trajectory | None = None
     terminal_evidence: TerminalSessionEvidence | None = None
     assertion_results: list[EvalAssertionResult] = []
+    public_output = EvalTrialOutputPreviewV1.unavailable()
+    diagnostic_code: EvalTrialDiagnosticCode | None = None
     deadline: asyncio.Timeout | None = None
 
     # asyncio.timeout(None) never expires, so the unbounded default shares the path.
@@ -476,8 +640,10 @@ async def _run_case_once(
                 # A provider-originated TimeoutError is an eval run error, not the case
                 # deadline. Deadline expiry arrives as cancellation and is handled below.
                 run_error = _format_exception(exc)
+                diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
             except Exception as exc:
                 run_error = _format_exception(exc)
+                diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
 
             candidate_session_id = observed_session_id or trial_request.session_id
             if candidate_session_id is not None:
@@ -511,26 +677,33 @@ async def _run_case_once(
                             unavailable_reason = (
                                 f"Fresh interrupted evidence unavailable: {interrupted_exc}"
                             )
+                            diagnostic_code = (
+                                EvalTrialDiagnosticCode.INTERRUPTED_EVIDENCE_UNAVAILABLE
+                            )
                         except Exception as interrupted_exc:
                             run_error = (
                                 "Failed to load fresh interrupted eval evidence: "
                                 f"{_format_exception(interrupted_exc)}"
                             )
+                            diagnostic_code = EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED
                     elif run_error is None:
                         unavailable_reason = (
                             f"Terminal evidence unavailable ({exc.code.value}): {exc}"
                         )
+                        diagnostic_code = EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE
                 except NotImplementedError:
                     if run_error is None:
                         unavailable_reason = (
                             "Terminal evidence unavailable: the configured session store does "
                             "not support exact terminal evidence reads."
                         )
+                        diagnostic_code = EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE
                 except Exception as exc:
                     if run_error is None:
                         run_error = (
                             f"Failed to load terminal eval evidence: {_format_exception(exc)}"
                         )
+                        diagnostic_code = EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED
 
             if evidence_complete:
                 try:
@@ -552,6 +725,7 @@ async def _run_case_once(
                             )
                         if not any(failed_session_flags):
                             run_error = _session_failure_reason(events)
+                            diagnostic_code = EvalTrialDiagnosticCode.SESSION_FAILED
                     final_output = final_output_text(transcript)
                     probe_requirements = _collect_probe_requirements(case.assertions)
                     probes = await _capture_probes(app, session, probe_requirements)
@@ -586,6 +760,7 @@ async def _run_case_once(
                             unavailable_reason = (
                                 "Child-session evidence could not be captured completely."
                             )
+                            diagnostic_code = EvalTrialDiagnosticCode.CHILD_EVIDENCE_UNAVAILABLE
                 except Exception as exc:
                     # Probe declaration/capture and trajectory construction are part
                     # of assertion evidence preparation. Public assertion extensions
@@ -596,6 +771,36 @@ async def _run_case_once(
                         run_error = (
                             f"Failed to prepare eval assertion evidence: {_format_exception(exc)}"
                         )
+                        diagnostic_code = EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED
+
+            prepared_portable_evidence = None
+            portable_evidence_error: Exception | None = None
+            prepared_context: EvalContext | None = None
+            if trajectory is not None and (
+                public_output_preview_bytes is not None
+                or (run_error is None and unavailable_reason is None)
+            ):
+                prepared_context = EvalContext(
+                    trajectory=trajectory,
+                    suite_id=suite_id,
+                    case_id=case.id,
+                    metadata=case.metadata,
+                    root_evidence_available=trajectory.session is not None,
+                )
+                prepared_portable_evidence, portable_evidence_error = _prepare_portable_evidence(
+                    case.assertions,
+                    prepared_context,
+                    runtime_app=app,
+                )
+                if (
+                    public_output_preview_bytes is not None
+                    and prepared_portable_evidence is not None
+                ):
+                    public_output = EvalTrialOutputPreviewV1.from_retained_evidence(
+                        prepared_portable_evidence.final_output,
+                        prepared_portable_evidence.final_output_state,
+                        max_preview_bytes=public_output_preview_bytes,
+                    )
 
             if run_error is not None:
                 assertion_results = list(
@@ -617,21 +822,15 @@ async def _run_case_once(
                 if identity_error is not None:
                     run_error = identity_error
                     unavailable_reason = None
-            elif trajectory is not None:
-                context = EvalContext(
-                    trajectory=trajectory,
-                    suite_id=suite_id,
-                    case_id=case.id,
-                    metadata=case.metadata,
-                    root_evidence_available=trajectory.session is not None,
+                    diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED
+            elif prepared_context is not None:
+                evaluated = await _evaluate_assertions_with_prepared_evidence(
+                    case.assertions,
+                    prepared_context,
+                    portable_evidence=prepared_portable_evidence,
+                    portable_evidence_error=portable_evidence_error,
                 )
-                assertion_results = list(
-                    await _evaluate_assertions(
-                        case.assertions,
-                        context,
-                        runtime_app=app,
-                    )
-                )
+                assertion_results = list(evaluated)
                 assertion_error = _assertion_diagnostic(
                     assertion_results,
                     EvalOutcome.ERROR,
@@ -644,13 +843,21 @@ async def _run_case_once(
                 )
                 if assertion_error is not None:
                     run_error = assertion_error
+                    diagnostic_code = (
+                        EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED
+                        if portable_evidence_error is not None
+                        else EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED
+                    )
                 elif assertion_unavailable is not None:
                     unavailable_reason = assertion_unavailable
+                    diagnostic_code = EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE
     except TimeoutError as exc:
         if deadline is not None and deadline.expired():
             run_error = f"Eval case timed out after {timeout_seconds} seconds."
+            diagnostic_code = EvalTrialDiagnosticCode.CASE_TIMEOUT
         else:
             run_error = _format_exception(exc)
+            diagnostic_code = EvalTrialDiagnosticCode.EXECUTION_FAILED
         unavailable_reason = None
         # A timeout may happen after the exact terminal snapshot, probes, and
         # child tree were fully captured while an assertion was evaluating.
@@ -670,26 +877,45 @@ async def _run_case_once(
         session_id = observed_session_id
     completed_at = datetime.now(UTC)
     status = _trial_status(run_error, unavailable_reason, assertion_results)
-    return EvalTrialResult(
-        trial_number=trial_number,
-        status=status,
-        session_id=session_id,
-        score=_trial_score(status, assertion_results),
-        final_output=final_output if retain_final_output else "",
-        assertions=tuple(assertion_results),
-        error=run_error,
-        unavailable_reason=unavailable_reason,
-        evidence_complete=evidence_complete,
-        events_count=len(events),
-        usage_summary=session_usage_summary_payload(usage_summary)
-        if usage_summary is not None
-        else None,
-        started_at=started_at,
-        completed_at=completed_at,
-        duration_ms=_duration_ms(started_at, completed_at),
-        # The probe-complete trajectory captured during this trial, for export/replay. Opt-in so
-        # the default run does not retain every trial's file bytes in memory.
-        trajectory=trajectory if retain_trajectory else None,
+    if diagnostic_code is None:
+        diagnostic_code = {
+            EvalStatus.PASSED: EvalTrialDiagnosticCode.PASSED,
+            EvalStatus.FAILED: EvalTrialDiagnosticCode.ASSERTION_FAILED,
+            EvalStatus.UNAVAILABLE: EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE,
+            EvalStatus.ERROR: EvalTrialDiagnosticCode.EXECUTION_FAILED,
+            EvalStatus.SKIPPED: None,
+        }[status]
+    public_data = (
+        None
+        if public_output_preview_bytes is None or diagnostic_code is None
+        else _EvalTrialPublicData(
+            diagnostic_code=diagnostic_code,
+            output=public_output,
+        )
+    )
+    return (
+        EvalTrialResult(
+            trial_number=trial_number,
+            status=status,
+            session_id=session_id,
+            score=_trial_score(status, assertion_results),
+            final_output=final_output if retain_final_output else "",
+            assertions=tuple(assertion_results),
+            error=run_error,
+            unavailable_reason=unavailable_reason,
+            evidence_complete=evidence_complete,
+            events_count=len(events),
+            usage_summary=session_usage_summary_payload(usage_summary)
+            if usage_summary is not None
+            else None,
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=_duration_ms(started_at, completed_at),
+            # The probe-complete trajectory captured during this trial, for export/replay. Opt-in
+            # so the default run does not retain every trial's file bytes in memory.
+            trajectory=trajectory if retain_trajectory else None,
+        ),
+        public_data,
     )
 
 
@@ -785,23 +1011,51 @@ async def _evaluate_assertions(
     *,
     runtime_app: CayuApp | None = None,
 ) -> tuple[EvalAssertionResult, ...]:
-    # Import lazily to keep the public assertion base independent of the
-    # optional portable-corpus adapter.
-    from cayu.evals.portable_assertions import (
-        _CompiledPortableAssertion,
-        _prepare_portable_assertion_evidence,
+    portable_evidence, portable_evidence_error = _prepare_portable_evidence(
+        assertions,
+        context,
+        runtime_app=runtime_app,
+    )
+    return await _evaluate_assertions_with_prepared_evidence(
+        assertions,
+        context,
+        portable_evidence=portable_evidence,
+        portable_evidence_error=portable_evidence_error,
     )
 
-    portable_evidence = None
-    portable_evidence_error: Exception | None = None
+
+def _prepare_portable_evidence(
+    assertions: Sequence[EvalAssertion],
+    context: EvalContext,
+    *,
+    runtime_app: CayuApp | None,
+) -> tuple[AssertionEvidenceView | None, Exception | None]:
+    # Import lazily to keep the public assertion base independent of the
+    # optional portable-corpus adapter.
+    from cayu.evals.portable_assertions import _prepare_portable_assertion_evidence
+
     try:
-        portable_evidence = _prepare_portable_assertion_evidence(
-            assertions,
-            context,
-            runtime_app=runtime_app,
+        return (
+            _prepare_portable_assertion_evidence(
+                assertions,
+                context,
+                runtime_app=runtime_app,
+            ),
+            None,
         )
     except Exception as exc:
-        portable_evidence_error = exc
+        return None, exc
+
+
+async def _evaluate_assertions_with_prepared_evidence(
+    assertions: Sequence[EvalAssertion],
+    context: EvalContext,
+    *,
+    portable_evidence: AssertionEvidenceView | None,
+    portable_evidence_error: Exception | None,
+) -> tuple[EvalAssertionResult, ...]:
+    from cayu.evals.portable_assertions import _CompiledPortableAssertion
+
     results: list[EvalAssertionResult] = []
     for assertion in assertions:
         assertion_revision: str | None = None
@@ -1002,6 +1256,17 @@ async def _capture_probes(
         artifact_scopes_unavailable=tuple(artifact_scopes_unavailable),
         artifacts=tuple(artifacts),
     )
+
+
+def _validate_public_output_preview_bytes(value: int | None, field_name: str) -> None:
+    if value is None:
+        return
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an int or None.")
+    if not 1 <= value <= EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES:
+        raise ValueError(
+            f"{field_name} must be between 1 and {EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES}."
+        )
 
 
 def _validate_trials(value: int, field_name: str) -> None:

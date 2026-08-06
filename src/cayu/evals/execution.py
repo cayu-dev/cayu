@@ -37,8 +37,12 @@ from cayu.evals.corpus import (
 )
 from cayu.evals.models import EvalRun, EvalRunContractV1, _model_instance_python_input
 from cayu.evals.portable_assertions import _compile_corpus_assertion_specs
-from cayu.evals.published import PublishedEvalRun, publish_eval_run
-from cayu.evals.runner import EvalCase, EvalSuite, run_eval_suite
+from cayu.evals.published import PublishedEvalRun, _publish_eval_run_with_trial_public_data
+from cayu.evals.result_contract import (
+    EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
+    PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
+)
+from cayu.evals.runner import EvalCase, EvalSuite, _run_eval_suite_with_public_projection
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook, copy_price_book
 from cayu.runtime.manifest import AppManifest
@@ -46,6 +50,7 @@ from cayu.runtime.sessions import RunRequest, copy_run_request
 
 CORPUS_EXECUTION_MAX_BOOTSTRAP_MESSAGES = EVAL_CORPUS_MAX_MESSAGES_PER_CASE
 CORPUS_EXECUTION_MAX_TOTAL_INPUT_CHARS = EVAL_CORPUS_MAX_TOTAL_MESSAGE_CHARS * 2
+CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS = 8 << 20
 CORPUS_EXECUTION_MAX_CONCURRENCY = 32
 CORPUS_EXECUTION_MAX_APP_MANIFEST_BYTES = 1 << 20
 CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES = 64 << 10
@@ -101,6 +106,11 @@ class CorpusExecutionLimits(BaseModel):
         default=CORPUS_EXECUTION_MAX_TOTAL_INPUT_CHARS,
         ge=1,
         le=CORPUS_EXECUTION_MAX_TOTAL_INPUT_CHARS,
+    )
+    max_compiled_input_chars: StrictInt = Field(
+        default=CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS,
+        ge=1,
+        le=CORPUS_EXECUTION_MAX_COMPILED_INPUT_CHARS,
     )
 
 
@@ -351,6 +361,8 @@ class CorpusTarget(BaseModel):
         )
         if bootstrap_chars > self.limits.max_total_input_chars:
             raise ValueError("CorpusTarget bootstrap text exceeds its configured input limit.")
+        if bootstrap_chars > self.limits.max_compiled_input_chars:
+            raise ValueError("CorpusTarget bootstrap text exceeds its compiled-suite input limit.")
         return self
 
 
@@ -440,6 +452,7 @@ def compile_corpus_suite(
             expected_pricing_profile=validated_corpus.pricing_profile,
         )
     )
+    compiled_input_chars = 0
     compiled_cases: list[EvalCase] = []
     for case_spec, assertion_count in zip(case_specs, assertion_counts, strict=True):
         corpus_messages = tuple(
@@ -452,6 +465,9 @@ def compile_corpus_suite(
             raise ValueError(
                 f"Eval corpus case {case_spec.id!r} exceeds the trusted target input limit."
             )
+        compiled_input_chars += total_input_chars
+        if compiled_input_chars > validated_target.limits.max_compiled_input_chars:
+            raise ValueError("Eval corpus suite exceeds the trusted target compiled-input limit.")
         request = validated_target.request_base.model_copy(
             update={
                 "messages": [
@@ -540,6 +556,14 @@ class CorpusExecutionResult(BaseModel):
     def validate_contract(self) -> CorpusExecutionResult:
         if self.target.target_key != self.run.target_key:
             raise ValueError("Execution target key does not match the published eval run.")
+        if any(
+            trial.status in {"passed", "failed"} and trial.output.evidence_state == "unavailable"
+            for case in self.run.cases
+            for trial in case.trials
+        ):
+            raise ValueError(
+                "Scored corpus execution trials require retained redacted output evidence."
+            )
         if not json_utf8_size_within_limit(self, CORPUS_EXECUTION_RESULT_MAX_BYTES):
             raise ValueError(
                 "Corpus execution result exceeds "
@@ -590,14 +614,18 @@ async def run_corpus_suite(
         )
     compiled = compile_corpus_suite(corpus, validated_target, suite_id)
     target_before = evaluation_target_identity(validated_target)
-    internal_run = await run_eval_suite(
+    trial_count = len(compiled.suite.cases) * compiled.trials
+    output_preview_bytes = min(
+        EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
+        PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES // trial_count,
+    )
+    internal_run, trial_public_data_by_case = await _run_eval_suite_with_public_projection(
         validated_target.app,
         compiled.suite,
-        retain_trajectory=False,
-        retain_final_output=False,
         max_concurrency=max_concurrency,
         case_timeout_seconds=compiled.timeout_seconds,
         trials=compiled.trials,
+        output_preview_bytes=output_preview_bytes,
     )
     target_after = evaluation_target_identity(validated_target)
     if target_after != target_before:
@@ -607,5 +635,9 @@ async def run_corpus_suite(
     bound_run = EvalRun.model_validate(run_document)
     return CorpusExecutionResult.create(
         target=target_before,
-        run=publish_eval_run(compiled.corpus, bound_run),
+        run=_publish_eval_run_with_trial_public_data(
+            compiled.corpus,
+            bound_run,
+            trial_public_data_by_case=trial_public_data_by_case,
+        ),
     )

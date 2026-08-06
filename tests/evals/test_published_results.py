@@ -41,6 +41,7 @@ from cayu.evals.models import (
     EvalTrialResult,
 )
 from cayu.evals.published import (
+    PUBLISHED_EVAL_SCHEMA_VERSION,
     PublishedAssertionResult,
     PublishedEvalRun,
     PublishedEvalTrialResult,
@@ -51,6 +52,11 @@ from cayu.evals.published import (
     publish_eval_run,
 )
 from cayu.evals.reporting import eval_run_to_json, load_eval_run
+from cayu.evals.result_contract import (
+    EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
+    PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
+    EvalTrialOutputPreviewV1,
+)
 from cayu.runtime.costs import SessionCostSummary
 from cayu.runtime.usage import (
     SessionUsageSummary,
@@ -225,6 +231,8 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     run = _run()
     published = publish_eval_run(corpus, run)
 
+    assert PUBLISHED_EVAL_SCHEMA_VERSION == 2
+    assert published.schema_version == 2
     assert published.corpus_revision == corpus.revision
     assert published.status == "unavailable"
     assert published.score is None
@@ -236,6 +244,7 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     assert published.cases[0].trials[0].usage is not None
     assert published.cases[0].trials[0].usage.total_tokens == 15
     assert published.cases[0].trials[1].assertions[-1].score is None
+    assert all(trial.output.evidence_state == "unavailable" for trial in published.cases[0].trials)
     assert run.cases[0].assertions[0].assertion_revision == assertion_spec_revision(
         corpus.cases[0].assertions[0]
     )
@@ -255,6 +264,108 @@ def test_published_graph_preserves_trials_and_reproducible_aggregates_only():
     ):
         assert forbidden not in encoded
     assert PublishedEvalRun.model_validate_json(encoded) == published
+
+
+def test_published_eval_run_rejects_v1_before_validating_its_obsolete_shape():
+    published = publish_eval_run(_corpus(), _run())
+    document = published.model_dump(mode="json")
+    document["schema_version"] = 1
+    for case in document["cases"]:
+        for trial in case["trials"]:
+            trial.pop("output")
+            trial["code"] = trial["status"]
+
+    with pytest.raises(ValidationError, match="other versions are unsupported"):
+        PublishedEvalRun.model_validate(document)
+
+    with pytest.raises(ValidationError, match="schema_version must be the integer 2"):
+        PublishedEvalRun.model_validate(
+            {**published.model_dump(mode="json"), "schema_version": "2"}
+        )
+
+    versionless = published.model_dump(mode="json")
+    versionless.pop("schema_version")
+    with pytest.raises(ValidationError, match="schema_version is required"):
+        PublishedEvalRun.model_validate(versionless)
+
+
+def test_output_preview_rejects_forged_size_digest_and_truncation_metadata():
+    with pytest.raises(ValidationError, match="output preview exceeds"):
+        EvalTrialOutputPreviewV1.model_validate(
+            {
+                "text": "x" * (EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES + 1),
+                "evidence_state": "complete",
+                "retained_chars": EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES + 1,
+                "retained_bytes": EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES + 1,
+                "retained_sha256": "0" * 64,
+            }
+        )
+    preview = EvalTrialOutputPreviewV1.from_retained_evidence(
+        "Approved",
+        "complete",
+        max_preview_bytes=EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
+    )
+    document = preview.model_dump(mode="python")
+
+    for update, match in (
+        ({"retained_chars": 1}, "character and UTF-8 byte counts"),
+        ({"retained_sha256": "0" * 64}, "digest does not match"),
+        ({"preview_truncated": True}, "must omit"),
+    ):
+        with pytest.raises(ValidationError, match=match):
+            EvalTrialOutputPreviewV1.model_validate({**document, **update})
+
+    truncated = EvalTrialOutputPreviewV1.from_retained_evidence(
+        "x" * (EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES + 1),
+        "complete",
+        max_preview_bytes=EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
+    ).model_dump(mode="python")
+    for update, match in (
+        ({"retained_chars": len(truncated["text"])}, "omit retained characters"),
+        (
+            {"retained_bytes": truncated["retained_chars"] * 4 + 1},
+            "character and UTF-8 byte counts",
+        ),
+    ):
+        with pytest.raises(ValidationError, match=match):
+            EvalTrialOutputPreviewV1.model_validate({**truncated, **update})
+
+    with pytest.raises(ValueError, match="max_preview_bytes"):
+        EvalTrialOutputPreviewV1.from_retained_evidence(
+            "",
+            "unavailable",
+            max_preview_bytes=0,
+        )
+
+
+def test_published_run_preflights_the_aggregate_output_preview_budget():
+    document = publish_eval_run(_corpus(), _run()).model_dump(mode="python")
+    trial = document["cases"][0]["trials"][0]
+    text = "x" * EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
+    output = EvalTrialOutputPreviewV1.from_retained_evidence(
+        text,
+        "complete",
+        max_preview_bytes=EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
+    ).model_dump(mode="python")
+    trials = [
+        {
+            **deepcopy(trial),
+            "trial_number": number,
+            "output": output,
+        }
+        for number in range(1, 101)
+    ]
+    # Two case branches would retain 3.125 MiB of previews. The 2 MiB public
+    # budget must reject the raw graph before nested result construction.
+    document["cases"] = [
+        {**deepcopy(document["cases"][0]), "case_id": case_id, "trials": trials}
+        for case_id in ("case-a", "case-b")
+    ]
+
+    with pytest.raises(ValidationError, match="aggregate output-preview limit"):
+        PublishedEvalRun.model_validate(document)
+
+    assert len(text) * 200 > PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES
 
 
 def test_published_assertion_details_are_closed_and_allowlisted():
@@ -555,10 +666,11 @@ def test_published_run_rejects_more_than_corpus_expanded_result_limit():
 
 def test_published_graph_preflight_fails_closed_on_a_malformed_leading_branch():
     document = {
+        "schema_version": PUBLISHED_EVAL_SCHEMA_VERSION,
         "cases": [
             {"trials": "malformed"},
             {"trials": [{"assertions": [{}] * 10_001}]},
-        ]
+        ],
     }
 
     with pytest.raises(ValidationError, match=r"cases\[0\]\.trials must be an array"):
@@ -705,8 +817,8 @@ def test_published_trial_rejects_mixed_availability_within_one_evidence_area(
     document.update(
         status="unavailable",
         score=None,
-        code="unavailable",
-        message="Required trial evidence was unavailable.",
+        code="assertion_evidence_unavailable",
+        message="Required assertion evidence was unavailable.",
     )
 
     with pytest.raises(ValidationError, match="evidence availability.*trial area"):
@@ -730,8 +842,8 @@ def test_complete_published_trial_requires_root_status_observation():
     document.update(
         status="unavailable",
         score=None,
-        code="unavailable",
-        message="Required trial evidence was unavailable.",
+        code="assertion_evidence_unavailable",
+        message="Required assertion evidence was unavailable.",
     )
 
     with pytest.raises(ValidationError, match="requires a root-status observation"):
@@ -755,8 +867,8 @@ def test_published_trial_allows_assertion_error_without_erasing_shared_observati
     document.update(
         status="error",
         score=None,
-        code="error",
-        message="Trial execution or assertion evaluation failed.",
+        code="assertion_evaluation_failed",
+        message="Assertion evaluation failed.",
     )
 
     assert PublishedEvalTrialResult.model_validate(document).status == "error"
@@ -1089,6 +1201,20 @@ def test_projection_uses_redacted_final_output_decision_without_copying_raw_outp
 
     assert published.cases[0].trials[0].assertions[2].detail.matched is True
     assert "secret-token" not in published.model_dump_json()
+
+
+def test_public_eval_trial_contract_has_no_publication_side_channel():
+    trial = _run().cases[0].trials[0]
+    document = trial.model_dump(mode="python")
+    document["public_data"] = {"output": "caller-secret-token"}
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        EvalTrialResult.model_validate(document)
+
+    assert "public_data" not in EvalTrialResult.model_json_schema(mode="validation")["properties"]
+    assert (
+        "public_data" not in EvalTrialResult.model_json_schema(mode="serialization")["properties"]
+    )
 
 
 @pytest.mark.parametrize("estimated_cost", ["secret-token", "1e999999999"])

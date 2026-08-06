@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
 import cayu.evals.execution as execution_module
+import cayu.evals.runner as runner_module
 from cayu import (
     AgentSpec,
     Message,
+    ModelProvider,
     ModelStreamEvent,
     RunRequest,
     ScriptedModelProvider,
@@ -27,19 +31,30 @@ from cayu.evals.corpus import (
     RootStatusAssertionSpec,
     RunInputSpec,
     TrialRequestSpec,
+    _content_revision,
     pricing_profile_identity,
 )
 from cayu.evals.execution import (
     CORPUS_EXECUTION_MAX_REQUEST_BASE_BYTES,
     CorpusExecutionLimits,
+    CorpusExecutionResult,
     CorpusTarget,
     compile_corpus_suite,
     evaluation_target_identity,
     run_corpus_suite,
 )
+from cayu.evals.execution_reporting import (
+    corpus_execution_result_from_json,
+    corpus_execution_result_to_json,
+    load_corpus_execution_result,
+    render_corpus_execution_html,
+    write_corpus_execution_result,
+)
+from cayu.evals.result_contract import EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
 from cayu.evals.runner import EvalPlan, run_eval_plan
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import ModelPrice, PriceBook
+from cayu.vaults import SecretRedactor
 
 
 def _source() -> EvaluationSourceIdentityV1:
@@ -72,16 +87,18 @@ def _corpus(
     trials: int = 2,
     input_text: str = "Refund order 42.",
     price_book: PriceBook | None = None,
+    expected_output: str = "Approved",
+    include_root_status: bool = True,
 ) -> EvalCorpusDocument:
     suite = EvalSuiteSpec.create(
         id="refund-regressions",
         name="Refund regressions",
         trial_request=TrialRequestSpec(trials=trials, timeout_seconds=30),
     )
-    assertions = [
-        RootStatusAssertionSpec(id="completed", expected="completed"),
-        FinalOutputEqualsAssertionSpec(id="answer", expected="Approved"),
-    ]
+    assertions = []
+    if include_root_status:
+        assertions.append(RootStatusAssertionSpec(id="completed", expected="completed"))
+    assertions.append(FinalOutputEqualsAssertionSpec(id="answer", expected=expected_output))
     if price_book is not None:
         assertions.append(MaxEstimatedCostAssertionSpec(id="cost", maximum="1", currency="USD"))
     case = EvalCaseSpec.create(
@@ -107,8 +124,10 @@ def _target(
     key: str = "refund-agent",
     price_book: PriceBook | None = None,
     limits: CorpusExecutionLimits | None = None,
+    application_release_id: str = "release-2026-08-06",
+    secret_redactor: SecretRedactor | None = None,
 ) -> CorpusTarget:
-    app = CayuApp(enable_logging=False)
+    app = CayuApp(enable_logging=False, secret_redactor=secret_redactor)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="agent", model="fixture-model"))
     return CorpusTarget(
@@ -116,16 +135,16 @@ def _target(
         app=app,
         request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
         bootstrap_messages=(Message.text("system", "Follow the refund policy."),),
-        application_release_id="release-2026-08-06",
+        application_release_id=application_release_id,
         evidence_policy=EvaluationEvidencePolicySpec.standard(),
         price_book=price_book,
         limits=limits or CorpusExecutionLimits(),
     )
 
 
-def _provider(*, trials: int = 2) -> ScriptedModelProvider:
+def _provider(*, trials: int = 2, output: str = "Approved") -> ScriptedModelProvider:
     batch = (
-        ModelStreamEvent.text_delta("Approved"),
+        ModelStreamEvent.text_delta(output),
         ModelStreamEvent.completed(
             {
                 "finish_reason": "stop",
@@ -166,6 +185,8 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
     result = asyncio.run(run_corpus_suite(target, corpus, "refund-regressions"))
 
     assert result.target == evaluation_target_identity(target)
+    assert result.schema_version == 1
+    assert result.run.schema_version == 2
     assert result.target.application_release_id == "release-2026-08-06"
     assert result.target.app_manifest_fingerprint == target.app.describe().fingerprint
     assert result.run.corpus_revision == corpus.revision
@@ -180,6 +201,23 @@ def test_run_corpus_suite_retains_every_trial_and_fresh_target_identity():
     forged = result.model_copy(update={"revision": "sha256:" + "0" * 64})
     with pytest.raises(ValidationError, match="revision does not match"):
         type(result).model_validate(forged.model_dump(mode="python"))
+
+    document = result.model_dump(mode="json")
+    document["run"]["cases"][0]["trials"][0]["output"] = {
+        "schema_version": 1,
+        "text": "",
+        "evidence_state": "unavailable",
+        "preview_truncated": False,
+        "retained_chars": 0,
+        "retained_bytes": 0,
+        "retained_sha256": None,
+    }
+    document["run"]["revision"] = _content_revision(
+        document["run"],
+        "published eval run",
+    )
+    with pytest.raises(ValidationError, match="Scored corpus execution trials"):
+        CorpusExecutionResult.model_validate_json(json.dumps(document))
 
 
 @pytest.mark.parametrize(
@@ -228,18 +266,31 @@ def test_execution_revalidates_forged_secret_bearing_release_before_dispatch():
 
 def test_corpus_execution_discards_raw_trial_output_before_publication(monkeypatch):
     retained_outputs: list[str] = []
-    publish = execution_module.publish_eval_run
+    publish = execution_module._publish_eval_run_with_trial_public_data
 
-    def observe_internal_run(corpus, run):
+    def observe_internal_run(corpus, run, *, trial_public_data_by_case):
         retained_outputs.extend(trial.final_output for case in run.cases for trial in case.trials)
-        return publish(corpus, run)
+        return publish(
+            corpus,
+            run,
+            trial_public_data_by_case=trial_public_data_by_case,
+        )
 
-    monkeypatch.setattr(execution_module, "publish_eval_run", observe_internal_run)
+    monkeypatch.setattr(
+        execution_module,
+        "_publish_eval_run_with_trial_public_data",
+        observe_internal_run,
+    )
 
     result = asyncio.run(run_corpus_suite(_target(_provider()), _corpus(), "refund-regressions"))
 
     assert result.run.status == "passed"
     assert retained_outputs == ["", ""]
+    assert [trial.output.text for trial in result.run.cases[0].trials] == [
+        "Approved",
+        "Approved",
+    ]
+    assert [trial.code for trial in result.run.cases[0].trials] == ["passed", "passed"]
 
 
 def test_eval_plan_corpus_mode_uses_the_shared_execution_service():
@@ -305,6 +356,213 @@ def test_execution_rejects_an_application_manifest_change_during_the_run(monkeyp
         asyncio.run(run_corpus_suite(target, _corpus(), "refund-regressions"))
 
     assert len(provider.requests) == 2
+
+
+def test_published_execution_json_is_deterministic_bounded_and_loadable(tmp_path):
+    result = asyncio.run(run_corpus_suite(_target(_provider()), _corpus(), "refund-regressions"))
+
+    encoded = corpus_execution_result_to_json(result)
+    destination = tmp_path / "result.json"
+    write_corpus_execution_result(result, destination)
+
+    assert encoded == corpus_execution_result_to_json(result)
+    assert corpus_execution_result_from_json(encoded) == result
+    assert load_corpus_execution_result(destination) == result
+    assert destination.read_text(encoding="utf-8") == encoded
+
+    duplicated = encoded.replace(
+        '  "schema_version": 1,',
+        '  "schema_version": 1,\n  "schema_version": 1,',
+        1,
+    )
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        corpus_execution_result_from_json(duplicated)
+
+    versionless_run = json.loads(encoded)
+    versionless_run["run"].pop("schema_version")
+    with pytest.raises(ValidationError, match="schema_version is required"):
+        corpus_execution_result_from_json(json.dumps(versionless_run))
+
+
+def test_published_execution_html_escapes_identity_and_shows_only_redacted_output():
+    target = _target(
+        _provider(output="Approved secret-token"),
+        application_release_id='<script>alert("release")</script>',
+        secret_redactor=SecretRedactor("secret-token"),
+    )
+    result = asyncio.run(
+        run_corpus_suite(
+            target,
+            _corpus(expected_output="Approved [REDACTED_SECRET]"),
+            "refund-regressions",
+        )
+    )
+
+    report = render_corpus_execution_html(result)
+
+    assert '<script>alert("release")</script>' not in report
+    assert "&lt;script&gt;alert(&quot;" in report
+    assert "Approved [REDACTED_SECRET]" in report
+    assert "secret-token" not in report
+    assert "session_id" not in report
+    assert result.target.app_manifest_fingerprint in report
+
+
+def test_corpus_execution_bounds_long_redacted_output_and_explains_unavailability():
+    output = "x" * 65_537
+    result = asyncio.run(
+        run_corpus_suite(
+            _target(_provider(trials=1, output=output)),
+            _corpus(trials=1),
+            "refund-regressions",
+        )
+    )
+
+    trial = result.run.cases[0].trials[0]
+    assert trial.status == "unavailable"
+    assert trial.code == "assertion_evidence_unavailable"
+    assert trial.message == "Required assertion evidence was unavailable."
+    assert trial.output.evidence_state == "limit_exceeded"
+    assert trial.output.preview_truncated is True
+    assert len(trial.output.text.encode("utf-8")) == EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES
+    assert trial.output.retained_chars == 65_536
+    assert trial.output.retained_sha256 == hashlib.sha256(b"x" * 65_536).hexdigest()
+    assert output not in result.model_dump_json()
+
+
+def test_failed_corpus_trial_retains_the_output_needed_to_diagnose_the_failure():
+    result = asyncio.run(
+        run_corpus_suite(
+            _target(_provider(trials=1)),
+            _corpus(trials=1, expected_output="Denied"),
+            "refund-regressions",
+        )
+    )
+
+    trial = result.run.cases[0].trials[0]
+    assert trial.status == "failed"
+    assert trial.code == "assertion_failed"
+    assert trial.output.evidence_state == "complete"
+    assert trial.output.text == "Approved"
+
+
+class _FailingProvider(ModelProvider):
+    name = "failing"
+
+    async def stream(self, request):
+        del request
+        raise RuntimeError("provider exploded near secret-token")
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _EchoProvider(ModelProvider):
+    name = "echo"
+
+    async def stream(self, request):
+        output = request.messages[-1].content[0].text
+        yield ModelStreamEvent.text_delta(output)
+        yield ModelStreamEvent.completed(
+            {
+                "finish_reason": "stop",
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+
+def test_corpus_execution_publishes_stable_safe_failure_diagnostics():
+    app = CayuApp(enable_logging=False)
+    app.register_provider(_FailingProvider(), default=True)
+    app.register_agent(AgentSpec(name="agent", model="fixture-model"))
+    target = CorpusTarget(
+        key="refund-agent",
+        app=app,
+        request_base=RunRequest(agent_name="agent", messages=[], max_steps=1),
+        application_release_id="release",
+    )
+
+    result = asyncio.run(
+        run_corpus_suite(
+            target,
+            _corpus(trials=1, include_root_status=False),
+            "refund-regressions",
+        )
+    )
+
+    trial = result.run.cases[0].trials[0]
+    assert trial.status == "error"
+    assert trial.code == "session_failed"
+    assert trial.message == "The trial session failed."
+    assert trial.output.evidence_state == "complete"
+    assert "secret-token" not in result.model_dump_json()
+    report = render_corpus_execution_html(result)
+    assert "The trial session failed." in report
+    assert "secret-token" not in report
+
+
+def test_corpus_execution_distinguishes_safe_evidence_preparation_failures(monkeypatch):
+    monkeypatch.setattr(
+        runner_module,
+        "_prepare_portable_evidence",
+        lambda *_args, **_kwargs: (None, RuntimeError("secret evidence failure")),
+    )
+
+    result = asyncio.run(
+        run_corpus_suite(
+            _target(_provider(trials=1)),
+            _corpus(trials=1),
+            "refund-regressions",
+        )
+    )
+
+    trial = result.run.cases[0].trials[0]
+    assert trial.status == "error"
+    assert trial.code == "evidence_preparation_failed"
+    assert trial.message == "Assertion evidence preparation failed."
+    assert "secret evidence failure" not in result.model_dump_json()
+
+
+def test_concurrent_corpus_execution_keeps_output_projection_bound_to_each_case():
+    corpus = _corpus(
+        trials=1,
+        input_text="alpha output",
+        expected_output="alpha output",
+    )
+    first = corpus.cases[0]
+    second = EvalCaseSpec.create(
+        id="refund-output-beta",
+        suite_id=first.suite_id,
+        name="Beta output",
+        source=first.source,
+        input=RunInputSpec(messages=(CorpusUserMessageSpec(text="beta output"),)),
+        assertions=(
+            RootStatusAssertionSpec(id="completed", expected="completed"),
+            FinalOutputEqualsAssertionSpec(id="answer", expected="beta output"),
+        ),
+    )
+    corpus = EvalCorpusDocument.create(
+        target_key=corpus.target_key,
+        evidence_policy=corpus.evidence_policy,
+        suites=corpus.suites,
+        cases=(first, second),
+    )
+
+    result = asyncio.run(
+        run_corpus_suite(
+            _target(_EchoProvider()),
+            corpus,
+            "refund-regressions",
+            max_concurrency=2,
+        )
+    )
+
+    assert {case.case_id: case.trials[0].output.text for case in result.run.cases} == {
+        "refund-approval": "alpha output",
+        "refund-output-beta": "beta output",
+    }
 
 
 @pytest.mark.parametrize(
@@ -382,6 +640,36 @@ def test_target_and_execution_limits_fail_before_provider_dispatch():
         asyncio.run(
             run_corpus_suite(target, _corpus(target_key="other-agent"), "refund-regressions")
         )
+    assert provider.requests == []
+
+
+def test_compilation_bounds_bootstrap_amplification_across_the_selected_suite():
+    base = _corpus(trials=1)
+    first = base.cases[0]
+    second = EvalCaseSpec.create(
+        id="refund-approval-two",
+        suite_id=first.suite_id,
+        name="Refund approval two",
+        source=first.source,
+        input=first.input,
+        assertions=first.assertions,
+    )
+    corpus = EvalCorpusDocument.create(
+        target_key=base.target_key,
+        evidence_policy=base.evidence_policy,
+        suites=base.suites,
+        cases=(first, second),
+    )
+    per_case_chars = len("Follow the refund policy.") + len("Refund order 42.")
+    provider = _provider(trials=1)
+    target = _target(
+        provider,
+        limits=CorpusExecutionLimits(max_compiled_input_chars=per_case_chars),
+    )
+
+    with pytest.raises(ValueError, match="compiled-input limit"):
+        compile_corpus_suite(corpus, target, "refund-regressions")
+
     assert provider.requests == []
 
 

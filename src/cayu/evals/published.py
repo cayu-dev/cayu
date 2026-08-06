@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal, TypeAlias, cast
 
 from pydantic import (
+    BaseModel,
     Field,
     StrictBool,
     StrictFloat,
@@ -47,7 +48,6 @@ from cayu.evals.corpus import (
     _ordered_sequence_input,
     _portable_id,
     _PortableModel,
-    _SchemaV1PortableModel,
     _sha256_revision,
     assertion_spec_revision,
     eval_run_contract_for_corpus,
@@ -58,9 +58,15 @@ from cayu.evals.models import (
     EvalRun,
     _model_instance_python_input,
 )
+from cayu.evals.result_contract import (
+    PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
+    EvalTrialDiagnosticCode,
+    EvalTrialOutputPreviewV1,
+    _EvalTrialPublicData,
+)
 from cayu.runtime.usage import AggregateCount, aggregate_usage_metrics_from_durable_payload
 
-PUBLISHED_EVAL_SCHEMA_VERSION = 1
+PUBLISHED_EVAL_SCHEMA_VERSION = 2
 PUBLISHED_EVAL_MAX_BYTES = 32 << 20
 PUBLISHED_EVAL_MAX_DURATION_MS = 2**63 - 1
 
@@ -74,10 +80,52 @@ _ASSERTION_MESSAGE = {
     "error": "Assertion evaluation failed.",
 }
 _TRIAL_MESSAGE = {
-    "passed": "Trial passed.",
-    "failed": "One or more assertions failed.",
-    "unavailable": "Required trial evidence was unavailable.",
-    "error": "Trial execution or assertion evaluation failed.",
+    EvalTrialDiagnosticCode.PASSED: "Trial passed.",
+    EvalTrialDiagnosticCode.ASSERTION_FAILED: "One or more assertions failed.",
+    EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE: (
+        "Required assertion evidence was unavailable."
+    ),
+    EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE: (
+        "Exact terminal evidence was unavailable."
+    ),
+    EvalTrialDiagnosticCode.INTERRUPTED_EVIDENCE_UNAVAILABLE: (
+        "Exact interrupted-session evidence was unavailable."
+    ),
+    EvalTrialDiagnosticCode.CHILD_EVIDENCE_UNAVAILABLE: (
+        "Complete child-session evidence was unavailable."
+    ),
+    EvalTrialDiagnosticCode.EXECUTION_FAILED: "Trial execution failed.",
+    EvalTrialDiagnosticCode.SESSION_FAILED: "The trial session failed.",
+    EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED: "Terminal evidence capture failed.",
+    EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED: ("Assertion evidence preparation failed."),
+    EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED: "Assertion evaluation failed.",
+    EvalTrialDiagnosticCode.CASE_TIMEOUT: "The trial exceeded its configured timeout.",
+}
+
+_DEFAULT_TRIAL_CODE = {
+    "passed": EvalTrialDiagnosticCode.PASSED,
+    "failed": EvalTrialDiagnosticCode.ASSERTION_FAILED,
+    "unavailable": EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE,
+    "error": EvalTrialDiagnosticCode.EXECUTION_FAILED,
+}
+
+_TRIAL_CODES_BY_STATUS = {
+    "passed": {EvalTrialDiagnosticCode.PASSED},
+    "failed": {EvalTrialDiagnosticCode.ASSERTION_FAILED},
+    "unavailable": {
+        EvalTrialDiagnosticCode.ASSERTION_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.INTERRUPTED_EVIDENCE_UNAVAILABLE,
+        EvalTrialDiagnosticCode.CHILD_EVIDENCE_UNAVAILABLE,
+    },
+    "error": {
+        EvalTrialDiagnosticCode.EXECUTION_FAILED,
+        EvalTrialDiagnosticCode.SESSION_FAILED,
+        EvalTrialDiagnosticCode.TERMINAL_EVIDENCE_FAILED,
+        EvalTrialDiagnosticCode.EVIDENCE_PREPARATION_FAILED,
+        EvalTrialDiagnosticCode.ASSERTION_EVALUATION_FAILED,
+        EvalTrialDiagnosticCode.CASE_TIMEOUT,
+    },
 }
 
 
@@ -322,13 +370,23 @@ class PublishedEvalTrialResult(_PortableModel):
     evidence_complete: StrictBool
     duration_ms: StrictInt = Field(ge=0, le=PUBLISHED_EVAL_MAX_DURATION_MS)
     usage: PublishedUsageSummaryV1 | None = None
-    code: PublishedStatus
+    output: EvalTrialOutputPreviewV1
+    code: EvalTrialDiagnosticCode
     message: StrictStr
 
     @field_validator("assertions", mode="before")
     @classmethod
     def validate_assertions_are_ordered(cls, value: object, info) -> object:
         return _ordered_sequence_input(value, info.field_name)
+
+    @field_validator("output", mode="before")
+    @classmethod
+    def copy_output(cls, value: object) -> object:
+        if type(value) is EvalTrialOutputPreviewV1:
+            return EvalTrialOutputPreviewV1.model_validate(value.model_dump(mode="python"))
+        if isinstance(value, BaseModel):
+            raise TypeError("output must be an exact EvalTrialOutputPreviewV1 or JSON object.")
+        return value
 
     @model_validator(mode="after")
     def validate_contract(self) -> PublishedEvalTrialResult:
@@ -345,7 +403,9 @@ class PublishedEvalTrialResult(_PortableModel):
             raise ValueError("Scored published trials require complete evidence.")
         if self.evidence_complete and self.usage is None:
             raise ValueError("Complete published trials require exact usage.")
-        if self.code != self.status or self.message != _TRIAL_MESSAGE[self.status]:
+        if self.code not in _TRIAL_CODES_BY_STATUS[self.status]:
+            raise ValueError("Published trial diagnostic code contradicts the status.")
+        if self.message != _TRIAL_MESSAGE[self.code]:
             raise ValueError("Published trial diagnostics do not match the status.")
         _validate_trial_observations(
             self.assertions,
@@ -401,8 +461,8 @@ class PublishedEvalCaseResult(_PortableModel):
         return self
 
 
-class PublishedEvalRun(_SchemaV1PortableModel):
-    schema_version: Literal[1] = PUBLISHED_EVAL_SCHEMA_VERSION
+class PublishedEvalRun(_PortableModel):
+    schema_version: Literal[2]
     revision: StrictStr
     corpus_revision: StrictStr
     target_key: StrictStr
@@ -427,6 +487,16 @@ class PublishedEvalRun(_SchemaV1PortableModel):
     @classmethod
     def validate_expanded_result_limit(cls, value):
         """Reject oversized raw graphs before constructing their nested models."""
+
+        if isinstance(value, Mapping):
+            if "schema_version" not in value:
+                raise ValueError("Published eval run schema_version is required.")
+            schema_version = value["schema_version"]
+            if type(schema_version) is not int or (schema_version != PUBLISHED_EVAL_SCHEMA_VERSION):
+                raise ValueError(
+                    "Published eval run schema_version must be the integer "
+                    f"{PUBLISHED_EVAL_SCHEMA_VERSION}; other versions are unsupported."
+                )
 
         def raw_sequence(container, field_name, path, model_type):
             if isinstance(container, Mapping):
@@ -457,6 +527,7 @@ class PublishedEvalRun(_SchemaV1PortableModel):
                 f"{EVAL_CORPUS_MAX_CASES} items."
             )
         published_assertion_results = 0
+        output_preview_bytes = 0
         for case_index, case in enumerate(cases):
             trials = raw_sequence(
                 case,
@@ -470,6 +541,48 @@ class PublishedEvalRun(_SchemaV1PortableModel):
                     f"{EVAL_CORPUS_MAX_TRIALS} items."
                 )
             for trial_index, trial in enumerate(trials):
+                if isinstance(trial, Mapping):
+                    if "output" not in trial:
+                        raise ValueError(
+                            "Published eval run "
+                            f"cases[{case_index}].trials[{trial_index}].output is required."
+                        )
+                    raw_output = trial["output"]
+                elif isinstance(trial, PublishedEvalTrialResult):
+                    raw_output = trial.output
+                else:
+                    raise ValueError(
+                        "Published eval run "
+                        f"cases[{case_index}].trials[{trial_index}] must be an object."
+                    )
+                if isinstance(raw_output, Mapping):
+                    raw_text = raw_output.get("text")
+                elif isinstance(raw_output, EvalTrialOutputPreviewV1):
+                    raw_text = raw_output.text
+                else:
+                    raw_text = None
+                if type(raw_text) is str:
+                    remaining = PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES - output_preview_bytes
+                    # Every Unicode character occupies at least one UTF-8 byte. Avoid
+                    # encoding a Python-supplied string once it already exceeds the
+                    # aggregate public-output budget.
+                    if len(raw_text) > remaining:
+                        raise ValueError(
+                            "Published eval run exceeds its aggregate output-preview "
+                            f"limit of {PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES} UTF-8 bytes."
+                        )
+                    try:
+                        encoded_text_bytes = len(raw_text.encode("utf-8"))
+                    except UnicodeEncodeError:
+                        # The nested durable-text validator reports malformed Unicode.
+                        # This preflight only accounts well-formed preview strings.
+                        encoded_text_bytes = 0
+                    output_preview_bytes += encoded_text_bytes
+                    if output_preview_bytes > PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES:
+                        raise ValueError(
+                            "Published eval run exceeds its aggregate output-preview "
+                            f"limit of {PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES} UTF-8 bytes."
+                        )
                 assertions = raw_sequence(
                     trial,
                     "assertions",
@@ -529,6 +642,14 @@ class PublishedEvalRun(_SchemaV1PortableModel):
             raise ValueError(
                 "Published eval run exceeds the corpus expanded assertion-result limit of "
                 f"{EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS}."
+            )
+        output_preview_bytes = sum(
+            len(trial.output.text.encode("utf-8")) for case in self.cases for trial in case.trials
+        )
+        if output_preview_bytes > PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES:
+            raise ValueError(
+                "Published eval run exceeds its aggregate output-preview limit of "
+                f"{PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES} UTF-8 bytes."
             )
         has_cost_assertion = any(
             assertion.detail.kind == "max_estimated_cost"
@@ -962,9 +1083,14 @@ def _published_usage(value: Mapping[str, Any] | None) -> PublishedUsageSummaryV1
     )
 
 
-def _published_case(case: EvalCaseSpec, result) -> PublishedEvalCaseResult:
+def _published_case(
+    case: EvalCaseSpec,
+    result,
+    *,
+    trial_public_data: tuple[_EvalTrialPublicData, ...] | None,
+) -> PublishedEvalCaseResult:
     trials: list[PublishedEvalTrialResult] = []
-    for trial in result.trials:
+    for index, trial in enumerate(result.trials):
         if len(trial.assertions) != len(case.assertions):
             raise ValueError("Internal trial assertions do not match the corpus contract.")
         assertions = tuple(
@@ -974,6 +1100,13 @@ def _published_case(case: EvalCaseSpec, result) -> PublishedEvalCaseResult:
         status = trial.status.value
         if status == "skipped":
             raise ValueError("Portable corpus trials cannot be skipped.")
+        if trial_public_data is None:
+            public_data = _EvalTrialPublicData(
+                diagnostic_code=_DEFAULT_TRIAL_CODE[status],
+                output=EvalTrialOutputPreviewV1.unavailable(),
+            )
+        else:
+            public_data = trial_public_data[index]
         trials.append(
             PublishedEvalTrialResult(
                 trial_number=trial.trial_number,
@@ -983,8 +1116,9 @@ def _published_case(case: EvalCaseSpec, result) -> PublishedEvalCaseResult:
                 evidence_complete=trial.evidence_complete,
                 duration_ms=trial.duration_ms,
                 usage=_published_usage(trial.usage_summary),
-                code=status,
-                message=_TRIAL_MESSAGE[status],
+                output=public_data.output,
+                code=public_data.diagnostic_code,
+                message=_TRIAL_MESSAGE[public_data.diagnostic_code],
             )
         )
     status = _published_status_from_statuses(trial.status for trial in trials)
@@ -1000,6 +1134,21 @@ def _published_case(case: EvalCaseSpec, result) -> PublishedEvalCaseResult:
 
 def publish_eval_run(corpus: EvalCorpusDocument, run: EvalRun) -> PublishedEvalRun:
     """Project one lossless internal suite run into the public corpus result graph."""
+
+    return _publish_eval_run_with_trial_public_data(
+        corpus,
+        run,
+        trial_public_data_by_case=None,
+    )
+
+
+def _publish_eval_run_with_trial_public_data(
+    corpus: EvalCorpusDocument,
+    run: EvalRun,
+    *,
+    trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]] | None,
+) -> PublishedEvalRun:
+    """Internal execution projection with separately supplied redacted trial data."""
 
     if type(corpus) is not EvalCorpusDocument:
         raise TypeError("corpus must be an exact EvalCorpusDocument.")
@@ -1021,7 +1170,35 @@ def publish_eval_run(corpus: EvalCorpusDocument, run: EvalRun) -> PublishedEvalR
         raise ValueError("Internal eval run cases do not match the complete corpus suite.")
     if any(len(result_by_id[case.id].trials) != suite.trial_request.trials for case in case_specs):
         raise ValueError("Internal eval run trial counts do not match the corpus suite.")
-    cases = tuple(_published_case(case, result_by_id[case.id]) for case in case_specs)
+    validated_public_data: dict[str, tuple[_EvalTrialPublicData, ...]] | None = None
+    if trial_public_data_by_case is not None:
+        if type(trial_public_data_by_case) is not dict:
+            raise TypeError("trial_public_data_by_case must be an exact dict.")
+        if set(trial_public_data_by_case) != {case.id for case in case_specs}:
+            raise ValueError("Trial public data must match the complete corpus suite.")
+        validated_public_data = {}
+        for case in case_specs:
+            values = trial_public_data_by_case[case.id]
+            if type(values) is not tuple or len(values) != len(result_by_id[case.id].trials):
+                raise ValueError("Trial public data counts must match the corpus suite.")
+            copied: list[_EvalTrialPublicData] = []
+            for value in values:
+                if type(value) is not _EvalTrialPublicData:
+                    raise TypeError(
+                        "Trial public data must contain exact runner-owned projection values."
+                    )
+                copied.append(_EvalTrialPublicData.model_validate(value.model_dump(mode="python")))
+            validated_public_data[case.id] = tuple(copied)
+    cases = tuple(
+        _published_case(
+            case,
+            result_by_id[case.id],
+            trial_public_data=(
+                None if validated_public_data is None else validated_public_data[case.id]
+            ),
+        )
+        for case in case_specs
+    )
     status = _published_status_from_statuses(case.status for case in cases)
     document: dict[str, Any] = {
         "schema_version": PUBLISHED_EVAL_SCHEMA_VERSION,
