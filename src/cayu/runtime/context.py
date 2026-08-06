@@ -6515,6 +6515,27 @@ def _compaction_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any] | None:
     return copy_json_value(value, _COMPACTION_CHECKPOINT_KEY)
 
 
+def project_compaction_invocation_checkpoint(
+    checkpoint: dict[str, Any] | None,
+    *,
+    redactor: SecretRedactor,
+) -> dict[str, Any] | None:
+    """Copy a checkpoint with descriptive compaction state safe for extensions."""
+
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+    if checkpoint is None:
+        return None
+    projected = copy_json_value(checkpoint, "checkpoint")
+    compaction = projected.get(_COMPACTION_CHECKPOINT_KEY)
+    if type(compaction) is not dict:
+        return projected
+    summary = compaction.get("summary")
+    if type(summary) is str:
+        compaction["summary"] = redactor.redact_text(summary)
+    return projected
+
+
 def _is_compaction_boundary(messages: list[Message], cursor: int) -> bool:
     """Return whether ``cursor`` leaves no assistant/tool round split."""
 

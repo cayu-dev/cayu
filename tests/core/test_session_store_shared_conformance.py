@@ -24,7 +24,16 @@ from cayu._validation import (
     DurableValueError,
     extract_durable_value_error,
 )
-from cayu.core import AgentSpec, Event, EventType, Message, ToolCallPart
+from cayu.artifacts import file_attachment
+from cayu.core import (
+    AgentSpec,
+    Event,
+    EventType,
+    Message,
+    MessageRole,
+    ToolCallPart,
+    ToolResultPart,
+)
 from cayu.core.billing import BillingIdentity
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import (
@@ -376,9 +385,11 @@ class _ConformanceCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.calls = 0
         self.fail_next = False
+        self.requests: list[CompactionRequest] = []
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.calls += 1
+        self.requests.append(request.model_copy(deep=True))
         if self.fail_next:
             self.fail_next = False
             raise RuntimeError("conformance compactor failed")
@@ -5262,8 +5273,13 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
     async def run() -> None:
         store = await _open_store(session_store_case)
         try:
+            secret = "explicit-conformance-transcript-secret"
             compactor = _ConformanceCompactor()
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 context_policy=CheckpointCompactionContextPolicy(
@@ -5280,7 +5296,7 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
                 identity=_identity(),
             )
             transcript = [
-                Message.text("user", "old request"),
+                Message.text("user", f"old request containing {secret}"),
                 Message.text("assistant", "old answer"),
                 Message.text("user", "current request"),
                 Message.text("assistant", "current answer"),
@@ -5304,7 +5320,11 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
 
             first = [event async for event in app.compact_session(request)]
             store = await _reopen_store(session_store_case, store)
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 context_policy=CheckpointCompactionContextPolicy(
@@ -5315,6 +5335,12 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
             replay = [event async for event in app.compact_session(request)]
             assert [event.id for event in replay] == [event.id for event in first]
             assert compactor.calls == 1
+            assert secret not in json.dumps(
+                [message.model_dump(mode="json") for message in compactor.requests[0].messages]
+            )
+            assert REDACTED_SECRET in json.dumps(
+                [message.model_dump(mode="json") for message in compactor.requests[0].messages]
+            )
             assert await store.load_transcript(created.id) == transcript
             checkpoint = await store.load_checkpoint(created.id)
             assert checkpoint is not None
@@ -5372,6 +5398,227 @@ def test_session_store_conformance_explicit_compaction_operation(session_store_c
             checkpoint = await store.load_checkpoint(created.id)
             assert checkpoint is not None
             assert "session_operations" not in checkpoint
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_explicit_compaction_projects_legacy_summary(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            secret = "explicit-conformance-legacy-summary-secret"
+            legacy_summary = f"legacy summary containing {secret}"
+            compactor = _ConformanceCompactor()
+            app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=compactor,
+                    max_user_turns=1,
+                ),
+            )
+            session_id = f"sess_compaction_legacy_summary_{session_store_case[0]}"
+            created = await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            transcript = [
+                Message.text("user", "old request"),
+                Message.text("assistant", "old answer"),
+                Message.text("user", "newer request"),
+                Message.text("assistant", "newer answer"),
+                Message.text("user", "current request"),
+            ]
+            await store.append_transcript_messages(created.id, transcript)
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            await store.checkpoint(
+                created.id,
+                {
+                    "context_compaction": {
+                        "version": 2,
+                        "summary": legacy_summary,
+                        "compacted_transcript_cursor": 2,
+                        "metadata": {"compactor": "legacy", "mode": "deterministic"},
+                    }
+                },
+            )
+            request = CompactSessionRequest(
+                session_id=created.id,
+                idempotency_key="compact-legacy-summary",
+                expected_run_epoch=completed.run_epoch,
+                expected_transcript_cursor=len(transcript),
+            )
+
+            first = [event async for event in app.compact_session(request)]
+            store = await _reopen_store(session_store_case, store)
+            replay_app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            replay_app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=compactor,
+                    max_user_turns=1,
+                ),
+            )
+            replay = [event async for event in replay_app.compact_session(request)]
+
+            assert [event.id for event in replay] == [event.id for event in first]
+            assert compactor.calls == 1
+            assert compactor.requests[0].existing_summary == (
+                f"legacy summary containing {REDACTED_SECRET}"
+            )
+            assert secret not in json.dumps(compactor.requests[0].model_dump(mode="json"))
+            checkpoint = await store.load_checkpoint(created.id)
+            assert checkpoint is not None
+            assert checkpoint["context_compaction"]["summary"] == (
+                f"legacy summary containing {REDACTED_SECRET}|summary-1"
+            )
+            assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 4
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("authority_position", ("first", "middle", "final"))
+@pytest.mark.parametrize(
+    "authority_kind",
+    ("file_attachment", "runtime_projection_artifact_id", "runtime_projection_store_id"),
+)
+def test_session_store_conformance_explicit_compaction_rejects_secret_authority(
+    session_store_case,
+    authority_position: str,
+    authority_kind: str,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            secret = (
+                "deadbeef"
+                if authority_kind == "runtime_projection_artifact_id"
+                else "explicit-conformance-authority-secret"
+            )
+            compactor = _ConformanceCompactor()
+            app = CayuApp(
+                session_store=store,
+                secret_redactor=SecretRedactor(secret),
+                enable_logging=False,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                context_policy=CheckpointCompactionContextPolicy(
+                    compactor=compactor,
+                    max_user_turns=1,
+                ),
+            )
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="sess_compaction_authority_conformance",
+                    messages=[],
+                ),
+                identity=_identity(),
+            )
+            if authority_kind == "file_attachment":
+                artifact = file_attachment(
+                    artifact_id=f"artifact-{secret}-suffix",
+                    kind="image",
+                    filename="safe.png",
+                    content_type="image/png",
+                    size_bytes=1,
+                )
+            else:
+                artifact_id = (
+                    f"art_{secret}{'a' * 24}"
+                    if authority_kind == "runtime_projection_artifact_id"
+                    else f"art_{'a' * 32}"
+                )
+                artifact = {
+                    "type": "cayu.tool_result_artifact.v1",
+                    "artifact_id": artifact_id,
+                    "store_id": (
+                        "artifacts"
+                        if authority_kind == "runtime_projection_artifact_id"
+                        else f"store-{secret}-suffix"
+                    ),
+                    "filename": f"tool-result-{artifact_id}.txt",
+                    "content_type": "text/plain; charset=utf-8",
+                    "size_bytes": 1,
+                    "sha256": "b" * 64,
+                    "scope": "session",
+                    "session_id_sha256": "c" * 64,
+                    "readback_max_bytes": 64,
+                    "projection_authority": "cayu.tool_result_projection.v1",
+                }
+            authority_message = Message(
+                role=MessageRole.TOOL,
+                content=(
+                    ToolResultPart(
+                        tool_call_id="safe-call",
+                        tool_name="safe_tool",
+                        artifacts=[artifact],
+                    ),
+                ),
+            )
+            safe_messages = [
+                Message.text("user", "old request"),
+                Message.text("assistant", "old answer"),
+                Message.text("user", "current request"),
+            ]
+            authority_index = {
+                "first": 0,
+                "middle": 1,
+                "final": len(safe_messages),
+            }[authority_position]
+            transcript = list(safe_messages)
+            transcript.insert(authority_index, authority_message)
+            await store.append_transcript_messages(created.id, transcript)
+            completed = await store.update_status(created.id, SessionStatus.COMPLETED)
+            before_events = await store.query_events(EventQuery(session_id=created.id, limit=100))
+            before_checkpoint = await store.load_checkpoint(created.id)
+            request = CompactSessionRequest(
+                session_id=created.id,
+                idempotency_key=f"reject-{authority_kind}-authority-conformance",
+                expected_run_epoch=completed.run_epoch,
+                expected_transcript_cursor=len(transcript),
+            )
+
+            with pytest.raises(
+                ValueError,
+                match="workload secret in execution authority",
+            ):
+                async for _event in app.compact_session(request):
+                    pass
+
+            current = await store.load(created.id)
+            assert current is not None
+            assert current.status == completed.status
+            assert current.run_epoch == completed.run_epoch
+            assert await store.load_transcript(created.id) == transcript
+            assert await store.load_checkpoint(created.id) == before_checkpoint
+            assert (
+                await store.query_events(EventQuery(session_id=created.id, limit=100))
+                == before_events
+            )
+            assert (
+                await store.load_session_operation(
+                    created.id,
+                    request.idempotency_key,
+                )
+                is None
+            )
+            assert compactor.calls == 0
         finally:
             await _close_store(store)
 

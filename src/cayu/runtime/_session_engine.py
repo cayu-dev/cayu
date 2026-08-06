@@ -204,6 +204,7 @@ from cayu.runtime.context import (
     _defer_billing_identity_cancellation_scope,
     _durable_compaction_completion_evidence,
     context_build_termination_compaction_telemetry,
+    project_compaction_invocation_checkpoint,
     sanitize_context_build_error_checkpoint,
     sanitize_context_build_result_checkpoint,
     sanitize_context_compaction_telemetry,
@@ -3399,11 +3400,25 @@ class SessionEngine:
         )
         environment_name = _environment_name(registered_environment)
         transcript = await self.session_store.load_transcript(loaded_session.id)
-        if len(transcript) != request.expected_transcript_cursor:
+        source_transcript_cursor = len(transcript)
+        if source_transcript_cursor != request.expected_transcript_cursor:
             raise ValueError(
                 "Session compaction source transcript cursor is stale: expected "
-                f"{request.expected_transcript_cursor}, current {len(transcript)}."
+                f"{request.expected_transcript_cursor}, current {source_transcript_cursor}."
             )
+        transcript, transcript_is_valid = session_request_boundary.redact_transcript(
+            transcript,
+            redactor=self._secret_redactor,
+            field_name="session.transcript",
+            reject_secret_bearing_runtime_projection_authority=True,
+        )
+        if not transcript_is_valid:
+            raise ValueError(
+                "Session transcript contains a workload secret in execution authority "
+                "and cannot be compacted."
+            ) from None
+        if len(transcript) != source_transcript_cursor:
+            raise AssertionError("Session transcript projection changed its message count.")
 
         candidate_app_policy_budget_limits = budget_limits_for_session(
             policy=self._get_budget_policy(),
@@ -3572,7 +3587,7 @@ class SessionEngine:
                         request=request,
                         operation_id=operation_id,
                         attempt_id=attempt_id,
-                        source_cursor=len(transcript),
+                        source_cursor=source_transcript_cursor,
                         compactor=compactor_name,
                     ),
                     **model_step_identity.payload(),
@@ -3770,6 +3785,12 @@ class SessionEngine:
             raise AssertionError("New session compaction did not persist its operation claim.")
         if claimed_operation_expires_at is None:
             raise AssertionError("New session compaction did not persist its claim expiry.")
+        compaction_invocation_checkpoint = project_compaction_invocation_checkpoint(
+            claimed_checkpoint,
+            redactor=self._secret_redactor,
+        )
+        checkpoint_before_claim = None
+        claimed_checkpoint = None
         _require_unexpired_session_operation_claim(
             clock=self._clock,
             claim_expires_at=claimed_operation_expires_at,
@@ -4714,7 +4735,7 @@ class SessionEngine:
                                 force_bounded_compaction=True,
                                 compaction_instructions=request.instructions,
                             ),
-                            checkpoint=claimed_checkpoint,
+                            checkpoint=compaction_invocation_checkpoint,
                         )
                 except ContextBuildError as error:
                     sanitize_context_build_error_checkpoint(

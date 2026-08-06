@@ -222,6 +222,25 @@ completed, failed, or interrupted boundary with no unresolved approval, user
 input, tool round, or interruption cascade. The request supplies an idempotency
 key plus the expected run epoch and transcript cursor. Both fences are checked
 again in the atomic store transaction before the compactor is invoked.
+After checking the raw durable transcript cursor, Cayu projects a detached copy
+through the workload-secret boundary before consulting compactor extensions,
+claiming the operation, or dispatching provider work. Descriptive secret values
+are redacted in that copy. A secret in execution-authority fields rejects the
+request before any operation state or event is written. The durable transcript
+remains the immutable source of record; only the model-facing compaction input
+is projected, and its coverage cursor continues to count the original stored
+messages.
+For this stored-state admission, a structurally valid
+`cayu.tool_result_artifact.v1` object is not by itself positive provenance. If
+redaction would change any value in that preserved reference, explicit
+compaction rejects it before claiming the operation. This stricter stored-input
+check does not alter authenticated runtime projection publication elsewhere.
+An existing versioned compaction summary is descriptive input at this boundary:
+Cayu redacts it in the detached checkpoint supplied to the context policy and
+compactor. Its durable cursor and operation state remain authoritative and are
+copied unchanged, and the compactor binds coverage to the prepared summary it
+actually received. Cayu does not persist the active secret registry or rewrite
+the durable checkpoint merely to prepare an invocation.
 
 The operation writes its single live durable claim into the session checkpoint
 and publishes the claim with `context.compaction.started` atomically. While its

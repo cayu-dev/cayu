@@ -650,6 +650,7 @@ def redact_transcript(
     *,
     redactor: SecretRedactor,
     field_name: str,
+    reject_secret_bearing_runtime_projection_authority: bool = False,
 ) -> tuple[list[Message], bool]:
     """Detach raw transcript state and return explicit positive validation."""
 
@@ -661,6 +662,9 @@ def redact_transcript(
                     message,
                     redactor=redactor,
                     field_name=f"{field_name}[{index}]",
+                    reject_secret_bearing_runtime_projection_authority=(
+                        reject_secret_bearing_runtime_projection_authority
+                    ),
                 )
             )
         except (TypeError, ValueError):

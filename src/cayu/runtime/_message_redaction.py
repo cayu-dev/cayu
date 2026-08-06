@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from cayu.artifacts.attachments import FILE_ATTACHMENT_TYPE
 from cayu.core.messages import Message
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.tool_result_projection import (
@@ -123,6 +124,7 @@ def redact_untrusted_message_for_boundary(
         redactor=redactor,
         field_name=field_name,
         trust_runtime_tool_result_projection=False,
+        reject_secret_bearing_runtime_projection_authority=False,
     )
 
 
@@ -131,6 +133,7 @@ def redact_runtime_message_for_boundary(
     *,
     redactor: SecretRedactor,
     field_name: str,
+    reject_secret_bearing_runtime_projection_authority: bool = False,
 ) -> Message:
     """Redact runtime-owned transcript state after validating projection authority."""
 
@@ -139,6 +142,9 @@ def redact_runtime_message_for_boundary(
         redactor=redactor,
         field_name=field_name,
         trust_runtime_tool_result_projection=True,
+        reject_secret_bearing_runtime_projection_authority=(
+            reject_secret_bearing_runtime_projection_authority
+        ),
     )
 
 
@@ -148,6 +154,7 @@ def _redact_message_for_boundary(
     redactor: SecretRedactor,
     field_name: str,
     trust_runtime_tool_result_projection: bool,
+    reject_secret_bearing_runtime_projection_authority: bool,
 ) -> Message:
     """Redact one message without rewriting executable protocol authorities."""
 
@@ -177,6 +184,12 @@ def _redact_message_for_boundary(
             part,
             trust_runtime_tool_result_projection=trust_runtime_tool_result_projection,
         )
+        if reject_secret_bearing_runtime_projection_authority:
+            _require_secret_free_runtime_projection_authority(
+                projection_references,
+                redactor=redactor,
+                field_name=f"{field_name}.content[{index}].artifacts",
+            )
         # Protocol linkage and routing fields are executable authority. They
         # must fail closed instead of being rewritten into a different value.
         for authority_field in _MESSAGE_AUTHORITY_STRING_FIELDS:
@@ -186,6 +199,11 @@ def _redact_message_for_boundary(
                     f"{field_name}.content[{index}].{authority_field} contains a "
                     "workload secret and cannot be used as execution authority."
                 )
+        _require_secret_free_file_attachment_authority(
+            part,
+            redactor=redactor,
+            field_name=f"{field_name}.content[{index}]",
+        )
         redacted_part = redactor.redact_json_values(
             part,
             preserve_string_fields=_MESSAGE_PRESERVED_STRING_FIELDS,
@@ -218,6 +236,41 @@ def _redact_message_for_boundary(
             "content": redacted_content,
         }
     )
+
+
+def _require_secret_free_file_attachment_authority(
+    part: dict[str, object],
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> None:
+    """Reject file handles that redaction would rewrite into different authority."""
+
+    part_type = part.get("type")
+    attachments: list[tuple[str, object]] = []
+    if part_type == "file":
+        attachments.append(("attachment", part.get("attachment")))
+    elif part_type == "tool_result":
+        artifacts = part.get("artifacts")
+        if type(artifacts) is not list:
+            raise AssertionError("Tool result artifacts serialized as a non-list.")
+        for index, untyped_artifact in enumerate(artifacts):
+            if type(untyped_artifact) is not dict:
+                continue
+            artifact = cast("dict[str, object]", untyped_artifact)
+            if artifact.get("type") == FILE_ATTACHMENT_TYPE:
+                attachments.append((f"artifacts[{index}]", artifact))
+
+    for path, untyped_attachment in attachments:
+        if type(untyped_attachment) is not dict:
+            raise AssertionError("File attachment serialized as a non-object.")
+        attachment = cast("dict[str, object]", untyped_attachment)
+        artifact_id = attachment.get("artifact_id")
+        if type(artifact_id) is str and redactor.redact_text(artifact_id) != artifact_id:
+            raise ValueError(
+                f"{field_name}.{path}.artifact_id contains a workload secret and cannot "
+                "be used as execution authority."
+            )
 
 
 def _require_secret_free_message_keys(
@@ -319,6 +372,22 @@ def _runtime_tool_result_artifact_references(
             continue
         references[index] = cast("dict[str, object]", reference)
     return references
+
+
+def _require_secret_free_runtime_projection_authority(
+    references: dict[int, dict[str, object]],
+    *,
+    redactor: SecretRedactor,
+    field_name: str,
+) -> None:
+    """Reject unverified stored references that secret redaction would rewrite."""
+
+    for index, reference in references.items():
+        if redactor.redact_json_values(reference) != reference:
+            raise ValueError(
+                f"{field_name}[{index}] contains a workload secret and cannot be "
+                "used as runtime projection authority."
+            )
 
 
 def _require_secret_free_tool_result_artifacts(
