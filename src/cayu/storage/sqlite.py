@@ -797,32 +797,6 @@ def _event_query_session_id_batches(
     ]
 
 
-def _event_query_with_session_ids(
-    query: EventQuery,
-    *,
-    session_ids: tuple[str, ...],
-) -> EventQuery:
-    return EventQuery(
-        session_ids=session_ids,
-        event_id=query.event_id,
-        interaction_id=query.interaction_id,
-        causal_budget_id=query.causal_budget_id,
-        event_type=query.event_type,
-        event_types=query.event_types,
-        exclude_event_types=query.exclude_event_types,
-        agent_name=query.agent_name,
-        environment_name=query.environment_name,
-        workflow_name=query.workflow_name,
-        tool_name=query.tool_name,
-        since=query.since,
-        until=query.until,
-        after_sequence=query.after_sequence,
-        before_sequence=query.before_sequence,
-        limit=query.limit,
-        order_by=query.order_by,
-    )
-
-
 # Columns needed to reconstruct an Event, in a stable order. The formerly-stored
 # event_json blob duplicated exactly these (plus payload_json), so the store now
 # rebuilds Events from the individual columns instead of parsing a redundant copy.
@@ -6260,7 +6234,10 @@ class SQLiteSessionStore(SessionStore):
         for batch in _event_query_session_id_batches(query.session_ids):
             records.extend(
                 await self.query_events(
-                    _event_query_with_session_ids(query, session_ids=batch),
+                    session_store_sql.event_query_with_session_ids(
+                        query,
+                        session_ids=batch,
+                    ),
                 )
             )
         records.sort(

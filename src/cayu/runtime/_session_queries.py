@@ -7,6 +7,7 @@ from cayu.runtime.sessions import (
     Session,
     SessionQuery,
     SessionStore,
+    copy_event_query,
 )
 
 
@@ -59,24 +60,13 @@ async def query_all_event_records(
 
     while True:
         page = await session_store.query_events(
-            EventQuery(
-                session_id=query.session_id,
-                session_ids=query.session_ids,
-                event_id=query.event_id,
-                causal_budget_id=query.causal_budget_id,
-                event_type=query.event_type,
-                event_types=query.event_types,
-                exclude_event_types=query.exclude_event_types,
-                agent_name=query.agent_name,
-                environment_name=query.environment_name,
-                workflow_name=query.workflow_name,
-                tool_name=query.tool_name,
-                since=query.since,
-                until=query.until,
-                after_sequence=after_sequence,
-                before_sequence=before_sequence,
-                limit=query.limit,
-                order_by=page_order,
+            copy_event_query(
+                query,
+                update={
+                    "after_sequence": after_sequence,
+                    "before_sequence": before_sequence,
+                    "order_by": page_order,
+                },
             )
         )
         if not page:

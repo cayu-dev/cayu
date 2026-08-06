@@ -2103,6 +2103,11 @@ class CayuApp:
             processed_for_watcher = 0
             while remaining > 0 and processed_for_watcher < watcher.batch_size:
                 state = await self.event_watcher_store.load_state(watcher.name)
+                if (
+                    watcher.query.before_sequence is not None
+                    and state.cursor_sequence >= watcher.query.before_sequence
+                ):
+                    break
                 page_limit = min(
                     remaining,
                     watcher.batch_size - processed_for_watcher,

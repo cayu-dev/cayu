@@ -14502,34 +14502,18 @@ def copy_session_lineage_query(query: SessionLineageQuery) -> SessionLineageQuer
     return SessionLineageQuery.model_validate(query.model_dump(mode="python"))
 
 
-def copy_event_query(query: EventQuery | None) -> EventQuery:
-    if query is None:
-        return EventQuery()
-    if type(query) is not EventQuery:
+def copy_event_query(
+    query: EventQuery | None,
+    *,
+    update: Mapping[str, object] | None = None,
+) -> EventQuery:
+    if query is not None and type(query) is not EventQuery:
         raise TypeError("Event queries must be EventQuery instances.")
-    return EventQuery(
-        session_id=query.session_id,
-        session_ids=query.session_ids,
-        event_id=query.event_id,
-        interaction_id=query.interaction_id,
-        causal_budget_id=query.causal_budget_id,
-        event_type=query.event_type,
-        event_types=query.event_types,
-        exclude_event_types=query.exclude_event_types,
-        agent_name=query.agent_name,
-        environment_name=query.environment_name,
-        workflow_name=query.workflow_name,
-        workflow_attempt_id=query.workflow_attempt_id,
-        workflow_step_id=query.workflow_step_id,
-        workflow_attempt_fenced=query.workflow_attempt_fenced,
-        tool_name=query.tool_name,
-        since=query.since,
-        until=query.until,
-        after_sequence=query.after_sequence,
-        before_sequence=query.before_sequence,
-        limit=query.limit,
-        order_by=query.order_by,
-    )
+    source = EventQuery() if query is None else query
+    values = source.model_dump(mode="python")
+    if update is not None:
+        values.update(update)
+    return EventQuery.model_validate(values)
 
 
 def copy_transcript_query(query: TranscriptQuery) -> TranscriptQuery:

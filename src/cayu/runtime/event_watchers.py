@@ -19,7 +19,7 @@ from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
 from cayu.runtime._diagnostics import exception_diagnostic
-from cayu.runtime.sessions import EventQuery, EventRecord, copy_event_query
+from cayu.runtime.sessions import EventOrder, EventQuery, EventRecord, copy_event_query
 from cayu.vaults import SecretRedactor
 
 EVENT_WATCHER_QUERY_PAGE_LIMIT = 5000
@@ -503,21 +503,13 @@ def event_query_after_cursor(
     query = copy_event_query(query)
     if type(limit) is not int or limit < 1:
         raise ValueError("limit must be an integer greater than or equal to 1.")
-    return EventQuery(
-        session_id=query.session_id,
-        session_ids=query.session_ids,
-        causal_budget_id=query.causal_budget_id,
-        event_type=query.event_type,
-        event_types=query.event_types,
-        exclude_event_types=query.exclude_event_types,
-        agent_name=query.agent_name,
-        environment_name=query.environment_name,
-        workflow_name=query.workflow_name,
-        tool_name=query.tool_name,
-        since=query.since,
-        until=query.until,
-        after_sequence=cursor_sequence,
-        limit=min(limit, EVENT_WATCHER_QUERY_PAGE_LIMIT),
+    return copy_event_query(
+        query,
+        update={
+            "after_sequence": cursor_sequence,
+            "limit": min(limit, EVENT_WATCHER_QUERY_PAGE_LIMIT),
+            "order_by": EventOrder.SEQUENCE_ASC,
+        },
     )
 
 

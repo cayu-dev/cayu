@@ -2558,8 +2558,10 @@ def test_postgres_session_store_batches_large_event_session_id_queries(postgres_
                     id=f"event_batch_{index}",
                     type=EventType.SESSION_STARTED,
                     session_id=session_id,
+                    interaction_id=("batch-target" if index % 2 == 0 else "batch-other"),
                     agent_name="builder",
                     environment_name="local",
+                    workflow_name="maintenance" if index % 2 == 0 else "other",
                     timestamp=datetime(2026, 1, 1, 12, index, tzinfo=UTC),
                 ),
             )
@@ -2580,6 +2582,15 @@ def test_postgres_session_store_batches_large_event_session_id_queries(postgres_
                 limit=10,
             )
         )
+        filtered_records = await store.query_events(
+            EventQuery(
+                session_ids=session_ids,
+                interaction_id="batch-target",
+                workflow_name="maintenance",
+                event_type=EventType.SESSION_STARTED,
+                limit=10,
+            )
+        )
 
         assert [record.event.id for record in records] == [
             "event_batch_0",
@@ -2596,6 +2607,11 @@ def test_postgres_session_store_batches_large_event_session_id_queries(postgres_
         assert [record.event.id for record in cursor_records] == [
             "event_batch_2",
             "event_batch_3",
+            "event_batch_4",
+        ]
+        assert [record.event.id for record in filtered_records] == [
+            "event_batch_0",
+            "event_batch_2",
             "event_batch_4",
         ]
 

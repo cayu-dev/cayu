@@ -38349,6 +38349,114 @@ def test_cayu_app_query_all_event_records_preserves_filters():
         )
         assert [record.event.id for record in event_id_records] == [delta_event.id]
 
+        await store.append_events(
+            "query_all_b",
+            [
+                Event(
+                    id="workflow-target-1",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="query_all_b",
+                    interaction_id="workflow-interaction",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2", "step_id": "step-a"},
+                ),
+                Event(
+                    id="workflow-other-interaction",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="query_all_b",
+                    interaction_id="other-interaction",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2", "step_id": "step-a"},
+                ),
+                Event(
+                    id="workflow-other-step",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="query_all_b",
+                    interaction_id="workflow-interaction",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2", "step_id": "step-b"},
+                ),
+                Event(
+                    id="workflow-target-2",
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="query_all_b",
+                    interaction_id="workflow-interaction",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2", "step_id": "step-a"},
+                ),
+            ],
+        )
+        workflow_records = await app._query_all_event_records(
+            EventQuery(
+                session_id="query_all_b",
+                interaction_id="workflow-interaction",
+                event_type=EventType.WORKFLOW_STEP_COMPLETED,
+                workflow_name="maintenance",
+                workflow_attempt_id="attempt-2",
+                workflow_step_id="step-a",
+                limit=1,
+            )
+        )
+        assert [record.event.id for record in workflow_records] == [
+            "workflow-target-1",
+            "workflow-target-2",
+        ]
+
+        await store.append_events(
+            "query_all_b",
+            [
+                Event(
+                    id="workflow-attempt-1",
+                    type="custom.cayu.workflow.attempt",
+                    session_id="query_all_b",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-1"},
+                ),
+                Event(
+                    id="workflow-valid-attempt-1",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="query_all_b",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-1", "step_id": "step-a"},
+                ),
+                Event(
+                    id="workflow-attempt-2",
+                    type="custom.cayu.workflow.attempt",
+                    session_id="query_all_b",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2"},
+                ),
+                Event(
+                    id="workflow-stale-attempt-1",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="query_all_b",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-1", "step_id": "step-a"},
+                ),
+                Event(
+                    id="workflow-valid-attempt-2",
+                    type=EventType.WORKFLOW_STEP_STARTED,
+                    session_id="query_all_b",
+                    workflow_name="maintenance",
+                    payload={"attempt_id": "attempt-2", "step_id": "step-a"},
+                ),
+            ],
+        )
+        fenced_records = await app._query_all_event_records(
+            EventQuery(
+                session_id="query_all_b",
+                event_type=EventType.WORKFLOW_STEP_STARTED,
+                workflow_name="maintenance",
+                workflow_step_id="step-a",
+                workflow_attempt_fenced=True,
+                limit=1,
+            )
+        )
+        assert [record.event.id for record in fenced_records] == [
+            "workflow-valid-attempt-1",
+            "workflow-valid-attempt-2",
+        ]
+
     asyncio.run(run())
 
 

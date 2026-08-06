@@ -522,32 +522,6 @@ def _event_query_session_id_batches(
     ]
 
 
-def _event_query_with_session_ids(
-    query: EventQuery,
-    *,
-    session_ids: tuple[str, ...],
-) -> EventQuery:
-    return EventQuery(
-        session_ids=session_ids,
-        event_id=query.event_id,
-        interaction_id=query.interaction_id,
-        causal_budget_id=query.causal_budget_id,
-        event_type=query.event_type,
-        event_types=query.event_types,
-        exclude_event_types=query.exclude_event_types,
-        agent_name=query.agent_name,
-        environment_name=query.environment_name,
-        workflow_name=query.workflow_name,
-        tool_name=query.tool_name,
-        since=query.since,
-        until=query.until,
-        after_sequence=query.after_sequence,
-        before_sequence=query.before_sequence,
-        limit=query.limit,
-        order_by=query.order_by,
-    )
-
-
 def _event_query_is_single_session(query: EventQuery) -> bool:
     return query.session_id is not None or len(query.session_ids) == 1
 
@@ -11346,7 +11320,10 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 records.extend(
                     await self._query_events(
                         cur,
-                        _event_query_with_session_ids(query, session_ids=batch),
+                        session_store_sql.event_query_with_session_ids(
+                            query,
+                            session_ids=batch,
+                        ),
                         safe_insert_xid=safe_insert_xid,
                         force_snapshot_cutoff=needs_snapshot_cutoff,
                     )

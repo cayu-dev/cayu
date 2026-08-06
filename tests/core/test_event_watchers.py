@@ -26,8 +26,10 @@ from cayu.runtime._event_projection import REDACTED_CUSTOM_EVENT_TYPE, public_ev
 from cayu.runtime.event_watchers import (
     EventWatcherClaim,
     EventWatcherDelivery,
+    EventWatcherRunResult,
     EventWatcherState,
     EventWatcherStore,
+    event_query_after_cursor,
 )
 from cayu.runtime.sessions import EventRecord, SessionIdentity, SessionStore
 from cayu.storage.migrations import SchemaMode
@@ -189,6 +191,36 @@ async def _append_event(
     return event_with_durable_sequence(event, records[0].sequence)
 
 
+async def _bounded_event_watcher_app() -> tuple[
+    str,
+    list[EventRecord],
+    InMemoryEventWatcherStore,
+    CayuApp,
+]:
+    session_id = "bounded-watcher"
+    session_store = InMemorySessionStore()
+    await _create_session(session_store, session_id)
+    for number in (1, 2, 3):
+        await _append_event(
+            session_store,
+            session_id=session_id,
+            payload={"number": number},
+        )
+    records = await session_store.query_events(
+        EventQuery(
+            session_id=session_id,
+            event_type=EventType.BUDGET_LIMIT_REACHED,
+        )
+    )
+    watcher_store = InMemoryEventWatcherStore()
+    app = CayuApp(
+        session_store=session_store,
+        event_watcher_store=watcher_store,
+        enable_logging=False,
+    )
+    return session_id, records, watcher_store, app
+
+
 def _public_id(event: Event) -> str:
     sequence = event_durable_sequence(event)
     assert sequence is not None
@@ -332,6 +364,150 @@ def test_event_watcher_fetches_matching_events_in_batches() -> None:
     assert [delivery.event_id for delivery in results[0].deliveries] == [
         _public_id(event) for event in events
     ]
+
+
+def test_event_watcher_cursor_query_preserves_workflow_filters() -> None:
+    async def run() -> list[str]:
+        session_id = "workflow-watcher"
+        store = InMemorySessionStore()
+        await _create_session(store, session_id)
+        for event_id, interaction_id, step_id in (
+            ("workflow-target-1", "target-interaction", "step-a"),
+            ("workflow-other-interaction", "other-interaction", "step-a"),
+            ("workflow-other-step", "target-interaction", "step-b"),
+            ("workflow-target-2", "target-interaction", "step-a"),
+        ):
+            await store.append_event(
+                session_id,
+                Event(
+                    id=event_id,
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                    workflow_name="maintenance",
+                    payload={
+                        "attempt_id": "attempt-2",
+                        "step_id": step_id,
+                        "label": event_id,
+                    },
+                ),
+            )
+
+        handled: list[str] = []
+
+        async def handler(context: EventWatcherContext) -> None:
+            handled.append(context.record.event.payload["label"])
+
+        app = CayuApp(
+            session_store=store,
+            event_watcher_store=InMemoryEventWatcherStore(),
+            enable_logging=False,
+        )
+        watcher = EventWatcher(
+            name="workflow-step-completed",
+            query=EventQuery(
+                session_id=session_id,
+                interaction_id="target-interaction",
+                event_type=EventType.WORKFLOW_STEP_COMPLETED,
+                workflow_name="maintenance",
+                workflow_attempt_id="attempt-2",
+                workflow_step_id="step-a",
+            ),
+            handler=handler,
+        )
+
+        await app.run_event_watchers([watcher], limit=10)
+        return handled
+
+    assert asyncio.run(run()) == ["workflow-target-1", "workflow-target-2"]
+
+
+def test_event_watcher_cursor_query_preserves_event_id_filter() -> None:
+    async def run() -> list[int]:
+        store = InMemorySessionStore()
+        await _create_session(store)
+        await _append_event(store, payload={"number": 1})
+        target = await _append_event(store, payload={"number": 2})
+        handled: list[int] = []
+
+        app = CayuApp(
+            session_store=store,
+            event_watcher_store=InMemoryEventWatcherStore(),
+            enable_logging=False,
+        )
+        watcher = EventWatcher(
+            name="one-event",
+            query=EventQuery(session_id=target.session_id, event_id=target.id),
+            handler=lambda context: handled.append(context.record.event.payload["number"]),
+        )
+
+        await app.run_event_watchers([watcher], limit=10)
+        return handled
+
+    assert asyncio.run(run()) == [2]
+
+
+def test_event_watcher_preserves_before_sequence_across_cursor_pages(monkeypatch) -> None:
+    import cayu.runtime.app as app_module
+
+    monkeypatch.setattr(app_module, "EVENT_WATCHER_QUERY_PAGE_LIMIT", 1)
+
+    async def run() -> list[int]:
+        session_id, records, _watcher_store, app = await _bounded_event_watcher_app()
+        handled: list[int] = []
+
+        watcher = EventWatcher(
+            name="bounded-budget-events",
+            query=EventQuery(
+                session_id=session_id,
+                event_type=EventType.BUDGET_LIMIT_REACHED,
+                before_sequence=records[2].sequence,
+            ),
+            handler=lambda context: handled.append(context.record.event.payload["number"]),
+            batch_size=3,
+        )
+
+        await app.run_event_watchers([watcher], limit=3)
+        return handled
+
+    assert asyncio.run(run()) == [1, 2]
+
+
+def test_event_watcher_stops_when_existing_cursor_reaches_before_sequence() -> None:
+    async def run() -> tuple[list[int], EventWatcherRunResult]:
+        session_id, records, watcher_store, app = await _bounded_event_watcher_app()
+
+        # Seed the durable state that a pre-repair worker could leave after consuming
+        # the exclusive bound that its reconstructed query dropped.
+        claim = await watcher_store.claim_event(
+            watcher_name="bounded-budget-events",
+            record=records[2],
+            lease_seconds=300,
+        )
+        assert claim is not None
+        await watcher_store.mark_success(claim)
+
+        handled: list[int] = []
+        results = await app.run_event_watchers(
+            [
+                EventWatcher(
+                    name="bounded-budget-events",
+                    query=EventQuery(
+                        session_id=session_id,
+                        event_type=EventType.BUDGET_LIMIT_REACHED,
+                        before_sequence=records[2].sequence,
+                    ),
+                    handler=lambda context: handled.append(context.record.event.payload["number"]),
+                    batch_size=3,
+                )
+            ],
+            limit=3,
+        )
+        return handled, results[0]
+
+    handled, result = asyncio.run(run())
+    assert handled == []
+    assert result.deliveries == []
 
 
 def test_event_watcher_large_batch_uses_capped_event_query_pages() -> None:
@@ -990,6 +1166,11 @@ def test_event_watcher_rejects_cursor_in_query() -> None:
             query=EventQuery(after_sequence=10),
             handler=lambda _context: None,
         )
+
+
+def test_event_watcher_cursor_reconstruction_revalidates_the_new_cursor() -> None:
+    with pytest.raises(ValidationError, match="after_sequence"):
+        event_query_after_cursor(EventQuery(), -1)
 
 
 async def _dead_letter_first_event(app: CayuApp) -> tuple[Event, Event]:
