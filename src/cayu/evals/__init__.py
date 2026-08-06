@@ -100,6 +100,11 @@ from cayu.evals.execution import (
     evaluation_target_identity,
     run_corpus_suite,
 )
+from cayu.evals.execution_comparison import (
+    CorpusComparisonCompatibility,
+    CorpusComparisonReason,
+    corpus_execution_compatibility,
+)
 from cayu.evals.execution_reporting import (
     CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES,
     CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
@@ -263,6 +268,8 @@ __all__ = [
     "ChildSessionCompleted",
     "ChildStatusAssertionSpec",
     "CompiledCorpusSuite",
+    "CorpusComparisonCompatibility",
+    "CorpusComparisonReason",
     "CorpusExecutionLimits",
     "CorpusExecutionResult",
     "CorpusTarget",
@@ -365,6 +372,7 @@ __all__ = [
     "comparison_to_json",
     "compile_assertion_spec",
     "compile_corpus_suite",
+    "corpus_execution_compatibility",
     "corpus_execution_result_from_json",
     "corpus_execution_result_to_json",
     "corpus_from_promotion_candidate",

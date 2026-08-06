@@ -43,6 +43,10 @@ from cayu.evals.execution import (
     evaluation_target_identity,
     run_corpus_suite,
 )
+from cayu.evals.execution_comparison import (
+    CorpusComparisonReason,
+    corpus_execution_compatibility,
+)
 from cayu.evals.execution_reporting import (
     corpus_execution_result_from_json,
     corpus_execution_result_to_json,
@@ -563,6 +567,45 @@ def test_concurrent_corpus_execution_keeps_output_projection_bound_to_each_case(
         "refund-approval": "alpha output",
         "refund-output-beta": "beta output",
     }
+
+
+def test_comparison_compatibility_permits_a_different_release_and_manifest():
+    baseline = asyncio.run(run_corpus_suite(_target(_provider()), _corpus(), "refund-regressions"))
+    changed_target = _target(
+        _provider(),
+        application_release_id="release-2026-08-07",
+    )
+    changed_target.app.register_agent(AgentSpec(name="diagnostic-change", model="fixture-model"))
+    current = CorpusExecutionResult.create(
+        target=evaluation_target_identity(changed_target),
+        run=baseline.run,
+    )
+
+    compatibility = corpus_execution_compatibility(baseline, current)
+
+    assert compatibility.comparable is True
+    assert compatibility.reasons == ()
+    assert baseline.target.application_release_id != current.target.application_release_id
+    assert baseline.target.app_manifest_fingerprint != current.target.app_manifest_fingerprint
+
+
+def test_comparison_compatibility_reports_changed_corpus_and_case_contracts():
+    baseline = asyncio.run(run_corpus_suite(_target(_provider()), _corpus(), "refund-regressions"))
+    current = asyncio.run(
+        run_corpus_suite(
+            _target(_provider()),
+            _corpus(input_text="Refund order 43."),
+            "refund-regressions",
+        )
+    )
+
+    compatibility = corpus_execution_compatibility(baseline, current)
+
+    assert compatibility.comparable is False
+    assert compatibility.reasons == (
+        CorpusComparisonReason.CORPUS_REVISION_MISMATCH,
+        CorpusComparisonReason.CASE_CONTRACT_MISMATCH,
+    )
 
 
 @pytest.mark.parametrize(
