@@ -34,12 +34,16 @@ function candidate() {
   }
 }
 
+function draftFromCandidate(source = candidate()) {
+  return promotionDraftFromCandidate(source, source.revision)
+}
+
 test("candidate projection owns a complete authority-free editable draft", () => {
   const source = candidate()
-  const draft = promotionDraftFromCandidate(source)
+  const draft = draftFromCandidate(source)
 
   assert.deepEqual(draft, {
-    expected_evidence_revision: source.evidence.revision,
+    expected_baseline_revision: source.revision,
     suite: {
       id: "support.regressions",
       name: "Support regressions",
@@ -70,17 +74,17 @@ test("all portable assertion kinds get valid deterministic editor defaults", () 
   assertions.push(createPromotionAssertion("root_status", assertions))
   assert.equal(assertions.at(-1).id, "root_status-2")
 
-  const draft = promotionDraftFromCandidate(candidate())
+  const draft = draftFromCandidate()
   draft.case.assertions = assertions
   assert.deepEqual(validatePromotionDraft(draft), { ok: true, draft })
 })
 
 test("draft validation rejects nonportable placement, duplicate assertions, and lossy counters", () => {
-  const mismatched = promotionDraftFromCandidate(candidate())
+  const mismatched = draftFromCandidate()
   mismatched.case.suite_id = "another-suite"
   assert.match(validatePromotionDraft(mismatched).error, /must match/)
 
-  const duplicate = promotionDraftFromCandidate(candidate())
+  const duplicate = draftFromCandidate()
   duplicate.case.assertions.push({
     id: "session-completed",
     kind: "max_tool_calls",
@@ -88,11 +92,47 @@ test("draft validation rejects nonportable placement, duplicate assertions, and 
   })
   assert.match(validatePromotionDraft(duplicate).error, /duplicated/)
 
-  const lossy = promotionDraftFromCandidate(candidate())
+  const lossy = draftFromCandidate()
   lossy.case.assertions = [
     { id: "tokens", kind: "max_total_tokens", maximum: Number.MAX_SAFE_INTEGER + 1 },
   ]
   assert.match(validatePromotionDraft(lossy).error, /whole number/)
+})
+
+test("draft validation follows portable Unicode and text boundaries", () => {
+  const unicode = draftFromCandidate()
+  unicode.case.input.messages[0].text = "😀".repeat(40_000)
+  assert.deepEqual(validatePromotionDraft(unicode), { ok: true, draft: unicode })
+
+  const blank = draftFromCandidate()
+  blank.case.input.messages[0].text = "   "
+  assert.match(validatePromotionDraft(blank).error, /cannot be blank/)
+
+  blank.case.input.messages[0].text = "\ufeff"
+  assert.deepEqual(validatePromotionDraft(blank), { ok: true, draft: blank })
+
+  const surrogate = draftFromCandidate()
+  surrogate.case.input.messages[0].text = "\ud800"
+  assert.match(validatePromotionDraft(surrogate).error, /Unicode scalar/)
+
+  const nul = draftFromCandidate()
+  nul.case.name = "invalid\0name"
+  assert.match(validatePromotionDraft(nul).error, /NUL/)
+})
+
+test("empty tool order is valid while portable decimal text remains bounded", () => {
+  const noTools = draftFromCandidate()
+  noTools.case.assertions = [{ id: "no-tools", kind: "tools_called_in_order", tool_names: [] }]
+  assert.deepEqual(validatePromotionDraft(noTools), { ok: true, draft: noTools })
+
+  const oversizedDecimal = draftFromCandidate()
+  oversizedDecimal.case.assertions = [
+    { id: "cost", kind: "max_estimated_cost", maximum: "1".repeat(65), currency: "USD" },
+  ]
+  assert.match(validatePromotionDraft(oversizedDecimal).error, /canonical non-negative decimal/)
+
+  oversizedDecimal.case.assertions[0].maximum = "1.0"
+  assert.match(validatePromotionDraft(oversizedDecimal).error, /canonical non-negative decimal/)
 })
 
 test("numeric editor parsing is canonical and bounded", () => {
@@ -104,8 +144,16 @@ test("numeric editor parsing is canonical and bounded", () => {
 
 test("preview equality compares only the complete editable projection", () => {
   const source = candidate()
-  const draft = promotionDraftFromCandidate(source)
-  assert.equal(previewMatchesDraft({ candidate: source, captured_score: {} }, draft), true)
+  const draft = draftFromCandidate(source)
+  const preview = {
+    baseline_revision: source.revision,
+    candidate: source,
+    captured_score: {},
+  }
+  assert.equal(previewMatchesDraft(preview, draft), true)
+  preview.baseline_revision = `sha256:${"9".repeat(64)}`
+  assert.equal(previewMatchesDraft(preview, draft), false)
+  preview.baseline_revision = source.revision
   draft.case.name = "Changed"
   assert.equal(previewMatchesDraft({ candidate: source, captured_score: {} }, draft), false)
 })
@@ -118,10 +166,17 @@ test("promotion API forwards encoded identity, cancellation, and server filename
   globalThis.fetch = async (input, init) => {
     calls.push({ input: String(input), init })
     if (String(input).endsWith("/preview")) {
-      return new Response(JSON.stringify({ candidate: candidate(), captured_score: {} }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      })
+      return new Response(
+        JSON.stringify({
+          baseline_revision: candidate().revision,
+          candidate: candidate(),
+          captured_score: {},
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      )
     }
     return new Response("corpus", {
       status: 200,
@@ -136,7 +191,7 @@ test("promotion API forwards encoded identity, cancellation, and server filename
       "../src/lib/api.ts"
     )
     const controller = new AbortController()
-    const draft = promotionDraftFromCandidate(candidate())
+    const draft = draftFromCandidate()
     await previewEvaluationPromotion("session/one", draft, controller.signal)
     const exported = await exportEvaluationPromotion(
       "session/one",

@@ -46,9 +46,10 @@ export type PromotionDraftValidation =
 
 export function promotionDraftFromCandidate(
   candidate: PromotionCandidateV1,
+  baselineRevision: string,
 ): EvaluationPromotionDraft {
   return structuredClone({
-    expected_evidence_revision: candidate.evidence.revision,
+    expected_baseline_revision: baselineRevision,
     suite: {
       id: candidate.suite.id,
       name: candidate.suite.name,
@@ -70,7 +71,10 @@ export function previewMatchesDraft(
   preview: EvaluationPromotionPreviewResponse,
   draft: EvaluationPromotionDraft,
 ): boolean {
-  return JSON.stringify(promotionDraftFromCandidate(preview.candidate)) === JSON.stringify(draft)
+  return (
+    JSON.stringify(promotionDraftFromCandidate(preview.candidate, preview.baseline_revision)) ===
+    JSON.stringify(draft)
+  )
 }
 
 export function validatePromotionDraft(draft: EvaluationPromotionDraft): PromotionDraftValidation {
@@ -86,7 +90,7 @@ export function validatePromotionDraft(draft: EvaluationPromotionDraft): Promoti
 }
 
 function validateDraft(draft: EvaluationPromotionDraft): void {
-  if (!SHA256_REVISION_PATTERN.test(draft.expected_evidence_revision)) {
+  if (!SHA256_REVISION_PATTERN.test(draft.expected_baseline_revision)) {
     throw new Error("Reload the promotion preview before editing this candidate.")
   }
   requirePortableId(draft.suite.id, "Suite ID")
@@ -111,10 +115,14 @@ function validateDraft(draft: EvaluationPromotionDraft): void {
     if (message.role !== "user") {
       throw new Error(`Input message ${index + 1} must have the user role.`)
     }
-    if (message.text.length > 65_536) {
+    const messageChars = durableTextLength(message.text, `Input message ${index + 1}`)
+    if (isPythonBlank(message.text)) {
+      throw new Error(`Input message ${index + 1} cannot be blank.`)
+    }
+    if (messageChars > 65_536) {
       throw new Error(`Input message ${index + 1} cannot exceed 65,536 characters.`)
     }
-    totalMessageChars += message.text.length
+    totalMessageChars += messageChars
   }
   if (totalMessageChars > 262_144) {
     throw new Error("Eval input cannot exceed 262,144 total characters.")
@@ -144,12 +152,15 @@ function validateAssertion(assertion: PromotionAssertion): void {
       requireRange(assertion.min_count ?? 1, assertion.max_count, "Child count", 500)
       return
     case "final_output_equals":
-      if (assertion.expected.length > 65_536) {
+      if (durableTextLength(assertion.expected, "Expected final output") > 65_536) {
         throw new Error("Expected final output cannot exceed 65,536 characters.")
       }
       return
     case "final_output_contains":
-      if (assertion.expected.length === 0 || assertion.expected.length > 65_536) {
+      if (
+        isPythonBlank(assertion.expected) ||
+        durableTextLength(assertion.expected, "Expected final-output text") > 65_536
+      ) {
         throw new Error("Expected final-output text must contain 1 to 65,536 characters.")
       }
       return
@@ -178,7 +189,10 @@ function validateAssertion(assertion: PromotionAssertion): void {
       requireInteger(assertion.maximum, "Maximum total tokens", 0, MAX_SAFE_COUNTER)
       return
     case "max_estimated_cost":
-      if (!/^(0|[1-9]\d*)(\.\d+)?$/.test(assertion.maximum)) {
+      if (
+        assertion.maximum.length > 64 ||
+        !/^(?:0|[1-9]\d*)(?:\.\d*[1-9])?$/.test(assertion.maximum)
+      ) {
         throw new Error("Maximum estimated cost must be a canonical non-negative decimal.")
       }
       if (!CURRENCY_PATTERN.test(assertion.currency ?? "USD")) {
@@ -281,7 +295,8 @@ function requirePortableId(value: string, label: string): void {
 }
 
 function requireBoundedCleanText(value: string, label: string, maximum: number): void {
-  if (value.length === 0 || value.trim() !== value || value.length > maximum) {
+  const length = durableTextLength(value, label)
+  if (length === 0 || hasPythonOuterWhitespace(value) || length > maximum) {
     throw new Error(`${label} must contain 1 to ${maximum} characters without outer whitespace.`)
   }
 }
@@ -293,4 +308,60 @@ function requireOptionalCleanText(
 ): void {
   if (value === null || value === undefined) return
   requireBoundedCleanText(value, label, maximum)
+}
+
+function durableTextLength(value: string, label: string): number {
+  let length = 0
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index)
+    if (codeUnit === 0) throw new Error(`${label} cannot contain NUL characters.`)
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const trailing = value.charCodeAt(index + 1)
+      if (!(trailing >= 0xdc00 && trailing <= 0xdfff)) {
+        throw new Error(`${label} must contain valid Unicode scalar text.`)
+      }
+      index += 1
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      throw new Error(`${label} must contain valid Unicode scalar text.`)
+    }
+    length += 1
+  }
+  return length
+}
+
+function isPythonBlank(value: string): boolean {
+  for (const character of value) {
+    if (!isPythonWhitespace(character.codePointAt(0) as number)) return false
+  }
+  return true
+}
+
+function hasPythonOuterWhitespace(value: string): boolean {
+  if (value.length === 0) return false
+  const lastIndex =
+    value.charCodeAt(value.length - 1) >= 0xdc00 && value.charCodeAt(value.length - 1) <= 0xdfff
+      ? value.length - 2
+      : value.length - 1
+  return (
+    isPythonWhitespace(value.codePointAt(0) as number) ||
+    isPythonWhitespace(value.codePointAt(lastIndex) as number)
+  )
+}
+
+function isPythonWhitespace(codePoint: number): boolean {
+  // Python's str.strip/isspace set is the portable-model authority. ECMAScript
+  // trim differs for U+0085 and U+FEFF, so do not use it for corpus validation.
+  return (
+    (codePoint >= 0x0009 && codePoint <= 0x000d) ||
+    (codePoint >= 0x001c && codePoint <= 0x0020) ||
+    codePoint === 0x0085 ||
+    codePoint === 0x00a0 ||
+    codePoint === 0x1680 ||
+    (codePoint >= 0x2000 && codePoint <= 0x200a) ||
+    codePoint === 0x2028 ||
+    codePoint === 0x2029 ||
+    codePoint === 0x202f ||
+    codePoint === 0x205f ||
+    codePoint === 0x3000
+  )
 }

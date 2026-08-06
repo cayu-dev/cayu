@@ -25,6 +25,7 @@ import {
   Wrench,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { EvaluationPromotionAction } from "../components/dashboard/evaluation-promotion"
 import { Page, PayloadViewer, StateMessage } from "../components/dashboard/layout"
 import {
   MutationTransportStatus,
@@ -2688,6 +2689,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
                 Artifacts
               </a>
             )}
+            <EvaluationPromotionAction
+              key={`${session.id}:${session.status}`}
+              sessionId={session.id}
+              status={session.status}
+            />
             {canInterrupt && (
               <Button
                 variant="destructive"
