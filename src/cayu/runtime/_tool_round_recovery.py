@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
@@ -10,12 +11,18 @@ from cayu._validation import (
     require_clean_nonblank,
     require_durable_text,
 )
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, copy_event
 from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_results as tool_results
+from cayu.runtime import _transcript as transcript_support
+from cayu.runtime._assistant_tool_round_publication import (
+    AssistantToolRoundPublication,
+    StagedToolCallTerminal,
+)
 from cayu.runtime._checkpoint_redaction import (
     durable_value_contains_secret,
     require_secret_free_durable_object,
@@ -38,6 +45,9 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.tool_policy import ToolPolicyResult
 from cayu.vaults import SecretRedactor, contains_redacted_secret
+
+if TYPE_CHECKING:
+    from cayu.runtime.user_input import PendingUserInput
 
 PENDING_TOOL_ROUND_CHECKPOINT_KEY = "pending_tool_round"
 _TOOL_ROUND_TERMINAL_EVENT_TYPES = frozenset(
@@ -66,6 +76,10 @@ class PendingToolRound(BaseModel):
     policy_context_version: Literal[1] | None = None
     request_metadata: dict[str, Any] = Field(default_factory=dict)
     deferred_messages: list[Message] = Field(default_factory=list)
+    assistant_message_state: Literal["published", "quarantined"] = "published"
+    quarantined_assistant_message: Message | None = None
+    assistant_publication: AssistantToolRoundPublication | None = None
+    staged_terminals: list[StagedToolCallTerminal] = Field(default_factory=list)
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
@@ -141,6 +155,31 @@ class PendingToolRound(BaseModel):
     @classmethod
     def copy_deferred_messages(cls, value: list[Message]) -> list[Message]:
         return [detach_message(message) for message in value]
+
+    @field_validator("quarantined_assistant_message")
+    @classmethod
+    def copy_quarantined_assistant_message(
+        cls,
+        value: Message | None,
+    ) -> Message | None:
+        return None if value is None else detach_message(value)
+
+    @field_validator("staged_terminals")
+    @classmethod
+    def copy_staged_terminals(
+        cls,
+        value: list[StagedToolCallTerminal],
+    ) -> list[StagedToolCallTerminal]:
+        copied = [
+            StagedToolCallTerminal.model_validate(item.model_dump(mode="json")) for item in value
+        ]
+        ids = [item.tool_call_id for item in copied]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Pending tool round cannot repeat staged terminal calls.")
+        event_ids = [item.event.id for item in copied]
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("Pending tool round cannot repeat staged terminal event ids.")
+        return copied
 
     @field_validator("structured_output")
     @classmethod
@@ -237,6 +276,42 @@ class PendingToolRound(BaseModel):
                 raise ValueError("An unplanned pending tool round cannot contain policy authority.")
         elif any(call.policy_evidence is ToolPolicyEvidence.UNPLANNED for call in self.tool_calls):
             raise ValueError("A planned pending tool round cannot contain unplanned calls.")
+        if self.assistant_message_state == "quarantined":
+            if self.quarantined_assistant_message is None:
+                raise ValueError(
+                    "A quarantined pending tool round requires its private assistant message."
+                )
+        elif self.quarantined_assistant_message is not None:
+            raise ValueError(
+                "A published pending tool round cannot retain a quarantined assistant message."
+            )
+        if self.assistant_message_state == "published" and self.assistant_publication is not None:
+            raise ValueError(
+                "A published pending tool round cannot retain assistant publication state."
+            )
+        if self.assistant_publication is not None:
+            expected_ids = {call.tool_call_id for call in self.tool_calls}
+            covered_ids = set(self.assistant_publication.covered_tool_call_ids)
+            if not covered_ids <= expected_ids:
+                raise ValueError("Assistant publication covers a call outside its pending round.")
+            expected_state = "ready" if covered_ids == expected_ids else "pending"
+            if (
+                self.assistant_publication.state != "blocked"
+                and self.assistant_publication.state != expected_state
+            ):
+                raise ValueError("Assistant publication readiness conflicts with call coverage.")
+        expected_ids = {call.tool_call_id for call in self.tool_calls}
+        if any(item.tool_call_id not in expected_ids for item in self.staged_terminals):
+            raise ValueError("Staged terminal evidence names a call outside its pending round.")
+        identity = pending_tool_round_identity(self)
+        calls_by_id = {call.tool_call_id: call for call in self.tool_calls}
+        for item in self.staged_terminals:
+            event = item.event
+            if not identity.matches_payload(event.payload):
+                raise ValueError("Staged terminal evidence has a conflicting round identity.")
+            call = calls_by_id[item.tool_call_id]
+            if event.tool_name != call.tool_name:
+                raise ValueError("Staged terminal evidence has a conflicting tool name.")
         return self
 
 
@@ -248,6 +323,323 @@ def pending_tool_round_identity(pending_round: PendingToolRound) -> ToolRoundIde
         model_step_id=pending_round.model_step_id,
         model_attempt_id=pending_round.model_attempt_id,
     )
+
+
+def ready_assistant_publication_message(pending_round: PendingToolRound) -> Message:
+    """Return positively complete assistant evidence or fence provider continuation."""
+
+    if type(pending_round) is not PendingToolRound:
+        raise TypeError("pending_round must be a PendingToolRound.")
+    publication = pending_round.assistant_publication
+    if publication is None:
+        raise RuntimeError("Quarantined tool round has no durable assistant publication evidence.")
+    if publication.state == "blocked":
+        raise RuntimeError(
+            "Quarantined tool round cannot safely continue with opaque provider state."
+        )
+    if publication.state != "ready" or publication.message is None:
+        raise RuntimeError("Quarantined tool round assistant publication is incomplete.")
+    return detach_message(publication.message)
+
+
+def checkpoint_with_assistant_publication_snapshot(
+    checkpoint: dict[str, Any] | None,
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    tool_call_id: str,
+    redactor: SecretRedactor,
+    unsafe_output: bool,
+) -> dict[str, Any]:
+    """Durably fold one sealed invocation scope into its assistant projection."""
+
+    copied_checkpoint = (
+        {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    )
+    tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
+    pending_round = pending_tool_round_from_checkpoint(copied_checkpoint)
+    if pending_round is not None:
+        if pending_tool_round_identity(pending_round) != copy_tool_round_identity(
+            tool_round_identity
+        ):
+            raise RuntimeError("Assistant publication update targets a different tool round.")
+        if pending_round.assistant_message_state == "published":
+            return copied_checkpoint
+        expected_ids = {call.tool_call_id for call in pending_round.tool_calls}
+        updated_publication = _updated_assistant_publication(
+            _publication_with_legacy_projection(
+                pending_round.assistant_publication,
+                message=pending_round.quarantined_assistant_message,
+                redactor=redactor,
+            ),
+            expected_ids=expected_ids,
+            tool_call_id=tool_call_id,
+            redactor=redactor,
+            unsafe_output=unsafe_output,
+            cover_call=True,
+        )
+        updated_round = pending_round.model_copy(
+            update={"assistant_publication": updated_publication},
+        )
+        updated_round = PendingToolRound.model_validate(updated_round.model_dump(mode="json"))
+        copied_checkpoint[PENDING_TOOL_ROUND_CHECKPOINT_KEY] = updated_round.model_dump(mode="json")
+        return copied_checkpoint
+
+    # User-input pauses move the same round-owned projection into their single
+    # pending checkpoint. Import lazily to keep the schema modules acyclic.
+    from cayu.runtime.user_input import (
+        PENDING_USER_INPUT_CHECKPOINT_KEY,
+        PendingUserInput,
+    )
+
+    pending_input_payload = copied_checkpoint.get(PENDING_USER_INPUT_CHECKPOINT_KEY)
+    if type(pending_input_payload) is not dict:
+        raise RuntimeError("Assistant publication update has no pending tool round.")
+    pending_input = PendingUserInput.model_validate(pending_input_payload)
+    if ToolRoundIdentity(
+        tool_round_id=pending_input.tool_round_id,
+        model_step_id=pending_input.model_step_id,
+        model_attempt_id=pending_input.model_attempt_id,
+    ) != copy_tool_round_identity(tool_round_identity):
+        raise RuntimeError("Assistant publication update targets a different user-input round.")
+    if pending_input.assistant_message_state == "published":
+        return copied_checkpoint
+    expected_ids = {call.tool_call_id for call in pending_input.tool_calls}
+    updated_publication = _updated_assistant_publication(
+        _publication_with_legacy_projection(
+            pending_input.assistant_publication,
+            message=pending_input.quarantined_assistant_message,
+            redactor=redactor,
+        ),
+        expected_ids=expected_ids,
+        tool_call_id=tool_call_id,
+        redactor=redactor,
+        unsafe_output=unsafe_output,
+        cover_call=True,
+    )
+    updated_input = pending_input.model_copy(
+        update={"assistant_publication": updated_publication},
+    )
+    updated_input = PendingUserInput.model_validate(updated_input.model_dump(mode="json"))
+    copied_checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = updated_input.model_dump(mode="json")
+    return copied_checkpoint
+
+
+def checkpoint_with_assistant_publication_redactor(
+    checkpoint: dict[str, Any] | None,
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    tool_call_id: str,
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    """Durably apply a newly resolved secret before returning it to a tool."""
+
+    copied_checkpoint = (
+        {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    )
+    tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
+    pending_round = pending_tool_round_from_checkpoint(copied_checkpoint)
+    if pending_round is not None:
+        if pending_tool_round_identity(pending_round) != copy_tool_round_identity(
+            tool_round_identity
+        ):
+            raise RuntimeError("Assistant publication update targets a different tool round.")
+        if pending_round.assistant_message_state == "published":
+            return copied_checkpoint
+        updated_round = pending_round.model_copy(
+            update={
+                "assistant_publication": _updated_assistant_publication(
+                    _publication_with_legacy_projection(
+                        pending_round.assistant_publication,
+                        message=pending_round.quarantined_assistant_message,
+                        redactor=redactor,
+                    ),
+                    expected_ids={call.tool_call_id for call in pending_round.tool_calls},
+                    tool_call_id=tool_call_id,
+                    redactor=redactor,
+                    unsafe_output=False,
+                    cover_call=False,
+                )
+            },
+        )
+        updated_round = PendingToolRound.model_validate(updated_round.model_dump(mode="json"))
+        copied_checkpoint[PENDING_TOOL_ROUND_CHECKPOINT_KEY] = updated_round.model_dump(mode="json")
+        return copied_checkpoint
+
+    from cayu.runtime.user_input import (
+        PENDING_USER_INPUT_CHECKPOINT_KEY,
+        PendingUserInput,
+    )
+
+    pending_input_payload = copied_checkpoint.get(PENDING_USER_INPUT_CHECKPOINT_KEY)
+    if type(pending_input_payload) is not dict:
+        raise RuntimeError("Assistant publication update has no pending tool round.")
+    pending_input = PendingUserInput.model_validate(pending_input_payload)
+    input_identity = ToolRoundIdentity(
+        tool_round_id=pending_input.tool_round_id,
+        model_step_id=pending_input.model_step_id,
+        model_attempt_id=pending_input.model_attempt_id,
+    )
+    if input_identity != copy_tool_round_identity(tool_round_identity):
+        raise RuntimeError("Assistant publication update targets a different user-input round.")
+    if pending_input.assistant_message_state == "published":
+        return copied_checkpoint
+    updated_input = pending_input.model_copy(
+        update={
+            "assistant_publication": _updated_assistant_publication(
+                _publication_with_legacy_projection(
+                    pending_input.assistant_publication,
+                    message=pending_input.quarantined_assistant_message,
+                    redactor=redactor,
+                ),
+                expected_ids={call.tool_call_id for call in pending_input.tool_calls},
+                tool_call_id=tool_call_id,
+                redactor=redactor,
+                unsafe_output=False,
+                cover_call=False,
+            )
+        },
+    )
+    updated_input = PendingUserInput.model_validate(updated_input.model_dump(mode="json"))
+    copied_checkpoint[PENDING_USER_INPUT_CHECKPOINT_KEY] = updated_input.model_dump(mode="json")
+    return copied_checkpoint
+
+
+def assistant_publication_snapshot_transform(
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    tool_call_id: str,
+    redactor: SecretRedactor,
+    unsafe_output: bool,
+) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
+    """Build one detached store transform for a sealed invocation snapshot."""
+
+    copied_identity = copy_tool_round_identity(tool_round_identity)
+    copied_tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
+    if type(redactor) is not SecretRedactor:
+        raise TypeError("redactor must be a SecretRedactor.")
+    if type(unsafe_output) is not bool:
+        raise TypeError("unsafe_output must be a boolean.")
+
+    def transform(
+        _current_session: Session,
+        current_checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return checkpoint_with_assistant_publication_snapshot(
+            current_checkpoint,
+            tool_round_identity=copied_identity,
+            tool_call_id=copied_tool_call_id,
+            redactor=redactor,
+            unsafe_output=unsafe_output,
+        )
+
+    return transform
+
+
+def assistant_publication_redactor_transform(
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    tool_call_id: str,
+    redactor: SecretRedactor,
+) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
+    """Build a detached transform for one pre-return secret registration."""
+
+    copied_identity = copy_tool_round_identity(tool_round_identity)
+    copied_tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
+    if type(redactor) is not SecretRedactor:
+        raise TypeError("redactor must be a SecretRedactor.")
+
+    def transform(
+        _current_session: Session,
+        current_checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return checkpoint_with_assistant_publication_redactor(
+            current_checkpoint,
+            tool_round_identity=copied_identity,
+            tool_call_id=copied_tool_call_id,
+            redactor=redactor,
+        )
+
+    return transform
+
+
+def _updated_assistant_publication(
+    publication: AssistantToolRoundPublication | None,
+    *,
+    expected_ids: set[str],
+    tool_call_id: str,
+    redactor: SecretRedactor,
+    unsafe_output: bool,
+    cover_call: bool,
+) -> AssistantToolRoundPublication:
+    if tool_call_id not in expected_ids:
+        raise RuntimeError("Assistant publication update targets a call outside its round.")
+    if publication is None:
+        publication = AssistantToolRoundPublication(
+            state="blocked",
+            reason="projection_evidence_unavailable",
+        )
+    covered_ids = list(publication.covered_tool_call_ids)
+    if cover_call and tool_call_id in covered_ids:
+        return publication
+    if cover_call:
+        covered_ids.append(tool_call_id)
+    publication_message = publication.message
+    blocked_reason = publication.reason
+    if publication.state != "blocked":
+        if unsafe_output:
+            publication_message = None
+            blocked_reason = "incomplete_invocation_secret_scope"
+        else:
+            if publication_message is None:
+                raise AssertionError("Publishable assistant projection lost its message.")
+            publication_message = (
+                transcript_support.project_assistant_message_for_tool_round_publication(
+                    publication_message,
+                    redactor=redactor,
+                )
+            )
+            if publication_message is None:
+                blocked_reason = "opaque_provider_state_secret"
+    if blocked_reason is not None:
+        updated_publication = AssistantToolRoundPublication(
+            state="blocked",
+            covered_tool_call_ids=covered_ids,
+            reason=blocked_reason,
+            secret_resolution_scope=publication.secret_resolution_scope,
+        )
+    else:
+        updated_publication = AssistantToolRoundPublication(
+            state="ready" if set(covered_ids) == expected_ids else "pending",
+            message=publication_message,
+            covered_tool_call_ids=covered_ids,
+            secret_resolution_scope=publication.secret_resolution_scope,
+        )
+    return updated_publication
+
+
+def _publication_with_legacy_projection(
+    publication: AssistantToolRoundPublication | None,
+    *,
+    message: Message | None,
+    redactor: SecretRedactor,
+) -> AssistantToolRoundPublication:
+    if publication is not None:
+        return publication
+    if message is None:
+        return AssistantToolRoundPublication(
+            state="blocked",
+            reason="projection_evidence_unavailable",
+        )
+    projected = transcript_support.project_assistant_message_for_tool_round_publication(
+        message,
+        redactor=redactor,
+    )
+    if projected is None:
+        return AssistantToolRoundPublication(
+            state="blocked",
+            reason="opaque_provider_state_secret",
+        )
+    return AssistantToolRoundPublication(state="pending", message=projected)
 
 
 def pending_tool_round_from_checkpoint(
@@ -317,6 +709,9 @@ def checkpoint_with_pending_tool_round(
     policy_context_version: Literal[1] | None = None,
     request_metadata: dict[str, Any] | None = None,
     deferred_messages: list[Message] | None = None,
+    assistant_message_state: Literal["published", "quarantined"] = "published",
+    quarantined_assistant_message: Message | None = None,
+    secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown",
     structured_output: StructuredOutputSpec | None = None,
     thinking: ThinkingConfig | None = None,
     max_steps: int | None = None,
@@ -351,8 +746,26 @@ def checkpoint_with_pending_tool_round(
     )
     if type(durable_request_metadata) is not dict:
         raise AssertionError("Pending tool-round request metadata must remain an object.")
+    assistant_publication = None
+    if assistant_message_state == "quarantined":
+        if quarantined_assistant_message is None:
+            raise ValueError("Quarantined assistant publication requires its private message.")
+        publication_message = (
+            transcript_support.project_assistant_message_for_tool_round_publication(
+                quarantined_assistant_message,
+                redactor=resolved_redactor,
+            )
+        )
+        assistant_publication = AssistantToolRoundPublication(
+            state="blocked" if publication_message is None else "pending",
+            message=publication_message,
+            reason=("opaque_provider_state_secret" if publication_message is None else None),
+            secret_resolution_scope=secret_resolution_scope,
+        )
     pending_round = PendingToolRound(
-        **identity.payload(),
+        tool_round_id=identity.tool_round_id,
+        model_step_id=identity.model_step_id,
+        model_attempt_id=identity.model_attempt_id,
         agent_name=agent_name,
         environment_name=environment_name,
         task_id=task_id,
@@ -374,6 +787,9 @@ def checkpoint_with_pending_tool_round(
             if deferred_messages is None
             else [detach_message(message) for message in deferred_messages]
         ),
+        assistant_message_state=assistant_message_state,
+        quarantined_assistant_message=quarantined_assistant_message,
+        assistant_publication=assistant_publication,
         structured_output=copy_structured_output_spec(structured_output),
         thinking=thinking,
         max_steps=max_steps,
@@ -516,7 +932,251 @@ def recorded_tool_outcomes(
         raise resume_ledger.ToolCallEvidenceConflict(
             "Tool-round recovery evidence contains a call outside the pending tool round."
         )
-    return ledger.outcomes, ledger.started_ids
+    outcomes = dict(ledger.outcomes)
+    pending_by_id = {call.tool_call_id: call for call in pending_round.tool_calls}
+    for staged in _recovery_safe_staged_terminals(pending_round):
+        pending_call = pending_by_id[staged.tool_call_id]
+        staged_outcome = resume_ledger.tool_call_outcome_from_terminal_event(
+            event=staged.event,
+            pending_tool_call=pending_call,
+        )
+        recorded = outcomes.get(staged.tool_call_id)
+        if recorded is not None:
+            if recorded != staged_outcome:
+                raise resume_ledger.ToolCallEvidenceConflict(
+                    "Durable and staged terminal evidence conflict for one tool call."
+                )
+            continue
+        outcomes[staged.tool_call_id] = staged_outcome
+    return outcomes, ledger.started_ids
+
+
+def staged_terminal_events(pending_round: PendingToolRound) -> list[Event]:
+    """Return detached private terminal projections in pending-call order."""
+
+    staged_by_id = {
+        item.tool_call_id: item.event for item in staged_terminal_records(pending_round)
+    }
+    return [
+        copy_event(staged_by_id[call.tool_call_id])
+        for call in pending_round.tool_calls
+        if call.tool_call_id in staged_by_id
+    ]
+
+
+def staged_terminal_records(pending_round: PendingToolRound) -> list[StagedToolCallTerminal]:
+    """Return recovery-safe staged records in pending-call order."""
+
+    staged_by_id = {
+        item.tool_call_id: item for item in _recovery_safe_staged_terminals(pending_round)
+    }
+    return [
+        StagedToolCallTerminal.model_validate(
+            staged_by_id[call.tool_call_id].model_dump(mode="json")
+        )
+        for call in pending_round.tool_calls
+        if call.tool_call_id in staged_by_id
+    ]
+
+
+def checkpoint_staged_terminals(
+    checkpoint: dict[str, Any] | None,
+    *,
+    tool_round_identity: ToolRoundIdentity,
+) -> list[StagedToolCallTerminal]:
+    """Read stages from an ordinary or user-input-owned tool round."""
+
+    _owner_key, owner = _checkpoint_staged_terminal_owner(
+        checkpoint,
+        tool_round_identity=tool_round_identity,
+    )
+    return [
+        StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
+        for item in owner.staged_terminals
+    ]
+
+
+def checkpoint_with_staged_terminals(
+    checkpoint: dict[str, Any] | None,
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    staged_terminals: list[StagedToolCallTerminal],
+) -> dict[str, Any]:
+    """Replace stages on the checkpoint boundary that owns the round."""
+
+    copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+    if type(copied) is not dict:
+        raise AssertionError("Checkpoint copied as a non-object.")
+    owner_key, owner = _checkpoint_staged_terminal_owner(
+        copied,
+        tool_round_identity=tool_round_identity,
+    )
+    copied_stages = [
+        StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
+        for item in staged_terminals
+    ]
+    updated_owner = owner.model_copy(update={"staged_terminals": copied_stages})
+    updated_owner = type(owner).model_validate(updated_owner.model_dump(mode="json"))
+    copied[owner_key] = updated_owner.model_dump(mode="json")
+    return copied
+
+
+def _checkpoint_staged_terminal_owner(
+    checkpoint: dict[str, Any] | None,
+    *,
+    tool_round_identity: ToolRoundIdentity,
+) -> tuple[str, PendingToolRound | PendingUserInput]:
+    identity = copy_tool_round_identity(tool_round_identity)
+    pending_round = pending_tool_round_from_checkpoint(checkpoint)
+    from cayu.runtime.user_input import (
+        PENDING_USER_INPUT_CHECKPOINT_KEY,
+        pending_user_input_from_checkpoint,
+    )
+
+    pending_input = pending_user_input_from_checkpoint(checkpoint)
+    if pending_round is not None and pending_input is not None:
+        raise RuntimeError("Checkpoint has multiple staged-terminal owners.")
+    if pending_round is not None:
+        if pending_tool_round_identity(pending_round) != identity:
+            raise RuntimeError("Staged terminals target a different pending tool round.")
+        return PENDING_TOOL_ROUND_CHECKPOINT_KEY, pending_round
+    if pending_input is not None:
+        input_identity = ToolRoundIdentity(
+            tool_round_id=pending_input.tool_round_id,
+            model_step_id=pending_input.model_step_id,
+            model_attempt_id=pending_input.model_attempt_id,
+        )
+        if input_identity != identity:
+            raise RuntimeError("Staged terminals target a different pending user-input round.")
+        return PENDING_USER_INPUT_CHECKPOINT_KEY, pending_input
+    raise RuntimeError("Staged terminals have no pending tool-round owner.")
+
+
+def completed_staged_terminal_transform(
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    event: Event,
+) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
+    """Record that terminal hooks completed before public event append."""
+
+    return _updated_staged_terminal_transform(
+        tool_round_identity=tool_round_identity,
+        event=event,
+        hooks_state="completed",
+        operation="Hook completion",
+    )
+
+
+def projected_staged_terminal_transform(
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    event: Event,
+) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
+    """Persist a projected terminal without claiming its hooks completed."""
+
+    return _updated_staged_terminal_transform(
+        tool_round_identity=tool_round_identity,
+        event=event,
+        hooks_state="preserve",
+        operation="Projection",
+    )
+
+
+def _updated_staged_terminal_transform(
+    *,
+    tool_round_identity: ToolRoundIdentity,
+    event: Event,
+    hooks_state: Literal["preserve", "completed"],
+    operation: str,
+) -> Callable[[Session, dict[str, Any] | None], dict[str, Any]]:
+    """Replace one owned stage while preserving or completing its hook state."""
+
+    identity = copy_tool_round_identity(tool_round_identity)
+    copied_event = copy_event(event)
+
+    def transform(
+        _session: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        copied = {} if checkpoint is None else copy_durable_json_value(checkpoint, "checkpoint")
+        if type(copied) is not dict:
+            raise AssertionError("Checkpoint copied as a non-object.")
+        existing_stages = checkpoint_staged_terminals(
+            copied,
+            tool_round_identity=identity,
+        )
+        tool_call_id = copied_event.payload.get("tool_call_id")
+        if type(tool_call_id) is not str:
+            raise ValueError(f"{operation} staged terminal lost its tool-call identity.")
+        found = False
+        staged: list[StagedToolCallTerminal] = []
+        for item in existing_stages:
+            if item.tool_call_id != tool_call_id:
+                staged.append(item)
+                continue
+            if item.event.id != copied_event.id:
+                raise RuntimeError(f"{operation} conflicts with staged terminal evidence.")
+            found = True
+            staged.append(
+                StagedToolCallTerminal(
+                    tool_call_id=tool_call_id,
+                    event=copied_event,
+                    hooks_state=(item.hooks_state if hooks_state == "preserve" else "completed"),
+                )
+            )
+        if not found:
+            raise RuntimeError(f"{operation} has no staged terminal owner.")
+        return checkpoint_with_staged_terminals(
+            copied,
+            tool_round_identity=identity,
+            staged_terminals=staged,
+        )
+
+    return transform
+
+
+def _recovery_safe_staged_terminals(
+    pending_round: PendingToolRound,
+) -> list[StagedToolCallTerminal]:
+    publication = pending_round.assistant_publication
+    expected_ids = {call.tool_call_id for call in pending_round.tool_calls}
+    covered_ids = set() if publication is None else set(publication.covered_tool_call_ids)
+    scope = "unknown" if publication is None else publication.secret_resolution_scope
+    if scope == "static" or covered_ids == expected_ids:
+        return [
+            StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
+            for item in pending_round.staged_terminals
+        ]
+    safe: list[StagedToolCallTerminal] = []
+    for item in pending_round.staged_terminals:
+        terminal_controls = tool_results.runtime_terminal_controls(item.event.payload)
+        fixed_result = ToolResult(
+            content="Tool result unavailable because invocation secret scope was incomplete.",
+            structured={
+                "error": "invalid_tool_output",
+                "outcome_unknown": True,
+                **terminal_controls,
+            },
+            is_error=True,
+        )
+        payload = copy_durable_json_value(item.event.payload, "staged_terminal.payload")
+        if type(payload) is not dict:
+            raise AssertionError("Staged terminal payload copied as a non-object.")
+        payload["result"] = fixed_result.model_dump(mode="json")
+        payload["recovered"] = True
+        payload["secret_scope_incomplete"] = True
+        event = item.event.model_copy(
+            update={"type": EventType.TOOL_CALL_FAILED, "payload": payload},
+            deep=True,
+        )
+        safe.append(
+            StagedToolCallTerminal(
+                tool_call_id=item.tool_call_id,
+                event=event,
+                hooks_state="finalized",
+            )
+        )
+    return safe
 
 
 def validate_tool_round_recovery_target(
@@ -610,6 +1270,37 @@ def unknown_recovered_tool_result(
             "outcome_unknown": True,
         },
         is_error=True,
+    )
+
+
+def hook_scope_unavailable_recovery_event(event: Event) -> Event:
+    """Fail closed when restart erased a dynamic round's hook redactor."""
+
+    if type(event) is not Event or event.type not in _TOOL_ROUND_TERMINAL_EVENT_TYPES:
+        raise TypeError("Recovered hook quarantine requires a terminal tool event.")
+    result = ToolResult(
+        content=(
+            "Tool result unavailable because its invocation-secret scope could not "
+            "be reconstructed before recovery hooks."
+        ),
+        structured={
+            "error": "invalid_tool_output",
+            "outcome_unknown": True,
+            "recovered": True,
+            "reason": "recovery_hook_secret_scope_unavailable",
+        },
+        is_error=True,
+    )
+    payload = copy_durable_json_value(event.payload, "recovered_terminal.payload")
+    payload["result"] = result.model_dump(mode="json")
+    payload["recovered"] = True
+    return copy_event(
+        event.model_copy(
+            update={
+                "type": EventType.TOOL_CALL_FAILED,
+                "payload": payload,
+            }
+        )
     )
 
 

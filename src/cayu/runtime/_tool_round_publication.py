@@ -30,6 +30,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _transcript as transcript_support
 from cayu.runtime._event_writer import RuntimeEventWriter
@@ -39,6 +40,7 @@ from cayu.runtime._tool_round_recovery import (
     checkpoint_without_pending_tool_round,
     pending_tool_round_from_checkpoint,
     pending_tool_round_identity,
+    ready_assistant_publication_message,
 )
 from cayu.runtime.sessions import (
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
@@ -176,9 +178,9 @@ def collect_tool_round_publication_evidence(
         if event.type == EventType.TOOL_CALL_STARTED:
             if tool_call_id in started_by_call:
                 raise ValueError(f"Tool call {tool_call_id} has duplicate durable started events.")
-            if not _durable_json_equal(
-                event.payload.get("arguments"),
-                pending_call.arguments,
+            if not tool_argument_publication.started_arguments_match_private_call(
+                event.payload,
+                private_arguments=pending_call.arguments,
             ):
                 raise ValueError(
                     f"Tool call {tool_call_id} started with arguments that conflict "
@@ -536,12 +538,19 @@ def _build_tool_round_publication_request(
         raise AssertionError("Pending tool-round deletion lost its exact marker fence.")
     tool_round_identity = pending_tool_round_identity(copied_pending_round)
     tool_call_ids = [call.tool_call_id for call in copied_pending_round.tool_calls]
-    transcript_messages = transcript_support.tool_result_messages(
+    tool_result_messages = transcript_support.tool_result_messages(
         list(evidence.outcomes),
         tool_round_identity=tool_round_identity,
     )
-    if len(transcript_messages) != 1:
+    if len(tool_result_messages) != 1:
         raise AssertionError("Tool-round transcript construction must return one message.")
+    transcript_messages = tuple(tool_result_messages)
+    if copied_pending_round.assistant_message_state == "quarantined":
+        projected_assistant = transcript_support.assistant_message_with_projected_tool_arguments(
+            ready_assistant_publication_message(copied_pending_round),
+            evidence.outcomes,
+        )
+        transcript_messages = (projected_assistant, *tool_result_messages)
     interaction_ids = {event.interaction_id for event in evidence.lifecycle_events}
     if len(interaction_ids) != 1 or None in interaction_ids:
         raise ValueError(
@@ -560,7 +569,7 @@ def _build_tool_round_publication_request(
             "pending_round_digest": pending_round_digest,
         },
         mutation=mutation,
-        transcript_messages=tuple(transcript_messages),
+        transcript_messages=transcript_messages,
         events=(),
         referenced_events=tuple(
             runtime_publication_event_reference(event) for event in evidence.lifecycle_events

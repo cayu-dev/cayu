@@ -476,6 +476,65 @@ def test_incomplete_recovery_atomically_finalizes_valid_structured_output_round(
     asyncio.run(scenario())
 
 
+def test_incomplete_recovery_accepts_partial_unavailable_terminal_evidence() -> None:
+    async def scenario() -> None:
+        store = InMemorySessionStore()
+        provider = _RecordingProvider()
+        spec = _answer_spec()
+        staged = await _publish_structured_model_step(
+            store,
+            session_id="structured-recovery-partial-terminal",
+            provider_name=provider.name,
+            spec=spec,
+            tool_calls=[
+                _structured_call(
+                    call_id="call-final-partial",
+                    output={"answer": "recovered"},
+                )
+            ],
+        )
+        app = _register_runtime(store, provider)
+        validation = staged.pending_round.structured_output_validation
+        assert validation is not None
+        outcome = structured_output_tool_round._structured_output_tool_round_outcomes(
+            tool_calls=tool_round_recovery.pending_round_tool_calls(staged.pending_round),
+            spec=spec,
+            validation=validation,
+        )[0]
+        terminal_event = structured_output_tool_round._structured_output_tool_terminal_event(
+            session=staged.session,
+            registered_agent=app._agents["assistant"],
+            environment_name=None,
+            tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                staged.pending_round
+            ),
+            outcome=outcome,
+        )
+        terminal_event = terminal_event.model_copy(
+            update={"interaction_id": staged.completion_event.interaction_id}
+        )
+        assert terminal_event.payload["arguments_state"] == "unavailable"
+        assert "arguments" not in terminal_event.payload
+        await app._event_writer.emit(terminal_event)
+        await store.release_run_fence(staged.session.id)
+
+        recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+        )
+        events = await store.load_events(staged.session.id)
+
+        assert IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND in recovery.actions
+        assert [
+            event.type
+            for event in events
+            if event.payload.get("tool_call_id") == "call-final-partial"
+            and event.type in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED}
+        ] == [EventType.TOOL_CALL_COMPLETED]
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
 def test_incomplete_recovery_uses_authoritative_validation_before_redaction() -> None:
     async def scenario() -> None:
         secret = "structured-output-authoritative-secret-12345"

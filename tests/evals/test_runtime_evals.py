@@ -57,6 +57,7 @@ from cayu import (
     Tool,
     ToolArgsContain,
     ToolCalled,
+    ToolCallPart,
     ToolContext,
     ToolNotCalled,
     ToolResult,
@@ -380,6 +381,136 @@ def test_eval_suite_asserts_tool_trajectory():
 
     assert result.status == EvalStatus.PASSED
     assert result.cases[0].trials[0].events_count >= 1
+
+
+def test_tool_args_contain_ignores_matching_historical_transcript_call() -> None:
+    history = Message(
+        role="assistant",
+        content=[
+            ToolCallPart(
+                tool_call_id="historical-call",
+                tool_name="echo",
+                arguments={"text": "expected"},
+            )
+        ],
+    )
+    idempotency_key = "cayu-tool:v1:current-call"
+    started = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="sess_eval",
+        tool_name="echo",
+        payload={
+            "tool_call_id": "current-call",
+            "idempotency_key": idempotency_key,
+            "arguments_state": "quarantined",
+        },
+    )
+    completed = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="sess_eval",
+        tool_name="echo",
+        payload={
+            "tool_call_id": "current-call",
+            "idempotency_key": idempotency_key,
+            "arguments_state": "finalized",
+            "arguments": {"text": "different"},
+        },
+    )
+    result = asyncio.run(
+        ToolArgsContain("echo", {"text": "expected"}).evaluate(
+            _context(events=(started, completed), transcript=(history,))
+        )
+    )
+
+    assert result.passed is False
+    assert result.metadata["actual"] == [{"text": "different"}]
+
+
+@pytest.mark.parametrize(
+    ("arguments_state", "arguments", "expected_passed"),
+    [
+        pytest.param("finalized", {"text": "expected"}, True, id="finalized"),
+        pytest.param("unavailable", None, False, id="unavailable"),
+        pytest.param("quarantined", {"text": "expected"}, False, id="quarantined"),
+        pytest.param("future", {"text": "expected"}, False, id="unknown-future-state"),
+    ],
+)
+def test_tool_args_contain_uses_correlated_terminal_argument_evidence(
+    arguments_state,
+    arguments,
+    expected_passed,
+) -> None:
+    idempotency_key = "cayu-tool:v1:eval-call"
+    started = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="sess_eval",
+        tool_name="echo",
+        payload={
+            "tool_call_id": "current-call",
+            "idempotency_key": idempotency_key,
+            "arguments_state": "quarantined",
+        },
+    )
+    terminal_payload = {
+        "tool_call_id": "current-call",
+        "idempotency_key": idempotency_key,
+        "arguments_state": arguments_state,
+    }
+    if arguments is not None:
+        terminal_payload["arguments"] = arguments
+    terminal = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="sess_eval",
+        tool_name="echo",
+        payload=terminal_payload,
+    )
+
+    result = asyncio.run(
+        ToolArgsContain("echo", {"text": "expected"}).evaluate(_context(events=(started, terminal)))
+    )
+
+    assert result.passed is expected_passed
+    assert result.metadata["actual"] == (arguments if expected_passed else [])
+
+
+def test_tool_args_contain_preserves_legacy_start_event_compatibility() -> None:
+    legacy_start = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="sess_eval",
+        tool_name="echo",
+        payload={
+            "tool_call_id": "legacy-call",
+            "arguments": {"text": "expected"},
+        },
+    )
+
+    result = asyncio.run(
+        ToolArgsContain("echo", {"text": "expected"}).evaluate(_context(events=(legacy_start,)))
+    )
+
+    assert result.passed is True
+    assert result.metadata["actual"] == {"text": "expected"}
+
+
+def test_tool_args_contain_rejects_uncorrelated_finalized_terminal_event() -> None:
+    terminal = Event(
+        type=EventType.TOOL_CALL_COMPLETED,
+        session_id="sess_eval",
+        tool_name="echo",
+        payload={
+            "tool_call_id": "uncorrelated-call",
+            "idempotency_key": "cayu-tool:v1:uncorrelated-call",
+            "arguments_state": "finalized",
+            "arguments": {"text": "expected"},
+        },
+    )
+
+    result = asyncio.run(
+        ToolArgsContain("echo", {"text": "expected"}).evaluate(_context(events=(terminal,)))
+    )
+
+    assert result.passed is False
+    assert result.metadata["actual"] == []
 
 
 def test_eval_json_html_and_compare(tmp_path):

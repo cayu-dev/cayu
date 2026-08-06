@@ -37,7 +37,7 @@ from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.evals import ScriptedModelProvider
 from cayu.runtime import (
     InMemorySessionStore,
-    PendingToolApproval,
+    PendingToolApprovalEventView,
     ResolutionActor,
     ResolutionActorSource,
     RunRequest,
@@ -151,7 +151,7 @@ def _tiered_policy(required_tier: str = "national") -> TieredApprovalPolicy:
 
 
 def _resolve(app: CayuApp, session_id: str, approval_event: Event, **overrides) -> list[Event]:
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = PendingToolApprovalEventView.from_event(approval_event)
     kwargs = {
         "session_id": session_id,
         "approval_id": pending.approval_id,
@@ -184,7 +184,7 @@ def test_tiered_policy_pauses_with_routing_and_allows_on_none() -> None:
 
 def test_routing_carrier_round_trips_through_a_real_pause() -> None:
     _app, _store, tool, approval_event = _paused_app(_tiered_policy(), "sess_biz_roundtrip")
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = PendingToolApprovalEventView.from_event(approval_event)
     routing = business_approval_routing(pending)
     assert routing.required_tier == "national"
     assert routing.chain == CHAIN
@@ -216,7 +216,7 @@ def test_tier_gate_reads_persisted_routing_not_a_caller_claim() -> None:
     app, _store, tool, approval_event = _paused_app(
         _tiered_policy("corporate"), "sess_biz_persisted_routing"
     )
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = PendingToolApprovalEventView.from_event(approval_event)
     assert business_approval_routing(pending).required_tier == "corporate"
 
     for tier in ("area", "national"):
@@ -352,7 +352,7 @@ def test_missing_routing_refuses_loudly() -> None:
     with pytest.raises(BusinessApprovalRoutingMissing, match="no business approval routing"):
         _resolve(app, "sess_biz_unrouted", approval_event)
     # The raw primitive still resolves such approvals.
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = PendingToolApprovalEventView.from_event(approval_event)
 
     async def resolve_raw() -> list[Event]:
         return [
@@ -431,7 +431,7 @@ def test_audit_projects_pending_adapter_and_raw_resolutions() -> None:
 
     # Raw-primitive resolution: the projection exposes the adapter bypass.
     app_raw, store_raw, _tool, approval_event = _paused_app(_tiered_policy(), "sess_audit_raw")
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = PendingToolApprovalEventView.from_event(approval_event)
 
     async def resolve_raw() -> None:
         async for _event in app_raw.resolve_tool_approval(
@@ -471,7 +471,7 @@ def test_audit_projects_exact_ambiguous_acknowledgement_as_blocked() -> None:
     approval.update(reason=None, metadata={}, tool_calls=pending_calls)
     payload["approval"] = approval
     request = original_request.model_copy(update={"payload": payload}, deep=True)
-    pending = PendingToolApproval.from_event(request)
+    pending = PendingToolApprovalEventView.from_event(request)
     blocked = Event(
         type=EventType.TOOL_CALL_BLOCKED,
         session_id=request.session_id,
@@ -540,7 +540,7 @@ def test_audit_rejects_malformed_ambiguous_block() -> None:
         _tiered_policy(),
         "sess_audit_invalid_ambiguous_block",
     )
-    pending = PendingToolApproval.from_event(request)
+    pending = PendingToolApprovalEventView.from_event(request)
     generic_block = Event(
         type=EventType.TOOL_CALL_BLOCKED,
         session_id=request.session_id,
@@ -589,7 +589,7 @@ def test_audit_ignores_ambiguous_sibling_blocks_in_any_event_order() -> None:
     )
     payload["approval"] = approval
     request = original_request.model_copy(update={"payload": payload}, deep=True)
-    pending = PendingToolApproval.from_event(request)
+    pending = PendingToolApprovalEventView.from_event(request)
 
     def blocked(call_id: str, *, event_id: str) -> Event:
         return Event(
@@ -697,7 +697,7 @@ def test_audit_ignores_ambiguous_sibling_of_authoritative_gate_in_any_event_orde
     approval["tool_calls"] = [authoritative_call, ambiguous_sibling]
     payload["approval"] = approval
     request = original_request.model_copy(update={"payload": payload}, deep=True)
-    pending = PendingToolApproval.from_event(request)
+    pending = PendingToolApprovalEventView.from_event(request)
     identity_payload = {
         "model_step_id": pending.model_step_id,
         "model_attempt_id": pending.model_attempt_id,
@@ -916,7 +916,7 @@ def test_lost_resolution_race_surfaces_the_primitives_error() -> None:
     # stream that lost a resolution race fails cleanly — no double resolution.
     session_id = "sess_biz_race"
     app, store, tool, approval_event = _paused_app(_tiered_policy(), session_id)
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = PendingToolApprovalEventView.from_event(approval_event)
 
     async def run() -> None:
         stale = await resolve_business_approval(
@@ -963,7 +963,7 @@ def test_tiered_policy_expiry_flows_to_the_pending_approval() -> None:
     _app, _store, _tool, approval_event = _paused_app(
         policy, "sess_biz_expiry_carrier", clock=lambda: clock["now"]
     )
-    pending = PendingToolApproval.from_event(approval_event)
+    pending = PendingToolApprovalEventView.from_event(approval_event)
     assert pending.expires_at == datetime(2026, 7, 9, 12, 1, tzinfo=UTC)
 
 

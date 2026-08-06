@@ -65,10 +65,12 @@ from cayu.providers import (
 )
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
@@ -352,6 +354,7 @@ from cayu.runtime.usage import (
 from cayu.runtime.user_input import (
     event_with_pending_user_input_authority,
     pending_user_input_from_checkpoint,
+    public_pending_user_input_event_payload,
 )
 from cayu.vaults import (
     SecretRedactor,
@@ -1554,6 +1557,7 @@ def _limit_reached_tool_call_event(
         "reason": "limit_reached",
         "limit": decision.limit.value,
         "result": tool_call_outcome.result.model_dump(),
+        **tool_argument_publication.unavailable_argument_projection().payload_fields(),
         **identity.payload(),
     }
     if approval_id is not None:
@@ -7638,6 +7642,15 @@ class SessionEngine:
                     policy_outcomes=None,
                     policy_context_version=1,
                     request_metadata=request_metadata,
+                    assistant_message_state=(
+                        "quarantined" if publication.defer_assistant_message else "published"
+                    ),
+                    quarantined_assistant_message=(
+                        assistant_message if publication.defer_assistant_message else None
+                    ),
+                    secret_resolution_scope=invocation_secrets.registered_environment_secret_resolution_scope(
+                        registered_environment
+                    ),
                     structured_output=structured_output,
                     thinking=thinking,
                     max_steps=max_steps,
@@ -7669,11 +7682,14 @@ class SessionEngine:
             source_transcript_cursor=(publication.dispatch.stage.source_transcript_cursor),
             transcript_end_cursor=(
                 publication.dispatch.stage.source_transcript_cursor
-                + int(assistant_message is not None)
+                + int(assistant_message is not None and not publication.defer_assistant_message)
             ),
             completion_event_id=publication.completion_event.id,
             classification=classification,
-            assistant_message_published=assistant_message is not None,
+            assistant_message_published=(
+                assistant_message is not None and not publication.defer_assistant_message
+            ),
+            assistant_message_deferred=publication.defer_assistant_message,
             tool_round_id=tool_round_id,
         )
         target_checkpoint[
@@ -7688,7 +7704,11 @@ class SessionEngine:
                 source_checkpoint,
                 target_checkpoint,
             ),
-            transcript_messages=(() if assistant_message is None else (assistant_message,)),
+            transcript_messages=(
+                ()
+                if assistant_message is None or publication.defer_assistant_message
+                else (assistant_message,)
+            ),
             events=(publication.completion_event,),
         )
 
@@ -8024,7 +8044,14 @@ class SessionEngine:
             recovered_structured_retry = False
             recovery_tail_message_count = len(messages_to_append)
             if pending_tool_round_source_transcript_cursor is not None:
-                pending_result_cursor = pending_tool_round_source_transcript_cursor + 1
+                checkpoint = await self.session_store.load_checkpoint(session.id)
+                entrance_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                    checkpoint
+                )
+                pending_result_cursor = pending_tool_round_source_transcript_cursor + int(
+                    entrance_pending_round is None
+                    or entrance_pending_round.assistant_message_state == "published"
+                )
                 if pending_result_cursor > len(messages):
                     raise RuntimeError(
                         "Pending tool round transcript cursor exceeds the resume context."
@@ -8309,8 +8336,6 @@ class SessionEngine:
                 )
                 pending_tool_round = None
 
-                if assistant_message is not None:
-                    messages.append(assistant_message)
                 if tool_calls:
                     if tool_round_identity is None:
                         raise RuntimeError("Tool calls require a tool-round identity.")
@@ -8357,6 +8382,11 @@ class SessionEngine:
                         raise RuntimeError(
                             "Model completion tool calls conflict with its durable pending marker."
                         )
+                if assistant_message is not None and (
+                    pending_tool_round is None
+                    or pending_tool_round.assistant_message_state == "published"
+                ):
+                    messages.append(assistant_message)
                 limit_evaluation = await limit_gate.evaluate_limits(
                     pending_tool_calls=_user_tool_call_count(tool_calls),
                     execution_identity=completed_model_attempt_identity,
@@ -8444,8 +8474,21 @@ class SessionEngine:
                         structured_tool_outcomes,
                         self._secret_redactor,
                     )
+                    structured_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
+                        registered_agent=registered_agent,
+                        tool_calls=tool_calls,
+                    )
                     terminal_events: list[Event] = []
                     for outcome in structured_tool_outcomes:
+                        await self.session_store.transform_checkpoint(
+                            session.id,
+                            tool_round_recovery.assistant_publication_snapshot_transform(
+                                tool_round_identity=tool_round_identity,
+                                tool_call_id=outcome.call.id,
+                                redactor=structured_round_redactor,
+                                unsafe_output=False,
+                            ),
+                        )
                         terminal_event = await self._event_writer.emit(
                             _structured_output_tool_terminal_event(
                                 session=session,
@@ -9030,7 +9073,7 @@ class SessionEngine:
                             "model_step_id": exc.pending.model_step_id,
                             "model_attempt_id": exc.pending.model_attempt_id,
                             "tool_round_id": exc.pending.tool_round_id,
-                            "user_input": exc.pending.model_dump(mode="json"),
+                            "user_input": public_pending_user_input_event_payload(exc.pending),
                         },
                     ),
                     exc.pending,
@@ -9942,9 +9985,17 @@ class SessionEngine:
                 if deferred_messages is None
                 else [detach_message(message) for message in deferred_messages]
             )
+            # The existing transcript may be a legacy, pre-quarantine assistant
+            # message. Validate that boundary against the private durable pause
+            # descriptor, not against terminal outcomes whose argument projection
+            # can intentionally be unavailable.
             expected_tool_calls = [
-                *tool_calls,
-                *(outcome.call for outcome in completed_tool_outcomes),
+                runtime_records.ToolCallRequest(
+                    id=call.tool_call_id,
+                    name=call.tool_name,
+                    arguments=call.arguments,
+                )
+                for call in pending_approval_to_clear.tool_calls
             ]
             if await transcript_helpers.tool_round_has_result_messages(
                 self.session_store,
@@ -10030,7 +10081,23 @@ class SessionEngine:
             skipped_outcomes,
             self._secret_redactor,
         )
+        base_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
         for skipped_outcome in skipped_outcomes:
+            await self.session_store.transform_checkpoint(
+                session.id,
+                lambda _current_session, current_checkpoint, call_id=skipped_outcome.call.id: (
+                    tool_round_recovery.checkpoint_with_assistant_publication_snapshot(
+                        current_checkpoint,
+                        tool_round_identity=tool_round_identity,
+                        tool_call_id=call_id,
+                        redactor=base_round_redactor,
+                        unsafe_output=False,
+                    )
+                ),
+            )
             yield await self._event_writer.emit(
                 _limit_reached_tool_call_event(
                     session=session,
@@ -10116,7 +10183,23 @@ class SessionEngine:
             skipped_outcomes,
             self._secret_redactor,
         )
+        base_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
         for skipped_outcome in skipped_outcomes:
+            await self.session_store.transform_checkpoint(
+                session.id,
+                lambda _current_session, current_checkpoint, call_id=skipped_outcome.call.id: (
+                    tool_round_recovery.checkpoint_with_assistant_publication_snapshot(
+                        current_checkpoint,
+                        tool_round_identity=tool_round_identity,
+                        tool_call_id=call_id,
+                        redactor=base_round_redactor,
+                        unsafe_output=False,
+                    )
+                ),
+            )
             yield await self._event_writer.emit(
                 _limit_reached_tool_call_event(
                     session=session,
@@ -10128,6 +10211,17 @@ class SessionEngine:
                     approval_id=pending_approval_to_clear.approval_id,
                 )
             )
+        skipped_outcomes = [
+            runtime_records.ToolCallOutcome(
+                call=runtime_records.ToolCallRequest(
+                    id=outcome.call.id,
+                    name=outcome.call.name,
+                    arguments={},
+                ),
+                result=outcome.result,
+            )
+            for outcome in skipped_outcomes
+        ]
         source_checkpoint = await self.session_store.load_checkpoint(session.id)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
             source_checkpoint,
@@ -10151,6 +10245,14 @@ class SessionEngine:
             tool_round_identity=tool_round_identity,
         )
         transcript_messages = list(tool_result_messages)
+        if pending_round.assistant_message_state == "quarantined":
+            transcript_messages.insert(
+                0,
+                transcript_helpers.assistant_message_with_projected_tool_arguments(
+                    tool_round_recovery.ready_assistant_publication_message(pending_round),
+                    [*completed_tool_outcomes, *skipped_outcomes],
+                ),
+            )
         target_checkpoint = approval_support.checkpoint_without_exact_pending_approval_round(
             source_checkpoint,
             approval=pending_approval_to_clear,

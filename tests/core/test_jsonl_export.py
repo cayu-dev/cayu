@@ -104,7 +104,7 @@ def test_export_sessions_writes_one_line_per_session_with_nested_state():
         assert len(rich["transcript_records"]) == 1
         assert rich["transcript_records"][0]["message"]["role"] == "assistant"
         assert rich["checkpoint"] == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
             "step": 3,
         }
 
@@ -430,7 +430,7 @@ def test_import_sessions_round_trips_export():
         assert rich.events == await store.load_events("sess_rich")
         assert rich.transcript == await store.load_transcript("sess_rich")
         assert rich.checkpoint == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
             "step": 3,
         }
         assert rich.deferred_interaction_input is None
@@ -458,14 +458,14 @@ def test_session_export_and_import_reject_future_root_checkpoint_versions() -> N
         await store.checkpoint(
             "sess_future_export",
             {
-                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                CHECKPOINT_SCHEMA_VERSION_KEY: 3,
                 "private": "must-not-appear",
             },
         )
         stream = io.StringIO()
         with pytest.raises(CheckpointCompatibilityError) as caught:
             await export_sessions(store, stream=stream)
-        assert caught.value.observed_version == 2
+        assert caught.value.observed_version == 3
         assert "must-not-appear" not in str(caught.value)
         assert stream.getvalue() == ""
 
@@ -474,13 +474,13 @@ def test_session_export_and_import_reject_future_root_checkpoint_versions() -> N
         return stream.getvalue()
 
     record = _lines(io.StringIO(asyncio.run(build_export())))[0]
-    record["checkpoint"][CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+    record["checkpoint"][CHECKPOINT_SCHEMA_VERSION_KEY] = 3
     record["checkpoint"]["private"] = "must-not-appear"
 
     with pytest.raises(CheckpointCompatibilityError) as caught:
         list(import_sessions([json.dumps(record)]))
 
-    assert caught.value.observed_version == 2
+    assert caught.value.observed_version == 3
     assert "must-not-appear" not in str(caught.value)
 
 

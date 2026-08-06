@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import pytest
 from pydantic import SecretStr, ValidationError
+from tests.core._workload_secret_support import FakeProvider
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_engine as session_engine_module
@@ -60,6 +61,7 @@ from cayu.runtime import (
     ModelCompactor,
     ModelCompletionStageRequest,
     PendingToolApproval,
+    PendingToolApprovalEventView,
     PersistedEventSideEffectClaimLost,
     PersistedEventSideEffectStatus,
     PublicAuthorityAliasCodec,
@@ -152,7 +154,7 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.usage import UsageMetrics
 from cayu.storage.jsonl_export import export_sessions, import_sessions
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
 
 _POSTGRES_TABLES = (
     "cayu_public_authority_aliases",
@@ -334,7 +336,27 @@ async def _pending_approval_for_public_event(
     store: SessionStore,
     event: Event,
 ) -> PendingToolApproval:
-    return PendingToolApproval.from_event(await _private_event_for_public_event(store, event))
+    event_approval = PendingToolApprovalEventView.from_event(
+        await _private_event_for_public_event(store, event)
+    )
+    checkpoint_approval = approval_support.pending_approval_from_checkpoint(
+        await store.load_checkpoint(event.session_id)
+    )
+    assert checkpoint_approval is not None
+    assert (
+        event_approval.approval_id,
+        event_approval.tool_call_id,
+        event_approval.model_step_id,
+        event_approval.model_attempt_id,
+        event_approval.tool_round_id,
+    ) == (
+        checkpoint_approval.approval_id,
+        checkpoint_approval.tool_call_id,
+        checkpoint_approval.model_step_id,
+        checkpoint_approval.model_attempt_id,
+        checkpoint_approval.tool_round_id,
+    )
+    return checkpoint_approval
 
 
 def _summary_with_existing(request: CompactionRequest, summary: str) -> str:
@@ -790,7 +812,7 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                 assert session.status == status
                 assert session.run_epoch == original_epochs[session_id] + 2
                 assert [record.event.type for record in records] == [expected_type]
-                assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+                assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
             class CompleteThenBlockProvider(ModelProvider):
                 name = "fake"
@@ -916,6 +938,81 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
         finally:
             await _close_store(store)
 
+    asyncio.run(run())
+
+
+def test_session_store_conformance_quarantines_late_secret_tool_arguments(
+    session_store_case,
+) -> None:
+    class ResolveLateSecretTool(Tool):
+        spec = ToolSpec(
+            name="resolve_late_secret",
+            description="Resolve one late invocation secret.",
+            input_schema={"type": "object", "additionalProperties": True},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+            assert args["provided"] == secret
+            assert ctx.vault is not None
+            await ctx.vault.resolve(SecretRef(name="api_key"))
+            return ToolResult(content="done")
+
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            provider = FakeProvider(
+                [
+                    [
+                        ModelStreamEvent.tool_call(
+                            id="call_late_secret",
+                            name="resolve_late_secret",
+                            arguments={"provided": secret, secret: {"nested": secret}},
+                        ),
+                        ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                    ],
+                    [
+                        ModelStreamEvent.text_delta("done"),
+                        ModelStreamEvent.completed({"finish_reason": "stop"}),
+                    ],
+                ]
+            )
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_environment(
+                Environment(
+                    EnvironmentSpec(name="local"),
+                    vault=StaticVault({"api_key": secret}),
+                ),
+                default=True,
+            )
+            app.register_agent(
+                AgentSpec(name="assistant", model="fake-model"),
+                tools=[ResolveLateSecretTool()],
+            )
+            events = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        agent_name="assistant",
+                        session_id="late-secret-store-conformance",
+                        messages=[Message.text("user", "run")],
+                    )
+                )
+            ]
+
+            durable_events = await store.load_events("late-secret-store-conformance")
+            started = next(
+                event for event in durable_events if event.type is EventType.TOOL_CALL_STARTED
+            )
+            assert started.payload["arguments_state"] == "quarantined"
+            assert "arguments" not in started.payload
+            assert secret not in repr(events)
+            assert secret not in repr(await store.load_transcript("late-secret-store-conformance"))
+            assert secret not in repr(provider.requests[1].messages)
+        finally:
+            await _close_store(store)
+
+    secret = "late-store-tool-start-secret-canary"
     asyncio.run(run())
 
 
@@ -1054,7 +1151,7 @@ def test_session_store_conformance_repairs_pre_boundary_resume_failure(
                 EventType.SESSION_FAILED,
             ]
             assert records[-1].event.payload["session_run_operation_id"] == operation_id
-            assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+            assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
         finally:
             await _close_store(store)
 
@@ -9054,6 +9151,7 @@ def test_session_store_conformance_model_completion_stage_recovers_lost_acknowle
             assert await store.load_events(session_id) == list(publication.events)
 
             store = await _reopen_store(session_store_case, store)
+
             promotion_replay = await store.promote_model_completion_stage(
                 session_id,
                 stage_id=stage_id,
@@ -10683,7 +10781,7 @@ def test_session_store_conformance_rejects_future_checkpoint_before_operation_lo
             await store.checkpoint(
                 created.id,
                 {
-                    CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
                     "private_checkpoint_detail": "must-not-be-reported",
                 },
             )
@@ -11995,7 +12093,7 @@ def test_session_store_conformance_rejects_future_checkpoint_before_marker_proje
             await store.checkpoint(
                 session_id,
                 {
-                    CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
                     "pending_interruption_cascade": {
                         "attempt_id": "must-not-be-interpreted",
                     },
@@ -12278,7 +12376,7 @@ def test_session_store_conformance_create_atomically_claims_and_admits_first_int
             assert deferred.source_messages == []
             checkpoint = await store.load_checkpoint(session.id)
             assert checkpoint == {
-                CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
                 "initial_transcript_pending": {
                     "version": 1,
                     "interaction_id": "interaction-atomic-create",
@@ -12384,7 +12482,7 @@ def test_session_store_conformance_initial_transcript_publication_clears_authori
             )
 
             store = await _reopen_store(session_store_case, store)
-            assert await store.load_checkpoint(session.id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+            assert await store.load_checkpoint(session.id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
             transcript = await store.query_transcript(
                 TranscriptQuery(session_id=session.id, limit=10)
             )
@@ -12422,7 +12520,7 @@ def test_session_store_conformance_rejects_future_checkpoint_before_initial_tran
             )
             checkpoint = await store.load_checkpoint(session.id)
             assert checkpoint is not None
-            checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+            checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
             checkpoint["private_checkpoint_detail"] = "must-not-be-reported"
             await store.checkpoint(session.id, checkpoint)
 

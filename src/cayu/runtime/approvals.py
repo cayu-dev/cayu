@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
@@ -15,6 +15,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType
 from cayu.core.thinking import ThinkingConfig
 from cayu.runtime._policy_evidence import ToolPolicyEvidence
+from cayu.runtime._tool_argument_publication import pause_checkpoint_validation_view
 from cayu.runtime.budgets import BudgetLimit, copy_budget_limits, copy_request_budget_limits
 from cayu.runtime.execution_units import ToolRoundIdentity
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
@@ -411,6 +412,7 @@ class PendingToolApproval(BaseModel):
     environment_name: str | None = None
     workspace_id: str | None = None
     task_id: str | None = None
+    secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown"
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     tool_calls: list[PendingToolCallApproval]
@@ -433,37 +435,18 @@ class PendingToolApproval(BaseModel):
 
     @classmethod
     def from_event(cls, event: Event) -> PendingToolApproval:
-        """Build a ``PendingToolApproval`` from a ``tool.call.approval_requested`` event.
+        """Parse a legacy approval event that retains complete arguments.
 
-        The complete approval remains nested under ``"approval"`` while its
-        lookup and execution-unit identities are repeated as first-class fields.
-        Both representations must agree.
+        Current quarantined events must be parsed as
+        :class:`PendingToolApprovalEventView`; they cannot produce executable
+        checkpoint state with fabricated empty arguments.
         """
-        if event.type != EventType.TOOL_CALL_APPROVAL_REQUESTED:
+        pending, arguments_quarantined = _validated_pending_tool_approval_event(event)
+        if arguments_quarantined:
             raise ValueError(
-                "PendingToolApproval.from_event expects a "
-                f"{EventType.TOOL_CALL_APPROVAL_REQUESTED.value} event, got {str(event.type)!r}."
+                "Approval-request event arguments are quarantined; parse it as a "
+                "PendingToolApprovalEventView."
             )
-        approval = (event.payload or {}).get("approval")
-        if not isinstance(approval, dict):
-            raise ValueError(
-                "Event payload has no 'approval' object; expected a "
-                "tool.call.approval_requested event payload."
-            )
-        pending = cls.model_validate(approval)
-        expected = {
-            "approval_id": pending.approval_id,
-            "tool_call_id": pending.tool_call_id,
-            "model_step_id": pending.model_step_id,
-            "model_attempt_id": pending.model_attempt_id,
-            "tool_round_id": pending.tool_round_id,
-        }
-        if any(event.payload.get(key) != value for key, value in expected.items()):
-            raise ValueError("Approval-request event identity does not match its nested approval.")
-        pending_tool_call_for_approval_event(
-            event=event,
-            approval=pending,
-        )
         return pending
 
     @field_validator("approval_id", "tool_call_id", "tool_name", "agent_name")
@@ -549,7 +532,135 @@ class PendingToolApproval(BaseModel):
         return copy_retry_policy(value)
 
 
-_PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS = tuple(PendingToolApproval.model_fields)
+class PendingToolCallApprovalEventView(BaseModel):
+    """Non-executable projection of one call in an approval event."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    tool_call_id: str
+    tool_name: str
+    arguments_state: Literal["finalized", "quarantined"]
+    arguments: dict[str, Any] | None
+    policy_evidence: ToolPolicyEvidence | None = None
+    policy_decision: str | None = None
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    active_taint_labels: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_argument_projection(self) -> PendingToolCallApprovalEventView:
+        if (self.arguments_state == "quarantined") != (self.arguments is None):
+            raise ValueError(
+                "Quarantined approval-event arguments must be unavailable, and finalized "
+                "arguments must be an object."
+            )
+        return self
+
+
+class PendingToolApprovalEventView(BaseModel):
+    """Typed approval-event projection with explicit argument availability."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    approval_id: str
+    tool_round_id: str
+    model_step_id: str
+    model_attempt_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments_state: Literal["finalized", "quarantined"]
+    arguments: dict[str, Any] | None
+    agent_name: str
+    environment_name: str | None = None
+    workspace_id: str | None = None
+    task_id: str | None = None
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    tool_calls: list[PendingToolCallApprovalEventView]
+    structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
+    max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
+    limits: RunLimits | None = None
+    budget_limits: tuple[BudgetLimit, ...] | None = None
+    retry_policy: RetryPolicy | None = None
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_argument_projection(self) -> PendingToolApprovalEventView:
+        if (self.arguments_state == "quarantined") != (self.arguments is None):
+            raise ValueError(
+                "Quarantined approval-event arguments must be unavailable, and finalized "
+                "arguments must be an object."
+            )
+        if any(call.arguments_state != self.arguments_state for call in self.tool_calls):
+            raise ValueError("Approval-event argument states must agree across the tool round.")
+        gating_calls = [call for call in self.tool_calls if call.tool_call_id == self.tool_call_id]
+        if len(gating_calls) != 1:
+            raise ValueError(
+                "Pending approval event must identify exactly one call in its tool round."
+            )
+        gating_call = gating_calls[0]
+        if gating_call.tool_name != self.tool_name or gating_call.arguments != self.arguments:
+            raise ValueError(
+                "Pending approval event call details do not match its tool-round record."
+            )
+        return self
+
+    @classmethod
+    def from_event(cls, event: Event) -> PendingToolApprovalEventView:
+        """Parse a complete legacy or quarantined current approval event."""
+
+        pending, arguments_quarantined = _validated_pending_tool_approval_event(event)
+        state: Literal["finalized", "quarantined"] = (
+            "quarantined" if arguments_quarantined else "finalized"
+        )
+        payload = pending.model_dump(mode="python")
+        payload.pop("secret_resolution_scope", None)
+        payload["arguments_state"] = state
+        payload["arguments"] = None if arguments_quarantined else pending.arguments
+        payload["tool_calls"] = [
+            {
+                **call.model_dump(mode="python"),
+                "arguments_state": state,
+                "arguments": None if arguments_quarantined else call.arguments,
+            }
+            for call in pending.tool_calls
+        ]
+        return cls.model_validate(payload)
+
+
+def _validated_pending_tool_approval_event(
+    event: Event,
+) -> tuple[PendingToolApproval, bool]:
+    """Validate event identity while keeping quarantine state explicit."""
+
+    if event.type != EventType.TOOL_CALL_APPROVAL_REQUESTED:
+        raise ValueError(
+            "Pending approval event parsing expects a "
+            f"{EventType.TOOL_CALL_APPROVAL_REQUESTED.value} event, got {str(event.type)!r}."
+        )
+    approval = (event.payload or {}).get("approval")
+    if not isinstance(approval, dict):
+        raise ValueError(
+            "Event payload has no 'approval' object; expected a "
+            "tool.call.approval_requested event payload."
+        )
+    validation_view, arguments_quarantined = pause_checkpoint_validation_view(approval)
+    pending = PendingToolApproval.model_validate(validation_view)
+    expected = {
+        "approval_id": pending.approval_id,
+        "tool_call_id": pending.tool_call_id,
+        "model_step_id": pending.model_step_id,
+        "model_attempt_id": pending.model_attempt_id,
+        "tool_round_id": pending.tool_round_id,
+    }
+    if any(event.payload.get(key) != value for key, value in expected.items()):
+        raise ValueError("Approval-request event identity does not match its nested approval.")
+    pending_tool_call_for_approval_event(event=event, approval=pending)
+    return pending, arguments_quarantined
+
+
+_PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS = tuple(PendingToolApprovalEventView.model_fields)
 
 
 def _copy_approval_resume_fields(
@@ -624,6 +735,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         environment_name=approval.environment_name,
         workspace_id=approval.workspace_id,
         task_id=approval.task_id,
+        secret_resolution_scope=approval.secret_resolution_scope,
         reason=approval.reason,
         metadata=copy_durable_json_value(approval.metadata, "metadata"),
         tool_calls=[copy_pending_tool_call_approval(call) for call in approval.tool_calls],
@@ -661,8 +773,8 @@ def copy_pending_tool_call_approval(
 def pending_tool_call_for_approval_event(
     *,
     event: Event,
-    approval: PendingToolApproval,
-) -> PendingToolCallApproval:
+    approval: PendingToolApproval | PendingToolApprovalEventView,
+) -> PendingToolCallApproval | PendingToolCallApprovalEventView:
     """Return the exact pending call described by one approval lifecycle event."""
 
     tool_call_id = event.payload.get("tool_call_id")

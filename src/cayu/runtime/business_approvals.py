@@ -46,6 +46,7 @@ from cayu.core.events import Event, EventType
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime.approvals import (
     PendingToolApproval,
+    PendingToolApprovalEventView,
     ResolutionActor,
     ToolApprovalDecision,
     ToolApprovalRequest,
@@ -245,14 +246,16 @@ class TieredApprovalPolicy(ToolPolicy):
         )
 
 
-def business_approval_routing(pending: PendingToolApproval) -> BusinessApprovalRouting:
+def business_approval_routing(
+    pending: PendingToolApproval | PendingToolApprovalEventView,
+) -> BusinessApprovalRouting:
     """Read the routing carrier off a pending approval.
 
     Raises ``BusinessApprovalRoutingMissing`` when the pause was created
     without the carrier or the carrier is malformed — the tier gate never
     silently degrades into an ungated resolve.
     """
-    if type(pending) is not PendingToolApproval:
+    if type(pending) not in {PendingToolApproval, PendingToolApprovalEventView}:
         raise TypeError("Business approval routing requires a PendingToolApproval.")
     value = pending.metadata.get(BUSINESS_APPROVAL_ROUTING_METADATA_KEY)
     if value is None:
@@ -477,7 +480,7 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
     """
     materialized = list(events)
     records: dict[tuple[str, str], dict[str, Any]] = {}
-    pending_by_key: dict[tuple[str, str], PendingToolApproval] = {}
+    pending_by_key: dict[tuple[str, str], PendingToolApprovalEventView] = {}
     identities: dict[tuple[str, str], ToolRoundIdentity] = {}
     contradictory_request_keys: set[tuple[str, str]] = set()
     resolution_context_descriptors: dict[tuple[str, str], dict[str, Any]] = {}
@@ -488,7 +491,7 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
         if event.type != EventType.TOOL_CALL_APPROVAL_REQUESTED:
             continue
         try:
-            pending = PendingToolApproval.from_event(event)
+            pending = PendingToolApprovalEventView.from_event(event)
         except (TypeError, ValueError):
             for approval_id in _approval_request_candidate_ids(event):
                 record_key = (event.session_id, approval_id)

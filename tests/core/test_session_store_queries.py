@@ -20,6 +20,7 @@ from cayu import (
 )
 from cayu.core import Event, EventType, Message, ThinkingPart, ToolCallPart
 from cayu.runtime import (
+    EventRecord,
     ForkSessionRequest,
     InMemorySessionStore,
     RunRequest,
@@ -31,9 +32,12 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
 )
+from cayu.runtime import _resume_ledger as resume_ledger
+from cayu.runtime.approvals import PendingToolCallApproval
 from cayu.runtime.pending_actions import (
     pending_action_event_storage_values,
     pending_action_lookup_key,
+    project_pending_action_event_record,
 )
 from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
@@ -69,6 +73,7 @@ def _pending_approval_payload(
     tool_call_id: str,
     arguments: dict | None = None,
     reason: str | None = None,
+    secret_resolution_scope: str = "unknown",
 ) -> dict:
     effective_arguments = {} if arguments is None else arguments
     return {
@@ -78,6 +83,7 @@ def _pending_approval_payload(
         "tool_name": "deploy",
         "arguments": effective_arguments,
         "agent_name": "assistant",
+        "secret_resolution_scope": secret_resolution_scope,
         "reason": reason,
         "tool_calls": [
             {
@@ -101,12 +107,14 @@ def _approval_request_event(
     tool_call_id: str,
     arguments: dict | None = None,
     reason: str | None = None,
+    secret_resolution_scope: str = "unknown",
 ) -> Event:
     approval = _pending_approval_payload(
         approval_id=approval_id,
         tool_call_id=tool_call_id,
         arguments=arguments,
         reason=reason,
+        secret_resolution_scope=secret_resolution_scope,
     )
     return Event(
         id=event_id,
@@ -273,6 +281,48 @@ def test_pending_approval_projection_retains_direct_execution_identity() -> None
     }
 
 
+def test_pending_tool_start_projection_retains_quarantined_argument_evidence() -> None:
+    identity = _tool_round_identity_payload()
+    started = Event(
+        type=EventType.TOOL_CALL_STARTED,
+        session_id="pending_quarantined_start",
+        tool_name="deploy",
+        payload={
+            **identity,
+            "tool_call_id": "call_1",
+            "arguments_state": "quarantined",
+        },
+    )
+
+    projected = project_pending_action_event_record(EventRecord(sequence=1, event=started)).event
+    ledger = resume_ledger.scan_projected_tool_call_evidence(
+        events=[projected],
+        pending_calls=[
+            PendingToolCallApproval(
+                tool_call_id="call_1",
+                tool_name="deploy",
+                arguments={"secret_bearing": "private"},
+            )
+        ],
+        in_scope=lambda event: all(
+            event.payload.get(key) == value for key, value in identity.items()
+        ),
+        terminal_event_types=frozenset(
+            {
+                EventType.TOOL_CALL_COMPLETED,
+                EventType.TOOL_CALL_FAILED,
+                EventType.TOOL_CALL_BLOCKED,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+            }
+        ),
+        terminal_result_is_valid=lambda event: False,
+    )
+
+    assert projected.payload["arguments_state"] == "quarantined"
+    assert ledger.started_ids == {"call_1"}
+    assert ledger.conflicting_ids == set()
+
+
 @pytest.mark.parametrize(
     ("pause_key", "pause_id"),
     [
@@ -344,6 +394,7 @@ def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
                         tool_call_id="bounded_call",
                         arguments={"blob": "x" * 4096},
                         reason="latest request",
+                        secret_resolution_scope="static",
                     ),
                 )
             await store.checkpoint(
@@ -354,6 +405,7 @@ def test_pending_action_queries_use_latest_matching_event_and_bound_bytes(
                         tool_call_id="bounded_call",
                         arguments={"blob": "x" * 4096},
                         reason="latest request",
+                        secret_resolution_scope="static",
                     )
                 },
             )

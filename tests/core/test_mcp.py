@@ -513,7 +513,7 @@ def test_runtime_composes_mcp_session_secrets_before_durable_tool_checkpoint() -
 
     assert events[-1].type == EventType.SESSION_FAILED
     assert calls == 0
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
     assert secret not in serialized
 
 

@@ -28,6 +28,7 @@ from cayu.core.tools import (
 )
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.providers.base import ModelFinishReason
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime._tool_identity import tool_idempotency_key
 from cayu.runtime.model_steps import StepClassificationType
@@ -134,6 +135,14 @@ _TOOL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_APPROVAL_EXPIRED,
     }
 )
+_TERMINAL_TOOL_ARGUMENT_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+)
 _INTERACTION_STATUS_BY_EVENT = {
     EventType.INTERACTION_STARTED: "active",
     EventType.INTERACTION_RESUMED: "active",
@@ -230,6 +239,31 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     EventType,
     Mapping[tuple[str, ...], frozenset[Any]],
 ] = {
+    EventType.TOOL_CALL_STARTED: {
+        ("arguments_state",): frozenset({"quarantined"}),
+    },
+    EventType.TOOL_CALL_APPROVAL_REQUESTED: {
+        ("approval", "arguments_state"): frozenset({"quarantined"}),
+        ("approval", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+    },
+    EventType.SESSION_AWAITING_USER_INPUT: {
+        ("tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+    },
+    EventType.SESSION_INTERRUPTED: {
+        ("approval", "arguments_state"): frozenset({"quarantined"}),
+        ("approval", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+        ("user_input", "arguments_state"): frozenset({"quarantined"}),
+        ("user_input", "tool_calls", "*", "arguments_state"): frozenset({"quarantined"}),
+    },
+    **{
+        event_type: {("arguments_state",): tool_argument_publication.TERMINAL_ARGUMENT_STATES}
+        for event_type in {
+            EventType.TOOL_CALL_COMPLETED,
+            EventType.TOOL_CALL_FAILED,
+            EventType.TOOL_CALL_BLOCKED,
+            EventType.TOOL_CALL_APPROVAL_DENIED,
+        }
+    },
     EventType.MODEL_STARTED: {
         ("purpose",): frozenset({"context_compaction"}),
     },
@@ -666,6 +700,7 @@ _PENDING_TOOL_CALL_FIELD_NAMES = frozenset(
     {
         "active_taint_labels",
         "arguments",
+        "arguments_state",
         "metadata",
         "policy_decision",
         "policy_evidence",
@@ -679,6 +714,7 @@ _PENDING_APPROVAL_FIELD_NAMES = frozenset(
         "agent_name",
         "approval_id",
         "arguments",
+        "arguments_state",
         "budget_limits",
         "environment_name",
         "expires_at",
@@ -689,6 +725,7 @@ _PENDING_APPROVAL_FIELD_NAMES = frozenset(
         "model_step_id",
         "reason",
         "retry_policy",
+        "secret_resolution_scope",
         "structured_output",
         "task_id",
         "thinking",
@@ -703,6 +740,9 @@ _PENDING_USER_INPUT_FIELD_NAMES = frozenset(
     {
         "agent_name",
         "arguments",
+        "arguments_state",
+        "assistant_message_state",
+        "assistant_publication",
         "budget_limits",
         "environment_name",
         "input_id",
@@ -712,6 +752,7 @@ _PENDING_USER_INPUT_FIELD_NAMES = frozenset(
         "model_step_id",
         "options",
         "question",
+        "quarantined_assistant_message",
         "retry_policy",
         "structured_output",
         "task_id",
@@ -1159,6 +1200,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "approval_id",
         "approval_metadata_truncated",
         "arguments",
+        "arguments_state",
         "effect",
         "effective_arguments",
         "expired",
@@ -1446,6 +1488,9 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "input_id model_attempt_id model_step_id options question tool_call_id tool_calls "
         "tool_round_id",
         aliased_authority_keys={"input_id", "tool_call_id", "tool_round_id"},
+        owned_nested_paths={
+            ("tool_calls", "*", "arguments_state"),
+        },
         nested_authority_paths=_TOOL_CALL_LIST_NESTED_AUTHORITY_PATHS,
         aliased_nested_authority_paths=_TOOL_CALL_LIST_NESTED_AUTHORITY_PATHS,
         untrusted_container_keys={"options", "tool_calls"},
@@ -1763,6 +1808,12 @@ def event_payload_policy(event_type: EventType | str) -> EventPayloadPolicy:
 def prepare_new_runtime_event(event: Event, *, redactor: SecretRedactor) -> Event:
     """Validate and redact one event before its first durable append."""
 
+    payload = copy_durable_json_value(event.payload, "event.payload")
+    if type(payload) is not dict:
+        raise AssertionError("Event payload copy returned a non-object.")
+    _quarantine_pre_execution_tool_arguments(event, payload=payload)
+    _validate_new_terminal_tool_argument_projection(event, payload=payload)
+    event = event.model_copy(update={"payload": payload})
     return _prepare_runtime_event(
         event,
         redactor=redactor,
@@ -1890,6 +1941,127 @@ def _prepare_runtime_event(
     )
 
 
+_PRE_EXECUTION_ARGUMENT_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_STARTED,
+        EventType.TOOL_CALL_APPROVAL_REQUESTED,
+        EventType.SESSION_AWAITING_USER_INPUT,
+        EventType.SESSION_INTERRUPTED,
+    }
+)
+
+
+def _quarantine_pre_execution_tool_arguments(
+    event: Event,
+    *,
+    payload: dict[str, Any],
+) -> None:
+    """Remove private arguments from schema-owned pre-execution event fields."""
+
+    if event.type not in _PRE_EXECUTION_ARGUMENT_EVENT_TYPES:
+        return
+
+    def quarantine_descriptor(value: Any) -> None:
+        if type(value) is not dict:
+            return
+        had_private_arguments = "arguments" in value
+        had_quarantine_marker = value.get("arguments_state") == "quarantined"
+        # The assistant publication is durable internal recovery evidence.  It
+        # is only provisional while a round is paused before execution, so it
+        # must never cross the immutable public event boundary.
+        value.pop("assistant_publication", None)
+        value.pop("quarantined_assistant_message", None)
+        value.pop("assistant_message_state", None)
+        value.pop("secret_resolution_scope", None)
+        value.pop("arguments", None)
+        value.pop("effective_arguments", None)
+        if had_private_arguments or had_quarantine_marker:
+            value["arguments_state"] = "quarantined"
+
+    if event.type == EventType.TOOL_CALL_STARTED:
+        payload.pop("arguments", None)
+        payload.pop("effective_arguments", None)
+        payload["arguments_state"] = "quarantined"
+        return
+    if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
+        approval = payload.get("approval")
+        quarantine_descriptor(approval)
+        if type(approval) is dict and type(approval.get("tool_calls")) is list:
+            for call in approval["tool_calls"]:
+                quarantine_descriptor(call)
+        return
+    if event.type == EventType.SESSION_AWAITING_USER_INPUT:
+        tool_calls = payload.get("tool_calls")
+        if type(tool_calls) is list:
+            for call in tool_calls:
+                quarantine_descriptor(call)
+        return
+    for field_name in ("approval", "user_input"):
+        pause = payload.get(field_name)
+        quarantine_descriptor(pause)
+        if type(pause) is dict and type(pause.get("tool_calls")) is list:
+            for call in pause["tool_calls"]:
+                quarantine_descriptor(call)
+
+
+def _validate_new_terminal_tool_argument_projection(
+    event: Event,
+    *,
+    payload: dict[str, Any],
+) -> None:
+    """Reject contradictory argument controls before first durable publication."""
+
+    if event.type not in _TERMINAL_TOOL_ARGUMENT_EVENT_TYPES:
+        return
+    state = payload.get(tool_argument_publication.ARGUMENTS_STATE_FIELD)
+    if state is None:
+        return
+    if state == "finalized":
+        if type(payload.get(tool_argument_publication.ARGUMENTS_FIELD)) is not dict:
+            raise ValueError("Finalized terminal arguments must be an object.")
+        effective_arguments = payload.get("effective_arguments")
+        if effective_arguments is not None and type(effective_arguments) is not dict:
+            raise TypeError("Terminal effective_arguments must be an object.")
+        return
+    if state == "unavailable":
+        if tool_argument_publication.ARGUMENTS_FIELD in payload or "effective_arguments" in payload:
+            raise ValueError("Unavailable terminal arguments cannot carry argument objects.")
+        return
+    raise ValueError("Terminal tool event has an invalid argument publication state.")
+
+
+def _fail_closed_public_terminal_tool_argument_projection(
+    event: Event,
+    *,
+    payload: dict[str, Any],
+) -> None:
+    """Downgrade contradictory legacy terminal projections without exposing data."""
+
+    if event.type not in _TERMINAL_TOOL_ARGUMENT_EVENT_TYPES:
+        return
+    original = event.payload
+    state = original.get(tool_argument_publication.ARGUMENTS_STATE_FIELD)
+    if state is None:
+        return
+    valid = False
+    if state == "finalized":
+        arguments = original.get(tool_argument_publication.ARGUMENTS_FIELD)
+        effective_arguments = original.get("effective_arguments")
+        valid = type(arguments) is dict and (
+            effective_arguments is None or type(effective_arguments) is dict
+        )
+    elif state == "unavailable":
+        valid = (
+            tool_argument_publication.ARGUMENTS_FIELD not in original
+            and "effective_arguments" not in original
+        )
+    if valid:
+        return
+    payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
+    payload.pop("effective_arguments", None)
+    payload[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "unavailable"
+
+
 def project_runtime_event(
     event: Event,
     *,
@@ -1971,6 +2143,12 @@ def _project_runtime_event(
         redacted_payload=redacted_payload,
         redactor=redactor,
     )
+    # Historical records can contain raw pre-execution arguments. Public
+    # replay applies the same quarantine contract as current publication.
+    _quarantine_pre_execution_tool_arguments(
+        event,
+        payload=redacted_payload,
+    )
     _remove_malformed_public_controls(
         event,
         policy=policy,
@@ -2016,6 +2194,10 @@ def _project_runtime_event(
     _synchronize_runtime_tool_result_projection_record(
         redacted_payload,
         controls=controls,
+    )
+    _fail_closed_public_terminal_tool_argument_projection(
+        event,
+        payload=redacted_payload,
     )
     event_type: EventType | str = event.type
     if not isinstance(event_type, EventType) and redactor.redact_text(str(event_type)) != str(

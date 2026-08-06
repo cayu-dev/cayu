@@ -15,6 +15,7 @@ from cayu.core import AgentSpec, EventType, Message
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.environments import Environment, EnvironmentSpec
 from cayu.providers import ModelStreamEvent
+from cayu.proxies import PassthroughProxy
 from cayu.runners import (
     ExecCommand,
     ExecResult,
@@ -69,6 +70,45 @@ class _BlockingRunner(Runner):
             self.cancelled = True
             raise
         return ExecResult()
+
+
+class _BlockingCancellationProjectionStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._armed = False
+        self._blocked = False
+        self.projection_started: asyncio.Event | None = None
+        self.release_projection: asyncio.Event | None = None
+
+    def arm(self) -> None:
+        self._armed = True
+        self.projection_started = asyncio.Event()
+        self.release_projection = asyncio.Event()
+
+    async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+        if self._armed and not self._blocked:
+            self._blocked = True
+            assert self.projection_started is not None
+            assert self.release_projection is not None
+            self.projection_started.set()
+            await self.release_projection.wait()
+        await super().transform_checkpoint(session_id, checkpoint_transform)
+
+
+class _FatalCancellationProjectionStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._armed = False
+        self._failed = False
+
+    def arm(self) -> None:
+        self._armed = True
+
+    async def transform_checkpoint(self, session_id, checkpoint_transform) -> None:
+        if self._armed and not self._failed:
+            self._failed = True
+            raise GeneratorExit("checkpoint projection terminated")
+        await super().transform_checkpoint(session_id, checkpoint_transform)
 
 
 class _ConcurrentRunner(Runner):
@@ -769,7 +809,12 @@ def test_runner_cleanup_failure_cancellation_stops_the_runtime_turn(
             del args
             assert ctx.runner is not None
             assert ctx.vault is not None
+            assert ctx.proxy is not None
             await ctx.vault.resolve(SecretRef(name="token"))
+            await ctx.proxy.authorize_request(
+                destination="https://example.test/operation",
+                credential=SecretRef(name="token"),
+            )
             await ctx.runner.exec(ExecCommand.process("blocked"))
             return ToolResult(content="unexpected")
 
@@ -789,7 +834,7 @@ def test_runner_cleanup_failure_cancellation_stops_the_runtime_turn(
             ],
         ]
     )
-    store = InMemorySessionStore()
+    store = _BlockingCancellationProjectionStore()
     app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_environment(
@@ -797,7 +842,104 @@ def test_runner_cleanup_failure_cancellation_stops_the_runtime_turn(
             EnvironmentSpec(name="local"),
             runner=runner,
             vault=StaticVault({"token": secret}),
+            proxy=PassthroughProxy(StaticVault({"token": secret})),
         ),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[RunCommandTool()],
+    )
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, int, bool]:
+        runner.started = asyncio.Event()
+        task = asyncio.create_task(
+            collect_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "run")],
+                ),
+            )
+        )
+        await runner.started.wait()
+        store.arm()
+        task.cancel(secret)
+        initial_cancelling = task.cancelling()
+        assert store.projection_started is not None
+        assert store.release_projection is not None
+        await store.projection_started.wait()
+        task.cancel("caller cancellation during publication")
+        final_cancelling = task.cancelling()
+        store.release_projection.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return (
+            exc_info.value,
+            initial_cancelling,
+            final_cancelling,
+            task.cancelled(),
+        )
+
+    cancellation, initial_cancelling, final_cancelling, cancelled = asyncio.run(scenario())
+    events = asyncio.run(store.load_events(session_id))
+    session = asyncio.run(store.load(session_id))
+
+    assert initial_cancelling == 1
+    assert final_cancelling == 2
+    assert cancelled is True
+    assert len(provider.requests) == 1
+    assert session is not None
+    assert session.status is SessionStatus.INTERRUPTED
+    assert [event.type for event in events].count(EventType.SESSION_INTERRUPTED) == 1
+    assert all(event.type is not EventType.CREDENTIAL_PROXY_CHECKED for event in events)
+    assert all(event.type is not EventType.SESSION_COMPLETED for event in events)
+    assert secret not in repr(cancellation)
+    assert secret not in repr(events)
+    if runner_type is _GroupedCleanupFailureRunner:
+        assert cancellation.artifacts == [
+            {
+                "type": "cayu.runner_cleanup.v1",
+                "adapter": "microsandbox",
+                "action": "kill_command",
+                "status": "failed",
+                "timeout_s": 5.0,
+            }
+        ]
+
+
+def test_fatal_snapshot_failure_does_not_replace_runner_cancellation() -> None:
+    runner = _CleanupReplacingCancellationRunner()
+
+    class RunCommandTool(Tool):
+        spec = ToolSpec(
+            name="run_during_fatal_projection",
+            description="Run through the invocation runner.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+            del args
+            assert ctx.runner is not None
+            await ctx.runner.exec(ExecCommand.process("blocked"))
+            return ToolResult(content="unexpected")
+
+    provider = FakeProvider(
+        [
+            ModelStreamEvent.tool_call(
+                id="call-fatal-projection",
+                name="run_during_fatal_projection",
+                arguments={},
+            ),
+            ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+        ]
+    )
+    store = _FatalCancellationProjectionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local"), runner=runner),
         default=True,
     )
     app.register_agent(
@@ -812,41 +954,36 @@ def test_runner_cleanup_failure_cancellation_stops_the_runtime_turn(
                 app,
                 RunRequest(
                     agent_name="assistant",
-                    session_id=session_id,
+                    session_id="fatal-cancellation-projection",
                     messages=[Message.text("user", "run")],
                 ),
             )
         )
         await runner.started.wait()
-        task.cancel(secret)
+        store.arm()
+        task.cancel("caller cancellation")
         cancelling = task.cancelling()
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
         return exc_info.value, cancelling, task.cancelled()
 
     cancellation, cancelling, cancelled = asyncio.run(scenario())
-    events = asyncio.run(store.load_events(session_id))
-    session = asyncio.run(store.load(session_id))
+    events = asyncio.run(store.load_events("fatal-cancellation-projection"))
+    session = asyncio.run(store.load("fatal-cancellation-projection"))
 
     assert cancelling == 1
     assert cancelled is True
-    assert len(provider.requests) == 1
     assert session is not None
     assert session.status is SessionStatus.INTERRUPTED
     assert [event.type for event in events].count(EventType.SESSION_INTERRUPTED) == 1
     assert all(event.type is not EventType.SESSION_COMPLETED for event in events)
-    assert secret not in repr(cancellation)
-    assert secret not in repr(events)
-    if runner_type is _GroupedCleanupFailureRunner:
-        assert cancellation.artifacts == [
-            {
-                "type": "cayu.runner_cleanup.v1",
-                "adapter": "microsandbox",
-                "action": "kill_command",
-                "status": "failed",
-                "timeout_s": 5.0,
-            }
-        ]
+    notes = getattr(cancellation, "__notes__", ())
+    assert notes == [
+        "Assistant publication projection terminated with GeneratorExit while "
+        "preserving cancellation."
+    ]
+    assert "checkpoint projection terminated" not in repr(cancellation)
+    assert "checkpoint projection terminated" not in repr(events)
 
 
 def test_parallel_runner_cleanup_failures_cross_task_group_cancellation() -> None:
@@ -1084,7 +1221,7 @@ def test_parallel_grouped_child_cancellation_preserves_runner_cleanup_failure() 
             ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
         ]
     )
-    store = InMemorySessionStore()
+    store = _BlockingCancellationProjectionStore()
     app = CayuApp(
         session_store=store,
         enable_logging=False,
@@ -1104,7 +1241,7 @@ def test_parallel_grouped_child_cancellation_preserves_runner_cleanup_failure() 
         tools=[RunCommandTool(), FatalSiblingTool()],
     )
 
-    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+    async def scenario() -> tuple[asyncio.CancelledError, int, int, bool]:
         nonlocal sibling_started
         runner.started = asyncio.Event()
         sibling_started = asyncio.Event()
@@ -1120,23 +1257,40 @@ def test_parallel_grouped_child_cancellation_preserves_runner_cleanup_failure() 
         )
         await runner.started.wait()
         await sibling_started.wait()
+        store.arm()
         task.cancel("caller cancellation")
-        cancelling = task.cancelling()
+        initial_cancelling = task.cancelling()
+        assert store.projection_started is not None
+        assert store.release_projection is not None
+        await store.projection_started.wait()
+        task.cancel("caller cancellation during publication")
+        final_cancelling = task.cancelling()
+        store.release_projection.set()
         with pytest.raises(asyncio.CancelledError) as exc_info:
             await task
-        return exc_info.value, cancelling, task.cancelled()
+        return (
+            exc_info.value,
+            initial_cancelling,
+            final_cancelling,
+            task.cancelled(),
+        )
 
-    cancellation, cancelling, cancelled = asyncio.run(scenario())
+    cancellation, initial_cancelling, final_cancelling, cancelled = asyncio.run(scenario())
     session = asyncio.run(store.load("parallel-fatal-sibling"))
     events = asyncio.run(store.load_events("parallel-fatal-sibling"))
     assert isinstance(cancellation.__cause__, BaseExceptionGroup)
-    cleanup_failures = [
-        candidate
-        for candidate in iter_exception_tree(cancellation.__cause__)
-        if isinstance(candidate, RunnerExecutionError)
-    ]
-
-    assert cancelling == 1
+    cleanup_failures: list[RunnerExecutionError] = []
+    cause = cancellation.__cause__
+    while cause is not None:
+        cleanup_failures.extend(
+            candidate
+            for candidate in iter_exception_tree(cause)
+            if isinstance(candidate, RunnerExecutionError)
+            and all(candidate is not existing for existing in cleanup_failures)
+        )
+        cause = cause.__cause__
+    assert initial_cancelling == 1
+    assert final_cancelling == 2
     assert cancelled is True
     assert session is not None
     assert session.status is SessionStatus.INTERRUPTED
@@ -2007,6 +2161,252 @@ def test_late_vault_resolution_error_traceback_does_not_retain_secret() -> None:
         assert all(
             secret_value not in repr(value) for value in traceback.tb_frame.f_locals.values()
         )
+        traceback = traceback.tb_next
+
+
+def test_cancellation_during_secret_projection_preserves_cancellation_and_clean_traceback() -> None:
+    secret_value = "projection-cancellation-secret-canary-ABCDEFGHIJKLMNOP"
+
+    async def scenario() -> tuple[asyncio.CancelledError, asyncio.Task[ResolvedSecret]]:
+        tracker = InvocationSecretTracker(SecretRedactor())
+        projection_started = asyncio.Event()
+        release_projection = asyncio.Event()
+
+        async def persist_projection(_snapshot: InvocationRedactorSnapshot) -> None:
+            projection_started.set()
+            await release_projection.wait()
+
+        tracking_vault = invocation_secrets_module._TrackingVault(
+            StaticVault({"api_key": secret_value}),
+            tracker,
+            persist_projection,
+        )
+        resolution = asyncio.create_task(tracking_vault.resolve(SecretRef(name="api_key")))
+        await projection_started.wait()
+        resolution.cancel("cancel secret projection")
+        assert resolution.cancelling() == 1
+        release_projection.set()
+        try:
+            await resolution
+        except asyncio.CancelledError as cancellation:
+            return cancellation, resolution
+        raise AssertionError("Secret resolution did not preserve caller cancellation.")
+
+    cancellation, resolution = asyncio.run(scenario())
+
+    assert cancellation.args == ("cancel secret projection",)
+    assert resolution.cancelled() is True
+    assert resolution.cancelling() == 1
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            assert all(
+                secret_value not in repr(value) for value in traceback.tb_frame.f_locals.values()
+            )
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize("surface", ["vault", "proxy"])
+def test_pending_cancellation_before_secret_resolution_prevents_dispatch(surface: str) -> None:
+    secret_value = "pending-projection-cancellation-secret-canary-ABCDEFGHIJKLMNOP"
+
+    class CountingVault(Vault):
+        def __init__(self) -> None:
+            self.dispatches = 0
+
+        async def get(
+            self,
+            name: str,
+            *,
+            scope: dict | None = None,
+        ) -> SecretRef:
+            del scope
+            return SecretRef(name=name)
+
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict | None = None,
+        ) -> ResolvedSecret:
+            del scope
+            self.dispatches += 1
+            return ResolvedSecret(name=ref.name, value=SecretStr(secret_value))
+
+    async def scenario() -> tuple[
+        asyncio.CancelledError,
+        asyncio.Task[ResolvedSecret],
+        list[int],
+        int,
+        int,
+    ]:
+        tracker = InvocationSecretTracker(SecretRedactor())
+        persisted_revisions: list[int] = []
+        vault = CountingVault()
+
+        async def persist_projection(snapshot: InvocationRedactorSnapshot) -> None:
+            persisted_revisions.append(snapshot.revision)
+
+        resolver = (
+            invocation_secrets_module._TrackingVault(
+                vault,
+                tracker,
+                persist_projection,
+            )
+            if surface == "vault"
+            else invocation_secrets_module._TrackingCredentialProxy(
+                PassthroughProxy(vault),
+                tracker,
+                lambda _record: None,
+                persist_projection,
+            )
+        )
+
+        async def resolve_after_pending_cancellation() -> ResolvedSecret:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel("cancel before secret projection")
+            return await resolver.resolve(SecretRef(name="api_key"))
+
+        resolution = asyncio.create_task(resolve_after_pending_cancellation())
+        try:
+            await resolution
+        except asyncio.CancelledError as cancellation:
+            return (
+                cancellation,
+                resolution,
+                persisted_revisions,
+                vault.dispatches,
+                tracker.snapshot().revision,
+            )
+        raise AssertionError("Pending cancellation did not remain authoritative.")
+
+    cancellation, resolution, persisted_revisions, dispatches, revision = asyncio.run(scenario())
+
+    assert cancellation.args == ("cancel before secret projection",)
+    assert resolution.cancelled() is True
+    assert resolution.cancelling() == 1
+    assert dispatches == 0
+    assert revision == 0
+    assert persisted_revisions == []
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            assert all(
+                secret_value not in repr(value) for value in traceback.tb_frame.f_locals.values()
+            )
+        traceback = traceback.tb_next
+
+
+@pytest.mark.parametrize("surface", ["vault", "proxy"])
+def test_cancellation_fences_a_nonresponsive_secret_resolver(surface: str) -> None:
+    secret_value = "detached-resolution-secret-canary-ABCDEFGHIJKLMNOP"
+
+    class CancellationIgnoringVault(Vault):
+        def __init__(self) -> None:
+            self.started: asyncio.Event | None = None
+            self.release: asyncio.Event | None = None
+            self.finished: asyncio.Event | None = None
+
+        async def get(
+            self,
+            name: str,
+            *,
+            scope: dict | None = None,
+        ) -> SecretRef:
+            del scope
+            return SecretRef(name=name)
+
+        async def resolve(
+            self,
+            ref: SecretRef,
+            *,
+            scope: dict | None = None,
+        ) -> ResolvedSecret:
+            del scope
+            assert self.started is not None
+            assert self.release is not None
+            assert self.finished is not None
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await self.release.wait()
+            self.finished.set()
+            return ResolvedSecret(name=ref.name, value=SecretStr(secret_value))
+
+    async def scenario() -> tuple[
+        asyncio.CancelledError,
+        asyncio.Task[ResolvedSecret],
+        list[int],
+        int,
+        bool,
+        bool,
+    ]:
+        tracker = InvocationSecretTracker(SecretRedactor())
+        persisted_revisions: list[int] = []
+        vault = CancellationIgnoringVault()
+        vault.started = asyncio.Event()
+        vault.release = asyncio.Event()
+        vault.finished = asyncio.Event()
+
+        async def persist_projection(snapshot: InvocationRedactorSnapshot) -> None:
+            persisted_revisions.append(snapshot.revision)
+
+        resolver = (
+            invocation_secrets_module._TrackingVault(
+                vault,
+                tracker,
+                persist_projection,
+            )
+            if surface == "vault"
+            else invocation_secrets_module._TrackingCredentialProxy(
+                PassthroughProxy(vault),
+                tracker,
+                lambda _record: None,
+                persist_projection,
+            )
+        )
+        resolution = asyncio.create_task(resolver.resolve(SecretRef(name="api_key")))
+        await vault.started.wait()
+        resolution.cancel("operator cancelled secret resolution")
+        completed, _pending = await asyncio.wait({resolution}, timeout=1)
+        assert completed == {resolution}
+        try:
+            await resolution
+        except asyncio.CancelledError as cancellation:
+            assert vault.finished.is_set() is False
+            vault.release.set()
+            await asyncio.wait_for(vault.finished.wait(), timeout=1)
+            await asyncio.sleep(0)
+            publication = tracker.seal_for_publication()
+            return (
+                cancellation,
+                resolution,
+                persisted_revisions,
+                tracker.snapshot().revision,
+                publication.secret_scope_incomplete,
+                publication.unsafe_output,
+            )
+        raise AssertionError("Secret resolution did not preserve caller cancellation.")
+
+    cancellation, resolution, persisted_revisions, revision, incomplete, unsafe_output = (
+        asyncio.run(scenario())
+    )
+
+    assert cancellation.args == ("operator cancelled secret resolution",)
+    assert resolution.cancelled() is True
+    assert resolution.cancelling() == 1
+    assert persisted_revisions == []
+    assert revision == 0
+    assert incomplete is True
+    assert unsafe_output is True
+    traceback = cancellation.__traceback__
+    while traceback is not None:
+        if is_cayu_source_filename(traceback.tb_frame.f_code.co_filename):
+            assert all(
+                secret_value not in repr(value) for value in traceback.tb_frame.f_locals.values()
+            )
         traceback = traceback.tb_next
 
 

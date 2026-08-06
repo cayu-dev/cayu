@@ -4,9 +4,11 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+from cayu import SQLiteSessionStore
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.messages import ToolCallPart, ToolResultPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
@@ -44,12 +46,16 @@ from cayu.runtime.approvals import (
     ToolApprovalRequest,
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
+from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.runtime.execution_units import ModelAttemptIdentity, ToolRoundIdentity
 from cayu.runtime.sessions import (
     ModelCompletionStage,
     ModelCompletionStageRequest,
+    RuntimePublicationCheckpointOperation,
+    RuntimePublicationMutation,
     RuntimePublicationRequest,
     runtime_publication_checkpoint_mutation,
+    runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.user_input import PendingUserInput
 
@@ -68,6 +74,76 @@ class _RecordingProvider(ModelProvider):
             raise AssertionError("Recovery must not redispatch the staged model completion.")
         for event in self._responses[call_index]:
             yield event
+
+
+class _LegacyTerminalModelCompletionMixin:
+    """Persist terminal model material exactly as a v1 checkpoint writer did."""
+
+    async def complete_model_completion_stage(
+        self,
+        session_id,
+        *,
+        stage_id,
+        publication,
+    ):
+        operations = []
+        for operation in publication.mutation.operations:
+            if operation.action != "set" or type(operation.value) is not dict:
+                operations.append(operation)
+                continue
+            legacy_value = dict(operation.value)
+            if (
+                operation.key
+                == model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY
+            ):
+                legacy_value["schema_version"] = 1
+                legacy_value.pop("assistant_message_deferred", None)
+            elif operation.key == "pending_tool_round":
+                legacy_value.pop("assistant_message_state", None)
+                legacy_value.pop("quarantined_assistant_message", None)
+                legacy_value.pop("assistant_publication", None)
+            operations.append(operation.model_copy(update={"value": legacy_value}, deep=True))
+        operations.append(
+            RuntimePublicationCheckpointOperation(
+                key=CHECKPOINT_SCHEMA_VERSION_KEY,
+                expected_value_digest=runtime_publication_checkpoint_value_digest(1),
+                action="set",
+                value=1,
+            )
+        )
+
+        def install_v1_root(_session, checkpoint):
+            copied = {} if checkpoint is None else dict(checkpoint)
+            copied[CHECKPOINT_SCHEMA_VERSION_KEY] = 1
+            return copied
+
+        await super().transform_checkpoint(session_id, install_v1_root)
+        return await super().complete_model_completion_stage(
+            session_id,
+            stage_id=stage_id,
+            publication=publication.model_copy(
+                update={
+                    "mutation": RuntimePublicationMutation(
+                        operations=tuple(operations),
+                    )
+                },
+                deep=True,
+            ),
+        )
+
+
+class _LegacyTerminalModelCompletionStore(
+    _LegacyTerminalModelCompletionMixin,
+    InMemorySessionStore,
+):
+    pass
+
+
+class _LegacyTerminalSQLiteModelCompletionStore(
+    _LegacyTerminalModelCompletionMixin,
+    SQLiteSessionStore,
+):
+    pass
 
 
 class _NeverExecutedTool(Tool):
@@ -235,12 +311,11 @@ async def _private_pending_approval(
     store: InMemorySessionStore,
     session_id: str,
 ) -> PendingToolApproval:
-    event = next(
-        event
-        for event in await store.load_events(session_id)
-        if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
+    pending = approval_support.pending_approval_from_checkpoint(
+        await store.load_checkpoint(session_id)
     )
-    return PendingToolApproval.from_event(event)
+    assert pending is not None
+    return pending
 
 
 async def _stage_completed_model_boundary(
@@ -447,6 +522,66 @@ async def _stage_completed_model_boundary(
         pointer=pointer,
         publication=publication,
     )
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("with_tool_call", [False, True])
+def test_current_worker_promotes_v1_terminal_model_completion(
+    with_tool_call: bool,
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        raw_store = (
+            _LegacyTerminalModelCompletionStore()
+            if backend == "memory"
+            else _LegacyTerminalSQLiteModelCompletionStore(
+                tmp_path / f"legacy-terminal-{with_tool_call}.sqlite"
+            )
+        )
+        provider = _RecordingProvider()
+        tool = _NeverExecutedTool() if with_tool_call else None
+        staged = await _stage_completed_model_boundary(
+            raw_store,
+            session_id=f"legacy-terminal-promotion-{with_tool_call}",
+            provider_name=provider.name,
+            with_tool_call=with_tool_call,
+        )
+        await raw_store.release_run_fence(staged.session.id)
+        app = _register_runtime(raw_store, provider, tool=tool)
+
+        recovery = await app.recover_incomplete_session(
+            IncompleteSessionRecoveryRequest(session_id=staged.session.id)
+        )
+
+        assert provider.requests == []
+        assert tool is None or tool.calls == 0
+        assert await raw_store.load_transcript(staged.session.id) == [
+            staged.user_message,
+            staged.assistant_message,
+        ]
+        durable_events = await raw_store.load_events(staged.session.id)
+        assert [event for event in durable_events if event.type is EventType.MODEL_COMPLETED] == [
+            staged.completion_event
+        ]
+        checkpoint = await app._runtime_session_store.load_checkpoint(staged.session.id)
+        assert checkpoint is not None
+        assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+        pointer = checkpoint[
+            model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY
+        ]
+        assert pointer["schema_version"] == 2
+        assert pointer["assistant_message_deferred"] is False
+        if with_tool_call:
+            assert recovery.actions == (
+                IncompleteSessionRecoveryAction.REPAIRED_TOOL_ROUND,
+                IncompleteSessionRecoveryAction.PENDING_APPROVAL,
+            )
+            pending_round = checkpoint["pending_tool_round"]
+            assert pending_round["assistant_message_state"] == "published"
+            assert pending_round["quarantined_assistant_message"] is None
+
+    asyncio.run(run())
 
 
 async def _stage_in_flight_model_boundary(

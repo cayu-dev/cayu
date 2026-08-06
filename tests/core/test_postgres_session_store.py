@@ -16,6 +16,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import SecretStr, ValidationError
 from tests.core.checkpoint_schema_conformance import (
+    assert_assistant_publication_checkpoint_conformance,
+    assert_current_checkpoint_publication_upgrade_conformance,
     assert_future_checkpoint_rejection_conformance,
     assert_versionless_checkpoint_resume_conformance,
     assert_versionless_noop_transform_stamps_conformance,
@@ -608,6 +610,14 @@ def test_postgres_checkpoint_schema_runtime_conformance(postgres_dsn: str) -> No
             store,
             session_id="sess-postgres-future-checkpoint",
         )
+        await assert_current_checkpoint_publication_upgrade_conformance(
+            store,
+            session_id_prefix="sess-postgres-current-publication",
+        )
+        await assert_assistant_publication_checkpoint_conformance(
+            store,
+            session_id="sess-postgres-assistant-publication",
+        )
 
     _run(postgres_dsn, exercise)
 
@@ -919,8 +929,10 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
         action = result.actions[0]
         assert action.session.id == session.id
         assert action.event.event.id == "approval_pg_latest"
-        assert action.detail == "latest request"
-        assert action.arguments == {"service": "api"}
+        # This legacy fixture has no positive secret-scope evidence, so its
+        # argument-derived policy reason is not safe for public projection.
+        assert action.detail == "Approval required"
+        assert action.arguments is None
 
         user_session = await store.create(
             RunRequest(

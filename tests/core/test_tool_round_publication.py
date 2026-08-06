@@ -8,8 +8,9 @@ from typing import TypeVar
 import pytest
 
 from cayu.core.events import Event, EventType
-from cayu.core.messages import ToolResultPart
+from cayu.core.messages import Message, ToolCallPart, ToolResultPart
 from cayu.core.tools import ToolResult
+from cayu.runtime._assistant_tool_round_publication import AssistantToolRoundPublication
 from cayu.runtime._event_projection import public_event_id
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._tool_execution import tool_idempotency_key
@@ -83,6 +84,43 @@ def _source_checkpoint(pending_round: PendingToolRound) -> dict:
         "unrelated": {"keep": True},
         PENDING_TOOL_ROUND_CHECKPOINT_KEY: pending_round.model_dump(mode="json"),
     }
+
+
+def _quarantined_pending_round() -> PendingToolRound:
+    pending_round = _pending_round()
+    identity = pending_tool_round_identity(pending_round)
+    assistant_message = Message(
+        role="assistant",
+        content=tuple(
+            ToolCallPart(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                arguments=call.arguments,
+                tool_round_id=identity.tool_round_id,
+                model_step_id=identity.model_step_id,
+                model_attempt_id=identity.model_attempt_id,
+            )
+            for call in pending_round.tool_calls
+        ),
+    )
+    return PendingToolRound.model_validate(
+        {
+            **pending_round.model_dump(mode="json"),
+            "assistant_message_state": "quarantined",
+            "quarantined_assistant_message": assistant_message.model_dump(mode="json"),
+            "assistant_publication": AssistantToolRoundPublication(
+                state="ready",
+                message=Message(
+                    role="assistant",
+                    content=tuple(
+                        part.model_copy(update={"arguments": {}})
+                        for part in assistant_message.content
+                    ),
+                ),
+                covered_tool_call_ids=[call.tool_call_id for call in pending_round.tool_calls],
+            ).model_dump(mode="json"),
+        }
+    )
 
 
 def _lifecycle_events(
@@ -611,6 +649,73 @@ async def _created_store(
         identity=SessionIdentity(provider_name="fake", model="fake-model"),
     )
     return store, session
+
+
+@pytest.mark.parametrize("assistant_message_state", ["published", "quarantined"])
+def test_publication_message_count_must_match_durable_assistant_state(
+    assistant_message_state: str,
+) -> None:
+    async def scenario() -> None:
+        store, session = await _created_store(
+            InMemorySessionStore(),
+            session_id=f"session-message-state-{assistant_message_state}",
+        )
+        pending_round = (
+            _quarantined_pending_round()
+            if assistant_message_state == "quarantined"
+            else _pending_round()
+        )
+        source_checkpoint = _source_checkpoint(pending_round)
+        events = _lifecycle_events(pending_round, session_id=session.id)
+        await store.checkpoint(session.id, source_checkpoint)
+        await store.append_events(session.id, events)
+        request = build_tool_round_publication_request(
+            session_id=session.id,
+            pending_round=pending_round,
+            source_checkpoint=source_checkpoint,
+            durable_events=events,
+        )
+        if assistant_message_state == "quarantined":
+            contradictory_messages = request.transcript_messages[-1:]
+        else:
+            quarantined_pending_round = _quarantined_pending_round()
+            quarantined_request = build_tool_round_publication_request(
+                session_id=session.id,
+                pending_round=quarantined_pending_round,
+                source_checkpoint=_source_checkpoint(quarantined_pending_round),
+                durable_events=_lifecycle_events(
+                    quarantined_pending_round,
+                    session_id=session.id,
+                ),
+            )
+            contradictory_messages = (
+                quarantined_request.transcript_messages[0],
+                *request.transcript_messages,
+            )
+        contradictory_request = RuntimePublicationRequest(
+            publication_id=request.publication_id,
+            kind=request.kind,
+            interaction_id=request.interaction_id,
+            intent=request.intent,
+            mutation=request.mutation,
+            transcript_messages=contradictory_messages,
+            events=request.events,
+            referenced_events=request.referenced_events,
+        )
+
+        with pytest.raises(
+            SessionRuntimePublicationConflict,
+            match="durable assistant-message state",
+        ):
+            await store.publish_runtime_publication(
+                session.id,
+                request=contradictory_request,
+                expected_statuses={SessionStatus.PENDING},
+                expected_run_epoch=session.run_epoch,
+                expected_transcript_cursor=0,
+            )
+
+    asyncio.run(scenario())
 
 
 def test_publish_commits_once_and_exactly_replays() -> None:

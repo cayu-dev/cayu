@@ -1917,7 +1917,7 @@ def test_invalid_tool_output_evidence_is_redacted_before_hooks_and_publication()
 def test_terminal_tool_diagnostics_and_evidence_remain_bounded_after_expanding_redaction():
     from cayu.vaults import REDACTED_SECRET, SecretRedactor
 
-    secret = "z"
+    secret = "zz"
     redactor = SecretRedactor(secret)
     redacted_diagnostic = tool_results_module.exception_diagnostic(
         RuntimeError(secret * 4096),

@@ -9,12 +9,13 @@ from typing import TYPE_CHECKING, Any
 
 from cayu._validation import copy_durable_json_object
 from cayu._validation import require_durable_clean_nonblank as require_clean_nonblank
+from cayu.runtime._model_completion_publication import ModelStepPublicationCheckpoint
 
 if TYPE_CHECKING:
     from cayu.runtime.sessions import CheckpointRootFieldProjection
 
 CHECKPOINT_SCHEMA_VERSION_KEY = "checkpoint_schema_version"
-CURRENT_CHECKPOINT_SCHEMA_VERSION = 1
+CURRENT_CHECKPOINT_SCHEMA_VERSION = 2
 MIN_SUPPORTED_CHECKPOINT_SCHEMA_VERSION = 1
 _VERSIONLESS_CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKPOINT_EVIDENCE_SESSION_ID_MAX_BYTES = 256
@@ -225,8 +226,36 @@ class CheckpointMigrator:
         return decoded
 
 
+def _migrate_checkpoint_v1_to_v2(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    """Add the durable tool-argument quarantine publication state."""
+
+    migrated = copy_durable_json_object(checkpoint, "checkpoint")
+    publication = migrated.get("last_model_step_publication")
+    if type(publication) is dict:
+        if (
+            publication.get("record_type") == "cayu.model-step-publication"
+            and publication.get("schema_version") == 1
+        ):
+            publication["schema_version"] = 2
+        publication.setdefault("assistant_message_deferred", False)
+    for checkpoint_key in ("pending_tool_round", "pending_user_input"):
+        pending_state = migrated.get(checkpoint_key)
+        if type(pending_state) is dict:
+            pending_state.setdefault("assistant_message_state", "published")
+            pending_state.setdefault("quarantined_assistant_message", None)
+    migrated[CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+    return migrated
+
+
 _RUNTIME_CHECKPOINT_MIGRATOR = CheckpointMigrator(
     current_version=CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    migrations=(
+        CheckpointMigration(
+            source_version=1,
+            target_version=2,
+            migrate=_migrate_checkpoint_v1_to_v2,
+        ),
+    ),
 )
 
 
@@ -282,3 +311,56 @@ def decode_runtime_checkpoint(
         checkpoint = None
         error.__traceback__ = None
         raise error from None
+
+
+def runtime_checkpoint_writer_view(
+    checkpoint: dict[str, Any] | None,
+    *,
+    writer_version: int,
+    session_id: str,
+) -> dict[str, Any]:
+    """Project current state into a supported staged writer's CAS schema."""
+
+    decoded = decode_runtime_checkpoint(checkpoint, session_id=session_id)
+    current = (
+        {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
+        if decoded is None
+        else decoded
+    )
+    if writer_version == CURRENT_CHECKPOINT_SCHEMA_VERSION:
+        return copy_durable_json_object(current, "checkpoint")
+    if writer_version != 1:
+        raise ValueError("Staged runtime publication uses an unsupported writer schema.")
+
+    projected = copy_durable_json_object(current, "checkpoint")
+    publication = projected.get("last_model_step_publication")
+    if type(publication) is dict:
+        try:
+            current_publication = ModelStepPublicationCheckpoint.model_validate(publication)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Current model-step publication state is not a recognized v2 pointer."
+            ) from exc
+        if current_publication.assistant_message_deferred:
+            raise ValueError(
+                "Current model-step publication state cannot be represented by a v1 writer."
+            )
+        publication = current_publication.model_dump(mode="json")
+        publication.pop("assistant_message_deferred")
+        publication["schema_version"] = 1
+        projected["last_model_step_publication"] = publication
+    for checkpoint_key in ("pending_tool_round", "pending_user_input"):
+        pending_state = projected.get(checkpoint_key)
+        if type(pending_state) is not dict:
+            continue
+        if (
+            pending_state.get("assistant_message_state") != "published"
+            or pending_state.get("quarantined_assistant_message") is not None
+        ):
+            raise ValueError(
+                "Current assistant publication state cannot be represented by a v1 writer."
+            )
+        pending_state.pop("assistant_message_state")
+        pending_state.pop("quarantined_assistant_message")
+    projected[CHECKPOINT_SCHEMA_VERSION_KEY] = 1
+    return projected

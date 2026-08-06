@@ -824,6 +824,7 @@ async def _session_tools(args: argparse.Namespace, store: SessionStore) -> int:
             "model_attempt_id",
             "tool_round_id",
             "parallel_round_width",
+            "arguments_state",
             "argument_summary",
             "started_at",
             "completed_at",
@@ -1258,28 +1259,43 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
         content = None if result is None else result.get("content")
         artifacts = None if result is None else result.get("artifacts")
         approval = _tool_approval_payload(approval_request)
-        argument_summary = (
-            started.event.payload.get("_argument_summary")
-            if started is not None
-            else approval_call.get("_argument_summary")
-            if approval_call is not None
-            else input_call.get("_argument_summary")
-            if input_call is not None
-            else None
-        )
+        argument_summary = None
+        arguments_state = None
+        for candidate_state in (
+            None if terminal is None else terminal.event.payload.get("_arguments_state"),
+            None if started is None else started.event.payload.get("_arguments_state"),
+            None if approval_call is None else approval_call.get("_arguments_state"),
+            None if input_call is None else input_call.get("_arguments_state"),
+        ):
+            if candidate_state in {"finalized", "quarantined", "unavailable"}:
+                arguments_state = candidate_state
+                break
+        for candidate_summary in (
+            None if terminal is None else terminal.event.payload.get("_argument_summary"),
+            None if started is None else started.event.payload.get("_argument_summary"),
+            None if approval_call is None else approval_call.get("_argument_summary"),
+            None if input_call is None else input_call.get("_argument_summary"),
+        ):
+            if type(candidate_summary) is str:
+                argument_summary = candidate_summary
+                break
         if type(argument_summary) is not str:
-            arguments = (
-                started.event.payload.get("arguments", {})
+            argument_source = (
+                terminal.event.payload
+                if terminal is not None
+                else started.event.payload
                 if started is not None
-                else approval_call.get("arguments", {})
+                else approval_call
                 if approval_call is not None
-                else input_call.get("arguments", {})
+                else input_call
                 if input_call is not None
+                else approval
+                if approval is not None
                 else {}
-                if approval is None
-                else approval.get("arguments", {})
             )
-            argument_summary = _bounded_argument_summary(arguments)
+            arguments_state, argument_summary = _tool_argument_inspection_projection(
+                argument_source
+            )
         tool_name = (
             anchor.event.tool_name
             if approval_call is None and input_call is None
@@ -1294,6 +1310,7 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 "model_attempt_id": model_attempt_id,
                 "tool_round_id": round_id,
                 "parallel_round_width": 1 if round_key is None else round_widths[round_key],
+                "arguments_state": arguments_state,
                 "argument_summary": argument_summary,
                 "started_at": (None if started is None else started.event.timestamp.isoformat()),
                 "completed_at": (
@@ -1901,7 +1918,9 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
         if key in event.payload:
             payload[key] = event.payload[key]
     if event.type == EventType.TOOL_CALL_STARTED:
-        payload["_argument_summary"] = _bounded_argument_summary(event.payload.get("arguments", {}))
+        state, summary = _tool_argument_inspection_projection(event.payload)
+        payload["_arguments_state"] = state
+        payload["_argument_summary"] = summary
     if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED:
         approval = _tool_approval_payload(record)
         if approval is not None:
@@ -1912,9 +1931,9 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
                 for key in ("approval_id", "tool_call_id", "tool_name")
                 if key in approval
             }
-            compact_approval["_argument_summary"] = _bounded_argument_summary(
-                approval.get("arguments", {})
-            )
+            state, summary = _tool_argument_inspection_projection(approval)
+            compact_approval["_arguments_state"] = state
+            compact_approval["_argument_summary"] = summary
             nested_calls = approval.get("tool_calls")
             if type(nested_calls) is list:
                 compact_approval["tool_calls"] = [
@@ -1928,7 +1947,7 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
                         )
                         if key in item
                     }
-                    | {"_argument_summary": _bounded_argument_summary(item.get("arguments", {}))}
+                    | _tool_argument_inspection_fields(item)
                     for item in nested_calls
                     if type(item) is dict
                 ]
@@ -1948,7 +1967,7 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
                     for key in ("tool_call_id", "tool_name", "policy_decision")
                     if key in item
                 }
-                | {"_argument_summary": _bounded_argument_summary(item.get("arguments", {}))}
+                | _tool_argument_inspection_fields(item)
                 for item in nested_calls
                 if type(item) is dict
             ]
@@ -1962,6 +1981,10 @@ def _tool_inspection_record(record: EventRecord) -> EventRecord:
             if key in event.payload:
                 payload[key] = event.payload[key]
     if event.type in _TOOL_TERMINAL_TYPES:
+        if "arguments_state" in event.payload or "arguments" in event.payload:
+            state, summary = _tool_argument_inspection_projection(event.payload)
+            payload["_arguments_state"] = state
+            payload["_argument_summary"] = summary
         result = event.payload.get("result")
         result = result if type(result) is dict else {}
         content = result.get("content")
@@ -2134,6 +2157,34 @@ def _normalize_sensitive_key(key: str) -> str:
     separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", key)
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", separated)
     return re.sub(r"[^a-z0-9]+", "_", separated.casefold()).strip("_")
+
+
+def _tool_argument_inspection_projection(value: Any) -> tuple[str | None, str]:
+    if type(value) is not dict:
+        return "unavailable", "[unavailable]"
+    state = value.get("arguments_state")
+    if state == "quarantined":
+        return state, "[quarantined]"
+    if state == "unavailable":
+        return state, "[unavailable]"
+    arguments = value.get("arguments")
+    if state == "finalized":
+        if type(arguments) is dict:
+            return state, _bounded_argument_summary(arguments)
+        return "unavailable", "[unavailable]"
+    if state is not None:
+        return "unavailable", "[unavailable]"
+    if type(arguments) is dict:
+        return None, _bounded_argument_summary(arguments)
+    return "unavailable", "[unavailable]"
+
+
+def _tool_argument_inspection_fields(value: Any) -> dict[str, str | None]:
+    state, summary = _tool_argument_inspection_projection(value)
+    return {
+        "_arguments_state": state,
+        "_argument_summary": summary,
+    }
 
 
 def _bounded_argument_summary(value: Any) -> str:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from typing import Any, cast
 
 import pytest
 from tests.core.checkpoint_schema_conformance import (
+    assert_assistant_publication_checkpoint_conformance,
+    assert_current_checkpoint_publication_upgrade_conformance,
     assert_future_checkpoint_rejection_conformance,
     assert_versionless_checkpoint_resume_conformance,
     assert_versionless_noop_transform_stamps_conformance,
@@ -18,6 +21,7 @@ from cayu import (
 )
 from cayu.runtime import InMemorySessionStore
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _session_engine as session_engine
 from cayu.runtime._tool_round_recovery import pending_tool_round_from_checkpoint
 from cayu.runtime.checkpoints import (
@@ -25,6 +29,7 @@ from cayu.runtime.checkpoints import (
     CheckpointMigrationDefinitionError,
     CheckpointMigrator,
     decode_runtime_checkpoint,
+    runtime_checkpoint_writer_view,
 )
 from cayu.runtime.context import _compaction_checkpoint
 from cayu.runtime.user_input import pending_user_input_from_checkpoint
@@ -134,7 +139,17 @@ def test_frozen_versionless_root_payloads_decode_without_data_loss_and_remain_co
     assert decoded[CHECKPOINT_SCHEMA_VERSION_KEY] == CURRENT_CHECKPOINT_SCHEMA_VERSION
     without_version = dict(decoded)
     without_version.pop(CHECKPOINT_SCHEMA_VERSION_KEY)
-    assert without_version == fixture
+    expected = copy.deepcopy(fixture)
+    if fixture_name in {"pending-tool-round", "user-input"}:
+        checkpoint_key = (
+            "pending_tool_round" if fixture_name == "pending-tool-round" else "pending_user_input"
+        )
+        pending_state = cast("dict[str, object]", expected[checkpoint_key])
+        pending_state.update(
+            assistant_message_state="published",
+            quarantined_assistant_message=None,
+        )
+    assert without_version == expected
     if fixture_name == "approval":
         assert approval_support.pending_approval_from_checkpoint(decoded) is not None
     elif fixture_name == "user-input":
@@ -147,7 +162,7 @@ def test_frozen_versionless_root_payloads_decode_without_data_loss_and_remain_co
         assert _compaction_checkpoint(decoded) is not None
 
 
-def test_versionless_root_checkpoint_is_lifted_to_version_one() -> None:
+def test_versionless_root_checkpoint_is_migrated_to_current_version() -> None:
     source = {
         "pending_user_input": {"input_id": "input-1"},
         "future_additive_field": {"kept": True},
@@ -156,8 +171,12 @@ def test_versionless_root_checkpoint_is_lifted_to_version_one() -> None:
     decoded = decode_runtime_checkpoint(source, session_id="sess-versionless")
 
     assert decoded == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
-        "pending_user_input": {"input_id": "input-1"},
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        "pending_user_input": {
+            "input_id": "input-1",
+            "assistant_message_state": "published",
+            "quarantined_assistant_message": None,
+        },
         "future_additive_field": {"kept": True},
     }
     assert source == {
@@ -177,6 +196,64 @@ def test_versionless_root_checkpoint_has_a_fixed_legacy_version() -> None:
 
     assert caught.value.reason == "checkpoint_schema_version_too_old"
     assert caught.value.observed_version == 1
+
+
+def test_v1_model_publication_pointer_is_upcast_to_v2() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY: {
+            "record_type": "cayu.model-step-publication",
+            "schema_version": 1,
+            "logical_step_id": "logical-step",
+            "stage_id": "stage-1",
+            "source_transcript_cursor": 0,
+            "transcript_end_cursor": 1,
+            "completion_event_id": "completion-event",
+            "classification": {"type": "final"},
+            "assistant_message_published": True,
+            "tool_round_id": None,
+        },
+    }
+
+    decoded = decode_runtime_checkpoint(source, session_id="sess-v1-publication")
+
+    assert decoded is not None
+    pointer = model_completion_publication.ModelStepPublicationCheckpoint.model_validate(
+        decoded[model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY]
+    )
+    assert pointer.schema_version == 2
+    assert pointer.assistant_message_deferred is False
+    original_pointer = cast(
+        "dict[str, object]",
+        source[model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY],
+    )
+    assert original_pointer["schema_version"] == 1
+
+
+def test_v1_writer_view_rejects_unrecognized_current_model_publication_pointer() -> None:
+    source = {
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
+        model_completion_publication.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY: {
+            "record_type": "cayu.model-step-publication",
+            "schema_version": CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
+            "logical_step_id": "logical-step",
+            "stage_id": "stage-1",
+            "source_transcript_cursor": 0,
+            "transcript_end_cursor": 1,
+            "completion_event_id": "completion-event",
+            "classification": {"type": "final"},
+            "assistant_message_published": True,
+            "assistant_message_deferred": False,
+            "tool_round_id": None,
+        },
+    }
+
+    with pytest.raises(ValueError, match="not a recognized v2 pointer"):
+        runtime_checkpoint_writer_view(
+            source,
+            writer_version=1,
+            session_id="sess-future-nested-publication",
+        )
 
 
 def test_current_root_checkpoint_is_defensively_copied() -> None:
@@ -225,7 +302,7 @@ def test_malformed_root_checkpoint_version_fails_with_bounded_typed_evidence(
     assert error.checkpoint_kind == "root"
     assert error.observed_version is None
     assert error.supported_min_version == 1
-    assert error.supported_max_version == 1
+    assert error.supported_max_version == CURRENT_CHECKPOINT_SCHEMA_VERSION
     assert error.session_id == "sess-invalid-version"
     assert error.recovery_disposition == "cannot_migrate"
     assert error.resumable_in_place is False
@@ -235,7 +312,7 @@ def test_malformed_root_checkpoint_version_fails_with_bounded_typed_evidence(
 
 def test_future_root_checkpoint_version_fails_with_bounded_typed_evidence() -> None:
     source = {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
+        CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
         "secret_checkpoint_content": "must-not-appear",
     }
 
@@ -244,15 +321,15 @@ def test_future_root_checkpoint_version_fails_with_bounded_typed_evidence() -> N
 
     error = caught.value
     assert error.reason == "checkpoint_schema_version_too_new"
-    assert error.observed_version == 2
+    assert error.observed_version == CURRENT_CHECKPOINT_SCHEMA_VERSION + 1
     assert error.safe_evidence() == {
         "checkpoint_kind": "root",
-        "observed_version": 2,
+        "observed_version": CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
         "reason": "checkpoint_schema_version_too_new",
         "recovery_disposition": "cannot_migrate",
         "resumable_in_place": False,
         "session_id": "sess-future-version",
-        "supported_max_version": 1,
+        "supported_max_version": CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "supported_min_version": 1,
     }
     assert "must-not-appear" not in str(error)
@@ -263,7 +340,7 @@ def test_compatibility_evidence_hashes_an_oversized_session_identity() -> None:
 
     with pytest.raises(CheckpointCompatibilityError) as caught:
         decode_runtime_checkpoint(
-            {CHECKPOINT_SCHEMA_VERSION_KEY: 2},
+            {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION + 1},
             session_id=oversized_session_id,
         )
 
@@ -393,6 +470,14 @@ def test_in_memory_checkpoint_schema_runtime_conformance() -> None:
             store,
             session_id="sess-memory-future-checkpoint",
         )
+        await assert_current_checkpoint_publication_upgrade_conformance(
+            store,
+            session_id_prefix="sess-memory-current-publication",
+        )
+        await assert_assistant_publication_checkpoint_conformance(
+            store,
+            session_id="sess-memory-assistant-publication",
+        )
 
     asyncio.run(run())
 
@@ -412,6 +497,14 @@ def test_sqlite_checkpoint_schema_runtime_conformance(tmp_path) -> None:
             await assert_future_checkpoint_rejection_conformance(
                 store,
                 session_id="sess-sqlite-future-checkpoint",
+            )
+            await assert_current_checkpoint_publication_upgrade_conformance(
+                store,
+                session_id_prefix="sess-sqlite-current-publication",
+            )
+            await assert_assistant_publication_checkpoint_conformance(
+                store,
+                session_id="sess-sqlite-assistant-publication",
             )
         finally:
             await store.close()

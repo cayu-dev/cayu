@@ -36,6 +36,15 @@ from cayu.evals.portable_evaluation import (
 from cayu.runtime.costs import PriceBook, SessionCostSummary, estimate_session_cost
 from cayu.runtime.sessions import SessionStatus
 
+_TOOL_ARGUMENT_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+        EventType.TOOL_CALL_BLOCKED,
+        EventType.TOOL_CALL_APPROVAL_DENIED,
+    }
+)
+
 
 class EvalAssertion(ABC):
     """Assertion over a completed Cayu eval case."""
@@ -482,10 +491,41 @@ class ToolArgsContain(EvalAssertion):
         self.expected = dict(expected)
 
     async def evaluate(self, context: EvalContext) -> EvalAssertionResult:
+        observed_arguments: list[dict[str, Any]] = []
         starts = _tool_start_events(context.events, self.tool_name)
+        started_idempotency_keys: set[str] = set()
         for event in starts:
+            arguments_state = event.payload.get("arguments_state")
+            idempotency_key = event.payload.get("idempotency_key")
+            if arguments_state == "quarantined" and (
+                type(idempotency_key) is str and idempotency_key
+            ):
+                started_idempotency_keys.add(idempotency_key)
+                continue
+            # Compatibility with evaluations over historical event-only fixtures.
+            if arguments_state is not None:
+                continue
             arguments = event.payload.get("arguments")
+            if isinstance(arguments, Mapping):
+                observed_arguments.append(dict(arguments))
             if isinstance(arguments, Mapping) and _mapping_contains(arguments, self.expected):
+                return self.passed(
+                    f"Tool {self.tool_name} arguments contained expected values.",
+                    metadata={"expected": self.expected, "actual": dict(arguments)},
+                )
+        for event in _tool_terminal_events(context.events, self.tool_name):
+            idempotency_key = event.payload.get("idempotency_key")
+            if (
+                type(idempotency_key) is not str
+                or idempotency_key not in started_idempotency_keys
+                or event.payload.get("arguments_state") != "finalized"
+            ):
+                continue
+            arguments = event.payload.get("arguments")
+            if not isinstance(arguments, Mapping):
+                continue
+            observed_arguments.append(dict(arguments))
+            if _mapping_contains(arguments, self.expected):
                 return self.passed(
                     f"Tool {self.tool_name} arguments contained expected values.",
                     metadata={"expected": self.expected, "actual": dict(arguments)},
@@ -494,11 +534,7 @@ class ToolArgsContain(EvalAssertion):
             f"No {self.tool_name} call contained expected arguments.",
             metadata={
                 "expected": self.expected,
-                "actual": [
-                    dict(event.payload.get("arguments", {}))
-                    for event in starts
-                    if isinstance(event.payload.get("arguments"), Mapping)
-                ],
+                "actual": observed_arguments,
             },
         )
 
@@ -869,6 +905,14 @@ def _direct_tool_evidence(
         root_evidence_available=context.root_evidence_available,
         allow_event_count_fallback=True,
     )
+
+
+def _tool_terminal_events(events: tuple[Event, ...], tool_name: str) -> list[Event]:
+    return [
+        event
+        for event in events
+        if event.type in _TOOL_ARGUMENT_TERMINAL_EVENT_TYPES and event.tool_name == tool_name
+    ]
 
 
 def _message_text(message: Message) -> str:

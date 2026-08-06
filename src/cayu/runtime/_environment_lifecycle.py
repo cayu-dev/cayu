@@ -751,6 +751,7 @@ class EnvironmentLifecycle:
             resolved_environment = runtime_records.RegisteredEnvironment(
                 spec=registered_environment.spec,
                 environment=environment,
+                factory_backed=True,
                 execution_candidate=(
                     None if admission_candidate is None else admission_candidate.candidate
                 ),
@@ -1272,6 +1273,7 @@ class EnvironmentLifecycle:
         bound_registered_environment = runtime_records.RegisteredEnvironment(
             spec=registered_environment.spec,
             environment=bound_environment,
+            factory_backed=registered_environment.factory_backed,
             bound_workspace=bound,
             binding_payload=copy_json_value(base_payload, "binding_payload"),
             execution_candidate=registered_environment.execution_candidate,

@@ -161,17 +161,16 @@ def test_event_payload_policies_cover_every_exact_builtin_type() -> None:
 
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
     assert (
-        frozenset(PendingToolCallApproval.model_fields)
+        frozenset(PendingToolCallApproval.model_fields) | {"arguments_state"}
         == event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES
     )
     assert (
-        frozenset(PendingToolApproval.model_fields)
+        frozenset(PendingToolApproval.model_fields) | {"arguments_state"}
         == event_projection_module._PENDING_APPROVAL_FIELD_NAMES
     )
-    assert (
-        frozenset(PendingUserInput.model_fields)
-        == event_projection_module._PENDING_USER_INPUT_FIELD_NAMES
-    )
+    assert (frozenset(PendingUserInput.model_fields) - {"staged_terminals"}) | {
+        "arguments_state"
+    } == event_projection_module._PENDING_USER_INPUT_FIELD_NAMES
 
 
 @pytest.mark.parametrize(
@@ -528,6 +527,113 @@ def test_runtime_tool_idempotency_authority_is_recomputed_not_shape_trusted() ->
             ),
             redactor=SecretRedactor(forged),
         )
+
+
+def test_pre_execution_projection_removes_every_effective_argument_copy() -> None:
+    identity = {
+        "model_step_id": "step",
+        "model_attempt_id": "attempt",
+        "tool_round_id": "round",
+        "tool_call_id": "call",
+    }
+    prepared_start = prepare_new_runtime_event(
+        Event(
+            type=EventType.TOOL_CALL_STARTED,
+            session_id="session",
+            payload={
+                **identity,
+                "arguments": {"private": "original"},
+                "effective_arguments": {"private": "modified"},
+                "idempotency_key": tool_idempotency_key(
+                    session_id="session",
+                    tool_round_id="round",
+                    tool_call_id="call",
+                ),
+            },
+        ),
+        redactor=SecretRedactor(),
+    )
+    prepared_pause = prepare_new_runtime_event(
+        Event(
+            type=EventType.SESSION_AWAITING_USER_INPUT,
+            session_id="session",
+            payload={
+                "tool_calls": [
+                    {
+                        **identity,
+                        "tool_name": "safe",
+                        "arguments": {"private": "original"},
+                        "effective_arguments": {"private": "modified"},
+                    }
+                ]
+            },
+        ),
+        redactor=SecretRedactor(),
+    )
+
+    assert prepared_start.payload["arguments_state"] == "quarantined"
+    assert "arguments" not in prepared_start.payload
+    assert "effective_arguments" not in prepared_start.payload
+    paused_call = prepared_pause.payload["tool_calls"][0]
+    assert paused_call["arguments_state"] == "quarantined"
+    assert "arguments" not in paused_call
+    assert "effective_arguments" not in paused_call
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"arguments_state": "finalized"},
+        {"arguments_state": "unavailable", "arguments": {}},
+        {"arguments_state": "unavailable", "effective_arguments": {}},
+        {"arguments_state": "future", "arguments": {}},
+    ],
+)
+def test_new_terminal_events_reject_contradictory_argument_state(payload: dict[str, Any]) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        prepare_new_runtime_event(
+            Event(
+                type=EventType.TOOL_CALL_FAILED,
+                session_id="session",
+                payload={
+                    "tool_call_id": "call",
+                    "tool_name": "safe",
+                    **payload,
+                },
+            ),
+            redactor=SecretRedactor(),
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"arguments_state": "finalized"},
+        {"arguments_state": "unavailable", "arguments": {"private": "value"}},
+        {"arguments_state": "unavailable", "effective_arguments": {"private": "value"}},
+        {"arguments_state": "future", "arguments": {"private": "value"}},
+    ],
+)
+def test_legacy_terminal_argument_conflicts_project_fail_closed(
+    payload: dict[str, Any],
+) -> None:
+    public = project_runtime_event(
+        Event(
+            type=EventType.TOOL_CALL_FAILED,
+            session_id="session",
+            payload={
+                "tool_call_id": "call",
+                "tool_name": "safe",
+                **payload,
+            },
+        ),
+        sequence=1,
+        redactor=SecretRedactor(),
+    )
+
+    assert public.payload["arguments_state"] == "unavailable"
+    assert "arguments" not in public.payload
+    assert "effective_arguments" not in public.payload
 
 
 def test_proxy_authority_is_non_actionable_and_verified_idempotency_survives_reprepare() -> None:
@@ -1033,18 +1139,46 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
             event_projection_module._PENDING_USER_INPUT_FIELD_NAMES,
         ),
     ):
+        private_field_names = {
+            "arguments",
+            "assistant_publication",
+            "assistant_message_state",
+            "quarantined_assistant_message",
+            "secret_resolution_scope",
+        }
         for field_name in field_names:
             prepared = prepare_new_runtime_event(
                 event,
                 redactor=SecretRedactor(field_name),
             )
-            assert field_name in prepared.payload[container_name]
+            if field_name in private_field_names:
+                assert field_name not in prepared.payload[container_name]
+                assert prepared.payload[container_name]["arguments_state"] == "quarantined"
+            else:
+                assert field_name in prepared.payload[container_name]
         for field_name in event_projection_module._PENDING_TOOL_CALL_FIELD_NAMES:
             prepared = prepare_new_runtime_event(
                 event,
                 redactor=SecretRedactor(field_name),
             )
-            assert field_name in prepared.payload[container_name]["tool_calls"][0]
+            if field_name == "arguments":
+                assert field_name not in prepared.payload[container_name]["tool_calls"][0]
+                assert (
+                    prepared.payload[container_name]["tool_calls"][0]["arguments_state"]
+                    == "quarantined"
+                )
+            else:
+                assert field_name in prepared.payload[container_name]["tool_calls"][0]
+
+        marker_collision = prepare_new_runtime_event(
+            event,
+            redactor=SecretRedactor("quarantined"),
+        )
+        assert marker_collision.payload[container_name]["arguments_state"] == "quarantined"
+        assert (
+            marker_collision.payload[container_name]["tool_calls"][0]["arguments_state"]
+            == "quarantined"
+        )
 
 
 @pytest.mark.parametrize(

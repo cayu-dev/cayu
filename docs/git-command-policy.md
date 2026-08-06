@@ -163,9 +163,12 @@ argv item, path, revision, commit message, environment value, stdin, repository
 content, credential, URL, or command output. The terminal
 `tool.call.blocked` result therefore stays category-only and carries
 `denied_by=command_policy`. The ordinary Cayu
-audit/replay contract still records the model's original tool arguments on
-`tool.call.started`; do not place secrets in command argv, environment, stdin,
-or commit messages when that event stream is not an appropriate secret store.
+audit/replay contract records only `arguments_state="quarantined"` on
+`tool.call.started`. After execution, the terminal tool event carries either a
+secret-redacted `arguments` object with `arguments_state="finalized"`, or
+`arguments_state="unavailable"` when no complete invocation secret scope was
+established. Command argv, environment, stdin, and commit messages remain
+private execution inputs and must not be copied into policy diagnostics.
 
 ## Residual risk and isolation
 

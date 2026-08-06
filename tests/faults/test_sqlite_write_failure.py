@@ -145,9 +145,13 @@ async def test_sqlite_terminal_write_failure_requires_manual_recovery_without_re
                 "SELECT event_type FROM cayu_events ORDER BY sequence"
             ).fetchall()
         ]
-    # The failed append touched last_activity_at while the session was still running.
-    # Only later, successful failure-reporting writes may leave audit markers behind.
-    assert activity_markers == {"activity-after-effect:failed"}
+    # Publication-scope evidence is checkpointed after the effect and before
+    # the terminal event. The rejected terminal append therefore observes the
+    # running state, while later failure reporting records the failed state.
+    assert activity_markers == {
+        "activity-after-effect:running",
+        "activity-after-effect:failed",
+    }
     assert persisted_types.count("tool.call.started") == 1
     assert "tool.call.completed" not in persisted_types
 

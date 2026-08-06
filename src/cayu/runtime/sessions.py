@@ -131,6 +131,7 @@ from cayu.runtime.budgets import (
 from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
+    decode_runtime_checkpoint,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -1431,6 +1432,68 @@ CheckpointTransform = Callable[
 CHECKPOINT_ROOT_FIELD_SCALAR_MAX_CHARS = 32
 
 
+def _validate_checkpoint_codec_pair(
+    checkpoint_decode: CheckpointTransform | None,
+    checkpoint_encode: CheckpointTransform | None,
+) -> None:
+    if (checkpoint_decode is None) != (checkpoint_encode is None):
+        raise ValueError("Checkpoint decode and encode transforms must be supplied together.")
+    if checkpoint_decode is not None and not callable(checkpoint_decode):
+        raise TypeError("checkpoint_decode must be callable.")
+    if checkpoint_encode is not None and not callable(checkpoint_encode):
+        raise TypeError("checkpoint_encode must be callable.")
+
+
+@dataclass(frozen=True)
+class _RuntimePublicationCheckpointCodec:
+    """Task-scoped checkpoint projection captured by a prepared publication."""
+
+    decode: CheckpointTransform
+    encode: CheckpointTransform
+    apply_mutation: Callable[
+        [Session, dict[str, Any] | None, RuntimePublicationMutation],
+        dict[str, Any] | None,
+    ]
+
+    def __post_init__(self) -> None:
+        _validate_checkpoint_codec_pair(self.decode, self.encode)
+        if not callable(self.apply_mutation):
+            raise TypeError("Checkpoint mutation projection must be callable.")
+
+
+_RUNTIME_PUBLICATION_CHECKPOINT_CODEC: ContextVar[_RuntimePublicationCheckpointCodec | None] = (
+    ContextVar("cayu_runtime_publication_checkpoint_codec", default=None)
+)
+
+
+@contextmanager
+def _runtime_publication_checkpoint_codec_scope(
+    *,
+    decode: CheckpointTransform,
+    encode: CheckpointTransform,
+    apply_mutation: Callable[
+        [Session, dict[str, Any] | None, RuntimePublicationMutation],
+        dict[str, Any] | None,
+    ],
+) -> Iterator[None]:
+    """Carry one codec through legacy-compatible public store overrides."""
+
+    codec = _RuntimePublicationCheckpointCodec(
+        decode=decode,
+        encode=encode,
+        apply_mutation=apply_mutation,
+    )
+    token = _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.set(codec)
+    try:
+        yield
+    finally:
+        _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.reset(token)
+
+
+def _active_runtime_publication_checkpoint_codec() -> _RuntimePublicationCheckpointCodec | None:
+    return _RUNTIME_PUBLICATION_CHECKPOINT_CODEC.get()
+
+
 @dataclass(frozen=True)
 class CheckpointRootFieldProjection:
     """Bounded opaque evidence for one runtime-selected root field."""
@@ -2040,6 +2103,7 @@ class _PreparedRuntimePublication:
     expected_statuses: frozenset[SessionStatus] | None
     expected_run_epoch: int | None
     expected_transcript_cursor: int | None
+    checkpoint_codec: _RuntimePublicationCheckpointCodec | None = None
 
 
 MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX = "__cayu_model_completion_stage_v1__:"
@@ -5010,12 +5074,15 @@ class SessionStore(ABC):
         identity: SessionIdentity,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> Session:
         """Create a session, optionally admitting its first interaction atomically.
 
         With admission, create the session directly in ``RUNNING``, claim its
         first run epoch, and persist the start event plus deferred source batch
         in the same transaction. Both optional arguments are supplied together.
+        When supplied with an admitted interaction, ``checkpoint_transform``
+        projects the initial authority marker inside that same transaction.
         """
 
     @abstractmethod
@@ -5608,7 +5675,7 @@ class SessionStore(ABC):
         self,
         prepared: _PreparedModelCompletionStageTerminal,
     ) -> ModelCompletionStageResult:
-        """Backend hook for an insert-only terminal completion record."""
+        """Backend hook for an insert-only terminal provider-response record."""
 
         raise NotImplementedError(
             f"{type(self).__name__} does not support durable model-completion stages."
@@ -6695,6 +6762,7 @@ class InMemorySessionStore(SessionStore):
         identity: SessionIdentity,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> Session:
         if type(request) is not RunRequest:
             raise TypeError("Session creation requires a RunRequest.")
@@ -6768,7 +6836,11 @@ class InMemorySessionStore(SessionStore):
                 )
                 self._store_checkpoint_unlocked(
                     session.id,
-                    _initial_transcript_pending_checkpoint(interaction_id),
+                    _initial_transcript_pending_checkpoint(
+                        session,
+                        interaction_id,
+                        checkpoint_transform=checkpoint_transform,
+                    ),
                 )
                 session = self._sessions[session.id]
                 _activate_session_run_fence(session)
@@ -8929,7 +9001,6 @@ class InMemorySessionStore(SessionStore):
                 raise SessionModelCompletionStageConflict(
                     "The terminal model completion intent conflicts with its preparation."
                 )
-
             completed_at = _next_runtime_publication_timestamp(session)
             terminal_record = _model_completion_stage_terminal_record(
                 prepared,
@@ -9138,6 +9209,8 @@ class InMemorySessionStore(SessionStore):
         session: Session,
         model_completion_stage: ModelCompletionStage | None = None,
     ) -> RuntimePublicationResult:
+        checkpoint_codec = prepared.checkpoint_codec
+        checkpoint_decode = None if checkpoint_codec is None else checkpoint_codec.decode
         session_id = prepared.session_id
         request = prepared.request
         operation_records = self._session_operation_records[session_id]
@@ -9201,7 +9274,12 @@ class InMemorySessionStore(SessionStore):
             durable_events_by_id,
             interaction_id=request.interaction_id,
         )
-        current_checkpoint = self._checkpoints.get(session_id)
+        stored_checkpoint = self._checkpoints.get(session_id)
+        current_checkpoint = (
+            stored_checkpoint
+            if checkpoint_decode is None
+            else checkpoint_decode(session, deepcopy(stored_checkpoint))
+        )
         _validate_tool_round_checkpoint_mutation(request, current_checkpoint)
         durable_tool_events: list[Event] = []
         tool_round_identity = _tool_round_publication_identity(request)
@@ -9234,10 +9312,19 @@ class InMemorySessionStore(SessionStore):
                 f"Event already exists for session {session_id}: {min(existing_event_ids)}"
             )
 
-        checkpoint = _apply_runtime_publication_checkpoint_mutation(
-            request.mutation,
-            current_checkpoint,
-        )
+        if checkpoint_codec is None:
+            checkpoint = _apply_runtime_publication_checkpoint_mutation(
+                request.mutation,
+                current_checkpoint,
+            )
+            stored_target_checkpoint = checkpoint
+        else:
+            checkpoint = checkpoint_codec.apply_mutation(
+                session,
+                deepcopy(stored_checkpoint),
+                request.mutation,
+            )
+            stored_target_checkpoint = checkpoint_codec.encode(session, checkpoint)
         if prepared.storage_key in operation_records:
             raise SessionRuntimePublicationConflict(
                 "Runtime publication receipt appeared while the session lock was held."
@@ -9249,10 +9336,10 @@ class InMemorySessionStore(SessionStore):
         )
         prepared_checkpoint = (
             None
-            if checkpoint is None or not request.mutation.operations
+            if stored_target_checkpoint is None or not request.mutation.operations
             else self._prepare_checkpoint_store_unlocked(
                 session_id,
-                checkpoint,
+                stored_target_checkpoint,
                 additional_event_records=tuple(event.record for event in prepared_events.events),
             )
         )
@@ -9261,7 +9348,7 @@ class InMemorySessionStore(SessionStore):
         receipt = _build_runtime_publication_receipt(
             prepared,
             source_session=session,
-            checkpoint=checkpoint,
+            checkpoint=stored_target_checkpoint,
             transcript_start_cursor=transcript_start_cursor,
             published_at=published_at,
         )
@@ -11289,6 +11376,15 @@ def _apply_runtime_publication_checkpoint_mutation(
     return updated
 
 
+def apply_runtime_publication_checkpoint_mutation(
+    mutation: RuntimePublicationMutation,
+    checkpoint: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Apply a validated runtime publication mutation to a defensive checkpoint copy."""
+
+    return _apply_runtime_publication_checkpoint_mutation(mutation, checkpoint)
+
+
 def _runtime_publication_event_digest(event: Event) -> str:
     copied_event = copy_event(event)
     return _canonical_runtime_publication_digest(copied_event.model_dump(mode="json"))
@@ -11659,21 +11755,41 @@ def _validate_tool_round_publication(
         round_id=round_id,
     )
 
+    if len(request.transcript_messages) not in {1, 2}:
+        raise ValueError(
+            "A tool-round publication must append its grouped result and optional "
+            "deferred assistant message."
+        )
+    assistant_call_parts: list[ToolCallPart] = []
+    result_message = request.transcript_messages[-1]
+    if len(request.transcript_messages) == 2:
+        assistant_message = request.transcript_messages[0]
+        if assistant_message.role != MessageRole.ASSISTANT:
+            raise ValueError("A deferred tool-round message must be an assistant message.")
+        assistant_call_parts = [
+            part for part in assistant_message.content if isinstance(part, ToolCallPart)
+        ]
+        if not assistant_call_parts:
+            raise ValueError("A deferred assistant message requires tool-call content.")
+    if result_message.role != MessageRole.TOOL:
+        raise ValueError("A tool-round publication must end with a tool-result message.")
     result_parts: list[ToolResultPart] = []
-    if len(request.transcript_messages) != 1:
-        raise ValueError("A tool-round publication must append one grouped tool-result message.")
-    for message in request.transcript_messages:
-        if message.role != MessageRole.TOOL:
-            raise ValueError("A tool-round publication can append only tool-result messages.")
-        for part in message.content:
-            if not isinstance(part, ToolResultPart):
-                raise ValueError(
-                    "A tool-round publication transcript can contain only tool results."
-                )
-            result_parts.append(part)
+    for part in result_message.content:
+        if not isinstance(part, ToolResultPart):
+            raise ValueError(
+                "A tool-round publication result message can contain only tool results."
+            )
+        result_parts.append(part)
     if tuple(part.tool_call_id for part in result_parts) != tool_call_ids:
         raise ValueError(
             "Tool-round result order and identities must exactly match intent.tool_call_ids."
+        )
+    if (
+        assistant_call_parts
+        and tuple(part.tool_call_id for part in assistant_call_parts) != tool_call_ids
+    ):
+        raise ValueError(
+            "Deferred assistant tool-call order must exactly match intent.tool_call_ids."
         )
 
     candidate_durable_events = (
@@ -11792,6 +11908,28 @@ def _validate_tool_round_publication(
         ):
             raise ValueError(
                 "A tool-round terminal event outcome conflicts with its transcript result."
+            )
+    for part in assistant_call_parts:
+        if (
+            part.model_step_id != execution_identity.model_step_id
+            or part.model_attempt_id != execution_identity.model_attempt_id
+            or part.tool_round_id != execution_identity.tool_round_id
+        ):
+            raise ValueError("A deferred assistant tool call has a conflicting execution identity.")
+        terminal = terminal_by_call[part.tool_call_id]
+        if terminal.tool_name != part.tool_name:
+            raise ValueError("A deferred assistant tool name conflicts with terminal evidence.")
+        arguments_state = terminal.payload.get("arguments_state")
+        expected_arguments = (
+            terminal.payload.get("arguments") if arguments_state == "finalized" else {}
+        )
+        if (
+            arguments_state not in {"finalized", "unavailable"}
+            or type(expected_arguments) is not dict
+            or not _runtime_publication_json_equal(part.arguments, expected_arguments)
+        ):
+            raise ValueError(
+                "A deferred assistant argument projection conflicts with terminal evidence."
             )
 
     pending_round_deletions = [
@@ -12038,6 +12176,16 @@ def _validate_tool_round_checkpoint_mutation(
     if type(raw_calls) is not list or any(type(call) is not dict for call in raw_calls):
         raise SessionRuntimePublicationConflict(
             "The durable pending tool round call list is malformed."
+        )
+    assistant_message_state = marker.get("assistant_message_state", "published")
+    if assistant_message_state not in {"published", "quarantined"}:
+        raise SessionRuntimePublicationConflict(
+            "The durable pending tool round assistant-message state is malformed."
+        )
+    expected_transcript_message_count = 2 if assistant_message_state == "quarantined" else 1
+    if len(request.transcript_messages) != expected_transcript_message_count:
+        raise SessionRuntimePublicationConflict(
+            "The tool-round transcript does not match the durable assistant-message state."
         )
     marker_call_ids = tuple(call.get("tool_call_id") for call in raw_calls)
     if (
@@ -12362,9 +12510,28 @@ def _validate_assistant_model_completion_publication(
             raise ValueError(
                 "The model.completed identity conflicts with its staged model attempt."
             )
-    assistant_message = (
+    published_assistant_message = (
         publication.transcript_messages[0] if publication.transcript_messages else None
     )
+    operations_by_key = {operation.key: operation for operation in publication.mutation.operations}
+    schema_operation = operations_by_key.get(CHECKPOINT_SCHEMA_VERSION_KEY)
+    pending_operation = operations_by_key.get(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
+    pending_marker = None if pending_operation is None else pending_operation.value
+    assistant_message = published_assistant_message
+    assistant_message_deferred = False
+    if (
+        assistant_message is None
+        and type(pending_marker) is dict
+        and pending_marker.get("assistant_message_state") == "quarantined"
+    ):
+        raw_quarantined_message = pending_marker.get("quarantined_assistant_message")
+        try:
+            assistant_message = Message.model_validate(raw_quarantined_message)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "A deferred model completion requires a valid private assistant message."
+            ) from exc
+        assistant_message_deferred = True
     tool_calls = (
         tuple(part for part in assistant_message.content if isinstance(part, ToolCallPart))
         if assistant_message is not None
@@ -12411,7 +12578,6 @@ def _validate_assistant_model_completion_publication(
     expected_operation_keys = {LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY}
     if tool_calls:
         expected_operation_keys.add(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
-    operations_by_key = {operation.key: operation for operation in publication.mutation.operations}
     actual_operation_keys = frozenset(operations_by_key)
     if actual_operation_keys not in {
         frozenset(expected_operation_keys),
@@ -12422,27 +12588,66 @@ def _validate_assistant_model_completion_publication(
             "pointer, optional pending tool-round marker, and optional root checkpoint "
             "schema stamp."
         )
-    schema_operation = operations_by_key.get(CHECKPOINT_SCHEMA_VERSION_KEY)
-    if schema_operation is not None and (
-        schema_operation.action != "set"
-        or schema_operation.expected_value_digest
-        != runtime_publication_checkpoint_value_digest(
-            CURRENT_CHECKPOINT_SCHEMA_VERSION,
-        )
-        or schema_operation.value != CURRENT_CHECKPOINT_SCHEMA_VERSION
-    ):
-        raise ValueError(
-            "A model completion root checkpoint schema stamp must fence the current version."
-        )
+    if schema_operation is not None:
+        if (
+            type(schema_operation.value) is not int
+            or not 1 <= schema_operation.value <= CURRENT_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "A model completion root checkpoint schema stamp must target a supported version."
+            )
+        supported_schema_digests = {
+            runtime_publication_checkpoint_value_digest(version)
+            for version in range(1, CURRENT_CHECKPOINT_SCHEMA_VERSION + 1)
+        }
+        if (
+            schema_operation.action != "set"
+            or schema_operation.expected_value_digest not in supported_schema_digests | {None}
+        ):
+            raise ValueError(
+                "A model completion root checkpoint schema stamp must fence a supported version."
+            )
 
     pointer_operation = operations_by_key[LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY]
     if pointer_operation.action != "set":
         raise ValueError("A model-step publication pointer must use a set operation.")
     try:
-        pointer = ModelStepPublicationCheckpoint.model_validate(pointer_operation.value)
+        if type(pointer_operation.value) is not dict:
+            raise TypeError("The model-step publication pointer must be an object.")
+        raw_pointer_schema_version = pointer_operation.value.get("schema_version")
+        if (
+            type(raw_pointer_schema_version) is not int
+            or not 1 <= raw_pointer_schema_version <= CURRENT_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "The model-step publication pointer has an unsupported schema version."
+            )
+        if schema_operation is not None and schema_operation.value != raw_pointer_schema_version:
+            raise ValueError(
+                "The model-step publication pointer schema conflicts with its root schema."
+            )
+        staged_checkpoint = {
+            CHECKPOINT_SCHEMA_VERSION_KEY: raw_pointer_schema_version,
+            LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY: pointer_operation.value,
+        }
+        if type(pending_marker) is dict:
+            staged_checkpoint[_PENDING_TOOL_ROUND_CHECKPOINT_KEY] = pending_marker
+        normalized_pointer_checkpoint = decode_runtime_checkpoint(
+            staged_checkpoint,
+            session_id=completed_event.session_id,
+        )
+        if normalized_pointer_checkpoint is None:
+            raise TypeError("The model-step publication pointer is missing.")
+        pointer = ModelStepPublicationCheckpoint.model_validate(
+            normalized_pointer_checkpoint[LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY]
+        )
+        if type(pending_marker) is dict:
+            pending_marker = normalized_pointer_checkpoint.get(_PENDING_TOOL_ROUND_CHECKPOINT_KEY)
     except (TypeError, ValueError) as exc:
         raise ValueError("The model-step publication pointer is malformed.") from exc
-    expected_transcript_end = stage.source_transcript_cursor + int(assistant_message is not None)
+    expected_transcript_end = stage.source_transcript_cursor + int(
+        published_assistant_message is not None
+    )
     expected_pointer = ModelStepPublicationCheckpoint(
         logical_step_id=stage.logical_step_id,
         stage_id=stage.stage_id,
@@ -12450,7 +12655,8 @@ def _validate_assistant_model_completion_publication(
         transcript_end_cursor=expected_transcript_end,
         completion_event_id=completed_event.id,
         classification=classification,
-        assistant_message_published=assistant_message is not None,
+        assistant_message_published=published_assistant_message is not None,
+        assistant_message_deferred=assistant_message_deferred,
         tool_round_id=expected_tool_round_id,
     )
     if pointer != expected_pointer:
@@ -12466,8 +12672,10 @@ def _validate_assistant_model_completion_publication(
     pending_operation = operations_by_key[_PENDING_TOOL_ROUND_CHECKPOINT_KEY]
     if pending_operation.action != "set" or type(pending_operation.value) is not dict:
         raise ValueError("A model-step pending tool-round marker must use an object set operation.")
-    marker = pending_operation.value
-    expected_marker_keys = {
+    marker = pending_marker
+    if type(marker) is not dict:
+        raise ValueError("A model-step pending tool-round marker must be an object.")
+    required_marker_keys = {
         "tool_round_id",
         "model_step_id",
         "model_attempt_id",
@@ -12479,6 +12687,9 @@ def _validate_assistant_model_completion_publication(
         "policy_context_version",
         "request_metadata",
         "deferred_messages",
+        "assistant_message_state",
+        "quarantined_assistant_message",
+        "staged_terminals",
         "structured_output",
         "thinking",
         "max_steps",
@@ -12491,8 +12702,23 @@ def _validate_assistant_model_completion_publication(
         "structured_output_attempt",
         "structured_output_validation",
     }
-    if set(marker) != expected_marker_keys:
+    marker_keys = set(marker)
+    if not required_marker_keys <= marker_keys or not marker_keys <= (
+        required_marker_keys | {"assistant_publication"}
+    ):
         raise ValueError("The model-step pending tool-round marker has invalid fields.")
+    if assistant_message_deferred:
+        if assistant_message is None:
+            raise AssertionError("Deferred assistant publication lost its private message.")
+        if marker.get("quarantined_assistant_message") != assistant_message.model_dump(mode="json"):
+            raise ValueError(
+                "The quarantined assistant message conflicts with its model completion."
+            )
+    elif (
+        marker.get("assistant_message_state") != "published"
+        or marker.get("quarantined_assistant_message") is not None
+    ):
+        raise ValueError("A published assistant message cannot remain quarantined.")
     if tool_round_identity is None:
         raise ValueError("The model-step pending tool round lost its identity.")
     if (
@@ -13698,6 +13924,7 @@ def _prepare_runtime_publication(
         expected_statuses=allowed_statuses,
         expected_run_epoch=expected_run_epoch,
         expected_transcript_cursor=expected_transcript_cursor,
+        checkpoint_codec=_active_runtime_publication_checkpoint_codec(),
     )
 
 
@@ -15296,16 +15523,27 @@ def _terminal_publication_delete_block_reason(
     return None
 
 
-def _initial_transcript_pending_checkpoint(interaction_id: str) -> dict[str, Any]:
+def _initial_transcript_pending_checkpoint(
+    session: Session,
+    interaction_id: str,
+    *,
+    checkpoint_transform: CheckpointTransform | None = None,
+) -> dict[str, Any]:
     """Create the authority marker held until initial transcript publication."""
 
-    return {
+    checkpoint = {
         CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
         INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY: {
             "version": 1,
             "interaction_id": require_clean_nonblank(interaction_id, "interaction_id"),
         },
     }
+    if checkpoint_transform is None:
+        return checkpoint
+    transformed = checkpoint_transform(session, checkpoint)
+    if type(transformed) is not dict:
+        raise TypeError("Initial transcript checkpoint transform must return an object.")
+    return copy_durable_json_object(transformed, "checkpoint")
 
 
 def _initial_transcript_pending_interaction_id(

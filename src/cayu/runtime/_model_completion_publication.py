@@ -23,7 +23,7 @@ from cayu._validation import (
 
 LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY = "last_model_step_publication"
 MODEL_STEP_PUBLICATION_CHECKPOINT_RECORD_TYPE = "cayu.model-step-publication"
-MODEL_STEP_PUBLICATION_CHECKPOINT_SCHEMA_VERSION = 1
+MODEL_STEP_PUBLICATION_CHECKPOINT_SCHEMA_VERSION = 2
 _NON_TURN_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
 _MESSAGELESS_CLASSIFICATIONS = _NON_TURN_CLASSIFICATIONS | {"continue"}
 _CLASSIFICATIONS = frozenset(
@@ -47,7 +47,7 @@ class ModelStepPublicationCheckpoint(BaseModel):
     record_type: Literal["cayu.model-step-publication"] = (
         MODEL_STEP_PUBLICATION_CHECKPOINT_RECORD_TYPE
     )
-    schema_version: Literal[1] = MODEL_STEP_PUBLICATION_CHECKPOINT_SCHEMA_VERSION
+    schema_version: Literal[2] = MODEL_STEP_PUBLICATION_CHECKPOINT_SCHEMA_VERSION
     logical_step_id: str = Field(max_length=256)
     stage_id: str = Field(max_length=256)
     source_transcript_cursor: StrictInt = Field(
@@ -61,6 +61,7 @@ class ModelStepPublicationCheckpoint(BaseModel):
     completion_event_id: str
     classification: dict[str, Any]
     assistant_message_published: StrictBool
+    assistant_message_deferred: StrictBool = False
     tool_round_id: str | None = None
 
     @field_validator(
@@ -96,15 +97,24 @@ class ModelStepPublicationCheckpoint(BaseModel):
             )
         if (
             not self.assistant_message_published
+            and not self.assistant_message_deferred
             and self.classification.get("type") not in _MESSAGELESS_CLASSIFICATIONS
         ):
             raise ValueError(
                 "A model-step pointer without an assistant message requires a "
                 "non-turn or continue classification."
             )
-        if self.tool_round_id is not None and not self.assistant_message_published:
+        if self.assistant_message_published and self.assistant_message_deferred:
             raise ValueError(
-                "A model-step pointer cannot publish a tool round without an assistant message."
+                "An assistant message cannot be published and deferred simultaneously."
+            )
+        if self.assistant_message_deferred and self.tool_round_id is None:
+            raise ValueError("A deferred assistant message requires a pending tool round.")
+        if self.tool_round_id is not None and not (
+            self.assistant_message_published or self.assistant_message_deferred
+        ):
+            raise ValueError(
+                "A model-step pointer cannot own a tool round without an assistant message."
             )
         return self
 

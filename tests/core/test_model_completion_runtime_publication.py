@@ -69,6 +69,101 @@ class _PromotionAcknowledgementLostStore(InMemorySessionStore):
         return result
 
 
+class _LegacyPublicationOverrideStore(InMemorySessionStore):
+    """Exercise the established public publication signatures without catch-all kwargs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.publications = 0
+        self.stage_completions = 0
+        self.stage_promotions = 0
+
+    async def publish_runtime_publication(
+        self,
+        session_id,
+        *,
+        request,
+        expected_statuses=None,
+        expected_run_epoch=None,
+        expected_transcript_cursor=None,
+    ):
+        self.publications += 1
+        return await super().publish_runtime_publication(
+            session_id,
+            request=request,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+    async def complete_model_completion_stage(
+        self,
+        session_id,
+        *,
+        stage_id,
+        publication,
+    ):
+        self.stage_completions += 1
+        return await super().complete_model_completion_stage(
+            session_id,
+            stage_id=stage_id,
+            publication=publication,
+        )
+
+    async def promote_model_completion_stage(
+        self,
+        session_id,
+        *,
+        stage_id,
+        expected_run_epoch,
+    ):
+        self.stage_promotions += 1
+        return await super().promote_model_completion_stage(
+            session_id,
+            stage_id=stage_id,
+            expected_run_epoch=expected_run_epoch,
+        )
+
+
+class _PreAssistantPublicationStageStore(InMemorySessionStore):
+    """Store one terminal tool-round stage in the additive pre-field v2 shape."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stripped_legacy_field = False
+
+    async def complete_model_completion_stage(
+        self,
+        session_id,
+        *,
+        stage_id,
+        publication,
+    ):
+        operations = []
+        for operation in publication.mutation.operations:
+            if operation.key != "pending_tool_round" or type(operation.value) is not dict:
+                operations.append(operation)
+                continue
+            legacy_value = dict(operation.value)
+            if "assistant_publication" in legacy_value:
+                self.stripped_legacy_field = True
+                legacy_value.pop("assistant_publication")
+            operations.append(operation.model_copy(update={"value": legacy_value}, deep=True))
+        legacy_mutation = publication.mutation.model_copy(
+            update={"operations": tuple(operations)},
+            deep=True,
+        )
+        legacy_publication = publication.model_copy(
+            update={"mutation": legacy_mutation},
+            deep=True,
+        )
+        return await super().complete_model_completion_stage(
+            session_id,
+            stage_id=stage_id,
+            publication=legacy_publication,
+        )
+
+
 async def _collect(app: CayuApp, request: RunRequest) -> list[Event]:
     return [event async for event in app.run(request)]
 
@@ -95,6 +190,50 @@ def _completed_payload() -> dict:
             "total_tokens": 3,
         },
     }
+
+
+def test_runtime_checkpoint_codec_preserves_legacy_publication_overrides() -> None:
+    store = _LegacyPublicationOverrideStore()
+    provider = _ScriptedProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="legacy-publication-call",
+                    name="echo",
+                    arguments={"value": "first"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("done"),
+                ModelStreamEvent.completed(_completed_payload()),
+            ],
+        ]
+    )
+    tool = _EchoTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="legacy-publication-overrides",
+                messages=[Message.text("user", "echo")],
+            ),
+        )
+    )
+
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    assert tool.calls == ["first"]
+    assert store.publications == 1
+    assert store.stage_completions == 2
+    assert store.stage_promotions == 2
 
 
 def test_session_engine_publishes_one_authoritative_assistant_turn() -> None:
@@ -350,9 +489,9 @@ def test_session_engine_links_model_and_tool_round_publications() -> None:
     ]
     assert first_receipt is not None
     assert first_receipt.transcript_start_cursor == 1
-    assert first_receipt.transcript_end_cursor == 2
+    assert first_receipt.transcript_end_cursor == 1
     assert tool_receipt is not None
-    assert tool_receipt.transcript_start_cursor == 2
+    assert tool_receipt.transcript_start_cursor == 1
     assert tool_receipt.transcript_end_cursor == 3
     assert second_receipt is not None
     assert second_receipt.transcript_start_cursor == 3
@@ -364,6 +503,58 @@ def test_session_engine_links_model_and_tool_round_publications() -> None:
     assert pointer.logical_step_id == second_step_id
     assert pointer.transcript_end_cursor == 4
     assert pointer.tool_round_id is None
+
+
+def test_pre_upgrade_v2_tool_round_stage_promotes_without_redispatch() -> None:
+    store = _PreAssistantPublicationStageStore()
+    provider = _ScriptedProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="legacy-v2-call",
+                    name="echo",
+                    arguments={"value": "once"},
+                ),
+                ModelStreamEvent.completed(
+                    {
+                        **_completed_payload(),
+                        "finish_reason": "tool_calls",
+                    }
+                ),
+            ],
+            [
+                ModelStreamEvent.text_delta("finished"),
+                ModelStreamEvent.completed(_completed_payload()),
+            ],
+        ]
+    )
+    tool = _EchoTool()
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[tool],
+    )
+
+    events = asyncio.run(
+        _collect(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="pre-assistant-publication-v2",
+                messages=[Message.text("user", "use echo")],
+            ),
+        )
+    )
+
+    assert store.stripped_legacy_field is True
+    assert events[-1].type is EventType.SESSION_COMPLETED
+    assert provider.calls == 2
+    assert tool.calls == ["once"]
+    assert [
+        message.role
+        for message in asyncio.run(store.load_transcript("pre-assistant-publication-v2"))
+    ] == ["user", "assistant", "tool", "assistant"]
 
 
 def test_model_promotion_acknowledgement_loss_replays_without_duplication() -> None:

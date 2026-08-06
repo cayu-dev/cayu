@@ -19,11 +19,10 @@ import json
 import logging
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from hashlib import sha256
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4, uuid5
 
 from cayu._exception_groups import (
@@ -55,15 +54,18 @@ from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
 from cayu.environments import EnvironmentFactoryOperation
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
+from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _model_completion_publication as model_completion_publication
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _structured_output_tool_round as structured_output_tool_round
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime import pending_actions
 from cayu.runtime._diagnostics import (
     bound_diagnostic_text,
     exception_diagnostic,
@@ -97,10 +99,13 @@ from cayu.runtime._terminal_evidence import (
     interruption_request_id_from_payload,
 )
 from cayu.runtime._tool_round_executor import (
+    DeferredTerminalStager,
     InterruptedToolRoundRequest,
     ToolApprovalRequired,
     ToolRoundExecutor,
+    _ToolRoundPublicationCoordinator,
     policy_denial_payload_fields,
+    restore_staged_terminal_authority,
 )
 from cayu.runtime.approvals import (
     PendingToolApproval,
@@ -187,7 +192,9 @@ from cayu.runtime.user_input import (
     UserInputRecoveryRequest,
     UserInputResponse,
     pending_user_input_from_checkpoint,
+    public_pending_user_input_event_payload,
 )
+from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.vaults import SecretRedactor
 
 _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
@@ -240,6 +247,52 @@ _MODEL_BOUNDARY_TOOL_TERMINAL_EVENT_TYPES = frozenset(
         EventType.TOOL_CALL_APPROVAL_DENIED,
     }
 )
+
+_MANUAL_RECOVERY_SECRET_SCOPE_UNAVAILABLE = (
+    "Externally verified tool output is unavailable because the invocation "
+    "secret scope could not be reconstructed."
+)
+
+
+def _public_manual_recovery_result(
+    result: ToolResult,
+    *,
+    secret_resolution_scope: invocation_secrets.SecretResolutionScope,
+) -> ToolResult:
+    """Fail closed when recovery cannot positively prove a static secret scope."""
+
+    if secret_resolution_scope == "static":
+        return result.model_copy(deep=True)
+    return ToolResult(
+        content=_MANUAL_RECOVERY_SECRET_SCOPE_UNAVAILABLE,
+        structured={
+            "error": "invalid_tool_output",
+            "manual_recovery": True,
+            "outcome_unknown": False,
+            "reason": "invocation_secret_scope_unavailable",
+        },
+        is_error=result.is_error,
+    )
+
+
+def _public_resolution_audit_fields(
+    *,
+    secret_resolution_scope: invocation_secrets.SecretResolutionScope,
+    reason: str | None,
+    metadata: dict[str, Any],
+    redactor: SecretRedactor,
+) -> dict[str, Any]:
+    """Project operator audit text only with positive static-scope evidence."""
+
+    if secret_resolution_scope != "static":
+        return {"reason": None, "metadata": {}}
+    return {
+        "reason": reason,
+        **approval_support.bounded_resolution_metadata_payload(
+            metadata,
+            redactor=redactor,
+        ),
+    }
 
 
 def _receiptless_pause_event_identity(
@@ -383,7 +436,8 @@ def _pending_approval_and_round_for_atomic_claim(
         checkpoint,
         redactor=redactor,
     )
-    if pending_round is None:
+    reconstructed_approval_only_round = pending_round is None
+    if reconstructed_approval_only_round:
         # Compatibility boundary for checkpoints written before the paired
         # approval/round contract. PendingToolApproval is itself validated and
         # carries the complete policy-planned call list; the atomic claim below
@@ -395,6 +449,13 @@ def _pending_approval_and_round_for_atomic_claim(
         pending_round.tool_round_id != approval.tool_round_id
         or pending_round.model_step_id != approval.model_step_id
         or pending_round.model_attempt_id != approval.model_attempt_id
+        or (
+            not reconstructed_approval_only_round
+            and not approval_support.pending_approval_scope_matches_round(
+                approval,
+                pending_round,
+            )
+        )
         or [call.model_dump(mode="json") for call in pending_round.tool_calls]
         != [call.model_dump(mode="json") for call in approval.tool_calls]
     ):
@@ -1065,7 +1126,11 @@ class RecoveryCoordinator:
         transcript_page = await self._session_store.query_transcript(
             TranscriptQuery(
                 session_id=session.id,
-                offset=max(0, pointer.transcript_end_cursor - 1),
+                offset=(
+                    pointer.transcript_end_cursor
+                    if pointer.assistant_message_deferred
+                    else max(0, pointer.transcript_end_cursor - 1)
+                ),
                 limit=2,
             )
         )
@@ -1091,9 +1156,19 @@ class RecoveryCoordinator:
                 )
         elif pointer.tool_round_id is not None:
             pending_pause = pending_approval if pending_approval is not None else pending_user_input
-            assistant_message = transcript_page.records[0].message
+            assistant_message = None
+            if pointer.assistant_message_deferred and pending_pause is not None:
+                assistant_message = getattr(
+                    pending_pause,
+                    "quarantined_assistant_message",
+                    None,
+                )
+            elif transcript_page.records:
+                assistant_message = transcript_page.records[0].message
             assistant_call_parts = tuple(
-                part for part in assistant_message.content if type(part) is ToolCallPart
+                part
+                for part in (() if assistant_message is None else assistant_message.content)
+                if type(part) is ToolCallPart
             )
             assistant_calls = tuple(
                 (part.tool_call_id, part.tool_name, part.arguments) for part in assistant_call_parts
@@ -1121,7 +1196,18 @@ class RecoveryCoordinator:
                     pending_pause.arguments,
                 )
                 if (
-                    not pointer.assistant_message_published
+                    not (
+                        pointer.assistant_message_published
+                        or (
+                            pointer.assistant_message_deferred
+                            and getattr(
+                                pending_pause,
+                                "assistant_message_state",
+                                None,
+                            )
+                            == "quarantined"
+                        )
+                    )
                     or not assistant_calls
                     or assistant_calls != pending_calls
                     or pending_calls.count(pending_target) != 1
@@ -1144,7 +1230,8 @@ class RecoveryCoordinator:
                         if type(part) is ToolResultPart
                     )
                     if next_record is not None
-                    and next_record.index == pointer.transcript_end_cursor
+                    and next_record.index
+                    == pointer.transcript_end_cursor + int(pointer.assistant_message_deferred)
                     and next_record.message.role == MessageRole.TOOL
                     else ()
                 )
@@ -1153,7 +1240,7 @@ class RecoveryCoordinator:
                     for tool_call_id, tool_name, _arguments in assistant_calls
                 )
                 if (
-                    not pointer.assistant_message_published
+                    not (pointer.assistant_message_published or pointer.assistant_message_deferred)
                     or not expected_results
                     or next_record is None
                     or len(tool_results) != len(next_record.message.content)
@@ -1206,6 +1293,7 @@ class RecoveryCoordinator:
                         ),
                         assistant_call_parts=assistant_call_parts,
                         tool_result_message=next_record.message,
+                        arguments_deferred=pointer.assistant_message_deferred,
                     ):
                         raise RuntimeError(
                             "The transcript contains tool results without durable tool-round "
@@ -1215,7 +1303,9 @@ class RecoveryCoordinator:
                     tool_receipt.publication_id != tool_publication_id
                     or tool_receipt.kind != "tool-round"
                     or tool_receipt.transcript_start_cursor != pointer.transcript_end_cursor
-                    or tool_receipt.transcript_end_cursor != pointer.transcript_end_cursor + 1
+                    or tool_receipt.transcript_end_cursor
+                    != pointer.transcript_end_cursor
+                    + (2 if pointer.assistant_message_deferred else 1)
                     or tool_receipt.intent.get("round_id") != pointer.tool_round_id
                     or tool_receipt.intent.get("model_step_id") != model_step_id
                     or tool_receipt.intent.get("model_attempt_id") != model_attempt_id
@@ -1245,6 +1335,7 @@ class RecoveryCoordinator:
         identity: ToolRoundIdentity,
         assistant_call_parts: tuple[ToolCallPart, ...],
         tool_result_message: Message,
+        arguments_deferred: bool,
     ) -> bool:
         """Verify pause-resume results published outside the ordinary round protocol.
 
@@ -1408,15 +1499,51 @@ class RecoveryCoordinator:
                     "Durable pause-origin evidence conflicts with its source model step."
                 )
             try:
-                if pause_kind == "approval":
-                    pending_pause = PendingToolApproval.model_validate(
+                pause_checkpoint, origin_arguments_quarantined = (
+                    tool_argument_publication.pause_checkpoint_validation_view(
                         event.payload.get(expected_origin_field)
                     )
+                )
+                if origin_arguments_quarantined:
+                    projected_calls = pause_checkpoint.get("tool_calls")
+                    if type(projected_calls) is not list or len(projected_calls) != len(
+                        pending_calls
+                    ):
+                        raise ValueError("Projected pause tool calls conflict with the round.")
+                    for projected_call, pending_call in zip(
+                        projected_calls,
+                        pending_calls,
+                        strict=True,
+                    ):
+                        if type(projected_call) is not dict:
+                            raise ValueError("Projected pause tool calls conflict with the round.")
+                        typed_projected_call = cast("dict[str, Any]", projected_call)
+                        if typed_projected_call.get("tool_name") != pending_call.tool_name:
+                            raise ValueError("Projected pause tool calls conflict with the round.")
+                        typed_projected_call["tool_call_id"] = pending_call.tool_call_id
+                    pause_checkpoint.update(
+                        {
+                            "tool_round_id": identity.tool_round_id,
+                            "model_step_id": identity.model_step_id,
+                            "model_attempt_id": identity.model_attempt_id,
+                            "tool_call_id": resume_tool_call_id,
+                            ("approval_id" if pause_kind == "approval" else "input_id"): pause_id,
+                        }
+                    )
+                    assistant_publication = pause_checkpoint.get("assistant_publication")
+                    if type(assistant_publication) is dict:
+                        safe_assistant_message = assistant_publication.get("message")
+                        if type(safe_assistant_message) is not dict:
+                            raise ValueError(
+                                "Projected pause has no safe assistant publication evidence."
+                            )
+                        pause_checkpoint["assistant_message_state"] = "quarantined"
+                        pause_checkpoint["quarantined_assistant_message"] = safe_assistant_message
+                if pause_kind == "approval":
+                    pending_pause = PendingToolApproval.model_validate(pause_checkpoint)
                     origin_pause_id = pending_pause.approval_id
                 else:
-                    pending_pause = PendingUserInput.model_validate(
-                        event.payload.get(expected_origin_field)
-                    )
+                    pending_pause = PendingUserInput.model_validate(pause_checkpoint)
                     origin_pause_id = pending_pause.input_id
             except (TypeError, ValueError):
                 raise RuntimeError(
@@ -1435,6 +1562,23 @@ class RecoveryCoordinator:
                 }
                 for call in pending_pause.tool_calls
             ]
+            comparable_origin_calls = origin_calls
+            comparable_expected_calls = expected_calls
+            if arguments_deferred or origin_arguments_quarantined:
+                comparable_origin_calls = [
+                    {
+                        "tool_call_id": call["tool_call_id"],
+                        "tool_name": call["tool_name"],
+                    }
+                    for call in origin_calls
+                ]
+                comparable_expected_calls = [
+                    {
+                        "tool_call_id": call["tool_call_id"],
+                        "tool_name": call["tool_name"],
+                    }
+                    for call in expected_calls
+                ]
             if (
                 origin_pause_id != pause_id
                 or origin_identity != identity
@@ -1442,11 +1586,11 @@ class RecoveryCoordinator:
                 or pending_pause.environment_name != session.environment_name
                 or pending_pause.tool_call_id != resume_tool_call_id
                 or canonical_durable_json_bytes(
-                    origin_calls,
+                    comparable_origin_calls,
                     "pause_origin_tool_calls",
                 )
                 != canonical_durable_json_bytes(
-                    expected_calls,
+                    comparable_expected_calls,
                     "assistant_tool_calls",
                 )
             ):
@@ -1509,12 +1653,9 @@ class RecoveryCoordinator:
                     raise RuntimeError(
                         "Durable pause-continuation evidence contains duplicate started events."
                     )
-                if canonical_durable_json_bytes(
-                    event.payload.get("arguments"),
-                    "started_arguments",
-                ) != canonical_durable_json_bytes(
-                    pending_call.arguments,
-                    "pending_arguments",
+                if not tool_argument_publication.started_arguments_match_private_call(
+                    event.payload,
+                    private_arguments=pending_call.arguments,
                 ):
                     raise RuntimeError(
                         "Durable pause-continuation started arguments conflict with "
@@ -1970,6 +2111,14 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
+        invocation_secrets.require_continuation_secret_resolution_compatibility(
+            (
+                "unknown"
+                if pending.assistant_publication is None
+                else pending.assistant_publication.secret_resolution_scope
+            ),
+            registered_environment,
+        )
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
             checkpoint=checkpoint,
@@ -2050,6 +2199,14 @@ class RecoveryCoordinator:
         )
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
+        )
+        invocation_secrets.require_continuation_secret_resolution_compatibility(
+            (
+                "unknown"
+                if pending.assistant_publication is None
+                else pending.assistant_publication.secret_resolution_scope
+            ),
+            registered_environment,
         )
         session, resumed_event = await self._transition_recovery_session_to_running(
             loaded_session,
@@ -2199,6 +2356,10 @@ class RecoveryCoordinator:
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
         )
+        invocation_secrets.require_continuation_secret_resolution_compatibility(
+            candidate_approval.secret_resolution_scope,
+            registered_environment,
+        )
         pending_approval: PendingToolApproval | None = None
         pending_round: tool_round_recovery.PendingToolRound | None = None
         claimed_intent: approval_support.ApprovalResolutionIntent | None = None
@@ -2327,6 +2488,10 @@ class RecoveryCoordinator:
         )
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
+        )
+        invocation_secrets.require_continuation_secret_resolution_compatibility(
+            candidate_approval.secret_resolution_scope,
+            registered_environment,
         )
         pending_approval: PendingToolApproval | None = None
         pending_round: tool_round_recovery.PendingToolRound | None = None
@@ -2482,6 +2647,10 @@ class RecoveryCoordinator:
         )
         registered_environment = self._resolve_registered_environment(
             loaded_session.environment_name
+        )
+        invocation_secrets.require_continuation_secret_resolution_compatibility(
+            approval_support.tool_round_secret_resolution_scope(pending_round),
+            registered_environment,
         )
         pending_operator_interruption = (
             checkpoint is not None and _PENDING_SESSION_INTERRUPT_CHECKPOINT_KEY in checkpoint
@@ -2690,6 +2859,108 @@ class RecoveryCoordinator:
                 )
                 for pending_call in pending.tool_calls
             ]
+            publish_arguments_as_unavailable = len(round_tool_calls) > 1
+            base_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
+                registered_agent=registered_agent,
+                tool_calls=round_tool_calls,
+            )
+            legacy_publication_scope = (
+                pending.assistant_message_state == "quarantined"
+                and pending.assistant_publication is None
+            )
+            persisted_secret_resolution_scope = (
+                "unknown"
+                if pending.assistant_publication is None
+                else pending.assistant_publication.secret_resolution_scope
+            )
+            pause_secret_resolution_scope = invocation_secrets.continuation_secret_resolution_scope(
+                persisted_secret_resolution_scope,
+                registered_environment,
+            )
+            defer_round_terminals = (
+                len(round_tool_calls) > 1 and pause_secret_resolution_scope != "static"
+            )
+            publication_coordinator = (
+                _ToolRoundPublicationCoordinator(
+                    session_id=session.id,
+                    tool_round_identity=tool_round_identity,
+                    session_store=self._session_store,
+                    redactor=base_round_redactor,
+                )
+                if defer_round_terminals
+                else None
+            )
+            staged_hook_modes: dict[str, tuple[bool, bool]] = {}
+
+            async def record_round_publication_snapshot(
+                tool_call_id: str,
+                snapshot: invocation_secrets.InvocationPublicationSnapshot,
+            ) -> None:
+                if publication_coordinator is not None:
+                    await publication_coordinator.seal_call(
+                        tool_call_id=tool_call_id,
+                        snapshot=snapshot,
+                    )
+                    return
+                await self._session_store.transform_checkpoint(
+                    session.id,
+                    tool_round_recovery.assistant_publication_snapshot_transform(
+                        tool_round_identity=tool_round_identity,
+                        tool_call_id=tool_call_id,
+                        redactor=snapshot.redactor,
+                        unsafe_output=snapshot.secret_scope_incomplete,
+                    ),
+                )
+
+            async def record_round_redactor(
+                tool_call_id: str,
+                snapshot: InvocationRedactorSnapshot,
+            ) -> None:
+                if publication_coordinator is None:
+                    raise AssertionError("Continuation redactor observer has no coordinator.")
+                await publication_coordinator.register_redactor(
+                    tool_call_id=tool_call_id,
+                    redactor=snapshot.redactor,
+                )
+
+            async def stage_round_terminal(
+                event: Event,
+                outcome: runtime_records.ToolCallOutcome,
+                allow_modification: bool,
+                publish_before_hooks: bool,
+                snapshot: invocation_secrets.InvocationPublicationSnapshot,
+            ) -> None:
+                if publication_coordinator is None:
+                    raise AssertionError("Continuation terminal staging has no coordinator.")
+                await publication_coordinator.stage_terminal(
+                    tool_call_id=outcome.call.id,
+                    event=self._event_writer.prepare(event),
+                    snapshot=snapshot,
+                    hooks_state=(
+                        "observational"
+                        if publish_before_hooks
+                        else ("pending" if allow_modification else "finalized")
+                    ),
+                )
+                staged_hook_modes[outcome.call.id] = (
+                    allow_modification,
+                    publish_before_hooks,
+                )
+
+            async def record_static_publication_scope(
+                tool_call_id: str,
+                *,
+                execution_scope_unknown: bool = False,
+            ) -> None:
+                await record_round_publication_snapshot(
+                    tool_call_id,
+                    invocation_secrets.InvocationPublicationSnapshot(
+                        redactor=base_round_redactor,
+                        unsafe_output=execution_scope_unknown,
+                        secret_scope_incomplete=execution_scope_unknown,
+                    ),
+                )
+
             # Reuse any outcomes already recorded for this round — e.g. a prior resume attempt
             # that ran some tools before a mid-resume failure — so a retry never re-executes a
             # side-effecting tool. The round was already projected against limits at pause time;
@@ -2700,6 +2971,21 @@ class RecoveryCoordinator:
                 pending_calls=pending.tool_calls,
                 input_id=pending.input_id,
                 tool_round_identity=tool_round_identity,
+                staged_terminals=pending.staged_terminals,
+            )
+            restarted_staged_ids = (
+                await self._fence_restarted_continuation_stages(
+                    coordinator=publication_coordinator,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    tool_calls=round_tool_calls,
+                    recorded_ids=set(recorded_outcomes),
+                    pause_payload={"input_id": pending.input_id},
+                    idempotency_options={"pause_id": pending.input_id},
+                )
+                if publication_coordinator is not None
+                else set()
             )
             pending_by_id = {call.tool_call_id: call for call in pending.tool_calls}
 
@@ -2709,7 +2995,16 @@ class RecoveryCoordinator:
             for tool_call in round_tool_calls:
                 recorded_outcome = recorded_outcomes.get(tool_call.id)
                 if recorded_outcome is not None:
+                    # A terminal record from an earlier process proves the
+                    # call is complete, but an additive pre-field checkpoint
+                    # does not prove which invocation secrets it resolved.
+                    await record_static_publication_scope(
+                        tool_call.id,
+                        execution_scope_unknown=legacy_publication_scope,
+                    )
                     tool_outcomes.append(recorded_outcome)
+                    continue
+                if tool_call.id in restarted_staged_ids:
                     continue
 
                 pending_call = pending_by_id[tool_call.id]
@@ -2733,11 +3028,12 @@ class RecoveryCoordinator:
                         artifacts=response.artifacts,
                         is_error=False,
                     )
+                    await record_static_publication_scope(tool_call.id)
                     started_payload: dict[str, Any] = {
                         **tool_round_identity.payload(),
                         "tool_call_id": tool_call.id,
                         "idempotency_key": idempotency_key,
-                        "arguments": deepcopy(tool_call.arguments),
+                        **tool_argument_publication.quarantined_argument_fields(),
                         "input_id": pending.input_id,
                     }
                     if registered_tool is not None:
@@ -2783,6 +3079,24 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=result,
                         task_id=pending.task_id,
+                        redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        output_redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        deferred_terminal_stager=(
+                            None if publication_coordinator is None else stage_round_terminal
+                        ),
+                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
+                            redactor=base_round_redactor,
+                            unsafe_output=False,
+                            secret_scope_incomplete=False,
+                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -2801,9 +3115,15 @@ class RecoveryCoordinator:
                     and policy_result is not None
                     and policy_result.decision == ToolPolicyDecision.DENY
                 ):
-                    reason = tool_execution.policy_denial_reason(policy_result)
+                    await record_static_publication_scope(tool_call.id)
+                    public_policy_result = approval_support.public_policy_denial_result(
+                        secret_resolution_scope=pause_secret_resolution_scope,
+                        policy_result=policy_result,
+                    )
+                    reason = tool_execution.policy_denial_reason(public_policy_result)
                     blocked_result = tool_execution.blocked_tool_result(
-                        policy_result, reason=reason
+                        public_policy_result,
+                        reason=reason,
                     )
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
@@ -2829,9 +3149,9 @@ class RecoveryCoordinator:
                                 **policy_denial_payload_fields(
                                     tool_name=tool_call.name,
                                     denied_by=_TOOL_POLICY_DENIAL_SOURCE,
-                                    decision=policy_result.decision.value,
+                                    decision=public_policy_result.decision.value,
                                     reason=reason,
-                                    metadata=policy_result.metadata,
+                                    metadata=public_policy_result.metadata,
                                 ),
                                 "result": blocked_result.model_dump(),
                             },
@@ -2842,6 +3162,24 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=blocked_result,
                         task_id=pending.task_id,
+                        redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        output_redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        deferred_terminal_stager=(
+                            None if publication_coordinator is None else stage_round_terminal
+                        ),
+                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
+                            redactor=base_round_redactor,
+                            unsafe_output=False,
+                            secret_scope_incomplete=False,
+                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -2852,6 +3190,7 @@ class RecoveryCoordinator:
                     ToolPolicyEvidence.AMBIGUOUS,
                     ToolPolicyEvidence.UNREGISTERED,
                 }:
+                    await record_static_publication_scope(tool_call.id)
                     async for (
                         event,
                         outcome,
@@ -2865,6 +3204,14 @@ class RecoveryCoordinator:
                         tool_round_identity=tool_round_identity,
                         task_id=pending.task_id,
                         input_id=pending.input_id,
+                        deferred_terminal_stager=(
+                            None if publication_coordinator is None else stage_round_terminal
+                        ),
+                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
+                            redactor=base_round_redactor,
+                            unsafe_output=False,
+                            secret_scope_incomplete=False,
+                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -2885,25 +3232,82 @@ class RecoveryCoordinator:
                     task_id=pending.task_id,
                     check_policy=False,
                     policy_result=policy_result,
+                    policy_output_secret_resolution_scope=pause_secret_resolution_scope,
                     input_id=pending.input_id,
                     tool_round_identity=tool_round_identity,
                     taint_labels=call_taint_labels,
+                    publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                    deferred_terminal_stager=(
+                        None if publication_coordinator is None else stage_round_terminal
+                    ),
+                    resolved_redactor_observer=(
+                        None if publication_coordinator is None else record_round_redactor
+                    ),
+                    publication_snapshot_observer=record_round_publication_snapshot,
                 ):
                     yield event
                     if outcome is not None:
                         tool_outcomes.append(outcome)
 
+            if publication_coordinator is not None:
+                expected_staged_ids = {
+                    call.id for call in round_tool_calls if call.id not in recorded_outcomes
+                } | (set(recorded_outcomes) & restarted_staged_ids)
+                current_stages = tool_round_recovery.checkpoint_staged_terminals(
+                    await self._session_store.load_checkpoint(session.id),
+                    tool_round_identity=tool_round_identity,
+                )
+                if {item.tool_call_id for item in current_stages} != expected_staged_ids:
+                    raise RuntimeError(
+                        "Dynamic user-input continuation requires one private terminal "
+                        "stage per unresolved call."
+                    )
+                async for event, outcome in self._publish_continuation_staged_terminals(
+                    coordinator=publication_coordinator,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_calls=round_tool_calls,
+                    task_id=pending.task_id,
+                    hook_modes=staged_hook_modes,
+                    pause_authority={"input_id": pending.input_id},
+                    already_published_ids=set(recorded_outcomes),
+                ):
+                    yield event
+                    if outcome is not None:
+                        tool_outcomes.append(outcome)
+                outcomes_by_id = {outcome.call.id: outcome for outcome in tool_outcomes}
+                tool_outcomes = [outcomes_by_id[call.id] for call in round_tool_calls]
+
             # The resume executes the round's tools sequentially in model order, so the outcome
             # list already lines up with the assistant tool-call parts.
+            durable_round = pending_actions.pending_action_evidence_round_from_checkpoint(
+                await self._session_store.load_checkpoint(session.id)
+            )
+            if (
+                durable_round is None
+                or tool_round_recovery.pending_tool_round_identity(durable_round)
+                != tool_round_identity
+            ):
+                raise RuntimeError("Pending user-input round changed before transcript closure.")
             tool_result_messages = transcript_helpers.tool_result_messages(
                 tool_outcomes,
                 tool_round_identity=tool_round_identity,
             )
-            transcript.extend(tool_result_messages)
+            transcript_messages = list(tool_result_messages)
+            if durable_round.assistant_message_state == "quarantined":
+                transcript_messages.insert(
+                    0,
+                    transcript_helpers.assistant_message_with_projected_tool_arguments(
+                        tool_round_recovery.ready_assistant_publication_message(durable_round),
+                        tool_outcomes,
+                    ),
+                )
+            transcript.extend(transcript_messages)
             cleared_checkpoint = await self._checkpoint_without_pending_user_input(session.id)
             await self._session_store.append_transcript_messages_and_transform_checkpoint(
                 session.id,
-                tool_result_messages,
+                transcript_messages,
                 self._checkpoint_transform(cleared_checkpoint),
             )
             pending_cleared = True
@@ -2962,7 +3366,7 @@ class RecoveryCoordinator:
                     ),
                     **tool_round_identity.payload(),
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                    "user_input": pending.model_dump(mode="json"),
+                    "user_input": public_pending_user_input_event_payload(pending),
                 }
                 if isinstance(exc, approval_support.RoundToolManualRecoveryRequired):
                     payload["manual_recovery_required"] = True
@@ -3001,6 +3405,185 @@ class RecoveryCoordinator:
         checkpoint.pop(PENDING_USER_INPUT_CHECKPOINT_KEY, None)
         return checkpoint
 
+    async def _publish_continuation_staged_terminals(
+        self,
+        *,
+        coordinator: _ToolRoundPublicationCoordinator,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        task_id: str | None,
+        hook_modes: dict[str, tuple[bool, bool]],
+        pause_authority: dict[str, str],
+        already_published_ids: set[str],
+    ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
+        """Publish continuation results only after the round scope is final."""
+
+        identity = coordinator.tool_round_identity
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        staged_records = tool_round_recovery.checkpoint_staged_terminals(
+            checkpoint,
+            tool_round_identity=identity,
+        )
+        staged_by_id = {item.tool_call_id: item for item in staged_records}
+        calls_by_id = {call.id: call for call in tool_calls}
+        if not set(staged_by_id).issubset(calls_by_id):
+            raise RuntimeError("Continuation stages contain a call outside their tool round.")
+        if not already_published_ids.issubset(calls_by_id):
+            raise RuntimeError("Published continuation evidence names an unknown tool call.")
+        unavailable = tool_argument_publication.unavailable_argument_projection()
+
+        async def complete_hooks(event: Event) -> Event:
+            return await coordinator.complete_terminal_hooks(event)
+
+        async def record_projection(event: Event) -> Event:
+            return await coordinator.record_projected_terminal(event)
+
+        for tool_call in tool_calls:
+            staged = staged_by_id.get(tool_call.id)
+            if staged is None:
+                continue
+            if tool_call.id in already_published_ids:
+                continue
+            staged_event = coordinator.restore_staged_event_authority(staged.event)
+            authority_fields: list[str] = []
+            for field_name, expected_value in pause_authority.items():
+                if staged_event.payload.get(field_name) != expected_value:
+                    raise RuntimeError(
+                        "Continuation stage conflicts with its pending pause identity."
+                    )
+                authority_fields.append(field_name)
+            if authority_fields:
+                staged_event = event_with_runtime_payload_authority(
+                    staged_event,
+                    *authority_fields,
+                )
+            result_payload = staged_event.payload.get("result")
+            if type(result_payload) is not dict:
+                raise RuntimeError("Continuation stage lost its tool result.")
+            result = tool_results.tool_result_from_payload(result_payload)
+            hooks_already_completed = staged.hooks_state == "completed"
+            allow_modification, publish_before_hooks = (
+                (False, False)
+                if hooks_already_completed
+                else hook_modes.get(
+                    tool_call.id,
+                    (
+                        staged.hooks_state == "pending",
+                        staged.hooks_state == "observational",
+                    ),
+                )
+            )
+            async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
+                event=staged_event,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                tool_call=tool_call,
+                result=result,
+                task_id=task_id,
+                redactor=coordinator.redactor,
+                output_redactor=coordinator.redactor,
+                argument_projection=unavailable,
+                hook_argument_projection=unavailable,
+                allow_modification=allow_modification,
+                publish_before_hooks=publish_before_hooks,
+                deferred_terminal_projection_recorder=(
+                    record_projection
+                    if publish_before_hooks and not hooks_already_completed
+                    else None
+                ),
+                deferred_terminal_finalizer=(None if hooks_already_completed else complete_hooks),
+                hooks_already_completed=hooks_already_completed,
+            ):
+                yield event, outcome
+
+    async def _fence_restarted_continuation_stages(
+        self,
+        *,
+        coordinator: _ToolRoundPublicationCoordinator,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        environment_name: str | None,
+        tool_calls: list[runtime_records.ToolCallRequest],
+        recorded_ids: set[str],
+        pause_payload: dict[str, str],
+        idempotency_options: dict[str, str],
+    ) -> set[str]:
+        """Close a partially staged continuation without re-executing siblings."""
+
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        stages = tool_round_recovery.checkpoint_staged_terminals(
+            checkpoint,
+            tool_round_identity=coordinator.tool_round_identity,
+        )
+        if not stages:
+            return set()
+        staged_ids = {item.tool_call_id for item in stages}
+        for staged in stages:
+            if staged.tool_call_id in recorded_ids or staged.hooks_state == "completed":
+                continue
+            unavailable = tool_round_recovery.hook_scope_unavailable_recovery_event(staged.event)
+            await self._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.completed_staged_terminal_transform(
+                    tool_round_identity=coordinator.tool_round_identity,
+                    event=unavailable,
+                ),
+            )
+
+        for tool_call in tool_calls:
+            if tool_call.id in recorded_ids or tool_call.id in staged_ids:
+                continue
+            result = ToolResult(
+                content=(
+                    "Tool call was not executed because recovery could not reconstruct "
+                    "the complete sibling invocation-secret scope."
+                ),
+                structured={
+                    "error": "invalid_tool_output",
+                    "executed": False,
+                    "outcome_unknown": False,
+                    "recovered": True,
+                    "reason": "continuation_secret_scope_unavailable",
+                },
+                is_error=True,
+            )
+            event = Event(
+                type=EventType.TOOL_CALL_BLOCKED,
+                session_id=session.id,
+                agent_name=registered_agent.spec.name,
+                environment_name=environment_name,
+                tool_name=tool_call.name,
+                payload={
+                    **coordinator.tool_round_identity.payload(),
+                    **pause_payload,
+                    "tool_call_id": tool_call.id,
+                    "idempotency_key": tool_execution.tool_idempotency_key(
+                        session_id=session.id,
+                        tool_round_id=coordinator.tool_round_identity.tool_round_id,
+                        tool_call_id=tool_call.id,
+                        **idempotency_options,
+                    ),
+                    "recovered": True,
+                    "result": result.model_dump(mode="json"),
+                },
+            )
+            staged_event = await coordinator.stage_terminal(
+                tool_call_id=tool_call.id,
+                event=self._event_writer.prepare(event),
+                snapshot=invocation_secrets.InvocationPublicationSnapshot(
+                    redactor=coordinator.redactor,
+                    unsafe_output=False,
+                    secret_scope_incomplete=False,
+                ),
+                hooks_state="finalized",
+            )
+            await coordinator.complete_terminal_hooks(staged_event)
+            staged_ids.add(tool_call.id)
+        return staged_ids
+
     async def _emit_non_authoritative_policy_call(
         self,
         *,
@@ -3018,6 +3601,8 @@ class RecoveryCoordinator:
         resolved_by_payload: dict[str, Any] | None = None,
         resolution_reason: str | None = None,
         resolution_metadata: dict[str, Any] | None = None,
+        deferred_terminal_stager: DeferredTerminalStager | None = None,
+        publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         """Close a call that lacks positive policy authority without dispatch."""
 
@@ -3113,6 +3698,8 @@ class RecoveryCoordinator:
             tool_call=tool_call,
             result=result,
             task_id=task_id,
+            deferred_terminal_stager=deferred_terminal_stager,
+            publication_snapshot=publication_snapshot,
         ):
             yield event, outcome
 
@@ -3213,9 +3800,24 @@ class RecoveryCoordinator:
                 decision=request.decision,
             )
             resolved_by_payload = resolution_actor_payload(request.resolved_by)
+            current_checkpoint = await self._session_store.load_checkpoint(session.id)
+            publication_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+                current_checkpoint,
+                redactor=self._secret_redactor,
+                consume_on_rejection=True,
+            )
+            if (
+                publication_round is None
+                or tool_round_recovery.pending_tool_round_identity(publication_round)
+                != tool_round_identity
+            ):
+                raise RuntimeError(
+                    "Pending approval round changed before publication-scope recovery."
+                )
             recorded_outcomes = approval_support.recorded_tool_outcomes(
                 events=approval_events,
                 approval=pending_approval,
+                staged_terminals=publication_round.staged_terminals,
             )
             terminal_outcomes_cover_round = set(recorded_outcomes) == {
                 pending_call.tool_call_id
@@ -3230,7 +3832,6 @@ class RecoveryCoordinator:
                 raise RuntimeError(
                     "Tool approval resolution request identity was not durably claimed."
                 )
-            current_checkpoint = await self._session_store.load_checkpoint(session.id)
             current_intent = approval_support.approval_resolution_intent_from_checkpoint(
                 current_checkpoint,
                 redactor=self._secret_redactor,
@@ -3434,12 +4035,132 @@ class RecoveryCoordinator:
                         yield event
                     return
 
-            for pending_tool_call in approval_support.pending_round_tool_calls(pending_approval):
-                tool_call = runtime_records.ToolCallRequest(
+            pending_round_tool_calls = approval_support.pending_round_tool_calls(pending_approval)
+            publish_arguments_as_unavailable = len(pending_round_tool_calls) > 1
+            round_tool_calls = [
+                runtime_records.ToolCallRequest(
                     id=pending_tool_call.tool_call_id,
                     name=pending_tool_call.tool_name,
                     arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
                 )
+                for pending_tool_call in pending_round_tool_calls
+            ]
+            base_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
+                registered_agent=registered_agent,
+                tool_calls=round_tool_calls,
+            )
+            legacy_publication_scope = (
+                publication_round.assistant_message_state == "quarantined"
+                and publication_round.assistant_publication is None
+            )
+            pause_secret_resolution_scope = invocation_secrets.continuation_secret_resolution_scope(
+                pending_approval.secret_resolution_scope,
+                registered_environment,
+            )
+            defer_round_terminals = (
+                len(round_tool_calls) > 1 and pause_secret_resolution_scope != "static"
+            )
+            publication_coordinator = (
+                _ToolRoundPublicationCoordinator(
+                    session_id=session.id,
+                    tool_round_identity=tool_round_identity,
+                    session_store=self._session_store,
+                    redactor=base_round_redactor,
+                )
+                if defer_round_terminals
+                else None
+            )
+            staged_hook_modes: dict[str, tuple[bool, bool]] = {}
+
+            async def record_round_publication_snapshot(
+                tool_call_id: str,
+                snapshot: invocation_secrets.InvocationPublicationSnapshot,
+            ) -> None:
+                if publication_coordinator is not None:
+                    await publication_coordinator.seal_call(
+                        tool_call_id=tool_call_id,
+                        snapshot=snapshot,
+                    )
+                    return
+                await self._session_store.transform_checkpoint(
+                    session.id,
+                    tool_round_recovery.assistant_publication_snapshot_transform(
+                        tool_round_identity=tool_round_identity,
+                        tool_call_id=tool_call_id,
+                        redactor=snapshot.redactor,
+                        unsafe_output=snapshot.secret_scope_incomplete,
+                    ),
+                )
+
+            async def record_round_redactor(
+                tool_call_id: str,
+                snapshot: InvocationRedactorSnapshot,
+            ) -> None:
+                if publication_coordinator is None:
+                    raise AssertionError("Continuation redactor observer has no coordinator.")
+                await publication_coordinator.register_redactor(
+                    tool_call_id=tool_call_id,
+                    redactor=snapshot.redactor,
+                )
+
+            async def stage_round_terminal(
+                event: Event,
+                outcome: runtime_records.ToolCallOutcome,
+                allow_modification: bool,
+                publish_before_hooks: bool,
+                snapshot: invocation_secrets.InvocationPublicationSnapshot,
+            ) -> None:
+                if publication_coordinator is None:
+                    raise AssertionError("Continuation terminal staging has no coordinator.")
+                await publication_coordinator.stage_terminal(
+                    tool_call_id=outcome.call.id,
+                    event=self._event_writer.prepare(event),
+                    snapshot=snapshot,
+                    hooks_state=(
+                        "observational"
+                        if publish_before_hooks
+                        else ("pending" if allow_modification else "finalized")
+                    ),
+                )
+                staged_hook_modes[outcome.call.id] = (
+                    allow_modification,
+                    publish_before_hooks,
+                )
+
+            async def record_static_publication_scope(
+                tool_call_id: str,
+                *,
+                execution_scope_unknown: bool = False,
+            ) -> None:
+                await record_round_publication_snapshot(
+                    tool_call_id,
+                    invocation_secrets.InvocationPublicationSnapshot(
+                        redactor=base_round_redactor,
+                        unsafe_output=execution_scope_unknown,
+                        secret_scope_incomplete=execution_scope_unknown,
+                    ),
+                )
+
+            restarted_staged_ids = (
+                await self._fence_restarted_continuation_stages(
+                    coordinator=publication_coordinator,
+                    session=session,
+                    registered_agent=registered_agent,
+                    environment_name=environment_name,
+                    tool_calls=round_tool_calls,
+                    recorded_ids=set(recorded_outcomes),
+                    pause_payload={"approval_id": pending_approval.approval_id},
+                    idempotency_options={"approval_id": pending_approval.approval_id},
+                )
+                if publication_coordinator is not None
+                else set()
+            )
+
+            for pending_tool_call, tool_call in zip(
+                pending_round_tool_calls,
+                round_tool_calls,
+                strict=True,
+            ):
                 policy_result = approval_support.policy_result_from_pending_tool_call(
                     pending_tool_call
                 )
@@ -3449,7 +4170,13 @@ class RecoveryCoordinator:
                 )
                 recorded_outcome = recorded_outcomes.get(tool_call.id)
                 if recorded_outcome is not None:
+                    await record_static_publication_scope(
+                        tool_call.id,
+                        execution_scope_unknown=legacy_publication_scope,
+                    )
                     tool_outcomes.append(recorded_outcome)
+                    continue
+                if tool_call.id in restarted_staged_ids:
                     continue
 
                 if (
@@ -3457,8 +4184,16 @@ class RecoveryCoordinator:
                     and policy_result is not None
                     and policy_result.decision == ToolPolicyDecision.DENY
                 ):
-                    reason = tool_execution.policy_denial_reason(policy_result)
-                    result = tool_execution.blocked_tool_result(policy_result, reason=reason)
+                    await record_static_publication_scope(tool_call.id)
+                    public_policy_result = approval_support.public_policy_denial_result(
+                        secret_resolution_scope=pause_secret_resolution_scope,
+                        policy_result=policy_result,
+                    )
+                    reason = tool_execution.policy_denial_reason(public_policy_result)
+                    result = tool_execution.blocked_tool_result(
+                        public_policy_result,
+                        reason=reason,
+                    )
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
                         tool_round_id=tool_round_identity.tool_round_id,
@@ -3483,9 +4218,9 @@ class RecoveryCoordinator:
                                 **policy_denial_payload_fields(
                                     tool_name=tool_call.name,
                                     denied_by=_TOOL_POLICY_DENIAL_SOURCE,
-                                    decision=policy_result.decision.value,
+                                    decision=public_policy_result.decision.value,
                                     reason=reason,
-                                    metadata=policy_result.metadata,
+                                    metadata=public_policy_result.metadata,
                                 ),
                                 "result": result.model_dump(),
                             },
@@ -3496,6 +4231,24 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=result,
                         task_id=pending_approval.task_id,
+                        redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        output_redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        deferred_terminal_stager=(
+                            None if publication_coordinator is None else stage_round_terminal
+                        ),
+                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
+                            redactor=base_round_redactor,
+                            unsafe_output=False,
+                            secret_scope_incomplete=False,
+                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -3522,6 +4275,7 @@ class RecoveryCoordinator:
                     )
 
                 if request.decision == ToolApprovalDecision.DENY:
+                    await record_static_publication_scope(tool_call.id)
                     approval_required = (
                         policy_evidence is ToolPolicyEvidence.AUTHORITATIVE
                         and policy_result is not None
@@ -3574,6 +4328,24 @@ class RecoveryCoordinator:
                         tool_call=tool_call,
                         result=result,
                         task_id=pending_approval.task_id,
+                        redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        output_redactor=(
+                            None
+                            if publication_coordinator is None
+                            else publication_coordinator.redactor
+                        ),
+                        deferred_terminal_stager=(
+                            None if publication_coordinator is None else stage_round_terminal
+                        ),
+                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
+                            redactor=base_round_redactor,
+                            unsafe_output=False,
+                            secret_scope_incomplete=False,
+                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -3584,6 +4356,7 @@ class RecoveryCoordinator:
                     ToolPolicyEvidence.AMBIGUOUS,
                     ToolPolicyEvidence.UNREGISTERED,
                 }:
+                    await record_static_publication_scope(tool_call.id)
                     async for (
                         event,
                         outcome,
@@ -3601,6 +4374,14 @@ class RecoveryCoordinator:
                         resolved_by_payload=resolved_by_payload,
                         resolution_reason=request.reason,
                         resolution_metadata=request.metadata,
+                        deferred_terminal_stager=(
+                            None if publication_coordinator is None else stage_round_terminal
+                        ),
+                        publication_snapshot=invocation_secrets.InvocationPublicationSnapshot(
+                            redactor=base_round_redactor,
+                            unsafe_output=False,
+                            secret_scope_incomplete=False,
+                        ),
                     ):
                         yield event
                         if outcome is not None:
@@ -3619,9 +4400,46 @@ class RecoveryCoordinator:
                     task_id=pending_approval.task_id,
                     check_policy=False,
                     emit_started=True,
+                    policy_output_secret_resolution_scope=pause_secret_resolution_scope,
                     approval_id=pending_approval.approval_id,
                     tool_round_identity=tool_round_identity,
                     taint_labels=call_taint_labels,
+                    publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                    deferred_terminal_stager=(
+                        None if publication_coordinator is None else stage_round_terminal
+                    ),
+                    resolved_redactor_observer=(
+                        None if publication_coordinator is None else record_round_redactor
+                    ),
+                    publication_snapshot_observer=record_round_publication_snapshot,
+                ):
+                    yield event
+                    if outcome is not None:
+                        tool_outcomes.append(outcome)
+
+            if publication_coordinator is not None:
+                expected_staged_ids = {
+                    call.id for call in round_tool_calls if call.id not in recorded_outcomes
+                } | (set(recorded_outcomes) & restarted_staged_ids)
+                current_stages = tool_round_recovery.checkpoint_staged_terminals(
+                    await self._session_store.load_checkpoint(session.id),
+                    tool_round_identity=tool_round_identity,
+                )
+                if {item.tool_call_id for item in current_stages} != expected_staged_ids:
+                    raise RuntimeError(
+                        "Dynamic approval continuation requires one private terminal "
+                        "stage per unresolved call."
+                    )
+                async for event, outcome in self._publish_continuation_staged_terminals(
+                    coordinator=publication_coordinator,
+                    session=session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    tool_calls=round_tool_calls,
+                    task_id=pending_approval.task_id,
+                    hook_modes=staged_hook_modes,
+                    pause_authority={"approval_id": pending_approval.approval_id},
+                    already_published_ids=set(recorded_outcomes),
                 ):
                     yield event
                     if outcome is not None:
@@ -3670,6 +4488,14 @@ class RecoveryCoordinator:
                 tool_round_identity=tool_round_identity,
             )
             transcript_messages = list(tool_result_messages)
+            if durable_round.assistant_message_state == "quarantined":
+                transcript_messages.insert(
+                    0,
+                    transcript_helpers.assistant_message_with_projected_tool_arguments(
+                        tool_round_recovery.ready_assistant_publication_message(durable_round),
+                        ordered_outcomes,
+                    ),
+                )
             target_checkpoint = approval_support.checkpoint_without_exact_pending_approval_round(
                 source_checkpoint,
                 approval=pending_approval,
@@ -4019,9 +4845,10 @@ class RecoveryCoordinator:
                             **tool_round_identity.payload(),
                             "approval_id": pending_approval.approval_id,
                             "tool_call_id": tool_call.id,
-                            "reason": reason,
-                            **approval_support.bounded_resolution_metadata_payload(
-                                metadata,
+                            **_public_resolution_audit_fields(
+                                secret_resolution_scope=(pending_approval.secret_resolution_scope),
+                                reason=reason,
+                                metadata=metadata,
                                 redactor=self._secret_redactor,
                             ),
                             "resolved_by": resolved_by_payload,
@@ -4173,6 +5000,15 @@ class RecoveryCoordinator:
                 artifacts=request.artifacts,
                 is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
             )
+            recovery_secret_resolution_scope = (
+                "unknown"
+                if pending.assistant_publication is None
+                else pending.assistant_publication.secret_resolution_scope
+            )
+            public_recovered_result = _public_manual_recovery_result(
+                recovered_result,
+                secret_resolution_scope=recovery_secret_resolution_scope,
+            )
             event_type = (
                 EventType.TOOL_CALL_FAILED
                 if recovered_result.is_error
@@ -4219,7 +5055,7 @@ class RecoveryCoordinator:
                             payload={
                                 **tool_round_identity.payload(),
                                 "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                                "user_input": pending.model_dump(mode="json"),
+                                "user_input": public_pending_user_input_event_payload(pending),
                                 **_environment_factory_resolution_error_payload(
                                     factory_resolution.error,
                                     redactor=self._secret_redactor,
@@ -4234,7 +5070,7 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
-            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
+            recovery_tool_event, public_recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
                     session_id=session.id,
@@ -4252,13 +5088,18 @@ class RecoveryCoordinator:
                         ),
                         "input_id": pending.input_id,
                         "manual_recovery": True,
-                        "reason": request.reason,
-                        "metadata": request.metadata,
+                        **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                        **_public_resolution_audit_fields(
+                            secret_resolution_scope=recovery_secret_resolution_scope,
+                            reason=request.reason,
+                            metadata=request.metadata,
+                            redactor=self._secret_redactor,
+                        ),
                         "resolved_by": resolution_actor_payload(request.resolved_by),
-                        "result": recovered_result.model_dump(),
+                        "result": public_recovered_result.model_dump(),
                     },
                 ),
-                result=recovered_result,
+                result=public_recovered_result,
                 redactor=self._secret_redactor,
             )
             recovery_event_to_reconcile = recovery_tool_event
@@ -4288,7 +5129,7 @@ class RecoveryCoordinator:
             tool_call = runtime_records.ToolCallRequest(
                 id=pending_tool_call.tool_call_id,
                 name=pending_tool_call.tool_name,
-                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+                arguments={},
             )
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
@@ -4299,9 +5140,10 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 tool_call=tool_call,
-                result=recovered_result,
+                result=public_recovered_result,
                 task_id=pending.task_id,
                 redactor=self._secret_redactor,
+                output_redactor=self._secret_redactor,
                 allow_modification=False,
             ):
                 yield event
@@ -4364,7 +5206,7 @@ class RecoveryCoordinator:
                         payload={
                             **tool_round_identity.payload(),
                             "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                            "user_input": pending.model_dump(mode="json"),
+                            "user_input": public_pending_user_input_event_payload(pending),
                             "input_id": pending.input_id,
                             "tool_call_id": pending_tool_call.tool_call_id,
                             **persistence_payload,
@@ -4497,6 +5339,11 @@ class RecoveryCoordinator:
             recovered_result = approval_support.recovered_tool_result(
                 request=request,
             )
+            recovery_secret_resolution_scope = pending_approval.secret_resolution_scope
+            public_recovered_result = _public_manual_recovery_result(
+                recovered_result,
+                secret_resolution_scope=recovery_secret_resolution_scope,
+            )
             event_type = (
                 EventType.TOOL_CALL_FAILED
                 if recovered_result.is_error
@@ -4567,7 +5414,7 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
-            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
+            recovery_tool_event, public_recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
                     session_id=session.id,
@@ -4585,17 +5432,19 @@ class RecoveryCoordinator:
                             approval_id=pending_approval.approval_id,
                         ),
                         "manual_recovery": True,
-                        "reason": request.reason,
-                        **approval_support.bounded_resolution_metadata_payload(
-                            request.metadata,
+                        **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                        **_public_resolution_audit_fields(
+                            secret_resolution_scope=recovery_secret_resolution_scope,
+                            reason=request.reason,
+                            metadata=request.metadata,
                             redactor=self._secret_redactor,
                         ),
                         "resolved_by": resolution_actor_payload(request.resolved_by),
                         "expired": recovered_after_expiry,
-                        "result": recovered_result.model_dump(),
+                        "result": public_recovered_result.model_dump(),
                     },
                 ),
-                result=recovered_result,
+                result=public_recovered_result,
                 redactor=self._secret_redactor,
             )
             recovery_event_to_reconcile = recovery_tool_event
@@ -4621,7 +5470,7 @@ class RecoveryCoordinator:
             tool_call = runtime_records.ToolCallRequest(
                 id=pending_tool_call.tool_call_id,
                 name=pending_tool_call.tool_name,
-                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+                arguments={},
             )
             tool_event = emitted_recovery_events[-1]
             # Manual recovery persists the operator-supplied result before hooks run, so
@@ -4632,9 +5481,10 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 tool_call=tool_call,
-                result=recovered_result,
+                result=public_recovered_result,
                 task_id=pending_approval.task_id,
                 redactor=self._secret_redactor,
+                output_redactor=self._secret_redactor,
                 allow_modification=False,
             ):
                 yield event
@@ -5490,6 +6340,13 @@ class RecoveryCoordinator:
             artifacts=request.artifacts,
             is_error=request.outcome == ToolApprovalRecoveryOutcome.FAILED,
         )
+        recovery_secret_resolution_scope = approval_support.tool_round_secret_resolution_scope(
+            pending_round
+        )
+        public_recovered_result = _public_manual_recovery_result(
+            recovered_result,
+            secret_resolution_scope=recovery_secret_resolution_scope,
+        )
         event_type = (
             EventType.TOOL_CALL_FAILED
             if recovered_result.is_error
@@ -5541,7 +6398,7 @@ class RecoveryCoordinator:
                 ):
                     yield event
                 return
-            recovery_tool_event, recovered_result = tool_results.redact_tool_result_event(
+            recovery_tool_event, public_recovered_result = tool_results.redact_tool_result_event(
                 event=Event(
                     type=event_type,
                     session_id=session.id,
@@ -5557,13 +6414,18 @@ class RecoveryCoordinator:
                             tool_call_id=pending_tool_call.tool_call_id,
                         ),
                         "manual_recovery": True,
-                        "reason": request.reason,
-                        "metadata": request.metadata,
+                        **tool_argument_publication.unavailable_argument_projection().payload_fields(),
+                        **_public_resolution_audit_fields(
+                            secret_resolution_scope=recovery_secret_resolution_scope,
+                            reason=request.reason,
+                            metadata=request.metadata,
+                            redactor=self._secret_redactor,
+                        ),
                         "resolved_by": resolution_actor_payload(request.resolved_by),
-                        "result": recovered_result.model_dump(),
+                        "result": public_recovered_result.model_dump(),
                     },
                 ),
-                result=recovered_result,
+                result=public_recovered_result,
                 redactor=self._secret_redactor,
             )
             recovery_event_to_reconcile = recovery_tool_event
@@ -5592,7 +6454,7 @@ class RecoveryCoordinator:
             tool_call = runtime_records.ToolCallRequest(
                 id=pending_tool_call.tool_call_id,
                 name=pending_tool_call.tool_name,
-                arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+                arguments={},
             )
             tool_event = emitted_recovery_events[-1]
             # The operator outcome is durable before hooks run. Recovery hooks are
@@ -5603,9 +6465,10 @@ class RecoveryCoordinator:
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 tool_call=tool_call,
-                result=recovered_result,
+                result=public_recovered_result,
                 task_id=pending_round.task_id,
                 redactor=self._secret_redactor,
+                output_redactor=self._secret_redactor,
                 allow_modification=False,
             ):
                 yield event
@@ -5914,7 +6777,7 @@ class RecoveryCoordinator:
             session_id=request.session.id,
             pending_round=pending_round,
         )
-        recorded_outcomes, _started_ids = tool_round_recovery.recorded_tool_outcomes(
+        recorded_outcomes, started_ids = tool_round_recovery.recorded_tool_outcomes(
             events=lifecycle_events,
             pending_round=pending_round,
         )
@@ -5938,6 +6801,14 @@ class RecoveryCoordinator:
             )[0]
             for outcome in interrupted_results
         ]
+        source_checkpoint, pending_round = await self._complete_recovery_assistant_publication(
+            session_id=request.session.id,
+            registered_agent=request.registered_agent,
+            pending_round=pending_round,
+            execution_scope_unknown_ids=started_ids,
+        )
+        if pending_round.assistant_message_state == "quarantined":
+            tool_round_recovery.ready_assistant_publication_message(pending_round)
         planned_terminal_events = [
             _interrupted_tool_call_event(
                 session=request.session,
@@ -5960,6 +6831,14 @@ class RecoveryCoordinator:
             planned_terminal_events,
             strict=True,
         ):
+            expected_public_outcome = runtime_records.ToolCallOutcome(
+                call=runtime_records.ToolCallRequest(
+                    id=interrupted_result.call.id,
+                    name=interrupted_result.call.name,
+                    arguments={},
+                ),
+                result=interrupted_result.result,
+            )
             async for event, outcome in self._tool_round_executor.emit_tool_call_result_with_hooks(
                 event=terminal_event,
                 session=request.session,
@@ -5970,7 +6849,7 @@ class RecoveryCoordinator:
                 task_id=pending_round.task_id,
             ):
                 emitted_events.append(event)
-                if outcome is not None and outcome != interrupted_result:
+                if outcome is not None and outcome != expected_public_outcome:
                     raise RuntimeError("Interrupted tool-round hooks changed terminal evidence.")
 
         lifecycle_events = await self._load_tool_round_lifecycle_events(
@@ -6035,6 +6914,62 @@ class RecoveryCoordinator:
             )
         return lifecycle_events
 
+    async def _complete_recovery_assistant_publication(
+        self,
+        *,
+        session_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        pending_round: tool_round_recovery.PendingToolRound,
+        execution_scope_unknown_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> tuple[dict[str, Any], tool_round_recovery.PendingToolRound]:
+        """Finalize calls after every returned secret was durably projected."""
+
+        if pending_round.assistant_message_state == "published":
+            checkpoint = await self._session_store.load_checkpoint(session_id)
+            return checkpoint or {}, pending_round
+        identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        tool_calls = tool_round_recovery.pending_round_tool_calls(pending_round)
+        base_redactor = self._tool_round_executor.redactor_for_tool_calls(
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
+        publication = pending_round.assistant_publication
+        covered_ids = set() if publication is None else set(publication.covered_tool_call_ids)
+        # Recovery trusts only the capability recorded with the original model
+        # completion. Current environment registration may differ after a
+        # restart; missing legacy evidence is therefore treated as unknown.
+        secret_resolution_scope = (
+            "unknown" if publication is None else publication.secret_resolution_scope
+        )
+        expected_ids = {tool_call.id for tool_call in tool_calls}
+        if not execution_scope_unknown_ids <= expected_ids:
+            raise RuntimeError("Assistant recovery evidence names a call outside its tool round.")
+        for tool_call in tool_calls:
+            if tool_call.id in covered_ids:
+                continue
+            await self._session_store.transform_checkpoint(
+                session_id,
+                tool_round_recovery.assistant_publication_snapshot_transform(
+                    tool_round_identity=identity,
+                    tool_call_id=tool_call.id,
+                    redactor=base_redactor,
+                    unsafe_output=(
+                        secret_resolution_scope != "static"
+                        and tool_call.id in execution_scope_unknown_ids
+                    ),
+                ),
+            )
+        checkpoint = await self._session_store.load_checkpoint(session_id)
+        recovered_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if (
+            recovered_round is None
+            or tool_round_recovery.pending_tool_round_identity(recovered_round) != identity
+        ):
+            raise RuntimeError(
+                "Pending tool round changed while sealing its recovery publication projection."
+            )
+        return checkpoint or {}, recovered_round
+
     async def _recover_structured_output_tool_round(
         self,
         *,
@@ -6076,6 +7011,34 @@ class RecoveryCoordinator:
             expected_outcomes,
             self._secret_redactor,
         )
+        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+        structured_round_redactor = self._tool_round_executor.redactor_for_tool_calls(
+            registered_agent=registered_agent,
+            tool_calls=tool_calls,
+        )
+        for expected_outcome in expected_outcomes:
+            await self._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.assistant_publication_snapshot_transform(
+                    tool_round_identity=tool_round_identity,
+                    tool_call_id=expected_outcome.call.id,
+                    redactor=structured_round_redactor,
+                    unsafe_output=False,
+                ),
+            )
+        source_checkpoint = await self._session_store.load_checkpoint(session.id)
+        reloaded_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            source_checkpoint
+        )
+        if (
+            reloaded_pending_round is None
+            or tool_round_recovery.pending_tool_round_identity(reloaded_pending_round)
+            != tool_round_identity
+        ):
+            raise RuntimeError(
+                "Structured-output tool round changed while sealing its publication projection."
+            )
+        pending_round = reloaded_pending_round
         environment_name = _environment_name(registered_environment)
         lifecycle_events = await self._load_tool_round_lifecycle_events(
             session_id=session.id,
@@ -6110,8 +7073,32 @@ class RecoveryCoordinator:
                 planned_terminal_events.append(expected_event)
                 continue
             recorded_event = terminal_events_by_call.get(expected_outcome.call.id)
+            expected_payload = expected_event.payload
+            legacy_expected_payload = dict(expected_payload)
+            legacy_expected_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
+            recorded_payload_matches = recorded_event is not None and (
+                recorded_event.payload == expected_payload
+                or (
+                    tool_argument_publication.ARGUMENTS_STATE_FIELD not in recorded_event.payload
+                    and recorded_event.payload == legacy_expected_payload
+                )
+            )
+            expected_recorded_outcome = expected_outcome
+            if recorded_event is not None:
+                recorded_projection = tool_argument_publication.terminal_argument_projection(
+                    recorded_event.payload,
+                    legacy_arguments=expected_outcome.call.arguments,
+                )
+                expected_recorded_outcome = runtime_records.ToolCallOutcome(
+                    call=runtime_records.ToolCallRequest(
+                        id=expected_outcome.call.id,
+                        name=expected_outcome.call.name,
+                        arguments=recorded_projection.transcript_arguments(),
+                    ),
+                    result=expected_outcome.result,
+                )
             if (
-                recorded_outcome != expected_outcome
+                recorded_outcome != expected_recorded_outcome
                 or recorded_event is None
                 or recorded_event.id != expected_event.id
                 or recorded_event.type != expected_event.type
@@ -6119,7 +7106,7 @@ class RecoveryCoordinator:
                 or recorded_event.agent_name != expected_event.agent_name
                 or recorded_event.environment_name != expected_event.environment_name
                 or recorded_event.tool_name != expected_event.tool_name
-                or recorded_event.payload != expected_event.payload
+                or not recorded_payload_matches
             ):
                 raise RuntimeError(
                     "Durable structured-output terminal evidence conflicts with "
@@ -6139,7 +7126,6 @@ class RecoveryCoordinator:
             session_id=session.id,
             pending_round=pending_round,
         )
-        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
         retry_scheduled = not validation.valid and retry_allowed and attempt <= spec.max_retries
         validating_event = structured_output_tool_round._structured_output_validating_event(
             session=session,
@@ -6673,8 +7659,86 @@ class RecoveryCoordinator:
             synthesized_outcomes,
             self._secret_redactor,
         )
+        # Classify staged evidence against the durable coverage exactly as it
+        # existed when recovery took ownership. Completing the assistant
+        # projection below may conservatively add coverage for calls that never
+        # produced terminal evidence; that must not retroactively authenticate
+        # a sibling result staged under an incomplete dynamic-secret scope.
+        recovery_staged_records = tool_round_recovery.staged_terminal_records(pending_round)
+        if any(item.event.session_id != session.id for item in recovery_staged_records):
+            raise RuntimeError("Staged recovery evidence belongs to a different session.")
+        checkpoint, pending_round = await self._complete_recovery_assistant_publication(
+            session_id=session.id,
+            registered_agent=registered_agent,
+            pending_round=pending_round,
+            execution_scope_unknown_ids=started_ids,
+        )
+        if pending_round.assistant_message_state == "quarantined":
+            tool_round_recovery.ready_assistant_publication_message(pending_round)
+        publication_scope = (
+            "unknown"
+            if pending_round.assistant_publication is None
+            else pending_round.assistant_publication.secret_resolution_scope
+        )
+        if publication_scope != "static":
+            quarantined_records: list[tool_round_recovery.StagedToolCallTerminal] = []
+            for staged in recovery_staged_records:
+                if staged.hooks_state == "completed":
+                    quarantined_records.append(staged)
+                    continue
+                quarantined_event = tool_round_recovery.hook_scope_unavailable_recovery_event(
+                    staged.event
+                )
+                await self._session_store.transform_checkpoint(
+                    session.id,
+                    tool_round_recovery.completed_staged_terminal_transform(
+                        tool_round_identity=tool_round_recovery.pending_tool_round_identity(
+                            pending_round
+                        ),
+                        event=quarantined_event,
+                    ),
+                )
+                quarantined_records.append(
+                    tool_round_recovery.StagedToolCallTerminal(
+                        tool_call_id=staged.tool_call_id,
+                        event=quarantined_event,
+                        hooks_state="completed",
+                    )
+                )
+            recovery_staged_records = quarantined_records
+        synthesized_by_id = {outcome.call.id: outcome for outcome in synthesized_outcomes}
+        staged_events_by_id = {item.tool_call_id: item.event for item in recovery_staged_records}
+        staged_hook_states_by_id = {
+            item.tool_call_id: item.hooks_state for item in recovery_staged_records
+        }
+        durable_terminal_ids = {
+            event.payload.get("tool_call_id")
+            for event in lifecycle_events
+            if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES
+        }
+        pending_calls_by_id = {call.tool_call_id: call for call in pending_round.tool_calls}
         planned_terminal_events: list[Event] = []
-        for outcome in synthesized_outcomes:
+        planned_outcomes: list[runtime_records.ToolCallOutcome] = []
+        planned_hook_states: list[
+            Literal["pending", "finalized", "observational", "completed"]
+        ] = []
+        for pending_call in pending_round.tool_calls:
+            if pending_call.tool_call_id in durable_terminal_ids:
+                continue
+            staged_event = staged_events_by_id.get(pending_call.tool_call_id)
+            if staged_event is not None:
+                planned_terminal_events.append(staged_event)
+                planned_outcomes.append(
+                    resume_ledger.tool_call_outcome_from_terminal_event(
+                        event=staged_event,
+                        pending_tool_call=pending_calls_by_id[pending_call.tool_call_id],
+                    )
+                )
+                planned_hook_states.append(staged_hook_states_by_id[pending_call.tool_call_id])
+                continue
+            outcome = synthesized_by_id.get(pending_call.tool_call_id)
+            if outcome is None:
+                raise RuntimeError("Recovery lost terminal evidence for a pending tool call.")
             event_type = (
                 EventType.TOOL_CALL_FAILED
                 if outcome.result.is_error
@@ -6700,6 +7764,8 @@ class RecoveryCoordinator:
                     },
                 )
             )
+            planned_outcomes.append(outcome)
+            planned_hook_states.append("finalized")
         tool_round_publication.collect_tool_round_publication_evidence(
             session_id=session.id,
             pending_round=pending_round,
@@ -6707,11 +7773,48 @@ class RecoveryCoordinator:
         )
 
         emitted_events: list[Event] = []
-        for expected_outcome, terminal_event in zip(
-            synthesized_outcomes,
+        tool_round_identity = tool_round_recovery.pending_tool_round_identity(pending_round)
+
+        async def complete_recovered_terminal_hooks(event: Event) -> Event:
+            await self._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.completed_staged_terminal_transform(
+                    tool_round_identity=tool_round_identity,
+                    event=event,
+                ),
+            )
+            return copy_event(event)
+
+        async def record_recovered_terminal_projection(event: Event) -> Event:
+            await self._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.projected_staged_terminal_transform(
+                    tool_round_identity=tool_round_identity,
+                    event=event,
+                ),
+            )
+            return copy_event(event)
+
+        for expected_outcome, terminal_event, hooks_state in zip(
+            planned_outcomes,
             planned_terminal_events,
+            planned_hook_states,
             strict=True,
         ):
+            if expected_outcome.call.id in staged_events_by_id:
+                terminal_event = restore_staged_terminal_authority(
+                    terminal_event,
+                    session_id=session.id,
+                    tool_round_identity=tool_round_identity,
+                )
+            expected_public_outcome = runtime_records.ToolCallOutcome(
+                call=runtime_records.ToolCallRequest(
+                    id=expected_outcome.call.id,
+                    name=expected_outcome.call.name,
+                    arguments={},
+                ),
+                result=expected_outcome.result,
+            )
             async for (
                 event,
                 emitted_outcome,
@@ -6723,15 +7826,43 @@ class RecoveryCoordinator:
                 tool_call=expected_outcome.call,
                 result=expected_outcome.result,
                 task_id=pending_round.task_id,
+                allow_modification=hooks_state == "pending",
+                publish_before_hooks=hooks_state == "observational",
+                deferred_terminal_projection_recorder=(
+                    record_recovered_terminal_projection
+                    if hooks_state == "observational"
+                    and expected_outcome.call.id in staged_events_by_id
+                    else None
+                ),
+                deferred_terminal_finalizer=(
+                    complete_recovered_terminal_hooks
+                    if hooks_state in {"pending", "finalized", "observational"}
+                    and expected_outcome.call.id in staged_events_by_id
+                    else None
+                ),
+                hooks_already_completed=hooks_state == "completed",
             ):
                 emitted_events.append(event)
-                if emitted_outcome is not None and emitted_outcome != expected_outcome:
+                if (
+                    emitted_outcome is not None
+                    and hooks_state != "pending"
+                    and emitted_outcome != expected_public_outcome
+                ):
                     raise RuntimeError("Recovered tool-round hooks changed terminal evidence.")
 
         lifecycle_events = await self._load_tool_round_lifecycle_events(
             session_id=session.id,
             pending_round=pending_round,
         )
+        checkpoint = await self._session_store.load_checkpoint(session.id)
+        refreshed_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+        if (
+            refreshed_pending_round is None
+            or tool_round_recovery.pending_tool_round_identity(refreshed_pending_round)
+            != tool_round_identity
+        ):
+            raise RuntimeError("Recovered hooks lost their pending tool-round owner.")
+        pending_round = refreshed_pending_round
         prepared = tool_round_publication.prepare_tool_round_publication(
             session_id=session.id,
             pending_round=pending_round,
@@ -7432,7 +8563,10 @@ class RecoveryCoordinator:
                 "model_step_id": pending_approval.model_step_id,
                 "model_attempt_id": pending_approval.model_attempt_id,
                 "tool_round_id": pending_approval.tool_round_id,
-                "approval": pending_approval.model_dump(mode="json"),
+                **approval_support.bounded_pending_approval_event_payload(
+                    pending_approval,
+                    redactor=self._secret_redactor,
+                ),
             }
         elif pending_user_input is not None and session.status == SessionStatus.INTERRUPTED:
             pending_action_interrupt_payload = {
@@ -7440,7 +8574,7 @@ class RecoveryCoordinator:
                 "model_step_id": pending_user_input.model_step_id,
                 "model_attempt_id": pending_user_input.model_attempt_id,
                 "tool_round_id": pending_user_input.tool_round_id,
-                "user_input": pending_user_input.model_dump(mode="json"),
+                "user_input": public_pending_user_input_event_payload(pending_user_input),
             }
         elif pending_tool_round is not None and session.status == SessionStatus.INTERRUPTED:
             pending_action_interrupt_payload = {
@@ -8470,7 +9604,7 @@ class RecoveryCoordinator:
                     "model_attempt_id": pending_user_input.model_attempt_id,
                     "tool_round_id": pending_user_input.tool_round_id,
                     "interruption_type": _INTERRUPTION_TYPE_USER_INPUT_REQUIRED,
-                    "user_input": pending_user_input.model_dump(mode="json"),
+                    "user_input": public_pending_user_input_event_payload(pending_user_input),
                     "recovered": True,
                     "reason": reason,
                     "metadata": metadata,

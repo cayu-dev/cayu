@@ -8,6 +8,7 @@ from cayu._validation import copy_json_value
 from cayu.core.events import Event, EventType
 from cayu.core.tools import _bound_policy_denial_text
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime.approvals import PendingToolCallApproval
 from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
@@ -102,8 +103,10 @@ def _scan_tool_call_events(
             outcomes.pop(tool_call_id, None)
             continue
         if event.type == EventType.TOOL_CALL_STARTED:
-            arguments = event.payload.get("arguments")
-            if type(arguments) is not dict or arguments != pending_call.arguments:
+            if not tool_argument_publication.started_arguments_match_private_call(
+                event.payload,
+                private_arguments=pending_call.arguments,
+            ):
                 started_ids.add(tool_call_id)
                 last_conflict_index[tool_call_id] = index
                 outcomes.pop(tool_call_id, None)
@@ -299,11 +302,19 @@ def tool_call_outcome_from_terminal_event(
             f"Terminal tool event is missing result payload: {pending_tool_call.tool_call_id}"
         )
     result = tool_results.tool_result_from_payload(result_payload)
+    argument_projection = tool_argument_publication.terminal_argument_projection(
+        event.payload,
+        legacy_arguments=pending_tool_call.arguments,
+    )
     return runtime_records.ToolCallOutcome(
         call=runtime_records.ToolCallRequest(
             id=pending_tool_call.tool_call_id,
             name=pending_tool_call.tool_name,
-            arguments=copy_json_value(pending_tool_call.arguments, "arguments"),
+            arguments=(
+                {}
+                if argument_projection.arguments is None
+                else copy_json_value(argument_projection.arguments, "arguments")
+            ),
         ),
         result=result,
     )

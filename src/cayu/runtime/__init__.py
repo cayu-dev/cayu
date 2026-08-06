@@ -42,7 +42,9 @@ from cayu.runtime.aggregates import (
 from cayu.runtime.app import CayuApp, RegisteredAgent, RegisteredEnvironment
 from cayu.runtime.approvals import (
     PendingToolApproval,
+    PendingToolApprovalEventView,
     PendingToolCallApproval,
+    PendingToolCallApprovalEventView,
     ResolutionActor,
     ResolutionActorSource,
     ToolApprovalDecision,
@@ -697,7 +699,9 @@ __all__ = [
     "PendingActionResultTooLarge",
     "PendingActionSession",
     "PendingToolApproval",
+    "PendingToolApprovalEventView",
     "PendingToolCallApproval",
+    "PendingToolCallApprovalEventView",
     "PendingUserInput",
     "PersistedEventSideEffectClaim",
     "PersistedEventSideEffectClaimLost",

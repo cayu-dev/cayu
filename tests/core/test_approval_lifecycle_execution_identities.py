@@ -16,6 +16,7 @@ from cayu import (
     Message,
     ModelStreamEvent,
     PendingToolApproval,
+    PendingToolApprovalEventView,
     ResolutionActor,
     ToolApprovalDecision,
     ToolApprovalRecoveryOutcome,
@@ -164,7 +165,7 @@ def test_conflicting_approval_descriptor_cannot_execute_external_tool(
             for event in await store.load_events("session-approval-descriptor-conflict")
             if event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        pending = PendingToolApproval.from_event(request_event)
+        pending = PendingToolApprovalEventView.from_event(request_event)
         conflicting_payload: dict[str, object] = {
             "model_step_id": pending.model_step_id,
             "model_attempt_id": pending.model_attempt_id,
@@ -433,7 +434,7 @@ def test_expired_pre_digest_approval_grant_retry_fails_closed_without_coercion()
             for event in await store.load_events(session_id)
             if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval = PendingToolApproval.from_event(approval_event)
+        approval = PendingToolApprovalEventView.from_event(approval_event)
 
         # A prior in-window resolve crashed after recording the grant.
         await store.append_event(
@@ -528,7 +529,7 @@ def test_tool_approval_recovery_does_not_authorize_unstarted_sibling() -> None:
             for event in await store.load_events(session_id)
             if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
         )
-        approval = PendingToolApproval.from_event(approval_event)
+        approval = PendingToolApprovalEventView.from_event(approval_event)
         request = ToolApprovalRequest(
             session_id=session_id,
             approval_id=approval.approval_id,

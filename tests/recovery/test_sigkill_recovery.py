@@ -31,7 +31,7 @@ def _assert_only_model_step_publication(checkpoint: dict) -> None:
         CHECKPOINT_SCHEMA_VERSION_KEY,
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
     publication = model_step_publication_from_checkpoint(checkpoint)
     assert publication is not None
     assert publication.assistant_message_published is True
@@ -105,7 +105,9 @@ def test_sigkill_during_ordinary_tool_execution_recovers_without_reexecution(
         assert pre_kill.session is not None
         assert pre_kill.session.status == SessionStatus.RUNNING
         assert "pending_tool_round" in pre_kill.checkpoint
-        assert [message.role for message in pre_kill.transcript] == ["user", "assistant"]
+        # The assistant tool-call message remains quarantined with the pending
+        # round until terminal argument projection is safe to publish.
+        assert [message.role for message in pre_kill.transcript] == ["user"]
         started = [event for event in pre_kill.events if event.type == EventType.TOOL_CALL_STARTED]
         assert len(started) == 1
         assert not any(

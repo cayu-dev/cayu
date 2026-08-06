@@ -10,10 +10,16 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
     {
         "agent_name",
         "approval_id",
+        "assistant_message_state",
+        "covered_tool_call_ids",
         "decision",
         "environment_name",
+        "event_id",
         "expires_at",
+        "hooks_state",
+        "id",
         "input_id",
+        "interaction_id",
         "model_attempt_id",
         "model_step_id",
         "name",
@@ -21,27 +27,35 @@ _DURABLE_STRUCTURE_STRING_FIELDS = frozenset(
         "policy_evidence",
         "role",
         "round_id",
+        "secret_resolution_scope",
         "source_model_step_id",
+        "state",
         "strategy",
         "task_id",
+        "timestamp",
         "tool_call_id",
         "tool_name",
         "tool_round_id",
         "type",
+        "workflow_name",
         "workspace_id",
     }
 )
 _DURABLE_ENUM_STRING_FIELDS = frozenset(
     {
+        "assistant_message_state",
         "decision",
         "policy_decision",
         "policy_evidence",
         "policy_state",
         "role",
+        "secret_resolution_scope",
         "source",
+        "state",
         "status",
         "strategy",
         "type",
+        "hooks_state",
     }
 )
 _DURABLE_SHA256_STRING_FIELDS = frozenset(
@@ -51,6 +65,7 @@ _DURABLE_SHA256_STRING_FIELDS = frozenset(
 )
 _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
     "approval_close_intent",
+    "assistant_publication",
     "approval_resolution_intent",
     "pending_tool_approval",
     "pending_tool_round",
@@ -82,6 +97,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "effective_through",
     "enabled",
     "errors",
+    "event",
     "generated_at",
     "generation",
     "include_in_transcript",
@@ -96,6 +112,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "limits",
     "match",
     "match_prefixes",
+    "message",
     "max_attempts",
     "max_cache_read_input_tokens",
     "max_cache_write_input_tokens",
@@ -120,6 +137,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "period",
     "policy_context_version",
     "policy_state",
+    "payload",
     "price_book_version",
     "prices",
     "pricing",
@@ -129,6 +147,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "provider_name",
     "records",
     "question",
+    "quarantined_assistant_message",
     "reason",
     "repair_prompt",
     "requires_cache_write_ttls",
@@ -190,6 +209,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "source_run_epoch",
     "source_transcript_cursor",
     "status",
+    "staged_terminals",
     "trigger_estimated_context_tokens",
     "updated_at",
     "valid",
@@ -205,6 +225,7 @@ _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
         "metadata",
         "options",
         "output",
+        "payload",
         "provider_options",
         "request_metadata",
         "structured",
@@ -215,6 +236,25 @@ _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
 # runtime schema. Other dynamic maps, notably environment reconnect metadata,
 # contain arbitrary extension data and must remain untrusted at every depth.
 _DURABLE_SINGLE_LEVEL_TYPED_MAPS = frozenset({"records"})
+_QUARANTINED_ASSISTANT_MESSAGE_KEYS = frozenset({"role", "content"})
+_QUARANTINED_ASSISTANT_MESSAGE_PART_KEYS = frozenset(
+    {
+        "type",
+        "text",
+        "tool_call_id",
+        "tool_name",
+        "arguments",
+        "tool_round_id",
+        "model_step_id",
+        "model_attempt_id",
+        "provider",
+        "state",
+        "provider_state",
+    }
+)
+_QUARANTINED_ASSISTANT_MESSAGE_UNTRUSTED_CONTAINERS = frozenset(
+    {"arguments", "provider_state", "state"}
+)
 _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
     {
         "context_compaction",
@@ -301,7 +341,11 @@ def durable_value_contains_secret(
             )
         for key, item in value.items():
             structural_key = (
-                key in (_DURABLE_ROOT_STRUCTURE_KEYS if not path else _DURABLE_STRUCTURE_KEYS)
+                (
+                    key in (_DURABLE_ROOT_STRUCTURE_KEYS if not path else _DURABLE_STRUCTURE_KEYS)
+                    or _is_quarantined_assistant_message_structural_key(path, key)
+                    or _is_staged_terminal_event_payload(path)
+                )
                 and _path_has_typed_schema(path)
                 and (not path or path[-1] not in _DURABLE_SINGLE_LEVEL_TYPED_MAPS)
             )
@@ -330,11 +374,62 @@ def _path_has_typed_schema(path: tuple[str, ...]) -> bool:
     if path and path[0] not in _DURABLE_ROOT_STRUCTURE_KEYS:
         return False
     for index, part in enumerate(path):
-        if part in _DURABLE_UNTRUSTED_CONTAINERS:
+        if (
+            part in _DURABLE_UNTRUSTED_CONTAINERS
+            and not (part == "payload" and _is_staged_terminal_event_payload(path[: index + 1]))
+        ) or (
+            _is_quarantined_assistant_message_part_key(path[:index], part)
+            and part in _QUARANTINED_ASSISTANT_MESSAGE_UNTRUSTED_CONTAINERS
+        ):
             return False
         if part in _DURABLE_STRUCTURE_KEYS:
+            continue
+        if _is_quarantined_assistant_message_structural_key(path[:index], part):
             continue
         if index > 0 and path[index - 1] in _DURABLE_SINGLE_LEVEL_TYPED_MAPS:
             continue
         return False
     return True
+
+
+def _is_staged_terminal_event_payload(path: tuple[str, ...]) -> bool:
+    return (
+        len(path) >= 4
+        and path[-4]
+        in {
+            "pending_tool_round",
+            "pending_user_input",
+        }
+        and path[-3:]
+        == (
+            "staged_terminals",
+            "event",
+            "payload",
+        )
+    )
+
+
+def _is_quarantined_assistant_message_structural_key(
+    path: tuple[str, ...],
+    key: str,
+) -> bool:
+    if path and (
+        path[-1] == "quarantined_assistant_message"
+        or (len(path) >= 2 and path[-2:] == ("assistant_publication", "message"))
+    ):
+        return key in _QUARANTINED_ASSISTANT_MESSAGE_KEYS
+    return _is_quarantined_assistant_message_part_key(path, key)
+
+
+def _is_quarantined_assistant_message_part_key(
+    path: tuple[str, ...],
+    key: str,
+) -> bool:
+    return (
+        len(path) >= 2
+        and (
+            path[-2:] == ("quarantined_assistant_message", "content")
+            or (len(path) >= 3 and path[-3:] == ("assistant_publication", "message", "content"))
+        )
+        and key in _QUARANTINED_ASSISTANT_MESSAGE_PART_KEYS
+    )

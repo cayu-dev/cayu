@@ -20,6 +20,7 @@ from cayu.runtime._event_projection import private_event_linkage_value
 from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
     PendingToolApproval,
+    PendingToolApprovalEventView,
     ToolPolicyEvidence,
 )
 from cayu.runtime.execution_units import ToolRoundIdentity
@@ -34,7 +35,11 @@ from cayu.runtime.sessions import (
     PendingActionSession,
     SessionStatus,
 )
-from cayu.runtime.user_input import pending_user_input_from_checkpoint
+from cayu.runtime.user_input import (
+    PendingUserInput,
+    pending_user_input_from_checkpoint,
+    public_pending_user_input_prompt,
+)
 
 PENDING_ACTION_SESSION_STATUSES = frozenset(
     {SessionStatus.INTERRUPTED, SessionStatus.FAILED, SessionStatus.COMPLETED}
@@ -74,7 +79,8 @@ _PENDING_ACTION_EVENT_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         }
     )
     | _TOOL_ROUND_IDENTITY_PAYLOAD_KEYS,
-    "tool.call.started": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS | frozenset({"arguments"}),
+    "tool.call.started": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS
+    | frozenset({"arguments", "arguments_state"}),
     "tool.call.completed": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "tool.call.failed": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
     "tool.call.blocked": _TOOL_EVENT_EVIDENCE_PAYLOAD_KEYS,
@@ -124,6 +130,10 @@ def pending_action_evidence_round_from_checkpoint(
             or pending_round.tool_round_id != approval.tool_round_id
             or pending_round.model_step_id != approval.model_step_id
             or pending_round.model_attempt_id != approval.model_attempt_id
+            or not approval_support.pending_approval_scope_matches_round(
+                approval,
+                pending_round,
+            )
             or [call.model_dump(mode="json") for call in pending_round.tool_calls]
             != [call.model_dump(mode="json") for call in approval.tool_calls]
         ):
@@ -141,6 +151,8 @@ def pending_action_evidence_round_from_checkpoint(
         return candidate.model_copy(deep=True)
     if type(candidate) is PendingToolApproval:
         return approval_support.planned_tool_round_from_pending_approval(candidate)
+    if type(candidate) is not PendingUserInput:
+        raise AssertionError("Pending-action candidate has an unsupported type.")
     return tool_round_recovery.PendingToolRound(
         tool_round_id=candidate.tool_round_id,
         model_step_id=candidate.model_step_id,
@@ -149,6 +161,12 @@ def pending_action_evidence_round_from_checkpoint(
         environment_name=candidate.environment_name,
         task_id=candidate.task_id,
         tool_calls=candidate.tool_calls,
+        policy_state="planned",
+        policy_context_version=1,
+        assistant_message_state=candidate.assistant_message_state,
+        quarantined_assistant_message=candidate.quarantined_assistant_message,
+        assistant_publication=candidate.assistant_publication,
+        staged_terminals=candidate.staged_terminals,
         structured_output=candidate.structured_output,
     )
 
@@ -555,17 +573,28 @@ def _project_payload_object_view(value: Any, keys: frozenset[str]) -> dict[str, 
 
 
 def _approval_event_matches_checkpoint(
-    event_pending: PendingToolApproval,
+    event_pending: PendingToolApprovalEventView,
     checkpoint_pending: PendingToolApproval | None,
+    *,
+    arguments_quarantined: bool,
 ) -> bool:
     """Compare approval authority while permitting bounded audit metadata."""
 
     if checkpoint_pending is None:
         return False
 
-    def authority_view(approval: PendingToolApproval) -> dict[str, Any]:
+    def authority_view(
+        approval: PendingToolApproval | PendingToolApprovalEventView,
+        *,
+        omit_arguments: bool,
+    ) -> dict[str, Any]:
         payload = approval.model_dump(mode="json")
         payload.pop("metadata", None)
+        payload.pop("reason", None)
+        payload.pop("arguments_state", None)
+        payload.pop("secret_resolution_scope", None)
+        if omit_arguments:
+            payload.pop("arguments", None)
         tool_calls = payload.get("tool_calls")
         if type(tool_calls) is not list:
             raise TypeError("Pending approval tool calls must be a list.")
@@ -573,9 +602,19 @@ def _approval_event_matches_checkpoint(
             if type(pending_call) is not dict:
                 raise TypeError("Pending approval tool calls must be objects.")
             pending_call.pop("metadata", None)
+            pending_call.pop("reason", None)
+            pending_call.pop("arguments_state", None)
+            if omit_arguments:
+                pending_call.pop("arguments", None)
         return payload
 
-    return authority_view(event_pending) == authority_view(checkpoint_pending)
+    return authority_view(
+        event_pending,
+        omit_arguments=arguments_quarantined,
+    ) == authority_view(
+        checkpoint_pending,
+        omit_arguments=arguments_quarantined,
+    )
 
 
 def pending_action_event_projection_bytes(record: EventRecord) -> int | None:
@@ -698,6 +737,10 @@ def _action_from_record(
     options: list[str] | None = None,
     arguments: dict[str, Any] | None = None,
 ) -> PendingActionRecord:
+    # Pending actions are public control-plane projections. Their private
+    # checkpoints retain executable arguments, but no invocation has yet
+    # established a complete secret scope for public display.
+    arguments = None
     discriminator = approval_id or input_id or tool_call_id or record.event.id
     return PendingActionRecord(
         id=f"{session.id}:{record.sequence}:{action_kind}:{discriminator}",
@@ -748,7 +791,7 @@ def _pending_approval_checkpoint_call(
             "arguments": pending.arguments,
             "tool_call_id": pending.tool_call_id,
             "tool_round_id": pending.tool_round_id,
-            "reason": pending.reason,
+            "reason": approval_support.public_pending_approval_reason(pending),
             "policy_evidence": approval_support.effective_tool_policy_evidence(
                 next(
                     call for call in pending.tool_calls if call.tool_call_id == pending.tool_call_id
@@ -764,7 +807,10 @@ def _pending_approval_checkpoint_call(
                 "arguments": call.arguments,
                 "tool_call_id": call.tool_call_id,
                 "tool_round_id": pending.tool_round_id,
-                "reason": pending.reason if call.tool_call_id == pending.tool_call_id else None,
+                "reason": approval_support.public_pending_approval_reason(
+                    pending,
+                    tool_call_id=call.tool_call_id,
+                ),
                 "policy_evidence": approval_support.effective_tool_policy_evidence(call),
             }
     return None
@@ -784,6 +830,7 @@ def _pending_user_input_checkpoint_call(
         return None
     if pending is None or pending.input_id != input_id:
         return None
+    public_question, public_options = public_pending_user_input_prompt(pending)
     if identity_payload is not None and any(
         identity_payload.get(key) != value
         for key, value in (
@@ -799,8 +846,8 @@ def _pending_user_input_checkpoint_call(
             "arguments": pending.arguments,
             "tool_call_id": pending.tool_call_id,
             "tool_round_id": pending.tool_round_id,
-            "question": pending.question,
-            "options": list(pending.options),
+            "question": public_question,
+            "options": public_options,
         }
     if gating_only and pending.tool_call_id != tool_call_id:
         return None
@@ -811,10 +858,10 @@ def _pending_user_input_checkpoint_call(
                 "arguments": call.arguments,
                 "tool_call_id": call.tool_call_id,
                 "tool_round_id": pending.tool_round_id,
-                "question": pending.question if call.tool_call_id == pending.tool_call_id else None,
-                "options": (
-                    list(pending.options) if call.tool_call_id == pending.tool_call_id else []
+                "question": (
+                    public_question if call.tool_call_id == pending.tool_call_id else None
                 ),
+                "options": (public_options if call.tool_call_id == pending.tool_call_id else []),
             }
     return None
 
@@ -961,7 +1008,8 @@ def pending_action_from_records(
                 approval_id = _optional_payload_string(payload, "approval_id")
                 tool_call_id = _optional_payload_string(payload, "tool_call_id")
                 try:
-                    event_pending = PendingToolApproval.from_event(event)
+                    event_pending = PendingToolApprovalEventView.from_event(event)
+                    arguments_quarantined = event_pending.arguments_state == "quarantined"
                     checkpoint_pending = approval_support.pending_approval_from_checkpoint(
                         checkpoint
                     )
@@ -973,6 +1021,7 @@ def pending_action_from_records(
                     and _approval_event_matches_checkpoint(
                         event_pending,
                         checkpoint_pending,
+                        arguments_quarantined=arguments_quarantined,
                     )
                     and approval_id is not None
                     and tool_call_id is not None
@@ -990,8 +1039,8 @@ def pending_action_from_records(
                             record=record,
                             action_kind=PendingActionKind.TOOL_APPROVAL,
                             title="Tool approval required",
-                            detail=_optional_payload_string(approval, "reason")
-                            or _optional_payload_string(checkpoint_call, "reason"),
+                            detail=_optional_payload_string(checkpoint_call, "reason")
+                            or "Approval required",
                             tool_name=_optional_payload_string(checkpoint_call, "tool_name")
                             or event.tool_name,
                             approval_id=approval_id,
@@ -1013,16 +1062,13 @@ def pending_action_from_records(
                         gating_only=True,
                     )
                     if checkpoint_call is not None:
-                        question = (
-                            _optional_payload_string(checkpoint_call, "question")
-                            or "Input required"
-                        )
+                        question = _optional_payload_string(checkpoint_call, "question")
                         return _action_from_record(
                             session=session,
                             record=record,
                             action_kind=PendingActionKind.USER_INPUT,
                             title="User input required",
-                            detail=question,
+                            detail=question or "Input required",
                             tool_name=event.tool_name
                             or _optional_payload_string(checkpoint_call, "tool_name"),
                             input_id=input_id,
@@ -1096,8 +1142,8 @@ def pending_action_from_records(
                     input_id=input_id,
                     round_id=round_id,
                     tool_call_id=tool_call_id,
-                    question=_optional_payload_string(user_input, "question"),
-                    options=_payload_string_list(user_input, "options"),
+                    question=_optional_payload_string(checkpoint_call, "question"),
+                    options=_payload_string_list(checkpoint_call, "options"),
                     arguments=arguments,
                 )
 
@@ -1116,8 +1162,8 @@ def pending_action_from_records(
                             record=record,
                             action_kind=PendingActionKind.TOOL_APPROVAL,
                             title="Tool approval required",
-                            detail=_optional_payload_string(approval, "reason")
-                            or _optional_payload_string(checkpoint_call, "reason"),
+                            detail=_optional_payload_string(checkpoint_call, "reason")
+                            or "Approval required",
                             tool_name=_optional_payload_string(checkpoint_call, "tool_name")
                             or event.tool_name,
                             approval_id=approval_id,
@@ -1139,16 +1185,13 @@ def pending_action_from_records(
                         gating_only=True,
                     )
                     if checkpoint_call is not None:
-                        question = (
-                            _optional_payload_string(checkpoint_call, "question")
-                            or "Input required"
-                        )
+                        question = _optional_payload_string(checkpoint_call, "question")
                         return _action_from_record(
                             session=session,
                             record=record,
                             action_kind=PendingActionKind.USER_INPUT,
                             title="User input required",
-                            detail=question,
+                            detail=question or "Input required",
                             tool_name=event.tool_name
                             or _optional_payload_string(checkpoint_call, "tool_name"),
                             input_id=input_id,

@@ -22,6 +22,7 @@ from cayu.core.events import (
 )
 from cayu.core.tools import ToolResult
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.execution_units import (
@@ -195,6 +196,7 @@ def _structured_output_tool_terminal_event(
                         tool_round_id=tool_round_id,
                         tool_call_id=outcome.call.id,
                     ),
+                    **tool_argument_publication.unavailable_argument_projection().payload_fields(),
                     "structured_output_validation": True,
                     "result": result,
                 },

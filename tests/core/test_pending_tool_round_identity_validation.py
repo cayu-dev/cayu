@@ -4,8 +4,10 @@ import pytest
 from pydantic import ValidationError
 
 from cayu.runtime import PendingToolApproval
+from cayu.runtime import _approval_support as approval_support
 from cayu.runtime._tool_round_recovery import PendingToolRound
 from cayu.runtime.approvals import PendingToolCallApproval
+from cayu.runtime.tool_policy import ToolPolicyDecision, ToolPolicyResult
 from cayu.runtime.user_input import PendingUserInput
 
 
@@ -119,3 +121,60 @@ def test_pending_pause_state_requires_its_gating_call_in_the_round(build) -> Non
 def test_pending_pause_state_rejects_conflicting_gating_call_details(build) -> None:
     with pytest.raises(ValidationError, match="details do not match"):
         build()
+
+
+def test_pending_approval_scope_requires_matching_paired_round_evidence() -> None:
+    pending_round = PendingToolRound(
+        **_identity(),
+        agent_name="assistant",
+        tool_calls=[_call()],
+    )
+    approval = PendingToolApproval(
+        approval_id="approval_1",
+        **_identity(),
+        tool_call_id="call_1",
+        tool_name="deploy",
+        arguments={"target": "production"},
+        agent_name="assistant",
+        secret_resolution_scope="static",
+        tool_calls=[_call()],
+    )
+
+    assert not approval_support.pending_approval_scope_matches_round(
+        approval,
+        pending_round,
+    )
+    assert approval_support.pending_approval_scope_matches_round(
+        approval.model_copy(update={"secret_resolution_scope": "unknown"}),
+        pending_round,
+    )
+
+
+def test_approval_closure_policy_output_requires_static_scope() -> None:
+    approval = PendingToolApproval(
+        approval_id="approval_1",
+        **_identity(),
+        tool_call_id="call_1",
+        tool_name="deploy",
+        arguments={"target": "production"},
+        agent_name="assistant",
+        secret_resolution_scope="dynamic",
+        tool_calls=[_call()],
+    )
+    denial = ToolPolicyResult(
+        decision=ToolPolicyDecision.DENY,
+        reason="private policy reason",
+        metadata={"private": "policy metadata"},
+    )
+
+    assert approval_support.public_policy_denial_result(
+        secret_resolution_scope=approval.secret_resolution_scope,
+        policy_result=denial,
+    ) == ToolPolicyResult(decision=ToolPolicyDecision.DENY)
+    assert (
+        approval_support.public_policy_denial_result(
+            secret_resolution_scope="static",
+            policy_result=denial,
+        )
+        == denial
+    )

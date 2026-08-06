@@ -123,7 +123,7 @@ def test_cayu_app_never_executes_new_tool_call_with_redaction_marker() -> None:
     assert events[-1].type == EventType.SESSION_FAILED
     assert tool.calls == []
     assert asyncio.run(store.load_checkpoint("sess_new_tool_marker")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2
     }
 
 
@@ -169,7 +169,7 @@ def test_cayu_app_rejects_workload_secret_before_approval_checkpoint() -> None:
     transcript = asyncio.run(store.load_transcript("sess_tool_approval_redaction"))
     assert events[-1].type == EventType.SESSION_FAILED
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED for event in events)
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
     assert tool.calls == []
     assert secret not in str([event.model_dump(mode="json") for event in events])
     assert secret not in str([message.model_dump(mode="json") for message in transcript])

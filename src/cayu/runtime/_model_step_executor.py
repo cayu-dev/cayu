@@ -403,6 +403,7 @@ class ModelCompletionPublicationRequest:
     assistant_step_result: AssistantStepResult | None
     completion_event: Event
     authoritative_assistant_message: Message | None
+    defer_assistant_message: bool
     structured_output_validation: StructuredOutputValidation | None
 
     def __post_init__(self) -> None:
@@ -423,6 +424,8 @@ class ModelCompletionPublicationRequest:
             if self.authoritative_assistant_message is None
             else detach_message(self.authoritative_assistant_message)
         )
+        if type(self.defer_assistant_message) is not bool:
+            raise TypeError("defer_assistant_message must be a bool.")
         if (
             self.structured_output_validation is not None
             and type(self.structured_output_validation) is not StructuredOutputValidation
@@ -448,6 +451,12 @@ class ModelCompletionPublicationRequest:
                 raise ValueError(
                     "Authoritative assistant message does not match the detached step result."
                 )
+        if self.defer_assistant_message and (
+            result is None or assistant_message is None or not result.tool_calls
+        ):
+            raise ValueError(
+                "Deferred assistant publication requires an ordinary tool-call message."
+            )
         if structured_output_validation is not None and (
             result is None
             or assistant_message is None
@@ -460,6 +469,7 @@ class ModelCompletionPublicationRequest:
         object.__setattr__(self, "assistant_step_result", result)
         object.__setattr__(self, "completion_event", event)
         object.__setattr__(self, "authoritative_assistant_message", assistant_message)
+        object.__setattr__(self, "defer_assistant_message", self.defer_assistant_message)
         object.__setattr__(
             self,
             "structured_output_validation",
@@ -629,7 +639,7 @@ def _validate_model_completion_publication_result(
     publication_request = completed.publication
     expected_messages = (
         ()
-        if request.authoritative_assistant_message is None
+        if request.authoritative_assistant_message is None or request.defer_assistant_message
         else (request.authoritative_assistant_message,)
     )
     if publication_request.publication_id != request.dispatch.logical_step_id:
@@ -700,6 +710,7 @@ async def _publish_model_completion(
         assistant_step_result=request.assistant_step_result,
         completion_event=request.completion_event,
         authoritative_assistant_message=request.authoritative_assistant_message,
+        defer_assistant_message=request.defer_assistant_message,
         structured_output_validation=request.structured_output_validation,
     )
     if publication_cancellation is not None:
@@ -1971,6 +1982,7 @@ class ModelStepExecutor:
                             completion=_stream_event_completion(completed_stream_event),
                         )
                         classification = classify_assistant_step(step_result)
+                    defer_assistant_message = bool(tool_calls)
                     completion_event = _model_stream_event_to_runtime_event(
                         stream_event,
                         session=session,
@@ -1990,7 +2002,11 @@ class ModelStepExecutor:
                         context_pressure_estimate=context_pressure_estimate,
                         transcript_cursor_after_completion=(
                             transcript_cursor_before_request
-                            + (1 if assistant_message is not None else 0)
+                            + (
+                                1
+                                if assistant_message is not None and not defer_assistant_message
+                                else 0
+                            )
                         ),
                         usage_dialect=registered_provider.usage_dialect,
                         billing_identity=billing_identity,
@@ -2243,6 +2259,11 @@ class ModelStepExecutor:
                 if durable_step_result is not None and terminal_failure is None
                 else None
             )
+            defer_assistant_message = bool(
+                authoritative_assistant_message is not None
+                and durable_step_result is not None
+                and durable_step_result.tool_calls
+            )
             publication_event = (
                 completion_event
                 if terminal_failure is None
@@ -2259,6 +2280,7 @@ class ModelStepExecutor:
                 assistant_step_result=durable_step_result,
                 completion_event=publication_event,
                 authoritative_assistant_message=authoritative_assistant_message,
+                defer_assistant_message=defer_assistant_message,
                 structured_output_validation=structured_output_validation,
             )
             await _publish_model_completion(

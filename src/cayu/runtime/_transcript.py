@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, cast
@@ -17,6 +18,7 @@ from cayu.core.messages import (
     ToolResultPart,
     copy_message_part,
 )
+from cayu.runtime import _message_redaction as message_redaction
 from cayu.runtime._runtime_records import ToolCallOutcome, ToolCallRequest
 from cayu.runtime.execution_units import (
     ToolRoundIdentity,
@@ -25,6 +27,7 @@ from cayu.runtime.execution_units import (
 )
 from cayu.runtime.sessions import SessionStore
 from cayu.runtime.usage import strip_provider_billing_identity
+from cayu.vaults import SecretRedactor
 
 
 @dataclass
@@ -325,6 +328,159 @@ def assistant_message_with_tool_round(
             for part in message.content
         ),
     )
+
+
+def assistant_message_with_projected_tool_arguments(
+    message: Message,
+    outcomes: list[ToolCallOutcome] | tuple[ToolCallOutcome, ...],
+) -> Message:
+    """Overlay terminal tool arguments onto a durable safe assistant projection."""
+
+    projected_by_id = {outcome.call.id: outcome.call for outcome in outcomes}
+    if len(projected_by_id) != len(outcomes):
+        raise ValueError("Projected tool outcomes cannot repeat tool-call identifiers.")
+    seen: set[str] = set()
+    projected_openai_state_ids: set[str] = set()
+    projected_content = []
+    for part in message.content:
+        if (
+            type(part) is ProviderStatePart
+            and part.provider == "openai"
+            and part.state.get("type") == "function_call"
+        ):
+            state = copy_json_value(part.state, "provider_state")
+            if type(state) is not dict:
+                raise AssertionError("Provider-state copy returned a non-object.")
+            call_id = state.get("call_id")
+            tool_name = state.get("name")
+            if type(call_id) is not str or type(tool_name) is not str:
+                raise ValueError("OpenAI function-call provider state is missing its identity.")
+            projected_call = projected_by_id.get(call_id)
+            if projected_call is None or projected_call.name != tool_name:
+                raise ValueError(
+                    "OpenAI function-call provider state conflicts with terminal tool evidence."
+                )
+            if call_id in projected_openai_state_ids:
+                raise ValueError(
+                    "OpenAI function-call provider state repeats a tool-call identifier."
+                )
+            projected_openai_state_ids.add(call_id)
+            state["arguments"] = json.dumps(
+                projected_call.arguments,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            projected_content.append(ProviderStatePart(provider="openai", state=state))
+            continue
+        if type(part) is not ToolCallPart:
+            projected_content.append(copy_message_part(part))
+            continue
+        projected_call = projected_by_id.get(part.tool_call_id)
+        if projected_call is None or projected_call.name != part.tool_name:
+            raise ValueError("Quarantined assistant message conflicts with terminal tool evidence.")
+        if part.tool_call_id in seen:
+            raise ValueError("Quarantined assistant message repeats a tool-call identifier.")
+        seen.add(part.tool_call_id)
+        projected_content.append(
+            ToolCallPart(
+                tool_call_id=part.tool_call_id,
+                tool_name=part.tool_name,
+                arguments=deepcopy(projected_call.arguments),
+                tool_round_id=part.tool_round_id,
+                model_step_id=part.model_step_id,
+                model_attempt_id=part.model_attempt_id,
+            )
+        )
+    if seen != set(projected_by_id):
+        raise ValueError(
+            "Terminal tool evidence contains a call absent from the assistant message."
+        )
+    return Message(role=message.role, content=tuple(projected_content))
+
+
+def project_assistant_message_for_tool_round_publication(
+    message: Message,
+    *,
+    redactor: SecretRedactor,
+) -> Message | None:
+    """Apply one secret scope without modifying opaque provider protocol state.
+
+    Tool arguments are deliberately replaced with unavailable placeholders; the
+    terminal execution ledger supplies their authoritative public projection at
+    final publication.  Thinking/provider state is integrity-bound and is
+    therefore preserved byte-for-byte only when the redactor is a no-op.  A
+    ``None`` result means the round must not be sent to another provider.
+    """
+
+    if type(message) is not Message:
+        raise TypeError("message must be a Message.")
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("redactor must be a SecretRedactor.")
+
+    projected_content = []
+    for part in message.content:
+        if type(part) is TextPart:
+            projected_content.append(TextPart(text=redactor.redact_text(part.text)))
+            continue
+        if type(part) is ToolCallPart:
+            projected_content.append(
+                ToolCallPart(
+                    tool_call_id=part.tool_call_id,
+                    tool_name=part.tool_name,
+                    arguments={},
+                    tool_round_id=part.tool_round_id,
+                    model_step_id=part.model_step_id,
+                    model_attempt_id=part.model_attempt_id,
+                )
+            )
+            continue
+        if type(part) is ThinkingPart:
+            if part.provider_state:
+                if _redactor_changes_integrity_bound_part(part, redactor=redactor):
+                    return None
+                projected_content.append(copy_message_part(part))
+            else:
+                projected_content.append(
+                    ThinkingPart(text=redactor.redact_text(part.text), provider_state=None)
+                )
+            continue
+        if type(part) is ProviderStatePart:
+            state = copy_json_value(part.state, "provider_state")
+            if type(state) is not dict:
+                raise AssertionError("Provider-state copy returned a non-object.")
+            if (
+                part.provider == "openai"
+                and state.get("type") == "function_call"
+                and "arguments" in state
+            ):
+                state["arguments"] = "{}"
+            projected_part = ProviderStatePart(provider=part.provider, state=state)
+            if _redactor_changes_integrity_bound_part(projected_part, redactor=redactor):
+                return None
+            projected_content.append(projected_part)
+            continue
+        projected = redactor.redact_json_values(part.model_dump(mode="json"))
+        projected_content.append(type(part).model_validate(projected))
+    return Message(role=message.role, content=tuple(projected_content))
+
+
+def _redactor_changes_integrity_bound_part(
+    part: ProviderStatePart | ThinkingPart,
+    *,
+    redactor: SecretRedactor,
+) -> bool:
+    """Check typed structure plus opaque keys and values without rewriting the part."""
+
+    candidate = Message(role=MessageRole.ASSISTANT, content=(copy_message_part(part),))
+    try:
+        projected = message_redaction.redact_runtime_message_for_boundary(
+            candidate,
+            redactor=redactor,
+            field_name="assistant_publication",
+        )
+    except ValueError:
+        return True
+    return projected != candidate
 
 
 def tool_result_messages(

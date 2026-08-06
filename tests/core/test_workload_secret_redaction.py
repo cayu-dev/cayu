@@ -165,7 +165,7 @@ def test_runtime_managed_context_rejects_secret_checkpoint_before_publication(
 
     assert provider.requests == []
     assert asyncio.run(store.load_checkpoint("secret_context_checkpoint")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
     }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
@@ -251,7 +251,7 @@ def test_runtime_managed_context_rejects_secret_checkpoint_event_payload_before_
 
     assert provider.requests == []
     assert asyncio.run(store.load_checkpoint(f"secret_context_event_{secret_location}")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2
     }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
@@ -313,7 +313,7 @@ def test_runtime_managed_context_discards_secret_checkpoint_carried_by_failure()
 
     assert provider.requests == []
     assert asyncio.run(store.load_checkpoint("secret_context_failure_checkpoint")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
     }
     assert all(event.type is not EventType.SESSION_CHECKPOINTED for event in events)
     assert secret not in repr(events)
@@ -3362,7 +3362,7 @@ def test_fork_validates_only_checkpoint_state_copied_to_child() -> None:
     child_checkpoint = asyncio.run(scenario())
 
     assert child_checkpoint == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "safe_state": {"value": "copied"},
     }
     assert secret not in repr(child_checkpoint)
@@ -4494,6 +4494,67 @@ def test_checkpoint_schema_keys_remain_valid_inside_typed_collections() -> None:
             }
         },
         redactor=SecretRedactor("model"),
+    )
+
+    quarantined_message = {
+        "pending_tool_round": {
+            "quarantined_assistant_message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "harmless prose"},
+                    {
+                        "type": "provider_state",
+                        "provider": "vendor",
+                        "state": {
+                            "safe-extension": "safe-value",
+                            "status": "safe-value",
+                        },
+                    },
+                    {
+                        "type": "thinking",
+                        "text": "safe thought",
+                        "provider_state": {
+                            "safe-extension": "safe-value",
+                            "status": "safe-value",
+                        },
+                    },
+                    {
+                        "type": "tool_call",
+                        "tool_call_id": "safe-call",
+                        "tool_name": "safe-tool",
+                        "arguments": {"safe-argument": "safe-value"},
+                    },
+                ],
+            }
+        }
+    }
+    for structural_key in (
+        "content",
+        "role",
+        "type",
+        "text",
+        "provider",
+        "state",
+        "provider_state",
+        "tool_call_id",
+        "tool_name",
+        "arguments",
+    ):
+        assert not durable_value_contains_secret(
+            quarantined_message,
+            redactor=SecretRedactor(structural_key),
+        )
+    assert durable_value_contains_secret(
+        quarantined_message,
+        redactor=SecretRedactor("safe-extension"),
+    )
+    assert durable_value_contains_secret(
+        quarantined_message,
+        redactor=SecretRedactor("status"),
+    )
+    assert durable_value_contains_secret(
+        quarantined_message,
+        redactor=SecretRedactor("safe-argument"),
     )
 
     assert durable_value_contains_secret(

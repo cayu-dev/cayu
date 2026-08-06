@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from cayu import Event, EventType, PendingToolApproval, PendingToolCallApproval
+from cayu import (
+    Event,
+    EventType,
+    PendingToolApproval,
+    PendingToolApprovalEventView,
+    PendingToolCallApproval,
+)
 
 
 def _pending() -> PendingToolApproval:
@@ -45,6 +51,45 @@ def test_from_event_reads_the_nested_approval() -> None:
     assert got.tool_call_id == "call_1"
     assert event.payload["approval_id"] == got.approval_id
     assert event.payload["tool_call_id"] == got.tool_call_id
+
+
+def test_from_event_rejects_a_quarantined_current_approval() -> None:
+    event = _approval_event()
+    approval = event.payload["approval"]
+    approval.pop("arguments")
+    approval["arguments_state"] = "quarantined"
+    for call in approval["tool_calls"]:
+        call.pop("arguments")
+        call["arguments_state"] = "quarantined"
+
+    with pytest.raises(ValueError, match="PendingToolApprovalEventView"):
+        PendingToolApproval.from_event(event)
+
+
+def test_event_view_marks_quarantined_arguments_unavailable() -> None:
+    event = _approval_event()
+    approval = event.payload["approval"]
+    approval.pop("arguments")
+    approval["arguments_state"] = "quarantined"
+    for call in approval["tool_calls"]:
+        call.pop("arguments")
+        call["arguments_state"] = "quarantined"
+
+    got = PendingToolApprovalEventView.from_event(event)
+
+    assert got.arguments_state == "quarantined"
+    assert got.arguments is None
+    assert got.tool_calls[0].arguments_state == "quarantined"
+    assert got.tool_calls[0].arguments is None
+
+
+def test_event_view_distinguishes_genuinely_empty_finalized_arguments() -> None:
+    got = PendingToolApprovalEventView.from_event(_approval_event())
+
+    assert got.arguments_state == "finalized"
+    assert got.arguments == {}
+    assert got.tool_calls[0].arguments_state == "finalized"
+    assert got.tool_calls[0].arguments == {}
 
 
 @pytest.mark.parametrize(

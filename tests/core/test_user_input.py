@@ -32,11 +32,13 @@ from cayu.runtime import (
     RetryPolicy,
     RunLimits,
     RunRequest,
+    RuntimeHook,
     Session,
     SessionStatus,
     StructuredOutputSpec,
     StructuredOutputStrategy,
     ToolApprovalRecoveryOutcome,
+    ToolCallHookContext,
     ToolPolicy,
     ToolPolicyDecision,
     ToolPolicyRequest,
@@ -52,7 +54,7 @@ from cayu.runtime.checkpoints import (
     CheckpointCompatibilityError,
 )
 from cayu.tools.user_input import UserInputTool
-from cayu.vaults import SecretRedactor
+from cayu.vaults import SecretRedactor, StaticVault
 
 
 class _ScriptedProvider(ModelProvider):
@@ -292,9 +294,9 @@ def _crashed_user_input_resume_events(
         if isinstance(call, dict) and call.get("tool_call_id") == tool_call_id
     )
     tool_name = tool_call["tool_name"]
-    arguments = tool_call["arguments"]
     assert isinstance(tool_name, str)
-    assert isinstance(arguments, dict)
+    assert tool_call.get("arguments_state") == "quarantined"
+    assert "arguments" not in tool_call
     identity = ToolRoundIdentity.model_validate(_tool_round_identity_payload(events))
     idempotency_key = tool_execution.tool_idempotency_key(
         session_id=session_id,
@@ -327,7 +329,7 @@ def _crashed_user_input_resume_events(
                 "input_id": input_id,
                 "tool_call_id": tool_call_id,
                 "idempotency_key": idempotency_key,
-                "arguments": arguments,
+                "arguments_state": "quarantined",
             },
         ),
     ]
@@ -384,7 +386,7 @@ def test_ask_user_pauses_the_session() -> None:
     assert interrupted.payload["interruption_type"] == "user_input_required"
     assert asyncio.run(store.load("s_pause")).status == SessionStatus.INTERRUPTED
     checkpoint = asyncio.run(store.load_checkpoint("s_pause"))
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
     assert "pending_user_input" in checkpoint
 
 
@@ -499,7 +501,7 @@ def test_resolve_user_input_lifts_versionless_root_checkpoint() -> None:
 
     checkpoint = asyncio.run(run())
 
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
     assert checkpoint["future_additive_field"] == {"kept": True}
     assert "pending_user_input" not in checkpoint
 
@@ -531,7 +533,7 @@ def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() 
         ).payload["input_id"]
         future_checkpoint = await store.load_checkpoint(session_id)
         assert future_checkpoint is not None
-        future_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = 2
+        future_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] = 3
         await store.checkpoint(session_id, future_checkpoint)
 
         with pytest.raises(CheckpointCompatibilityError) as caught:
@@ -555,7 +557,7 @@ def test_future_root_checkpoint_blocks_user_input_resume_before_governed_work() 
     assert error.reason == "checkpoint_schema_version_too_new"
     assert provider_calls == 1
     assert status is SessionStatus.INTERRUPTED
-    assert checkpoint_after[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
+    assert checkpoint_after[CHECKPOINT_SCHEMA_VERSION_KEY] == 3
     assert "pending_user_input" in checkpoint_after
 
 
@@ -1868,20 +1870,47 @@ def test_recover_user_input_rejects_secret_structured_output_before_transition()
     assert len(provider.requests) == 1
 
 
-def test_recover_user_input_supplies_outcome_and_completes() -> None:
+@pytest.mark.parametrize("dynamic_scope", [False, True], ids=["static", "dynamic"])
+def test_recover_user_input_supplies_outcome_and_completes(
+    dynamic_scope: bool,
+) -> None:
     # After a crashed sibling leaves the round on manual_recovery_required, recover_user_input
     # supplies the missing outcome; the round finishes without re-running the sibling, and the
     # re-supplied answer is injected as the ask_user result (it was unrecorded before the crash).
     store = InMemorySessionStore()
     counting = _CountingTool()
-    app = CayuApp(session_store=store, enable_logging=False)
-    app.register_provider(
-        _ScriptedProvider(
-            [("call_1", "count", {}), ("call_2", "ask_user", {"question": "q"})],
-            final_text="all done",
-        ),
-        default=True,
+    session_id = f"s_rec_{'dynamic' if dynamic_scope else 'static'}"
+    recovery_message = "manual-recovery-secret-canary" if dynamic_scope else "recovered externally"
+
+    class ObserveManualRecovery(RuntimeHook):
+        def __init__(self) -> None:
+            self.arguments: list[dict] = []
+
+        async def after_tool_call(self, context: ToolCallHookContext) -> None:
+            self.arguments.append(context.arguments)
+
+    observer = ObserveManualRecovery()
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        runtime_hooks=[observer],
     )
+    provider = _ScriptedProvider(
+        [
+            ("call_1", "count", {"private": "pending"}),
+            ("call_2", "ask_user", {"question": "q"}),
+        ],
+        final_text="all done",
+    )
+    app.register_provider(provider, default=True)
+    if dynamic_scope:
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                vault=StaticVault({"api_key": recovery_message}),
+            ),
+            default=True,
+        )
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[UserInputTool(), counting],
@@ -1890,7 +1919,7 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
         _collect(
             app,
             RunRequest(
-                agent_name="assistant", session_id="s_rec", messages=[Message.text("user", "go")]
+                agent_name="assistant", session_id=session_id, messages=[Message.text("user", "go")]
             ),
         )
     )
@@ -1902,10 +1931,10 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     # Simulate a prior resume that started `count` but crashed before a terminal event.
     asyncio.run(
         store.append_events(
-            "s_rec",
+            session_id,
             _crashed_user_input_resume_events(
                 asyncio.run(private_events_for_public_events(store, pause)),
-                session_id="s_rec",
+                session_id=session_id,
                 tool_call_id="call_1",
             ),
         )
@@ -1913,7 +1942,7 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     stuck = asyncio.run(
         _drain(
             app.resolve_user_input(
-                UserInputResponse(session_id="s_rec", input_id=input_id, answer="a")
+                UserInputResponse(session_id=session_id, input_id=input_id, answer="a")
             )
         )
     )
@@ -1923,12 +1952,18 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
         _drain(
             app.recover_user_input(
                 UserInputRecoveryRequest(
-                    session_id="s_rec",
+                    session_id=session_id,
                     input_id=input_id,
                     answer="a",
                     tool_call_id="call_1",
                     outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                    message="recovered externally",
+                    message=recovery_message,
+                    # ``structured`` belongs to the re-supplied ask_user answer as well as
+                    # the recovered sibling result. Keep the answer unrelated so this test
+                    # isolates the manual-recovery publication boundary.
+                    structured={"answer_detail": "safe"},
+                    reason=recovery_message,
+                    metadata={"provided": recovery_message},
                 )
             )
         )
@@ -1945,19 +1980,37 @@ def test_recover_user_input_supplies_outcome_and_completes() -> None:
     assert private_recovered_tool_event.payload[
         "idempotency_key"
     ] == tool_execution.tool_idempotency_key(
-        session_id="s_rec",
+        session_id=session_id,
         tool_round_id=private_recovered_tool_event.payload["tool_round_id"],
         tool_call_id="call_1",
         pause_id=private_input_id,
     )
+    assert private_recovered_tool_event.payload["reason"] == (
+        None if dynamic_scope else recovery_message
+    )
+    assert private_recovered_tool_event.payload["metadata"] == (
+        {} if dynamic_scope else {"provided": recovery_message}
+    )
     assert recovered[-1].type == EventType.SESSION_COMPLETED
     assert counting.calls == 0  # the recovered tool was never re-executed
-    checkpoint = asyncio.run(store.load_checkpoint("s_rec"))
+    assert observer.arguments
+    assert all(arguments == {} for arguments in observer.arguments)
+    checkpoint = asyncio.run(store.load_checkpoint(session_id))
     assert checkpoint is not None
     assert "pending_user_input" not in checkpoint
-    parts = _tool_result_parts(asyncio.run(store.load_transcript("s_rec")))
+    parts = _tool_result_parts(asyncio.run(store.load_transcript(session_id)))
     results = {part.tool_call_id: part.content for part in parts}
-    assert results["call_1"] == "recovered externally"  # operator-supplied outcome
+    if dynamic_scope:
+        assert results["call_1"] == (
+            "Externally verified tool output is unavailable because the invocation "
+            "secret scope could not be reconstructed."
+        )
+        assert recovery_message not in repr(recovered)
+        assert recovery_message not in repr(asyncio.run(store.load_events(session_id)))
+        assert recovery_message not in repr(asyncio.run(store.load_transcript(session_id)))
+        assert recovery_message not in repr(provider.requests[-1].messages)
+    else:
+        assert results["call_1"] == "recovered externally"
     assert results["call_2"] == "a"  # ask_user answer injected on continuation
 
 

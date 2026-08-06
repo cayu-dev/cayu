@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from types import MappingProxyType
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -326,8 +326,21 @@ def bounded_pending_approval_event_payload(
     """
 
     payload = approval.model_dump(mode="json")
-    bounded = bounded_resolution_metadata_payload(approval.metadata, redactor=redactor)
-    payload["metadata"] = bounded["metadata"]
+    # Secret-scope provenance is private checkpoint evidence, not public
+    # approval content.  Only a positively static scope proves that a policy's
+    # argument-derived output cannot become a late-resolved workload secret.
+    payload.pop("secret_resolution_scope", None)
+    publish_policy_output = approval.secret_resolution_scope == "static"
+    if not publish_policy_output:
+        payload.pop("reason", None)
+        payload.pop("metadata", None)
+    bounded = (
+        bounded_resolution_metadata_payload(approval.metadata, redactor=redactor)
+        if publish_policy_output
+        else {}
+    )
+    if publish_policy_output:
+        payload["metadata"] = bounded["metadata"]
     truncated_tool_call_ids: list[str] = []
     tool_calls = payload.get("tool_calls")
     if type(tool_calls) is not list:
@@ -336,6 +349,10 @@ def bounded_pending_approval_event_payload(
         raw_call = tool_calls[index]
         if type(raw_call) is not dict:
             raise TypeError("Pending approval event tool calls must be objects.")
+        if not publish_policy_output:
+            raw_call.pop("reason", None)
+            raw_call.pop("metadata", None)
+            continue
         call_metadata = bounded_resolution_metadata_payload(
             pending_call.metadata,
             redactor=redactor,
@@ -344,11 +361,74 @@ def bounded_pending_approval_event_payload(
         if call_metadata.get("metadata_truncated") is True:
             truncated_tool_call_ids.append(pending_call.tool_call_id)
     result: dict[str, Any] = {"approval": payload}
-    if bounded.get("metadata_truncated") is True:
+    if publish_policy_output and bounded.get("metadata_truncated") is True:
         result["approval_metadata_truncated"] = True
     if truncated_tool_call_ids:
         result["tool_call_metadata_truncated"] = truncated_tool_call_ids
     return result
+
+
+def tool_round_secret_resolution_scope(
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> Literal["static", "dynamic", "unknown"]:
+    """Return positive durable secret-scope evidence for one tool round."""
+
+    if type(pending_round) is not tool_round_recovery.PendingToolRound:
+        raise TypeError("pending_round must be a PendingToolRound.")
+    publication = pending_round.assistant_publication
+    return "unknown" if publication is None else publication.secret_resolution_scope
+
+
+def pending_approval_scope_matches_round(
+    approval: PendingToolApproval,
+    pending_round: tool_round_recovery.PendingToolRound,
+) -> bool:
+    """Accept legacy unknown scope, otherwise require paired positive evidence."""
+
+    if type(approval) is not PendingToolApproval:
+        raise TypeError("approval must be a PendingToolApproval.")
+    round_scope = tool_round_secret_resolution_scope(pending_round)
+    return (
+        approval.secret_resolution_scope == "unknown"
+        or approval.secret_resolution_scope == round_scope
+    )
+
+
+def public_pending_approval_reason(
+    approval: PendingToolApproval,
+    *,
+    tool_call_id: str | None = None,
+) -> str | None:
+    """Return policy reason only with positive static-scope evidence."""
+
+    if type(approval) is not PendingToolApproval:
+        raise TypeError("approval must be a PendingToolApproval.")
+    if approval.secret_resolution_scope != "static":
+        return None
+    if tool_call_id is None or tool_call_id == approval.tool_call_id:
+        return approval.reason
+    for call in approval.tool_calls:
+        if call.tool_call_id == tool_call_id:
+            return call.reason
+    return None
+
+
+def public_policy_denial_result(
+    *,
+    secret_resolution_scope: Literal["static", "dynamic", "unknown"],
+    policy_result: ToolPolicyResult,
+) -> ToolPolicyResult:
+    """Remove argument-derived denial output without positive static evidence."""
+
+    if secret_resolution_scope not in {"static", "dynamic", "unknown"}:
+        raise ValueError("secret_resolution_scope must be static, dynamic, or unknown.")
+    if type(policy_result) is not ToolPolicyResult:
+        raise TypeError("policy_result must be a ToolPolicyResult.")
+    if policy_result.decision is not ToolPolicyDecision.DENY:
+        raise ValueError("Public policy result must be a denial.")
+    if secret_resolution_scope == "static":
+        return policy_result.model_copy(deep=True)
+    return ToolPolicyResult(decision=ToolPolicyDecision.DENY)
 
 
 def planned_tool_round_from_pending_approval(
@@ -686,6 +766,7 @@ def recorded_round_tool_outcomes(
     pending_calls: list[PendingToolCallApproval],
     input_id: str,
     tool_round_identity: ToolRoundIdentity,
+    staged_terminals: list[tool_round_recovery.StagedToolCallTerminal] | None = None,
 ) -> dict[str, runtime_records.ToolCallOutcome]:
     """Reconstruct already-recorded terminal outcomes for a paused user-input round, keyed by
     ``tool_call_id``, scoped to the pause's resume window (see ``user_input_resume_events``).
@@ -695,8 +776,9 @@ def recorded_round_tool_outcomes(
     """
     identity = copy_tool_round_identity(tool_round_identity)
     pending_by_id = {call.tool_call_id: call for call in pending_calls}
+    resume_events = user_input_resume_events(events, input_id)
     ledger = resume_ledger.scan_tool_call_events(
-        events=user_input_resume_events(events, input_id),
+        events=resume_events,
         pending_calls=pending_calls,
         in_scope=lambda event: identity.matches_payload(event.payload),
         candidate_scope=lambda event: (
@@ -708,9 +790,21 @@ def recorded_round_tool_outcomes(
         raise resume_ledger.ToolCallEvidenceConflict(
             "User-input recovery evidence contains a call outside the pending tool round."
         )
+    staged_ids = _validated_staged_terminal_ids(
+        staged_terminals,
+        pending_by_id=pending_by_id,
+        identity=identity,
+        pause_field="input_id",
+        pause_id=input_id,
+        recorded_outcomes=ledger.outcomes,
+        durable_events=resume_events,
+        conflicting_ids=ledger.conflicting_ids,
+    )
     # A tool that started on a prior resume attempt but has no terminal event (a crash mid-tool)
     # cannot be safely re-run — fail loudly instead of silently double-executing a side effect.
     for tool_call_id in ledger.started_without_terminal_ids:
+        if tool_call_id in staged_ids:
+            continue
         pending_call = pending_by_id[tool_call_id]
         raise RoundToolManualRecoveryRequired(
             tool_call_id=tool_call_id,
@@ -723,6 +817,7 @@ def recorded_tool_outcomes(
     *,
     events: list[Event],
     approval: PendingToolApproval,
+    staged_terminals: list[tool_round_recovery.StagedToolCallTerminal] | None = None,
 ) -> dict[str, runtime_records.ToolCallOutcome]:
     identity = _approval_tool_round_identity(approval)
     pending_calls = pending_round_tool_calls(approval)
@@ -744,8 +839,20 @@ def recorded_tool_outcomes(
         raise resume_ledger.ToolCallEvidenceConflict(
             "Tool approval evidence contains a call outside the pending tool round."
         )
+    staged_ids = _validated_staged_terminal_ids(
+        staged_terminals,
+        pending_by_id=pending_by_id,
+        identity=identity,
+        pause_field="approval_id",
+        pause_id=approval.approval_id,
+        recorded_outcomes=ledger.outcomes,
+        durable_events=events,
+        conflicting_ids=ledger.conflicting_ids,
+    )
 
     for tool_call_id in ledger.started_without_terminal_ids:
+        if tool_call_id in staged_ids:
+            continue
         pending_tool_call = pending_by_id[tool_call_id]
         raise ToolApprovalManualRecoveryRequired(
             tool_call_id=tool_call_id,
@@ -753,6 +860,57 @@ def recorded_tool_outcomes(
         )
 
     return ledger.outcomes
+
+
+def _validated_staged_terminal_ids(
+    staged_terminals: list[tool_round_recovery.StagedToolCallTerminal] | None,
+    *,
+    pending_by_id: dict[str, PendingToolCallApproval],
+    identity: ToolRoundIdentity,
+    pause_field: Literal["approval_id", "input_id"],
+    pause_id: str,
+    recorded_outcomes: dict[str, runtime_records.ToolCallOutcome],
+    durable_events: list[Event],
+    conflicting_ids: set[str],
+) -> set[str]:
+    """Return only positively owned private terminals for retry classification."""
+
+    if staged_terminals is None:
+        return set()
+    staged_ids: set[str] = set()
+    for candidate in staged_terminals:
+        staged = tool_round_recovery.StagedToolCallTerminal.model_validate(
+            candidate.model_dump(mode="json")
+        )
+        pending_call = pending_by_id.get(staged.tool_call_id)
+        if (
+            pending_call is None
+            or staged.tool_call_id in staged_ids
+            or staged.tool_call_id in conflicting_ids
+            or staged.event.tool_name != pending_call.tool_name
+            or not identity.matches_payload(staged.event.payload)
+            or staged.event.payload.get(pause_field) != pause_id
+        ):
+            raise resume_ledger.ToolCallEvidenceConflict(
+                "Private staged terminal evidence conflicts with its paused tool round."
+            )
+        recorded = recorded_outcomes.get(staged.tool_call_id)
+        if recorded is not None:
+            staged_outcome = resume_ledger.tool_call_outcome_from_terminal_event(
+                event=staged.event,
+                pending_tool_call=pending_call,
+            )
+            durable_matches = [event for event in durable_events if event.id == staged.event.id]
+            if (
+                recorded != staged_outcome
+                or len(durable_matches) != 1
+                or durable_matches[0] != staged.event
+            ):
+                raise resume_ledger.ToolCallEvidenceConflict(
+                    "Durable and staged terminal evidence conflict for one paused tool call."
+                )
+        staged_ids.add(staged.tool_call_id)
+    return staged_ids
 
 
 def approval_resolution_history(

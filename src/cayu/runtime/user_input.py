@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
@@ -15,7 +15,13 @@ from cayu.core.events import (
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
+from cayu.core.messages import Message, detach_message
 from cayu.core.thinking import ThinkingConfig
+from cayu.runtime._assistant_tool_round_publication import (
+    AssistantToolRoundPublication,
+    StagedToolCallTerminal,
+    copy_assistant_tool_round_publication,
+)
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime.approvals import (
     PendingToolCallApproval,
@@ -141,6 +147,10 @@ class PendingUserInput(BaseModel):
     workspace_id: str | None = None
     task_id: str | None = None
     tool_calls: list[PendingToolCallApproval]
+    assistant_message_state: Literal["published", "quarantined"] = "published"
+    quarantined_assistant_message: Message | None = None
+    assistant_publication: AssistantToolRoundPublication | None = None
+    staged_terminals: list[StagedToolCallTerminal] = Field(default_factory=list)
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
     max_steps: StrictInt | None = Field(default=None, ge=1, le=256)
@@ -166,6 +176,37 @@ class PendingUserInput(BaseModel):
         gating_call = gating_calls[0]
         if gating_call.tool_name != self.tool_name or gating_call.arguments != self.arguments:
             raise ValueError("Pending user-input call details do not match its tool-round record.")
+        if self.assistant_message_state == "quarantined":
+            if self.quarantined_assistant_message is None:
+                raise ValueError(
+                    "A quarantined pending user input requires its private assistant message."
+                )
+        elif self.quarantined_assistant_message is not None:
+            raise ValueError(
+                "A published pending user input cannot retain a quarantined assistant message."
+            )
+        if self.assistant_message_state == "published" and self.assistant_publication is not None:
+            raise ValueError(
+                "Published pending user input cannot retain assistant publication state."
+            )
+        expected_ids = {call.tool_call_id for call in self.tool_calls}
+        if any(item.tool_call_id not in expected_ids for item in self.staged_terminals):
+            raise ValueError("Staged terminal evidence names a call outside its user-input round.")
+        calls_by_id = {call.tool_call_id: call for call in self.tool_calls}
+        identity = ToolRoundIdentity(
+            tool_round_id=self.tool_round_id,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+        )
+        event_ids: set[str] = set()
+        for item in self.staged_terminals:
+            if item.event.id in event_ids:
+                raise ValueError("Pending user input cannot repeat staged terminal event ids.")
+            event_ids.add(item.event.id)
+            if not identity.matches_payload(item.event.payload):
+                raise ValueError("Staged terminal evidence has a conflicting round identity.")
+            if item.event.tool_name != calls_by_id[item.tool_call_id].tool_name:
+                raise ValueError("Staged terminal evidence has a conflicting tool name.")
         return self
 
     @field_validator("question")
@@ -213,6 +254,36 @@ class PendingUserInput(BaseModel):
             owner="Pending user input",
         )
 
+    @field_validator("quarantined_assistant_message")
+    @classmethod
+    def copy_quarantined_assistant_message(
+        cls,
+        value: Message | None,
+    ) -> Message | None:
+        return None if value is None else detach_message(value)
+
+    @field_validator("assistant_publication")
+    @classmethod
+    def copy_assistant_publication(
+        cls,
+        value: AssistantToolRoundPublication | None,
+    ) -> AssistantToolRoundPublication | None:
+        return copy_assistant_tool_round_publication(value)
+
+    @field_validator("staged_terminals")
+    @classmethod
+    def copy_staged_terminals(
+        cls,
+        value: list[StagedToolCallTerminal],
+    ) -> list[StagedToolCallTerminal]:
+        copied = [
+            StagedToolCallTerminal.model_validate(item.model_dump(mode="json")) for item in value
+        ]
+        ids = [item.tool_call_id for item in copied]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Pending user input cannot repeat staged terminal calls.")
+        return copied
+
     @field_validator("limits")
     @classmethod
     def copy_limits(cls, value: RunLimits | None) -> RunLimits | None:
@@ -241,6 +312,53 @@ _RUNTIME_USER_INPUT_IDENTITY_FIELDS = (
     "model_attempt_id",
     "tool_round_id",
 )
+
+
+def public_pending_user_input_prompt(
+    pending: PendingUserInput,
+) -> tuple[str | None, list[str]]:
+    """Project a pause prompt only when its durable secret scope is complete.
+
+    The private checkpoint retains the original prompt for continuation.  A
+    dynamic, unknown, or legacy scope cannot prove that a sibling invocation
+    will not resolve the prompt as a workload secret after the pause was
+    published, so public representations must withhold it.
+    """
+
+    if type(pending) is not PendingUserInput:
+        raise TypeError("pending must be a PendingUserInput.")
+    publication = pending.assistant_publication
+    if publication is None or publication.secret_resolution_scope != "static":
+        return None, []
+    return pending.question, list(pending.options)
+
+
+def public_pending_user_input_event_payload(
+    pending: PendingUserInput,
+) -> dict[str, Any]:
+    """Copy a pending-input payload without unproven prompt or policy output."""
+
+    payload = pending.model_dump(mode="json")
+    # Staged terminals are private crash-recovery evidence. They are published
+    # only through the terminal event boundary after the round-wide secret
+    # scope is finalized, never as part of a pending-input representation.
+    payload.pop("staged_terminals", None)
+    question, options = public_pending_user_input_prompt(pending)
+    if question is None:
+        payload.pop("question", None)
+        payload.pop("options", None)
+        tool_calls = payload.get("tool_calls")
+        if type(tool_calls) is not list:
+            raise TypeError("Pending user-input event payload must contain tool_calls.")
+        for pending_call in tool_calls:
+            if type(pending_call) is not dict:
+                raise TypeError("Pending user-input event tool calls must be objects.")
+            pending_call.pop("reason", None)
+            pending_call.pop("metadata", None)
+    else:
+        payload["question"] = question
+        payload["options"] = options
+    return payload
 
 
 def event_with_pending_user_input_authority(
@@ -312,6 +430,17 @@ def copy_pending_user_input(pending: PendingUserInput) -> PendingUserInput:
         workspace_id=pending.workspace_id,
         task_id=pending.task_id,
         tool_calls=[copy_pending_tool_call_approval(call) for call in pending.tool_calls],
+        assistant_message_state=pending.assistant_message_state,
+        quarantined_assistant_message=(
+            None
+            if pending.quarantined_assistant_message is None
+            else detach_message(pending.quarantined_assistant_message)
+        ),
+        assistant_publication=copy_assistant_tool_round_publication(pending.assistant_publication),
+        staged_terminals=[
+            StagedToolCallTerminal.model_validate(item.model_dump(mode="json"))
+            for item in pending.staged_terminals
+        ],
         structured_output=copy_structured_output_spec(pending.structured_output),
         thinking=pending.thinking,
         max_steps=pending.max_steps,

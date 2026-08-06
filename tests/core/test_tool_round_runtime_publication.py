@@ -95,7 +95,7 @@ def _assert_only_model_step_publication_checkpoint(
         CHECKPOINT_SCHEMA_VERSION_KEY,
         LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
     assert model_step_publication_from_checkpoint(checkpoint) is not None
 
 

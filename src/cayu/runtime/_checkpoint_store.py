@@ -9,6 +9,7 @@ from cayu.runtime.checkpoints import (
     CHECKPOINT_SCHEMA_VERSION_KEY,
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
+    runtime_checkpoint_writer_view,
     validate_runtime_checkpoint_root_projection,
 )
 from cayu.runtime.sessions import (
@@ -20,6 +21,8 @@ from cayu.runtime.sessions import (
     Session,
     SessionOperationPublication,
     SessionStore,
+    _apply_runtime_publication_checkpoint_mutation,
+    _runtime_publication_checkpoint_codec_scope,
     runtime_publication_checkpoint_value_digest,
 )
 
@@ -133,6 +136,40 @@ class _RuntimeCheckpointSessionStore:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
 
+    async def create(
+        self,
+        request: Any,
+        *,
+        identity: Any,
+        interaction_started_event: Any = None,
+        interaction_source_messages: Any = None,
+        checkpoint_transform: CheckpointTransform | None = None,
+    ) -> Session:
+        if checkpoint_transform is None:
+            return await self._store.create(
+                request,
+                identity=identity,
+                interaction_started_event=interaction_started_event,
+                interaction_source_messages=interaction_source_messages,
+            )
+
+        def transform_initial_checkpoint(
+            session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            return _versioned_checkpoint_transform(
+                session.id,
+                checkpoint_transform,
+            )(session, checkpoint)
+
+        return await self._store.create(
+            request,
+            identity=identity,
+            interaction_started_event=interaction_started_event,
+            interaction_source_messages=interaction_source_messages,
+            checkpoint_transform=transform_initial_checkpoint,
+        )
+
     async def load_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         checkpoint = await self._store.load_checkpoint(session_id)
         try:
@@ -142,14 +179,26 @@ class _RuntimeCheckpointSessionStore:
             raise
 
     async def checkpoint(self, session_id: str, state: dict[str, Any]) -> None:
+        checkpoint = None
         try:
             checkpoint = decode_runtime_checkpoint(state, session_id=session_id)
+            if checkpoint is None:
+                raise TypeError("Checkpoint state must be an object.")
+            encoded_checkpoint = checkpoint
+
+            def replace_checkpoint(
+                _session: Session,
+                current: dict[str, Any] | None,
+            ) -> dict[str, Any]:
+                decode_runtime_checkpoint(current, session_id=session_id)
+                return encoded_checkpoint
+
+            await self._store.transform_checkpoint(session_id, replace_checkpoint)
         except BaseException:
             state = {}
+            if checkpoint is not None:
+                checkpoint.clear()
             raise
-        if checkpoint is None:
-            raise TypeError("Checkpoint state must be an object.")
-        await self._store.checkpoint(session_id, checkpoint)
 
     async def transform_checkpoint(
         self,
@@ -191,7 +240,10 @@ class _RuntimeCheckpointSessionStore:
         await self._store.append_transcript_messages_and_transform_checkpoint(
             session_id,
             messages,
-            _versioned_checkpoint_transform(session_id, checkpoint_transform),
+            _versioned_checkpoint_transform(
+                session_id,
+                checkpoint_transform,
+            ),
             **kwargs,
         )
 
@@ -323,38 +375,6 @@ class _RuntimeCheckpointSessionStore:
             **kwargs,
         )
 
-    async def _ensure_checkpoint_version(
-        self,
-        session_id: str,
-    ) -> None:
-        raw_checkpoint = await self._store.load_checkpoint(session_id)
-        try:
-            decode_runtime_checkpoint(
-                raw_checkpoint,
-                session_id=session_id,
-            )
-        except BaseException:
-            raw_checkpoint = None
-            raise
-        if (
-            raw_checkpoint is not None
-            and raw_checkpoint.get(CHECKPOINT_SCHEMA_VERSION_KEY)
-            == CURRENT_CHECKPOINT_SCHEMA_VERSION
-        ):
-            return
-
-        def stamp(
-            _session: Session,
-            checkpoint: dict[str, Any] | None,
-        ) -> dict[str, Any]:
-            if checkpoint is None:
-                return {
-                    CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION,
-                }
-            return checkpoint
-
-        await self.transform_checkpoint(session_id, stamp)
-
     def _versioned_publication_request(
         self,
         request: RuntimePublicationRequest,
@@ -369,7 +389,7 @@ class _RuntimeCheckpointSessionStore:
         schema_operation = RuntimePublicationCheckpointOperation(
             key=CHECKPOINT_SCHEMA_VERSION_KEY,
             expected_value_digest=runtime_publication_checkpoint_value_digest(
-                CURRENT_CHECKPOINT_SCHEMA_VERSION,
+                CURRENT_CHECKPOINT_SCHEMA_VERSION
             ),
             action="set",
             value=CURRENT_CHECKPOINT_SCHEMA_VERSION,
@@ -387,6 +407,70 @@ class _RuntimeCheckpointSessionStore:
             referenced_events=request.referenced_events,
         )
 
+    def _decode_publication_checkpoint(
+        self,
+        session: Session,
+        raw_checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        decoded = decode_runtime_checkpoint(raw_checkpoint, session_id=session.id)
+        if decoded is not None:
+            return decoded
+        # Publication requests are expressed against the current logical
+        # schema. Treat a missing root as that empty logical root so their
+        # schema fence can be evaluated before the current writer commits it.
+        return {CHECKPOINT_SCHEMA_VERSION_KEY: CURRENT_CHECKPOINT_SCHEMA_VERSION}
+
+    def _encode_publication_checkpoint(
+        self,
+        session: Session,
+        checkpoint: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        return decode_runtime_checkpoint(checkpoint, session_id=session.id)
+
+    def _apply_publication_checkpoint_mutation(
+        self,
+        session: Session,
+        raw_checkpoint: dict[str, Any] | None,
+        mutation: RuntimePublicationMutation,
+    ) -> dict[str, Any] | None:
+        """Apply a staged mutation in its writer schema, then upcast the result."""
+
+        writer_version = CURRENT_CHECKPOINT_SCHEMA_VERSION
+        schema_operations = [
+            operation
+            for operation in mutation.operations
+            if operation.key == CHECKPOINT_SCHEMA_VERSION_KEY
+        ]
+        if len(schema_operations) == 1 and type(schema_operations[0].value) is int:
+            writer_version = schema_operations[0].value
+        elif not schema_operations:
+            pointer_operation = next(
+                (
+                    operation
+                    for operation in mutation.operations
+                    if operation.key == "last_model_step_publication"
+                    and operation.action == "set"
+                    and type(operation.value) is dict
+                ),
+                None,
+            )
+            if pointer_operation is not None:
+                pointer_version = pointer_operation.value.get("schema_version")
+                if type(pointer_version) is int:
+                    writer_version = pointer_version
+
+        source_checkpoint = runtime_checkpoint_writer_view(
+            raw_checkpoint,
+            writer_version=writer_version,
+            session_id=session.id,
+        )
+
+        target_checkpoint = _apply_runtime_publication_checkpoint_mutation(
+            mutation,
+            source_checkpoint,
+        )
+        return decode_runtime_checkpoint(target_checkpoint, session_id=session.id)
+
     async def publish_runtime_publication(
         self,
         session_id: str,
@@ -394,12 +478,17 @@ class _RuntimeCheckpointSessionStore:
         request: RuntimePublicationRequest,
         **kwargs: Any,
     ) -> Any:
-        await self._ensure_checkpoint_version(session_id)
-        return await self._store.publish_runtime_publication(
-            session_id,
-            request=self._versioned_publication_request(request),
-            **kwargs,
-        )
+        versioned_request = self._versioned_publication_request(request)
+        with _runtime_publication_checkpoint_codec_scope(
+            decode=self._decode_publication_checkpoint,
+            encode=self._encode_publication_checkpoint,
+            apply_mutation=self._apply_publication_checkpoint_mutation,
+        ):
+            return await self._store.publish_runtime_publication(
+                session_id,
+                request=versioned_request,
+                **kwargs,
+            )
 
     async def complete_model_completion_stage(
         self,
@@ -408,7 +497,6 @@ class _RuntimeCheckpointSessionStore:
         stage_id: str,
         publication: RuntimePublicationRequest,
     ) -> Any:
-        await self._ensure_checkpoint_version(session_id)
         return await self._store.complete_model_completion_stage(
             session_id,
             stage_id=stage_id,
@@ -422,12 +510,16 @@ class _RuntimeCheckpointSessionStore:
         stage_id: str,
         expected_run_epoch: int,
     ) -> Any:
-        await self._ensure_checkpoint_version(session_id)
-        return await self._store.promote_model_completion_stage(
-            session_id,
-            stage_id=stage_id,
-            expected_run_epoch=expected_run_epoch,
-        )
+        with _runtime_publication_checkpoint_codec_scope(
+            decode=self._decode_publication_checkpoint,
+            encode=self._encode_publication_checkpoint,
+            apply_mutation=self._apply_publication_checkpoint_mutation,
+        ):
+            return await self._store.promote_model_completion_stage(
+                session_id,
+                stage_id=stage_id,
+                expected_run_epoch=expected_run_epoch,
+            )
 
     async def load_interruption_cascade_marker(
         self,
@@ -451,9 +543,14 @@ class _RuntimeCheckpointSessionStore:
         )
 
 
-def runtime_checkpoint_session_store(store: SessionStore) -> SessionStore:
+def runtime_checkpoint_session_store(
+    store: SessionStore,
+) -> SessionStore:
     """Return a runtime-only schema adapter while preserving the public raw store."""
 
     if isinstance(store, _RuntimeCheckpointSessionStore):
         return cast("SessionStore", store)
-    return cast("SessionStore", _RuntimeCheckpointSessionStore(store))
+    return cast(
+        "SessionStore",
+        _RuntimeCheckpointSessionStore(store),
+    )

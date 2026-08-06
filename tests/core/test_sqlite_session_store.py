@@ -1544,7 +1544,7 @@ def test_sqlite_session_store_persists_forked_session_state(tmp_path):
         ]
         checkpoint = await reopened.load_checkpoint("sess_sqlite_fork_child")
         assert checkpoint == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
             "context_compaction": {},
         }
         children = (

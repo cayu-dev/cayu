@@ -71,12 +71,14 @@ class _HookActionContext:
         hook_name: str,
         phase: RuntimeHookPhase,
         session: Session,
+        publication_actions_allowed: bool = True,
     ) -> None:
         self._runtime = runtime
         self._hook_name = require_durable_clean_nonblank(hook_name, "hook_name")
         self._phase = phase
         self._session = session.model_copy(deep=True)
         self._actions: list[dict[str, Any]] = []
+        self._publication_actions_allowed = publication_actions_allowed
 
     @property
     def hook_name(self) -> str:
@@ -94,7 +96,15 @@ class _HookActionContext:
     def actions(self) -> list[dict[str, Any]]:
         return copy_json_value(self._actions, "actions")
 
+    def _require_publication_actions_allowed(self) -> None:
+        if not self._publication_actions_allowed:
+            raise RuntimeError(
+                "Before-tool hook publication actions are unavailable until "
+                "the invocation secret scope is complete."
+            )
+
     async def fork_session(self, request: ForkSessionRequest) -> list[Event]:
+        self._require_publication_actions_allowed()
         request = copy_fork_session_request(request)
         stream = (
             self._runtime._fork_session_from_runtime_context(
@@ -117,6 +127,7 @@ class _HookActionContext:
         return [copy_event(event) for event in events]
 
     async def dispatch(self, request: DispatchRequest) -> DispatchHandle:
+        self._require_publication_actions_allowed()
         handle = await self._runtime.dispatch(request)
         self._record_action(
             "dispatch",
@@ -131,6 +142,7 @@ class _HookActionContext:
         return copy_dispatch_handle(handle)
 
     async def dispatch_inline(self, request: DispatchRequest) -> list[Event]:
+        self._require_publication_actions_allowed()
         events = [event async for event in self._runtime.dispatch_inline(request)]
         self._record_action(
             "dispatch_inline",
@@ -144,6 +156,7 @@ class _HookActionContext:
         return [copy_event(event) for event in events]
 
     async def create_task(self, request: TaskCreate) -> Task:
+        self._require_publication_actions_allowed()
         task = await self._runtime.create_task(request)
         self._record_action(
             "create_task",
@@ -163,6 +176,7 @@ class _HookActionContext:
         session_id: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Event:
+        self._require_publication_actions_allowed()
         emitted = await self._runtime.emit_hook_event(
             session_id=session_id or self._session.id,
             event_type=event_type,
@@ -282,12 +296,14 @@ class BeforeToolCallHookContext(_HookActionContext):
         tool_call_id: str,
         arguments: dict[str, Any],
         task_id: str | None,
+        publication_actions_allowed: bool = True,
     ) -> None:
         super().__init__(
             runtime=runtime,
             hook_name=hook_name,
             phase=phase,
             session=session,
+            publication_actions_allowed=publication_actions_allowed,
         )
         self._tool_name = require_clean_nonblank(tool_name, "tool_name")
         self._tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")

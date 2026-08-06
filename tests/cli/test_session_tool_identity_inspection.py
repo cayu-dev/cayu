@@ -29,7 +29,11 @@ def _record(
     }
     if payload_extra is not None:
         payload.update(payload_extra)
-    if event_type == EventType.TOOL_CALL_STARTED:
+    if (
+        event_type == EventType.TOOL_CALL_STARTED
+        and "arguments" not in payload
+        and "arguments_state" not in payload
+    ):
         payload["arguments"] = {}
     if result is not None:
         payload["result"] = result.model_dump(mode="json")
@@ -118,6 +122,152 @@ def test_tool_inspection_marks_terminal_before_start_unavailable() -> None:
 
     assert len(rows) == 1
     assert rows[0]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("records", "expected_state", "expected_summary"),
+    [
+        (
+            [
+                _record(
+                    1,
+                    EventType.TOOL_CALL_STARTED,
+                    payload_extra={"arguments_state": "quarantined"},
+                )
+            ],
+            "quarantined",
+            "[quarantined]",
+        ),
+        (
+            [
+                _record(
+                    1,
+                    EventType.TOOL_CALL_STARTED,
+                    payload_extra={"arguments_state": "quarantined"},
+                ),
+                _record(
+                    2,
+                    EventType.TOOL_CALL_FAILED,
+                    payload_extra={"arguments_state": "unavailable"},
+                ),
+            ],
+            "unavailable",
+            "[unavailable]",
+        ),
+        (
+            [
+                _record(
+                    1,
+                    EventType.TOOL_CALL_COMPLETED,
+                    payload_extra={"arguments_state": "finalized", "arguments": {}},
+                )
+            ],
+            "finalized",
+            "{}",
+        ),
+    ],
+)
+def test_tool_inspection_distinguishes_argument_publication_states(
+    records: list[EventRecord],
+    expected_state: str,
+    expected_summary: str,
+) -> None:
+    rows = _tool_call_rows(records)
+
+    assert len(rows) == 1
+    assert rows[0]["arguments_state"] == expected_state
+    assert rows[0]["argument_summary"] == expected_summary
+
+
+def test_tool_inspection_preserves_legacy_argument_summary_without_inventing_state() -> None:
+    rows = _tool_call_rows(
+        [
+            _record(
+                1,
+                EventType.TOOL_CALL_STARTED,
+                payload_extra={"arguments": {"value": "legacy"}},
+            )
+        ]
+    )
+
+    assert rows[0]["arguments_state"] is None
+    assert rows[0]["argument_summary"] == '{"value":"legacy"}'
+
+
+def test_tool_inspection_legacy_terminal_does_not_hide_started_arguments() -> None:
+    rows = _tool_call_rows(
+        [
+            _record(
+                1,
+                EventType.TOOL_CALL_STARTED,
+                payload_extra={"arguments": {"value": "legacy"}},
+            ),
+            _record(2, EventType.TOOL_CALL_COMPLETED),
+        ]
+    )
+
+    assert rows[0]["arguments_state"] is None
+    assert rows[0]["argument_summary"] == '{"value":"legacy"}'
+
+
+def test_tool_inspection_preserves_quarantine_state_from_approval_descriptor() -> None:
+    approval = _tool_inspection_record(
+        EventRecord(
+            sequence=1,
+            event=Event(
+                type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                session_id="session-1",
+                tool_name="side_effect",
+                payload={
+                    **_identity(),
+                    "approval_id": "approval-1",
+                    "tool_call_id": "call-1",
+                    "approval": {
+                        **_identity(),
+                        "approval_id": "approval-1",
+                        "tool_call_id": "call-1",
+                        "tool_name": "side_effect",
+                        "arguments_state": "quarantined",
+                        "tool_calls": [],
+                    },
+                },
+            ),
+        )
+    )
+
+    row = _tool_call_rows([approval])[0]
+    assert row["arguments_state"] == "quarantined"
+    assert row["argument_summary"] == "[quarantined]"
+
+
+def test_tool_inspection_preserves_unavailable_state_from_user_input_descriptor() -> None:
+    awaiting_input = _tool_inspection_record(
+        EventRecord(
+            sequence=1,
+            event=Event(
+                type=EventType.SESSION_AWAITING_USER_INPUT,
+                session_id="session-1",
+                tool_name="ask_user",
+                payload={
+                    **_identity(),
+                    "input_id": "input-1",
+                    "tool_call_id": "call-1",
+                    "question": "Continue?",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call-1",
+                            "tool_name": "ask_user",
+                            "arguments_state": "unavailable",
+                        }
+                    ],
+                },
+            ),
+        )
+    )
+
+    row = _tool_call_rows([awaiting_input])[0]
+    assert row["arguments_state"] == "unavailable"
+    assert row["argument_summary"] == "[unavailable]"
 
 
 def test_tool_inspection_marks_conflicting_tool_descriptor_unavailable() -> None:

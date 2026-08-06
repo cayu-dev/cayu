@@ -87,6 +87,9 @@ class RegisteredEnvironment:
     spec: EnvironmentSpec
     environment: Environment
     factory: EnvironmentFactory | None = None
+    # Capability provenance survives factory materialization without retaining
+    # the live factory as part of the session-owned environment lifecycle.
+    factory_backed: bool = False
     bound_workspace: BoundWorkspace | None = None
     binding_payload: dict[str, Any] | None = None
     execution_candidate: str | None = None

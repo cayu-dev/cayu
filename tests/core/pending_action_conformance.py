@@ -350,6 +350,8 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                         "input_id": "conformance_recovery_input_id",
                         **_tool_round_identity_payload(),
                         "tool_call_id": "conformance_recovery_input_call",
+                        "question": "legacy-manual-recovery-secret-canary",
+                        "options": ["yes", "legacy-manual-recovery-secret-canary"],
                     },
                     "tool_call_id": "conformance_recovery_input_call",
                     "tool_name": "ask_user",
@@ -359,7 +361,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
         checkpoint=_input_checkpoint(
             "conformance_recovery_input_id",
             "conformance_recovery_input_call",
-            "Continue?",
+            "legacy-manual-recovery-secret-canary",
         ),
     )
     await create(
@@ -784,6 +786,11 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
     assert by_session["conformance_input"].tool_call_id == "conformance_input_call"
     assert by_session["conformance_approval_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
     assert by_session["conformance_input_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
+    assert by_session["conformance_input_recovery"].question is None
+    assert by_session["conformance_input_recovery"].options == []
+    assert "legacy-manual-recovery-secret-canary" not in repr(
+        by_session["conformance_input_recovery"]
+    )
     assert by_session["conformance_round_recovery"].kind == PendingActionKind.MANUAL_RECOVERY
     assert (
         by_session["conformance_malformed_terminal"].tool_call_id

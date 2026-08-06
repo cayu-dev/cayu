@@ -1339,6 +1339,7 @@ class CayuApp:
             spec=stored_spec,
             environment=stored_environment,
             factory=factory,
+            factory_backed=True,
             registration_source=registration_source,
             registration_symbol=registration_symbol,
         )
@@ -1446,6 +1447,7 @@ class CayuApp:
                     spec=registered_environment.spec.model_copy(deep=True),
                     environment=copy_environment(registered_environment.environment),
                     factory=registered_environment.factory,
+                    factory_backed=registered_environment.factory_backed,
                     bound_workspace=(
                         copy_bound_workspace(registered_environment.bound_workspace)
                         if registered_environment.bound_workspace is not None

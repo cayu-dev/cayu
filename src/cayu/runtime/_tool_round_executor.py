@@ -18,7 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from types import MappingProxyType
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 from uuid import uuid4
 
 from cayu._exception_groups import (
@@ -47,6 +47,7 @@ from cayu.core.events import (
     EventType,
     copy_event,
     event_with_runtime_envelope_authority,
+    event_with_runtime_generated_id,
     event_with_runtime_nested_payload_authority,
     event_with_runtime_payload_authority,
 )
@@ -73,6 +74,7 @@ from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_execution as tool_execution
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_publication as tool_round_publication
@@ -174,7 +176,10 @@ from cayu.runtime.user_input import (
     PendingUserInput,
     copy_pending_user_input,
     pending_user_input_from_checkpoint,
+    public_pending_user_input_event_payload,
+    public_pending_user_input_prompt,
 )
+from cayu.tools._redaction import InvocationRedactorSnapshot
 from cayu.tools._resources import (
     invocation_artifact_store_handle,
     invocation_workspace_handle,
@@ -250,6 +255,17 @@ class InterruptedToolRoundRequest:
 
 LimitEventStream = Callable[[ToolRoundLimitRequest], AsyncIterator[Event]]
 InterruptedRoundEventStream = Callable[[InterruptedToolRoundRequest], AsyncIterator[Event]]
+DeferredTerminalStager = Callable[
+    [
+        Event,
+        runtime_records.ToolCallOutcome,
+        bool,
+        bool,
+        invocation_secrets.InvocationPublicationSnapshot,
+    ],
+    Awaitable[None],
+]
+DeferredTerminalFinalizer = Callable[[Event], Awaitable[Event]]
 
 _AMBIGUOUS_POLICY_RECOVERY_REASON = (
     "Tool policy planning was interrupted without a durable outcome; "
@@ -334,6 +350,250 @@ def _consume_projection_task_outcome(task: asyncio.Task[Any]) -> None:
 
     with suppress(BaseException):
         task.result()
+
+
+class _ToolRoundPublicationCoordinator:
+    """Serialize actual secret discovery with private terminal staging."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        tool_round_identity: ToolRoundIdentity,
+        session_store: SessionStore,
+        redactor: SecretRedactor,
+    ) -> None:
+        self._session_id = require_clean_nonblank(session_id, "session_id")
+        self._tool_round_identity = copy_tool_round_identity(tool_round_identity)
+        self._session_store = session_store
+        self._redactor = redactor
+        self._lock = asyncio.Lock()
+
+    @property
+    def redactor(self) -> SecretRedactor:
+        return self._redactor
+
+    @property
+    def tool_round_identity(self) -> ToolRoundIdentity:
+        return copy_tool_round_identity(self._tool_round_identity)
+
+    def restore_staged_event_authority(self, event: Event) -> Event:
+        return restore_staged_terminal_authority(
+            event,
+            session_id=self._session_id,
+            tool_round_identity=self._tool_round_identity,
+        )
+
+    async def register_redactor(
+        self,
+        *,
+        tool_call_id: str,
+        redactor: SecretRedactor,
+    ) -> None:
+        """Persist one real invocation redactor before its secret is returned."""
+
+        async with self._lock:
+            self._redactor = self._redactor.merged_with(redactor)
+            await self._session_store.transform_checkpoint(
+                self._session_id,
+                self._checkpoint_transform(
+                    tool_call_id=tool_call_id,
+                    cover_call=False,
+                    staged_terminal=None,
+                ),
+            )
+
+    async def seal_call(
+        self,
+        *,
+        tool_call_id: str,
+        snapshot: invocation_secrets.InvocationPublicationSnapshot,
+    ) -> None:
+        """Durably cover a call whose terminal outcome will be synthesized."""
+
+        async with self._lock:
+            self._redactor = self._redactor.merged_with(snapshot.redactor)
+            await self._session_store.transform_checkpoint(
+                self._session_id,
+                self._checkpoint_transform(
+                    tool_call_id=tool_call_id,
+                    cover_call=True,
+                    unsafe_scope=snapshot.secret_scope_incomplete,
+                    staged_terminal=None,
+                ),
+            )
+
+    async def stage_terminal(
+        self,
+        *,
+        tool_call_id: str,
+        event: Event,
+        snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        hooks_state: Literal["pending", "finalized", "observational"],
+    ) -> Event:
+        """Persist a stable terminal event after applying the cumulative scope."""
+
+        if event.session_id != self._session_id:
+            raise ValueError("Staged terminal event belongs to a different session.")
+        async with self._lock:
+            self._redactor = self._redactor.merged_with(snapshot.redactor)
+            staged = tool_round_recovery.StagedToolCallTerminal(
+                tool_call_id=tool_call_id,
+                event=_project_staged_terminal_event(event, redactor=self._redactor),
+                hooks_state=hooks_state,
+            )
+            await self._session_store.transform_checkpoint(
+                self._session_id,
+                self._checkpoint_transform(
+                    tool_call_id=tool_call_id,
+                    cover_call=True,
+                    unsafe_scope=snapshot.secret_scope_incomplete,
+                    staged_terminal=staged,
+                ),
+            )
+            checkpoint = await self._session_store.load_checkpoint(self._session_id)
+            stored_stages = tool_round_recovery.checkpoint_staged_terminals(
+                checkpoint,
+                tool_round_identity=self._tool_round_identity,
+            )
+            stored = next(
+                (item for item in stored_stages if item.tool_call_id == tool_call_id),
+                None,
+            )
+            if stored is None or stored.event.id != event.id:
+                raise RuntimeError("Staged terminal acknowledgement conflicts with its event.")
+            return self.restore_staged_event_authority(stored.event)
+
+    async def record_projected_terminal(self, event: Event) -> Event:
+        """Persist a public projection while retaining its current hook state."""
+
+        return await self._persist_projected_terminal(event, hooks_completed=False)
+
+    async def complete_terminal_hooks(self, event: Event) -> Event:
+        """Persist the final hook projection and mark its hooks complete."""
+
+        return await self._persist_projected_terminal(event, hooks_completed=True)
+
+    async def _persist_projected_terminal(
+        self,
+        event: Event,
+        *,
+        hooks_completed: bool,
+    ) -> Event:
+        if event.session_id != self._session_id:
+            raise ValueError("Projected terminal belongs to a different session.")
+        async with self._lock:
+            # Hook execution and tool-result projection already applied the
+            # finalized round redactor.  Preparing that event again validates
+            # the boundary while preserving the runtime-owned projection
+            # authority attached to externalized artifact references.
+            projected = prepare_runtime_event(event, redactor=self._redactor)
+            await self._session_store.transform_checkpoint(
+                self._session_id,
+                (
+                    tool_round_recovery.completed_staged_terminal_transform
+                    if hooks_completed
+                    else tool_round_recovery.projected_staged_terminal_transform
+                )(
+                    tool_round_identity=self._tool_round_identity,
+                    event=projected,
+                ),
+            )
+            checkpoint = await self._session_store.load_checkpoint(self._session_id)
+            stored_stages = tool_round_recovery.checkpoint_staged_terminals(
+                checkpoint,
+                tool_round_identity=self._tool_round_identity,
+            )
+            tool_call_id = projected.payload.get("tool_call_id")
+            stored = next(
+                (item for item in stored_stages if item.tool_call_id == tool_call_id),
+                None,
+            )
+            if (
+                stored is None
+                or stored.event.id != projected.id
+                or (hooks_completed and stored.hooks_state != "completed")
+                or (not hooks_completed and stored.event != projected)
+            ):
+                raise RuntimeError("Projected terminal acknowledgement conflicts with its stage.")
+            return self.restore_staged_event_authority(stored.event)
+
+    def _checkpoint_transform(
+        self,
+        *,
+        tool_call_id: str,
+        cover_call: bool,
+        staged_terminal: tool_round_recovery.StagedToolCallTerminal | None,
+        unsafe_scope: bool = False,
+    ) -> CheckpointTransform:
+        identity = copy_tool_round_identity(self._tool_round_identity)
+        redactor = self._redactor
+
+        def transform(
+            _session: Session,
+            checkpoint: dict[str, Any] | None,
+        ) -> dict[str, Any]:
+            updated = (
+                tool_round_recovery.checkpoint_with_assistant_publication_snapshot(
+                    checkpoint,
+                    tool_round_identity=identity,
+                    tool_call_id=tool_call_id,
+                    redactor=redactor,
+                    unsafe_output=unsafe_scope,
+                )
+                if cover_call
+                else tool_round_recovery.checkpoint_with_assistant_publication_redactor(
+                    checkpoint,
+                    tool_round_identity=identity,
+                    tool_call_id=tool_call_id,
+                    redactor=redactor,
+                )
+            )
+            existing_stages = tool_round_recovery.checkpoint_staged_terminals(
+                updated,
+                tool_round_identity=identity,
+            )
+            projected = [
+                item.model_copy(
+                    update={
+                        "event": _project_staged_terminal_event(
+                            item.event,
+                            redactor=redactor,
+                        )
+                    },
+                    deep=True,
+                )
+                for item in existing_stages
+            ]
+            if staged_terminal is not None:
+                existing = next(
+                    (
+                        item
+                        for item in projected
+                        if item.tool_call_id == staged_terminal.tool_call_id
+                    ),
+                    None,
+                )
+                if existing is None:
+                    projected.append(staged_terminal)
+                elif existing.event.id != staged_terminal.event.id:
+                    raise RuntimeError(
+                        "Tool call already has conflicting staged terminal evidence."
+                    )
+                else:
+                    projected = [
+                        staged_terminal
+                        if item.tool_call_id == staged_terminal.tool_call_id
+                        else item
+                        for item in projected
+                    ]
+            return tool_round_recovery.checkpoint_with_staged_terminals(
+                updated,
+                tool_round_identity=identity,
+                staged_terminals=projected,
+            )
+
+        return transform
 
 
 class ToolRoundExecutor:
@@ -748,6 +1008,9 @@ class ToolRoundExecutor:
             environment_name=_environment_name(registered_environment),
             workspace_id=_workspace_id(registered_environment),
             task_id=task_id,
+            secret_resolution_scope=(
+                approval_support.tool_round_secret_resolution_scope(pending_round)
+            ),
             reason=(
                 None if policy_result.reason is None else redactor.redact_text(policy_result.reason)
             ),
@@ -996,7 +1259,13 @@ class ToolRoundExecutor:
             active_taint_by_id=active_taint_by_id,
             redactor=redactor,
         )
-        source_round_payload = pending_round.model_dump(mode="json")
+        # Retain the exact durable source for the compare-and-swap. Additive
+        # model defaults, including assistant publication evidence introduced
+        # after an older v2 stage was written, must not fabricate a mismatch.
+        source_round_payload = copy_json_value(
+            checkpoint[tool_round_recovery.PENDING_TOOL_ROUND_CHECKPOINT_KEY],
+            "pending_tool_round",
+        )
         eligible_statuses = {session.status} if recovered else {SessionStatus.RUNNING}
         planned_round_payload = _require_secret_free_durable_object(
             planned_round.model_dump(mode="json"),
@@ -1063,6 +1332,18 @@ class ToolRoundExecutor:
         )
         checkpoint = await self._session_store.load_checkpoint(session.id)
         checkpoint = {} if checkpoint is None else copy_json_value(checkpoint, "checkpoint")
+        pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
+            checkpoint,
+            redactor=self._secret_redactor,
+            consume_on_rejection=True,
+        )
+        if pending_round is None:
+            raise RuntimeError("Session has no pending tool round for its user-input pause.")
+        _require_matching_policy_round(
+            pending_round=pending_round,
+            tool_round_identity=tool_round_identity,
+            tool_calls=tool_calls,
+        )
         if (
             approval_support.pending_approval_from_checkpoint(
                 checkpoint,
@@ -1085,7 +1366,9 @@ class ToolRoundExecutor:
 
         pending = PendingUserInput(
             input_id=str(uuid4()),
-            **tool_round_identity.payload(),
+            tool_round_id=tool_round_identity.tool_round_id,
+            model_step_id=tool_round_identity.model_step_id,
+            model_attempt_id=tool_round_identity.model_attempt_id,
             tool_call_id=tool_call.id,
             tool_name=tool_call.name,
             question=question,
@@ -1101,6 +1384,9 @@ class ToolRoundExecutor:
                 active_taint_by_id=active_taint_by_id,
                 redactor=redactor,
             ),
+            assistant_message_state=pending_round.assistant_message_state,
+            quarantined_assistant_message=pending_round.quarantined_assistant_message,
+            assistant_publication=pending_round.assistant_publication,
             structured_output=copy_structured_output_spec(structured_output),
             thinking=thinking,
             max_steps=max_steps,
@@ -1281,20 +1567,119 @@ class ToolRoundExecutor:
         check_policy: bool = True,
         emit_started: bool = True,
         policy_result: ToolPolicyResult | None = None,
+        policy_output_secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown",
         approval_id: str | None = None,
         tool_round_identity: ToolRoundIdentity,
         input_id: str | None = None,
         taint_labels: frozenset[str] | None = None,
+        publish_arguments_as_unavailable: bool = False,
+        deferred_terminal_stager: DeferredTerminalStager | None = None,
+        resolved_redactor_observer: (
+            Callable[[str, InvocationRedactorSnapshot], Awaitable[None]] | None
+        ) = None,
+        publication_snapshot_observer: (
+            Callable[
+                [str, invocation_secrets.InvocationPublicationSnapshot],
+                Awaitable[None],
+            ]
+            | None
+        ) = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         tool_round_identity = copy_tool_round_identity(tool_round_identity)
         identity_payload = tool_round_identity.payload()
         tool_round_id = tool_round_identity.tool_round_id
         environment_name = _environment_name(registered_environment)
+        model_arguments = copy_json_value(tool_call.arguments, "tool_call.arguments")
         invocation_redactor = _redactor_for_tool_calls(
             self._secret_redactor,
             registered_agent=registered_agent,
             tool_calls=[tool_call],
         )
+        provisional_output_redactor = invocation_redactor
+        publication_snapshot_recorded = False
+
+        async def record_publication_snapshot(
+            snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        ) -> None:
+            nonlocal publication_snapshot_recorded
+            if publication_snapshot_recorded:
+                return
+            if publication_snapshot_observer is not None:
+                await publication_snapshot_observer(tool_call.id, snapshot)
+            publication_snapshot_recorded = True
+
+        async def record_static_publication_scope() -> (
+            invocation_secrets.InvocationPublicationSnapshot
+        ):
+            snapshot = invocation_secrets.InvocationPublicationSnapshot(
+                redactor=invocation_redactor,
+                unsafe_output=False,
+            )
+            await record_publication_snapshot(snapshot)
+            return snapshot
+
+        async def record_interrupted_publication_scope(
+            interrupt: BaseException,
+        ) -> bool:
+            """Persist the final scope without replacing an owned interrupt."""
+
+            def record_abandoned_publication_diagnostic(error: BaseException) -> None:
+                if type(error) is GeneratorExit:
+                    error_type = "GeneratorExit"
+                elif isinstance(error, BaseExceptionGroup):
+                    error_type = "BaseExceptionGroup"
+                elif isinstance(error, asyncio.CancelledError):
+                    error_type = "CancelledError"
+                else:
+                    # Exception subclass names and messages are extension-owned
+                    # and can contain workload-derived values. Keep only a fixed
+                    # classification at this public cancellation boundary.
+                    error_type = "BaseException"
+                note = (
+                    "Assistant publication projection terminated with "
+                    f"{error_type} while preserving cancellation."
+                )
+                interrupt.add_note(note)
+                if isinstance(interrupt, BaseExceptionGroup):
+                    for candidate in iter_exception_tree(interrupt):
+                        if isinstance(candidate, asyncio.CancelledError):
+                            candidate.add_note(note)
+
+            publication_task = asyncio.create_task(
+                record_publication_snapshot(invocation_secret_scope.seal_for_publication())
+            )
+            publication_outcome = await await_shielded_task_outcome(publication_task)
+            publication_error = publication_outcome.error
+            if publication_error is not None and not isinstance(publication_error, Exception):
+                if type(publication_error) in (KeyboardInterrupt, SystemExit):
+                    # Process-level interpreter signals retain their ordinary
+                    # semantics; this issue does not redefine process shutdown.
+                    raise publication_error
+                # Caller cancellation remains authoritative over task-contained
+                # snapshot abandonment. Retain only a fixed diagnostic because
+                # raw extension-owned exception state is unsafe to publish.
+                record_abandoned_publication_diagnostic(publication_error)
+            if publication_error is not None and isinstance(publication_error, Exception):
+                interrupt.add_note(
+                    "Failed to persist the assistant publication projection while "
+                    "preserving cancellation."
+                )
+            later_cancellation = publication_outcome.cancellation
+            if later_cancellation is None:
+                return False
+            current_task = asyncio.current_task()
+            if current_task is None:  # pragma: no cover - coroutine execution invariant
+                interrupt.add_note(
+                    "A later cancellation could not be redelivered after publication."
+                )
+                return False
+            cancellation_args = later_cancellation.args
+            if not cancellation_args:
+                current_task.cancel()
+            else:
+                current_task.cancel(cancellation_args[0])
+            return True
+
         started_event: Event | None = None
         registered_tool = registered_agent.tools.get(tool_call.name)
         if taint_labels is None:
@@ -1316,7 +1701,7 @@ class ToolRoundExecutor:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
                 "idempotency_key": idempotency_key,
-                "arguments": deepcopy(tool_call.arguments),
+                **tool_argument_publication.quarantined_argument_fields(),
                 **identity_payload,
             }
             if registered_tool is not None:
@@ -1346,6 +1731,7 @@ class ToolRoundExecutor:
             yield started_event, None
 
         if registered_tool is None:
+            publication_snapshot = await record_static_publication_scope()
             result = ToolResult(
                 content=f"Tool not registered: {tool_call.name}",
                 is_error=True,
@@ -1376,6 +1762,9 @@ class ToolRoundExecutor:
                 result=result,
                 task_id=task_id,
                 redactor=invocation_redactor,
+                output_redactor=provisional_output_redactor,
+                deferred_terminal_stager=deferred_terminal_stager,
+                publication_snapshot=publication_snapshot,
             ):
                 yield event
             return
@@ -1393,17 +1782,22 @@ class ToolRoundExecutor:
             else:
                 resolved_policy_result = tool_execution.validate_tool_policy_result(policy_result)
             if resolved_policy_result.decision == ToolPolicyDecision.DENY:
-                reason = tool_execution.policy_denial_reason(resolved_policy_result)
-                result = tool_execution.blocked_tool_result(resolved_policy_result, reason=reason)
+                publication_snapshot = await record_static_publication_scope()
+                public_policy_result = approval_support.public_policy_denial_result(
+                    secret_resolution_scope=policy_output_secret_resolution_scope,
+                    policy_result=resolved_policy_result,
+                )
+                reason = tool_execution.policy_denial_reason(public_policy_result)
+                result = tool_execution.blocked_tool_result(public_policy_result, reason=reason)
                 payload = {
                     "tool_call_id": tool_call.id,
                     "idempotency_key": idempotency_key,
                     **policy_denial_payload_fields(
                         tool_name=tool_call.name,
                         denied_by=_TOOL_POLICY_DENIAL_SOURCE,
-                        decision=resolved_policy_result.decision.value,
+                        decision=public_policy_result.decision.value,
                         reason=reason,
-                        metadata=resolved_policy_result.metadata,
+                        metadata=public_policy_result.metadata,
                     ),
                     "result": result.model_dump(),
                     **identity_payload,
@@ -1428,6 +1822,9 @@ class ToolRoundExecutor:
                     result=result,
                     task_id=task_id,
                     redactor=invocation_redactor,
+                    output_redactor=provisional_output_redactor,
+                    deferred_terminal_stager=deferred_terminal_stager,
+                    publication_snapshot=publication_snapshot,
                 ):
                     yield event
                 return
@@ -1467,6 +1864,7 @@ class ToolRoundExecutor:
             payload={"tool_call_id": tool_call.id, **identity_payload},
         )
         before_resolution = _BeforeToolCallResolution(arguments=deepcopy(tool_call.arguments))
+        quarantine_pre_execution_publication = policy_output_secret_resolution_scope != "static"
         async for hook_event in self._run_before_tool_call_hooks(
             session=session,
             registered_agent=registered_agent,
@@ -1476,6 +1874,8 @@ class ToolRoundExecutor:
             task_id=task_id,
             resolution=before_resolution,
             redactor=invocation_redactor,
+            output_redactor=provisional_output_redactor,
+            quarantine_output=quarantine_pre_execution_publication,
         ):
             yield hook_event, None
         effective_tool_call = (
@@ -1489,6 +1889,7 @@ class ToolRoundExecutor:
             else {}
         )
         if before_resolution.block_reason is not None:
+            publication_snapshot = await record_static_publication_scope()
             async for event in self._emit_terminal_tool_result(
                 session=session,
                 registered_agent=registered_agent,
@@ -1508,10 +1909,14 @@ class ToolRoundExecutor:
                 input_id=input_id,
                 allow_modification=False,
                 redactor=invocation_redactor,
+                output_redactor=provisional_output_redactor,
+                deferred_terminal_stager=deferred_terminal_stager,
+                publication_snapshot=publication_snapshot,
             ):
                 yield event
             return
         if before_resolution.short_circuit_result is not None:
+            publication_snapshot = await record_static_publication_scope()
             short_result = before_resolution.short_circuit_result
             async for event in self._emit_terminal_tool_result(
                 session=session,
@@ -1535,6 +1940,9 @@ class ToolRoundExecutor:
                 input_id=input_id,
                 allow_modification=True,
                 redactor=invocation_redactor,
+                output_redactor=provisional_output_redactor,
+                deferred_terminal_stager=deferred_terminal_stager,
+                publication_snapshot=publication_snapshot,
             ):
                 yield event
             return
@@ -1552,11 +1960,26 @@ class ToolRoundExecutor:
                 taint_labels=taint_labels,
             )
             if reauthorization.decision != ToolPolicyDecision.ALLOW:
+                publication_snapshot = await record_static_publication_scope()
                 if reauthorization.decision == ToolPolicyDecision.DENY:
-                    reason = tool_execution.policy_denial_reason(reauthorization)
+                    public_reauthorization = approval_support.public_policy_denial_result(
+                        secret_resolution_scope=policy_output_secret_resolution_scope,
+                        policy_result=reauthorization,
+                    )
+                    reason = tool_execution.policy_denial_reason(public_reauthorization)
+                    metadata = public_reauthorization.metadata
                 else:
+                    metadata = (
+                        reauthorization.metadata
+                        if policy_output_secret_resolution_scope == "static"
+                        else {}
+                    )
                     reason = (
-                        reauthorization.reason
+                        (
+                            reauthorization.reason
+                            if policy_output_secret_resolution_scope == "static"
+                            else None
+                        )
                         or "Modified tool arguments require approval, which before_tool_call "
                         "hook modifications do not support."
                     )
@@ -1573,7 +1996,7 @@ class ToolRoundExecutor:
                             denied_by=_TOOL_POLICY_DENIAL_SOURCE,
                             decision=reauthorization.decision.value,
                             reason=reason,
-                            metadata=reauthorization.metadata,
+                            metadata=metadata,
                         ),
                         "blocked_by": "tool_policy_reauthorization",
                         "idempotency_key": idempotency_key,
@@ -1584,6 +2007,9 @@ class ToolRoundExecutor:
                     input_id=input_id,
                     allow_modification=False,
                     redactor=invocation_redactor,
+                    output_redactor=provisional_output_redactor,
+                    deferred_terminal_stager=deferred_terminal_stager,
+                    publication_snapshot=publication_snapshot,
                 ):
                     yield event
                 return
@@ -1603,6 +2029,21 @@ class ToolRoundExecutor:
 
         def redactor_provider():
             return invocation_secret_scope.redactor
+
+        async def persist_resolved_secret_projection(
+            snapshot: InvocationRedactorSnapshot,
+        ) -> None:
+            if resolved_redactor_observer is not None:
+                await resolved_redactor_observer(tool_call.id, snapshot)
+                return
+            await self._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.assistant_publication_redactor_transform(
+                    tool_round_identity=tool_round_identity,
+                    tool_call_id=tool_call.id,
+                    redactor=snapshot.redactor,
+                ),
+            )
 
         raw_workspace = _workspace(registered_environment)
         raw_artifact_store = _artifact_store(registered_environment)
@@ -1639,11 +2080,13 @@ class ToolRoundExecutor:
             vault=invocation_secrets.vault_for_environment(
                 registered_environment,
                 tracker=invocation_secret_scope,
+                on_redactor_change=persist_resolved_secret_projection,
             ),
             proxy=invocation_secrets.proxy_for_environment(
                 registered_environment,
                 tracker=invocation_secret_scope,
                 on_authorize=proxy_authorizations.append,
+                on_redactor_change=persist_resolved_secret_projection,
             ),
             knowledge_store=_knowledge_store(registered_environment),
             mcp_servers=_mcp_servers(registered_environment),
@@ -1677,6 +2120,7 @@ class ToolRoundExecutor:
                         candidate,
                         tool_call.id,
                     )
+                await record_interrupted_publication_scope(exc)
             raise
         except asyncio.CancelledError as exc:
             invocation_secrets.initialize_cancellation_evidence(exc)
@@ -1685,6 +2129,9 @@ class ToolRoundExecutor:
                 invocation_secret_scope.redactor,
             )
             invocation_secrets.set_cancellation_tool_call_id(exc, tool_call.id)
+            cancellation_redelivered = await record_interrupted_publication_scope(exc)
+            if cancellation_redelivered:
+                raise
             if proxy_authorizations and await self._session_control.interrupt_requested(session.id):
                 clear_current_task_cancellation()
                 async for event in self._emit_proxy_authorization_events(
@@ -1698,12 +2145,42 @@ class ToolRoundExecutor:
                     input_id=input_id,
                     idempotency_key=idempotency_key,
                     redactor=invocation_secret_scope.redactor,
+                    output_redactor=invocation_secret_scope.redactor,
+                    quarantine_output=deferred_terminal_stager is not None,
                 ):
                     yield event, None
             raise
         result = execution_outcome.result
         redactor = invocation_secret_scope.redactor
+        output_redactor = redactor
+        publication_snapshot = invocation_secret_scope.seal_for_publication()
+        await record_publication_snapshot(publication_snapshot)
+        hook_argument_projection = (
+            tool_argument_publication.unavailable_argument_projection()
+            if publish_arguments_as_unavailable
+            else tool_argument_publication.finalized_argument_projection(
+                effective_tool_call.arguments,
+                redactor=publication_snapshot.redactor,
+                scope_finalized=not publication_snapshot.unsafe_output,
+            )
+        )
+        argument_projection = (
+            tool_argument_publication.unavailable_argument_projection()
+            if publish_arguments_as_unavailable
+            else tool_argument_publication.finalized_argument_projection(
+                model_arguments,
+                redactor=publication_snapshot.redactor,
+                scope_finalized=not publication_snapshot.unsafe_output,
+            )
+        )
         policy_denial = tool_context._policy_denial_for(registered_tool.tool)
+        if policy_denial is not None:
+            # Command-policy refusal occurs before the tool owns a publishable
+            # result boundary. Command arguments can contain credentials even
+            # when they were not resolved through the invocation secret
+            # registry, so retain only explicit unavailability.
+            argument_projection = tool_argument_publication.unavailable_argument_projection()
+            hook_argument_projection = argument_projection
         result_event: Event | None = None
         published_terminal_event: Event | None = None
         projection_cancellation: asyncio.CancelledError | None = None
@@ -1714,6 +2191,7 @@ class ToolRoundExecutor:
             payload = {
                 "tool_call_id": tool_call.id,
                 "idempotency_key": idempotency_key,
+                **argument_projection.payload_fields(),
                 "result": result.model_dump(),
                 **effective_arguments_payload,
                 **execution_outcome.terminal_payload_fields(),
@@ -1731,12 +2209,18 @@ class ToolRoundExecutor:
                 tool_name=tool_call.name,
                 payload=payload,
             )
-            if execution_outcome.publish_before_hooks:
+            if execution_outcome.publish_before_hooks and deferred_terminal_stager is None:
                 result_event, result = _prepare_tool_result_event(
                     event=result_event,
                     result=result,
-                    redactor=redactor,
+                    redactor=output_redactor,
                 )
+                if not output_redactor.has_same_registry(redactor):
+                    result_event, result = _prepare_tool_result_event(
+                        event=result_event,
+                        result=result,
+                        redactor=redactor,
+                    )
                 (
                     result_event,
                     result,
@@ -1751,7 +2235,13 @@ class ToolRoundExecutor:
                 published_terminal_event = await self._event_writer.emit(result_event)
                 yield (
                     published_terminal_event,
-                    runtime_records.ToolCallOutcome(call=effective_tool_call, result=result),
+                    runtime_records.ToolCallOutcome(
+                        call=replace(
+                            effective_tool_call,
+                            arguments=argument_projection.transcript_arguments(),
+                        ),
+                        result=result,
+                    ),
                 )
         async for event in self._emit_proxy_authorization_events(
             session=session,
@@ -1764,6 +2254,8 @@ class ToolRoundExecutor:
             input_id=input_id,
             idempotency_key=idempotency_key,
             redactor=redactor,
+            output_redactor=output_redactor,
+            quarantine_output=deferred_terminal_stager is not None,
         ):
             yield event, None
         if projection_cancellation is not None:
@@ -1773,6 +2265,7 @@ class ToolRoundExecutor:
         if tool_swallowed_cancellation and await self._session_control.is_interrupting(session.id):
             raise SessionInterruptedByRequest(session.id)
         if policy_denial is not None:
+            public_policy_denial_reason = output_redactor.redact_text(policy_denial.reason)
             async for event in self._emit_terminal_tool_result(
                 session=session,
                 registered_agent=registered_agent,
@@ -1786,7 +2279,7 @@ class ToolRoundExecutor:
                         tool_name=effective_tool_call.name,
                         denied_by=policy_denial.denied_by,
                         decision=policy_denial.decision,
-                        reason=policy_denial.reason,
+                        reason=public_policy_denial_reason,
                         metadata={},
                     ),
                 },
@@ -1796,19 +2289,29 @@ class ToolRoundExecutor:
                 input_id=input_id,
                 allow_modification=False,
                 redactor=redactor,
+                output_redactor=output_redactor,
+                argument_projection=argument_projection,
+                deferred_terminal_stager=deferred_terminal_stager,
+                publication_snapshot=publication_snapshot,
             ):
                 yield event
             return
         if published_terminal_event is not None:
+            hook_tool_call = _project_tool_call_for_hook(
+                effective_tool_call,
+                argument_projection=hook_argument_projection,
+                redactor=redactor,
+            )
             async for hook_event, modified in self.run_tool_call_hooks(
                 session=session,
                 tool_event=published_terminal_event,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                tool_call=effective_tool_call,
+                tool_call=hook_tool_call,
                 result=result,
                 task_id=task_id,
                 redactor=redactor,
+                output_redactor=output_redactor,
                 allow_modification=False,
             ):
                 if modified is not None:
@@ -1830,8 +2333,13 @@ class ToolRoundExecutor:
             result=result,
             task_id=task_id,
             redactor=redactor,
+            output_redactor=output_redactor,
+            argument_projection=argument_projection,
+            hook_argument_projection=hook_argument_projection,
             allow_modification=execution_outcome.allows_hook_modification,
-            publish_before_hooks=False,
+            publish_before_hooks=execution_outcome.publish_before_hooks,
+            deferred_terminal_stager=deferred_terminal_stager,
+            publication_snapshot=publication_snapshot,
         ):
             yield event
         if await self._session_control.is_interrupting(session.id):
@@ -2190,19 +2698,47 @@ class ToolRoundExecutor:
         approval_id: str | None,
         input_id: str | None,
         redactor: SecretRedactor,
+        output_redactor: SecretRedactor,
+        quarantine_output: bool = False,
         idempotency_key: str | None = None,
     ) -> AsyncIterator[Event]:
         identity_payload = copy_tool_round_identity(tool_round_identity).payload()
         for record in records:
             payload: dict[str, Any] = {
                 "tool_call_id": tool_call.id,
-                "destination": record.destination,
-                "credential": None if record.credential is None else record.credential.name,
-                "action": record.action,
-                "metadata": copy_json_value(record.metadata, "metadata"),
+                "destination": (
+                    "unavailable"
+                    if quarantine_output
+                    else output_redactor.redact_text(record.destination)
+                ),
+                "credential": (
+                    None
+                    if quarantine_output or record.credential is None
+                    else output_redactor.redact_text(record.credential.name)
+                ),
+                "action": (
+                    None
+                    if quarantine_output or record.action is None
+                    else output_redactor.redact_text(record.action)
+                ),
+                "metadata": (
+                    {}
+                    if quarantine_output
+                    else output_redactor.redact_json(copy_json_value(record.metadata, "metadata"))
+                ),
                 "allowed": record.result.allowed,
-                "reason": record.result.reason,
-                "result_metadata": copy_json_value(record.result.metadata, "result_metadata"),
+                "reason": (
+                    None
+                    if quarantine_output or record.result.reason is None
+                    else output_redactor.redact_text(record.result.reason)
+                ),
+                "result_metadata": (
+                    {}
+                    if quarantine_output
+                    else output_redactor.redact_json(
+                        copy_json_value(record.result.metadata, "result_metadata")
+                    )
+                ),
                 **identity_payload,
             }
             if idempotency_key is not None:
@@ -2249,6 +2785,10 @@ class ToolRoundExecutor:
         input_id: str | None,
         allow_modification: bool,
         redactor: SecretRedactor | None = None,
+        output_redactor: SecretRedactor | None = None,
+        argument_projection: tool_argument_publication.ToolArgumentProjection | None = None,
+        deferred_terminal_stager: DeferredTerminalStager | None = None,
+        publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         payload: dict[str, Any] = {
             "tool_call_id": tool_call.id,
@@ -2276,7 +2816,11 @@ class ToolRoundExecutor:
             result=result,
             task_id=task_id,
             redactor=redactor,
+            output_redactor=output_redactor,
+            argument_projection=argument_projection,
             allow_modification=allow_modification,
+            deferred_terminal_stager=deferred_terminal_stager,
+            publication_snapshot=publication_snapshot,
         ):
             yield event
 
@@ -2291,6 +2835,8 @@ class ToolRoundExecutor:
         task_id: str | None,
         resolution: _BeforeToolCallResolution,
         redactor: SecretRedactor,
+        output_redactor: SecretRedactor,
+        quarantine_output: bool = False,
     ) -> AsyncIterator[Event]:
         for hooks, scope in (
             (self._runtime_hooks, "app"),
@@ -2332,6 +2878,7 @@ class ToolRoundExecutor:
                     tool_call_id=tool_call.id,
                     arguments=resolution.arguments,
                     task_id=task_id,
+                    publication_actions_allowed=not quarantine_output,
                 )
                 try:
                     decision = await hook.before_tool_call(context)
@@ -2351,8 +2898,24 @@ class ToolRoundExecutor:
                                 payload={
                                     "tool_name": tool_call.name,
                                     "tool_call_id": tool_call.id,
-                                    **_hook_failure_payload(exc, redactor=redactor),
-                                    **_hook_actions_payload(context, redactor=redactor),
+                                    **(
+                                        {
+                                            "error_type": "runtime_hook_failure",
+                                            "actions": [],
+                                            "actions_omitted": True,
+                                        }
+                                        if quarantine_output
+                                        else {
+                                            **_hook_failure_payload(
+                                                exc,
+                                                redactor=output_redactor,
+                                            ),
+                                            **_hook_actions_payload(
+                                                context,
+                                                redactor=output_redactor,
+                                            ),
+                                        }
+                                    ),
                                 },
                             ),
                             redactor=redactor,
@@ -2373,9 +2936,13 @@ class ToolRoundExecutor:
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
-                                **_hook_actions_payload(
-                                    context,
-                                    redactor=redactor,
+                                **(
+                                    {"actions": [], "actions_omitted": True}
+                                    if quarantine_output
+                                    else _hook_actions_payload(
+                                        context,
+                                        redactor=output_redactor,
+                                    )
                                 ),
                             },
                         ),
@@ -2396,14 +2963,55 @@ class ToolRoundExecutor:
         result: ToolResult,
         task_id: str | None,
         redactor: SecretRedactor | None = None,
+        output_redactor: SecretRedactor | None = None,
+        argument_projection: tool_argument_publication.ToolArgumentProjection | None = None,
+        hook_argument_projection: tool_argument_publication.ToolArgumentProjection | None = None,
         allow_modification: bool = False,
         publish_before_hooks: bool = False,
+        deferred_terminal_stager: DeferredTerminalStager | None = None,
+        deferred_terminal_projection_recorder: DeferredTerminalFinalizer | None = None,
+        deferred_terminal_finalizer: DeferredTerminalFinalizer | None = None,
+        hooks_already_completed: bool = False,
+        publication_snapshot: invocation_secrets.InvocationPublicationSnapshot | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         if publish_before_hooks and allow_modification:
             raise ValueError("Pre-hook tool-result publication cannot allow hook modification.")
+        if hooks_already_completed and (publish_before_hooks or allow_modification):
+            raise ValueError("Completed terminal hooks cannot be scheduled again.")
         if publish_before_hooks and "terminal_outcome" not in event.payload:
             raise ValueError("Pre-hook tool-result publication requires terminal controls.")
+        if deferred_terminal_stager is not None and publication_snapshot is None:
+            raise ValueError("Deferred terminal staging requires a publication snapshot.")
+        if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
+            raise ValueError("Deferred terminal projection recording requires observational hooks.")
         resolved_redactor = redactor if redactor is not None else self._secret_redactor
+        resolved_output_redactor = resolved_redactor if output_redactor is None else output_redactor
+        resolved_argument_projection = (
+            tool_argument_publication.unavailable_argument_projection()
+            if argument_projection is None
+            else argument_projection
+        )
+        resolved_hook_argument_projection = (
+            resolved_argument_projection
+            if hook_argument_projection is None
+            else hook_argument_projection
+        )
+        projected_tool_call = replace(
+            tool_call,
+            arguments=resolved_argument_projection.transcript_arguments(),
+        )
+        event_payload = dict(event.payload)
+        event_payload.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
+        event_payload.pop(tool_argument_publication.ARGUMENTS_STATE_FIELD, None)
+        if resolved_argument_projection.state == "unavailable":
+            event_payload.pop("effective_arguments", None)
+        event_payload.update(resolved_argument_projection.payload_fields())
+        event = event.model_copy(update={"payload": event_payload})
+        hook_tool_call = _project_tool_call_for_hook(
+            tool_call,
+            argument_projection=resolved_hook_argument_projection,
+            redactor=resolved_output_redactor,
+        )
         event_identity_values = {
             field_name: event.payload.get(field_name)
             for field_name in ("model_step_id", "model_attempt_id", "tool_round_id")
@@ -2422,18 +3030,61 @@ class ToolRoundExecutor:
         event, result = _prepare_tool_result_event(
             event=event,
             result=result,
-            redactor=resolved_redactor,
+            redactor=resolved_output_redactor,
         )
+        if not resolved_output_redactor.has_same_registry(resolved_redactor):
+            event, result = _prepare_tool_result_event(
+                event=event,
+                result=result,
+                redactor=resolved_redactor,
+            )
+        if deferred_terminal_stager is not None:
+            await deferred_terminal_stager(
+                event,
+                runtime_records.ToolCallOutcome(
+                    call=projected_tool_call,
+                    result=result,
+                ),
+                allow_modification,
+                publish_before_hooks,
+                cast(
+                    "invocation_secrets.InvocationPublicationSnapshot",
+                    publication_snapshot,
+                ),
+            )
+            return
+        if hooks_already_completed:
+            tool_event = await self._event_writer.emit(event)
+            yield (
+                tool_event,
+                runtime_records.ToolCallOutcome(
+                    call=projected_tool_call,
+                    result=result,
+                ),
+            )
+            return
         if publish_before_hooks:
             event, result, projection_cancellation = await self._project_terminal_tool_result(
                 event=event,
                 result=result,
                 session=session,
                 registered_environment=registered_environment,
-                tool_call=tool_call,
+                tool_call=hook_tool_call,
             )
+            if deferred_terminal_projection_recorder is not None:
+                event = await deferred_terminal_projection_recorder(event)
+                stored_result = event.payload.get("result")
+                if type(stored_result) is not dict:
+                    raise RuntimeError("Projected staged terminal lost its tool result.")
+                result = tool_results.tool_result_from_payload(stored_result)
             tool_event = await self._event_writer.emit(event)
-            yield tool_event, runtime_records.ToolCallOutcome(call=tool_call, result=result)
+            yield (
+                tool_event,
+                runtime_records.ToolCallOutcome(
+                    call=projected_tool_call,
+                    result=result,
+                ),
+            )
             if projection_cancellation is not None:
                 raise projection_cancellation
             async for hook_event, modified in self.run_tool_call_hooks(
@@ -2441,10 +3092,11 @@ class ToolRoundExecutor:
                 tool_event=tool_event,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
-                tool_call=tool_call,
+                tool_call=hook_tool_call,
                 result=result,
                 task_id=task_id,
                 redactor=resolved_redactor,
+                output_redactor=resolved_output_redactor,
                 allow_modification=False,
             ):
                 if modified is not None:
@@ -2452,6 +3104,8 @@ class ToolRoundExecutor:
                         "Observational after-tool hook modified terminal evidence."
                     )
                 yield hook_event, None
+            if deferred_terminal_finalizer is not None:
+                await deferred_terminal_finalizer(event)
             return
         final_result = result
         async for hook_event, modified in self.run_tool_call_hooks(
@@ -2459,10 +3113,11 @@ class ToolRoundExecutor:
             tool_event=event,
             registered_agent=registered_agent,
             registered_environment=registered_environment,
-            tool_call=tool_call,
+            tool_call=hook_tool_call,
             result=final_result,
             task_id=task_id,
             redactor=resolved_redactor,
+            output_redactor=resolved_output_redactor,
             allow_modification=allow_modification,
         ):
             yield hook_event, None
@@ -2475,8 +3130,14 @@ class ToolRoundExecutor:
             event, final_result = _prepare_tool_result_event(
                 event=event,
                 result=final_result,
-                redactor=resolved_redactor,
+                redactor=resolved_output_redactor,
             )
+            if not resolved_output_redactor.has_same_registry(resolved_redactor):
+                event, final_result = _prepare_tool_result_event(
+                    event=event,
+                    result=final_result,
+                    redactor=resolved_redactor,
+                )
         event, final_result, projection_cancellation = await self._project_terminal_tool_result(
             event=event,
             result=final_result,
@@ -2484,8 +3145,20 @@ class ToolRoundExecutor:
             registered_environment=registered_environment,
             tool_call=tool_call,
         )
+        if deferred_terminal_finalizer is not None:
+            event = await deferred_terminal_finalizer(event)
+            stored_result = event.payload.get("result")
+            if type(stored_result) is not dict:
+                raise RuntimeError("Finalized staged terminal lost its tool result.")
+            final_result = tool_results.tool_result_from_payload(stored_result)
         tool_event = await self._event_writer.emit(event)
-        yield tool_event, runtime_records.ToolCallOutcome(call=tool_call, result=final_result)
+        yield (
+            tool_event,
+            runtime_records.ToolCallOutcome(
+                call=projected_tool_call,
+                result=final_result,
+            ),
+        )
         if projection_cancellation is not None:
             raise projection_cancellation
 
@@ -2592,6 +3265,7 @@ class ToolRoundExecutor:
         result: ToolResult,
         task_id: str | None,
         redactor: SecretRedactor,
+        output_redactor: SecretRedactor,
         allow_modification: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
         current_result = result
@@ -2610,6 +3284,7 @@ class ToolRoundExecutor:
                 hooks=hooks,
                 scope=scope,
                 redactor=redactor,
+                output_redactor=output_redactor,
                 allow_modification=allow_modification,
             ):
                 yield hook_event, modified
@@ -2629,6 +3304,7 @@ class ToolRoundExecutor:
         hooks: tuple[runtime_records.RegisteredRuntimeHook, ...],
         scope: str,
         redactor: SecretRedactor,
+        output_redactor: SecretRedactor,
         allow_modification: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
         current_result = result
@@ -2670,14 +3346,14 @@ class ToolRoundExecutor:
                 tool_event=tool_event,
                 tool_name=tool_call.name,
                 tool_call_id=tool_call.id,
-                arguments=redactor.redact_json(tool_call.arguments),
+                arguments=output_redactor.redact_json(tool_call.arguments),
                 result=(
                     current_result
                     if _is_policy_denial_event(tool_event) and not allow_modification
                     else _redact_tool_result_for_event(
                         event=tool_event,
                         result=current_result,
-                        redactor=redactor,
+                        redactor=output_redactor,
                     )
                 ),
                 task_id=task_id,
@@ -2702,8 +3378,14 @@ class ToolRoundExecutor:
                                 payload={
                                     "tool_name": tool_call.name,
                                     "tool_call_id": tool_call.id,
-                                    **_hook_failure_payload(exc, redactor=redactor),
-                                    **_hook_actions_payload(context, redactor=redactor),
+                                    **_hook_failure_payload(
+                                        exc,
+                                        redactor=output_redactor,
+                                    ),
+                                    **_hook_actions_payload(
+                                        context,
+                                        redactor=output_redactor,
+                                    ),
                                 },
                             ),
                             redactor=redactor,
@@ -2729,7 +3411,10 @@ class ToolRoundExecutor:
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
-                                **_hook_actions_payload(context, redactor=redactor),
+                                **_hook_actions_payload(
+                                    context,
+                                    redactor=output_redactor,
+                                ),
                             },
                         ),
                         redactor=redactor,
@@ -2820,10 +3505,11 @@ class ToolRoundRun:
                 yield event
             raise
 
+        planned_round: tool_round_recovery.PendingToolRound | None = None
         if policy_plan.pending_approval is None:
             try:
                 try:
-                    await executor.checkpoint_tool_round_policy_plan(
+                    planned_round = await executor.checkpoint_tool_round_policy_plan(
                         session=session,
                         registered_agent=self._registered_agent,
                         tool_calls=tool_calls,
@@ -2931,6 +3617,13 @@ class ToolRoundRun:
                 options=options,
                 tool_round_identity=tool_round_identity,
             )
+            public_question, public_options = public_pending_user_input_prompt(pending_input)
+            public_prompt_payload = (
+                {}
+                if public_question is None
+                else {"question": public_question, "options": public_options}
+            )
+            public_pending_input = public_pending_user_input_event_payload(pending_input)
             yield await executor._event_writer.emit(checkpoint_event)
             yield await executor._event_writer.emit(
                 _event_with_tool_round_authority(
@@ -2944,11 +3637,8 @@ class ToolRoundRun:
                             **tool_round_identity.payload(),
                             "input_id": pending_input.input_id,
                             "tool_call_id": pending_input.tool_call_id,
-                            "question": pending_input.question,
-                            "options": list(pending_input.options),
-                            "tool_calls": [
-                                call.model_dump(mode="json") for call in pending_input.tool_calls
-                            ],
+                            **public_prompt_payload,
+                            "tool_calls": public_pending_input["tool_calls"],
                         },
                     ),
                     tool_round_identity,
@@ -2957,7 +3647,221 @@ class ToolRoundRun:
             )
             raise UserInputRequired(pending_input)
 
+        if planned_round is None:
+            raise RuntimeError("Executable tool round has no durable policy plan.")
+        policy_output_secret_resolution_scope = approval_support.tool_round_secret_resolution_scope(
+            planned_round
+        )
+        defer_round_terminals = (
+            len(tool_calls) > 1 and policy_output_secret_resolution_scope != "static"
+        )
+        publication_coordinator = (
+            _ToolRoundPublicationCoordinator(
+                session_id=session.id,
+                tool_round_identity=tool_round_identity,
+                session_store=executor._session_store,
+                redactor=_redactor_for_tool_calls(
+                    executor._secret_redactor,
+                    registered_agent=self._registered_agent,
+                    tool_calls=tool_calls,
+                ),
+            )
+            if defer_round_terminals
+            else None
+        )
+        staged_hook_modes: dict[str, tuple[bool, bool]] = {}
+        staged_private_outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
         segments = self._tool_round_segments(tool_calls)
+
+        async def synchronize_staged_outcomes() -> None:
+            """Refresh private limit/interruption bookkeeping from durable stages."""
+
+            if publication_coordinator is None:
+                return
+            checkpoint = await executor._session_store.load_checkpoint(session.id)
+            pending = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
+            if (
+                pending is None
+                or tool_round_recovery.pending_tool_round_identity(pending) != tool_round_identity
+            ):
+                raise RuntimeError("Staged outcomes lost their pending tool-round owner.")
+            calls_by_id = {call.id: call for call in tool_calls}
+            staged_private_outcomes.clear()
+            for staged in pending.staged_terminals:
+                call = calls_by_id.get(staged.tool_call_id)
+                result_payload = staged.event.payload.get("result")
+                if call is None or type(result_payload) is not dict:
+                    raise RuntimeError("Staged outcome conflicts with its tool-round call.")
+                staged_private_outcomes[staged.tool_call_id] = runtime_records.ToolCallOutcome(
+                    call=replace(call, arguments={}),
+                    result=tool_results.tool_result_from_payload(result_payload),
+                )
+            tool_outcomes[:] = [
+                staged_private_outcomes[call.id]
+                for call in tool_calls
+                if call.id in staged_private_outcomes
+            ]
+
+        async def record_round_publication_snapshot(
+            tool_call_id: str,
+            snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        ) -> None:
+            if publication_coordinator is not None:
+                await publication_coordinator.seal_call(
+                    tool_call_id=tool_call_id,
+                    snapshot=snapshot,
+                )
+                return
+            await executor._session_store.transform_checkpoint(
+                session.id,
+                tool_round_recovery.assistant_publication_snapshot_transform(
+                    tool_round_identity=tool_round_identity,
+                    tool_call_id=tool_call_id,
+                    redactor=snapshot.redactor,
+                    unsafe_output=snapshot.secret_scope_incomplete,
+                ),
+            )
+
+        async def record_round_redactor(
+            tool_call_id: str,
+            snapshot: InvocationRedactorSnapshot,
+        ) -> None:
+            if publication_coordinator is None:
+                raise AssertionError("Round redactor observer requires a publication coordinator.")
+            await publication_coordinator.register_redactor(
+                tool_call_id=tool_call_id,
+                redactor=snapshot.redactor,
+            )
+            await synchronize_staged_outcomes()
+
+        async def stage_round_terminal(
+            event: Event,
+            outcome: runtime_records.ToolCallOutcome,
+            allow_modification: bool,
+            publish_before_hooks: bool,
+            snapshot: invocation_secrets.InvocationPublicationSnapshot,
+        ) -> None:
+            if publication_coordinator is None:
+                raise AssertionError("Terminal staging requires a publication coordinator.")
+            prepared_event = executor._event_writer.prepare(event)
+            await publication_coordinator.stage_terminal(
+                tool_call_id=outcome.call.id,
+                event=prepared_event,
+                snapshot=snapshot,
+                hooks_state=(
+                    "observational"
+                    if publish_before_hooks
+                    else ("pending" if allow_modification else "finalized")
+                ),
+            )
+            staged_hook_modes[outcome.call.id] = (
+                allow_modification,
+                publish_before_hooks,
+            )
+            await synchronize_staged_outcomes()
+
+        async def complete_round_terminal_hooks(event: Event) -> Event:
+            if publication_coordinator is None:
+                raise AssertionError("Hook finalization requires a publication coordinator.")
+            return await publication_coordinator.complete_terminal_hooks(event)
+
+        async def record_round_terminal_projection(event: Event) -> Event:
+            if publication_coordinator is None:
+                raise AssertionError("Projection recording requires a publication coordinator.")
+            return await publication_coordinator.record_projected_terminal(event)
+
+        async def publish_staged_round_terminals(
+            expected_stage_ids: set[str],
+        ) -> AsyncIterator[Event]:
+            if publication_coordinator is None:
+                if expected_stage_ids:
+                    raise AssertionError("Staged publication requires a coordinator.")
+                return
+            staged_checkpoint = await executor._session_store.load_checkpoint(session.id)
+            staged_round = tool_round_recovery.pending_tool_round_from_checkpoint(staged_checkpoint)
+            if (
+                staged_round is None
+                or tool_round_recovery.pending_tool_round_identity(staged_round)
+                != tool_round_identity
+            ):
+                raise RuntimeError("Staged terminal publication lost its pending tool round.")
+            staged_by_id = {item.tool_call_id: item for item in staged_round.staged_terminals}
+            if set(staged_by_id) != expected_stage_ids:
+                raise RuntimeError(
+                    "Dynamic multi-call publication has an unexpected staged-terminal set."
+                )
+            calls_by_id = {call.id: call for call in tool_calls}
+            if not expected_stage_ids.issubset(calls_by_id):
+                raise RuntimeError("Staged terminal publication names an unknown tool call.")
+            unavailable = tool_argument_publication.unavailable_argument_projection()
+            final_outcomes: dict[str, runtime_records.ToolCallOutcome] = {}
+            for tool_call in tool_calls:
+                staged = staged_by_id.get(tool_call.id)
+                if staged is None:
+                    continue
+                staged_event = publication_coordinator.restore_staged_event_authority(staged.event)
+                result_payload = staged_event.payload.get("result")
+                if type(result_payload) is not dict:
+                    raise RuntimeError("Staged terminal publication lost its tool result.")
+                result = tool_results.tool_result_from_payload(result_payload)
+                hooks_already_completed = staged.hooks_state == "completed"
+                allow_modification, publish_before_hooks = (
+                    (False, False)
+                    if hooks_already_completed
+                    else staged_hook_modes.get(
+                        tool_call.id,
+                        (
+                            staged.hooks_state == "pending",
+                            staged.hooks_state == "observational",
+                        ),
+                    )
+                )
+                async for event, outcome in executor.emit_tool_call_result_with_hooks(
+                    event=staged_event,
+                    session=session,
+                    registered_agent=self._registered_agent,
+                    registered_environment=self._registered_environment,
+                    tool_call=tool_call,
+                    result=result,
+                    task_id=self._task_id,
+                    redactor=publication_coordinator.redactor,
+                    output_redactor=publication_coordinator.redactor,
+                    argument_projection=unavailable,
+                    hook_argument_projection=unavailable,
+                    allow_modification=allow_modification,
+                    publish_before_hooks=publish_before_hooks,
+                    deferred_terminal_projection_recorder=(
+                        record_round_terminal_projection
+                        if publish_before_hooks and not hooks_already_completed
+                        else None
+                    ),
+                    deferred_terminal_finalizer=(
+                        None if hooks_already_completed else complete_round_terminal_hooks
+                    ),
+                    hooks_already_completed=hooks_already_completed,
+                ):
+                    yield event
+                    if event.type in tool_round_recovery._TOOL_ROUND_TERMINAL_EVENT_TYPES:
+                        durable_lifecycle_events.append(copy_event(event))
+                    if outcome is not None:
+                        final_outcomes[outcome.call.id] = outcome
+            if set(final_outcomes) != expected_stage_ids:
+                raise RuntimeError("Staged terminal publication lost a public outcome.")
+            current_by_id = {outcome.call.id: outcome for outcome in tool_outcomes}
+            current_by_id.update(final_outcomes)
+            tool_outcomes[:] = [
+                current_by_id[call.id] for call in tool_calls if call.id in current_by_id
+            ]
+
+        async def publish_staged_terminals_before_limit() -> AsyncIterator[Event]:
+            expected_stage_ids = {outcome.call.id for outcome in tool_outcomes}
+            async for event in publish_staged_round_terminals(expected_stage_ids):
+                yield event
+
+        # Terminal argument projections remain invocation-owned. A multi-call
+        # round therefore omits them, while the separate round scope safely
+        # merges sealed redactors for whole-message publication.
+        publish_arguments_as_unavailable = len(tool_calls) > 1
         round_task = asyncio.current_task()
         round_cancellation_baseline = 0 if round_task is None else round_task.cancelling()
         try:
@@ -2969,6 +3873,17 @@ class ToolRoundRun:
                         policy_results_by_id=policy_results_by_id,
                         tool_round_identity=tool_round_identity,
                         taint_labels_by_id=policy_plan.active_taint_labels,
+                        publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                        policy_output_secret_resolution_scope=(
+                            policy_output_secret_resolution_scope
+                        ),
+                        deferred_terminal_stager=(
+                            stage_round_terminal if publication_coordinator is not None else None
+                        ),
+                        resolved_redactor_observer=(
+                            record_round_redactor if publication_coordinator is not None else None
+                        ),
+                        publication_snapshot_observer=record_round_publication_snapshot,
                     )
                 else:
                     call_stream = self._run_tool_calls_sequential(
@@ -2979,6 +3894,22 @@ class ToolRoundRun:
                         policy_results_by_id=policy_results_by_id,
                         tool_round_identity=tool_round_identity,
                         taint_labels_by_id=policy_plan.active_taint_labels,
+                        publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                        policy_output_secret_resolution_scope=(
+                            policy_output_secret_resolution_scope
+                        ),
+                        deferred_terminal_stager=(
+                            stage_round_terminal if publication_coordinator is not None else None
+                        ),
+                        resolved_redactor_observer=(
+                            record_round_redactor if publication_coordinator is not None else None
+                        ),
+                        publication_snapshot_observer=record_round_publication_snapshot,
+                        publish_staged_terminals=(
+                            publish_staged_terminals_before_limit
+                            if publication_coordinator is not None
+                            else None
+                        ),
                     )
                 async for event, outcome in call_stream:
                     yield event
@@ -3072,6 +4003,14 @@ class ToolRoundRun:
                 yield event
             raise
 
+        if publication_coordinator is not None:
+            # Private stages were retained in ``tool_outcomes`` only so limit
+            # and interruption closure could account for completed effects.
+            # Rebuild the normal successful outcome list from the final public
+            # events in model order.
+            async for event in publish_staged_round_terminals({call.id for call in tool_calls}):
+                yield event
+
         source_checkpoint = await executor._session_store.load_checkpoint(session.id)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(source_checkpoint)
         if (
@@ -3109,7 +4048,11 @@ class ToolRoundRun:
         tool_calls: list[runtime_records.ToolCallRequest],
         completed_tool_outcomes: list[runtime_records.ToolCallOutcome] | None = None,
         tool_round_identity: ToolRoundIdentity,
+        publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
     ) -> AsyncIterator[Event]:
+        if evaluation.decision is not None and publish_staged_terminals is not None:
+            async for event in publish_staged_terminals():
+                yield event
         request = ToolRoundLimitRequest(
             evaluation=evaluation,
             session=self._session,
@@ -3237,6 +4180,20 @@ class ToolRoundRun:
         tool_round_identity: ToolRoundIdentity,
         round_tool_calls: list[runtime_records.ToolCallRequest] | None = None,
         taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
+        publish_arguments_as_unavailable: bool = False,
+        policy_output_secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown",
+        deferred_terminal_stager: DeferredTerminalStager | None = None,
+        resolved_redactor_observer: (
+            Callable[[str, InvocationRedactorSnapshot], Awaitable[None]] | None
+        ) = None,
+        publication_snapshot_observer: (
+            Callable[
+                [str, invocation_secrets.InvocationPublicationSnapshot],
+                Awaitable[None],
+            ]
+            | None
+        ) = None,
+        publish_staged_terminals: Callable[[], AsyncIterator[Event]] | None = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         if round_tool_calls is None:
             round_tool_calls = tool_calls
@@ -3256,6 +4213,7 @@ class ToolRoundRun:
                 tool_calls=round_tool_calls,
                 completed_tool_outcomes=tool_outcomes,
                 tool_round_identity=tool_round_identity,
+                publish_staged_terminals=publish_staged_terminals,
             ):
                 yield event, None
             if limit_evaluation.decision is not None:
@@ -3271,6 +4229,11 @@ class ToolRoundRun:
                 policy_result=policy_results_by_id.get(tool_call.id),
                 tool_round_identity=tool_round_identity,
                 taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
+                publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                policy_output_secret_resolution_scope=(policy_output_secret_resolution_scope),
+                deferred_terminal_stager=deferred_terminal_stager,
+                resolved_redactor_observer=resolved_redactor_observer,
+                publication_snapshot_observer=publication_snapshot_observer,
             ):
                 yield event, outcome
             await self._executor._session_control.raise_if_interrupted(self._session.id)
@@ -3283,6 +4246,19 @@ class ToolRoundRun:
         policy_results_by_id: dict[str, ToolPolicyResult | None],
         tool_round_identity: ToolRoundIdentity,
         taint_labels_by_id: Mapping[str, frozenset[str]] = MappingProxyType({}),
+        publish_arguments_as_unavailable: bool = False,
+        policy_output_secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown",
+        deferred_terminal_stager: DeferredTerminalStager | None = None,
+        resolved_redactor_observer: (
+            Callable[[str, InvocationRedactorSnapshot], Awaitable[None]] | None
+        ) = None,
+        publication_snapshot_observer: (
+            Callable[
+                [str, invocation_secrets.InvocationPublicationSnapshot],
+                Awaitable[None],
+            ]
+            | None
+        ) = None,
     ) -> AsyncIterator[tuple[Event, runtime_records.ToolCallOutcome | None]]:
         semaphore = asyncio.Semaphore(self._executor._max_parallel_tool_calls)
         buffers: list[list[tuple[Event, runtime_records.ToolCallOutcome | None]]] = [
@@ -3304,6 +4280,13 @@ class ToolRoundRun:
                         policy_result=policy_results_by_id.get(tool_call.id),
                         tool_round_identity=tool_round_identity,
                         taint_labels=taint_labels_by_id.get(tool_call.id, frozenset()),
+                        publish_arguments_as_unavailable=publish_arguments_as_unavailable,
+                        policy_output_secret_resolution_scope=(
+                            policy_output_secret_resolution_scope
+                        ),
+                        deferred_terminal_stager=deferred_terminal_stager,
+                        resolved_redactor_observer=resolved_redactor_observer,
+                        publication_snapshot_observer=publication_snapshot_observer,
                     ):
                         buffers[index].append(item)
                 except asyncio.CancelledError as exc:
@@ -3434,7 +4417,9 @@ class ToolRoundRun:
         if current_cancellation_failure is not None:
             raise current_cancellation_failure
         for index, tool_call in enumerate(tool_calls):
-            if all(outcome is None for _, outcome in buffers[index]):
+            if deferred_terminal_stager is None and all(
+                outcome is None for _, outcome in buffers[index]
+            ):
                 buffers[index].append(
                     await self._abnormal_tool_termination_item(
                         tool_call=tool_call,
@@ -3469,6 +4454,7 @@ class ToolRoundRun:
             ),
             "abnormal_termination": True,
             "result": result.model_dump(),
+            **tool_argument_publication.unavailable_argument_projection().payload_fields(),
             **copy_tool_round_identity(tool_round_identity).payload(),
         }
         event = await self._executor._event_writer.emit(
@@ -3483,7 +4469,10 @@ class ToolRoundRun:
         )
         return (
             event,
-            runtime_records.ToolCallOutcome(call=tool_call, result=result),
+            runtime_records.ToolCallOutcome(
+                call=replace(tool_call, arguments={}),
+                result=result,
+            ),
         )
 
 
@@ -4559,6 +5548,38 @@ def _prepare_tool_result_event(
     result: ToolResult,
     redactor: SecretRedactor,
 ) -> tuple[Event, ToolResult]:
+    argument_state = event.payload.get(tool_argument_publication.ARGUMENTS_STATE_FIELD)
+    if argument_state is not None and (
+        type(argument_state) is not str
+        or argument_state not in tool_argument_publication.TERMINAL_ARGUMENT_STATES
+    ):
+        raise ValueError("Terminal tool event has an invalid argument publication state.")
+    argument_projection: tool_argument_publication.ToolArgumentProjection | None = None
+    effective_arguments: dict[str, Any] | None = None
+    if argument_state is not None:
+        argument_projection = tool_argument_publication.terminal_argument_projection(
+            event.payload,
+            legacy_arguments={},
+        )
+        raw_effective_arguments = event.payload.get("effective_arguments")
+        if raw_effective_arguments is not None:
+            if argument_projection.state == "unavailable":
+                raw_effective_arguments = None
+            elif type(raw_effective_arguments) is not dict:
+                raise TypeError("Terminal effective_arguments must be an object.")
+            else:
+                projected_effective_arguments = redactor.redact_json(raw_effective_arguments)
+                if type(projected_effective_arguments) is not dict:
+                    raise AssertionError("Effective argument projection returned a non-object.")
+                effective_arguments = projected_effective_arguments
+        payload_without_argument_projection = dict(event.payload)
+        payload_without_argument_projection.pop(tool_argument_publication.ARGUMENTS_FIELD, None)
+        payload_without_argument_projection.pop(
+            tool_argument_publication.ARGUMENTS_STATE_FIELD,
+            None,
+        )
+        payload_without_argument_projection.pop("effective_arguments", None)
+        event = event.model_copy(update={"payload": payload_without_argument_projection})
     result = result.model_copy(
         update={
             "artifacts": tool_results.strip_runtime_tool_result_projection_authority(
@@ -4582,8 +5603,32 @@ def _prepare_tool_result_event(
             result=result,
             redactor=redactor,
         )
+    if argument_projection is not None:
+        payload = dict(event.payload)
+        payload.update(argument_projection.payload_fields())
+        if effective_arguments is not None:
+            payload["effective_arguments"] = effective_arguments
+        event = event.model_copy(update={"payload": payload})
     event, result = _bound_policy_denial_event(event=event, result=result)
     return _validate_and_synchronize_tool_result_event(event=event, result=result)
+
+
+def _project_tool_call_for_hook(
+    tool_call: runtime_records.ToolCallRequest,
+    *,
+    argument_projection: tool_argument_publication.ToolArgumentProjection,
+    redactor: SecretRedactor,
+) -> runtime_records.ToolCallRequest:
+    """Expose effective arguments only after the invocation scope is complete."""
+
+    if argument_projection.state == "unavailable":
+        arguments: dict[str, Any] = {}
+    else:
+        projected = redactor.redact_json(tool_call.arguments)
+        if type(projected) is not dict:
+            raise AssertionError("Hook argument projection returned a non-object.")
+        arguments = projected
+    return replace(tool_call, arguments=arguments)
 
 
 def _validate_and_synchronize_tool_result_event(
@@ -4715,6 +5760,61 @@ def _bound_policy_denial_event(*, event: Event, result: ToolResult) -> tuple[Eve
     payload["reason"] = _bound_policy_denial_text(require_nonblank(reason, "reason"))
     payload["result"] = bounded_result.model_dump()
     return event.model_copy(update={"payload": payload}), bounded_result
+
+
+def _project_staged_terminal_event(
+    event: Event,
+    *,
+    redactor: SecretRedactor,
+) -> Event:
+    """Progressively sanitize one private terminal without changing its identity."""
+
+    raw_result = event.payload.get("result")
+    if type(raw_result) is not dict:
+        raise ValueError("Staged terminal event requires a tool result object.")
+    result = tool_results.tool_result_from_payload(raw_result)
+    projected, _ = _prepare_tool_result_event(
+        event=event,
+        result=result,
+        redactor=redactor,
+    )
+    return copy_event(projected)
+
+
+def restore_staged_terminal_authority(
+    event: Event,
+    *,
+    session_id: str,
+    tool_round_identity: ToolRoundIdentity,
+) -> Event:
+    """Restore only typed authority erased by checkpoint serialization."""
+
+    session_id = require_clean_nonblank(session_id, "session_id")
+    identity = copy_tool_round_identity(tool_round_identity)
+    if event.session_id != session_id or not identity.matches_payload(event.payload):
+        raise RuntimeError("Staged terminal conflicts with its durable round owner.")
+    tool_call_id = event.payload.get("tool_call_id")
+    if type(tool_call_id) is not str or not tool_call_id:
+        raise ValueError("Staged terminal lost its tool-call identity.")
+    restored = event_with_runtime_generated_id(copy_event(event))
+    restored = _event_with_tool_round_authority(
+        restored,
+        identity,
+        "tool_call_id",
+    )
+    if restored.interaction_id is not None:
+        restored = event_with_runtime_envelope_authority(restored, "interaction_id")
+    controls, _references = tool_results.runtime_tool_event_boundary_controls(
+        restored.payload,
+        include_terminal_controls=restored.type
+        in {EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED},
+    )
+    if "tool_result_projection" in controls:
+        restored = event_with_runtime_nested_payload_authority(
+            restored,
+            _TOOL_RESULT_PROJECTION_PROVENANCE_PATH,
+        )
+    return restored
 
 
 def policy_denial_payload_fields(

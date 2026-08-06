@@ -106,6 +106,7 @@ from cayu.runtime._event_projection import (
     public_event_sequence,
 )
 from cayu.runtime.budgets import InMemoryBudgetStore
+from cayu.runtime.checkpoints import CURRENT_CHECKPOINT_SCHEMA_VERSION
 from cayu.runtime.usage import CacheUsageMetrics, UsageMetrics
 from cayu.server import (
     DashboardConfig,
@@ -4016,6 +4017,7 @@ def test_server_sessions_summary_filters_debug_states_before_pagination() -> Non
 
 def test_server_pending_actions_lists_blocking_session_work() -> None:
     app = CayuApp()
+    private_approval_reason = "pending-approval-policy-secret-canary"
     approval_round_id = f"tround_{'3' * 32}"
     user_input_round_id = f"tround_{'4' * 32}"
     recovery_round_id = f"tround_{'5' * 32}"
@@ -4152,7 +4154,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                             "approval_id": "approval_1",
                             "tool_call_id": "call_deploy",
                             "tool_name": "deploy",
-                            "reason": "production write",
+                            "reason": private_approval_reason,
                             "arguments": {"service": "api"},
                             "agent_name": "assistant",
                             "tool_calls": [
@@ -4171,7 +4173,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                 tool_call_id="call_deploy",
                 tool_name="deploy",
                 arguments={"service": "api"},
-                reason="production write",
+                reason=private_approval_reason,
             ),
         )
         await create(
@@ -4186,8 +4188,8 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                         **execution_identity(user_input_round_id),
                         "input_id": "input_1",
                         "tool_call_id": "call_ask",
-                        "question": "Deploy now?",
-                        "options": ["yes", "no"],
+                        "question": "pending-user-input-secret-canary",
+                        "options": ["yes", "pending-user-input-secret-canary"],
                     },
                 )
             ],
@@ -4195,8 +4197,8 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                 input_id="input_1",
                 tool_call_id="call_ask",
                 tool_name="ask_user",
-                question="Deploy now?",
-                options=["yes", "no"],
+                question="pending-user-input-secret-canary",
+                options=["yes", "pending-user-input-secret-canary"],
             ),
         )
         await create(
@@ -4318,6 +4320,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         response = client.get("/api/pending-actions")
     assert response.status_code == 200
     body = response.json()
+    assert private_approval_reason not in response.text
     assert body["inspected_candidate_count"] == 4
     assert body["has_more"] is False
     assert body["next_cursor"] is None
@@ -4335,15 +4338,17 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         approval["event"]["sequence"],
         "approval_id",
     )
-    assert approval["arguments"] == {"service": "api"}
+    assert approval["arguments"] is None
     user_input = actions_by_session["pending_user_input"]
     assert user_input["kind"] == "user_input"
     assert user_input["input_id"] == public_event_linkage_id(
         user_input["event"]["sequence"],
         "input_id",
     )
-    assert user_input["question"] == "Deploy now?"
-    assert user_input["options"] == ["yes", "no"]
+    assert user_input["detail"] == "Input required"
+    assert user_input["question"] is None
+    assert user_input["options"] == []
+    assert "pending-user-input-secret-canary" not in response.text
     tool_round = actions_by_session["manual_tool_round_recovery"]
     assert tool_round["kind"] == "manual_recovery"
     assert tool_round["round_id"] == public_event_linkage_id(
@@ -4356,7 +4361,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
     )
     assert tool_round["approval_id"] is None
     assert tool_round["input_id"] is None
-    assert tool_round["arguments"] == {"amount": 42}
+    assert tool_round["arguments"] is None
     assert tool_round["event"]["type"] == EventType.SESSION_FAILED
     assert tool_round["event"]["payload"] == {}
 
@@ -4398,9 +4403,9 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
         _serialize_pending_action(app, contradictory_approval)
     approval_recovery = actions_by_session["manual_recovery"]
     assert approval_recovery["kind"] == "manual_recovery"
-    assert approval_recovery["arguments"] == {"invoice_id": "inv_123"}
+    assert approval_recovery["arguments"] is None
 
-    filtered = client.get("/api/pending-actions?kind=user_input&q=deploy")
+    filtered = client.get("/api/pending-actions?kind=user_input&q=input")
     assert filtered.status_code == 200
     filtered_body = filtered.json()
     assert filtered_body["total_count"] == 1
@@ -4593,15 +4598,13 @@ def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_
         rendered = json.dumps(response.json(), sort_keys=True)
         assert secret not in rendered
 
-    for response in responses[:-1]:
-        rendered = json.dumps(response.json(), sort_keys=True)
-        assert REDACTED_SECRET in rendered
+    assert REDACTED_SECRET in "".join(
+        json.dumps(response.json(), sort_keys=True) for response in responses
+    )
 
     pending_body = responses[3].json()
     assert pending_body["actions"][0]["session"]["id"] == public_session_id
-    assert pending_body["actions"][0]["arguments"] == {
-        REDACTED_SECRET: f"checkpoint value {REDACTED_SECRET}"
-    }
+    assert pending_body["actions"][0]["arguments"] is None
     assert pending_body["next_cursor"] is None
     assert responses[0].json()["id"] == public_session_id
     assert responses[-1].json()["sessions"][0]["id"] == public_session_id
@@ -5030,7 +5033,7 @@ def test_server_pending_actions_reports_future_checkpoint_without_exposing_conte
         await app.session_store.checkpoint(
             session_id,
             {
-                "checkpoint_schema_version": 2,
+                "checkpoint_schema_version": CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
                 "pending_user_input": {"secret": "must-not-escape"},
             },
         )
@@ -5043,12 +5046,12 @@ def test_server_pending_actions_reports_future_checkpoint_without_exposing_conte
     assert response.status_code == 409
     assert response.json()["detail"] == {
         "checkpoint_kind": "root",
-        "observed_version": 2,
+        "observed_version": CURRENT_CHECKPOINT_SCHEMA_VERSION + 1,
         "reason": "checkpoint_schema_version_too_new",
         "recovery_disposition": "cannot_migrate",
         "resumable_in_place": False,
         "session_id": session_id,
-        "supported_max_version": 1,
+        "supported_max_version": CURRENT_CHECKPOINT_SCHEMA_VERSION,
         "supported_min_version": 1,
     }
     assert "must-not-escape" not in response.text

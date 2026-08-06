@@ -167,7 +167,7 @@ def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
         ]
         checkpoint = await store.load_checkpoint(session.id)
         assert checkpoint is not None
-        assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+        assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
         assert checkpoint["future_additive_field"] == {"preserved": True}
         assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 1
         first_request_count = len(provider.requests)
@@ -2465,7 +2465,7 @@ def test_compact_session_rejects_secret_checkpoint_event_payload_before_publicat
 
     error, policy, checkpoint, durable_events = asyncio.run(run())
 
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
     assert secret not in repr(durable_events)
     assert policy.result is not None
     assert policy.result.messages == []

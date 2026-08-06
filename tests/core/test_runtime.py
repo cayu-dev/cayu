@@ -159,6 +159,7 @@ from cayu.runtime import (
     ObservedDeltaContextEstimator,
     ParameterConstrainedToolPolicy,
     PendingToolApproval,
+    PendingToolApprovalEventView,
     PriceBook,
     PriceSchedule,
     PriceTier,
@@ -1341,7 +1342,25 @@ async def _pending_tool_approval_from_public_event(
             [event],
         )
     )[0]
-    return PendingToolApproval.from_event(private_event)
+    projected_approval = PendingToolApprovalEventView.from_event(private_event)
+    checkpoint_approval = approval_support_module.pending_approval_from_checkpoint(
+        await store.load_checkpoint(event.session_id)
+    )
+    assert checkpoint_approval is not None
+    assert (
+        projected_approval.approval_id,
+        projected_approval.tool_call_id,
+        projected_approval.model_step_id,
+        projected_approval.model_attempt_id,
+        projected_approval.tool_round_id,
+    ) == (
+        checkpoint_approval.approval_id,
+        checkpoint_approval.tool_call_id,
+        checkpoint_approval.model_step_id,
+        checkpoint_approval.model_attempt_id,
+        checkpoint_approval.tool_round_id,
+    )
+    return checkpoint_approval
 
 
 def tool_round_identity_payload(event: Event) -> dict[str, str]:
@@ -1419,7 +1438,7 @@ def assert_only_model_step_publication_checkpoint(
         CHECKPOINT_SCHEMA_VERSION_KEY,
         model_completion_publication_module.LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     }
-    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
     assert (
         model_completion_publication_module.model_step_publication_from_checkpoint(checkpoint)
         is not None
@@ -2816,7 +2835,7 @@ def test_knowledge_injection_fail_closed_preserves_completed_compaction_checkpoi
     }
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_fail_closed_after_compaction"))
     assert checkpoint == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "context_compaction": {
             "version": 2,
             "summary": "old|old answer",
@@ -2900,7 +2919,7 @@ def test_knowledge_injection_policy_composes_with_checkpoint_compaction() -> Non
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_knowledge_injection_compaction"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "context_compaction": {
             "version": 2,
             "summary": "old|old answer",
@@ -3816,7 +3835,16 @@ def test_cayu_app_bounds_policy_denial_after_secret_redaction_expands_it() -> No
 def test_policy_denial_redaction_preserves_protocol_fields_that_match_secrets() -> None:
     from cayu.vaults import SecretRedactor
 
-    secret_values = ["reason", "denied", "deny", "tool", "decision", "result"]
+    secret_values = [
+        "reason",
+        "denied",
+        "deny",
+        "tool",
+        "decision",
+        "result",
+        "quarantined",
+        "unavailable",
+    ]
     redactor = SecretRedactor(secret_values)
     raw_reason = "reason denied deny tool echo decision result " * 300
     raw_metadata = {"detail": "tool", "safe": "deny this value"}
@@ -14394,7 +14422,7 @@ def test_cayu_app_forks_completed_session_and_preserves_source():
     assert fork.metadata == {"purpose": "alternate path"}
     fork_checkpoint = asyncio.run(store.load_checkpoint("sess_fork_child"))
     assert fork_checkpoint is not None
-    assert fork_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 1
+    assert fork_checkpoint[CHECKPOINT_SCHEMA_VERSION_KEY] == 2
     assert fork_checkpoint["future_additive_field"] == {"kept": True}
 
     fork_transcript = asyncio.run(store.load_transcript("sess_fork_child"))
@@ -14519,7 +14547,7 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
             assert after_takeover.metadata == {"stale_owner_write_before_atomic_takeover": True}
             source_checkpoint = await store.load_checkpoint(session_id)
             assert source_checkpoint == {
-                CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
                 "custom_state": {"value": 1},
             }
         finally:
@@ -14538,7 +14566,7 @@ def test_cayu_app_fences_expired_recovery_owner_before_fork(
         child_checkpoint = await store.load_checkpoint(child_id)
         expected_checkpoint = (
             {
-                CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+                CHECKPOINT_SCHEMA_VERSION_KEY: 2,
                 "custom_state": {"value": 1},
             }
             if copy_checkpoint
@@ -14614,7 +14642,7 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
         assert after_failure.run_epoch > completed.run_epoch
         assert await store.load(child_id) is None
         assert await store.load_checkpoint(session_id) == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
             "custom_state": {"value": 1},
         }
 
@@ -14628,7 +14656,7 @@ def test_cayu_app_cleans_ambiguous_expired_recovery_takeover_before_retry() -> N
         )
         assert [event.type for event in retry_events] == [EventType.SESSION_FORKED]
         assert await store.load_checkpoint(child_id) == {
-            CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+            CHECKPOINT_SCHEMA_VERSION_KEY: 2,
             "custom_state": {"value": 1},
         }
 
@@ -16301,7 +16329,7 @@ def test_background_interruption_reconciles_child_already_interrupting_elsewhere
     assert all(
         event.type != EventType.SESSION_INTERRUPTION_CASCADE_FAILED for event in parent_events
     )
-    assert parent_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert parent_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
 
 def test_background_interruption_cascade_isolates_child_completion_race(monkeypatch):
@@ -17696,7 +17724,7 @@ def test_interrupt_does_not_start_or_clear_cascade_before_terminal_event(monkeyp
     assert first_event.type == EventType.SESSION_INTERRUPTED
     assert "pending_interruption_cascade" in checkpoint_before_terminal
     assert tasks_before_terminal == 0
-    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
 
 def test_pending_interruption_cascade_resumes_from_durable_checkpoint():
@@ -18215,7 +18243,7 @@ def test_interruption_cascade_generation_rejects_stale_worker_results():
     assert stale_completion == (False, False)
     assert failed_generation_completion == (False, False)
     assert current_completion == (True, True)
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
 
 def test_interruption_cascade_completion_publish_failure_keeps_retryable_marker(monkeypatch):
@@ -20124,7 +20152,11 @@ def test_after_tool_call_hook_sees_redacted_arguments():
     assert seen["arguments"] == {"text": REDACTED_SECRET}
 
     started = next(event for event in events if event.type == EventType.TOOL_CALL_STARTED)
-    assert started.payload["arguments"] == {"text": "public"}
+    assert started.payload["arguments_state"] == "quarantined"
+    assert "arguments" not in started.payload
+    completed = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    assert completed.payload["arguments_state"] == "finalized"
+    assert completed.payload["arguments"] == {"text": "public"}
 
     transcript = asyncio.run(store.load_transcript("sess_arg_redact"))
     assistant_tool_call = next(
@@ -20201,7 +20233,7 @@ class _CaptureAfterArgsHook(RuntimeHook):
         self.arguments = context.arguments
 
 
-def test_effective_args_flow_to_short_circuit_terminal_path():
+def test_short_circuit_without_invocation_scope_omits_effective_arguments():
     class ShortCircuitHook(RuntimeHook):
         async def before_tool_call(
             self, context: BeforeToolCallHookContext
@@ -20232,15 +20264,15 @@ def test_effective_args_flow_to_short_circuit_terminal_path():
         )
     )
 
-    # A hook modified args, then a later hook short-circuited: the effective args must reach the
-    # after-hook and the result event, even though the tool never ran.
+    # No invocation scope was established, so modified private arguments remain unavailable.
     assert tool.calls == []
-    assert capture.arguments == {"text": "modified-before-short"}
+    assert capture.arguments == {}
     completed = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
-    assert completed.payload["effective_arguments"] == {"text": "modified-before-short"}
+    assert completed.payload["arguments_state"] == "unavailable"
+    assert "effective_arguments" not in completed.payload
 
 
-def test_effective_args_flow_to_block_terminal_path():
+def test_block_without_invocation_scope_omits_effective_arguments():
     class BlockHook(RuntimeHook):
         async def before_tool_call(
             self, context: BeforeToolCallHookContext
@@ -20270,9 +20302,10 @@ def test_effective_args_flow_to_block_terminal_path():
     )
 
     assert tool.calls == []
-    assert capture.arguments == {"text": "modified-before-block"}
+    assert capture.arguments == {}
     blocked = next(event for event in events if event.type == EventType.TOOL_CALL_BLOCKED)
-    assert blocked.payload["effective_arguments"] == {"text": "modified-before-block"}
+    assert blocked.payload["arguments_state"] == "unavailable"
+    assert "effective_arguments" not in blocked.payload
 
 
 def test_invalid_after_tool_call_decision_fails_even_when_observe_only():
@@ -21344,7 +21377,7 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
     assert session is not None
     assert session.status == SessionStatus.FAILED
     assert asyncio.run(store.load_checkpoint("sess_broken_transcript")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2
     }
 
 
@@ -22501,7 +22534,7 @@ def test_cayu_app_executes_tool_call_and_records_result():
         "tool_call_id": "call_1",
         "idempotency_key": private_events[3].payload["idempotency_key"],
         "effect": "external",
-        "arguments": {"text": "from tool"},
+        "arguments_state": "quarantined",
         **tool_round_identity_payload(private_events[3]),
     }
     assert private_events[4].payload["tool_round_id"] == private_events[3].payload["tool_round_id"]
@@ -22844,7 +22877,7 @@ def test_cayu_app_resume_gates_pending_round_without_policy_outcome():
             approval_events,
         )
     )[0]
-    approval = PendingToolApproval.from_event(durable_approval)
+    approval = PendingToolApprovalEventView.from_event(durable_approval)
     assert approval.tool_round_id == checkpoint["pending_tool_round"]["tool_round_id"]
     assert approval.tool_call_id == "call_1"
     assert approval.tool_calls[0].policy_evidence == "ambiguous"
@@ -22859,7 +22892,7 @@ def test_cayu_app_resume_gates_pending_round_without_policy_outcome():
     assert recovered_checkpoint["pending_tool_approval"]["approval_id"] == (approval.approval_id)
     assert recovered_checkpoint["pending_tool_round"]["policy_state"] == "planned"
     transcript = asyncio.run(store.load_transcript("sess_tool_round_recover_not_started"))
-    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert [message.role for message in transcript] == ["user"]
     assert len(provider.requests) == 1
 
 
@@ -23515,6 +23548,8 @@ def _crashed_tool_round_app(
     *,
     clock: Callable[[], datetime] | None = None,
     secret_redactor: SecretRedactor | None = None,
+    environment: Environment | None = None,
+    provider_capture: list[FakeProvider] | None = None,
 ) -> tuple[CayuApp, FailingTerminalToolEventStore, SideEffectTool, dict]:
     """Run a session whose only tool call starts but records no terminal event.
 
@@ -23535,12 +23570,16 @@ def _crashed_tool_round_app(
             ],
         ]
     )
+    if provider_capture is not None:
+        provider_capture.append(provider)
     app = CayuApp(
         session_store=store,
         clock=clock,
         secret_redactor=secret_redactor,
     )
     app.register_provider(provider, default=True)
+    if environment is not None:
+        app.register_environment(environment, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"), tools=[tool])
 
     initial_events = asyncio.run(
@@ -23788,9 +23827,28 @@ def test_approved_tool_policy_then_command_policy_denial_emits_one_command_block
     assert resolution_events[-1].type == EventType.SESSION_COMPLETED
 
 
-def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown():
-    session_id = "sess_tool_round_manual_completed"
-    app, store, tool, checkpoint = _crashed_tool_round_app(session_id)
+@pytest.mark.parametrize("dynamic_scope", [False, True], ids=["static", "dynamic"])
+def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown(
+    dynamic_scope: bool,
+):
+    session_id = f"sess_tool_round_manual_completed_{dynamic_scope}"
+    recovery_message = (
+        "manual-recovery-secret-canary" if dynamic_scope else "side effect verified externally"
+    )
+    environment = (
+        Environment(
+            EnvironmentSpec(name="dynamic"),
+            vault=StaticVault({"api_key": recovery_message}),
+        )
+        if dynamic_scope
+        else None
+    )
+    provider_capture: list[FakeProvider] = []
+    app, store, tool, checkpoint = _crashed_tool_round_app(
+        session_id,
+        environment=environment,
+        provider_capture=provider_capture,
+    )
     round_id = checkpoint["pending_tool_round"]["tool_round_id"]
 
     recovery_events = asyncio.run(
@@ -23801,9 +23859,10 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown()
                 round_id=round_id,
                 tool_call_id="call_1",
                 outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                message="side effect verified externally",
-                structured={"verified": True},
-                reason="operator checked the downstream system",
+                message=recovery_message,
+                structured={"verified": True, "provided": recovery_message},
+                reason=recovery_message,
+                metadata={"provided": recovery_message},
                 resolved_by=ResolutionActor(
                     subject="operator@example.com",
                     tenant="tenant-a",
@@ -23835,8 +23894,18 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown()
         tool_round_id=round_id,
         tool_call_id="call_1",
     )
-    assert durable_recovered.payload["result"]["content"] == "side effect verified externally"
+    expected_content = (
+        "Externally verified tool output is unavailable because the invocation "
+        "secret scope could not be reconstructed."
+        if dynamic_scope
+        else "side effect verified externally"
+    )
+    assert durable_recovered.payload["result"]["content"] == expected_content
     assert durable_recovered.payload["result"]["is_error"] is False
+    assert durable_recovered.payload["reason"] == (None if dynamic_scope else recovery_message)
+    assert durable_recovered.payload["metadata"] == (
+        {} if dynamic_scope else {"provided": recovery_message}
+    )
     assert recovered.payload["resolved_by"] == {
         "subject": "operator@example.com",
         "tenant": "tenant-a",
@@ -23859,8 +23928,22 @@ def test_cayu_app_recover_tool_round_completed_outcome_resumes_without_unknown()
     recovered_result = transcript[2].content[0]
     assert recovered_result.tool_call_id == "call_1"
     assert recovered_result.is_error is False
-    assert recovered_result.content == "side effect verified externally"
-    assert recovered_result.structured == {"verified": True}
+    assert recovered_result.content == expected_content
+    assert recovered_result.structured == (
+        {
+            "error": "invalid_tool_output",
+            "manual_recovery": True,
+            "outcome_unknown": False,
+            "reason": "invocation_secret_scope_unavailable",
+        }
+        if dynamic_scope
+        else {"verified": True, "provided": recovery_message}
+    )
+    if dynamic_scope:
+        assert recovery_message not in repr(recovery_events)
+        assert recovery_message not in repr(asyncio.run(store.load_events(session_id)))
+        assert recovery_message not in repr(transcript)
+        assert recovery_message not in repr(provider_capture[0].requests[-1].messages)
 
     # The round is closed and the checkpoint cleared — a second recovery rejects.
     with pytest.raises(RuntimeError, match="no pending tool round"):
@@ -26253,6 +26336,7 @@ def test_cayu_app_recover_tool_round_closes_stale_live_claim_failure_to_interrup
                             tool_call_id="call_1",
                         ),
                         "manual_recovery": True,
+                        "arguments_state": "unavailable",
                         "result": ToolResult(content="verified externally").model_dump(),
                     },
                 ),
@@ -27149,6 +27233,17 @@ def test_cayu_app_recovery_and_resume_preserve_healthy_fork_baseline() -> None:
 
 
 def test_cayu_app_recovery_repairs_missing_pending_approval_terminal_evidence() -> None:
+    secret = "late-secret-repaired-approval-pause"
+
+    class ArgumentDerivedApprovalPolicy(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            provided = request.arguments["value"]
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"Approve {provided}",
+                metadata={"provided": provided},
+            )
+
     class CrashBeforeApprovalPauseEventStore(InMemorySessionStore):
         def __init__(self) -> None:
             super().__init__()
@@ -27169,17 +27264,24 @@ def test_cayu_app_recovery_repairs_missing_pending_approval_terminal_evidence() 
                     ModelStreamEvent.tool_call(
                         id="call_1",
                         name="side_effect",
-                        arguments={"value": "approval"},
+                        arguments={"value": secret},
                     ),
                     ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
                 ]
             ),
             default=True,
         )
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="local"),
+                vault=StaticVault({"api_key": secret}),
+            ),
+            default=True,
+        )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             tools=[SideEffectTool()],
-            tool_policy=RequireApprovalPolicy(),
+            tool_policy=ArgumentDerivedApprovalPolicy(),
         )
         session_id = "sess_missing_approval_pause_terminal"
         with pytest.raises(ConnectionError, match="crash before approval pause event"):
@@ -27225,6 +27327,10 @@ def test_cayu_app_recovery_repairs_missing_pending_approval_terminal_evidence() 
         )
         assert terminal_records[0].event.payload["interruption_type"] == ("tool_approval_required")
         assert terminal_records[0].event.payload["approval"]["approval_id"] == approval_id
+        assert "reason" not in terminal_records[0].event.payload["approval"]
+        assert "metadata" not in terminal_records[0].event.payload["approval"]
+        assert secret not in repr(terminal_records)
+        assert secret not in repr(recovered.events)
         assert checkpoint_after is not None
         assert checkpoint_after["pending_tool_approval"]["approval_id"] == approval_id
         assert "incomplete_session_recovery_claim" not in checkpoint_after
@@ -27486,7 +27592,7 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
             str(UUID(terminal_records[-1].event.payload["session_run_operation_id"]))
             == terminal_records[-1].event.payload["session_run_operation_id"]
         )
-        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
     asyncio.run(scenario())
 
@@ -27753,7 +27859,7 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
             **pending_payload,
             "interruption_request_id": PRIVATE_EVENT_AUTHORITY,
         }
-        assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+        assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
         resumed = await collect_resume_events(
             app,
@@ -27832,7 +27938,7 @@ def test_cayu_app_recover_incomplete_session_finalizes_pending_interrupt():
 
     assert session is not None
     assert session.status == SessionStatus.INTERRUPTED
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
     assert result.actions == (IncompleteSessionRecoveryAction.FINALIZED_INTERRUPT,)
     assert [event.type for event in result.events] == [EventType.SESSION_INTERRUPTED]
     assert result.events[0].payload["interruption_request_id"] == PRIVATE_EVENT_AUTHORITY
@@ -27944,7 +28050,7 @@ def test_cayu_app_recover_incomplete_session_gates_round_without_policy_outcome(
     )
     assert tool.calls == []
     assert len(provider.requests) == provider_requests_before_recovery
-    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert [message.role for message in transcript] == ["user"]
     recovered_checkpoint = asyncio.run(store.load_checkpoint("sess_recover_incomplete_tool_round"))
     assert recovered_checkpoint is not None
     approval = PendingToolApproval.model_validate(recovered_checkpoint["pending_tool_approval"])
@@ -29410,6 +29516,7 @@ def test_cayu_app_blocks_tool_call_before_execution_with_tool_policy():
         "decision": "deny",
         "reason": "Tool denied by policy: side_effect",
         "metadata": {},
+        "arguments_state": "unavailable",
         "result": {
             "content": "Tool denied by policy: side_effect",
             "structured": {
@@ -29702,7 +29809,8 @@ def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
     assert private_events[-1].payload["approval"]["approval_id"] == approval["approval_id"]
     assert approval["tool_call_id"] == "call_1"
     assert approval["tool_name"] == "side_effect"
-    assert approval["arguments"] == {"value": "secret"}
+    assert "arguments" not in approval
+    assert approval["arguments_state"] == "quarantined"
     assert approval["agent_name"] == "assistant"
     assert approval["reason"] == "Approval required for side_effect."
     assert approval["metadata"] == {"scope": "human"}
@@ -29715,10 +29823,15 @@ def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
     checkpoint = asyncio.run(store.load_checkpoint("sess_tool_approval"))
     assert checkpoint is not None
     assert checkpoint["pending_tool_approval"]["approval_id"] == approval["approval_id"]
+    assert checkpoint["pending_tool_approval"]["arguments"] == {"value": "secret"}
 
     transcript = asyncio.run(store.load_transcript("sess_tool_approval"))
-    assert [message.role for message in transcript] == ["user", "assistant"]
-    assert transcript[-1].content[0].type == "tool_call"
+    assert [message.role for message in transcript] == ["user"]
+    quarantined_assistant = Message.model_validate(
+        checkpoint["pending_tool_round"]["quarantined_assistant_message"]
+    )
+    assert quarantined_assistant.role == "assistant"
+    assert quarantined_assistant.content[0].type == "tool_call"
 
 
 def test_cayu_app_resolves_approved_tool_call_and_continues_session():
@@ -30329,6 +30442,8 @@ def test_tool_approval_requested_audit_metadata_is_bounded_and_redacted():
     approval_event = next(
         event for event in events if event.type is EventType.TOOL_CALL_APPROVAL_REQUESTED
     )
+    assert approval_event.payload["approval"]["reason"] == "review required"
+    assert approval_event.payload["approval"]["metadata"]["classification"] == "public"
     assert approval_event.payload["approval_metadata_truncated"] is True
     assert approval_event.payload["tool_call_metadata_truncated"] == ["call_1"]
     assert (
@@ -30381,6 +30496,15 @@ def test_tool_approval_requested_audit_metadata_is_bounded_and_redacted():
     redacted_serialized = json.dumps(redacted_payload, sort_keys=True)
     assert secret not in redacted_serialized
     assert REDACTED_SECRET in redacted_serialized
+    unknown_payload = approval_support.bounded_pending_approval_event_payload(
+        secret_approval.model_copy(update={"secret_resolution_scope": "unknown"}),
+        redactor=SecretRedactor(),
+    )
+    unknown_approval = unknown_payload["approval"]
+    assert "reason" not in unknown_approval
+    assert "metadata" not in unknown_approval
+    assert all("reason" not in call for call in unknown_approval["tool_calls"])
+    assert all("metadata" not in call for call in unknown_approval["tool_calls"])
 
 
 class ExpiringApprovalPolicy(ToolPolicy):
@@ -30509,8 +30633,19 @@ def test_tool_approval_resolution_atomically_migrates_legacy_approval_only_check
         )
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
+        await store.append_transcript_messages(
+            session_id,
+            [
+                Message.model_validate(
+                    checkpoint["pending_tool_round"]["quarantined_assistant_message"]
+                )
+            ],
+        )
         legacy_checkpoint = dict(checkpoint)
         legacy_checkpoint.pop("pending_tool_round")
+        legacy_approval = dict(legacy_checkpoint["pending_tool_approval"])
+        legacy_approval.pop("secret_resolution_scope")
+        legacy_checkpoint["pending_tool_approval"] = legacy_approval
         await store.checkpoint(session_id, legacy_checkpoint)
 
         resumed = await collect_tool_approval_events(
@@ -31636,11 +31771,17 @@ def test_automatic_compaction_failed_start_publication_reuses_causal_event() -> 
     asyncio.run(run())
 
 
-def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp():
+@pytest.mark.parametrize("dynamic_scope", [False, True], ids=["static", "dynamic"])
+def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp(
+    dynamic_scope: bool,
+):
     # Recovery reconciles a side effect authorized in-window before a crash;
     # it is never blocked by expiry, but an out-of-window reconciliation is
     # stamped for the audit trail.
     clock = {"now": datetime(2026, 7, 9, 12, 0, tzinfo=UTC)}
+    recovery_message = (
+        "approval-recovery-secret-canary" if dynamic_scope else "side effect completed externally"
+    )
     store = FailingTerminalToolEventStore()
     tool = SideEffectTool()
     provider = FakeProvider(
@@ -31661,6 +31802,14 @@ def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp():
     )
     app = CayuApp(session_store=store, clock=lambda: clock["now"])
     app.register_provider(provider, default=True)
+    if dynamic_scope:
+        app.register_environment(
+            Environment(
+                EnvironmentSpec(name="dynamic"),
+                vault=StaticVault({"api_key": recovery_message}),
+            ),
+            default=True,
+        )
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
         tools=[tool],
@@ -31708,7 +31857,10 @@ def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp():
                 tool_round_id=approval_event.payload["tool_round_id"],
                 tool_call_id="call_1",
                 outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                message="side effect completed externally",
+                message=recovery_message,
+                structured={"provided": recovery_message},
+                reason=recovery_message,
+                metadata={"provided": recovery_message},
                 resolved_by=_reviewer_actor(),
             ),
         )
@@ -31728,6 +31880,24 @@ def test_tool_approval_recovery_events_carry_resolved_by_and_expiry_stamp():
     assert recovered.payload["resolved_by"]["subject"] == "reviewer@example.com"
     assert recovered.payload["resolved_by"]["source"] == "request"
     assert recovered.payload["expired"] is True
+    assert recovered.payload["reason"] == (None if dynamic_scope else recovery_message)
+    assert recovered.payload["metadata"] == (
+        {} if dynamic_scope else {"provided": recovery_message}
+    )
+    expected_content = (
+        "Externally verified tool output is unavailable because the invocation "
+        "secret scope could not be reconstructed."
+        if dynamic_scope
+        else recovery_message
+    )
+    assert recovered.payload["result"]["content"] == expected_content
+    if dynamic_scope:
+        assert recovery_message not in repr(recovery_events)
+        assert recovery_message not in repr(asyncio.run(store.load_events("sess_recovery_actor")))
+        assert recovery_message not in repr(
+            asyncio.run(store.load_transcript("sess_recovery_actor"))
+        )
+        assert recovery_message not in repr(provider.requests[-1].messages)
     assert not any(event.type == EventType.TOOL_CALL_APPROVAL_EXPIRED for event in recovery_events)
     assert recovery_events[-1].type == EventType.SESSION_COMPLETED
     assert release_calls == 1
@@ -32865,7 +33035,6 @@ def test_cayu_app_resolves_denied_tool_call_and_continues_session():
     private_resolution_events = asyncio.run(
         _private_events_for_public_events(store, "sess_tool_approval_deny", events)
     )
-    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
     assert private_resolution_events[1].payload[
         "idempotency_key"
     ] == tool_execution.tool_idempotency_key(
@@ -33137,7 +33306,7 @@ def test_cayu_app_keeps_pending_approval_if_atomic_resolution_close_fails():
     assert checkpoint["pending_tool_approval"]["approval_id"] == private_approval.approval_id
 
     transcript = asyncio.run(store.load_transcript("sess_approval_atomic_close_failure"))
-    assert [message.role for message in transcript] == ["user", "assistant"]
+    assert [message.role for message in transcript] == ["user"]
 
     retry_events = asyncio.run(
         collect_tool_approval_events(
@@ -33570,6 +33739,7 @@ def test_cayu_app_approval_recovery_ignores_unrelated_terminal_tool_events():
     )
     approval_event = interrupt_events[4]
     approval_id = approval_event.payload["approval"]["approval_id"]
+    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
     asyncio.run(
         store.append_event(
             "sess_approval_scoped_recovery",
@@ -33614,7 +33784,6 @@ def test_cayu_app_approval_recovery_ignores_unrelated_terminal_tool_events():
     private_resolution = asyncio.run(
         _private_events_for_public_events(store, "sess_approval_scoped_recovery", events)
     )
-    private_approval = asyncio.run(_pending_tool_approval_from_public_event(store, approval_event))
     assert private_resolution[2].payload["approval_id"] == private_approval.approval_id
     assert private_resolution[3].payload["approval_id"] == private_approval.approval_id
     assert tool.calls == [{"value": "secret"}]
@@ -37015,7 +37184,7 @@ def test_usage_triggered_context_policy_stays_triggered_after_previous_actual_us
     }
     checkpoint = asyncio.run(app.session_store.load_checkpoint("usage_triggered_policy"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "usage_triggered_context": {
             "version": 1,
             "min_input_tokens": 50,
@@ -37112,7 +37281,7 @@ def test_usage_triggered_context_policy_preserves_marker_with_checkpoint_policy(
         app.session_store.load_checkpoint("usage_triggered_policy_checkpoint_merge")
     )
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "triggered_policy": {"calls": 2},
         "usage_triggered_context": {
             "version": 1,
@@ -37510,7 +37679,7 @@ def test_context_overflow_policy_can_checkpoint_compaction_before_retry():
         app.session_store.load_checkpoint("context_overflow_compaction_recovery")
     )
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "context_compaction": {
             "version": 2,
             "summary": "old request",
@@ -41075,7 +41244,7 @@ def test_automatic_compaction_internal_persistence_cancellation_is_not_caller_ca
             "Context outcome persistence was cancelled without caller cancellation."
         )
         assert task.exception() is None
-        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
     asyncio.run(run())
 
@@ -42856,7 +43025,7 @@ def test_cayu_app_checkpoint_compacts_model_context_without_rewriting_transcript
     ]
     checkpoint = asyncio.run(store.load_checkpoint("sess_compaction"))
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "context_compaction": {
             "version": 2,
             "summary": "old one|old answer one|old two|old answer two",
@@ -42987,7 +43156,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         _private_events_for_public_events(store, "sess_model_compaction", [events[2]])
     )[0]
     assert checkpoint_without_model_step_publication(checkpoint) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1,
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2,
         "context_compaction": {
             "version": 2,
             "summary": "model summary",
@@ -46072,7 +46241,7 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
         }
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_invalid_compaction_summary")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2
     }
 
     usage = asyncio.run(app.get_session_usage("sess_invalid_compaction_summary"))
@@ -46202,7 +46371,7 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
     assert events[5].payload["error"] == "Compaction model must not call tools."
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_rejected_compaction_tool_call")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2
     }
 
     usage = asyncio.run(app.get_session_usage("sess_rejected_compaction_tool_call"))
@@ -46327,7 +46496,7 @@ def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
     assert events[5].payload["error"] == expected_error
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_unfinished_compaction")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2
     }
 
     usage = asyncio.run(app.get_session_usage("sess_unfinished_compaction"))
@@ -46540,7 +46709,7 @@ def test_automatic_compaction_real_cancellation_records_uncertain_dispatch() -> 
         assert completions[0].payload["compaction_outcome"] == "cancelled"
         assert completions[0].payload["usage_unavailable_reason"]
         assert sum(event.type == EventType.CONTEXT_COMPACTION_FAILED for event in events) == 1
-        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+        assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
         usage = await app.get_session_usage(session_id)
         assert usage.model_steps == 1
         assert usage.usage.total_tokens == 0
@@ -46724,7 +46893,7 @@ def test_cayu_app_emits_compaction_failed_event_before_session_failure():
     }
     assert provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_compaction_failed")) == {
-        CHECKPOINT_SCHEMA_VERSION_KEY: 1
+        CHECKPOINT_SCHEMA_VERSION_KEY: 2
     }
 
 
@@ -48552,7 +48721,11 @@ def test_cayu_app_protects_tool_call_arguments_from_tool_mutation():
 
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert events[3].type == EventType.TOOL_CALL_STARTED
-    assert events[3].payload["arguments"] == {"nested": {"value": "original"}}
+    assert events[3].payload["arguments_state"] == "quarantined"
+    assert "arguments" not in events[3].payload
+    completed = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    assert completed.payload["arguments_state"] == "finalized"
+    assert completed.payload["arguments"] == {"nested": {"value": "original"}}
 
     assistant_message = provider.requests[1].messages[-2]
     tool_call_part = assistant_message.content[0]
@@ -51897,7 +52070,7 @@ def test_interrupt_session_race_returns_existing_interrupt_event_without_duplica
         ).event
         == stored_interrupt_events[0]
     )
-    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
 
 def test_new_interruption_does_not_reuse_terminal_event_from_before_resume():
@@ -52461,7 +52634,7 @@ def test_interrupt_session_clears_payload_before_yielding_direct_terminal_event(
     assert first_event.type == EventType.SESSION_INTERRUPTED
     assert first_event.payload["reason"] == "operator stop"
     assert "pending_session_interrupt" not in checkpoint_after_event
-    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
 
 def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
@@ -52525,7 +52698,7 @@ def test_run_interrupt_clears_payload_before_yielding_active_terminal_event():
     assert run_event.id == interrupt_events[0].id
     assert run_event.payload["reason"] == "operator stop"
     assert "pending_session_interrupt" not in checkpoint_after_event
-    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 1}
+    assert final_checkpoint == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
 
 
 def test_interrupt_session_persists_payload_atomically_with_interrupting_status():
@@ -53984,32 +54157,11 @@ def test_interrupt_session_preserves_tool_result_when_interrupted_after_tool_ret
     assert transcript[-1].content[0].is_error is False
 
 
-def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_tool_call_append():
-    class InterruptingAfterAssistantToolCallStore(InMemorySessionStore):
+def test_interrupt_session_closes_tool_round_after_assistant_tool_call_is_quarantined():
+    class InterruptingAfterAssistantToolCallQuarantineStore(InMemorySessionStore):
         def __init__(self) -> None:
             super().__init__()
-            self.interrupt_after_next_assistant_tool_call_append = False
-
-        async def append_transcript_messages(
-            self,
-            session_id: str,
-            messages: list[Message],
-        ) -> None:
-            await super().append_transcript_messages(session_id, messages)
-            await self._interrupt_if_assistant_tool_call_appended(session_id, messages)
-
-        async def append_transcript_messages_and_transform_checkpoint(
-            self,
-            session_id: str,
-            messages: list[Message],
-            checkpoint_transform,
-        ) -> None:
-            await super().append_transcript_messages_and_transform_checkpoint(
-                session_id,
-                messages,
-                checkpoint_transform,
-            )
-            await self._interrupt_if_assistant_tool_call_appended(session_id, messages)
+            self.interrupt_after_next_assistant_tool_call_quarantine = False
 
         async def promote_model_completion_stage(
             self,
@@ -54023,25 +54175,18 @@ def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_to
                 stage_id=stage_id,
                 expected_run_epoch=expected_run_epoch,
             )
-            transcript = await self.load_transcript(session_id)
-            await self._interrupt_if_assistant_tool_call_appended(
-                session_id,
-                transcript[-1:],
-            )
+            checkpoint = await self.load_checkpoint(session_id)
+            pending_round = checkpoint.get("pending_tool_round")
+            if (
+                self.interrupt_after_next_assistant_tool_call_quarantine
+                and type(pending_round) is dict
+                and pending_round.get("assistant_message_state") == "quarantined"
+            ):
+                self.interrupt_after_next_assistant_tool_call_quarantine = False
+                await self.update_status(session_id, SessionStatus.INTERRUPTED)
             return result
 
-        async def _interrupt_if_assistant_tool_call_appended(
-            self,
-            session_id: str,
-            messages: list[Message],
-        ) -> None:
-            if self.interrupt_after_next_assistant_tool_call_append and any(
-                any(type(part) is ToolCallPart for part in message.content) for message in messages
-            ):
-                self.interrupt_after_next_assistant_tool_call_append = False
-                await self.update_status(session_id, SessionStatus.INTERRUPTED)
-
-    store = InterruptingAfterAssistantToolCallStore()
+    store = InterruptingAfterAssistantToolCallQuarantineStore()
     provider = FakeProvider(
         [
             ModelStreamEvent.tool_call(
@@ -54060,7 +54205,7 @@ def test_interrupt_session_closes_tool_round_when_interrupted_after_assistant_to
     )
 
     async def run():
-        store.interrupt_after_next_assistant_tool_call_append = True
+        store.interrupt_after_next_assistant_tool_call_quarantine = True
         events = await collect_events(
             app,
             RunRequest(

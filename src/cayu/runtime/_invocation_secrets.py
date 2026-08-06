@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import suppress
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from cayu._exception_state import exception_state, pop_exception_state, set_exception_state
+from cayu._task_wait import unexpected_child_cancellation_error
 from cayu._validation import (
     copy_durable_json_object,
     copy_json_object,
@@ -41,6 +43,62 @@ _BASE_EXCEPTION_TRACEBACK_DESCRIPTOR = BaseException.__dict__["__traceback__"]
 _BASE_EXCEPTION_CAUSE_DESCRIPTOR = BaseException.__dict__["__cause__"]
 _BASE_EXCEPTION_CONTEXT_DESCRIPTOR = BaseException.__dict__["__context__"]
 _BASE_EXCEPTION_DICT_DESCRIPTOR = BaseException.__dict__["__dict__"]
+_RESOLUTION_CANCELLATION_DRAIN_SECONDS = 0.1
+_RESOLUTION_CHILD_CANCELLATION_MESSAGE = "Invocation secret resolution cancelled by caller."
+
+SecretResolutionScope = Literal["static", "dynamic", "unknown"]
+
+
+def registered_environment_secret_resolution_scope(
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> Literal["static", "dynamic"]:
+    """Describe an environment registration's dynamic-secret capability."""
+
+    if registered_environment is None:
+        return "static"
+    # A factory may reconnect the same durable environment with a different
+    # vault/proxy capability set. Without an explicit immutable capability
+    # contract, factory origin is positive evidence of dynamic scope.
+    if registered_environment.factory is not None or registered_environment.factory_backed:
+        return "dynamic"
+    environment = registered_environment.environment
+    return "dynamic" if environment.vault is not None or environment.proxy is not None else "static"
+
+
+def continuation_secret_resolution_scope(
+    persisted_scope: SecretResolutionScope,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> SecretResolutionScope:
+    """Combine durable pause evidence with the current environment capability."""
+
+    current_scope = registered_environment_secret_resolution_scope(registered_environment)
+    if persisted_scope == "dynamic" or current_scope == "dynamic":
+        return "dynamic"
+    if persisted_scope == "unknown":
+        return "unknown"
+    return "static"
+
+
+def require_continuation_secret_resolution_compatibility(
+    persisted_scope: SecretResolutionScope,
+    registered_environment: runtime_records.RegisteredEnvironment | None,
+) -> None:
+    """Reject a capability upgrade that would redefine already-public pause data.
+
+    A statically classified pause may have exposed prompt or policy fields.  A
+    later process must not add dynamic secret resolution to that same pending
+    round, because a resolution could retroactively prove those fields secret
+    after they have crossed durable and external boundaries.
+    """
+
+    if (
+        persisted_scope == "static"
+        and registered_environment_secret_resolution_scope(registered_environment) == "dynamic"
+    ):
+        raise RuntimeError(
+            "Pending tool-round continuation cannot add dynamic secret resolution "
+            "after static publication."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +116,7 @@ class InvocationPublicationSnapshot:
 
     redactor: SecretRedactor
     unsafe_output: bool
+    secret_scope_incomplete: bool = False
 
 
 class InvocationSecretTracker:
@@ -69,6 +128,7 @@ class InvocationSecretTracker:
         self._redactor = redactor
         self._revision = 0
         self._active_resolutions: set[object] = set()
+        self._secret_scope_uncertain = False
         self._ambiguous_capture_revisions: list[int] = []
         self._sealed = False
         self._publication_snapshot: InvocationPublicationSnapshot | None = None
@@ -105,10 +165,24 @@ class InvocationSecretTracker:
         self.record(secret)
         return True
 
-    def abandon_resolution(self, token: object) -> None:
-        """Release a failed resolution claim without changing the secret revision."""
+    def abandon_resolution(
+        self,
+        token: object,
+        *,
+        secret_scope_uncertain: bool = False,
+    ) -> bool:
+        """Revoke a pending resolution claim and report whether it was still active."""
 
-        self._active_resolutions.discard(token)
+        if token not in self._active_resolutions:
+            return False
+        self._active_resolutions.remove(token)
+        if secret_scope_uncertain:
+            # A dispatched opaque resolver may still return after caller
+            # cancellation. Its result is fenced from mutating this tracker,
+            # but absence of that unknown value can never prove publication
+            # safe for the remainder of the invocation.
+            self._secret_scope_uncertain = True
+        return True
 
     def record(self, secret: ResolvedSecret) -> None:
         if type(secret) is not ResolvedSecret:
@@ -141,15 +215,166 @@ class InvocationSecretTracker:
         if self._publication_snapshot is not None:
             return self._publication_snapshot
         self._sealed = True
-        unsafe_output = bool(self._active_resolutions) or any(
+        secret_scope_incomplete = bool(self._active_resolutions) or self._secret_scope_uncertain
+        unsafe_output = secret_scope_incomplete or any(
             revision != self._revision for revision in self._ambiguous_capture_revisions
         )
         snapshot = InvocationPublicationSnapshot(
             redactor=self._redactor,
             unsafe_output=unsafe_output,
+            secret_scope_incomplete=secret_scope_incomplete,
         )
         self._publication_snapshot = snapshot
         return snapshot
+
+
+async def _ignore_redactor_change(_snapshot: InvocationRedactorSnapshot) -> None:
+    return None
+
+
+async def _await_resolved_secret_operation(
+    operation: asyncio.Task[ResolvedSecret],
+    *,
+    abandon_resolution: Callable[[], bool],
+) -> ResolvedSecret:
+    """Return a persisted resolution or fence a cancelled remote lookup."""
+
+    current_task = asyncio.current_task()
+    cancellation: asyncio.CancelledError | None = None
+    observed_cancelling = 0 if current_task is None else current_task.cancelling()
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            current_cancelling = 0 if current_task is None else current_task.cancelling()
+            if current_cancelling <= observed_cancelling:
+                if not operation.done():
+                    raise
+                break
+            if cancellation is None:
+                cancellation = exc
+            observed_cancelling = current_cancelling
+            if abandon_resolution():
+                # The remote lookup had not yet registered its secret or
+                # started the durable redactor projection. Revoke its claim
+                # before requesting cancellation so an opaque adapter that
+                # keeps running cannot mutate invocation publication later.
+                operation.cancel(_RESOLUTION_CHILD_CANCELLATION_MESSAGE)
+                deadline = (
+                    asyncio.get_running_loop().time() + _RESOLUTION_CANCELLATION_DRAIN_SECONDS
+                )
+                while not operation.done():
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(operation),
+                            timeout=remaining,
+                        )
+                    except asyncio.CancelledError as later:
+                        current_cancelling = (
+                            0 if current_task is None else current_task.cancelling()
+                        )
+                        if current_cancelling <= observed_cancelling:
+                            if not operation.done():
+                                raise
+                            break
+                        observed_cancelling = current_cancelling
+                        if cancellation is None:  # pragma: no cover - construction invariant
+                            cancellation = later
+                    except TimeoutError:
+                        break
+                    except BaseException:
+                        if not operation.done():
+                            raise
+                        break
+                if operation.done():
+                    _consume_resolution_task(operation)
+                else:
+                    operation.add_done_callback(_consume_resolution_task)
+                del operation, abandon_resolution
+                raise cancellation from None
+            # Resolution has already registered its redactor and entered the
+            # durable projection boundary. Settle that write before returning
+            # cancellation; abandoning an in-flight store mutation would make
+            # its eventual commit race with terminal publication.
+            abandon_resolution = _resolution_already_accepted
+    # Do not let a cancellation arriving in the same loop turn as child
+    # completion escape after a successful secret has been returned.
+    try:
+        await asyncio.sleep(0)
+    except asyncio.CancelledError as exc:
+        current_cancelling = 0 if current_task is None else current_task.cancelling()
+        if current_cancelling <= observed_cancelling:
+            raise
+        if cancellation is None:
+            cancellation = exc
+        observed_cancelling = current_cancelling
+    try:
+        result = operation.result()
+        error: BaseException | None = None
+    except BaseException as exc:
+        result = None
+        error = exc
+    del operation
+    if isinstance(error, asyncio.CancelledError) and cancellation is None:
+        error = unexpected_child_cancellation_error(
+            error,
+            operation="Invocation secret resolution publication",
+        )
+    if cancellation is not None:
+        result = None
+        error = None
+        raise cancellation from None
+    if error is not None:
+        raise error
+    if type(result) is not ResolvedSecret:
+        raise RuntimeError("Secret resolution publication returned no resolved secret.")
+    return result
+
+
+def _resolution_already_accepted() -> bool:
+    return False
+
+
+def _consume_resolution_task(task: asyncio.Task[ResolvedSecret]) -> None:
+    """Observe a detached resolver outcome without retaining its secret or error."""
+
+    with suppress(BaseException):
+        task.result()
+
+
+async def _dispatch_tracked_secret_resolution(
+    tracker: InvocationSecretTracker,
+    operation_factory: Callable[[object], Coroutine[Any, Any, ResolvedSecret]],
+) -> ResolvedSecret:
+    """Checkpoint cancellation, claim ownership, and dispatch one resolver."""
+
+    # Pending cancellation is authoritative before dispatch. In particular,
+    # do not create an adapter task or an active publication claim first.
+    await asyncio.sleep(0)
+    token = tracker.begin_resolution()
+    operation: asyncio.Task[ResolvedSecret] | None = None
+    try:
+        operation = asyncio.create_task(operation_factory(token))
+    except BaseException:
+        tracker.abandon_resolution(token)
+        raise
+    finally:
+        del operation_factory
+
+    def abandon(
+        tracker: InvocationSecretTracker = tracker,
+        token: object = token,
+    ) -> bool:
+        return tracker.abandon_resolution(token, secret_scope_uncertain=True)
+
+    del tracker, token
+    return await _await_resolved_secret_operation(
+        operation,
+        abandon_resolution=abandon,
+    )
 
 
 class _TrackingVault(Vault):
@@ -159,13 +384,17 @@ class _TrackingVault(Vault):
         self,
         vault: Vault,
         tracker: InvocationSecretTracker,
+        on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]] | None = None,
     ) -> None:
         if not isinstance(vault, Vault):
             raise TypeError("vault must be a Vault.")
         if not isinstance(tracker, InvocationSecretTracker):
             raise TypeError("tracker must be an InvocationSecretTracker.")
+        if on_redactor_change is not None and not callable(on_redactor_change):
+            raise TypeError("on_redactor_change must be callable.")
         self._vault = vault
         self._tracker = tracker
+        self._on_redactor_change = on_redactor_change or _ignore_redactor_change
 
     async def get(
         self,
@@ -190,11 +419,32 @@ class _TrackingVault(Vault):
     ) -> ResolvedSecret:
         copied_ref = copy_secret_ref(ref)
         copied_scope = None if scope is None else copy_json_object(scope, "scope")
-        token = self._tracker.begin_resolution()
+
+        def operation_factory(token: object) -> Coroutine[Any, Any, ResolvedSecret]:
+            return self._resolve_and_publish(
+                copied_ref,
+                scope=copied_scope,
+                token=token,
+            )
+
+        return await _dispatch_tracked_secret_resolution(
+            self._tracker,
+            operation_factory,
+        )
+
+    async def _resolve_and_publish(
+        self,
+        ref: SecretRef,
+        *,
+        scope: dict[str, Any] | None,
+        token: object,
+    ) -> ResolvedSecret:
+        secret: ResolvedSecret | None = None
+        copied_secret: ResolvedSecret | None = None
         try:
             secret = await self._vault.resolve(
-                copied_ref,
-                scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
+                ref,
+                scope=None if scope is None else copy_json_object(scope, "scope"),
             )
         except BaseException:
             self._tracker.abandon_resolution(token)
@@ -202,13 +452,18 @@ class _TrackingVault(Vault):
         if type(secret) is not ResolvedSecret:
             self._tracker.abandon_resolution(token)
             raise TypeError("Vault secret resolution must return ResolvedSecret.")
-        copied_secret = copy_resolved_secret(secret)
-        del secret
-        accepted = self._tracker.complete_resolution(token, copied_secret)
-        if not accepted:
-            del copied_secret
-            raise RuntimeError("Secret resolution completed after tool publication.")
-        return copy_resolved_secret(copied_secret)
+        try:
+            copied_secret = copy_resolved_secret(secret)
+            secret = None
+            accepted = self._tracker.complete_resolution(token, copied_secret)
+            if not accepted:
+                raise RuntimeError("Secret resolution completed after tool publication.")
+            await self._on_redactor_change(self._tracker.snapshot())
+            return copy_resolved_secret(copied_secret)
+        except BaseException:
+            secret = None
+            copied_secret = None
+            raise
 
 
 class _TrackingCredentialProxy(CredentialProxy):
@@ -217,6 +472,7 @@ class _TrackingCredentialProxy(CredentialProxy):
         proxy: CredentialProxy,
         tracker: InvocationSecretTracker,
         on_authorize: Callable[[ProxyAuthorizationRecord], None],
+        on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]] | None = None,
     ) -> None:
         if not isinstance(proxy, CredentialProxy):
             raise TypeError("proxy must be a CredentialProxy.")
@@ -224,9 +480,12 @@ class _TrackingCredentialProxy(CredentialProxy):
             raise TypeError("tracker must be an InvocationSecretTracker.")
         if not callable(on_authorize):
             raise TypeError("on_authorize must be callable.")
+        if on_redactor_change is not None and not callable(on_redactor_change):
+            raise TypeError("on_redactor_change must be callable.")
         self._proxy = proxy
         self._tracker = tracker
         self._on_authorize = on_authorize
+        self._on_redactor_change = on_redactor_change or _ignore_redactor_change
 
     async def resolve(
         self,
@@ -236,11 +495,32 @@ class _TrackingCredentialProxy(CredentialProxy):
     ) -> ResolvedSecret:
         copied_ref = copy_secret_ref(ref)
         copied_scope = None if scope is None else copy_json_object(scope, "scope")
-        token = self._tracker.begin_resolution()
+
+        def operation_factory(token: object) -> Coroutine[Any, Any, ResolvedSecret]:
+            return self._resolve_and_publish(
+                copied_ref,
+                scope=copied_scope,
+                token=token,
+            )
+
+        return await _dispatch_tracked_secret_resolution(
+            self._tracker,
+            operation_factory,
+        )
+
+    async def _resolve_and_publish(
+        self,
+        ref: SecretRef,
+        *,
+        scope: dict[str, Any] | None,
+        token: object,
+    ) -> ResolvedSecret:
+        secret: ResolvedSecret | None = None
+        copied_secret: ResolvedSecret | None = None
         try:
             secret = await self._proxy.resolve(
-                copied_ref,
-                scope=None if copied_scope is None else copy_json_object(copied_scope, "scope"),
+                ref,
+                scope=None if scope is None else copy_json_object(scope, "scope"),
             )
         except BaseException:
             self._tracker.abandon_resolution(token)
@@ -248,13 +528,18 @@ class _TrackingCredentialProxy(CredentialProxy):
         if type(secret) is not ResolvedSecret:
             self._tracker.abandon_resolution(token)
             raise TypeError("Proxy secret resolution must return ResolvedSecret.")
-        copied_secret = copy_resolved_secret(secret)
-        del secret
-        accepted = self._tracker.complete_resolution(token, copied_secret)
-        if not accepted:
-            del copied_secret
-            raise RuntimeError("Secret resolution completed after tool publication.")
-        return copy_resolved_secret(copied_secret)
+        try:
+            copied_secret = copy_resolved_secret(secret)
+            secret = None
+            accepted = self._tracker.complete_resolution(token, copied_secret)
+            if not accepted:
+                raise RuntimeError("Secret resolution completed after tool publication.")
+            await self._on_redactor_change(self._tracker.snapshot())
+            return copy_resolved_secret(copied_secret)
+        except BaseException:
+            secret = None
+            copied_secret = None
+            raise
 
     async def authorize_request(
         self,
@@ -309,13 +594,14 @@ def vault_for_environment(
     registered_environment: runtime_records.RegisteredEnvironment | None,
     *,
     tracker: InvocationSecretTracker,
+    on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]],
 ) -> Vault | None:
     if registered_environment is None:
         return None
     vault = registered_environment.environment.vault
     if vault is None:
         return None
-    return _TrackingVault(vault, tracker)
+    return _TrackingVault(vault, tracker, on_redactor_change)
 
 
 def proxy_for_environment(
@@ -323,13 +609,14 @@ def proxy_for_environment(
     *,
     tracker: InvocationSecretTracker,
     on_authorize: Callable[[ProxyAuthorizationRecord], None],
+    on_redactor_change: Callable[[InvocationRedactorSnapshot], Awaitable[None]],
 ) -> CredentialProxy | None:
     if registered_environment is None:
         return None
     proxy = registered_environment.environment.proxy
     if proxy is None:
         return None
-    return _TrackingCredentialProxy(proxy, tracker, on_authorize)
+    return _TrackingCredentialProxy(proxy, tracker, on_authorize, on_redactor_change)
 
 
 @dataclass(frozen=True, slots=True)

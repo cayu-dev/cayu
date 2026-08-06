@@ -6240,6 +6240,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         identity: SessionIdentity,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
+        checkpoint_transform: CheckpointTransform | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -6361,7 +6362,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         await self._upsert_checkpoint(
                             cur,
                             session.id,
-                            _initial_transcript_pending_checkpoint(interaction_id),
+                            _initial_transcript_pending_checkpoint(
+                                session,
+                                interaction_id,
+                                checkpoint_transform=checkpoint_transform,
+                            ),
                             session.updated_at,
                         )
                 await conn.commit()
@@ -9415,7 +9420,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionModelCompletionStageConflict(
                             "The terminal model completion intent conflicts with its preparation."
                         )
-
                     completed_at = _next_runtime_publication_timestamp(loaded)
                     terminal_record = _model_completion_stage_terminal_record(
                         prepared,
@@ -9708,6 +9712,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 
         session_id = prepared.session_id
         request = prepared.request
+        checkpoint_codec = prepared.checkpoint_codec
+        checkpoint_decode = None if checkpoint_codec is None else checkpoint_codec.decode
         published_at: datetime
         receipt: RuntimePublicationReceipt
         loaded: Session
@@ -9929,7 +9935,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         durable_references,
                         interaction_id=request.interaction_id,
                     )
-                    current_checkpoint = await self._load_checkpoint(cur, session_id)
+                    stored_checkpoint = await self._load_checkpoint(cur, session_id)
+                    current_checkpoint = (
+                        stored_checkpoint
+                        if checkpoint_decode is None
+                        else checkpoint_decode(loaded, stored_checkpoint)
+                    )
                     _validate_tool_round_checkpoint_mutation(
                         request,
                         current_checkpoint,
@@ -9999,10 +10010,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 f"{existing_event_row[0]}"
                             )
 
-                    checkpoint = _apply_runtime_publication_checkpoint_mutation(
-                        request.mutation,
-                        current_checkpoint,
-                    )
+                    if checkpoint_codec is None:
+                        checkpoint = _apply_runtime_publication_checkpoint_mutation(
+                            request.mutation,
+                            current_checkpoint,
+                        )
+                        stored_target_checkpoint = checkpoint
+                    else:
+                        checkpoint = checkpoint_codec.apply_mutation(
+                            loaded,
+                            stored_checkpoint,
+                            request.mutation,
+                        )
+                        stored_target_checkpoint = checkpoint_codec.encode(loaded, checkpoint)
 
                     transcript_rows = [
                         (session_id, request.interaction_id, _dumps(message_payload))
@@ -10039,17 +10059,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     published_at = _next_runtime_publication_timestamp(loaded)
                     checkpoint_values = (
                         None
-                        if checkpoint is None or not request.mutation.operations
+                        if stored_target_checkpoint is None or not request.mutation.operations
                         else _checkpoint_row_values(
                             session_id,
-                            checkpoint,
+                            stored_target_checkpoint,
                             published_at,
                         )
                     )
                     receipt = _build_runtime_publication_receipt(
                         prepared,
                         source_session=loaded,
-                        checkpoint=checkpoint,
+                        checkpoint=stored_target_checkpoint,
                         transcript_start_cursor=transcript_start_cursor,
                         published_at=published_at,
                     )
