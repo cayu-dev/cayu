@@ -151,8 +151,9 @@ bit for runtime-attested fresh-input markers and raises the compatibility floor 
 31. Pre-31 readers do not know that the marker is private and would expose it as
 ordinary event payload, so mixed-version operation and app-only rollback are
 rejected. Rows written before migration receive a false proof bit and cannot gain
-runtime authority from payload text alone. Control-plane persistence and dashboard
-workflows remain separate follow-ups.
+runtime authority from payload text alone. The authenticated, stateless dashboard
+workflow described below consumes this boundary without adding draft persistence
+or eval execution.
 
 ### Production sessions produce reviewable portable eval candidates
 
@@ -167,9 +168,15 @@ and non-text input remain explicit unsupported cases rather than being silently
 rewritten into a different replay contract.
 
 Candidates can be rescored against the captured evidence, converted to the
-existing portable corpus model, and exported as deterministic UTF-8 JSON. This
-release does not automatically publish the candidate, execute the exported
-corpus, or add control-plane routes; those remain explicit subsequent steps.
+existing portable corpus model, and exported as deterministic UTF-8 JSON.
+Authenticated servers can opt into two stateless control-plane routes and the
+packaged dashboard workflow: an operator can edit the suite, case, captured
+input, and every portable assertion; preview the exact draft against freshly
+reconstructed evidence; and download the same candidate as canonical corpus
+JSON. Editing invalidates the preview, and a changed source snapshot or server
+policy requires a fresh candidate. The workflow does not persist drafts,
+publish corpora, execute evals, or invoke providers, tools, environments, or
+hooks.
 
 ### Eval results preserve every trial and explicit evidence gaps
 
@@ -209,13 +216,13 @@ cannot be published under different case input, evidence, pricing, or suite sett
 Contracted saved runs now enforce the exact requested trial count, and complete
 lossless and published trials require their exact aggregate usage so conclusive
 usage observations cannot be detached from their source summary. Portable
-evidence and published results preserve aggregate token totals above signed
-64-bit as canonical decimal strings while marking token assertions beyond their
-declared ceiling unavailable. Rootless trajectories cannot acquire conclusive
-model-step or usage evidence from detached fields, and publication rejects cost
-metadata that contradicts its retained exact cost summary. Raw published-result
-admission also fails closed on malformed branches before any later oversized
-graph can be constructed.
+evidence and published results preserve aggregate token totals above the
+IEEE-754 safe-integer assertion ceiling as canonical decimal strings while
+marking those token assertions unavailable. Rootless trajectories cannot acquire
+conclusive model-step or usage evidence from detached fields, and publication
+rejects cost metadata that contradicts its retained exact cost summary. Raw
+published-result admission also fails closed on malformed branches before any
+later oversized graph can be constructed.
 Standalone trajectory documents advance from version 1 to version 2 for the same provenance
 contract. Older prerelease documents must be regenerated; Cayu does not migrate
 or guess at their meaning.

@@ -26,6 +26,7 @@ test("packaged dashboard carries the licenses for its bundled code", () => {
     ["lucide-react", "ISC"],
     ["react", "MIT"],
     ["react-dom", "MIT"],
+    ["reselect", "MIT"],
     ["scheduler", "MIT"],
     ["tailwind-merge", "MIT"],
     ["tailwindcss", "MIT"],

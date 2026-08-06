@@ -65,6 +65,8 @@ Vite origin. `deployment_name="development"` alone does none of those things.
 - `api`: whether the control-plane API is exposed and its mount path;
 - `dashboard`: availability, path, directory, runtime data, and an optional
   access override (otherwise it inherits the server access policy);
+- `evaluation_promotion`: an optional authenticated, stateless policy for
+  reviewing and exporting captured sessions as portable eval cases;
 - `docs`: generated OpenAPI, Swagger UI, and ReDoc exposure;
 - `cors`: allowed origins, methods, headers, and credential behavior; and
 - `lifecycle`: replay timeout, startup recovery, inactivity fencing, durable
@@ -105,6 +107,54 @@ checks on `/api/health`.
 therefore browser-visible. Use it only for non-secret client configuration;
 server credentials belong in the auth dependency or another trusted server-side
 provider.
+
+## Eval promotion
+
+Captured-session promotion is off by default. Enable it only on an authenticated
+server and name the registered source agent whose runtime-attested input may be
+promoted:
+
+```python
+from cayu.server import BasicAuth, EvaluationPromotionConfig, ServerConfig
+
+config = ServerConfig.protected(
+    BasicAuth(username="operator", password=resolved_password),
+    evaluation_promotion=EvaluationPromotionConfig(
+        target_key="support.regressions",
+        source_agent_name="support-agent",
+        application_release_id="support-api-2026-08-06",
+    ),
+)
+```
+
+The dashboard then shows **Promote to eval** on eligible completed and failed
+sessions. Preview reconstructs bounded terminal evidence, creates an editable
+suite and case, and scores its assertions without executing the application.
+Export is enabled only for the exact candidate most recently previewed; it
+downloads deterministic portable corpus JSON and does not include the source
+session ID. A changed durable snapshot, app manifest, source identity, pricing
+profile, or edited candidate requires another preview.
+
+`target_key`, `source_agent_name`, and `application_release_id` are public-safe
+diagnostic configuration, not secrets or executable lookup authority. The source
+agent must already be registered on the supplied `CayuApp`. The application
+redactor validates all three values before the server starts. If dashboard
+runtime configuration contains a validated `priceBook`, promotion uses that
+same exact book for cost evidence; the exported corpus carries only its pricing
+fingerprint, never the book itself.
+
+The two promotion API routes are mounted only when this policy is configured:
+
+- `POST /api/evals/promotion/sessions/{session_id}/preview`
+- `POST /api/evals/promotion/sessions/{session_id}/export`
+
+Both routes are request-byte bounded and covered by the server authentication
+dependency. They are stateless adapters over the configured session store: they
+do not save drafts, publish corpora, invoke providers or tools, or run the
+exported eval. Configure the same nested fields through `ServerSettings` with
+`CAYU_SERVER_EVALUATION_PROMOTION__TARGET_KEY`,
+`CAYU_SERVER_EVALUATION_PROMOTION__SOURCE_AGENT_NAME`, and
+`CAYU_SERVER_EVALUATION_PROMOTION__APPLICATION_RELEASE_ID`.
 
 The resolved model is immutable, owns nested runtime JSON, and is evaluated
 once when the server is created. A non-secret effective summary is available

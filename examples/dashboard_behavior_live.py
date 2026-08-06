@@ -53,13 +53,20 @@ from cayu.providers import (
     completed_bedrock_billing_identity,
 )
 from cayu.runtime import EventQuery, InMemorySessionStore, SessionIdentity, SessionStatus
-from cayu.server import DashboardConfig, ServerConfig, create_server
+from cayu.server import (
+    BasicAuth,
+    DashboardConfig,
+    EvaluationPromotionConfig,
+    ServerConfig,
+    create_server,
+)
 
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
     from starlette.types import Message as AsgiMessage
 
 SESSION_ID = "dashboard-contract-session"
+PROMOTION_SESSION_ID = "dashboard-contract-eval-promotion"
 APPROVAL_SESSION_ID = "dashboard-contract-approval"
 INTERRUPT_SESSION_ID = "dashboard-contract-interrupt"
 INTERRUPT_FAILURE_SESSION_ID = "dashboard-contract-interrupt-failure"
@@ -74,6 +81,8 @@ DISCOVERY_BUDGET_ID = "dashboard-contract-budget"
 SLOW_SESSION_QUERY = "dashboard-contract-slow-query"
 SLOW_USAGE_AGENT = "dashboard-contract-slow-usage-agent"
 AGENT_NAME = "dashboard-contract-agent"
+AUTH_USERNAME = "dashboard-contract-operator"
+AUTH_PASSWORD = "dashboard-contract-password"
 PROVIDER_NAME = "contract-provider"
 MODEL_NAME = "contract-model"
 PAYLOAD_MARKER = "dashboard-contract-usage"
@@ -135,6 +144,10 @@ class DashboardContractProvider(ModelProvider):
             for part in message.content
             if isinstance(part, TextPart)
         )
+        if "promote this captured dashboard run" in request_text.lower():
+            yield ModelStreamEvent.text_delta("dashboard eval promotion output")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+            return
         if "recover after" not in request_text:
             if "seed the dashboard approval" in request_text.lower() and not self._approval_seeded:
                 self._approval_seeded = True
@@ -286,10 +299,16 @@ async def main() -> None:
     server_app = MutationDisconnectFaults(
         create_server(
             app,
-            config=ServerConfig.local_development(
+            config=ServerConfig.protected(
+                BasicAuth(username=AUTH_USERNAME, password=AUTH_PASSWORD),
                 dashboard=DashboardConfig(
                     runtime_config={"priceBook": price_book.model_dump(mode="json")}
-                )
+                ),
+                evaluation_promotion=EvaluationPromotionConfig(
+                    target_key="dashboard.regressions",
+                    source_agent_name=AGENT_NAME,
+                    application_release_id="dashboard-browser-contract",
+                ),
             ),
         ),
         provider,
@@ -498,6 +517,15 @@ async def _seed_app() -> tuple[
         ],
     )
     await store.update_status(SESSION_ID, SessionStatus.COMPLETED)
+
+    async for _ in app.run(
+        RunRequest(
+            agent_name=AGENT_NAME,
+            session_id=PROMOTION_SESSION_ID,
+            messages=[Message.text("user", "Promote this captured dashboard run.")],
+        )
+    ):
+        pass
 
     bedrock_identity = completed_bedrock_billing_identity(
         bedrock_billing_identity(
@@ -863,7 +891,10 @@ async def _run_browser_contract(
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context(viewport={"width": 1440, "height": 1000})
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 1000},
+            http_credentials={"username": AUTH_USERNAME, "password": AUTH_PASSWORD},
+        )
         await context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
         await context.tracing.start(screenshots=True, snapshots=True)
         page = await context.new_page()
@@ -958,6 +989,7 @@ async def _run_browser_contract(
             "manual_mutation_reobservation",
             "sessions_list",
             "session_detail",
+            "evaluation_promotion",
             "session_annotation_editing",
             "event_detail",
             "event_filters",
@@ -1092,12 +1124,78 @@ async def _exercise_dashboard(
     await expect(include_thinking).to_be_checked()
     await expect(thinking_payload).to_be_visible()
     await _exercise_existing_session_mutations(page, base_url, provider)
+    await _exercise_evaluation_promotion(page, base_url)
     await _exercise_workflow(
         page,
         base_url,
         session_store,
         task_store,
         expected_query_aborts,
+    )
+
+
+async def _exercise_evaluation_promotion(page: Page, base_url: str) -> None:
+    await page.goto(
+        f"{base_url}/cayu/sessions/{WORKFLOW_ACTIVE_SESSION_ID}",
+        wait_until="networkidle",
+    )
+    await expect(page.get_by_test_id("promote-to-eval")).to_have_count(0)
+
+    await page.goto(
+        f"{base_url}/cayu/sessions/{PROMOTION_SESSION_ID}",
+        wait_until="networkidle",
+    )
+    promote = page.get_by_test_id("promote-to-eval")
+    await expect(promote).to_be_visible()
+    await promote.focus()
+    await page.keyboard.press("Enter")
+
+    sheet = page.get_by_test_id("promotion-sheet")
+    await expect(sheet).to_be_visible()
+    await expect(sheet.get_by_text("Captured evidence", exact=True)).to_be_visible()
+    await expect(
+        sheet.get_by_text("This score matches the current edits.", exact=True)
+    ).to_be_visible()
+
+    export = sheet.get_by_test_id("promotion-export")
+    await expect(export).to_be_enabled()
+    case_name = sheet.get_by_label("Case name", exact=True)
+    await case_name.fill("Captured dashboard regression")
+    await expect(export).to_be_disabled()
+    await expect(
+        sheet.get_by_text("Edit detected. Preview again before export.", exact=True)
+    ).to_be_visible()
+
+    await sheet.get_by_test_id("promotion-preview").click()
+    await expect(
+        sheet.get_by_text("This score matches the current edits.", exact=True)
+    ).to_be_visible()
+    await expect(export).to_be_enabled()
+
+    async with page.expect_download() as download_info:
+        await export.click()
+    download = await download_info.value
+    require_equal(
+        download.suggested_filename,
+        "dashboard.regressions.eval.json",
+        "promotion export must retain the server-owned portable target filename",
+    )
+    download_path = await download.path()
+    require(download_path is not None, "promotion export must produce a browser download")
+    corpus = json.loads(Path(download_path).read_text(encoding="utf-8"))
+    require_equal(
+        corpus["target_key"],
+        "dashboard.regressions",
+        "promotion export must retain the configured target key",
+    )
+    require_equal(
+        corpus["cases"][0]["name"],
+        "Captured dashboard regression",
+        "promotion export must contain the exact rescored case edit",
+    )
+    require(
+        PROMOTION_SESSION_ID not in json.dumps(corpus, sort_keys=True),
+        "promotion export must not disclose its source session identity",
     )
 
 
@@ -2004,7 +2102,7 @@ async def _exercise_operational_scope(page: Page, base_url: str) -> None:
     ).to_be_visible()
     await expect(identity_counts.get_by_text("Evaluated steps", exact=True)).to_be_visible()
     await expect(identity_counts.get_by_text("1", exact=True)).to_be_visible()
-    await expect(identity_counts.get_by_text("5", exact=True)).to_be_visible()
+    await expect(identity_counts.get_by_text("6", exact=True)).to_be_visible()
     await expect(identity_counts.get_by_text("Without identity", exact=True)).to_have_count(0)
     await expect(bedrock_breakdown.get_by_test_id("usage-billing-identity-gap")).to_have_count(0)
     bedrock_row = bedrock_breakdown.get_by_role("row").filter(

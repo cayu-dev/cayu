@@ -23,6 +23,9 @@ export default defineConfig({
     },
     rolldownOptions: {
       output: {
+        // Shared route chunks can otherwise evaluate a circular dependency
+        // before its class exports are initialized.
+        strictExecutionOrder: true,
         chunkFileNames: (chunk) => {
           const name = chunk.name.startsWith("shared~") ? "shared" : chunk.name;
           return `assets/${name}-[hash].js`;
@@ -33,8 +36,6 @@ export default defineConfig({
               name: "shared",
               minShareCount: 2,
               entriesAware: true,
-              // Merge transport-inefficient microchunks without pulling
-              // route-only code into the always-loaded dashboard shell.
               entriesAwareMergeThreshold: 16 * 1024,
             },
           ],

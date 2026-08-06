@@ -167,8 +167,10 @@ so detached usage fields cannot make a rootless replay conclusive. The compiled
 `EvalAssertion` adapter also preserves the existing explicit complete-synthetic
 context contract used by direct assertions. Exact aggregate token counts use
 Cayu's canonical nonnegative decimal-string JSON representation; counts above the
-signed-64-bit assertion ceiling remain lossless but are marked `limit_exceeded`
-and cannot produce a scored usage assertion. The serialized evidence view is
+IEEE-754 safe-integer assertion ceiling remain lossless but are marked
+`limit_exceeded` and cannot produce a scored usage assertion. This keeps every
+numeric corpus field exact across Python, browser, and other portable JSON
+boundaries. The serialized evidence view is
 capped at 10 MiB, enough to retain every field at its declared character and
 cardinality ceiling, including four-byte Unicode.
 
@@ -525,6 +527,30 @@ factories. Cost assertions without a compatible pricing-profile identity reject.
 Preview evidence, warnings, app internals, runtime configuration, and session
 identity are not corpus fields. The same valid candidate produces byte-identical
 output across processes.
+
+### Dashboard promotion workflow
+
+An authenticated Cayu server can expose this same promotion contract directly
+on completed and failed session pages. Configure
+`EvaluationPromotionConfig(target_key=..., source_agent_name=...,
+application_release_id=...)` on `ServerConfig`; the feature and both API routes
+are absent when that policy is not configured.
+
+**Promote to eval** first rebuilds the candidate from the current bounded durable
+snapshot. The sheet exposes its diagnostic source and evidence, then lets the
+operator edit the suite identity and trial settings, case identity and input,
+and every schema-v1 portable assertion. **Preview score** sends the complete
+authority-free draft back to the server. The server reapplies application
+redaction, restores all server-owned provenance and evidence, revalidates the
+current session, and scores through `score_promotion_candidate(...)`.
+
+Editing any field makes the displayed score stale and disables export until the
+new draft is previewed. **Export eval JSON** submits that exact canonical
+candidate; the server reconstructs and rescores it again before returning the
+deterministic corpus download. A racing session, app-manifest change, pricing
+change, or stale candidate returns a conflict and requires a fresh preview. The
+adapter stores no draft or corpus and does not run providers, tools,
+environments, hooks, or the exported eval.
 
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable
