@@ -178,6 +178,40 @@ policy requires a fresh candidate. The workflow does not persist drafts,
 publish corpora, execute evals, or invoke providers, tools, environments, or
 hooks.
 
+### Portable eval corpora run through one trusted local execution core
+
+Downloaded corpus JSON can now run immediately through the Python SDK or
+`cayu eval run --corpus PATH`. A corpus-mode `EvalPlan` binds one validated
+`CorpusTarget`: the local `CayuApp`, message-free request base, bounded trusted
+bootstrap, application release, evidence policy, optional PriceBook, and hard
+execution ceilings. Corpus data supplies only bounded user text, allowlisted
+assertions, and trial settings. Target, policy, applicable pricing, and limits
+are checked before provider dispatch, and fresh trials reuse the existing eval
+runner and assertion bridge rather than a parallel evaluator.
+Public target-key and application-release identity must survive the target app's
+workload-secret redaction boundary unchanged. Selected-suite cost assertions
+share one compile-time pricing binding instead of repeatedly validating and
+fingerprinting the trusted PriceBook.
+
+Successful execution returns a versioned `CorpusExecutionResult` containing the
+sanitized `PublishedEvalRun` and the fresh release plus bounded public
+AppManifest. Deterministic bounded JSON and standalone HTML retain only the
+assertion projection's app-redacted output preview (at most 16 KiB per trial and
+2 MiB per run), its evidence/truncation state and digest, and stable Cayu-owned
+trial reason codes. They expose no raw output, omitted preview suffix, trajectory,
+session ID, provider payload, exception text, credential, or executable target
+state. AppManifest changes during execution reject publication. Typed
+compatibility checks require an equal evaluation contract while intentionally
+allowing different target releases and manifests.
+
+The CLI also provides `cayu eval validate`, `cayu eval inspect`, and atomic
+`cayu eval merge`. Equal definitions deduplicate; a same-ID content conflict
+rejects unless replacement is explicit. The merged document is fully validated
+before replacing its destination. Corpus and `CorpusExecutionResult` schemas
+start at version 1. Their nested `PublishedEvalRun` advances to version 2 because
+trial output evidence and expanded diagnostic codes are required; version 1
+published runs are unsupported and are not guessed or migrated.
+
 ### Eval results preserve every trial and explicit evidence gaps
 
 Repeated eval cases now retain an ordered `EvalTrialResult` for every concrete

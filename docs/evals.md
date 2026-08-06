@@ -71,8 +71,9 @@ async def main():
 return one of:
 
 - `EvalPlan(app=app, suite=suite)`
+- `EvalPlan(corpus_target=CorpusTarget(...))`
 - `(app, suite)`
-- an object or dict with `app` and `suite`
+- an object or dict with either `app` and `suite`, or `corpus_target`
 
 Projects can declare one default alongside their application factory:
 
@@ -104,6 +105,24 @@ cayu eval report results.json --format html --output eval-report.html
 cayu eval compare baseline.json results.json --output comparison.json
 ```
 
+Portable corpora use the same target discovery but must select corpus mode:
+
+```bash
+cayu eval validate evals.json
+cayu eval inspect evals.json --json
+cayu eval merge combined.json team-a.json team-b.json
+cayu eval run --corpus combined.json --suite refund-regressions \
+  --output refund-results.json --html-output refund-results.html
+```
+
+`--suite` is optional only when the corpus contains exactly one suite. Corpus
+trial counts and timeouts come from the content-addressed corpus contract and
+cannot be replaced by command-line flags. `merge` includes an existing
+destination as its first input, deduplicates equal content, rejects a same-ID
+revision conflict by default, validates the complete result, and atomically
+replaces the destination. `--replace-conflicts` deliberately selects the last
+conflicting definition in command-line order.
+
 The command exits with `0` when all cases pass and `1` when the run fails,
 errors, or a comparison detects regressions. `eval report` and `eval compare`
 operate only on the paths supplied to them and do not perform project
@@ -128,8 +147,9 @@ used elsewhere and never embeds or authorizes a `PriceBook`.
 Corpus documents are definitions, not executable application configuration.
 Parsing one never imports project code or invokes a provider, tool, environment,
 hook, or runtime. A trusted caller resolves `target_key` to local application
-bootstrap code and separately verifies the diagnostic source identity before
-execution.
+bootstrap code. Captured source identity remains diagnostic provenance; fresh
+execution records its own target release and AppManifest and does not pretend
+that the source application is reproducible or unchanged.
 
 Use the `.create(...)` factories for `EvalSuiteSpec`, `EvalCaseSpec`, and
 `EvalCorpusDocument`. They validate and canonicalize their inputs and compute
@@ -148,11 +168,100 @@ validation. Input is rejected before an unbounded read or decode. The hard
 document limit is 8 MiB, with at most 64 suites, 1,000 cases, 64 assertions per
 case, 16 messages per case, 65,536 characters per message, 262,144 input
 characters per case, 100 sequential trials, and a 3,600-second per-trial timeout.
-Each suite may expand to at most 10,000 published assertion results across all
-of its cases and trials, so every accepted suite fits the complete 32 MiB public
-result graph instead of failing only after execution.
+Each suite may expand to at most 10,000 published assertion results across its
+cases and trials, matching the boundary of the one-suite execution result. A
+multi-suite corpus may exceed that aggregate because suites execute and publish
+independently; inspection reports the complete corpus-wide count without
+materializing result graphs.
 Unknown fields and assertion kinds fail closed; schema version 1 has no legacy
 compatibility loader.
+
+### Trusted corpus execution
+
+A corpus deliberately contains no executable application authority. Local SDK
+and CLI execution resolves that authority from the project-owned eval target:
+
+```python
+from cayu import (
+    CorpusTarget,
+    EvalPlan,
+    EvaluationEvidencePolicySpec,
+    Message,
+    RunRequest,
+)
+
+
+def build_eval() -> EvalPlan:
+    app = build_app()
+    return EvalPlan(
+        corpus_target=CorpusTarget(
+            key="refund-agent",
+            app=app,
+            request_base=RunRequest(
+                agent_name="refund-agent",
+                messages=[],
+                max_steps=12,
+            ),
+            bootstrap_messages=(
+                Message.text("system", "Follow the production refund policy."),
+            ),
+            application_release_id="refund-service-2026-08-06",
+            evidence_policy=EvaluationEvidencePolicySpec.standard(),
+            # price_book=trusted_price_book,  # required when the corpus uses cost assertions
+        )
+    )
+```
+
+`CorpusTarget` is immutable and defensively copies its request, bootstrap,
+evidence-policy, limit, and optional pricing inputs. Its request base must have
+no messages, session/parent/causal/task identity, structured-output request,
+prior redaction state, or runtime authority. Bootstrap messages are bounded
+single-text-part system or user messages. Compilation produces exactly that
+trusted bootstrap followed by the corpus's user messages; every trial then gets
+a fresh runtime session and causal identity from the existing evaluator. The
+trusted request base is capped at 64 KiB and the published AppManifest at 1 MiB.
+Input is bounded both per case and across the fully compiled suite, including the
+trusted bootstrap repeated for each case, so compilation cannot multiply one
+large bootstrap into an unbounded working set. The compiled-suite ceiling is
+8,388,608 input characters. A target may lower case, trial, timeout,
+concurrency, bootstrap, and input ceilings but cannot raise Cayu's hard limits.
+The target key and application release ID are public result identity: both must
+cross the target app's workload-secret redaction boundary unchanged, or target
+validation fails before provider dispatch.
+
+Before provider dispatch, `compile_corpus_suite(...)` revalidates the complete
+corpus and matches its target key, evidence-policy revision, applicable trusted
+PriceBook identity, selected suite, and trial/input/case/timeout ceilings. It
+compiles the allowlisted assertions through the same portable assertion adapter
+used by `compile_assertion_spec(...)`; there is no second evaluator. All cost
+assertions in the selected suite share one
+compile-time pricing binding, so the trusted PriceBook is validated and
+fingerprinted once for the suite rather than once per assertion.
+`run_corpus_suite(...)` and corpus-mode
+`run_eval_plan(...)` execute that compiled suite through `run_eval_suite(...)`,
+bind the pre-dispatch corpus contract, and publish through
+`publish_eval_run(...)`. A changed AppManifest during execution rejects the
+result instead of publishing it under stale target diagnostics.
+
+The returned `CorpusExecutionResult` contains the safe `PublishedEvalRun` plus
+the fresh application release and complete bounded public `AppManifest`. The
+manifest is diagnostic, not a reproducibility claim, and its fingerprint is
+recomputed during validation. `corpus_execution_result_to_json(...)` and
+`load_corpus_execution_result(...)` provide bounded deterministic JSON;
+`render_corpus_execution_html(...)` renders only the published graph. Each trial
+may include a Cayu-produced preview of the same app-redacted output evidence used
+by its assertions: at most 16 KiB per trial and 2 MiB across a published run,
+with explicit availability/truncation state, retained size, and retained-content
+digest. The raw final output and omitted preview suffix are discarded before
+publication. Neither format contains trajectories, session IDs, provider
+payloads, exception text, credentials, or executable target objects.
+
+`corpus_execution_compatibility(...)` is the typed precondition for later
+regression comparison. It requires the same target key, corpus/suite/case/
+assertion contract, evidence policy, and applicable pricing identity, while
+deliberately allowing a different fresh application release and AppManifest.
+It returns stable incomparable reason codes; it does not silently compare
+different evaluation contracts.
 
 Portable assertions consume one immutable `AssertionEvidenceView`, produced by
 `project_assertion_evidence_view(...)` from a validated `Trajectory`. The view
@@ -202,27 +311,33 @@ tool-presence/count assertions use calls that actually started.
 
 `publish_eval_run(...)` is the only public result projection for a portable
 corpus run. It matches the complete internal suite result back to the corpus and
-produces a content-addressed `PublishedEvalRun` containing every case, trial,
-assertion outcome, safe structural detail, duration, and identity-free aggregate
-usage. Every complete trial carries its exact aggregate usage, and conclusive
+produces a content-addressed schema-version-2 `PublishedEvalRun` containing
+every case, trial, assertion outcome, safe structural detail, duration, and
+identity-free aggregate usage. Every complete trial carries its exact aggregate
+usage, and conclusive
 usage-derived observations cannot exist without that summary. A publishable run
 carries large aggregate counters in the same canonical decimal-string JSON
 representation as Cayu's other aggregate usage surfaces. Cost observations are
 published only when their allowlisted metadata exactly matches any retained
 `SessionCostSummary`, including currency, total, and the priced/unpriced step
 partition. The run carries the exact corpus, suite, case, evidence-policy,
-pricing-profile, trial-count, and timeout contract fixed before provider dispatch;
+applicable pricing-profile, trial-count, and timeout contract fixed before provider dispatch;
 publication rejects an absent or different execution contract. Every internal
 assertion result must also carry the exact corpus assertion revision it evaluated,
 preventing publication under a different expectation. Final-output decisions are
-carried as the shared evaluator's safe boolean observation, and tool-order
+carried as the shared evaluator's safe boolean observation. Trusted corpus
+execution can additionally carry a bounded preview of that same redacted evidence;
+direct publication without the runner-owned projection marks output unavailable
+instead of copying `EvalTrialResult.final_output`. Tool-order
 decisions are checked against the complete bounded order retained by evaluation;
 only boolean matches and safe counts cross the publishing boundary.
 Trial, case, and run scores and statuses are rederived from the retained
-published children. Public diagnostics are fixed Cayu-owned codes and messages;
-raw assertion metadata, exception text, final output, trajectories, concrete
-session IDs, and provider/model identity are never copied. Cost results require
-the corpus pricing-profile fingerprint. The closed schema-v1 graph is bounded to
+published children. Public diagnostics use fixed Cayu-owned reason codes and
+messages that distinguish assertion, lifecycle, evidence, and timeout failures
+without copying raw exception text. Raw assertion metadata, raw final output,
+trajectories, concrete session IDs, and provider/model identity are never copied.
+Cost results require
+the corpus pricing-profile fingerprint. The closed schema-v2 graph is bounded to
 32 MiB and is the reporting, comparison, and CI substrate for portable corpus
 execution; the lossless `EvalRun` does not cross that publishing boundary.
 The publication model defines and enforces this boundary independently of execution.
