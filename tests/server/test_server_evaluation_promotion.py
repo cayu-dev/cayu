@@ -23,6 +23,7 @@ from cayu import (
     ModelStreamEvent,
     PromotionCandidateV1,
     RunRequest,
+    default_price_book,
     eval_corpus_from_json,
 )
 from cayu.server import (
@@ -86,13 +87,17 @@ def _promotion_config() -> EvaluationPromotionConfig:
     )
 
 
-def _client(app: CayuApp) -> TestClient:
+def _client(app: CayuApp, *, with_pricing: bool = False) -> TestClient:
     return TestClient(
         create_server(
             app,
             config=ServerConfig.protected(
                 _authenticate,
-                dashboard=DashboardConfig(enabled=False),
+                dashboard=(
+                    DashboardConfig(runtime_config={"priceBook": default_price_book()})
+                    if with_pricing
+                    else DashboardConfig(enabled=False)
+                ),
                 evaluation_promotion=_promotion_config(),
             ),
         )
@@ -338,3 +343,79 @@ def test_preview_rejects_stale_or_secret_drafts_and_bounds_bodies_before_parsing
     assert oversized_response.json() == {
         "detail": "Evaluation promotion request exceeds the server byte limit."
     }
+
+
+def test_preview_returns_only_candidates_that_the_unchanged_export_route_accepts() -> None:
+    unpriced_client = _client(asyncio.run(_seed_app()))
+    preview_url = f"/api/evals/promotion/sessions/{_SESSION_ID}/preview"
+    export_url = f"/api/evals/promotion/sessions/{_SESSION_ID}/export"
+    unpriced_candidate = unpriced_client.post(
+        preview_url,
+        headers=_AUTH_HEADERS,
+        json={},
+    ).json()["candidate"]
+    unpriced_draft = _draft(unpriced_candidate)
+    unpriced_draft["case"]["assertions"] = [
+        {
+            "id": "cost",
+            "kind": "max_estimated_cost",
+            "maximum": "1",
+            "currency": "USD",
+        }
+    ]
+
+    missing_pricing = unpriced_client.post(
+        preview_url,
+        headers=_AUTH_HEADERS,
+        json={"draft": unpriced_draft},
+    )
+
+    assert missing_pricing.status_code == 400
+    assert missing_pricing.json()["detail"]["code"] == "draft_rejected"
+    assert "pricing profile" in missing_pricing.json()["detail"]["message"]
+
+    priced_client = _client(asyncio.run(_seed_app()), with_pricing=True)
+    priced_candidate = priced_client.post(
+        preview_url,
+        headers=_AUTH_HEADERS,
+        json={},
+    ).json()["candidate"]
+    priced_draft = _draft(priced_candidate)
+    priced_draft["case"]["assertions"] = unpriced_draft["case"]["assertions"]
+
+    previewed = priced_client.post(
+        preview_url,
+        headers=_AUTH_HEADERS,
+        json={"draft": priced_draft},
+    )
+
+    assert previewed.status_code == 200
+    previewed_candidate = previewed.json()["candidate"]
+    exported = priced_client.post(
+        export_url,
+        headers=_AUTH_HEADERS,
+        json={
+            "expected_candidate_revision": previewed_candidate["revision"],
+            "candidate": previewed_candidate,
+        },
+    )
+    assert exported.status_code == 200
+    assert eval_corpus_from_json(exported.text).pricing_profile is not None
+
+    unsupported_currency = _draft(priced_candidate)
+    unsupported_currency["case"]["assertions"] = [
+        {
+            "id": "cost",
+            "kind": "max_estimated_cost",
+            "maximum": "1",
+            "currency": "ZZZ",
+        }
+    ]
+    rejected_currency = priced_client.post(
+        preview_url,
+        headers=_AUTH_HEADERS,
+        json={"draft": unsupported_currency},
+    )
+    assert rejected_currency.status_code == 400
+    assert rejected_currency.json()["detail"]["code"] == "draft_rejected"
+    assert "pricing profile" in rejected_currency.json()["detail"]["message"]

@@ -542,7 +542,10 @@ operator edit the suite identity and trial settings, case identity and input,
 and every schema-v1 portable assertion. **Preview score** sends the complete
 authority-free draft back to the server. The server reapplies application
 redaction, restores all server-owned provenance and evidence, revalidates the
-current session, and scores through `score_promotion_candidate(...)`.
+current session, verifies that the draft satisfies the complete portable-corpus
+contract, and scores through `score_promotion_candidate(...)`. A cost assertion
+without a configured pricing profile, or with a currency absent from that
+profile, is rejected during preview instead of producing an unusable export.
 
 Editing any field makes the displayed score stale and disables export until the
 new draft is previewed. **Export eval JSON** submits that exact canonical

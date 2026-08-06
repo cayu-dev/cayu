@@ -69,6 +69,7 @@ from cayu.evals.promotion import (
     PromotionCandidateV1,
     SessionPromotionError,
     build_promotion_candidate,
+    corpus_from_promotion_candidate,
     export_promotion_corpus,
     score_promotion_candidate,
 )
@@ -3454,7 +3455,7 @@ def create_router(
                 input=draft.case.input,
                 assertions=draft.case.assertions,
             )
-            return PromotionCandidateV1.create(
+            candidate = PromotionCandidateV1.create(
                 target_key=baseline.target_key,
                 source=baseline.source,
                 evidence_policy=baseline.evidence_policy,
@@ -3471,6 +3472,21 @@ def create_router(
                     "The edited candidate violates the promotion contract.",
                 ),
             ) from exc
+        try:
+            # A successful dashboard preview is also the export gate. Validate
+            # corpus-only invariants here so the UI never presents a current
+            # preview that the unchanged export route must reject later.
+            corpus_from_promotion_candidate(candidate)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=_promotion_error_detail(
+                    "draft_rejected",
+                    "The edited candidate is incompatible with the configured corpus limits or "
+                    "pricing profile.",
+                ),
+            ) from exc
+        return candidate
 
     def _require_safe_promotion_document(
         document: dict[str, Any],

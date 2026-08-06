@@ -2428,7 +2428,7 @@ export type EvaluationPromotionCaseDraft = {
 /**
  * EvaluationPromotionDraft
  *
- * Complete editable projection based on one previewed evidence revision.
+ * Complete editable projection bound to one server-owned promotion baseline.
  */
 export type EvaluationPromotionDraft = {
     case: EvaluationPromotionCaseDraft;

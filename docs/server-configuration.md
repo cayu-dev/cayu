@@ -135,6 +135,10 @@ downloads deterministic portable corpus JSON and does not include the source
 session ID. A changed durable snapshot, app manifest, source identity, pricing
 profile, or edited candidate requires another preview.
 
+Preview returns only candidates that satisfy the complete export contract.
+Cost assertions therefore require a configured pricing profile containing the
+selected currency; incompatible drafts are rejected before export is enabled.
+
 `target_key`, `source_agent_name`, and `application_release_id` are public-safe
 diagnostic configuration, not secrets or executable lookup authority. The source
 agent must already be registered on the supplied `CayuApp`. The application
