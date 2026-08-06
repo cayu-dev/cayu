@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
+import tempfile
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import suppress
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias, TypeVar
@@ -21,6 +25,7 @@ from pydantic import (
 
 from cayu._validation import (
     canonical_durable_json_bytes,
+    compact_json_utf8_size,
     copy_durable_json_object,
     durable_json_object_from_pairs,
     json_utf8_size_within_limit,
@@ -55,6 +60,7 @@ EVAL_CORPUS_MAX_FINAL_OUTPUT_ASSERTION_CHARS = 65_536
 EVAL_CORPUS_MAX_TOOL_NAMES = 256
 EVAL_CORPUS_MAX_TRIALS = 100
 EVAL_CORPUS_MAX_TIMEOUT_SECONDS = 3_600
+EVAL_CORPUS_MAX_MERGE_INPUTS = 256
 
 EVIDENCE_MAX_FINAL_OUTPUT_CHARS = 65_536
 EVIDENCE_MAX_CHILD_SESSIONS = 500
@@ -1182,3 +1188,381 @@ def load_eval_corpus(path: str | Path) -> EvalCorpusDocument:
     except UnicodeDecodeError as exc:
         raise ValueError("Eval corpus JSON must be UTF-8.") from exc
     return eval_corpus_from_json(source)
+
+
+class EvalCorpusSuiteInspectionV1(_SchemaV1PortableModel):
+    """Bounded structural summary for one corpus suite."""
+
+    id: StrictStr
+    revision: StrictStr
+    name: StrictStr
+    case_count: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_CASES)
+    assertion_count: StrictInt = Field(ge=1)
+    trials: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TRIALS)
+    timeout_seconds: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_TIMEOUT_SECONDS)
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("revision")
+    @classmethod
+    def validate_revision(cls, value: str, info) -> str:
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str, info) -> str:
+        return _bounded_durable_text(
+            value,
+            info.field_name,
+            max_chars=256,
+            nonblank=True,
+            clean=True,
+        )
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> EvalCorpusSuiteInspectionV1:
+        if (
+            not self.case_count
+            <= self.assertion_count
+            <= (self.case_count * EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE)
+        ):
+            raise ValueError("Corpus suite inspection assertion_count is impossible.")
+        if self.assertion_count * self.trials > EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS:
+            raise ValueError("Corpus suite inspection expanded result count is impossible.")
+        return self
+
+
+class EvalCorpusInspectionV1(_SchemaV1PortableModel):
+    """Stable authority-free summary returned by corpus validation and inspection."""
+
+    revision: StrictStr
+    target_key: StrictStr
+    evidence_policy_revision: StrictStr
+    pricing_profile_fingerprint: StrictStr | None = None
+    suite_count: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_SUITES)
+    case_count: StrictInt = Field(ge=1, le=EVAL_CORPUS_MAX_CASES)
+    assertion_count: StrictInt = Field(ge=1)
+    expanded_assertion_result_count: StrictInt = Field(
+        ge=1,
+        le=(EVAL_CORPUS_MAX_SUITES * EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS),
+    )
+    suites: tuple[EvalCorpusSuiteInspectionV1, ...] = Field(
+        min_length=1,
+        max_length=EVAL_CORPUS_MAX_SUITES,
+    )
+
+    @field_validator(
+        "revision",
+        "evidence_policy_revision",
+        "pricing_profile_fingerprint",
+    )
+    @classmethod
+    def validate_revision_fields(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _sha256_revision(value, info.field_name)
+
+    @field_validator("target_key")
+    @classmethod
+    def validate_target_key(cls, value: str, info) -> str:
+        return _portable_id(value, info.field_name)
+
+    @field_validator("suites", mode="before")
+    @classmethod
+    def validate_suites_are_ordered(cls, value: object, info) -> object:
+        return _ordered_sequence_input(value, info.field_name)
+
+    @model_validator(mode="after")
+    def validate_summary(self) -> EvalCorpusInspectionV1:
+        suite_ids = tuple(item.id for item in self.suites)
+        if suite_ids != tuple(sorted(set(suite_ids))):
+            raise ValueError("Corpus inspection suites must be unique and sorted by id.")
+        if self.suite_count != len(self.suites):
+            raise ValueError("Corpus inspection suite_count does not match suites.")
+        if self.case_count != sum(item.case_count for item in self.suites):
+            raise ValueError("Corpus inspection case_count does not match suites.")
+        if self.assertion_count != sum(item.assertion_count for item in self.suites):
+            raise ValueError("Corpus inspection assertion_count does not match suites.")
+        expected_expanded = sum(item.assertion_count * item.trials for item in self.suites)
+        if self.expanded_assertion_result_count != expected_expanded:
+            raise ValueError(
+                "Corpus inspection expanded_assertion_result_count does not match suites."
+            )
+        return self
+
+
+def inspect_eval_corpus(corpus: EvalCorpusDocument) -> EvalCorpusInspectionV1:
+    """Return a defensive bounded structural summary of one corpus."""
+
+    validated, _ = _validated_model_document(
+        corpus,
+        model_type=EvalCorpusDocument,
+        field_name="eval corpus",
+    )
+    cases_by_suite: dict[str, list[EvalCaseSpec]] = {suite.id: [] for suite in validated.suites}
+    for case in validated.cases:
+        cases_by_suite[case.suite_id].append(case)
+    suites = tuple(
+        EvalCorpusSuiteInspectionV1(
+            id=suite.id,
+            revision=suite.revision,
+            name=suite.name,
+            case_count=len(cases_by_suite[suite.id]),
+            assertion_count=sum(len(case.assertions) for case in cases_by_suite[suite.id]),
+            trials=suite.trial_request.trials,
+            timeout_seconds=suite.trial_request.timeout_seconds,
+        )
+        for suite in validated.suites
+    )
+    return EvalCorpusInspectionV1(
+        revision=validated.revision,
+        target_key=validated.target_key,
+        evidence_policy_revision=validated.evidence_policy.revision,
+        pricing_profile_fingerprint=(
+            None if validated.pricing_profile is None else validated.pricing_profile.fingerprint
+        ),
+        suite_count=len(suites),
+        case_count=len(validated.cases),
+        assertion_count=sum(item.assertion_count for item in suites),
+        expanded_assertion_result_count=sum(item.assertion_count * item.trials for item in suites),
+        suites=suites,
+    )
+
+
+def eval_corpus_inspection_to_json(inspection: EvalCorpusInspectionV1) -> str:
+    """Return deterministic JSON for one defensive corpus inspection."""
+
+    if type(inspection) is not EvalCorpusInspectionV1:
+        raise TypeError("inspection must be an exact EvalCorpusInspectionV1.")
+    validated = EvalCorpusInspectionV1.model_validate(_model_python_input(inspection))
+    return (
+        json.dumps(
+            validated.model_dump(mode="json"),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def merge_eval_corpora(
+    corpora: list[EvalCorpusDocument] | tuple[EvalCorpusDocument, ...],
+    *,
+    replace_conflicts: bool = False,
+) -> EvalCorpusDocument:
+    """Merge compatible corpora by immutable ID/revision contracts."""
+
+    if type(replace_conflicts) is not bool:
+        raise TypeError("replace_conflicts must be a bool.")
+    if type(corpora) not in (list, tuple):
+        raise TypeError("corpora must be an ordered sequence (a list or tuple).")
+    if not corpora:
+        raise ValueError("corpora must contain at least one document.")
+    if len(corpora) > EVAL_CORPUS_MAX_MERGE_INPUTS:
+        raise ValueError(
+            f"corpora cannot contain more than {EVAL_CORPUS_MAX_MERGE_INPUTS} documents."
+        )
+    return _merge_eval_corpus_documents(
+        corpora,
+        replace_conflicts=replace_conflicts,
+    )
+
+
+_MergeItemT = TypeVar("_MergeItemT", EvalSuiteSpec, EvalCaseSpec)
+
+
+def _merge_eval_corpus_documents(
+    corpora: Iterable[EvalCorpusDocument],
+    *,
+    replace_conflicts: bool,
+) -> EvalCorpusDocument:
+    """Merge a bounded caller-validated stream without retaining every source."""
+
+    first: EvalCorpusDocument | None = None
+    suites: dict[str, EvalSuiteSpec] = {}
+    cases: dict[str, EvalCaseSpec] = {}
+    suite_sizes: dict[str, int] = {}
+    case_sizes: dict[str, int] = {}
+    retained_bytes = 0
+
+    def merge_item(
+        kind: str,
+        key: str,
+        value: _MergeItemT,
+        destination: dict[str, _MergeItemT],
+        sizes: dict[str, int],
+        max_items: int,
+    ) -> None:
+        nonlocal retained_bytes
+        existing = destination.get(key)
+        if existing == value:
+            return
+        if existing is not None and not replace_conflicts:
+            raise ValueError(
+                f"Eval corpus {kind} {key!r} has conflicting content revisions "
+                f"{existing.revision!r} and {value.revision!r}."
+            )
+        if existing is None and len(destination) >= max_items:
+            raise ValueError(f"Merged eval corpus cannot contain more than {max_items} {kind}s.")
+
+        value_size = compact_json_utf8_size(value.model_dump(mode="json"))
+        if existing is None:
+            # Empty and one-item arrays both contribute their two brackets; only
+            # the item, plus a comma after the first item, grows the document.
+            size_delta = value_size + (1 if destination else 0)
+        else:
+            size_delta = value_size - sizes[key]
+        if retained_bytes + size_delta > EVAL_CORPUS_MAX_BYTES:
+            raise ValueError(
+                f"Merged eval corpus exceeds {EVAL_CORPUS_MAX_BYTES} canonical JSON bytes."
+            )
+        destination[key] = value
+        sizes[key] = value_size
+        retained_bytes += size_delta
+
+    for corpus in corpora:
+        if type(corpus) is not EvalCorpusDocument:
+            raise TypeError("corpora must contain exact EvalCorpusDocument instances.")
+        item, _ = _validated_model_document(
+            corpus,
+            model_type=EvalCorpusDocument,
+            field_name="eval corpus",
+        )
+        if first is None:
+            first = item
+            retained_bytes = compact_json_utf8_size(
+                {
+                    "schema_version": EVAL_CORPUS_SCHEMA_VERSION,
+                    "revision": "sha256:" + "0" * 64,
+                    "target_key": first.target_key,
+                    "evidence_policy": first.evidence_policy.model_dump(mode="json"),
+                    "pricing_profile": (
+                        None
+                        if first.pricing_profile is None
+                        else first.pricing_profile.model_dump(mode="json")
+                    ),
+                    "suites": [],
+                    "cases": [],
+                }
+            )
+        else:
+            if item.target_key != first.target_key:
+                raise ValueError("Cannot merge eval corpora with different target keys.")
+            if item.evidence_policy != first.evidence_policy:
+                raise ValueError("Cannot merge eval corpora with different evidence policies.")
+            if item.pricing_profile != first.pricing_profile:
+                raise ValueError("Cannot merge eval corpora with different pricing profiles.")
+        for suite in item.suites:
+            merge_item(
+                "suite",
+                suite.id,
+                suite,
+                suites,
+                suite_sizes,
+                EVAL_CORPUS_MAX_SUITES,
+            )
+        for case in item.cases:
+            merge_item(
+                "case",
+                case.id,
+                case,
+                cases,
+                case_sizes,
+                EVAL_CORPUS_MAX_CASES,
+            )
+    if first is None:  # guarded by the non-empty check above
+        raise RuntimeError("Eval corpus merge lost its first input.")
+    return EvalCorpusDocument.create(
+        target_key=first.target_key,
+        evidence_policy=first.evidence_policy,
+        pricing_profile=first.pricing_profile,
+        suites=tuple(suites.values()),
+        cases=tuple(cases.values()),
+    )
+
+
+def merge_eval_corpus_files(
+    destination: str | Path,
+    inputs: list[str | Path] | tuple[str | Path, ...],
+    *,
+    replace_conflicts: bool = False,
+) -> EvalCorpusDocument:
+    """Validate, merge, and atomically replace one corpus destination."""
+
+    if type(replace_conflicts) is not bool:
+        raise TypeError("replace_conflicts must be a bool.")
+    if type(inputs) not in (list, tuple):
+        raise TypeError("inputs must be an ordered sequence of paths.")
+    if not inputs:
+        raise ValueError("inputs must contain at least one path.")
+    if len(inputs) > EVAL_CORPUS_MAX_MERGE_INPUTS:
+        raise ValueError(f"inputs cannot contain more than {EVAL_CORPUS_MAX_MERGE_INPUTS} paths.")
+    ordered_inputs = tuple(inputs)
+    destination_path = Path(destination)
+    if destination_path.is_symlink():
+        raise ValueError("Eval corpus destination cannot be a symbolic link.")
+    if destination_path.exists() and not destination_path.is_file():
+        raise ValueError("Eval corpus destination must be a file path.")
+    destination_exists = destination_path.exists()
+    source_count = len(ordered_inputs) + int(destination_exists)
+    if source_count > EVAL_CORPUS_MAX_MERGE_INPUTS:
+        raise ValueError(
+            "Existing destination and inputs cannot total more than "
+            f"{EVAL_CORPUS_MAX_MERGE_INPUTS} corpus documents."
+        )
+    source_paths = ((destination_path,) if destination_exists else ()) + ordered_inputs
+    merged = _merge_eval_corpus_documents(
+        (load_eval_corpus(path) for path in source_paths),
+        replace_conflicts=replace_conflicts,
+    )
+    _atomic_write_corpus(destination_path, eval_corpus_to_json(merged))
+    return merged
+
+
+def _atomic_write_corpus(destination: Path, content: str) -> None:
+    parent = destination.parent
+    if not parent.is_dir():
+        raise ValueError("Eval corpus destination parent must be an existing directory.")
+    existing_mode = None
+    if destination.exists():
+        existing_mode = stat.S_IMODE(destination.stat().st_mode)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        if existing_mode is not None:
+            os.fchmod(descriptor, existing_mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        directory_descriptor = None
+        try:
+            # The file itself is durable before publication. Directory fsync is
+            # a best-effort crash-consistency strengthening because some valid
+            # filesystems reject it after the atomic replace has already
+            # succeeded; surfacing that late error would falsely report a
+            # failed merge even though the destination changed.
+            with suppress(OSError):
+                directory_descriptor = os.open(parent, os.O_RDONLY)
+            if directory_descriptor is not None:
+                with suppress(OSError):
+                    os.fsync(directory_descriptor)
+        finally:
+            if directory_descriptor is not None:
+                with suppress(OSError):
+                    os.close(directory_descriptor)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        raise

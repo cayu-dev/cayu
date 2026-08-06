@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from cayu.evals.corpus import (
+    EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    EVAL_CORPUS_MAX_MERGE_INPUTS,
     EVAL_CORPUS_MAX_MESSAGE_CHARS,
     EVAL_CORPUS_MAX_PUBLISHED_ASSERTION_RESULTS,
     EVAL_CORPUS_SCHEMA_VERSION,
@@ -32,9 +35,13 @@ from cayu.evals.corpus import (
     UsageRecordedAssertionSpec,
     assertion_spec_revision,
     eval_corpus_from_json,
+    eval_corpus_inspection_to_json,
     eval_corpus_to_json,
     eval_run_contract_for_corpus,
+    inspect_eval_corpus,
     load_eval_corpus,
+    merge_eval_corpora,
+    merge_eval_corpus_files,
 )
 
 
@@ -518,6 +525,367 @@ def test_corpus_rejects_suites_that_cannot_fit_the_complete_published_graph():
             suites=(suite,),
             cases=cases(11),
         )
+
+
+def test_corpus_expanded_result_limit_applies_independently_to_each_suite():
+    suites = tuple(
+        EvalSuiteSpec.create(
+            id=f"suite-{index}",
+            name=f"Suite {index}",
+            trial_request=TrialRequestSpec(trials=100, timeout_seconds=120),
+        )
+        for index in range(2)
+    )
+    cases = tuple(
+        EvalCaseSpec.create(
+            id=f"case-{index}",
+            suite_id=suite.id,
+            name=f"Case {index}",
+            source=_source(),
+            input=RunInputSpec(messages=(CorpusUserMessageSpec(text="Run."),)),
+            assertions=tuple(
+                RootStatusAssertionSpec(id=f"root-{item}", expected="completed")
+                for item in range(60)
+            ),
+        )
+        for index, suite in enumerate(suites)
+    )
+
+    corpus = EvalCorpusDocument.create(
+        target_key="refund-agent",
+        evidence_policy=EvaluationEvidencePolicySpec.standard(),
+        suites=suites,
+        cases=cases,
+    )
+
+    assert inspect_eval_corpus(corpus).expanded_assertion_result_count == 12_000
+
+
+def test_corpus_inspection_is_stable_bounded_and_defensively_revalidated():
+    corpus = _corpus(include_cost=True)
+
+    inspection = inspect_eval_corpus(corpus)
+
+    assert inspection.revision == corpus.revision
+    assert inspection.target_key == corpus.target_key
+    assert inspection.suite_count == 1
+    assert inspection.case_count == 1
+    assert inspection.assertion_count == 11
+    assert inspection.expanded_assertion_result_count == 33
+
+    with pytest.raises(ValidationError, match="assertion_count is impossible"):
+        type(inspection.suites[0])(
+            **{
+                **inspection.suites[0].model_dump(mode="python"),
+                "assertion_count": (
+                    inspection.suites[0].case_count * EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE + 1
+                ),
+            }
+        )
+    with pytest.raises(ValidationError, match="expanded result count is impossible"):
+        type(inspection.suites[0])(
+            **{
+                **inspection.suites[0].model_dump(mode="python"),
+                "case_count": 100,
+                "assertion_count": 101,
+                "trials": 100,
+            }
+        )
+    assert inspection.suites[0].trials == 3
+    assert json.loads(eval_corpus_inspection_to_json(inspection))["revision"] == corpus.revision
+
+    forged = corpus.model_copy(update={"target_key": "forged-target"})
+    with pytest.raises(ValidationError, match="revision does not match"):
+        inspect_eval_corpus(forged)
+
+
+def test_merge_corpora_deduplicates_equal_content_and_sorts_new_suites():
+    first = _corpus()
+    second_suite = _suite(suite_id="account-regressions", name="Account regressions")
+    second_case = _case(
+        case_id="account-review",
+        suite_id=second_suite.id,
+        name="Account review",
+    )
+    second = EvalCorpusDocument.create(
+        target_key=first.target_key,
+        evidence_policy=first.evidence_policy,
+        suites=(second_suite,),
+        cases=(second_case,),
+    )
+
+    merged = merge_eval_corpora((first, first, second))
+
+    assert tuple(suite.id for suite in merged.suites) == (
+        "account-regressions",
+        "refund-regressions",
+    )
+    assert tuple(case.id for case in merged.cases) == (
+        "account-review",
+        "refund-approval",
+    )
+    assert merge_eval_corpora((merged, first)) == merged
+
+
+def test_merge_corpora_rejects_identity_and_revision_conflicts_unless_replaced():
+    original = _corpus()
+    replacement_suite = _suite(name="Updated refund regressions")
+    replacement = EvalCorpusDocument.create(
+        target_key=original.target_key,
+        evidence_policy=original.evidence_policy,
+        suites=(replacement_suite,),
+        cases=original.cases,
+    )
+
+    with pytest.raises(ValueError, match="suite 'refund-regressions' has conflicting"):
+        merge_eval_corpora((original, replacement))
+    merged = merge_eval_corpora((original, replacement), replace_conflicts=True)
+    assert merged.suites == (replacement_suite,)
+
+    wrong_target = EvalCorpusDocument.create(
+        target_key="other-target",
+        evidence_policy=original.evidence_policy,
+        suites=original.suites,
+        cases=original.cases,
+    )
+    with pytest.raises(ValueError, match="different target keys"):
+        merge_eval_corpora((original, wrong_target))
+
+
+def test_merge_corpora_rejects_unbounded_iterables_without_consuming_them():
+    consumed = 0
+
+    def corpora():
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield _corpus()
+
+    with pytest.raises(TypeError, match="ordered sequence"):
+        merge_eval_corpora(corpora())
+
+    assert consumed == 0
+
+    class AdversarialList(list):
+        def __iter__(self):
+            nonlocal consumed
+            consumed += 1
+            return super().__iter__()
+
+    with pytest.raises(TypeError, match="ordered sequence"):
+        merge_eval_corpora(AdversarialList([_corpus()]))
+
+    assert consumed == 0
+
+
+def test_merge_corpora_rejects_the_retained_graph_before_reading_another_input(monkeypatch):
+    import cayu.evals.corpus as corpus_module
+
+    first = _corpus()
+    second_suite = _suite(suite_id="account-regressions", name="Account regressions")
+    second = EvalCorpusDocument.create(
+        target_key=first.target_key,
+        evidence_policy=first.evidence_policy,
+        suites=(second_suite,),
+        cases=(
+            _case(
+                case_id="account-review",
+                suite_id=second_suite.id,
+                name="Account review",
+            ),
+        ),
+    )
+    individual_limit = max(
+        len(eval_corpus_to_json(first).encode("utf-8")),
+        len(eval_corpus_to_json(second).encode("utf-8")),
+    )
+    monkeypatch.setattr(corpus_module, "EVAL_CORPUS_MAX_BYTES", individual_limit)
+
+    with pytest.raises(ValueError, match="Merged eval corpus exceeds .* canonical JSON bytes"):
+        merge_eval_corpora((first, second, object()))
+
+
+def test_merge_corpora_rejects_the_retained_count_before_reading_another_input(monkeypatch):
+    import cayu.evals.corpus as corpus_module
+
+    first = _corpus()
+    second = EvalCorpusDocument.create(
+        target_key=first.target_key,
+        evidence_policy=first.evidence_policy,
+        suites=first.suites,
+        cases=(_case(case_id="account-review", name="Account review"),),
+    )
+    monkeypatch.setattr(corpus_module, "EVAL_CORPUS_MAX_CASES", 1)
+
+    with pytest.raises(ValueError, match="cannot contain more than 1 case"):
+        merge_eval_corpora((first, second, object()))
+
+
+def test_merge_corpora_reclaims_the_retained_byte_budget_on_replacement(monkeypatch):
+    import cayu.evals.corpus as corpus_module
+
+    original = _corpus()
+    replacement_case = _case(name="R")
+    replacement = EvalCorpusDocument.create(
+        target_key=original.target_key,
+        evidence_policy=original.evidence_policy,
+        suites=original.suites,
+        cases=(replacement_case,),
+    )
+    limit = max(
+        len(eval_corpus_to_json(original).encode("utf-8")),
+        len(eval_corpus_to_json(replacement).encode("utf-8")),
+    )
+    monkeypatch.setattr(corpus_module, "EVAL_CORPUS_MAX_BYTES", limit)
+
+    assert merge_eval_corpora(
+        (original, replacement),
+        replace_conflicts=True,
+    ).cases == (replacement_case,)
+
+
+def test_file_merge_is_atomic_and_preserves_destination_on_replace_failure(tmp_path, monkeypatch):
+    import cayu.evals.corpus as corpus_module
+
+    destination = tmp_path / "evals.json"
+    incoming = tmp_path / "incoming.json"
+    original = _corpus()
+    destination.write_text(eval_corpus_to_json(original), encoding="utf-8")
+    second_suite = _suite(suite_id="account-regressions", name="Account regressions")
+    second = EvalCorpusDocument.create(
+        target_key=original.target_key,
+        evidence_policy=original.evidence_policy,
+        suites=(second_suite,),
+        cases=(
+            _case(
+                case_id="account-review",
+                suite_id=second_suite.id,
+                name="Account review",
+            ),
+        ),
+    )
+    incoming.write_text(eval_corpus_to_json(second), encoding="utf-8")
+    before = destination.read_bytes()
+
+    def fail_replace(source, target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(corpus_module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        merge_eval_corpus_files(destination, (incoming,))
+
+    assert destination.read_bytes() == before
+    assert not tuple(tmp_path.glob(".evals.json.*.tmp"))
+
+
+def test_file_merge_validates_before_atomically_replacing_destination(tmp_path):
+    destination = tmp_path / "evals.json"
+    incoming = tmp_path / "incoming.json"
+    original = _corpus()
+    incoming.write_text(eval_corpus_to_json(original), encoding="utf-8")
+
+    merged = merge_eval_corpus_files(destination, (incoming,))
+
+    assert load_eval_corpus(destination) == merged == original
+
+
+def test_file_merge_rejects_symbolic_link_destination(tmp_path):
+    target = tmp_path / "target.json"
+    destination = tmp_path / "evals.json"
+    incoming = tmp_path / "incoming.json"
+    corpus = _corpus()
+    target.write_text(eval_corpus_to_json(corpus), encoding="utf-8")
+    destination.symlink_to(target)
+    incoming.write_text(eval_corpus_to_json(corpus), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot be a symbolic link"):
+        merge_eval_corpus_files(destination, (incoming,))
+
+    assert destination.is_symlink()
+    assert load_eval_corpus(target) == corpus
+
+
+def test_file_merge_does_not_report_failure_after_atomic_replace_succeeds(
+    tmp_path,
+    monkeypatch,
+):
+    import cayu.evals.corpus as corpus_module
+
+    destination = tmp_path / "evals.json"
+    incoming = tmp_path / "incoming.json"
+    corpus = _corpus()
+    incoming.write_text(eval_corpus_to_json(corpus), encoding="utf-8")
+    original_open = corpus_module.os.open
+
+    def reject_directory_fsync_open(path, flags, *args, **kwargs):
+        if Path(path) == tmp_path and flags == corpus_module.os.O_RDONLY:
+            raise OSError("directory fsync unsupported")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(corpus_module.os, "open", reject_directory_fsync_open)
+
+    merged = merge_eval_corpus_files(destination, (incoming,))
+
+    assert merged == corpus
+    assert load_eval_corpus(destination) == corpus
+
+
+def test_file_merge_counts_existing_destination_before_reading_inputs(tmp_path):
+    destination = tmp_path / "evals.json"
+    destination.write_text(eval_corpus_to_json(_corpus()), encoding="utf-8")
+    missing = tmp_path / "missing.json"
+
+    with pytest.raises(ValueError, match="cannot total more than"):
+        merge_eval_corpus_files(
+            destination,
+            (missing,) * EVAL_CORPUS_MAX_MERGE_INPUTS,
+        )
+
+
+def test_file_merge_rejects_unbounded_iterables_without_consuming_them(tmp_path):
+    consumed = 0
+
+    def inputs():
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield tmp_path / "missing.json"
+
+    with pytest.raises(TypeError, match="ordered sequence"):
+        merge_eval_corpus_files(tmp_path / "evals.json", inputs())
+
+    assert consumed == 0
+
+    class AdversarialList(list):
+        def __iter__(self):
+            nonlocal consumed
+            consumed += 1
+            return super().__iter__()
+
+    with pytest.raises(TypeError, match="ordered sequence"):
+        merge_eval_corpus_files(
+            tmp_path / "evals.json",
+            AdversarialList([tmp_path / "missing.json"]),
+        )
+
+    assert consumed == 0
+
+
+def test_merge_entry_points_require_an_exact_conflict_policy(tmp_path):
+    corpus = _corpus()
+    source = tmp_path / "source.json"
+    source.write_text(eval_corpus_to_json(corpus), encoding="utf-8")
+
+    with pytest.raises(TypeError, match="replace_conflicts must be a bool"):
+        merge_eval_corpora((corpus,), replace_conflicts=1)
+    with pytest.raises(TypeError, match="replace_conflicts must be a bool"):
+        merge_eval_corpus_files(
+            tmp_path / "destination.json",
+            (source,),
+            replace_conflicts=1,
+        )
+
+    assert not (tmp_path / "destination.json").exists()
 
 
 @pytest.mark.parametrize(
