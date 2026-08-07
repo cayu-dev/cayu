@@ -347,6 +347,27 @@ The same agent can run in a local workspace, trusted Docker container, E2B,
 Microsandbox, Lambda MicroVM, or an application-owned runner without changing
 its identity or transcript contract.
 
+## Open and replaceable control plane
+
+Cayu ships three equally supported control-plane choices: use the bundled compiled dashboard,
+eject the exact version-matched React/TypeScript source for application-owned customization, or
+provide a completely custom UI over the versioned control-plane API.
+
+```bash
+cayu dashboard eject ./control-plane
+cd control-plane
+npm ci
+npm run dev
+npm run build
+```
+
+Extraction uses package data only—no repository clone, GitHub access, or network request. Serve
+the resulting `dist/` with `DashboardConfig(directory=...)`,
+`mount_cayu(..., dashboard_dir=...)`, or `mount_dashboard(..., dashboard_dir=...)`. Cayu never
+rewrites the extracted application-owned source during upgrades. See [Open and replaceable
+control plane](docs/control-plane.md) for the complete workflow, compatibility gate, and
+redistribution obligations.
+
 ## Production boundaries
 
 Cayu makes safety boundaries explicit, but configuration still matters:
@@ -416,6 +437,7 @@ Start with the document that matches the job:
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |
 | Use the application console | [Console](https://github.com/cayu-dev/cayu/blob/main/docs/console.md) |
 | Start a configured server process | [Project server](docs/project-server.md) |
+| Use, customize, or replace the operator control plane | [Open and replaceable control plane](docs/control-plane.md) |
 | Start a named worker process | [Project workers](docs/project-workers.md) |
 | Configure CLI session-store discovery | [Session-store targets](https://github.com/cayu-dev/cayu/blob/main/docs/session-store-targets.md) |
 | Inspect durable sessions safely | [Session inspection](https://github.com/cayu-dev/cayu/blob/main/docs/session-inspection.md) |

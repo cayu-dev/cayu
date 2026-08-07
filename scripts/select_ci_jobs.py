@@ -23,16 +23,23 @@ _SQLITE_EXACT_PATHS = {
     "tests/core/test_task_wait.py",
 }
 _DASHBOARD_EXACT_PATHS = {
+    ".gitattributes",
     "scripts/generate_dashboard_api_types.py",
+    "src/cayu/_server_contract_version.py",
     "src/cayu/_validation.py",
 }
 _RELEASE_EXACT_PATHS = {
+    ".gitattributes",
     "LICENSE",
     "NOTICE",
     "README.md",
     "pyproject.toml",
     "scripts/check_release_artifacts.py",
+    "scripts/build_dashboard_source_bundle.py",
+    "scripts/check_ejected_dashboard_build.py",
     "scripts/generate_sidecar_manifest.py",
+    "scripts/smoke_ejected_dashboard.py",
+    "src/cayu/_server_contract_version.py",
     "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
     "uv.lock",
 }
@@ -87,6 +94,7 @@ def _affects_dashboard(path: str) -> bool:
             "dashboard/",
             "src/cayu/artifacts/",
             "src/cayu/core/",
+            "src/cayu/evals/",
             "src/cayu/runtime/",
             "src/cayu/server/",
             "src/cayu/storage/",
@@ -98,9 +106,12 @@ def _affects_dashboard(path: str) -> bool:
 def _affects_release_artifacts(path: str) -> bool:
     if path in _RELEASE_EXACT_PATHS:
         return True
-    if path.startswith(("maintenance/model_catalog/", "src/cayu/data/")):
+    if path.startswith(("dashboard/", "maintenance/model_catalog/", "src/cayu/data/")):
         return True
-    return (path.startswith("src/cayu/") and ("lambda_microvm" in path or "manifest" in path)) or (
+    return (
+        path.startswith("src/cayu/")
+        and ("dashboard" in path or "lambda_microvm" in path or "manifest" in path)
+    ) or (
         path.startswith("examples/aws/")
         and ("lambda_microvm" in path or path.startswith("examples/aws/lambda_microvm"))
     )

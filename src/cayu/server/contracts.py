@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu._validation import json_utf8_size_within_limit, require_unicode_scalar_text
 from cayu.core.events import EVENT_ID_MAX_CHARS
 from cayu.evals.corpus import (
@@ -88,7 +89,6 @@ from cayu.server.sse import (
 )
 
 SERVER_API_PREFIX = "/api"
-SERVER_CONTRACT_VERSION = "6"
 SSE_CONTENT_TYPE = "text/event-stream"
 SSE_LAST_EVENT_ID_FORMAT = "session_id:cayu_event_<sequence>"
 MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS = 64

@@ -2,10 +2,7 @@ import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
 import test from "node:test"
 
-const noticeUrl = new URL(
-  "../../src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
-  import.meta.url,
-)
+const noticeUrl = new URL("../THIRD_PARTY_LICENSES.md", import.meta.url)
 
 test("packaged dashboard carries the licenses for its bundled code", () => {
   const notice = readFileSync(noticeUrl, "utf8")

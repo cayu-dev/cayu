@@ -64,6 +64,7 @@ jobs:
       - run: uv run ruff format --check src/ tests/ examples/ scripts/ maintenance/
       - run: uv run ty check src/cayu examples maintenance
       - run: uv run python scripts/generate_sidecar_manifest.py --check
+      - run: uv run python scripts/build_dashboard_source_bundle.py --check
       - run: uv lock --check
 
   test_shards:
@@ -191,12 +192,17 @@ jobs:
     needs: verification-scope
     if: needs.verification-scope.outputs.release_artifacts == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     outputs:
       prerelease: ${{ steps.release-version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
       - run: uv python install 3.11
       # PR and main CI must be deterministic. Freshness is wall-clock policy enforced by
       # scheduled maintenance and release-tag validation; this check validates the committed
@@ -242,10 +248,32 @@ jobs:
       - name: Install built wheel with server extra
         run: |
           for wheel_path in dist/first/*.whl; do
-            uv pip install --python .release-server-venv/bin/python "${wheel_path}[server]"
+            uv pip install --python .release-server-venv/bin/python "${wheel_path}[server,browser]"
           done
+      - run: .release-server-venv/bin/playwright install --with-deps chromium
       - name: Smoke-test protected cayu serve from the built wheel
         run: .release-server-venv/bin/python scripts/smoke_built_wheel_serve.py
+      - name: Verify editable dashboard source from installed release artifacts
+        run: |
+          uv venv --python 3.11 .release-sdist-venv
+          uv pip install --python .release-sdist-venv/bin/python dist/first/*.tar.gz
+          proof_root="$(mktemp -d)"
+          .release-venv/bin/cayu dashboard eject "$proof_root/wheel-dashboard"
+          .release-sdist-venv/bin/cayu dashboard eject "$proof_root/sdist-dashboard"
+          diff -ru "$proof_root/wheel-dashboard" "$proof_root/sdist-dashboard"
+          cd "$proof_root/wheel-dashboard"
+          node -e 'const scripts = require("./package.json").scripts; if (scripts["build:package"]) process.exit(1)'
+          npm ci
+          npm run lint
+          npm run test
+          npm run typecheck
+          ln -s "$GITHUB_WORKSPACE/.release-server-venv" "$proof_root/python venv with spaces"
+          CAYU_PYTHON="$proof_root/python venv with spaces/bin/python" npm run check:api
+          npm run build
+          "$GITHUB_WORKSPACE/.release-venv/bin/python" \
+            "$GITHUB_WORKSPACE/scripts/check_ejected_dashboard_build.py" dist
+          "$GITHUB_WORKSPACE/.release-server-venv/bin/python" \
+            "$GITHUB_WORKSPACE/scripts/smoke_ejected_dashboard.py" dist
       - name: Check bundled model catalog and price book from the installed wheel
         run: |
           .release-venv/bin/python - <<'PY'
@@ -274,8 +302,6 @@ jobs:
           platforms: arm64
       - name: Verify installed wheel and source-distribution sidecar exports
         run: |
-          uv venv --python 3.11 .release-sdist-venv
-          uv pip install --python .release-sdist-venv/bin/python dist/first/*.tar.gz
           proof_root="$(mktemp -d)"
           cd "$proof_root"
           unset PYTHONPATH
@@ -475,6 +501,94 @@ jobs:
           path: dist/first/
           if-no-files-found: error
 
+  windows-dashboard-artifact:
+    name: Windows dashboard artifact
+    needs: verification-scope
+    if: needs.verification-scope.outputs.release_artifacts == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.18.0
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: uv python install 3.11
+      - name: Exercise the native Windows ACL transition
+        shell: pwsh
+        run: |
+          uv sync --frozen --extra dev --python 3.11
+          $windowsTests = @(
+            "protects_staging_dacl_before_writing",
+            "restores_parent_acl_inheritance_after_publication",
+            "preserves_published_tree_if_permissions_cannot_be_restored",
+            "removes_staging_after_filesystem_failure",
+            "refuses_windows_cleanup_junction_replacement",
+            "preserves_cleanup_with_preexisting_windows_writer",
+            "blocks_windows_writer_after_cleanup_is_pinned"
+          ) -join " or "
+          uv run pytest -q tests/cli/test_dashboard.py -k $windowsTests
+      - run: uv build --wheel --out-dir dist/windows
+      - name: Install and eject the built wheel
+        shell: pwsh
+        run: |
+          uv venv --python 3.11 .windows-release-venv
+          $wheel = Get-ChildItem dist/windows/*.whl | Select-Object -First 1
+          uv pip install --python .windows-release-venv/Scripts/python.exe "$($wheel.FullName)[server]"
+          $proofRoot = Join-Path $env:RUNNER_TEMP "cayu dashboard artifact"
+          $parent = Join-Path $proofRoot "inherited parent"
+          New-Item -ItemType Directory -Force $parent | Out-Null
+          $everyone = [System.Security.Principal.SecurityIdentifier]::new("S-1-1-0")
+          $readRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $everyone,
+            [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+            [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit",
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+          )
+          $parentAcl = Get-Acl $parent
+          $parentAcl.AddAccessRule($readRule)
+          Set-Acl -Path $parent -AclObject $parentAcl
+          $destination = Join-Path $parent "editable dashboard"
+          & ./.windows-release-venv/Scripts/cayu.exe dashboard eject $destination
+          "DASHBOARD_DESTINATION=$destination" | Out-File $env:GITHUB_ENV -Append
+      - name: Verify inherited final access and the extracted API workflow
+        shell: pwsh
+        run: |
+          function Assert-InheritedEveryoneRead([string]$path) {
+            $acl = Get-Acl $path
+            if ($acl.AreAccessRulesProtected) {
+              throw "published path retained a protected DACL: $path"
+            }
+            $matchingRule = $acl.Access | Where-Object {
+              $sid = $_.IdentityReference.Translate(
+                [System.Security.Principal.SecurityIdentifier]
+              )
+              $sid.Value -eq "S-1-1-0" -and
+                $_.IsInherited -and
+                (($_.FileSystemRights -band
+                  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq
+                  [System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+            }
+            if (-not $matchingRule) {
+              throw "published path did not inherit the parent's read access: $path"
+            }
+          }
+          Assert-InheritedEveryoneRead $env:DASHBOARD_DESTINATION
+          Assert-InheritedEveryoneRead (Join-Path $env:DASHBOARD_DESTINATION "package.json")
+          Push-Location $env:DASHBOARD_DESTINATION
+          try {
+            npm ci
+            $env:CAYU_PYTHON = Resolve-Path (
+              Join-Path $env:GITHUB_WORKSPACE ".windows-release-venv/Scripts/python.exe"
+            )
+            npm run check:api
+          } finally {
+            Pop-Location
+          }
+
   dashboard:
     name: Dashboard
     needs: verification-scope
@@ -500,7 +614,7 @@ jobs:
         working-directory: .
       - run: uv sync --frozen --extra dev --extra server --python 3.11
         working-directory: .
-      - run: npm run check:api
+      - run: CAYU_PYTHON=../.venv/bin/python npm run check:api
       - run: npm run build:package
       - name: Check packaged dashboard assets
         run: |
@@ -530,7 +644,7 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/v') &&
       vars.PYPI_PUBLISH_ENABLED == 'true'
-    needs: [static, test, sqlite-cancellation, package, dashboard]
+    needs: [static, test, sqlite-cancellation, package, windows-dashboard-artifact, dashboard]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:

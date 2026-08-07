@@ -17,15 +17,23 @@ from cayu.runners.aws_lambda_microvm import LAMBDA_MICROVM_PROTOCOL_VERSION
 
 _ROOT = Path(__file__).parents[2]
 _SIDECAR_SOURCE = _ROOT / "examples" / "aws" / "lambda_microvm_sidecar"
+_COMPILED_DASHBOARD_SOURCE = _ROOT / "src" / "cayu" / "server" / "dashboard"
 _MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
 with (_ROOT / "pyproject.toml").open("rb") as _project_file:
     _VERSION = tomllib.load(_project_file)["project"]["version"]
 _WHEEL_DIST_INFO = f"cayu-{_VERSION}.dist-info"
+_DASHBOARD_SOURCE_BUNDLE_NAME = f"cayu-dashboard-source-{_VERSION}.zip"
+_DASHBOARD_SOURCE_BUNDLE = (
+    _ROOT / "src" / "cayu" / "data" / "dashboard_source" / _DASHBOARD_SOURCE_BUNDLE_NAME
+)
+_WHEEL_DASHBOARD_SOURCE = f"cayu/data/dashboard_source/{_DASHBOARD_SOURCE_BUNDLE_NAME}"
+_SDIST_DASHBOARD_SOURCE = f"src/cayu/data/dashboard_source/{_DASHBOARD_SOURCE_BUNDLE_NAME}"
 
 artifact_validator = runpy.run_path(str(_ROOT / "scripts" / "check_release_artifacts.py"))
 validate_sdist = artifact_validator["validate_sdist"]
 validate_wheel = artifact_validator["validate_wheel"]
 validate_sidecar_equivalence = artifact_validator["validate_sidecar_equivalence"]
+validate_dashboard_source_equivalence = artifact_validator["validate_dashboard_source_equivalence"]
 
 
 def _canonical_sidecar() -> dict[str, bytes]:
@@ -38,8 +46,17 @@ def _canonical_sidecar() -> dict[str, bytes]:
     }
 
 
+def _canonical_compiled_dashboard() -> dict[str, bytes]:
+    return {
+        path.relative_to(_COMPILED_DASHBOARD_SOURCE).as_posix(): path.read_bytes()
+        for path in _COMPILED_DASHBOARD_SOURCE.rglob("*")
+        if path.is_file()
+    }
+
+
 def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
     sidecar = sidecar or _canonical_sidecar()
+    compiled_dashboard = _canonical_compiled_dashboard()
     return {
         "cayu/__init__.py",
         "cayu/cli/_targets.py",
@@ -52,10 +69,8 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/guides/authoring.md",
         "cayu/guides/diagnostics.md",
         "cayu/guides/tool-effects.md",
-        "cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
-        "cayu/server/dashboard/index.html",
-        "cayu/server/dashboard/assets/app.js",
-        "cayu/server/dashboard/assets/app.css",
+        _WHEEL_DASHBOARD_SOURCE,
+        *{f"cayu/server/dashboard/{name}" for name in compiled_dashboard},
         *{f"{artifact_validator['_WHEEL_SIDECAR_PREFIX']}/{name}" for name in sidecar},
         f"{_WHEEL_DIST_INFO}/METADATA",
         f"{_WHEEL_DIST_INFO}/RECORD",
@@ -80,21 +95,31 @@ def _write_wheel(
     symlink_name: str | None = None,
 ) -> None:
     sidecar = sidecar or _canonical_sidecar()
+    compiled_dashboard = _canonical_compiled_dashboard()
     contents_by_name = contents_by_name or {}
     prefix = f"{artifact_validator['_WHEEL_SIDECAR_PREFIX']}/"
     with zipfile.ZipFile(path, "w") as archive:
         for name in names:
-            content: str | bytes = contents_by_name.get(name, "")
+            content: str | bytes = ""
             if name.startswith(prefix) and name.removeprefix(prefix) in sidecar:
                 content = sidecar[name.removeprefix(prefix)]
-            if name == "cayu/server/dashboard/THIRD_PARTY_LICENSES.md":
-                content = (
-                    third_party_notice
-                    if third_party_notice is not None
-                    else "\n".join(artifact_validator["_THIRD_PARTY_LICENSE_MARKERS"])
-                )
+            dashboard_prefix = "cayu/server/dashboard/"
+            if (
+                name.startswith(dashboard_prefix)
+                and name.removeprefix(dashboard_prefix) in compiled_dashboard
+            ):
+                content = compiled_dashboard[name.removeprefix(dashboard_prefix)]
+            if name == _WHEEL_DASHBOARD_SOURCE:
+                content = _DASHBOARD_SOURCE_BUNDLE.read_bytes()
             if name == f"{_WHEEL_DIST_INFO}/METADATA":
                 content = f"Metadata-Version: 2.4\nName: cayu\nVersion: {_VERSION}\n"
+            if name in contents_by_name:
+                content = contents_by_name[name]
+            if (
+                name == "cayu/server/dashboard/THIRD_PARTY_LICENSES.md"
+                and third_party_notice is not None
+            ):
+                content = third_party_notice
             if name == symlink_name:
                 member = zipfile.ZipInfo(name)
                 member.create_system = 3
@@ -112,6 +137,7 @@ def _write_sdist(
     contents_by_name: dict[str, str | bytes] | None = None,
 ) -> None:
     sidecar = sidecar or _canonical_sidecar()
+    compiled_dashboard = _canonical_compiled_dashboard()
     additional_names = additional_names or set()
     contents_by_name = contents_by_name or {}
     prefix = artifact_validator["_SDIST_SIDECAR_PREFIX"]
@@ -119,19 +145,30 @@ def _write_sdist(
         artifact_validator["_SDIST_REQUIRED"]
         | additional_names
         | {f"{prefix}/{name}" for name in sidecar}
+        | {_SDIST_DASHBOARD_SOURCE}
+        | {f"src/cayu/server/dashboard/{name}" for name in compiled_dashboard}
     )
-    notice = "\n".join(artifact_validator["_THIRD_PARTY_LICENSE_MARKERS"])
     with tarfile.open(path, "w:gz") as archive:
         for relative_name in names:
-            content: str | bytes = contents_by_name.get(relative_name, "")
+            content: str | bytes = ""
             if relative_name.startswith(f"{prefix}/"):
                 sidecar_name = relative_name.removeprefix(f"{prefix}/")
                 if sidecar_name in sidecar:
                     content = sidecar[sidecar_name]
+            dashboard_prefix = "src/cayu/server/dashboard/"
+            if (
+                relative_name.startswith(dashboard_prefix)
+                and relative_name.removeprefix(dashboard_prefix) in compiled_dashboard
+            ):
+                content = compiled_dashboard[relative_name.removeprefix(dashboard_prefix)]
+            if relative_name == _SDIST_DASHBOARD_SOURCE:
+                content = _DASHBOARD_SOURCE_BUNDLE.read_bytes()
             if relative_name == "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md":
-                content = notice
+                content = compiled_dashboard["THIRD_PARTY_LICENSES.md"]
             if relative_name == "PKG-INFO":
                 content = f"Metadata-Version: 2.4\nName: cayu\nVersion: {_VERSION}\n"
+            if relative_name in contents_by_name:
+                content = contents_by_name[relative_name]
             data = _as_bytes(content)
             member = tarfile.TarInfo(f"cayu-{_VERSION}/{relative_name}")
             member.size = len(data)
@@ -150,6 +187,22 @@ def _sidecar_with_nested_file() -> dict[str, bytes]:
     return sidecar
 
 
+def _dashboard_bundle_with_manifest_value(field: str, value: str) -> bytes:
+    output = io.BytesIO()
+    with (
+        zipfile.ZipFile(io.BytesIO(_DASHBOARD_SOURCE_BUNDLE.read_bytes())) as source,
+        zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as target,
+    ):
+        for member in source.infolist():
+            content = source.read(member)
+            if member.filename == "cayu-dashboard-source.json":
+                manifest = json.loads(content)
+                manifest[field] = value
+                content = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+            target.writestr(member, content)
+    return output.getvalue()
+
+
 def test_validate_wheel_requires_application_anatomy_guide(tmp_path: Path) -> None:
     wheel = tmp_path / "cayu.whl"
     names = _valid_wheel_names()
@@ -166,6 +219,66 @@ def test_validate_wheel_requires_sidecar_manifest(tmp_path: Path) -> None:
     _write_wheel(wheel, names)
     with pytest.raises(ValueError, match="missing required wheel files"):
         validate_wheel(wheel)
+
+
+def test_validate_wheel_requires_dashboard_source_bundle(tmp_path: Path) -> None:
+    wheel = tmp_path / "missing-dashboard-source.whl"
+    names = _valid_wheel_names()
+    names.remove(_WHEEL_DASHBOARD_SOURCE)
+    _write_wheel(wheel, names)
+
+    with pytest.raises(ValueError, match="missing required dashboard source bundle"):
+        validate_wheel(wheel)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("cayu_version", "9.9.9", "dashboard source Cayu version mismatch"),
+        ("server_contract_version", "999", "dashboard source server contract mismatch"),
+    ],
+)
+def test_validate_wheel_rejects_dashboard_source_metadata_drift(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    wheel = tmp_path / f"dashboard-{field}-mismatch.whl"
+    _write_wheel(
+        wheel,
+        _valid_wheel_names(),
+        contents_by_name={
+            _WHEEL_DASHBOARD_SOURCE: _dashboard_bundle_with_manifest_value(field, value)
+        },
+    )
+
+    with pytest.raises(ValueError, match=message):
+        validate_wheel(wheel)
+
+
+def test_validate_wheel_rejects_dashboard_source_compiled_asset_drift(tmp_path: Path) -> None:
+    wheel = tmp_path / "dashboard-assets-mismatch.whl"
+    _write_wheel(
+        wheel,
+        _valid_wheel_names(),
+        contents_by_name={"cayu/server/dashboard/index.html": "tampered\n"},
+    )
+
+    with pytest.raises(ValueError, match="does not match compiled dashboard assets"):
+        validate_wheel(wheel)
+
+
+def test_validate_release_artifacts_require_identical_dashboard_source_bundles(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="dashboard source bundle differs"):
+        validate_dashboard_source_equivalence(
+            tmp_path / "source.tar.gz",
+            tmp_path / "wheel.whl",
+            sdist_bundle=b"source",
+            wheel_bundle=b"wheel",
+        )
 
 
 def test_validate_wheel_rejects_manifest_inventory_and_digest_mismatches(tmp_path: Path) -> None:
@@ -195,14 +308,9 @@ def test_validate_release_artifacts_accept_manifest_driven_nested_files_and_zip_
     }
     _write_wheel(wheel, names, sidecar=sidecar)
     source_contents = validate_sdist(sdist)
-    wheel_contents = validate_wheel(wheel)
-    validate_sidecar_equivalence(
-        sdist,
-        wheel,
-        sdist_contents=source_contents,
-        wheel_contents=wheel_contents,
-    )
-    assert source_contents["support/nested.txt"] == b"nested\n"
+    validate_sidecar_equivalence(sdist, wheel)
+    validate_dashboard_source_equivalence(sdist, wheel)
+    assert source_contents.sidecar["support/nested.txt"] == b"nested\n"
 
 
 def test_validate_sidecar_manifest_version_must_match_package_metadata(tmp_path: Path) -> None:

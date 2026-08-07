@@ -7,14 +7,26 @@ import stat
 import sys
 import tarfile
 import zipfile
+from dataclasses import dataclass
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 
+from cayu._server_contract_version import SERVER_CONTRACT_VERSION
+from cayu.cli.dashboard import (
+    _REQUIRED_SOURCE_FILES,
+    DashboardSourceError,
+    ValidatedDashboardSource,
+    contents_digest,
+    validate_dashboard_source_bundle,
+)
 from cayu.cli.lambda_microvm import _SidecarArtifactError, _validate_artifact_contents
 
 _SIDECAR_MANIFEST = "cayu-lambda-microvm-sidecar-manifest.json"
 _SDIST_SIDECAR_PREFIX = "examples/aws/lambda_microvm_sidecar"
 _WHEEL_SIDECAR_PREFIX = "cayu/data/lambda_microvm_sidecar"
+_SDIST_DASHBOARD_SOURCE_PREFIX = "src/cayu/data/dashboard_source"
+_WHEEL_DASHBOARD_SOURCE_PREFIX = "cayu/data/dashboard_source"
+_DASHBOARD_SOURCE_REQUIRED = _REQUIRED_SOURCE_FILES
 _SDIST_REQUIRED = {
     "LICENSE",
     "NOTICE",
@@ -25,6 +37,9 @@ _SDIST_REQUIRED = {
     "src/cayu/data/__init__.py",
     "src/cayu/data/default_model_catalog.json",
     "src/cayu/data/default_price_book.json",
+    "src/cayu/server/dashboard/LICENSE",
+    "src/cayu/server/dashboard/NOTICE",
+    "src/cayu/server/dashboard/REDISTRIBUTION.md",
     "src/cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
     f"{_SDIST_SIDECAR_PREFIX}/{_SIDECAR_MANIFEST}",
 }
@@ -49,6 +64,9 @@ _WHEEL_REQUIRED = {
     "cayu/guides/authoring.md",
     "cayu/guides/diagnostics.md",
     "cayu/guides/tool-effects.md",
+    "cayu/server/dashboard/LICENSE",
+    "cayu/server/dashboard/NOTICE",
+    "cayu/server/dashboard/REDISTRIBUTION.md",
     "cayu/server/dashboard/THIRD_PARTY_LICENSES.md",
     "cayu/server/dashboard/index.html",
     f"{_WHEEL_SIDECAR_PREFIX}/{_SIDECAR_MANIFEST}",
@@ -67,6 +85,12 @@ _NON_PUBLIC_IDENTIFIERS = (
     b"vertex" + b"kg",
     b"lane" + b"-" + b"agent",
 )
+
+
+@dataclass(frozen=True)
+class ValidatedReleaseContents:
+    sidecar: dict[str, bytes]
+    dashboard_bundle: bytes
 
 
 def _fail(message: str) -> None:
@@ -143,7 +167,7 @@ def _validate_sidecar(
     return artifact.contents
 
 
-def validate_sdist(archive: Path) -> dict[str, bytes]:
+def validate_sdist(archive: Path) -> ValidatedReleaseContents:
     with tarfile.open(archive, "r:gz") as source:
         members = source.getmembers()
         if not members:
@@ -194,14 +218,22 @@ def validate_sdist(archive: Path) -> dict[str, bytes]:
         for name, content in contents_by_relative_name.items()
         if name.startswith(prefix)
     }
-    return _validate_sidecar(
+    sidecar = _validate_sidecar(
         sidecar_contents,
         archive=archive,
         package_version=package_version,
     )
+    dashboard_bundle = _validate_dashboard_source(
+        contents_by_relative_name,
+        archive=archive,
+        package_version=package_version,
+        bundle_prefix=_SDIST_DASHBOARD_SOURCE_PREFIX,
+        compiled_prefix="src/cayu/server/dashboard",
+    )
+    return ValidatedReleaseContents(sidecar=sidecar, dashboard_bundle=dashboard_bundle)
 
 
-def validate_wheel(archive: Path) -> dict[str, bytes]:
+def validate_wheel(archive: Path) -> ValidatedReleaseContents:
     with zipfile.ZipFile(archive) as wheel:
         members = wheel.infolist()
         if not members:
@@ -275,11 +307,76 @@ def validate_wheel(archive: Path) -> dict[str, bytes]:
         for name, content in file_contents.items()
         if name.startswith(prefix)
     }
-    return _validate_sidecar(
+    sidecar = _validate_sidecar(
         sidecar_contents,
         archive=archive,
         package_version=package_version,
     )
+    dashboard_bundle = _validate_dashboard_source(
+        file_contents,
+        archive=archive,
+        package_version=package_version,
+        bundle_prefix=_WHEEL_DASHBOARD_SOURCE_PREFIX,
+        compiled_prefix="cayu/server/dashboard",
+    )
+    return ValidatedReleaseContents(sidecar=sidecar, dashboard_bundle=dashboard_bundle)
+
+
+def _validate_dashboard_source(
+    archive_contents: dict[str, bytes],
+    *,
+    archive: Path,
+    package_version: str,
+    bundle_prefix: str,
+    compiled_prefix: str,
+) -> bytes:
+    expected_name = f"{bundle_prefix}/cayu-dashboard-source-{package_version}.zip"
+    bundle_names = sorted(
+        name
+        for name in archive_contents
+        if name.startswith(f"{bundle_prefix}/") and name.endswith(".zip")
+    )
+    if not bundle_names:
+        _fail(f"{archive}: missing required dashboard source bundle: {expected_name}")
+    if bundle_names != [expected_name]:
+        _fail(
+            f"{archive}: expected exactly dashboard source bundle {expected_name}, "
+            f"found {', '.join(bundle_names)}"
+        )
+    bundle = archive_contents[expected_name]
+    try:
+        artifact = validate_dashboard_source_bundle(
+            bundle,
+            expected_cayu_version=package_version,
+            expected_server_contract_version=SERVER_CONTRACT_VERSION,
+        )
+    except DashboardSourceError as exc:
+        raise ValueError(f"{archive}: invalid dashboard source bundle: {exc}") from exc
+    _validate_dashboard_source_inventory(artifact, archive=archive)
+
+    compiled_prefix = f"{compiled_prefix}/"
+    compiled_contents = {
+        name.removeprefix(compiled_prefix): content
+        for name, content in archive_contents.items()
+        if name.startswith(compiled_prefix)
+    }
+    compiled_digest = contents_digest(compiled_contents)
+    if compiled_digest != artifact.manifest.compiled_dashboard_digest:
+        _fail(
+            f"{archive}: dashboard source bundle does not match compiled dashboard assets: "
+            f"expected {artifact.manifest.compiled_dashboard_digest}, found {compiled_digest}"
+        )
+    return bundle
+
+
+def _validate_dashboard_source_inventory(
+    artifact: ValidatedDashboardSource,
+    *,
+    archive: Path,
+) -> None:
+    missing = sorted(_DASHBOARD_SOURCE_REQUIRED - artifact.contents.keys())
+    if missing:
+        _fail(f"{archive}: dashboard source bundle is incomplete: {', '.join(missing)}")
 
 
 def validate_sidecar_equivalence(
@@ -289,8 +386,12 @@ def validate_sidecar_equivalence(
     sdist_contents: dict[str, bytes] | None = None,
     wheel_contents: dict[str, bytes] | None = None,
 ) -> None:
-    source_contents = sdist_contents if sdist_contents is not None else validate_sdist(sdist)
-    package_contents = wheel_contents if wheel_contents is not None else validate_wheel(wheel)
+    source_contents = (
+        sdist_contents if sdist_contents is not None else validate_sdist(sdist).sidecar
+    )
+    package_contents = (
+        wheel_contents if wheel_contents is not None else validate_wheel(wheel).sidecar
+    )
     if source_contents.keys() != package_contents.keys():
         _fail(f"{wheel}: packaged sidecar inventory differs from the sdist source")
     mismatched = sorted(
@@ -298,6 +399,19 @@ def validate_sidecar_equivalence(
     )
     if mismatched:
         _fail(f"{wheel}: packaged sidecar differs from the sdist source: {', '.join(mismatched)}")
+
+
+def validate_dashboard_source_equivalence(
+    sdist: Path,
+    wheel: Path,
+    *,
+    sdist_bundle: bytes | None = None,
+    wheel_bundle: bytes | None = None,
+) -> None:
+    source = sdist_bundle if sdist_bundle is not None else validate_sdist(sdist).dashboard_bundle
+    package = wheel_bundle if wheel_bundle is not None else validate_wheel(wheel).dashboard_bundle
+    if source != package:
+        _fail(f"{wheel}: dashboard source bundle differs from the sdist bundle")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -313,8 +427,14 @@ def main(argv: list[str] | None = None) -> int:
     validate_sidecar_equivalence(
         sdists[0],
         wheels[0],
-        sdist_contents=sdist_contents,
-        wheel_contents=wheel_contents,
+        sdist_contents=sdist_contents.sidecar,
+        wheel_contents=wheel_contents.sidecar,
+    )
+    validate_dashboard_source_equivalence(
+        sdists[0],
+        wheels[0],
+        sdist_bundle=sdist_contents.dashboard_bundle,
+        wheel_bundle=wheel_contents.dashboard_bundle,
     )
     print(f"validated {sdists[0]} and {wheels[0]}")
     return 0

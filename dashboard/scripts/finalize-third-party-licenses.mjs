@@ -93,6 +93,18 @@ async function supplementalLicenses() {
   ];
 }
 
+async function sourceDocument(name) {
+  const localPath = path.join(dashboardRoot, name);
+  try {
+    return await readFile(localPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  return readFile(path.resolve(dashboardRoot, "..", name));
+}
+
 async function main() {
   const outputArgument = process.argv[2];
   if (outputArgument === undefined) {
@@ -121,6 +133,9 @@ async function main() {
     notice = `${notice.trimEnd()}\n\n${additions.join("\n")}`;
   }
   await writeFile(noticePath, `${notice.trimEnd()}\n`, "utf8");
+  for (const name of ["LICENSE", "NOTICE", "REDISTRIBUTION.md"]) {
+    await writeFile(path.join(outputDirectory, name), await sourceDocument(name));
+  }
 }
 
 await main();

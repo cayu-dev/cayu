@@ -1552,6 +1552,18 @@ and other protected content at the canonical target remain subject to configured
 authentication.
 Root, disabled, and unavailable dashboard mounts add no redirect.
 
+The installed distribution contains both the stock compiled dashboard and one deterministic
+editable dashboard-source bundle. The bundle manifest binds its file inventory to the installed
+Cayu version, exact server contract, generated OpenAPI client, and compiled dashboard asset tree.
+`cayu dashboard eject DESTINATION` validates that complete manifest in memory before writing,
+rejects unsafe or conflicting archive entries, and atomically publishes only to an absent or empty
+non-symlink destination. It performs no network or repository lookup. The extracted project is
+application-owned: installation, upgrade, and later Cayu commands never rewrite it. Explicit API
+generation may update that copy, while ordinary drift checking and the browser compatibility gate
+remain read-only. `DashboardConfig.directory`, `mount_cayu(..., dashboard_dir=...)`, and
+`mount_dashboard(..., dashboard_dir=...)` serve its production `dist/` under the same access,
+base-path, deep-link, redaction, and capability contracts as the bundled dashboard.
+
 The optional server exposes `GET /api/sessions/{session_id}/summary` for compact
 session health views. It combines session identity/status, storage-backed event
 totals and counts, the latest event, transcript message count, normalized usage,

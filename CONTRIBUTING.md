@@ -162,10 +162,16 @@ npm run test
 npm run typecheck
 npm run check:api
 npm run build:package
+cd ..
+uv run python scripts/build_dashboard_source_bundle.py
 ```
 
 `build:package` regenerates `src/cayu/server/dashboard/`. Commit those packaged assets
-when dashboard source changes; CI fails when the committed assets are stale.
+when dashboard source changes. The bundle command then regenerates the deterministic editable
+source shipped in wheel and source distributions. Commit both outputs; CI fails when the compiled
+assets, API baseline, license inventory, release metadata, or source bundle is stale. If a reviewed
+dependency license changes, update `dashboard/THIRD_PARTY_LICENSES.md` from the finalized build
+before regenerating the source bundle.
 
 ### Pull request verification scope
 

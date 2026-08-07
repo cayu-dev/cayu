@@ -1,0 +1,6 @@
+# Dashboard release inputs are hashed byte-for-byte across checkout platforms.
+/LICENSE text eol=lf
+/NOTICE text eol=lf
+dashboard/** text=auto eol=lf
+src/cayu/server/dashboard/** text=auto eol=lf
+src/cayu/data/dashboard_source/*.zip binary

@@ -49,7 +49,18 @@ without protection rules.
    add one exact, non-empty `## vX.Y.Z` section to `docs/release-notes.md` for
    the matching tag. The workflow publishes that curated section verbatim and
    does not generate release notes; a missing, duplicate, or empty section
-   fails before GitHub release creation.
+   fails before GitHub release creation. Regenerate dashboard API metadata,
+   compiled assets, and the version-matched editable source bundle after the
+   version change:
+
+   ```bash
+   cd dashboard
+   npm ci
+   CAYU_PYTHON=../.venv/bin/python npm run generate:api
+   npm run build:package
+   cd ..
+   uv run python scripts/build_dashboard_source_bundle.py
+   ```
 2. Create and push the matching tag:
 
    ```bash
@@ -60,9 +71,15 @@ without protection rules.
    git push origin "v${version}"
    ```
 
-3. Wait for the `static`, `test`, `package`, and `dashboard` jobs to pass on the
-   tagged commit. The `package` job checks that the tag matches the project
-   version and uploads the exact distribution it validated.
+3. Wait for the `static`, `test`, `sqlite-cancellation`, `package`,
+   `windows-dashboard-artifact`, and `dashboard` jobs to pass on the tagged commit. The
+   `package` job checks that the tag matches the project version and uploads the exact
+   distribution it validated. Its artifact gate verifies identical dashboard-source bundles in
+   the wheel and sdist, ejects from both installed artifacts, installs the locked Node
+   dependencies, runs lint/tests/typechecking/API drift checks, reproduces the packaged dashboard
+   tree, and browser-smokes a non-root deep link plus a bounded control-plane read against the
+   installed server. The Windows artifact job separately verifies native extraction, inherited
+   permissions, and the installed API-check workflow.
 4. Confirm the environment request names the expected tag and commit, then
    approve the `pypi` deployment.
 5. Wait for PyPI publication and the dependent GitHub release to complete.

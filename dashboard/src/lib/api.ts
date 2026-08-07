@@ -66,8 +66,9 @@ import type {
   UsageRollupRequest,
   UserInputRecoveryBody,
 } from "./generated/server-api"
+import { SUPPORTED_SERVER_CONTRACT_VERSION } from "./release-metadata.ts"
 
-export const SUPPORTED_SERVER_CONTRACT_VERSION = "6"
+export { SUPPORTED_SERVER_CONTRACT_VERSION } from "./release-metadata.ts"
 
 export class ApiClientError extends Error {
   readonly status: number

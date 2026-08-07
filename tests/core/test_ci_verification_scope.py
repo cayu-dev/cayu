@@ -43,15 +43,26 @@ def test_runtime_change_selects_sqlite_and_dashboard_contract_lanes() -> None:
     )
 
 
-def test_dashboard_contract_changes_select_only_dashboard_lane() -> None:
-    expected = VerificationScope(
+def test_dashboard_contract_changes_select_dashboard_and_release_artifact_lanes() -> None:
+    assert select_pull_request_jobs(["dashboard/src/api.ts"]) == VerificationScope(
+        dashboard=True,
+        release_artifacts=True,
+        sqlite_cancellation=False,
+    )
+
+    dashboard_only = VerificationScope(
         dashboard=True,
         release_artifacts=False,
         sqlite_cancellation=False,
     )
-    assert select_pull_request_jobs(["dashboard/src/api.ts"]) == expected
-    assert select_pull_request_jobs(["scripts/generate_dashboard_api_types.py"]) == expected
-    assert select_pull_request_jobs(["src/cayu/artifacts/base.py"]) == expected
+    assert select_pull_request_jobs(["scripts/generate_dashboard_api_types.py"]) == dashboard_only
+    assert select_pull_request_jobs(["src/cayu/artifacts/base.py"]) == dashboard_only
+    assert select_pull_request_jobs(["src/cayu/evals/corpus.py"]) == dashboard_only
+    assert select_pull_request_jobs([".gitattributes"]) == VerificationScope(
+        dashboard=True,
+        release_artifacts=True,
+        sqlite_cancellation=False,
+    )
 
 
 def test_release_input_selects_only_release_artifact_lane() -> None:
