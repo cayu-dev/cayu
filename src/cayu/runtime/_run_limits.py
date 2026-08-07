@@ -1214,7 +1214,7 @@ class RunLimitController:
                 created_at = created_at.replace(tzinfo=UTC)
             elapsed_seconds = max(
                 0,
-                int((datetime.now(UTC) - created_at.astimezone(UTC)).total_seconds()),
+                int((self._clock() - created_at.astimezone(UTC)).total_seconds()),
             )
         else:
             elapsed_seconds = max(0, int(time.monotonic() - run_started_at))

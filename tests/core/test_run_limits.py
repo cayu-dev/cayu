@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -79,6 +79,7 @@ def _controller(
     store: InMemorySessionStore,
     *,
     ledger: BudgetLedger | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> RunLimitController:
     budget_store = SessionBudgetStore(store)
     return RunLimitController(
@@ -90,7 +91,7 @@ def _controller(
             budget_store=budget_store,
             event_sinks=(),
         ),
-        clock=lambda: datetime(2026, 1, 1, tzinfo=UTC),
+        clock=clock or (lambda: datetime(2026, 1, 1, tzinfo=UTC)),
     )
 
 
@@ -539,6 +540,137 @@ def test_controller_returns_typed_limit_decision_without_finalizing_session():
     assert result.usage_summary.usage.total_tokens == 11
     assert result.events == ()
     assert session.status == SessionStatus.RUNNING
+
+
+def test_controller_session_elapsed_paths_share_injected_clock():
+    store = InMemorySessionStore()
+    injected_now = datetime(2030, 1, 1, tzinfo=UTC)
+    controller = _controller(store, clock=lambda: injected_now)
+
+    async def scenario():
+        await _running_session(store, "sess_controller_elapsed_clock")
+        store._sessions["sess_controller_elapsed_clock"].created_at = injected_now - timedelta(
+            seconds=2
+        )
+        session = await store.load("sess_controller_elapsed_clock")
+        assert session is not None
+        limits = RunLimits(max_elapsed_seconds=1, scope="session")
+
+        request_evaluation = await controller.evaluate_request_limits(
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            limits=limits,
+            budget_limits=(),
+            run_started_at=time.monotonic(),
+        )
+        operation_decision = await controller.evaluate_operation_run_limit(
+            session=session,
+            limits=limits,
+            operation_events=[],
+            operation_started_at=time.monotonic(),
+        )
+        return request_evaluation.decision, operation_decision
+
+    request_decision, operation_decision = asyncio.run(scenario())
+
+    assert request_decision is not None
+    assert request_decision.limit is StopLimit.ELAPSED_SECONDS
+    assert operation_decision is not None
+    assert operation_decision.limit is StopLimit.ELAPSED_SECONDS
+
+
+def test_cayu_app_session_elapsed_limit_uses_injected_clock_before_provider_dispatch():
+    store = InMemorySessionStore()
+    provider = _RecordingProvider()
+    injected_now = datetime(2030, 1, 1, tzinfo=UTC)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        clock=lambda: injected_now,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario():
+        session = await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_app_elapsed_clock",
+                messages=[Message.text("user", "initial")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        store._sessions[session.id].created_at = injected_now - timedelta(seconds=2)
+        await store.update_status(session.id, SessionStatus.COMPLETED)
+
+        events = [
+            event
+            async for event in app.resume(
+                ResumeRequest(
+                    session_id=session.id,
+                    messages=[Message.text("user", "do not dispatch")],
+                    limits=RunLimits(max_elapsed_seconds=1, scope="session"),
+                )
+            )
+        ]
+        loaded = await store.load(session.id)
+        assert loaded is not None
+        return events, loaded
+
+    events, session = asyncio.run(scenario())
+
+    assert provider.calls == 0
+    assert [event.type for event in events] == [
+        EventType.INTERACTION_STARTED,
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.INTERACTION_INTERRUPTED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert events[2].payload["limit"] == "elapsed_seconds"
+    assert session.status is SessionStatus.INTERRUPTED
+
+
+def test_controller_run_elapsed_paths_keep_monotonic_invocation_time(monkeypatch):
+    monotonic_now = {"value": 100.0}
+    monkeypatch.setattr(run_limits_module.time, "monotonic", lambda: monotonic_now["value"])
+    store = InMemorySessionStore()
+    controller = _controller(
+        store,
+        clock=lambda: datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+    async def evaluate(session_id: str):
+        session = await _running_session(store, session_id)
+        limits = RunLimits(max_elapsed_seconds=1, scope="run")
+        request_evaluation = await controller.evaluate_request_limits(
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            limits=limits,
+            budget_limits=(),
+            run_started_at=100.0,
+        )
+        operation_decision = await controller.evaluate_operation_run_limit(
+            session=session,
+            limits=limits,
+            operation_events=[],
+            operation_started_at=100.0,
+        )
+        return request_evaluation.decision, operation_decision
+
+    before_request, before_operation = asyncio.run(evaluate("sess_controller_run_elapsed_before"))
+    assert before_request is None
+    assert before_operation is None
+
+    monotonic_now["value"] = 101.0
+    after_request, after_operation = asyncio.run(evaluate("sess_controller_run_elapsed_after"))
+    assert after_request is not None
+    assert after_request.limit is StopLimit.ELAPSED_SECONDS
+    assert after_operation is not None
+    assert after_operation.limit is StopLimit.ELAPSED_SECONDS
 
 
 def test_controller_fails_closed_on_malformed_normalized_usage_without_crashing():

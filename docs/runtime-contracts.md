@@ -2647,8 +2647,10 @@ the default: token, tool-call, and cost limits are session-cumulative because
 they are evaluated from durable `model.completed` and `tool.call.started`
 events. `scope="run"` evaluates token, tool-call, and cost limits against the
 delta since the current `run(...)`, `resume(...)`, dispatch, or
-approval-continuation invocation started. `max_elapsed_seconds` is always scoped
-to the current runtime invocation and resets for each call.
+approval-continuation invocation started. For `max_elapsed_seconds`, session
+scope measures from the durable session creation time using the clock injected
+into `CayuApp`, while run scope uses monotonic per-invocation time and resets for
+each call.
 
 Budget limits are estimates, not billing records. They use normalized usage
 metrics and the app's pricing table. By default, a request-scoped interrupt
