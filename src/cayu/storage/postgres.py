@@ -1214,6 +1214,13 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         )
         """,
     ),
+    33: (
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_target_catalog "
+        "ON cayu_eval_runs(target_key, created_at DESC, run_id ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_target_status_claim "
+        "ON cayu_eval_runs("
+        "target_key, status, lease_expires_at, created_at ASC, run_id ASC)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """

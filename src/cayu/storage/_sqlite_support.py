@@ -1429,6 +1429,14 @@ _MIGRATION_STEPS: dict[int, str] = {
             created_at TEXT NOT NULL
         );
     """,
+    33: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_target_catalog
+            ON cayu_eval_runs(target_key, created_at DESC, run_id ASC);
+        CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_target_status_claim
+            ON cayu_eval_runs(
+                target_key, status, lease_expires_at, created_at ASC, run_id ASC
+            );
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no

@@ -12,6 +12,7 @@ from uuid import uuid4
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_BYTES,
     EvalCorpusDocument,
+    _portable_id,
     _sha256_revision,
     inspect_eval_corpus,
 )
@@ -70,7 +71,7 @@ from cayu.storage import _sqlite_support as sqlite_support
 from cayu.storage import migrations as schema
 from cayu.storage.sqlite import _run_off_thread_with_connection_ownership
 
-_SQLITE_EVAL_MIN_REQUIRED_REVISION = 32
+_SQLITE_EVAL_MIN_REQUIRED_REVISION = 33
 
 _RUN_COLUMNS = """
     run_id,
@@ -536,7 +537,12 @@ class SQLiteEvalStore(EvalStore):
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
         boundary = (
-            decode_run_cursor(query.cursor, query.status, query.corpus_revision)
+            decode_run_cursor(
+                query.cursor,
+                query.target_key,
+                query.status,
+                query.corpus_revision,
+            )
             if query.cursor is not None
             else None
         )
@@ -544,6 +550,9 @@ class SQLiteEvalStore(EvalStore):
         def operation(connection: sqlite3.Connection) -> EvalRunPage:
             clauses: list[str] = []
             params: list[object] = []
+            if query.target_key is not None:
+                clauses.append("target_key = ?")
+                params.append(query.target_key)
             if query.status is not None:
                 clauses.append("status = ?")
                 params.append(str(query.status))
@@ -572,8 +581,11 @@ class SQLiteEvalStore(EvalStore):
     async def claim_run(
         self,
         *,
+        target_key: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
+        if target_key is not None:
+            target_key = _portable_id(target_key, "target_key")
         lease_seconds = _lease_seconds(lease_seconds)
 
         def operation(connection: sqlite3.Connection) -> EvalRunLease | None:
@@ -581,17 +593,21 @@ class SQLiteEvalStore(EvalStore):
                 connection.execute("BEGIN IMMEDIATE")
                 now = datetime.now(UTC)
                 claim_id = str(uuid4())
+                target_clause = "" if target_key is None else "AND target_key = ?"
+                target_params: tuple[str, ...] = () if target_key is None else (target_key,)
                 row = connection.execute(
                     f"""
                     SELECT {_RUN_COLUMNS}
                     FROM cayu_eval_runs
                     WHERE ownership_epoch < 9223372036854775807
+                      {target_clause}
                       AND (status = ?
                        OR (status IN (?, ?) AND lease_expires_at <= ?))
                     ORDER BY created_at ASC, run_id ASC
                     LIMIT 1
                     """,
                     (
+                        *target_params,
                         str(EvalRunStatus.QUEUED),
                         str(EvalRunStatus.RUNNING),
                         str(EvalRunStatus.CANCELLING),

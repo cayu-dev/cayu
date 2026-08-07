@@ -90,7 +90,7 @@ def test_postgres_eval_store_shared_conformance(postgres_dsn) -> None:
     asyncio.run(exercise())
 
 
-def test_postgres_eval_store_creates_revision_thirty_two_schema(postgres_dsn) -> None:
+def test_postgres_eval_store_creates_revision_thirty_three_schema(postgres_dsn) -> None:
     async def exercise() -> None:
         import psycopg
 
@@ -109,9 +109,17 @@ def test_postgres_eval_store_creates_revision_thirty_two_schema(postgres_dsn) ->
             conn.cursor() as cur,
         ):
             await cur.execute(
-                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 32"
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 33"
             )
             assert await cur.fetchone() == ("additive", 31)
+            await cur.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() "
+                "AND indexname LIKE 'idx_cayu_eval_runs_target_%' ORDER BY indexname"
+            )
+            assert [row[0] for row in await cur.fetchall()] == [
+                "idx_cayu_eval_runs_target_catalog",
+                "idx_cayu_eval_runs_target_status_claim",
+            ]
             await cur.execute(
                 "SELECT tablename FROM pg_tables "
                 "WHERE schemaname = current_schema() AND tablename LIKE 'cayu_eval_%'"

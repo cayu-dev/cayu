@@ -83,7 +83,7 @@ def test_revision_thirty_two_adds_opt_in_eval_storage() -> None:
     state = m.SchemaState(revision=32, compatible_from=31)
 
     # Revision-31 stores do not use the new eval tables, so they may continue
-    # operating on the expanded database. EvalStore itself requires revision 32.
+    # operating on the expanded database.
     m.validate(state, app_latest=31, app_min_supported=31)
     m.validate(state, app_latest=32, app_min_supported=32)
     with pytest.raises(m.SchemaTooOld, match="requires >= 32"):
@@ -91,6 +91,21 @@ def test_revision_thirty_two_adds_opt_in_eval_storage() -> None:
             m.SchemaState(revision=31, compatible_from=31),
             app_latest=32,
             app_min_supported=32,
+        )
+
+
+def test_revision_thirty_three_adds_target_scoped_eval_indexes() -> None:
+    state = m.SchemaState(revision=33, compatible_from=31)
+
+    # Existing writers maintain every indexed column, while EvalStore requires
+    # the target-leading query plans introduced at revision 33.
+    m.validate(state, app_latest=31, app_min_supported=31)
+    m.validate(state, app_latest=33, app_min_supported=33)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 33"):
+        m.validate(
+            m.SchemaState(revision=32, compatible_from=31),
+            app_latest=33,
+            app_min_supported=33,
         )
 
 

@@ -199,6 +199,9 @@ REVISIONS: tuple[Revision, ...] = (
     # lifecycle tables. Existing stores neither read nor write these new tables,
     # so the revision is additive; EvalStore itself requires revision 32.
     Revision(revision=32, kind=RevisionKind.ADDITIVE, compatible_from=31),
+    # Add target-leading eval run catalog and claim indexes. Existing writers
+    # already maintain target_key and every lifecycle column in these indexes.
+    Revision(revision=33, kind=RevisionKind.ADDITIVE, compatible_from=31),
 )
 
 #: The revision an empty database is initialized to.

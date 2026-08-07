@@ -56,6 +56,16 @@ def _corpus_with_input(corpus: EvalCorpusDocument, text: str) -> EvalCorpusDocum
     )
 
 
+def _corpus_with_target(corpus: EvalCorpusDocument, target_key: str) -> EvalCorpusDocument:
+    return EvalCorpusDocument.create(
+        target_key=target_key,
+        evidence_policy=corpus.evidence_policy,
+        pricing_profile=corpus.pricing_profile,
+        suites=corpus.suites,
+        cases=corpus.cases,
+    )
+
+
 def _broken_redaction_boundary(_value):
     raise RuntimeError("must not cross the store boundary")
 
@@ -343,3 +353,52 @@ async def assert_eval_store_conformance(
     assert "request-" not in public_records
     assert "idempotency_key" not in public_records
     assert "claim_id" not in public_records
+
+    other_corpus = _corpus_with_target(corpus, "other-target")
+    await store.save_corpus(other_corpus, redact_json=_NO_SECRETS.redact_json)
+    other_suite = other_corpus.suites[0]
+    other_request = EvalRunRequest(
+        run_id="target-scope-other",
+        idempotency_key="sha256:" + "d" * 64,
+        corpus_revision=other_corpus.revision,
+        target_key=other_corpus.target_key,
+        suite_id=other_suite.id,
+        suite_revision=other_suite.revision,
+        max_concurrency=1,
+    )
+    main_suite = corpus.suites[0]
+    main_request = EvalRunRequest(
+        run_id="target-scope-main",
+        idempotency_key="sha256:" + "e" * 64,
+        corpus_revision=corpus.revision,
+        target_key=corpus.target_key,
+        suite_id=main_suite.id,
+        suite_revision=main_suite.revision,
+        max_concurrency=1,
+    )
+    await store.admit_run(other_request, redact_json=_NO_SECRETS.redact_json)
+    await store.admit_run(main_request, redact_json=_NO_SECRETS.redact_json)
+
+    main_claimed = await store.claim_run(target_key=corpus.target_key)
+    assert main_claimed is not None
+    assert main_claimed.run.id == main_request.run_id
+    await store.release_run(main_claimed.claim)
+    await store.request_cancel(main_request.run_id)
+    other_claimed = await store.claim_run(target_key=other_corpus.target_key)
+    assert other_claimed is not None
+    assert other_claimed.run.id == other_request.run_id
+    await store.release_run(other_claimed.claim)
+    await store.request_cancel(other_request.run_id)
+
+    target_page = await store.list_runs(EvalRunQuery(target_key=corpus.target_key, limit=1))
+    assert target_page.items
+    assert all(item.spec.target_key == corpus.target_key for item in target_page.items)
+    assert target_page.next_cursor is not None
+    with pytest.raises(ValueError, match="cursor does not match this query"):
+        await store.list_runs(
+            EvalRunQuery(
+                target_key=other_corpus.target_key,
+                limit=1,
+                cursor=target_page.next_cursor,
+            )
+        )

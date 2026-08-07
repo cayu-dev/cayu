@@ -338,6 +338,7 @@ class EvalSuiteCatalogQuery(_EvalStoreModel):
 
 
 class EvalRunQuery(_EvalStoreModel):
+    target_key: StrictStr | None = None
     status: EvalRunStatus | None = None
     corpus_revision: StrictStr | None = None
     cursor: StrictStr | None = None
@@ -351,6 +352,13 @@ class EvalRunQuery(_EvalStoreModel):
         ge=1_024,
         le=EVAL_STORE_MAX_PAGE_BYTES,
     )
+
+    @field_validator("target_key")
+    @classmethod
+    def validate_target_key(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return _portable_id(value, info.field_name)
 
     @field_validator("corpus_revision")
     @classmethod
@@ -785,10 +793,10 @@ class EvalRunPage(_EvalStoreModel):
             raise ValueError("Eval run page is not in keyset order.")
         if self.has_more:
             assert self.next_cursor is not None
-            timestamp, run_id, status, corpus_revision = _decode_cursor(
+            timestamp, run_id, target_key, status, corpus_revision = _decode_cursor(
                 self.next_cursor,
                 "runs",
-                ("created_at", "run_id", "status", "corpus_revision"),
+                ("created_at", "run_id", "target_key", "status", "corpus_revision"),
             )
             if (timestamp, run_id) != (
                 self.items[-1].created_at.isoformat(),
@@ -797,6 +805,8 @@ class EvalRunPage(_EvalStoreModel):
                 raise ValueError("Eval run cursor does not follow its last item.")
             if status and any(str(item.status) != status for item in self.items):
                 raise ValueError("Eval run cursor status filter does not match its items.")
+            if target_key and any(item.spec.target_key != target_key for item in self.items):
+                raise ValueError("Eval run cursor target filter does not match its items.")
             if corpus_revision and any(
                 item.spec.corpus_revision != corpus_revision for item in self.items
             ):
@@ -925,6 +935,7 @@ def _run_cursor(record: EvalRunRecord, query: EvalRunQuery) -> str:
         {
             "created_at": record.created_at.isoformat(),
             "run_id": record.id,
+            "target_key": query.target_key or "",
             "status": "" if query.status is None else str(query.status),
             "corpus_revision": query.corpus_revision or "",
         },
@@ -933,16 +944,19 @@ def _run_cursor(record: EvalRunRecord, query: EvalRunQuery) -> str:
 
 def decode_run_cursor(
     cursor: str,
+    target_key: str | None,
     status: EvalRunStatus | None,
     corpus_revision: str | None,
 ) -> tuple[datetime, str]:
-    timestamp, run_id, cursor_status, cursor_corpus_revision = _decode_cursor(
+    timestamp, run_id, cursor_target_key, cursor_status, cursor_corpus_revision = _decode_cursor(
         cursor,
         "runs",
-        ("created_at", "run_id", "status", "corpus_revision"),
+        ("created_at", "run_id", "target_key", "status", "corpus_revision"),
     )
-    if cursor_status != ("" if status is None else str(status)) or cursor_corpus_revision != (
-        corpus_revision or ""
+    if (
+        cursor_target_key != (target_key or "")
+        or cursor_status != ("" if status is None else str(status))
+        or cursor_corpus_revision != (corpus_revision or "")
     ):
         raise ValueError("Eval-store run cursor does not match this query.")
     try:
@@ -1140,9 +1154,10 @@ class EvalStore(ABC):
     async def claim_run(
         self,
         *,
+        target_key: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
-        """Claim the oldest eligible queued or expired nonterminal run."""
+        """Claim the oldest eligible queued or expired run for an optional target."""
 
     @abstractmethod
     async def heartbeat_run(
@@ -1397,7 +1412,12 @@ class InMemoryEvalStore(EvalStore):
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
         boundary = (
-            decode_run_cursor(query.cursor, query.status, query.corpus_revision)
+            decode_run_cursor(
+                query.cursor,
+                query.target_key,
+                query.status,
+                query.corpus_revision,
+            )
             if query.cursor is not None
             else None
         )
@@ -1406,6 +1426,7 @@ class InMemoryEvalStore(EvalStore):
                 self._record(state)
                 for state in self._runs.values()
                 if (query.status is None or state.status is query.status)
+                and (query.target_key is None or state.request.target_key == query.target_key)
                 and (
                     query.corpus_revision is None
                     or state.request.corpus_revision == query.corpus_revision
@@ -1426,15 +1447,19 @@ class InMemoryEvalStore(EvalStore):
     async def claim_run(
         self,
         *,
+        target_key: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
+        if target_key is not None:
+            target_key = _portable_id(target_key, "target_key")
         lease_seconds = _lease_seconds(lease_seconds)
         async with self._lock:
             now = self._now()
             eligible = [
                 state
                 for state in self._runs.values()
-                if state.epoch < _EVAL_STORE_MAX_BIGINT
+                if (target_key is None or state.request.target_key == target_key)
+                and state.epoch < _EVAL_STORE_MAX_BIGINT
                 and (
                     state.status is EvalRunStatus.QUEUED
                     or (

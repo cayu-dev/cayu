@@ -9,6 +9,7 @@ from uuid import uuid4
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_BYTES,
     EvalCorpusDocument,
+    _portable_id,
     _sha256_revision,
     inspect_eval_corpus,
 )
@@ -65,7 +66,7 @@ from cayu.evals.store import (
 )
 from cayu.storage.postgres import _PostgresStoreBase
 
-_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 32
+_POSTGRES_EVAL_MIN_REQUIRED_REVISION = 33
 
 _RUN_COLUMNS = """
     run_id,
@@ -504,12 +505,20 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
     async def list_runs(self, query: EvalRunQuery | None = None) -> EvalRunPage:
         query = _copy_query(query, EvalRunQuery)
         boundary = (
-            decode_run_cursor(query.cursor, query.status, query.corpus_revision)
+            decode_run_cursor(
+                query.cursor,
+                query.target_key,
+                query.status,
+                query.corpus_revision,
+            )
             if query.cursor is not None
             else None
         )
         clauses: list[str] = []
         params: list[object] = []
+        if query.target_key is not None:
+            clauses.append("target_key = %s")
+            params.append(query.target_key)
         if query.status is not None:
             clauses.append("status = %s")
             params.append(str(query.status))
@@ -541,19 +550,25 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
     async def claim_run(
         self,
         *,
+        target_key: str | None = None,
         lease_seconds: int = 300,
     ) -> EvalRunLease | None:
+        if target_key is not None:
+            target_key = _portable_id(target_key, "target_key")
         lease_seconds = _lease_seconds(lease_seconds)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     now = await _database_now(cur)
+                    target_clause = "" if target_key is None else "AND target_key = %s"
+                    target_params: tuple[str, ...] = () if target_key is None else (target_key,)
                     await cur.execute(
                         f"""
                         SELECT {_RUN_COLUMNS}
                         FROM cayu_eval_runs
                         WHERE ownership_epoch < 9223372036854775807
+                          {target_clause}
                           AND (status = %s
                            OR (status IN (%s, %s) AND lease_expires_at <= %s))
                         ORDER BY created_at ASC, run_id ASC
@@ -561,6 +576,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                         LIMIT 1
                         """,
                         (
+                            *target_params,
                             str(EvalRunStatus.QUEUED),
                             str(EvalRunStatus.RUNNING),
                             str(EvalRunStatus.CANCELLING),

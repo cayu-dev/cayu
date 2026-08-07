@@ -69,7 +69,7 @@ def test_sqlite_eval_store_shared_conformance(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-def test_sqlite_eval_store_creates_revision_thirty_two_schema(tmp_path) -> None:
+def test_sqlite_eval_store_creates_revision_thirty_three_schema(tmp_path) -> None:
     path = tmp_path / "evals.db"
 
     async def initialize() -> None:
@@ -80,12 +80,19 @@ def test_sqlite_eval_store_creates_revision_thirty_two_schema(tmp_path) -> None:
     connection = sqlite3.connect(path)
     try:
         revision = connection.execute(
-            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 32"
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 33"
         ).fetchone()
         tables = {
             row[0]
             for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'cayu_eval_%'"
+            ).fetchall()
+        }
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name LIKE 'idx_cayu_eval_runs_target_%'"
             ).fetchall()
         }
     finally:
@@ -97,6 +104,10 @@ def test_sqlite_eval_store_creates_revision_thirty_two_schema(tmp_path) -> None:
         "cayu_eval_results",
         "cayu_eval_runs",
         "cayu_eval_suites",
+    }
+    assert indexes == {
+        "idx_cayu_eval_runs_target_catalog",
+        "idx_cayu_eval_runs_target_status_claim",
     }
 
 
