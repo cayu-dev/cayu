@@ -1158,7 +1158,7 @@ def eval_corpus_from_json(source: str) -> EvalCorpusDocument:
             ),
         )
     except RecursionError as exc:
-        raise ValueError("Eval corpus JSON exceeds the supported nesting depth.") from exc
+        raise ValueError("Eval corpus JSON nesting exceeds the supported depth.") from exc
     document = copy_durable_json_object(decoded, "eval corpus JSON")
     raw_version = document.get("schema_version")
     if type(raw_version) is not int or raw_version != EVAL_CORPUS_SCHEMA_VERSION:
