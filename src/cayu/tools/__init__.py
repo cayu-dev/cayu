@@ -43,6 +43,15 @@ from cayu.tools.subagents import (
     default_background_subagent_registry,
 )
 from cayu.tools.user_input import UserInputTool
+from cayu.tools.web import (
+    HttpxWebFetchTransport,
+    SystemWebFetchResolver,
+    WebFetchHttpRequest,
+    WebFetchHttpResponse,
+    WebFetchHttpTransport,
+    WebFetchResolver,
+    WebFetchTool,
+)
 
 __all__ = [
     "ArtifactReadRequest",
@@ -57,6 +66,7 @@ __all__ = [
     "ExecCommandTool",
     "GitChangesTool",
     "GitCommandPolicy",
+    "HttpxWebFetchTransport",
     "ImageArtifactReader",
     "ListArtifactsTool",
     "ListFilesTool",
@@ -75,8 +85,14 @@ __all__ = [
     "SubagentResultTool",
     "SubagentSpec",
     "SubagentTool",
+    "SystemWebFetchResolver",
     "TextArtifactReader",
     "UserInputTool",
+    "WebFetchHttpRequest",
+    "WebFetchHttpResponse",
+    "WebFetchHttpTransport",
+    "WebFetchResolver",
+    "WebFetchTool",
     "WriteFileTool",
     "default_artifact_readers",
     "default_background_subagent_registry",

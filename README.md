@@ -410,6 +410,7 @@ Start with the document that matches the job:
 | Create per-session workspaces and runners | [Environment factories](https://github.com/cayu-dev/cayu/blob/main/docs/environment-factories.md) |
 | Implement a runner for your platform | [Build a runner](https://github.com/cayu-dev/cayu/blob/main/docs/build-a-runner.md) |
 | Configure network and credential boundaries | [Virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/virtual-egress.md) |
+| Let a local agent read bounded public HTTPS pages | [Local web fetch](https://github.com/cayu-dev/cayu/blob/main/docs/web-fetch.md) |
 | Run GitHub CLI without giving the runner a real token | [GitHub CLI through virtual egress](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/github-cli-virtual-egress.md) |
 | Design assertions and trajectory evals | [Evals](https://github.com/cayu-dev/cayu/blob/main/docs/evals.md) |
 | Estimate and govern cost | [Cost optimization](https://github.com/cayu-dev/cayu/blob/main/docs/cost-optimization.md) |

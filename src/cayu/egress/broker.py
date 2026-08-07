@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ipaddress
 import json
-import socket
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
@@ -14,6 +12,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cayu._validation import require_clean_nonblank
+from cayu.egress._resolution import (
+    resolve_destination as _resolve_destination,
+)
+from cayu.egress._resolution import (
+    validated_resolved_address as _validated_resolved_address,
+)
 from cayu.egress.credential_kinds import (
     extract_presented_credential,
     supported_credential_kind_descriptor,
@@ -226,29 +230,6 @@ class HttpxUpstream:
             host_header=host_header,
             sni_hostname=host if split.scheme == "https" else None,
         )
-
-
-async def _resolve_destination(host: str, port: int) -> tuple[str, ...]:
-    records = await asyncio.get_running_loop().getaddrinfo(
-        host,
-        port,
-        type=socket.SOCK_STREAM,
-    )
-    return tuple(dict.fromkeys(str(record[4][0]) for record in records))
-
-
-def _validated_resolved_address(address: str, *, allow_private: bool) -> str:
-    resolved = ipaddress.ip_address(address)
-    if (
-        resolved.is_loopback
-        or resolved.is_link_local
-        or resolved.is_multicast
-        or resolved.is_reserved
-        or resolved.is_unspecified
-        or (not allow_private and not resolved.is_global)
-    ):
-        raise ValueError("Upstream destination resolved to a prohibited address.")
-    return resolved.compressed
 
 
 def _format_authority(host: str, port: int, scheme: str) -> str:

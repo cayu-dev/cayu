@@ -3254,6 +3254,45 @@ is required, and return only safe results. Arbitrary values read directly from
 the host process environment do not automatically enter Cayu's workload-secret
 tracking or redaction boundary.
 
+`WebFetchTool` is the opt-in trusted-process adapter for bounded public page
+reads. Its model-facing `web_fetch` schema is closed and contains only `url`.
+The tool canonicalizes credentialless HTTPS URLs on port 443, rejects user
+information and IP literals, requires every DNS answer for each hop to be
+global, and pins the connection to one admitted address while retaining the
+canonical hostname for `Host` and TLS verification. It follows redirects
+itself so every target, including a same-host target, is resolved and admitted
+again. Mixed public/private answers fail closed.
+
+The direct transport requests identity content encoding and rejects compressed,
+missing-media-type, or unsupported-media-type successful responses before
+reading their bodies. Redirect and non-success bodies are left unread and are
+classified from status and headers. It streams raw identity response bytes
+under a finite ceiling and does not follow redirects below the admission layer.
+Redirect count, response bytes, accepted HTML/plain-text content types,
+extracted-content bytes, title bytes, and one total elapsed deadline are
+bounded. Results carry requested and final canonical URLs, optional title,
+`representation="text"`, extracted content, redirect evidence, and explicit
+`truncated` plus `truncation_reasons` metadata. Invalid URL,
+destination denial, DNS failure, redirect denial, timeout, unsupported content,
+and response overflow return distinct bounded `structured.error` codes without
+response bodies or exception text. Other connection failures use
+`fetch_failed`; completed non-success responses use `http_status` with the
+numeric status and no body. Cancellation remains caller cancellation.
+The model-facing summary places the final URL, fetched title, and extracted text
+inside one untrusted-content envelope and neutralizes embedded closing markers.
+
+The public read is `ToolEffect.NONE`; applications can name `web_fetch` in
+`TaintAwareToolPolicy.taint_sources` when later tools require origin-based
+gating.
+
+This adapter performs direct network I/O from the trusted Cayu application
+process. DNS admission and pinning constrain its destination, but do not provide
+process isolation, browser isolation, or a sandbox network boundary. It does
+not execute JavaScript, accept arbitrary request methods or headers, carry
+credentials, or invoke a secondary model. Register a separately governed
+sandbox or browser tool when those execution semantics are required. See
+[`docs/web-fetch.md`](web-fetch.md) for registration and deployment guidance.
+
 A custom `Tool` uses environment services through `ctx`:
 `await ctx.runner.exec(ExecCommand.process(...))` runs a command in the
 environment's runner, while `ctx.workspace.read_bytes(path, offset=...,
