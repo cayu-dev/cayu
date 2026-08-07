@@ -551,12 +551,12 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
         record_key = (event.session_id, approval_id)
         if record_key not in records or not identities[record_key].matches_payload(event.payload):
             continue
-        is_ambiguous_block_candidate = event.type is EventType.TOOL_CALL_BLOCKED and (
+        is_ambiguous_block_candidate = event.type == EventType.TOOL_CALL_BLOCKED and (
             "requested_decision" in event.payload
             or event.payload.get("decision") == "ambiguous"
             or event.payload.get("blocked_by") == "policy_evaluation_ambiguous"
         )
-        if event.type is EventType.TOOL_CALL_BLOCKED and not is_ambiguous_block_candidate:
+        if event.type == EventType.TOOL_CALL_BLOCKED and not is_ambiguous_block_candidate:
             continue
         try:
             resolution_call = pending_tool_call_for_approval_event(
@@ -569,18 +569,18 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
             continue
         is_gating_call = resolution_call.tool_call_id == records[record_key]["tool_call_id"]
         is_valid_ambiguous_block = (
-            event.type is EventType.TOOL_CALL_BLOCKED
+            event.type == EventType.TOOL_CALL_BLOCKED
             and resolution_call.policy_evidence is ToolPolicyEvidence.AMBIGUOUS
             and resolution_call.policy_decision is None
             and event.payload.get("decision") == "ambiguous"
             and event.payload.get("blocked_by") == "policy_evaluation_ambiguous"
             and event.payload.get("requested_decision") == ToolApprovalDecision.APPROVE.value
         )
-        if event.type is EventType.TOOL_CALL_BLOCKED and not is_valid_ambiguous_block:
+        if event.type == EventType.TOOL_CALL_BLOCKED and not is_valid_ambiguous_block:
             contradictory_resolution_keys.add(record_key)
             records.pop(record_key, None)
             continue
-        if event.type is EventType.TOOL_CALL_APPROVED and not (
+        if event.type == EventType.TOOL_CALL_APPROVED and not (
             resolution_call.policy_evidence
             in {
                 None,
@@ -591,7 +591,7 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
             contradictory_resolution_keys.add(record_key)
             records.pop(record_key, None)
             continue
-        is_ambiguous_block = event.type is EventType.TOOL_CALL_BLOCKED
+        is_ambiguous_block = event.type == EventType.TOOL_CALL_BLOCKED
         call_resolution_key = (*record_key, resolution_call.tool_call_id)
         resolution_state = str(event.type)
         previous_call_resolution_state = call_resolution_states.setdefault(
@@ -606,7 +606,7 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
             event.payload.get("requested_decision")
             if is_ambiguous_block
             else ToolApprovalDecision.APPROVE.value
-            if event.type is EventType.TOOL_CALL_APPROVED
+            if event.type == EventType.TOOL_CALL_APPROVED
             else ToolApprovalDecision.DENY.value
         )
         resolution_context = copy_durable_json_value(
@@ -657,7 +657,7 @@ def business_approval_audit(events: Iterable[Event]) -> list[BusinessApprovalRec
         if is_ambiguous_block:
             record["resolution_state"] = BusinessApprovalResolutionState.BLOCKED
             record["decision"] = None
-        elif event.type is EventType.TOOL_CALL_APPROVED:
+        elif event.type == EventType.TOOL_CALL_APPROVED:
             record["resolution_state"] = BusinessApprovalResolutionState.APPROVED
             record["decision"] = ToolApprovalDecision.APPROVE
         else:

@@ -75,6 +75,10 @@ def _routing(required_tier: str = "national") -> BusinessApprovalRouting:
     )
 
 
+def _with_string_event_types(events: list[Event]) -> list[Event]:
+    return [event.model_copy(update={"type": str(event.type)}, deep=True) for event in events]
+
+
 def _policy_request(tool_name: str = "route_package") -> ToolPolicyRequest:
     return ToolPolicyRequest(
         session=Session(
@@ -454,6 +458,40 @@ def test_audit_projects_pending_adapter_and_raw_resolutions() -> None:
     assert record.outcome is None and not record.resolved_via_adapter
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected_state", "expected_decision"),
+    [
+        (
+            BusinessApprovalOutcome.APPROVED,
+            BusinessApprovalResolutionState.APPROVED,
+            ToolApprovalDecision.APPROVE,
+        ),
+        (
+            BusinessApprovalOutcome.DECLINED,
+            BusinessApprovalResolutionState.DENIED,
+            ToolApprovalDecision.DENY,
+        ),
+    ],
+)
+def test_audit_matches_enum_and_string_event_types_for_resolutions(
+    outcome: BusinessApprovalOutcome,
+    expected_state: BusinessApprovalResolutionState,
+    expected_decision: ToolApprovalDecision,
+) -> None:
+    session_id = f"sess_audit_string_{outcome.value}"
+    app, store, _tool, approval_event = _paused_app(_tiered_policy(), session_id)
+    _resolve(app, session_id, approval_event, outcome=outcome)
+    events = asyncio.run(store.load_events(session_id))
+
+    enum_records = business_approval_audit(events)
+    string_records = business_approval_audit(_with_string_event_types(events))
+
+    assert string_records == enum_records
+    assert len(string_records) == 1
+    assert string_records[0].resolution_state is expected_state
+    assert string_records[0].decision is expected_decision
+
+
 def test_audit_projects_exact_ambiguous_acknowledgement_as_blocked() -> None:
     _app, _store, _tool, original_request = _paused_app(
         _tiered_policy(),
@@ -506,8 +544,10 @@ def test_audit_projects_exact_ambiguous_acknowledgement_as_blocked() -> None:
     )
 
     records = business_approval_audit([blocked, request])
+    string_records = business_approval_audit(_with_string_event_types([blocked, request]))
 
     assert len(records) == 1
+    assert string_records == records
     record = records[0]
     assert record.resolution_state is BusinessApprovalResolutionState.BLOCKED
     assert record.decision is None
@@ -533,6 +573,7 @@ def test_audit_projects_exact_ambiguous_acknowledgement_as_blocked() -> None:
         deep=True,
     )
     assert business_approval_audit([request, blocked, conflicting]) == []
+    assert business_approval_audit(_with_string_event_types([request, blocked, conflicting])) == []
 
 
 def test_audit_rejects_malformed_ambiguous_block() -> None:
@@ -560,8 +601,10 @@ def test_audit_rejects_malformed_ambiguous_block() -> None:
     )
 
     records = business_approval_audit([request, generic_block])
+    string_records = business_approval_audit(_with_string_event_types([request, generic_block]))
 
     assert records == []
+    assert string_records == []
 
 
 def test_audit_ignores_ambiguous_sibling_blocks_in_any_event_order() -> None:
@@ -841,10 +884,14 @@ def test_audit_does_not_attach_resolution_from_another_execution_unit() -> None:
     )
 
     records = business_approval_audit([approval_event, conflicting_resolution])
+    mixed_records = business_approval_audit(
+        [approval_event, _with_string_event_types([conflicting_resolution])[0]]
+    )
 
     assert len(records) == 1
     assert records[0].pending
     assert records[0].resolved_at is None
+    assert mixed_records == records
 
 
 @pytest.mark.parametrize(
@@ -875,8 +922,12 @@ def test_audit_fails_closed_on_conflicting_resolution_tool_descriptor(
     )
 
     records = business_approval_audit([approval_event, conflicting_resolution])
+    string_records = business_approval_audit(
+        _with_string_event_types([approval_event, conflicting_resolution])
+    )
 
     assert records == []
+    assert string_records == []
 
 
 def test_audit_fails_closed_on_conflicting_duplicate_request_descriptor() -> None:
@@ -906,8 +957,12 @@ def test_audit_fails_closed_on_conflicting_resolutions_for_one_execution_unit() 
     )
 
     records = business_approval_audit([approval_event, approved, conflicting])
+    string_records = business_approval_audit(
+        _with_string_event_types([approval_event, approved, conflicting])
+    )
 
     assert records == []
+    assert string_records == []
 
 
 def test_lost_resolution_race_surfaces_the_primitives_error() -> None:
