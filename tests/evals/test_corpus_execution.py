@@ -123,7 +123,7 @@ def _corpus(
 
 
 def _target(
-    provider: ScriptedModelProvider,
+    provider: ModelProvider,
     *,
     key: str = "refund-agent",
     price_book: PriceBook | None = None,
@@ -784,6 +784,53 @@ def test_corpus_compilation_builds_one_shared_pricing_binding(monkeypatch):
     )
     assert identity_calls == 1
     assert len({id(binding) for binding in bindings}) == 1
+
+
+def test_full_target_validation_reuses_corpus_and_pricing_across_suites(monkeypatch):
+    import cayu.evals.portable_assertions as portable_assertions_module
+
+    price_book = _price_book()
+    base = _corpus(trials=1, price_book=price_book)
+    second_suite = EvalSuiteSpec.create(
+        id="second-regressions",
+        name="Second regressions",
+        trial_request=TrialRequestSpec(trials=1, timeout_seconds=30),
+    )
+    base_case = base.cases[0]
+    second_case = EvalCaseSpec.create(
+        id="second-case",
+        suite_id=second_suite.id,
+        name="Second case",
+        source=base_case.source,
+        input=base_case.input,
+        assertions=base_case.assertions,
+    )
+    corpus = EvalCorpusDocument.create(
+        target_key=base.target_key,
+        evidence_policy=base.evidence_policy,
+        pricing_profile=base.pricing_profile,
+        suites=(*base.suites, second_suite),
+        cases=(*base.cases, second_case),
+    )
+    target = _target(_provider(trials=1), price_book=price_book)
+    identity_calls = 0
+    pricing_identity = execution_module.pricing_profile_identity
+
+    def counted_identity(source):
+        nonlocal identity_calls
+        identity_calls += 1
+        return pricing_identity(source)
+
+    monkeypatch.setattr(execution_module, "pricing_profile_identity", counted_identity)
+    monkeypatch.setattr(
+        portable_assertions_module,
+        "pricing_profile_identity",
+        counted_identity,
+    )
+
+    execution_module._validate_corpus_target_compatibility(corpus, target)
+
+    assert 0 < identity_calls <= 2
 
 
 def test_pricing_is_required_only_for_the_selected_suite_that_uses_it():

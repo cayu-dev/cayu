@@ -271,6 +271,7 @@ def _compile_corpus_assertion_specs(
     evidence_policy: EvaluationEvidencePolicySpec,
     trusted_pricing: PriceBook | None,
     expected_pricing_profile: PricingProfileIdentityV1 | None,
+    trusted_pricing_identity: PricingProfileIdentityV1 | None = None,
 ) -> tuple[EvalAssertion, ...]:
     """Compile one corpus suite with a single shared pricing binding."""
 
@@ -284,6 +285,12 @@ def _compile_corpus_assertion_specs(
         raise TypeError(
             "expected_pricing_profile must be an exact PricingProfileIdentityV1 or None."
         )
+    if trusted_pricing_identity is not None and (
+        type(trusted_pricing_identity) is not PricingProfileIdentityV1
+    ):
+        raise TypeError(
+            "trusted_pricing_identity must be an exact PricingProfileIdentityV1 or None."
+        )
 
     validated_specs = tuple(_validated_assertion_spec(spec) for spec in specs)
     uses_pricing = any(type(spec) is MaxEstimatedCostAssertionSpec for spec in validated_specs)
@@ -291,7 +298,11 @@ def _compile_corpus_assertion_specs(
     if uses_pricing:
         if trusted_pricing is None:
             raise ValueError("Eval corpus pricing profile does not match the trusted CorpusTarget.")
-        trusted_identity = pricing_profile_identity(trusted_pricing)
+        trusted_identity = (
+            pricing_profile_identity(trusted_pricing)
+            if trusted_pricing_identity is None
+            else trusted_pricing_identity
+        )
         if trusted_identity != expected_pricing_profile:
             raise ValueError("Eval corpus pricing profile does not match the trusted CorpusTarget.")
         pricing_binding = _CompiledPricingBinding(

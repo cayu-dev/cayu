@@ -26,6 +26,8 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_TRIALS,
     EvalCorpusDocument,
     EvaluationEvidencePolicySpec,
+    MaxEstimatedCostAssertionSpec,
+    PricingProfileIdentityV1,
     _bounded_durable_text,
     _content_revision,
     _model_content_revision,
@@ -377,6 +379,12 @@ class CompiledCorpusSuite:
     timeout_seconds: int
 
 
+@dataclass(frozen=True)
+class _CorpusCompilationContext:
+    corpus: EvalCorpusDocument
+    target: CorpusTarget
+
+
 def _copy_corpus_target(target: CorpusTarget) -> CorpusTarget:
     if type(target) is not CorpusTarget:
         raise TypeError("target must be an exact CorpusTarget.")
@@ -396,32 +404,58 @@ def evaluation_target_identity(target: CorpusTarget) -> EvaluationTargetIdentity
     """Describe a validated target without invoking application dependencies."""
 
     validated = _copy_corpus_target(target)
-    manifest = validated.app.describe()
+    return _evaluation_target_identity_from_validated_target(validated)
+
+
+def _evaluation_target_identity_from_validated_target(
+    target: CorpusTarget,
+) -> EvaluationTargetIdentity:
+    """Describe an internally validated target without another potentially large copy."""
+
+    if type(target) is not CorpusTarget:
+        raise TypeError("target must be an exact CorpusTarget.")
+    manifest = target.app.describe()
     if type(manifest) is not AppManifest:
         raise TypeError("CayuApp.describe() must return an AppManifest.")
     return EvaluationTargetIdentity(
-        target_key=validated.key,
-        application_release_id=validated.application_release_id,
+        target_key=target.key,
+        application_release_id=target.application_release_id,
         app_manifest=manifest,
     )
 
 
-def compile_corpus_suite(
+def _prepare_corpus_compilation(
     corpus: EvalCorpusDocument,
     target: CorpusTarget,
-    suite_id: str,
-) -> CompiledCorpusSuite:
-    """Compile authority-free corpus data against one trusted local target."""
+) -> _CorpusCompilationContext:
+    return _prepare_corpus_with_validated_target(corpus, _copy_corpus_target(target))
 
+
+def _prepare_corpus_with_validated_target(
+    corpus: EvalCorpusDocument,
+    target: CorpusTarget,
+) -> _CorpusCompilationContext:
     if type(corpus) is not EvalCorpusDocument:
         raise TypeError("corpus must be an exact EvalCorpusDocument.")
+    if type(target) is not CorpusTarget:
+        raise TypeError("target must be an exact CorpusTarget.")
     validated_corpus = EvalCorpusDocument.model_validate(_model_python_input(corpus))
-    validated_target = _copy_corpus_target(target)
-    validated_suite_id = _portable_id(suite_id, "suite_id")
-    if validated_corpus.target_key != validated_target.key:
+    if validated_corpus.target_key != target.key:
         raise ValueError("Eval corpus target key does not match the trusted CorpusTarget.")
-    if validated_corpus.evidence_policy != validated_target.evidence_policy:
+    if validated_corpus.evidence_policy != target.evidence_policy:
         raise ValueError("Eval corpus evidence policy does not match the trusted CorpusTarget.")
+    return _CorpusCompilationContext(corpus=validated_corpus, target=target)
+
+
+def _compile_prepared_corpus_suite(
+    context: _CorpusCompilationContext,
+    suite_id: str,
+    *,
+    trusted_pricing_identity: PricingProfileIdentityV1 | None = None,
+) -> CompiledCorpusSuite:
+    validated_corpus = context.corpus
+    validated_target = context.target
+    validated_suite_id = _portable_id(suite_id, "suite_id")
 
     suite_spec = next(
         (suite for suite in validated_corpus.suites if suite.id == validated_suite_id),
@@ -450,6 +484,7 @@ def compile_corpus_suite(
             evidence_policy=validated_target.evidence_policy,
             trusted_pricing=validated_target.price_book,
             expected_pricing_profile=validated_corpus.pricing_profile,
+            trusted_pricing_identity=trusted_pricing_identity,
         )
     )
     compiled_input_chars = 0
@@ -504,6 +539,44 @@ def compile_corpus_suite(
         trials=suite_spec.trial_request.trials,
         timeout_seconds=suite_spec.trial_request.timeout_seconds,
     )
+
+
+def compile_corpus_suite(
+    corpus: EvalCorpusDocument,
+    target: CorpusTarget,
+    suite_id: str,
+) -> CompiledCorpusSuite:
+    """Compile authority-free corpus data against one trusted local target."""
+
+    return _compile_prepared_corpus_suite(
+        _prepare_corpus_compilation(corpus, target),
+        suite_id,
+    )
+
+
+def _validate_corpus_target_compatibility(
+    corpus: EvalCorpusDocument,
+    target: CorpusTarget,
+) -> None:
+    """Validate every suite against one trusted target without repeated full copies."""
+
+    context = _prepare_corpus_compilation(corpus, target)
+    uses_pricing = any(
+        type(assertion) is MaxEstimatedCostAssertionSpec
+        for case in context.corpus.cases
+        for assertion in case.assertions
+    )
+    trusted_pricing_identity = None
+    if uses_pricing:
+        if context.target.price_book is None:
+            raise ValueError("Eval corpus pricing profile does not match the trusted CorpusTarget.")
+        trusted_pricing_identity = pricing_profile_identity(context.target.price_book)
+    for suite in context.corpus.suites:
+        _compile_prepared_corpus_suite(
+            context,
+            suite.id,
+            trusted_pricing_identity=trusted_pricing_identity,
+        )
 
 
 class CorpusExecutionResult(BaseModel):
@@ -606,14 +679,36 @@ async def run_corpus_suite(
     """Execute one corpus suite through Cayu's existing runner and publish it safely."""
 
     validated_target = _copy_corpus_target(target)
-    if type(max_concurrency) is not int:
-        raise TypeError("max_concurrency must be an int.")
-    if not 1 <= max_concurrency <= validated_target.limits.max_concurrency:
-        raise ValueError(
-            "max_concurrency must be between 1 and the trusted target concurrency limit."
-        )
-    compiled = compile_corpus_suite(corpus, validated_target, suite_id)
-    target_before = evaluation_target_identity(validated_target)
+    _validate_corpus_concurrency(validated_target, max_concurrency)
+    compiled = _compile_prepared_corpus_suite(
+        _prepare_corpus_with_validated_target(corpus, validated_target),
+        suite_id,
+    )
+    return await _run_compiled_corpus_suite(
+        validated_target,
+        compiled,
+        max_concurrency=max_concurrency,
+    )
+
+
+async def _run_compiled_corpus_suite(
+    target: CorpusTarget,
+    compiled: CompiledCorpusSuite,
+    *,
+    max_concurrency: int,
+) -> CorpusExecutionResult:
+    """Execute one internally compiled suite without repeating corpus compilation."""
+
+    validated_target = _copy_corpus_target(target)
+    if type(compiled) is not CompiledCorpusSuite:
+        raise TypeError("compiled must be an exact CompiledCorpusSuite.")
+    if compiled.corpus.target_key != validated_target.key:
+        raise ValueError("Compiled corpus target key does not match the trusted target.")
+    if compiled.corpus.evidence_policy != validated_target.evidence_policy:
+        raise ValueError("Compiled corpus evidence policy does not match the trusted target.")
+    _validate_corpus_concurrency(validated_target, max_concurrency)
+
+    target_before = _evaluation_target_identity_from_validated_target(validated_target)
     trial_count = len(compiled.suite.cases) * compiled.trials
     output_preview_bytes = min(
         EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
@@ -627,7 +722,7 @@ async def run_corpus_suite(
         trials=compiled.trials,
         output_preview_bytes=output_preview_bytes,
     )
-    target_after = evaluation_target_identity(validated_target)
+    target_after = _evaluation_target_identity_from_validated_target(validated_target)
     if target_after != target_before:
         raise RuntimeError("CorpusTarget application manifest changed during eval execution.")
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)
@@ -641,3 +736,12 @@ async def run_corpus_suite(
             trial_public_data_by_case=trial_public_data_by_case,
         ),
     )
+
+
+def _validate_corpus_concurrency(target: CorpusTarget, max_concurrency: int) -> None:
+    if type(max_concurrency) is not int:
+        raise TypeError("max_concurrency must be an int.")
+    if not 1 <= max_concurrency <= target.limits.max_concurrency:
+        raise ValueError(
+            "max_concurrency must be between 1 and the trusted target concurrency limit."
+        )
