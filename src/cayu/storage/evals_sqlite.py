@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +14,7 @@ from cayu.evals.corpus import (
     EvalCorpusDocument,
     _portable_id,
     _sha256_revision,
+    eval_corpus_from_json,
 )
 from cayu.evals.execution import CORPUS_EXECUTION_RESULT_MAX_BYTES, CorpusExecutionResult
 from cayu.evals.execution_reporting import corpus_execution_result_from_json
@@ -324,7 +324,7 @@ class SQLiteEvalStore(EvalStore):
         revision = _sha256_revision(revision, "revision")
         max_bytes = _read_limit(max_bytes, hard_max=EVAL_CORPUS_MAX_BYTES)
 
-        def operation(connection: sqlite3.Connection) -> EvalCorpusDocument | None:
+        def operation(connection: sqlite3.Connection) -> str | None:
             size_row = connection.execute(
                 "SELECT document_bytes FROM cayu_eval_corpora WHERE revision = ?",
                 (revision,),
@@ -339,9 +339,12 @@ class SQLiteEvalStore(EvalStore):
             ).fetchone()
             if row is None:
                 raise RuntimeError("Immutable eval corpus disappeared during a read.")
-            return EvalCorpusDocument.model_validate(json.loads(row["document_json"]))
+            return row["document_json"]
 
-        return await self._run(operation)
+        document = await self._run(operation)
+        if document is None:
+            return None
+        return await asyncio.to_thread(eval_corpus_from_json, document)
 
     async def list_corpora(
         self,
@@ -780,15 +783,26 @@ class SQLiteEvalStore(EvalStore):
             redact_json=redact_json,
         )
         document_text = document.decode("utf-8")
+        request = await self._load_run_request(claim.run_id)
+        corpus = await self.load_corpus(request.corpus_revision)
+        if corpus is None:
+            raise RuntimeError("Eval run references a missing immutable corpus.")
+        validated = await asyncio.to_thread(
+            validate_result_for_run,
+            request,
+            result,
+            corpus,
+        )
 
         def operation(connection: sqlite3.Connection) -> EvalRunRecord:
             try:
                 connection.execute("BEGIN IMMEDIATE")
                 now = datetime.now(UTC)
                 row = self._require_run_row(connection, claim.run_id)
-                request = _request_from_row(row)
-                corpus = self._load_corpus_document(connection, request.corpus_revision)
-                validated = validate_result_for_run(request, result, corpus)
+                if _request_from_row(row) != request:
+                    raise EvalRunStateConflict(
+                        "Eval run request changed during result publication."
+                    )
                 status = EvalRunStatus(row["status"])
                 if status is EvalRunStatus.COMPLETED:
                     existing = connection.execute(
@@ -928,7 +942,7 @@ class SQLiteEvalStore(EvalStore):
         run_id = _store_identifier(run_id, "run_id")
         max_bytes = _read_limit(max_bytes, hard_max=CORPUS_EXECUTION_RESULT_MAX_BYTES)
 
-        def operation(connection: sqlite3.Connection) -> CorpusExecutionResult | None:
+        def operation(connection: sqlite3.Connection) -> str | None:
             size = connection.execute(
                 "SELECT result_bytes FROM cayu_eval_results WHERE run_id = ?",
                 (run_id,),
@@ -943,9 +957,12 @@ class SQLiteEvalStore(EvalStore):
             ).fetchone()
             if row is None:
                 raise RuntimeError("Immutable eval result disappeared during a read.")
-            return corpus_execution_result_from_json(row["result_json"])
+            return row["result_json"]
 
-        return await self._run(operation)
+        document = await self._run(operation)
+        if document is None:
+            return None
+        return await asyncio.to_thread(corpus_execution_result_from_json, document)
 
     async def _terminalize_without_result(
         self,
@@ -1041,6 +1058,12 @@ class SQLiteEvalStore(EvalStore):
             raise KeyError(f"Eval run not found: {run_id}")
         return row
 
+    async def _load_run_request(self, run_id: str) -> EvalRunRequest:
+        def operation(connection: sqlite3.Connection) -> EvalRunRequest:
+            return _request_from_row(self._require_run_row(connection, run_id))
+
+        return await self._run(operation)
+
     @staticmethod
     def _corpus_exists(connection: sqlite3.Connection, revision: str) -> bool:
         return (
@@ -1069,19 +1092,6 @@ class SQLiteEvalStore(EvalStore):
             (revision,),
         ).fetchone()
         return None if row is None else cls._corpus_entry_from_row(row)
-
-    @staticmethod
-    def _load_corpus_document(
-        connection: sqlite3.Connection,
-        revision: str,
-    ) -> EvalCorpusDocument:
-        row = connection.execute(
-            "SELECT document_json FROM cayu_eval_corpora WHERE revision = ?",
-            (revision,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("Eval run references a missing immutable corpus.")
-        return EvalCorpusDocument.model_validate(json.loads(row["document_json"]))
 
     @staticmethod
     def _corpus_entry_from_row(row: sqlite3.Row) -> EvalCorpusCatalogEntry:

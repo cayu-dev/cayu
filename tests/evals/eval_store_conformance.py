@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import threading
+from typing import Literal
 
 import pytest
 
@@ -157,6 +160,94 @@ def _request(corpus, *, suffix: str, concurrency: int = 1) -> EvalRunRequest:
         suite_revision=suite.revision,
         max_concurrency=concurrency,
     )
+
+
+async def assert_eval_store_reconstruction_releases_heartbeat_capacity(
+    store: EvalStore,
+    *,
+    corpus: EvalCorpusDocument,
+    result: CorpusExecutionResult,
+    read_kind: Literal["corpus", "result"],
+    parser_owner: object,
+    parser_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Prove CPU reconstruction cannot occupy durable lease-operation capacity."""
+
+    if read_kind not in {"corpus", "result"}:
+        raise ValueError("read_kind must be corpus or result.")
+    suite = corpus.suites[0]
+
+    def request(run_id: str, idempotency_character: str) -> EvalRunRequest:
+        return EvalRunRequest(
+            run_id=run_id,
+            idempotency_key="sha256:" + idempotency_character * 64,
+            corpus_revision=corpus.revision,
+            target_key=corpus.target_key,
+            suite_id=suite.id,
+            suite_revision=suite.revision,
+            max_concurrency=1,
+        )
+
+    await store.save_corpus(corpus, redact_json=_NO_SECRETS.redact_json)
+    await store.admit_run(
+        request("capacity-completed-run", "7"),
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    completed_lease = await store.claim_run(target_key=corpus.target_key)
+    assert completed_lease is not None
+    await store.publish_result(
+        completed_lease.claim,
+        result,
+        redact_json=_NO_SECRETS.redact_json,
+    )
+
+    await store.admit_run(
+        request("capacity-active-run", "8"),
+        redact_json=_NO_SECRETS.redact_json,
+    )
+    active_lease = await store.claim_run(
+        target_key=corpus.target_key,
+        lease_seconds=5,
+    )
+    assert active_lease is not None
+
+    parser_started = threading.Event()
+    release_parser = threading.Event()
+    original_parser = getattr(parser_owner, parser_name)
+
+    def blocking_parser(document):
+        parser_started.set()
+        if not release_parser.wait(timeout=5):
+            raise AssertionError("Timed out releasing eval document reconstruction.")
+        return original_parser(document)
+
+    monkeypatch.setattr(parser_owner, parser_name, blocking_parser)
+    read_task = asyncio.create_task(
+        store.load_corpus(corpus.revision)
+        if read_kind == "corpus"
+        else store.load_result("capacity-completed-run")
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2
+        while not parser_started.is_set() and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        assert parser_started.is_set()
+
+        heartbeat = await asyncio.wait_for(
+            store.heartbeat_run(active_lease.claim, extend_seconds=5),
+            timeout=2,
+        )
+        assert heartbeat.ownership is not None
+        assert heartbeat.ownership.epoch == active_lease.claim.epoch
+
+        release_parser.set()
+        assert await read_task == (corpus if read_kind == "corpus" else result)
+        await store.release_run(active_lease.claim)
+    finally:
+        release_parser.set()
+        await asyncio.gather(read_task, return_exceptions=True)
 
 
 async def assert_eval_store_conformance(

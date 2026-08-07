@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
+from contextlib import suppress
 
 import pytest
-from tests.evals.eval_store_conformance import assert_eval_store_conformance
+from tests.evals.eval_store_conformance import (
+    assert_eval_store_conformance,
+    assert_eval_store_reconstruction_releases_heartbeat_capacity,
+)
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
 
+import cayu.storage.evals_sqlite as evals_sqlite_module
 from cayu.evals.execution import run_corpus_suite
-from cayu.evals.store import EvalRunRequest, EvalRunStatus
+from cayu.evals.store import EvalRunClaim, EvalRunRecord, EvalRunRequest, EvalRunStatus
 from cayu.storage.evals_sqlite import SQLiteEvalStore
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults.redaction import SecretRedactor
@@ -38,11 +44,16 @@ async def _publish_result(store, claim, result):
     )
 
 
-def _request(corpus, *, run_id: str = "run-1") -> EvalRunRequest:
+def _request(
+    corpus,
+    *,
+    run_id: str = "run-1",
+    idempotency_digit: str = "1",
+) -> EvalRunRequest:
     suite = corpus.suites[0]
     return EvalRunRequest(
         run_id=run_id,
-        idempotency_key="sha256:" + "1" * 64,
+        idempotency_key="sha256:" + idempotency_digit * 64,
         corpus_revision=corpus.revision,
         target_key=corpus.target_key,
         suite_id=suite.id,
@@ -137,6 +148,143 @@ def test_sqlite_eval_store_is_restart_durable_and_idempotent(tmp_path) -> None:
         assert await reopened.load_result(completed.id) == result
         assert await _admit_run(reopened, _request(corpus, run_id="retry-id")) == completed
         await reopened.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("read_kind", "parser_name"),
+    [
+        ("corpus", "eval_corpus_from_json"),
+        ("result", "corpus_execution_result_from_json"),
+    ],
+)
+def test_sqlite_eval_reconstruction_does_not_occupy_heartbeat_capacity(
+    tmp_path,
+    monkeypatch,
+    read_kind: str,
+    parser_name: str,
+) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+        store = SQLiteEvalStore(tmp_path / "evals.db")
+        try:
+            await assert_eval_store_reconstruction_releases_heartbeat_capacity(
+                store,
+                corpus=corpus,
+                result=result,
+                read_kind=read_kind,
+                parser_owner=evals_sqlite_module,
+                parser_name=parser_name,
+                monkeypatch=monkeypatch,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_sqlite_result_validation_does_not_block_live_claim_heartbeats(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+        path = tmp_path / "evals.db"
+        publishing_store = SQLiteEvalStore(path)
+        unrelated_store = SQLiteEvalStore(path, schema_mode=SchemaMode.VALIDATE)
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        stop_heartbeats = asyncio.Event()
+        original_validate = evals_sqlite_module.validate_result_for_run
+        heartbeat_counts = {"publishing": 0, "unrelated": 0}
+        publication: asyncio.Task[EvalRunRecord] | None = None
+        heartbeats: list[asyncio.Task[None]] = []
+
+        def blocking_validate(*args, **kwargs):
+            validation_started.set()
+            if not release_validation.wait(timeout=5):
+                raise AssertionError("Timed out releasing SQLite eval result validation.")
+            return original_validate(*args, **kwargs)
+
+        async def maintain_claim(
+            store: SQLiteEvalStore,
+            claim: EvalRunClaim,
+            counter: str,
+        ) -> None:
+            while not stop_heartbeats.is_set():
+                await store.heartbeat_run(claim, extend_seconds=1)
+                heartbeat_counts[counter] += 1
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(stop_heartbeats.wait(), timeout=0.1)
+
+        try:
+            await _save_corpus(publishing_store, corpus)
+            await _admit_run(
+                publishing_store,
+                _request(corpus, run_id="publishing-run", idempotency_digit="1"),
+            )
+            publishing_lease = await publishing_store.claim_run(lease_seconds=1)
+            assert publishing_lease is not None
+            await _admit_run(
+                unrelated_store,
+                _request(corpus, run_id="unrelated-run", idempotency_digit="2"),
+            )
+            unrelated_lease = await unrelated_store.claim_run(lease_seconds=1)
+            assert unrelated_lease is not None
+
+            monkeypatch.setattr(
+                evals_sqlite_module,
+                "validate_result_for_run",
+                blocking_validate,
+            )
+            publication = asyncio.create_task(
+                _publish_result(publishing_store, publishing_lease.claim, result)
+            )
+            assert await asyncio.to_thread(validation_started.wait, 2)
+            heartbeats = [
+                asyncio.create_task(
+                    maintain_claim(
+                        publishing_store,
+                        publishing_lease.claim,
+                        "publishing",
+                    )
+                ),
+                asyncio.create_task(
+                    maintain_claim(unrelated_store, unrelated_lease.claim, "unrelated")
+                ),
+            ]
+
+            await asyncio.sleep(1.2)
+            assert heartbeat_counts["publishing"] >= 4
+            assert heartbeat_counts["unrelated"] >= 4
+
+            stop_heartbeats.set()
+            await asyncio.wait_for(asyncio.gather(*heartbeats), timeout=2)
+            release_validation.set()
+            completed = await asyncio.wait_for(publication, timeout=2)
+            assert completed.status is EvalRunStatus.COMPLETED
+            await unrelated_store.release_run(unrelated_lease.claim)
+        finally:
+            stop_heartbeats.set()
+            release_validation.set()
+            tasks = tuple(task for task in (publication, *heartbeats) if task is not None)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await unrelated_store.close()
+            await publishing_store.close()
 
     asyncio.run(exercise())
 

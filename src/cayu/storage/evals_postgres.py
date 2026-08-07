@@ -294,7 +294,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             row = await cur.fetchone()
             if row is None:
                 raise RuntimeError("Immutable eval corpus disappeared during a read.")
-            return await asyncio.to_thread(eval_corpus_from_json, row[0])
+            document = row[0]
+        return await asyncio.to_thread(eval_corpus_from_json, document)
 
     async def list_corpora(
         self,
@@ -726,19 +727,24 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         )
         result_text = result_document.decode("utf-8")
         result_bytes = len(result_document)
-        await self._ensure_ready()
+        request = await self._load_run_request(claim.run_id)
+        corpus = await self.load_corpus(request.corpus_revision)
+        if corpus is None:
+            raise RuntimeError("Eval run references a missing immutable corpus.")
+        validated = await asyncio.to_thread(
+            validate_result_for_run,
+            request,
+            result,
+            corpus,
+        )
         async with self._connection() as conn:
             try:
                 async with conn.cursor() as cur:
                     row = await self._require_run_row(cur, claim.run_id, for_update=True)
-                    request = _request_from_row(row)
-                    corpus = await self._load_corpus_document(cur, request.corpus_revision)
-                    validated = await asyncio.to_thread(
-                        validate_result_for_run,
-                        request,
-                        result,
-                        corpus,
-                    )
+                    if _request_from_row(row) != request:
+                        raise EvalRunStateConflict(
+                            "Eval run request changed during result publication."
+                        )
                     status = EvalRunStatus(row[7])
                     if status is EvalRunStatus.COMPLETED:
                         await cur.execute(
@@ -894,7 +900,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             row = await cur.fetchone()
             if row is None:
                 raise RuntimeError("Immutable eval result disappeared during a read.")
-            return await asyncio.to_thread(corpus_execution_result_from_json, row[0])
+            document = row[0]
+        return await asyncio.to_thread(corpus_execution_result_from_json, document)
 
     async def _terminalize_without_result(
         self,
@@ -992,6 +999,12 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         )
         return await cur.fetchone()
 
+    async def _load_run_request(self, run_id: str) -> EvalRunRequest:
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            row = await self._require_run_row(cur, run_id)
+            return _request_from_row(row)
+
     @staticmethod
     async def _corpus_exists(cur: Any, revision: str) -> bool:
         await cur.execute(
@@ -1019,17 +1032,6 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         )
         row = await cur.fetchone()
         return None if row is None else cls._corpus_entry_from_row(row)
-
-    @staticmethod
-    async def _load_corpus_document(cur: Any, revision: str) -> EvalCorpusDocument:
-        await cur.execute(
-            "SELECT document FROM cayu_eval_corpora WHERE revision = %s",
-            (revision,),
-        )
-        row = await cur.fetchone()
-        if row is None:
-            raise RuntimeError("Eval run references a missing immutable corpus.")
-        return await asyncio.to_thread(eval_corpus_from_json, row[0])
 
     @staticmethod
     def _corpus_entry_from_row(row: Any) -> EvalCorpusCatalogEntry:

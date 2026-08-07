@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from contextlib import suppress
 
 import pytest
-from tests.evals.eval_store_conformance import assert_eval_store_conformance
+from tests.evals.eval_store_conformance import (
+    assert_eval_store_conformance,
+    assert_eval_store_reconstruction_releases_heartbeat_capacity,
+)
 from tests.evals.test_corpus_execution import _corpus, _provider, _target
 
 from cayu.evals.execution import run_corpus_suite
-from cayu.evals.store import EvalRunRequest, EvalRunStatus
+from cayu.evals.store import EvalRunClaim, EvalRunRecord, EvalRunRequest, EvalRunStatus
 from cayu.vaults.redaction import SecretRedactor
 
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
@@ -205,6 +210,132 @@ def test_postgres_eval_store_is_restart_durable_and_idempotent(postgres_dsn) -> 
             assert await _admit_run(reopened, _request(corpus, run_id="retry-id")) == completed
         finally:
             await reopened.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("read_kind", "parser_name"),
+    [
+        ("corpus", "eval_corpus_from_json"),
+        ("result", "corpus_execution_result_from_json"),
+    ],
+)
+def test_postgres_eval_reconstruction_releases_its_pool_connection(
+    postgres_dsn,
+    monkeypatch,
+    read_kind: str,
+    parser_name: str,
+) -> None:
+    async def exercise() -> None:
+        from cayu.storage import evals_postgres as evals_postgres_module
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+        store = PostgresEvalStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=1,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        try:
+            await assert_eval_store_reconstruction_releases_heartbeat_capacity(
+                store,
+                corpus=corpus,
+                result=result,
+                read_kind=read_kind,
+                parser_owner=evals_postgres_module,
+                parser_name=parser_name,
+                monkeypatch=monkeypatch,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_result_validation_releases_heartbeat_capacity(
+    postgres_dsn,
+    monkeypatch,
+) -> None:
+    async def exercise() -> None:
+        from cayu.storage import evals_postgres as evals_postgres_module
+        from cayu.storage.evals_postgres import PostgresEvalStore
+        from cayu.storage.migrations import SchemaMode
+
+        await _drop_eval_tables(postgres_dsn)
+        corpus = _corpus(trials=1)
+        result = await run_corpus_suite(
+            _target(_provider(trials=1)),
+            corpus,
+            corpus.suites[0].id,
+            max_concurrency=1,
+        )
+        store = PostgresEvalStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=1,
+            schema_mode=SchemaMode.MIGRATE,
+        )
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        stop_heartbeats = asyncio.Event()
+        original_validate = evals_postgres_module.validate_result_for_run
+        heartbeat_count = 0
+        publication: asyncio.Task[EvalRunRecord] | None = None
+        heartbeats: asyncio.Task[None] | None = None
+
+        def blocking_validate(*args, **kwargs):
+            validation_started.set()
+            if not release_validation.wait(timeout=5):
+                raise AssertionError("Timed out releasing eval result validation.")
+            return original_validate(*args, **kwargs)
+
+        async def maintain_claim(claim: EvalRunClaim) -> None:
+            nonlocal heartbeat_count
+            while not stop_heartbeats.is_set():
+                await store.heartbeat_run(claim, extend_seconds=1)
+                heartbeat_count += 1
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(stop_heartbeats.wait(), timeout=0.1)
+
+        try:
+            await _save_corpus(store, corpus)
+            await _admit_run(store, _request(corpus))
+            lease = await store.claim_run(lease_seconds=1)
+            assert lease is not None
+            monkeypatch.setattr(
+                evals_postgres_module,
+                "validate_result_for_run",
+                blocking_validate,
+            )
+            publication = asyncio.create_task(_publish_result(store, lease.claim, result))
+            assert await asyncio.to_thread(validation_started.wait, 2)
+            heartbeats = asyncio.create_task(maintain_claim(lease.claim))
+
+            await asyncio.sleep(1.2)
+            assert heartbeat_count >= 4
+
+            stop_heartbeats.set()
+            await asyncio.wait_for(heartbeats, timeout=2)
+            release_validation.set()
+            completed = await asyncio.wait_for(publication, timeout=2)
+            assert completed.status is EvalRunStatus.COMPLETED
+        finally:
+            stop_heartbeats.set()
+            release_validation.set()
+            tasks = tuple(task for task in (publication, heartbeats) if task is not None)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await store.close()
 
     asyncio.run(exercise())
 
