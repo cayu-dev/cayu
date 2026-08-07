@@ -195,6 +195,10 @@ REVISIONS: tuple[Revision, ...] = (
     # an explicit SQL proof bit. Pre-31 readers do not remove that marker at the
     # public projection boundary, so they must not share a revision-31 database.
     Revision(revision=31, kind=RevisionKind.BREAKING, compatible_from=31),
+    # Add the embedded eval catalog, immutable published results, and fenced run
+    # lifecycle tables. Existing stores neither read nor write these new tables,
+    # so the revision is additive; EvalStore itself requires revision 32.
+    Revision(revision=32, kind=RevisionKind.ADDITIVE, compatible_from=31),
 )
 
 #: The revision an empty database is initialized to.

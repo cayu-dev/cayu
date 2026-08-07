@@ -57,6 +57,11 @@ _TABLES = (
     "cayu_session_operations",
     "cayu_tasks",
     "cayu_sessions",
+    "cayu_eval_results",
+    "cayu_eval_runs",
+    "cayu_eval_cases",
+    "cayu_eval_suites",
+    "cayu_eval_corpora",
     "cayu_schema_migrations",
 )
 

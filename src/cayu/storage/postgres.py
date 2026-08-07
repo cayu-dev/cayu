@@ -1058,6 +1058,162 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ALTER TABLE cayu_events ADD COLUMN IF NOT EXISTS "
         "input_contract_runtime_owned BOOLEAN NOT NULL DEFAULT FALSE",
     ),
+    32: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_corpora (
+            revision TEXT COLLATE "C" PRIMARY KEY,
+            target_key TEXT NOT NULL,
+            evidence_policy_revision TEXT NOT NULL,
+            pricing_profile_fingerprint TEXT,
+            suite_count INTEGER NOT NULL CHECK (suite_count >= 1 AND suite_count <= 64),
+            case_count INTEGER NOT NULL CHECK (case_count >= 1 AND case_count <= 1000),
+            assertion_count INTEGER NOT NULL
+                CHECK (assertion_count >= case_count AND assertion_count <= case_count * 64),
+            expanded_assertion_result_count INTEGER NOT NULL
+                CHECK (expanded_assertion_result_count >= assertion_count
+                    AND expanded_assertion_result_count <= 640000),
+            document TEXT NOT NULL,
+            document_bytes BIGINT NOT NULL
+                CHECK (document_bytes >= 1 AND document_bytes <= 8388608)
+                CHECK (document_bytes = octet_length(document)),
+            created_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_corpora_catalog "
+        "ON cayu_eval_corpora(created_at DESC, revision ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_corpora_target_catalog "
+        "ON cayu_eval_corpora(target_key, created_at DESC, revision ASC)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_suites (
+            corpus_revision TEXT NOT NULL
+                REFERENCES cayu_eval_corpora(revision) ON DELETE CASCADE,
+            suite_id TEXT COLLATE "C" NOT NULL,
+            suite_revision TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            case_count INTEGER NOT NULL CHECK (case_count >= 1 AND case_count <= 1000),
+            assertion_count INTEGER NOT NULL
+                CHECK (assertion_count >= case_count AND assertion_count <= case_count * 64),
+            trials INTEGER NOT NULL CHECK (trials >= 1 AND trials <= 100),
+            timeout_seconds INTEGER NOT NULL
+                CHECK (timeout_seconds >= 1 AND timeout_seconds <= 3600),
+            CHECK (assertion_count * trials <= 10000),
+            PRIMARY KEY (corpus_revision, suite_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_cases (
+            corpus_revision TEXT NOT NULL,
+            case_id TEXT COLLATE "C" NOT NULL,
+            case_revision TEXT NOT NULL,
+            suite_id TEXT COLLATE "C" NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            message_count INTEGER NOT NULL
+                CHECK (message_count >= 1 AND message_count <= 16),
+            assertion_count INTEGER NOT NULL
+                CHECK (assertion_count >= 1 AND assertion_count <= 64),
+            PRIMARY KEY (corpus_revision, case_id),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id) ON DELETE CASCADE
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_cases_suite "
+        "ON cayu_eval_cases(corpus_revision, suite_id, case_id ASC)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_runs (
+            run_id TEXT COLLATE "C" PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            corpus_revision TEXT NOT NULL
+                REFERENCES cayu_eval_corpora(revision),
+            target_key TEXT NOT NULL,
+            suite_id TEXT COLLATE "C" NOT NULL,
+            suite_revision TEXT NOT NULL,
+            max_concurrency INTEGER NOT NULL
+                CHECK (max_concurrency >= 1 AND max_concurrency <= 32),
+            status TEXT NOT NULL CHECK (
+                status IN ('queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled')
+            ),
+            created_at TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            started_at TIMESTAMPTZ,
+            finished_at TIMESTAMPTZ,
+            cancel_requested_at TIMESTAMPTZ,
+            claim_id TEXT,
+            ownership_epoch BIGINT NOT NULL DEFAULT 0
+                CHECK (ownership_epoch >= 0 AND ownership_epoch <= 9223372036854775807),
+            lease_expires_at TIMESTAMPTZ,
+            result_revision TEXT,
+            result_status TEXT CHECK (
+                result_status IS NULL
+                OR result_status IN ('passed', 'failed', 'unavailable', 'error')
+            ),
+            result_score DOUBLE PRECISION CHECK (
+                result_score IS NULL OR (result_score >= 0.0 AND result_score <= 1.0)
+            ),
+            result_duration_ms BIGINT CHECK (
+                result_duration_ms IS NULL OR result_duration_ms >= 0
+            ),
+            failure_code TEXT CHECK (
+                failure_code IS NULL OR failure_code IN (
+                    'target_unavailable', 'corpus_unavailable', 'execution_failed',
+                    'worker_interrupted'
+                )
+            ),
+            CHECK (
+                (status IN ('completed', 'failed', 'cancelled') AND finished_at IS NOT NULL)
+                OR (status NOT IN ('completed', 'failed', 'cancelled') AND finished_at IS NULL)
+            ),
+            CHECK (
+                (status IN ('cancelling', 'cancelled') AND cancel_requested_at IS NOT NULL)
+                OR (status NOT IN ('cancelling', 'cancelled') AND cancel_requested_at IS NULL)
+            ),
+            CHECK (
+                (status IN ('running', 'cancelling') AND started_at IS NOT NULL
+                    AND claim_id IS NOT NULL
+                    AND lease_expires_at IS NOT NULL AND lease_expires_at > updated_at)
+                OR (status NOT IN ('running', 'cancelling') AND lease_expires_at IS NULL)
+            ),
+            CHECK (status NOT IN ('completed', 'failed') OR started_at IS NOT NULL),
+            CHECK (
+                (status = 'completed' AND result_revision IS NOT NULL
+                    AND result_status IS NOT NULL AND result_duration_ms IS NOT NULL)
+                OR (status != 'completed' AND result_revision IS NULL
+                    AND result_status IS NULL AND result_score IS NULL
+                    AND result_duration_ms IS NULL)
+            ),
+            CHECK (
+                (result_status IN ('passed', 'failed') AND result_score IS NOT NULL)
+                OR (result_status NOT IN ('passed', 'failed') AND result_score IS NULL)
+                OR result_status IS NULL
+            ),
+            CHECK (
+                (status = 'failed' AND failure_code IS NOT NULL)
+                OR (status != 'failed' AND failure_code IS NULL)
+            ),
+            FOREIGN KEY (corpus_revision, suite_id)
+                REFERENCES cayu_eval_suites(corpus_revision, suite_id)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_catalog "
+        "ON cayu_eval_runs(created_at DESC, run_id ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_status_claim "
+        "ON cayu_eval_runs(status, lease_expires_at, created_at ASC, run_id ASC)",
+        "CREATE INDEX IF NOT EXISTS idx_cayu_eval_runs_corpus_catalog "
+        "ON cayu_eval_runs(corpus_revision, created_at DESC, run_id ASC)",
+        """
+        CREATE TABLE IF NOT EXISTS cayu_eval_results (
+            run_id TEXT PRIMARY KEY
+                REFERENCES cayu_eval_runs(run_id) ON DELETE RESTRICT,
+            revision TEXT NOT NULL,
+            result TEXT NOT NULL,
+            result_bytes BIGINT NOT NULL
+                CHECK (result_bytes >= 1 AND result_bytes <= 41943040)
+                CHECK (result_bytes = octet_length(result)),
+            created_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """

@@ -79,6 +79,21 @@ def test_revision_thirty_one_rejects_pre_input_contract_readers() -> None:
     m.validate(state, app_latest=31, app_min_supported=31)
 
 
+def test_revision_thirty_two_adds_opt_in_eval_storage() -> None:
+    state = m.SchemaState(revision=32, compatible_from=31)
+
+    # Revision-31 stores do not use the new eval tables, so they may continue
+    # operating on the expanded database. EvalStore itself requires revision 32.
+    m.validate(state, app_latest=31, app_min_supported=31)
+    m.validate(state, app_latest=32, app_min_supported=32)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 32"):
+        m.validate(
+            m.SchemaState(revision=31, compatible_from=31),
+            app_latest=32,
+            app_min_supported=32,
+        )
+
+
 def test_revision_fourteen_remains_compatible_with_older_binaries() -> None:
     m.validate(
         m.SchemaState(revision=14, compatible_from=10),
