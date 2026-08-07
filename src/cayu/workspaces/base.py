@@ -58,6 +58,8 @@ class WorkspaceReadResult:
             raise ValueError(
                 "WorkspaceReadResult truncated must match source progress and total_bytes."
             )
+        if self.truncated and source_bytes_read == 0:
+            raise ValueError("WorkspaceReadResult truncated pages must make forward progress.")
         if type(self.redaction_truncated) is not bool:
             raise TypeError("WorkspaceReadResult redaction_truncated must be a bool.")
         if self.revision is not None and (

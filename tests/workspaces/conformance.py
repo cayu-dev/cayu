@@ -139,6 +139,8 @@ async def verify_bounded_reads_and_result_isolation(workspace: Workspace) -> Non
     assert type(result.content) is bytes
     assert result.total_bytes == 6
     assert result.truncated is True
+    assert result.next_offset is not None
+    assert result.next_offset > result.offset
 
     listing = await workspace.list("**/*")
     assert type(listing.paths) is tuple

@@ -8,7 +8,7 @@ import stat
 import sys
 import tarfile
 import tracemalloc
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
@@ -851,6 +851,7 @@ _SeededWorkspaceDefect = Literal[
     "truncation",
     "resource-alias",
     "mutation-leakage",
+    "no-progress-read",
 ]
 _SeededWorkspaceScenario = Literal[
     "path",
@@ -896,7 +897,14 @@ class _SeededBrokenWorkspace(Workspace):
             return WorkspaceReadResult(content, len(content))
         if self.defect == "overread":
             return await self.delegate.read_bytes(path)
-        return await self.delegate.read_bytes(path, offset=offset, max_bytes=max_bytes)
+        result = await self.delegate.read_bytes(path, offset=offset, max_bytes=max_bytes)
+        if self.defect != "no-progress-read" or not result.truncated:
+            return result
+        broken = object.__new__(WorkspaceReadResult)
+        for result_field in fields(WorkspaceReadResult):
+            object.__setattr__(broken, result_field.name, getattr(result, result_field.name))
+        object.__setattr__(broken, "source_bytes_read", 0)
+        return broken
 
     async def write_bytes(self, path: str, content: bytes) -> None:
         if self.defect == "traversal" and path == "nested/../accepted.txt":
@@ -954,6 +962,7 @@ class _SeededBrokenWorkspace(Workspace):
         ("truncation", "listing"),
         ("resource-alias", "identity-relationships"),
         ("mutation-leakage", "bounds"),
+        ("no-progress-read", "bounds"),
     ),
 )
 def test_seeded_broken_workspace_is_rejected(

@@ -4311,6 +4311,31 @@ def test_workspace_result_types_validate_boundary_values():
     with pytest.raises(ValueError, match="truncated must match"):
         WorkspaceReadResult(content=b"abc", total_bytes=4, truncated=False)
 
+    with pytest.raises(ValueError, match="forward progress"):
+        WorkspaceReadResult(
+            content=b"",
+            total_bytes=1,
+            truncated=True,
+            source_bytes_read=0,
+        )
+
+    exact_eof = WorkspaceReadResult(
+        content=b"",
+        total_bytes=1,
+        offset=1,
+        source_bytes_read=0,
+    )
+    assert exact_eof.next_offset is None
+
+    fully_redacted_page = WorkspaceReadResult(
+        content=b"",
+        total_bytes=2,
+        truncated=True,
+        source_bytes_read=1,
+        redaction_truncated=True,
+    )
+    assert fully_redacted_page.next_offset == 1
+
     with pytest.raises(TypeError, match="paths"):
         WorkspaceListResult(paths="a.txt", total_count=1)  # type: ignore[arg-type]
 

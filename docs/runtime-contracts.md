@@ -4214,7 +4214,7 @@ were not omitted.
 
 Workspace result objects enforce consistent metadata:
 
-- `WorkspaceReadResult`: `truncated` must equal `offset + source_bytes_read < total_bytes`; `next_offset` advances by raw `source_bytes_read`, while `content` may be shorter after redaction and `redaction_truncated` reports projection loss; revision and SHA-256 metadata require a complete offset-zero source snapshot
+- `WorkspaceReadResult`: `truncated` must equal `offset + source_bytes_read < total_bytes`; every truncated page must make positive raw-source progress, so `next_offset` is strictly greater than `offset`; an exact-EOF empty page remains valid and exposes no `next_offset`; `content` may be shorter or empty after redaction and `redaction_truncated` reports projection loss; revision and SHA-256 metadata require a complete offset-zero source snapshot
 - `WorkspaceMutationResult`: create has only after metadata, delete has only before metadata, and replace has both
 - `WorkspaceListResult` complete list: `truncated=false` and `total_count == len(paths)`
 - `WorkspaceListResult` truncated list: `truncated=true` and `total_count is None or total_count >= len(paths)`
