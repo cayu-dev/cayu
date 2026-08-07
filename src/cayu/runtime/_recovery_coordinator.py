@@ -124,6 +124,7 @@ from cayu.runtime.budgets import (
     request_budget_limits_for_session,
 )
 from cayu.runtime.costs import SessionCostSummary
+from cayu.runtime.errors import InteractionLifecyclePublicationRejected
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -7905,6 +7906,8 @@ class RecoveryCoordinator:
                     active_run=request.active_run,
                 )
             )
+        except InteractionLifecyclePublicationRejected:
+            raise
         except BaseException:
             try:
                 finalized = await self._session_store.transition_status(
@@ -7945,7 +7948,12 @@ class RecoveryCoordinator:
             ):
                 pass
 
-    async def finalize_abandoned_session_by_id(self, session_id: str) -> None:
+    async def finalize_abandoned_session_by_id(
+        self,
+        session_id: str,
+        *,
+        propagate_interaction_publication_rejection: bool = False,
+    ) -> None:
         """Idempotently finalize a live session when setup-time streaming is abandoned."""
         try:
             session = await self._session_store.load(session_id)
@@ -7983,7 +7991,7 @@ class RecoveryCoordinator:
                 # Preserve the existing best-effort fallback if the durable
                 # operator-interruption payload cannot be finalized.
                 pass
-        with contextlib.suppress(BaseException):
+        try:
             await self.finalize_abandoned_session_run(
                 RecoveryAbandonedSessionRequest(
                     session=session,
@@ -7992,6 +8000,11 @@ class RecoveryCoordinator:
                     environment_name=_environment_name(registered_environment),
                 )
             )
+        except InteractionLifecyclePublicationRejected:
+            if propagate_interaction_publication_rejection:
+                raise
+        except BaseException:
+            pass
 
     async def _finalize_abandoned_without_registered_runtime(self, session_id: str) -> None:
         try:

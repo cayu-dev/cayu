@@ -160,4 +160,6 @@ class InteractionSummaryEvidence(BaseModel):
         }
         if terminal != (self.completed_at is not None):
             raise ValueError("completed_at must be present exactly for terminal interactions.")
+        if self.completed_at is not None and self.completed_at < self.started_at:
+            raise ValueError("completed_at must not precede started_at.")
         return self

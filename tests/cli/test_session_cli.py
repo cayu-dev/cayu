@@ -2810,3 +2810,60 @@ def test_session_cli_lists_and_filters_response_scoped_interactions(
 
     assert [item["index"] for item in payload["messages"]] == [0, 1]
     assert {item["interaction_id"] for item in payload["messages"]} == {"interaction-a"}
+
+
+def test_session_cli_rejects_interaction_completion_before_start(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = _write_project(tmp_path)
+    started_at = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(database)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="operator",
+                    session_id="sess_invalid_interaction_time",
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=SessionIdentity(provider_name="fake", model="model"),
+            )
+            await store.append_event(
+                "sess_invalid_interaction_time",
+                Event(
+                    id="interaction-invalid-completed",
+                    type=EventType.INTERACTION_COMPLETED,
+                    session_id="sess_invalid_interaction_time",
+                    interaction_id="interaction-invalid-time",
+                    timestamp=started_at,
+                    payload={
+                        "status": "completed",
+                        "start_event_id": "interaction-invalid-started",
+                        "started_at": started_at.isoformat(),
+                        "completed_at": (started_at - timedelta(microseconds=1)).isoformat(),
+                    },
+                ),
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+    assert (
+        main(
+            [
+                "session",
+                "interactions",
+                "sess_invalid_interaction_time",
+                "--sqlite",
+                str(database),
+                "--json",
+            ]
+        )
+        == 1
+    )
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "SESSION_INSPECTION_FAILED"
+    assert "completed_at must not precede started_at" in error["message"]

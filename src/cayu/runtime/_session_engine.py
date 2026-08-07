@@ -14,10 +14,12 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
-from cayu._exception_groups import exception_cause
+from pydantic import ValidationError
+
+from cayu._exception_groups import exception_cause, iter_exception_tree, set_exception_cause
 from cayu._task_wait import (
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
@@ -212,7 +214,11 @@ from cayu.runtime.context import (
 from cayu.runtime.costs import (
     SessionCostSummary,
 )
-from cayu.runtime.errors import TerminalEventPublicationUncertain
+from cayu.runtime.errors import (
+    TerminalEventPublicationUncertain,
+    _is_runtime_interaction_lifecycle_publication_rejection,
+    _runtime_interaction_lifecycle_publication_rejected,
+)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ModelStepIdentity,
@@ -1664,6 +1670,46 @@ def _user_tool_call_count(tool_calls: list[runtime_records.ToolCallRequest]) -> 
     return sum(1 for tool_call in tool_calls if tool_call.name != STRUCTURED_OUTPUT_TOOL_NAME)
 
 
+def _raise_primary_with_secondary_failure(
+    primary: BaseException,
+    secondary: BaseException,
+    *,
+    group_message: str,
+) -> NoReturn:
+    existing_cause = exception_cause(primary)
+    combined_cause: BaseException = secondary
+    if existing_cause is not None:
+        combined_cause = BaseExceptionGroup(
+            group_message,
+            [existing_cause, secondary],
+        )
+    if not set_exception_cause(primary, combined_cause):
+        raise BaseExceptionGroup(
+            group_message,
+            [primary, secondary],
+        )
+    raise primary
+
+
+def _failure_carries_interaction_publication_rejection(
+    failure: Exception,
+    *,
+    session_id: str,
+    interaction_id: str | None,
+    runtime_authority: object,
+) -> bool:
+    cause = exception_cause(failure)
+    return cause is not None and any(
+        _is_runtime_interaction_lifecycle_publication_rejection(
+            candidate,
+            session_id=session_id,
+            interaction_id=interaction_id,
+            runtime_authority=runtime_authority,
+        )
+        for candidate in iter_exception_tree(cause)
+    )
+
+
 class SessionEngine:
     """Own durable session operations and one run's end-to-end orchestration."""
 
@@ -1711,6 +1757,7 @@ class SessionEngine:
         self._recovery_coordinator = recovery_coordinator
         self._background_interruption_coordinator = background_interruption_coordinator
         self._secret_redactor = secret_redactor
+        self._interaction_lifecycle_publication_authority = object()
         self._workflow_structured_output_handoff = WorkflowStructuredOutputHandoff()
         self._clock = clock
         self._runtime_hooks = runtime_hooks
@@ -2269,6 +2316,7 @@ class SessionEngine:
         status: InteractionStatus,
         pending_action_kind: str | None = None,
         recovered_active_through: datetime | None = None,
+        observed_at: datetime | None = None,
     ) -> Event | None:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is None:
@@ -2359,7 +2407,7 @@ class SessionEngine:
         source_start, source_end = await transcript_range(MessageRole.USER)
         result_start, result_end = await transcript_range(MessageRole.ASSISTANT)
         segment_started_at = _current_session_interaction_started_at(session.id)
-        observed_at = self._clock()
+        observed_at = self._clock() if observed_at is None else observed_at
         if recovered_active_through is None:
             recovered_active_through = _current_session_interaction_recovered_active_through(
                 session.id
@@ -2390,32 +2438,41 @@ class SessionEngine:
                 else max(0, int((time.monotonic() - segment_started_at) * 1000))
             )
         terminal = event_type in INTERACTION_TERMINAL_EVENT_TYPES
-        evidence = InteractionSummaryEvidence(
-            status=status,
-            start_event_id=start_record.event.id,
-            start_event_sequence=start_record.sequence,
-            source_transcript_start=source_start,
-            source_transcript_end=source_end,
-            result_transcript_start=result_start,
-            result_transcript_end=result_end,
-            started_at=start_evidence.started_at,
-            completed_at=observed_at if terminal else None,
-            active_duration_ms=prior_evidence.active_duration_ms + current_segment_ms,
-            wall_duration_ms=(
-                max(
-                    0,
-                    int((observed_at - start_evidence.started_at).total_seconds() * 1000),
-                )
-                if terminal
-                else None
-            ),
-            model_step_count=usage_summary.model_steps,
-            tool_call_count=usage_summary.tool_calls,
-            token_usage=usage_summary.usage,
-            provider_names=usage_summary.provider_names,
-            models=usage_summary.models,
-            pending_action_kind=pending_action_kind,
-        )
+        try:
+            evidence = InteractionSummaryEvidence(
+                status=status,
+                start_event_id=start_record.event.id,
+                start_event_sequence=start_record.sequence,
+                source_transcript_start=source_start,
+                source_transcript_end=source_end,
+                result_transcript_start=result_start,
+                result_transcript_end=result_end,
+                started_at=start_evidence.started_at,
+                completed_at=observed_at if terminal else None,
+                active_duration_ms=prior_evidence.active_duration_ms + current_segment_ms,
+                wall_duration_ms=(
+                    max(
+                        0,
+                        int((observed_at - start_evidence.started_at).total_seconds() * 1000),
+                    )
+                    if terminal
+                    else None
+                ),
+                model_step_count=usage_summary.model_steps,
+                tool_call_count=usage_summary.tool_calls,
+                token_usage=usage_summary.usage,
+                provider_names=usage_summary.provider_names,
+                models=usage_summary.models,
+                pending_action_kind=pending_action_kind,
+            )
+        except ValidationError as exc:
+            if terminal and observed_at < start_evidence.started_at:
+                raise _runtime_interaction_lifecycle_publication_rejected(
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    runtime_authority=self._interaction_lifecycle_publication_authority,
+                ) from exc
+            raise
         event = event_with_runtime_payload_authority(
             Event(
                 type=event_type,
@@ -2431,6 +2488,31 @@ class SessionEngine:
         if event_type == EventType.INTERACTION_RESUMED:
             _clear_session_interaction_recovered_active_through(session.id)
         return event
+
+    async def _failure_interaction_observed_at(self, session: Session) -> datetime | None:
+        interaction_id = _current_session_interaction_id(session.id)
+        if interaction_id is None:
+            return None
+        records = await self.session_store.query_events(
+            EventQuery(
+                session_id=session.id,
+                interaction_id=interaction_id,
+                event_types=(EventType.INTERACTION_STARTED,),
+                order_by=EventOrder.SEQUENCE_ASC,
+                limit=1,
+            )
+        )
+        if not records:
+            return None
+        start_evidence = InteractionSummaryEvidence.model_validate(records[0].event.payload)
+        observed_at = self._clock()
+        if observed_at < start_evidence.started_at:
+            raise _runtime_interaction_lifecycle_publication_rejected(
+                session_id=session.id,
+                interaction_id=interaction_id,
+                runtime_authority=self._interaction_lifecycle_publication_authority,
+            )
+        return observed_at
 
     async def _emit_interaction_state(
         self,
@@ -2466,6 +2548,7 @@ class SessionEngine:
         only_if_no_queued_messages: bool = False,
         from_statuses: set[SessionStatus] | None = None,
         recovered_active_through: datetime | None = None,
+        observed_at: datetime | None = None,
     ) -> tuple[Session, Event | None, bool]:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is None:
@@ -2512,6 +2595,7 @@ class SessionEngine:
             status=interaction_status,
             pending_action_kind=pending_action_kind,
             recovered_active_through=recovered_active_through,
+            observed_at=observed_at,
         )
         if event is None:
             loaded = await self.session_store.load(session.id)
@@ -2727,64 +2811,7 @@ class SessionEngine:
             async for queued_event in self._session_control.drain_out_of_band_events(session.id):
                 yield queued_event
             if resolution.error is not None:
-                failure_diagnostic = exception_diagnostic(
-                    resolution.error,
-                    redactor=self._secret_redactor,
-                )
-                await self.session_store.materialize_deferred_interaction_input(session.id)
-                task_failure_event, task_failure_error = await self._fail_task_for_run_setup_error(
-                    task_id=request.task_id,
-                    task_worker_id=request.task_worker_id,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    diagnostic=failure_diagnostic,
-                )
-                if task_failure_event is not None:
-                    yield task_failure_event
-                (
-                    session,
-                    interaction_failed_event,
-                    _,
-                ) = await self._publish_interaction_transition(
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=_environment_name(registered_environment),
-                    to_status=SessionStatus.FAILED,
-                )
-                if interaction_failed_event is not None:
-                    yield interaction_failed_event
-                failure_payload = exception_failure_payload(
-                    resolution.error,
-                    diagnostic=failure_diagnostic,
-                    redactor=self._secret_redactor,
-                )
-                if task_failure_error is not None:
-                    failure_payload.update(
-                        task_update_error_payload(
-                            task_failure_error,
-                            redactor=self._secret_redactor,
-                        )
-                    )
-                async for event in self._emit_terminal_event_with_hooks(
-                    event=Event(
-                        type=EventType.SESSION_FAILED,
-                        session_id=session.id,
-                        agent_name=registered_agent.spec.name,
-                        environment_name=_environment_name(registered_environment),
-                        payload=failure_payload,
-                    ),
-                    phase=RuntimeHookPhase.AFTER_SESSION_FAILED,
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                ):
-                    yield event
-                    async for queued_event in self._session_control.drain_out_of_band_events(
-                        session.id
-                    ):
-                        yield queued_event
-                return
+                raise resolution.error
 
             if workspace_instructions is None:
                 workspace_instructions = (
@@ -2823,33 +2850,35 @@ class SessionEngine:
                     (
                         "cancelled pre-run session finalization",
                         lambda: self._recovery_coordinator.finalize_abandoned_session_by_id(
-                            session.id
+                            session.id,
+                            propagate_interaction_publication_rejection=True,
                         ),
                     ),
                 ),
             )
             raise
-        except BaseExceptionGroup as exc:
-            persisted_session = await self.session_store.load(session.id)
-            if (
-                binding_finalize_explicit_cancellation(exc) is not None
-                and persisted_session is not None
-                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
-            ):
-                if interaction_started:
-                    await self.session_store.materialize_deferred_interaction_input(session.id)
-                async for event in self._handle_session_interrupted(
-                    session=persisted_session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                ):
-                    yield event
-                raise exc
-            raise
         except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
+            if _failure_carries_interaction_publication_rejection(
+                exc,
+                session_id=session.id,
+                interaction_id=_current_session_interaction_id(session.id),
+                runtime_authority=self._interaction_lifecycle_publication_authority,
+            ):
+                raise
+            try:
+                failure_interaction_observed_at = await self._failure_interaction_observed_at(
+                    session
+                )
+            except Exception as preflight_failure:
+                _raise_primary_with_secondary_failure(
+                    exc,
+                    preflight_failure,
+                    group_message=(
+                        "Run failure evidence and interaction terminalization preflight failure."
+                    ),
+                )
             failure_diagnostic = exception_diagnostic(
                 exc,
                 redactor=self._secret_redactor,
@@ -2875,6 +2904,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 environment_name=_environment_name(registered_environment),
                 to_status=SessionStatus.FAILED,
+                observed_at=failure_interaction_observed_at,
             )
             if interaction_failed_event is not None:
                 yield interaction_failed_event
@@ -2904,21 +2934,52 @@ class SessionEngine:
                 registered_environment=registered_environment,
             ):
                 yield event
+                async for queued_event in self._session_control.drain_out_of_band_events(
+                    session.id
+                ):
+                    yield queued_event
             return
-        except GeneratorExit:
+        except BaseExceptionGroup as exc:
+            persisted_session = await self.session_store.load(session.id)
+            if (
+                binding_finalize_explicit_cancellation(exc) is not None
+                and persisted_session is not None
+                and persisted_session.status in _INTERRUPTIBLE_SESSION_STATUSES
+            ):
+                if interaction_started:
+                    await self.session_store.materialize_deferred_interaction_input(session.id)
+                async for event in self._handle_session_interrupted(
+                    session=persisted_session,
+                    registered_agent=registered_agent,
+                    registered_environment=registered_environment,
+                    environment_name=_environment_name(registered_environment),
+                ):
+                    yield event
+                raise exc
+            raise
+        except GeneratorExit as abandonment:
             # This window is outside _run_session's own finalizer. Publish the
             # interaction closure and session interruption through the same
             # atomic boundary used by ordinary interruption.
             await self.session_store.materialize_deferred_interaction_input(session.id)
             current_session = await self.session_store.load(session.id)
             if current_session is not None:
-                async for _ in self._handle_session_interrupted(
-                    session=current_session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=_environment_name(registered_environment),
-                ):
-                    pass
+                try:
+                    async for _ in self._handle_session_interrupted(
+                        session=current_session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=_environment_name(registered_environment),
+                    ):
+                        pass
+                except Exception as finalization_failure:
+                    _raise_primary_with_secondary_failure(
+                        abandonment,
+                        finalization_failure,
+                        group_message=(
+                            "Setup stream abandonment and interaction terminalization failure."
+                        ),
+                    )
             raise
         finally:
             try:
@@ -9219,28 +9280,58 @@ class SessionEngine:
                 ),
             )
             raise
-        except GeneratorExit:
+        except GeneratorExit as abandonment:
             # The consumer closed the event stream (client disconnect / abandoned
             # async generator) while the session was still live. Finalize instead of
             # stranding it in RUNNING; an async generator must not yield while
             # handling GeneratorExit, so the terminal emission is drained, not
             # streamed.
             await materialize_deferred_messages_after_failure()
-            await self._recovery_coordinator.finalize_abandoned_session_run(
-                RecoveryAbandonedSessionRequest(
-                    session=session,
-                    registered_agent=registered_agent,
-                    registered_environment=registered_environment,
-                    environment_name=environment_name,
-                    run_started_at=run_started_at,
-                    turn_usage_tracker=turn_usage_tracker,
-                    active_run=active_run,
+            try:
+                await self._recovery_coordinator.finalize_abandoned_session_run(
+                    RecoveryAbandonedSessionRequest(
+                        session=session,
+                        registered_agent=registered_agent,
+                        registered_environment=registered_environment,
+                        environment_name=environment_name,
+                        run_started_at=run_started_at,
+                        turn_usage_tracker=turn_usage_tracker,
+                        active_run=active_run,
+                    )
                 )
-            )
+            except Exception as finalization_failure:
+                _raise_primary_with_secondary_failure(
+                    abandonment,
+                    finalization_failure,
+                    group_message=("Stream abandonment and interaction terminalization failure."),
+                )
             raise
         except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
+            if _is_runtime_interaction_lifecycle_publication_rejection(
+                exc,
+                session_id=session.id,
+                interaction_id=_current_session_interaction_id(session.id),
+                runtime_authority=self._interaction_lifecycle_publication_authority,
+            ):
+                # A terminal interaction cannot be represented using the observed
+                # wall clock. Preserve the live session, linked task, and durable
+                # run-operation marker so normal incomplete-session recovery owns
+                # the eventual terminal classification.
+                raise
+            try:
+                failure_interaction_observed_at = await self._failure_interaction_observed_at(
+                    session
+                )
+            except Exception as preflight_failure:
+                _raise_primary_with_secondary_failure(
+                    exc,
+                    preflight_failure,
+                    group_message=(
+                        "Run failure evidence and interaction terminalization preflight failure."
+                    ),
+                )
             failure_diagnostic = exception_diagnostic(
                 exc,
                 redactor=self._secret_redactor,
@@ -9296,6 +9387,7 @@ class SessionEngine:
                 registered_agent=registered_agent,
                 environment_name=environment_name,
                 to_status=SessionStatus.FAILED,
+                observed_at=failure_interaction_observed_at,
             )
             if interaction_failed_event is not None:
                 yield interaction_failed_event

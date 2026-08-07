@@ -187,7 +187,10 @@ from cayu.runtime.egress import (
     VirtualEgressRunnerRequest,
     VirtualEgressWorkspaceFactory,
 )
-from cayu.runtime.errors import TerminalEventPublicationUncertain
+from cayu.runtime.errors import (
+    InteractionLifecyclePublicationRejected,
+    TerminalEventPublicationUncertain,
+)
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.event_watchers import (
     EventWatcher,
@@ -655,6 +658,7 @@ __all__ = [
     "IncompleteSessionsRecoveryPage",
     "IncompleteSessionsRecoveryRequest",
     "InlineDispatcher",
+    "InteractionLifecyclePublicationRejected",
     "InteractionStatus",
     "InteractionSummaryEvidence",
     "InteractionTransitionResult",

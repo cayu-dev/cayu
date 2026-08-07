@@ -16,6 +16,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 
 fastapi = pytest.importorskip("fastapi")
 pytest.importorskip("sse_starlette")
@@ -6510,6 +6511,44 @@ def test_server_exposes_response_scoped_interaction_summaries() -> None:
         ).status_code
         == 422
     )
+
+
+def test_server_rejects_interaction_completion_before_start() -> None:
+    started_at = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store = InMemorySessionStore()
+    app = CayuApp(session_store=store, enable_logging=False)
+
+    async def seed() -> None:
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_invalid_interaction_time",
+                messages=[Message.text("user", "start")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="model"),
+        )
+        await store.append_event(
+            "sess_invalid_interaction_time",
+            Event(
+                id="interaction-invalid-completed",
+                type=EventType.INTERACTION_COMPLETED,
+                session_id="sess_invalid_interaction_time",
+                interaction_id="interaction-invalid-time",
+                timestamp=started_at,
+                payload={
+                    "status": "completed",
+                    "start_event_id": "interaction-invalid-started",
+                    "started_at": started_at.isoformat(),
+                    "completed_at": (started_at - timedelta(microseconds=1)).isoformat(),
+                },
+            ),
+        )
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    with pytest.raises(ValidationError, match="completed_at must not precede started_at"):
+        client.get("/api/sessions/sess_invalid_interaction_time/interactions?limit=10")
 
 
 def test_generated_session_and_interaction_aliases_remain_distinct_and_addressable() -> None:
