@@ -49,6 +49,8 @@ from cayu.runtime.sessions import CheckpointTransform, Session
 from cayu.storage.migrations import SchemaMode
 from cayu.vaults import SecretRedactor
 
+pytestmark = pytest.mark.postgres
+
 _SESSION_ID = "recoverable-allocation-session"
 _ENVIRONMENT_NAME = "remote"
 _PROVIDER = "fake-remote"

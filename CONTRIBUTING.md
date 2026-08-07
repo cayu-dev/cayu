@@ -111,9 +111,16 @@ uv sync --extra dev --extra server
 ### Tests
 
 ```bash
-uv run pytest                    # full suite
-uv run pytest tests/core -q     # focused runs are fine while iterating
+uv run pytest                                  # full suite, serial
+uv run pytest -n 3 --dist loadfile             # full suite, conservative parallelism
+uv run pytest tests/core -q                    # focused runs are fine while iterating
+uv run pytest --store-durations                # refresh CI's .test_durations snapshot
 ```
+
+The parallel command is safe with the default testcontainers-managed Postgres setup,
+where each worker gets an isolated container. When `CAYU_TEST_POSTGRES_DSN` points at one
+shared database, run the suite serially because store tests intentionally clear their
+disposable schema between cases.
 
 Postgres tests **skip automatically** when no disposable database is available. Two
 ways to run them:

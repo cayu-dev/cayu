@@ -34,6 +34,8 @@ dev = [
   "pypdf>=4",
   "pytest>=8.0",
   "pytest-cov>=7.1",
+  "pytest-split>=0.11,<1",
+  "pytest-xdist>=3.8,<4",
   "pydantic-settings>=2.7,<3",
   "ruff>=0.11",
   "sse-starlette>=2.0",
@@ -126,8 +128,11 @@ cayu = "cayu.cli:main"
 testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
+  "postgres: tests requiring a disposable Postgres database or sharing its schema",
+  "process: real subprocess or container boundary coverage",
   "postgres_recovery: real process-death coverage requiring the Postgres lane",
   "sigkill_recovery: real process-death recovery coverage run in its own lane",
+  "stress: deterministic concurrency and fault-injection coverage",
 ]
 
 [tool.ruff]

@@ -42,6 +42,8 @@ from cayu.core.events import (
 from cayu.evals.trajectory import _build_child_trajectories, _CaptureState, _IncompleteFlag
 from cayu.storage.migrations import SchemaMode
 
+pytestmark = pytest.mark.postgres
+
 
 @pytest.fixture(params=("memory", "sqlite", "postgres"))
 def trajectory_store_case(request, tmp_path):

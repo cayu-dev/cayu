@@ -164,7 +164,10 @@ from cayu.runtime.structured_output import (
 )
 from cayu.runtime.usage import UsageMetrics
 from cayu.storage.jsonl_export import export_sessions, import_sessions
+from cayu.storage.migrations import SchemaMode
 from cayu.vaults import REDACTED_SECRET, SecretRedactor, SecretRef, StaticVault
+
+pytestmark = pytest.mark.postgres
 
 _POSTGRES_TABLES = (
     "cayu_public_authority_aliases",
@@ -173,14 +176,18 @@ _POSTGRES_TABLES = (
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
+    "cayu_knowledge_embeddings",
     "cayu_knowledge_chunks",
     "cayu_knowledge_entries",
+    "cayu_event_watcher_dead_letters",
     "cayu_event_watcher_state",
     "cayu_deferred_interaction_inputs",
     "cayu_interaction_latest_events",
     "cayu_session_message_deliveries",
     "cayu_persisted_event_side_effects",
     "cayu_mcp_manifest_baselines",
+    "cayu_budget_settlements",
+    "cayu_budget_reservations",
     "cayu_budget_reservation_identities",
     "cayu_events",
     "cayu_session_labels",
@@ -191,6 +198,14 @@ _POSTGRES_TABLES = (
     "cayu_tasks",
     "cayu_sessions",
     "cayu_schema_migrations",
+)
+_POSTGRES_DATA_TABLES = (
+    "cayu_public_authority_alias_config",
+    *(
+        table
+        for table in _POSTGRES_TABLES
+        if table not in {"cayu_public_authority_alias_config", "cayu_schema_migrations"}
+    ),
 )
 
 
@@ -300,7 +315,7 @@ def _mcp_test_manifest_hash(
     )
 
 
-async def _truncate_postgres(dsn: str) -> None:
+async def _drop_postgres_schema(dsn: str) -> None:
     import psycopg
 
     async with await psycopg.AsyncConnection.connect(dsn) as conn:
@@ -310,19 +325,49 @@ async def _truncate_postgres(dsn: str) -> None:
         await conn.commit()
 
 
+async def _reset_postgres_data(dsn: str) -> None:
+    import psycopg
+    from psycopg import sql
+
+    async with await psycopg.AsyncConnection.connect(dsn) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT tablename FROM pg_catalog.pg_tables "
+                "WHERE schemaname = current_schema() AND tablename = ANY(%s)",
+                (list(_POSTGRES_DATA_TABLES),),
+            )
+            existing_tables = {row[0] for row in await cur.fetchall()}
+            for table in _POSTGRES_DATA_TABLES:
+                if table not in existing_tables:
+                    continue
+                await cur.execute(sql.SQL("DELETE FROM {}").format(sql.Identifier(table)))
+            for table, column in (
+                ("cayu_events", "sequence"),
+                ("cayu_transcript_messages", "sequence"),
+                ("cayu_session_message_queue", "ordering_key"),
+            ):
+                await cur.execute(
+                    sql.SQL("ALTER TABLE {} ALTER COLUMN {} RESTART WITH 1").format(
+                        sql.Identifier(table),
+                        sql.Identifier(column),
+                    )
+                )
+        await conn.commit()
+
+
 def _new_postgres_store(
     dsn: str,
     *,
     public_authority_alias_codec: PublicAuthorityAliasCodec | None = None,
+    schema_mode: SchemaMode = SchemaMode.VALIDATE,
 ) -> SessionStore:
     from cayu import PostgresSessionStore
-    from cayu.storage.migrations import SchemaMode
 
     return PostgresSessionStore(
         dsn,
         min_size=1,
         max_size=4,
-        schema_mode=SchemaMode.CREATE,
+        schema_mode=schema_mode,
         public_authority_alias_codec=public_authority_alias_codec,
     )
 
@@ -663,7 +708,24 @@ def session_store_case(request, tmp_path):
         return request.param, tmp_path, None
     if request.param == "sqlite":
         return request.param, tmp_path, None
-    return request.param, tmp_path, request.getfixturevalue("postgres_dsn")
+    return request.param, tmp_path, request.getfixturevalue("conformance_postgres_dsn")
+
+
+@pytest.fixture(scope="module")
+def conformance_postgres_dsn(postgres_dsn) -> Iterator[str]:
+    async def initialize_schema() -> None:
+        await _drop_postgres_schema(postgres_dsn)
+        store = _new_postgres_store(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            await store.ensure_schema()
+        finally:
+            await _close_store(store)
+
+    asyncio.run(initialize_schema())
+    try:
+        yield postgres_dsn
+    finally:
+        asyncio.run(_reset_postgres_data(postgres_dsn))
 
 
 def test_in_memory_public_authority_aliases_reject_retired_keys() -> None:
@@ -741,7 +803,7 @@ async def _open_store(
             tmp_path / "sessions.sqlite",
             public_authority_alias_codec=public_authority_alias_codec,
         )
-    await _truncate_postgres(postgres_dsn)
+    await _reset_postgres_data(postgres_dsn)
     return _new_postgres_store(
         postgres_dsn,
         public_authority_alias_codec=public_authority_alias_codec,
@@ -4357,7 +4419,7 @@ def test_session_store_conformance_preserves_exact_portable_number_representatio
 
 def test_sqlite_jsonl_to_postgres_preserves_exact_portable_number_representation(
     tmp_path,
-    postgres_dsn,
+    conformance_postgres_dsn,
 ) -> None:
     async def run() -> None:
         session_id = "sess_sqlite_postgres_portable_numbers"
@@ -4414,8 +4476,8 @@ def test_sqlite_jsonl_to_postgres_preserves_exact_portable_number_representation
         assert imported.checkpoint is not None
         _assert_portable_number_probe(imported.checkpoint["numbers"])
 
-        await _truncate_postgres(postgres_dsn)
-        postgres_store = _new_postgres_store(postgres_dsn)
+        await _reset_postgres_data(conformance_postgres_dsn)
+        postgres_store = _new_postgres_store(conformance_postgres_dsn)
         try:
             source = imported.session
             await postgres_store.create(
@@ -4443,7 +4505,7 @@ def test_sqlite_jsonl_to_postgres_preserves_exact_portable_number_representation
             await postgres_store.checkpoint(source.id, imported.checkpoint)
 
             postgres_store = await _reopen_store(
-                ("postgres", tmp_path, postgres_dsn),
+                ("postgres", tmp_path, conformance_postgres_dsn),
                 postgres_store,
             )
             restored = await postgres_store.load(source.id)

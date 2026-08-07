@@ -66,10 +66,15 @@ jobs:
       - run: uv run python scripts/generate_sidecar_manifest.py --check
       - run: uv lock --check
 
-  test:
-    name: Test (Python 3.14)
+  test_shards:
+    name: Test shard ${{ matrix.shard }}/4 (Python 3.14)
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     env:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
@@ -79,13 +84,74 @@ jobs:
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.14
       - run: uv sync --frozen --extra dev --extra server --python 3.14
-      - name: Test
+      - name: Test duration-balanced shard
+        run: |
+          uv run pytest -q \
+            -m "not (stress or process or postgres)" \
+            --splits 4 \
+            --group "${{ matrix.shard }}" \
+            --splitting-algorithm least_duration \
+            --durations=20
+
+  test_specialists:
+    name: Test specialist ${{ matrix.lane }} (Python 3.14)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: stress
+            marker: stress
+          - lane: process
+            marker: process
+          - lane: postgres-conformance
+            marker: postgres
+    env:
+      CAYU_REQUIRE_POSTGRES: "1"
+      CAYU_REQUIRE_DOCKER_RUNNER: "1"
+      CAYU_REQUIRE_DOCKER_EGRESS: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv python install 3.14
+      - run: uv sync --frozen --extra dev --extra server --python 3.14
+      - name: Test specialist lane
+        run: uv run pytest -q -m "${{ matrix.marker }}" --durations=20
+
+  test:
+    name: Test (Python 3.14)
+    needs: [test_shards, test_specialists]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CAYU_REQUIRE_POSTGRES: "1"
+      CAYU_REQUIRE_DOCKER_RUNNER: "1"
+      CAYU_REQUIRE_DOCKER_EGRESS: "1"
+    steps:
+      - name: Require every pull request shard
         if: github.event_name == 'pull_request'
-        run: uv run pytest -q --durations=20
+        env:
+          SHARD_RESULT: ${{ needs.test_shards.result }}
+          SPECIALIST_RESULT: ${{ needs.test_specialists.result }}
+        run: |
+          test "$SHARD_RESULT" = "success"
+          test "$SPECIALIST_RESULT" = "success"
+      - if: github.event_name != 'pull_request'
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - if: github.event_name != 'pull_request'
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - if: github.event_name != 'pull_request'
+        run: uv python install 3.14
+      - if: github.event_name != 'pull_request'
+        run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Test with coverage visibility
         if: github.event_name != 'pull_request'
         run: |
           uv run pytest -q \
+            -n 3 --dist loadfile \
             --durations=20 \
             --cov=cayu \
             --cov-branch \

@@ -6,7 +6,8 @@ import inspect
 import math
 import pickle
 import sys
-import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
@@ -3624,7 +3625,8 @@ def test_local_artifact_store_concurrent_deterministic_writes_publish_once(tmp_p
     (False, True),
     ids=("native-directory-fd", "directory-fd-fallback"),
 )
-def test_local_artifact_store_concurrent_partial_recovery_stress(
+@pytest.mark.stress
+def test_local_artifact_store_concurrent_partial_recovery(
     monkeypatch,
     tmp_path,
     writer_count,
@@ -3633,36 +3635,62 @@ def test_local_artifact_store_concurrent_partial_recovery_stress(
     if force_directory_fd_fallback:
         monkeypatch.setattr(artifact_local_module, "_SUPPORTS_DIRECTORY_FD", False)
 
+    workers_ready = threading.Barrier(writer_count)
+    original_put = artifact_local_module._put_deterministic_artifact
+    original_recover = artifact_local_module._remove_matching_incomplete_artifact
+    recovery_lock = threading.Lock()
+    recovery_calls = 0
+
+    def synchronized_put(*args):
+        workers_ready.wait(timeout=10)
+        return original_put(*args)
+
+    def counted_recovery(*args):
+        nonlocal recovery_calls
+        with recovery_lock:
+            recovery_calls += 1
+        return original_recover(*args)
+
+    monkeypatch.setattr(artifact_local_module, "_put_deterministic_artifact", synchronized_put)
+    monkeypatch.setattr(
+        artifact_local_module,
+        "_remove_matching_incomplete_artifact",
+        counted_recovery,
+    )
+
     async def write_concurrently(store):
-        return await asyncio.gather(
-            *(
-                store.put_bytes(
-                    b"shared-content",
-                    artifact_id=artifact_id,
-                    filename="shared.txt",
-                    content_type="text/plain",
-                    session_id="sess_shared",
-                )
-                for _ in range(writer_count)
-            ),
-            return_exceptions=True,
-        )
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=writer_count) as executor:
+            loop.set_default_executor(executor)
+            return await asyncio.gather(
+                *(
+                    store.put_bytes(
+                        b"shared-content",
+                        artifact_id=artifact_id,
+                        filename="shared.txt",
+                        content_type="text/plain",
+                        session_id="sess_shared",
+                    )
+                    for _ in range(writer_count)
+                ),
+                return_exceptions=True,
+            )
 
     artifact_id = f"art_{'b' * 32}"
-    for iteration in range(50):
-        store = LocalArtifactStore(tmp_path / str(iteration), store_id="artifacts")
-        partial = store.root / artifact_id
-        partial.mkdir()
-        (partial / "content").write_bytes(b"shared-content")
+    store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    partial = store.root / artifact_id
+    partial.mkdir()
+    (partial / "content").write_bytes(b"shared-content")
 
-        results = asyncio.run(write_concurrently(store))
-        failures = [result for result in results if isinstance(result, BaseException)]
-        assert failures == [], f"concurrent recovery failed at iteration {iteration}"
-        artifacts = [result for result in results if isinstance(result, ArtifactMetadata)]
-        assert len(artifacts) == writer_count
-        assert artifacts == [artifacts[0]] * writer_count
-        assert asyncio.run(store.read_bytes(artifact_id)).content == b"shared-content"
-        assert [path.name for path in store.root.iterdir()] == [artifact_id]
+    results = asyncio.run(write_concurrently(store))
+    failures = [result for result in results if isinstance(result, BaseException)]
+    assert failures == []
+    artifacts = [result for result in results if isinstance(result, ArtifactMetadata)]
+    assert len(artifacts) == writer_count
+    assert artifacts == [artifacts[0]] * writer_count
+    assert recovery_calls == 1
+    assert asyncio.run(store.read_bytes(artifact_id)).content == b"shared-content"
+    assert [path.name for path in store.root.iterdir()] == [artifact_id]
 
 
 def test_local_artifact_store_rejects_symlinked_artifact_files(tmp_path):
@@ -4553,6 +4581,7 @@ def test_local_runner_supports_cwd_env_and_stdin(tmp_path):
     assert result.stdout.splitlines() == ["work", "ok", "input"]
 
 
+@pytest.mark.process
 def test_local_runner_captures_failure_and_timeout(tmp_path):
     runner = LocalRunner(tmp_path)
 
@@ -4566,22 +4595,24 @@ def test_local_runner_captures_failure_and_timeout(tmp_path):
             )
         )
     )
-    timed_out = asyncio.run(
-        runner.exec(
-            ExecCommand.process(
-                sys.executable,
-                "-c",
-                "import time; time.sleep(5)",
+
+    async def capture_timeouts():
+        return await asyncio.gather(
+            runner.exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(30)",
+                ),
+                timeout_s=1,
             ),
-            timeout_s=1,
+            runner.exec(
+                ExecCommand.bash("sleep 30"),
+                timeout_s=1,
+            ),
         )
-    )
-    shell_timed_out = asyncio.run(
-        runner.exec(
-            ExecCommand.bash("sleep 5"),
-            timeout_s=1,
-        )
-    )
+
+    timed_out, shell_timed_out = asyncio.run(capture_timeouts())
 
     assert missing.exit_code == 127
     assert missing.stderr == "Command not found: cayu-command-that-does-not-exist"
@@ -4613,10 +4644,43 @@ def test_local_runner_enforces_output_limit_while_process_runs(tmp_path):
     assert result.stderr_truncated is True
 
 
-def test_local_runner_kills_process_on_cancellation(tmp_path):
-    started = tmp_path / "started.txt"
-    marker = tmp_path / "marker.txt"
+_BLOCKING_PROCESS_PROGRAM = (
+    "import pathlib,threading; "
+    "pathlib.Path('started.txt').write_text('started'); "
+    "threading.Event().wait()"
+)
+
+
+async def _wait_for_process_marker(marker) -> None:
+    for _ in range(200):
+        if marker.exists():
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail("LocalRunner child did not publish its start marker.")
+
+
+def _capture_spawned_processes(monkeypatch):
+    original_spawn = runner_subprocess_module.asyncio.create_subprocess_exec
+    spawned = []
+
+    async def capturing_spawn(*args, **kwargs):
+        process = await original_spawn(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(
+        runner_subprocess_module.asyncio,
+        "create_subprocess_exec",
+        capturing_spawn,
+    )
+    return spawned
+
+
+@pytest.mark.process
+def test_local_runner_kills_process_on_cancellation(tmp_path, monkeypatch):
+    marker = tmp_path / "started.txt"
     runner = LocalRunner(tmp_path)
+    spawned = _capture_spawned_processes(monkeypatch)
 
     async def run_and_cancel() -> None:
         task = asyncio.create_task(
@@ -4624,44 +4688,36 @@ def test_local_runner_kills_process_on_cancellation(tmp_path):
                 ExecCommand.process(
                     sys.executable,
                     "-c",
-                    (
-                        "import pathlib,time; "
-                        "pathlib.Path('started.txt').write_text('started'); "
-                        "time.sleep(2); "
-                        "pathlib.Path('marker.txt').write_text('alive')"
-                    ),
+                    _BLOCKING_PROCESS_PROGRAM,
                 )
             )
         )
-        for _ in range(20):
-            if started.exists():
-                break
-            await asyncio.sleep(0.05)
-        assert started.exists()
+        await _wait_for_process_marker(marker)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
+        assert len(spawned) == 1
+        assert spawned[0].returncode is not None
+
     asyncio.run(run_and_cancel())
-    time.sleep(2.2)
-    assert not marker.exists()
 
 
+@pytest.mark.process
 def test_local_runner_cleans_up_when_cancelled_during_timeout(tmp_path, monkeypatch):
-    marker = tmp_path / "marker.txt"
+    marker = tmp_path / "started.txt"
     runner = LocalRunner(tmp_path)
+    spawned = _capture_spawned_processes(monkeypatch)
     original_waiter = runner_subprocess_module._await_process_exit
 
     async def run_and_cancel() -> None:
         cleanup_started = asyncio.Event()
+        finish_cleanup = asyncio.Event()
 
         async def delayed_waiter(wait_task):
             cleanup_started.set()
-            try:
-                await asyncio.sleep(10)
-            except asyncio.CancelledError:
-                await original_waiter(wait_task)
-                raise
+            await finish_cleanup.wait()
+            await original_waiter(wait_task)
 
         monkeypatch.setattr(runner_subprocess_module, "_await_process_exit", delayed_waiter)
         task = asyncio.create_task(
@@ -4669,23 +4725,23 @@ def test_local_runner_cleans_up_when_cancelled_during_timeout(tmp_path, monkeypa
                 ExecCommand.process(
                     sys.executable,
                     "-c",
-                    (
-                        "import pathlib,time; "
-                        "time.sleep(2); "
-                        "pathlib.Path('marker.txt').write_text('alive')"
-                    ),
+                    _BLOCKING_PROCESS_PROGRAM,
                 ),
                 timeout_s=1,
             )
         )
-        await cleanup_started.wait()
+        await asyncio.wait_for(cleanup_started.wait(), timeout=5)
+        await _wait_for_process_marker(marker)
         task.cancel()
+        await asyncio.sleep(0)
+        finish_cleanup.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 
+        assert len(spawned) == 1
+        assert spawned[0].returncode is not None
+
     asyncio.run(run_and_cancel())
-    time.sleep(1.2)
-    assert not marker.exists()
 
 
 def test_local_runner_is_fail_closed_on_host_env_inheritance(tmp_path, monkeypatch):

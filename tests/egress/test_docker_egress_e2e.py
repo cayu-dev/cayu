@@ -61,10 +61,13 @@ _DOCKER_AVAILABLE = _docker_available()
 if os.environ.get("CAYU_REQUIRE_DOCKER_EGRESS") == "1" and not _DOCKER_AVAILABLE:
     raise RuntimeError("CAYU_REQUIRE_DOCKER_EGRESS=1 but the Docker daemon is unavailable.")
 
-pytestmark = pytest.mark.skipif(
-    not _DOCKER_AVAILABLE,
-    reason="Docker daemon not available for virtual-egress E2E.",
-)
+pytestmark = [
+    pytest.mark.process,
+    pytest.mark.skipif(
+        not _DOCKER_AVAILABLE,
+        reason="Docker daemon not available for virtual-egress E2E.",
+    ),
+]
 
 
 class _FakeStripe:

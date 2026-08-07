@@ -155,6 +155,14 @@ def _skip_or_fail_postgres_unavailable(reason: str) -> None:
     pytest.skip(reason)
 
 
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Keep every statically declared Postgres consumer in one ordered CI lane."""
+
+    for item in items:
+        if "postgres_dsn" in item.fixturenames:
+            item.add_marker(pytest.mark.postgres)
+
+
 @pytest.fixture(scope="session")
 def postgres_dsn() -> str:
     """Session-scoped Postgres DSN for the store parity tests.

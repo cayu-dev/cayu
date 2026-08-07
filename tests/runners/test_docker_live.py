@@ -15,6 +15,8 @@ from cayu import DockerRunner, ExecCommand, SearchTextTool, ToolContext
 _REQUIRE_DOCKER_RUNNER_ENV_VAR = "CAYU_REQUIRE_DOCKER_RUNNER"
 _SEARCH_TEXT_IMAGE = "cayu-search-text-live:local"
 
+pytestmark = pytest.mark.process
+
 
 def _docker_path_or_skip() -> str:
     docker_path = os.environ.get("CAYU_DOCKER_PATH") or shutil.which("docker")

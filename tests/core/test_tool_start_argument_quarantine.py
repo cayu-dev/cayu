@@ -2932,7 +2932,10 @@ def test_command_policy_denial_redacts_before_a_sibling_resolves_its_secret(
 
 @pytest.mark.parametrize("max_parallel_tool_calls", [1, 4])
 @pytest.mark.parametrize("result_is_error", [False, True])
-@pytest.mark.parametrize("store_kind", ["memory", "sqlite", "postgres"])
+@pytest.mark.parametrize(
+    "store_kind",
+    ["memory", "sqlite", pytest.param("postgres", marks=pytest.mark.postgres)],
+)
 def test_multi_call_result_redacts_argument_before_a_sibling_resolves_its_secret(
     tmp_path,
     request,

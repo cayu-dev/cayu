@@ -18,6 +18,7 @@ from cayu.runtime._model_completion_publication import (
 )
 
 pytestmark = [
+    pytest.mark.process,
     pytest.mark.sigkill_recovery,
     pytest.mark.skipif(
         os.name != "posix" or not hasattr(signal, "SIGKILL"),

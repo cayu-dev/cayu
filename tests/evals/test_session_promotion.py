@@ -137,7 +137,7 @@ def _price_book(*, input_rate: str = "1", currency: str = "USD") -> PriceBook:
     )
 
 
-@pytest.fixture(params=("memory", "sqlite", "postgres"))
+@pytest.fixture(params=("memory", "sqlite", pytest.param("postgres", marks=pytest.mark.postgres)))
 def promotion_store_case(request, tmp_path):
     if request.param == "postgres":
         return request.param, tmp_path, request.getfixturevalue("postgres_dsn")
