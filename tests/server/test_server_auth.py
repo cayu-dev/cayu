@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 # ruff: noqa: E402
+import asyncio
 import inspect
 from collections.abc import AsyncIterator
 
@@ -27,6 +28,7 @@ from cayu.server import (
     mount_cayu,
     mount_dashboard,
 )
+from cayu.server.auth import server_auth_dependency
 
 _TOKEN = "secret-token"
 _AUTH_HEADERS = {"Authorization": f"Bearer {_TOKEN}"}
@@ -75,6 +77,43 @@ def _make_client(*, expose_docs: bool | None = None) -> TestClient:
             ),
         )
     )
+
+
+def test_auth_context_cache_is_bound_to_the_originating_dependency() -> None:
+    calls: list[str] = []
+
+    def first_auth(_request: Request) -> AuthContext:
+        calls.append("first")
+        return AuthContext(subject="first")
+
+    def second_auth(_request: Request) -> AuthContext:
+        calls.append("second")
+        return AuthContext(subject="second")
+
+    async def exercise() -> tuple[AuthContext, AuthContext, AuthContext]:
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/",
+                "headers": [],
+                "query_string": b"",
+            }
+        )
+        first_dependency = server_auth_dependency(first_auth)
+        second_dependency = server_auth_dependency(second_auth)
+        return (
+            await first_dependency(request),
+            await first_dependency(request),
+            await second_dependency(request),
+        )
+
+    first, replayed, second = asyncio.run(exercise())
+
+    assert first.subject == "first"
+    assert replayed.subject == "first"
+    assert second.subject == "second"
+    assert calls == ["first", "second"]
 
 
 @pytest.mark.parametrize(

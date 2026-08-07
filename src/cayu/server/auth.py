@@ -6,6 +6,7 @@ import base64
 import inspect
 import secrets
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, cast
 
 from fastapi import Request  # noqa: TC002 - FastAPI inspects this annotation at runtime.
@@ -75,13 +76,25 @@ class AuthContext(BaseModel):
 
 AuthDependencyResult = AuthContext | Mapping[str, Any]
 AuthDependency = Callable[[Any], AuthDependencyResult | Awaitable[AuthDependencyResult]]
+_AUTH_CONTEXT_SCOPE_KEY = "cayu.auth_context.v1"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CachedAuthContext:
+    auth: AuthDependency
+    context: AuthContext
 
 
 def server_auth_dependency(auth: AuthDependency) -> Callable[[Request], Awaitable[AuthContext]]:
     """Wrap a user auth callable so routes receive a validated AuthContext."""
 
     async def dependency(request: Request) -> AuthContext:
-        return await resolve_auth_context(auth, request)
+        cached = request.scope.get(_AUTH_CONTEXT_SCOPE_KEY)
+        if type(cached) is _CachedAuthContext and cached.auth is auth:
+            return cached.context.model_copy(deep=True)
+        context = await resolve_auth_context(auth, request)
+        request.scope[_AUTH_CONTEXT_SCOPE_KEY] = _CachedAuthContext(auth=auth, context=context)
+        return context.model_copy(deep=True)
 
     return dependency
 

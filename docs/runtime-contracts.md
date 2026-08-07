@@ -2515,8 +2515,10 @@ event records, and transcript records, and exposes interaction-scoped control-pl
 reads. Server contract version 6 changes public SSE event identities to opaque,
 sequence-backed replay markers and applies schema-aware public event projection.
 Server contract version 7 adds explicit provider-operation reconnect and
-reconciliation states to session-state inspection. Clients generated against
-contract version 1 through 6 must regenerate from the current OpenAPI document.
+reconciliation states to session-state inspection. Server contract version 8
+adds the required Evals capability surface and authenticated corpus, run,
+result, cancellation, and comparison endpoints. Clients generated against
+contract version 1 through 7 must regenerate from the current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from cayu.evals.published import PublishedEvalRun, _publish_eval_run_with_trial_
 from cayu.evals.result_contract import (
     EVAL_TRIAL_OUTPUT_MAX_PREVIEW_BYTES,
     PUBLISHED_EVAL_OUTPUT_PREVIEW_BUDGET_BYTES,
+    _EvalTrialPublicData,
 )
 from cayu.evals.runner import EvalCase, EvalSuite, _run_eval_suite_with_public_projection
 from cayu.runtime.app import CayuApp
@@ -722,7 +724,26 @@ async def _run_compiled_corpus_suite(
         trials=compiled.trials,
         output_preview_bytes=output_preview_bytes,
     )
-    target_after = _evaluation_target_identity_from_validated_target(validated_target)
+    return await asyncio.to_thread(
+        _finalize_compiled_corpus_result,
+        validated_target,
+        compiled,
+        target_before,
+        internal_run,
+        trial_public_data_by_case,
+    )
+
+
+def _finalize_compiled_corpus_result(
+    target: CorpusTarget,
+    compiled: CompiledCorpusSuite,
+    target_before: EvaluationTargetIdentity,
+    internal_run: EvalRun,
+    trial_public_data_by_case: dict[str, tuple[_EvalTrialPublicData, ...]],
+) -> CorpusExecutionResult:
+    """Construct and validate the complete published result off the event loop."""
+
+    target_after = _evaluation_target_identity_from_validated_target(target)
     if target_after != target_before:
         raise RuntimeError("CorpusTarget application manifest changed during eval execution.")
     run_document: dict[str, Any] = _model_instance_python_input(internal_run)

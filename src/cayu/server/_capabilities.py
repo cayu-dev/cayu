@@ -31,6 +31,7 @@ class ControlPlaneCapabilitySnapshot:
     session_topology_supported: bool
     evaluation_promotion_configured: bool
     evaluation_promotion_supported: bool
+    evals_configured: bool
 
     def project(
         self,
@@ -97,6 +98,10 @@ class ControlPlaneCapabilitySnapshot:
                     self.evaluation_promotion_configured,
                     supported=self.evaluation_promotion_supported,
                 ),
+                evals=_optional_surface(
+                    self.evals_configured,
+                    mutation_supported=True,
+                ),
             ),
             mutations=ControlPlaneMutationCapabilities(
                 session_execution=_operation(True),
@@ -119,6 +124,7 @@ def inspect_control_plane_capabilities(
     session_topology_supported: bool,
     evaluation_promotion_configured: bool = False,
     evaluation_promotion_supported: bool = False,
+    evals_configured: bool = False,
 ) -> ControlPlaneCapabilitySnapshot:
     """Capture fixed capability inputs once, without probing external services."""
 
@@ -131,6 +137,7 @@ def inspect_control_plane_capabilities(
         ("session_topology_supported", session_topology_supported),
         ("evaluation_promotion_configured", evaluation_promotion_configured),
         ("evaluation_promotion_supported", evaluation_promotion_supported),
+        ("evals_configured", evals_configured),
     ):
         if type(value) is not bool:
             raise TypeError(f"{field_name} must be a bool.")
@@ -149,6 +156,7 @@ def inspect_control_plane_capabilities(
         session_topology_supported=session_topology_supported,
         evaluation_promotion_configured=evaluation_promotion_configured,
         evaluation_promotion_supported=evaluation_promotion_supported,
+        evals_configured=evals_configured,
     )
 
 

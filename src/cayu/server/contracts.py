@@ -25,15 +25,22 @@ from cayu._validation import json_utf8_size_within_limit, require_unicode_scalar
 from cayu.core.events import EVENT_ID_MAX_CHARS
 from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_ASSERTIONS_PER_CASE,
+    EVAL_CORPUS_MAX_BYTES,
     AssertionSpec,
     RunInputSpec,
     TrialRequestSpec,
 )
+from cayu.evals.execution import (
+    CORPUS_EXECUTION_MAX_CONCURRENCY,
+    CorpusExecutionResult,
+)
+from cayu.evals.execution_comparison import CorpusComparisonCompatibility
 from cayu.evals.promotion import (
     PROMOTION_CANDIDATE_MAX_BYTES,
     CapturedRunScoreV1,
     PromotionCandidateV1,
 )
+from cayu.evals.store import EvalRunRecord, EvalRunStatus
 from cayu.runtime.aggregates import (
     AggregateAccuracy,
     AggregateCount,
@@ -103,6 +110,7 @@ MAX_CONTROL_PLANE_METADATA_NESTING = 32
 MAX_CONTROL_PLANE_PROMPT_BYTES = 64 * 1024
 MAX_CONTROL_PLANE_REQUEST_BYTES = 1024 * 1024
 MAX_EVALUATION_PROMOTION_REQUEST_BYTES = PROMOTION_CANDIDATE_MAX_BYTES + (64 * 1024)
+MAX_EVALS_REQUEST_BYTES = EVAL_CORPUS_MAX_BYTES + (64 * 1024)
 MAX_EXECUTION_TOPOLOGY_EDGES = 1500
 
 SessionTopologyIdentifier = Annotated[
@@ -785,6 +793,7 @@ class ControlPlaneSurfaceCapabilities(ApiBaseModel):
     usage: OptionalSurfaceCapability
     pricing: OptionalSurfaceCapability
     evaluation_promotion: OptionalSurfaceCapability
+    evals: OptionalSurfaceCapability
 
 
 class ControlPlaneMutationCapabilities(ApiBaseModel):
@@ -826,6 +835,83 @@ PromotionPortableId = Annotated[
         pattern=r"^[a-z][a-z0-9._-]{0,127}$",
     ),
 ]
+
+EvalRevision = Annotated[
+    str,
+    StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$", min_length=71, max_length=71),
+]
+EvalServerIdentifier = Annotated[
+    str,
+    StringConstraints(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+    ),
+]
+
+
+class EvalRunCreateRequest(ApiBaseModel):
+    """Authority-free request to execute one stored suite on the attached target."""
+
+    corpus_revision: EvalRevision
+    suite_id: PromotionPortableId
+    max_concurrency: StrictInt = Field(default=1, ge=1, le=CORPUS_EXECUTION_MAX_CONCURRENCY)
+
+
+class EvalComparisonRequest(ApiBaseModel):
+    baseline_run_id: EvalServerIdentifier
+    current_run_id: EvalServerIdentifier
+
+
+class EvalComparisonResponse(ApiBaseModel):
+    baseline: EvalRunRecord
+    current: EvalRunRecord
+    compatibility: CorpusComparisonCompatibility
+
+    @model_validator(mode="after")
+    def validate_terminal_runs(self) -> EvalComparisonResponse:
+        if self.baseline.status is not EvalRunStatus.COMPLETED:
+            raise ValueError("Eval comparison baseline must have a completed result.")
+        if self.current.status is not EvalRunStatus.COMPLETED:
+            raise ValueError("Eval comparison current run must have a completed result.")
+        return self
+
+
+class EvalResultResponse(ApiBaseModel):
+    run: EvalRunRecord
+    result: CorpusExecutionResult
+
+    @model_validator(mode="after")
+    def validate_run_result(self) -> EvalResultResponse:
+        if self.run.status is not EvalRunStatus.COMPLETED or self.run.result is None:
+            raise ValueError("Eval result response requires a completed run.")
+        spec = self.run.spec
+        published = self.result.run
+        if (
+            spec.corpus_revision != published.corpus_revision
+            or spec.target_key != published.target_key
+            or spec.suite_id != published.suite_id
+            or spec.suite_revision != published.suite_revision
+        ):
+            raise ValueError("Eval result response does not match its run specification.")
+        summary = self.run.result
+        if (
+            summary.revision != self.result.revision
+            or summary.status != published.status
+            or summary.score != published.score
+            or summary.duration_ms != published.duration_ms
+        ):
+            raise ValueError("Eval result response does not match its run summary.")
+        return self
+
+
+EVALS_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    400: {"description": "The request is incompatible with the attached eval target."},
+    404: {"description": "The requested eval resource does not exist."},
+    409: {"description": "The requested eval lifecycle transition is not currently valid."},
+    413: {"description": "The request or bounded store result exceeds its byte limit."},
+    422: {"description": "The request is invalid or contains unsafe public data."},
+}
 
 
 class EvaluationPromotionSuiteDraft(ApiBaseModel):

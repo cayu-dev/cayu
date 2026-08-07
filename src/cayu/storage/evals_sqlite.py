@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
@@ -14,7 +15,6 @@ from cayu.evals.corpus import (
     EvalCorpusDocument,
     _portable_id,
     _sha256_revision,
-    inspect_eval_corpus,
 )
 from cayu.evals.execution import CORPUS_EXECUTION_RESULT_MAX_BYTES, CorpusExecutionResult
 from cayu.evals.execution_reporting import corpus_execution_result_from_json
@@ -53,18 +53,16 @@ from cayu.evals.store import (
     _copy_query,
     _exact_model,
     _lease_seconds,
-    _prepare_corpus_for_store,
+    _prepare_corpus_catalog_for_store,
     _prepare_result_for_store,
     _prepare_run_request_for_store,
     _read_limit,
     _store_identifier,
-    case_catalog_entries,
     decode_case_cursor,
     decode_corpus_cursor,
     decode_run_cursor,
     decode_suite_cursor,
     result_summary,
-    suite_catalog_entries,
     validate_result_for_run,
 )
 from cayu.storage import _sqlite_support as sqlite_support
@@ -188,16 +186,28 @@ class SQLiteEvalStore(EvalStore):
         except BaseException:
             self._connection.close()
             raise
+        try:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="cayu-evals-sqlite",
+            )
+        except BaseException:
+            self._connection.close()
+            raise
 
     async def _run(self, operation):
         return await _run_off_thread_with_connection_ownership(
             self._lock,
             self._connection,
             operation,
+            executor=self._executor,
         )
 
     async def close(self) -> None:
-        await self._run(lambda connection: connection.close())
+        try:
+            await self._run(lambda connection: connection.close())
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
     async def save_corpus(
         self,
@@ -205,14 +215,12 @@ class SQLiteEvalStore(EvalStore):
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalCorpusCatalogEntry:
-        corpus, document = _prepare_corpus_for_store(
+        corpus, document, inspection, suites, cases = await asyncio.to_thread(
+            _prepare_corpus_catalog_for_store,
             corpus,
             redact_json=redact_json,
         )
         document_text = document.decode("utf-8")
-        suites = suite_catalog_entries(corpus)
-        cases = case_catalog_entries(corpus)
-        inspection = inspect_eval_corpus(corpus)
 
         def operation(connection: sqlite3.Connection) -> EvalCorpusCatalogEntry:
             try:
@@ -766,7 +774,8 @@ class SQLiteEvalStore(EvalStore):
         redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
-        result, document = _prepare_result_for_store(
+        result, document = await asyncio.to_thread(
+            _prepare_result_for_store,
             result,
             redact_json=redact_json,
         )

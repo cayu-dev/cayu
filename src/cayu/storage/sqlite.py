@@ -7,6 +7,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Callable, Sequence
+from concurrent.futures import Executor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar, cast
@@ -306,6 +307,8 @@ async def _run_off_thread_with_connection_ownership(
     lock: asyncio.Lock,
     connection: sqlite3.Connection,
     operation: Callable[[sqlite3.Connection], _T],
+    *,
+    executor: Executor | None = None,
 ) -> _T:
     """Keep a SQLite connection owned until its off-thread operation terminates.
 
@@ -329,7 +332,7 @@ async def _run_off_thread_with_connection_ownership(
 
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
-        worker = loop.run_in_executor(None, context.run, capture_outcome)
+        worker = loop.run_in_executor(executor, context.run, capture_outcome)
         cancellation: asyncio.CancelledError | None = None
 
         while not worker.done():

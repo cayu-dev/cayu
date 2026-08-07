@@ -5,6 +5,79 @@ export type ClientOptions = {
 };
 
 /**
+ * AgentAuthoringState
+ *
+ * Explicit application-authoring state carried by an agent specification.
+ */
+export type AgentAuthoringState = 'unfinished_generated_tracer_bullet';
+
+/**
+ * AgentManifest
+ */
+export type AgentManifest = {
+    authoring_state?: AgentAuthoringState | null;
+    /**
+     * Configured Provider
+     */
+    configured_provider: string | null;
+    /**
+     * Context Overflow Policy
+     */
+    context_overflow_policy: string | null;
+    /**
+     * Context Policy
+     */
+    context_policy: string;
+    execution_requirements: ExecutionRequirements;
+    /**
+     * Has System Prompt
+     */
+    has_system_prompt: boolean;
+    implementation_provenance: RegistrationProvenance;
+    /**
+     * Loop Policies
+     */
+    loop_policies?: Array<string>;
+    /**
+     * Model
+     */
+    model: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Provider Candidates
+     */
+    provider_candidates?: Array<string>;
+    /**
+     * Provider Resolution
+     */
+    provider_resolution: 'explicit' | 'model_pattern' | 'default' | 'missing' | 'ambiguous';
+    registration_provenance: RegistrationProvenance;
+    /**
+     * Resolved Provider
+     */
+    resolved_provider: string | null;
+    /**
+     * Runtime Hooks
+     */
+    runtime_hooks?: Array<string>;
+    /**
+     * Tool Policy
+     */
+    tool_policy: string;
+    /**
+     * Tools
+     */
+    tools?: Array<ToolManifest>;
+    /**
+     * Workflow Tool Names
+     */
+    workflow_tool_names?: Array<string>;
+};
+
+/**
  * AgentsResponse
  */
 export type AgentsResponse = {
@@ -1449,6 +1522,53 @@ export type ApiTranscriptMessage = {
 };
 
 /**
+ * AppManifest
+ */
+export type AppManifest = {
+    /**
+     * Agents
+     */
+    agents: Array<AgentManifest>;
+    /**
+     * Capabilities
+     */
+    capabilities: Array<CapabilityManifest>;
+    defaults: ApplicationDefaultsManifest;
+    /**
+     * Environments
+     */
+    environments: Array<EnvironmentManifest>;
+    /**
+     * Fingerprint
+     */
+    fingerprint: string;
+    /**
+     * Providers
+     */
+    providers: Array<ProviderManifest>;
+    runtime: RuntimeManifest;
+    /**
+     * Schema Version
+     */
+    schema_version?: '7';
+    stores: StoreManifest;
+};
+
+/**
+ * ApplicationDefaultsManifest
+ */
+export type ApplicationDefaultsManifest = {
+    /**
+     * Environment
+     */
+    environment: string | null;
+    /**
+     * Provider
+     */
+    provider: string | null;
+};
+
+/**
  * ArtifactReadResponse
  */
 export type ArtifactReadResponse = {
@@ -1774,6 +1894,32 @@ export type BudgetWindow = {
      * Timezone
      */
     timezone?: string | null;
+};
+
+/**
+ * CapabilityManifest
+ */
+export type CapabilityManifest = {
+    /**
+     * Declared
+     */
+    declared: boolean;
+    /**
+     * Live Verified
+     */
+    live_verified?: 'not_run';
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Process Available
+     */
+    process_available?: 'not_checked';
+    /**
+     * Resolved
+     */
+    resolved: boolean;
 };
 
 /**
@@ -2135,12 +2281,66 @@ export type ControlPlaneMutationCapabilities = {
 export type ControlPlaneSurfaceCapabilities = {
     artifacts: OptionalSurfaceCapability;
     dashboard: OptionalSurfaceCapability;
+    evals: OptionalSurfaceCapability;
     evaluation_promotion: OptionalSurfaceCapability;
     pricing: OptionalSurfaceCapability;
     reviewed_knowledge: OptionalSurfaceCapability;
     tasks: OptionalSurfaceCapability;
     usage: OptionalSurfaceCapability;
     workflow?: OptionalSurfaceCapability | null;
+};
+
+/**
+ * CorpusComparisonCompatibility
+ *
+ * Typed precondition result for later regression comparison and UI adapters.
+ */
+export type CorpusComparisonCompatibility = {
+    /**
+     * Baseline Result Revision
+     */
+    baseline_result_revision: string;
+    /**
+     * Comparable
+     */
+    comparable: boolean;
+    /**
+     * Current Result Revision
+     */
+    current_result_revision: string;
+    /**
+     * Reasons
+     */
+    reasons?: Array<CorpusComparisonReason>;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+};
+
+/**
+ * CorpusComparisonReason
+ *
+ * Stable reason that two published executions cannot be compared as one contract.
+ */
+export type CorpusComparisonReason = 'target_key_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
+
+/**
+ * CorpusExecutionResult
+ *
+ * Safe published run plus the fresh target identity used to produce it.
+ */
+export type CorpusExecutionResult = {
+    /**
+     * Revision
+     */
+    revision: string;
+    run: PublishedEvalRun;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    target: EvaluationTargetIdentity;
 };
 
 /**
@@ -2290,6 +2490,58 @@ export type EnqueueSessionMessageBody = {
 };
 
 /**
+ * EnvironmentManifest
+ */
+export type EnvironmentManifest = {
+    /**
+     * Artifact Store
+     */
+    artifact_store: string | null;
+    /**
+     * Binding
+     */
+    binding: string | null;
+    /**
+     * Credential Proxy
+     */
+    credential_proxy: string | null;
+    /**
+     * Factory Backed
+     */
+    factory_backed: boolean;
+    implementation_provenance: RegistrationProvenance;
+    /**
+     * Is Default
+     */
+    is_default: boolean;
+    /**
+     * Knowledge Store
+     */
+    knowledge_store: string | null;
+    /**
+     * Mcp Servers
+     */
+    mcp_servers: Array<string>;
+    /**
+     * Name
+     */
+    name: string;
+    registration_provenance: RegistrationProvenance;
+    /**
+     * Runner
+     */
+    runner: string | null;
+    /**
+     * Vault
+     */
+    vault: string | null;
+    /**
+     * Workspace
+     */
+    workspace: string | null;
+};
+
+/**
  * EnvironmentsResponse
  */
 export type EnvironmentsResponse = {
@@ -2301,6 +2553,62 @@ export type EnvironmentsResponse = {
      * Total Count
      */
     total_count: number;
+};
+
+/**
+ * EvalCaseCatalogEntry
+ */
+export type EvalCaseCatalogEntry = {
+    /**
+     * Assertion Count
+     */
+    assertion_count: number;
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Message Count
+     */
+    message_count: number;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+};
+
+/**
+ * EvalCaseCatalogPage
+ */
+export type EvalCaseCatalogPage = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalCaseCatalogEntry>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
 };
 
 /**
@@ -2338,6 +2646,304 @@ export type EvalCaseSpec = {
 };
 
 /**
+ * EvalComparisonResponse
+ */
+export type EvalComparisonResponse = {
+    baseline: EvalRunRecord;
+    compatibility: CorpusComparisonCompatibility;
+    current: EvalRunRecord;
+};
+
+/**
+ * EvalCorpusCatalogEntry
+ */
+export type EvalCorpusCatalogEntry = {
+    /**
+     * Assertion Count
+     */
+    assertion_count: number;
+    /**
+     * Case Count
+     */
+    case_count: number;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Document Bytes
+     */
+    document_bytes: number;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * Expanded Assertion Result Count
+     */
+    expanded_assertion_result_count: number;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Suite Count
+     */
+    suite_count: number;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalCorpusCatalogPage
+ */
+export type EvalCorpusCatalogPage = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalCorpusCatalogEntry>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+};
+
+/**
+ * EvalCorpusDocument
+ *
+ * One canonical, authority-free corpus for exactly one trusted target key.
+ */
+export type EvalCorpusDocument = {
+    /**
+     * Cases
+     */
+    cases: Array<EvalCaseSpec>;
+    evidence_policy: EvaluationEvidencePolicySpec;
+    pricing_profile?: PricingProfileIdentityV1 | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Suites
+     */
+    suites: Array<EvalSuiteSpec>;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalResultResponse
+ */
+export type EvalResultResponse = {
+    result: CorpusExecutionResult;
+    run: EvalRunRecord;
+};
+
+/**
+ * EvalRunFailureCode
+ *
+ * Safe terminal diagnostics; arbitrary exception text is never persisted.
+ */
+export type EvalRunFailureCode = 'target_unavailable' | 'corpus_unavailable' | 'execution_failed' | 'worker_interrupted';
+
+/**
+ * EvalRunOwnership
+ */
+export type EvalRunOwnership = {
+    /**
+     * Epoch
+     */
+    epoch: number;
+    /**
+     * Lease Expires At
+     */
+    lease_expires_at: string;
+};
+
+/**
+ * EvalRunPage
+ */
+export type EvalRunPage = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalRunRecord>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+};
+
+/**
+ * EvalRunRecord
+ */
+export type EvalRunRecord = {
+    /**
+     * Cancel Requested At
+     */
+    cancel_requested_at?: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    failure_code?: EvalRunFailureCode | null;
+    /**
+     * Finished At
+     */
+    finished_at?: string | null;
+    ownership?: EvalRunOwnership | null;
+    result?: EvalRunResultSummary | null;
+    spec: EvalRunSpec;
+    /**
+     * Started At
+     */
+    started_at?: string | null;
+    status: EvalRunStatus;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * EvalRunResultSummary
+ */
+export type EvalRunResultSummary = {
+    /**
+     * Duration Ms
+     */
+    duration_ms: number;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+};
+
+/**
+ * EvalRunSpec
+ */
+export type EvalRunSpec = {
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Max Concurrency
+     */
+    max_concurrency: number;
+    /**
+     * Run Id
+     */
+    run_id: string;
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * EvalRunStatus
+ */
+export type EvalRunStatus = 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
+
+/**
+ * EvalSuiteCatalogEntry
+ */
+export type EvalSuiteCatalogEntry = {
+    /**
+     * Assertion Count
+     */
+    assertion_count: number;
+    /**
+     * Case Count
+     */
+    case_count: number;
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Description
+     */
+    description?: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Timeout Seconds
+     */
+    timeout_seconds: number;
+    /**
+     * Trials
+     */
+    trials: number;
+};
+
+/**
+ * EvalSuiteCatalogPage
+ */
+export type EvalSuiteCatalogPage = {
+    /**
+     * Has More
+     */
+    has_more?: boolean;
+    /**
+     * Items
+     */
+    items: Array<EvalSuiteCatalogEntry>;
+    /**
+     * Next Cursor
+     */
+    next_cursor?: string | null;
+};
+
+/**
  * EvalSuiteSpec
  *
  * Reusable execution settings; case membership remains mergeable by suite_id.
@@ -2360,6 +2966,49 @@ export type EvalSuiteSpec = {
      */
     revision: string;
     trial_request?: TrialRequestSpec;
+};
+
+/**
+ * EvalTrialDiagnosticCode
+ *
+ * Stable, non-secret reason for one fresh trial's terminal outcome.
+ */
+export type EvalTrialDiagnosticCode = 'passed' | 'assertion_failed' | 'assertion_evidence_unavailable' | 'terminal_evidence_unavailable' | 'interrupted_evidence_unavailable' | 'child_evidence_unavailable' | 'execution_failed' | 'session_failed' | 'terminal_evidence_failed' | 'evidence_preparation_failed' | 'assertion_evaluation_failed' | 'case_timeout';
+
+/**
+ * EvalTrialOutputPreviewV1
+ *
+ * Bounded redacted output evidence retained for safe result inspection.
+ */
+export type EvalTrialOutputPreviewV1 = {
+    /**
+     * Evidence State
+     */
+    evidence_state: 'complete' | 'unavailable' | 'limit_exceeded';
+    /**
+     * Preview Truncated
+     */
+    preview_truncated?: boolean;
+    /**
+     * Retained Bytes
+     */
+    retained_bytes: number;
+    /**
+     * Retained Chars
+     */
+    retained_chars: number;
+    /**
+     * Retained Sha256
+     */
+    retained_sha256?: string | null;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Text
+     */
+    text?: string;
 };
 
 /**
@@ -2541,9 +3190,94 @@ export type EvaluationSourceIdentityV1 = {
 };
 
 /**
+ * EvaluationTargetIdentity
+ *
+ * Public diagnostic identity of the fresh application used for execution.
+ */
+export type EvaluationTargetIdentity = {
+    app_manifest: AppManifest;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
  * EventOrder
  */
 export type EventOrder = 'sequence_asc' | 'sequence_desc';
+
+/**
+ * ExecutionEvidenceOverride
+ *
+ * A capability-specific minimum that overrides the workload default.
+ */
+export type ExecutionEvidenceOverride = {
+    /**
+     * Capability
+     */
+    capability: string;
+    /**
+     * Minimum Evidence
+     */
+    minimum_evidence: 'declared' | 'available' | 'live_verified';
+};
+
+/**
+ * ExecutionRequirements
+ *
+ * Provider-neutral security and lifecycle requirements for one workload.
+ */
+export type ExecutionRequirements = {
+    /**
+     * Cancellation
+     */
+    cancellation?: 'best_effort' | 'confirmed';
+    /**
+     * Cleanup
+     */
+    cleanup?: 'best_effort' | 'confirmed';
+    /**
+     * Code Trust
+     */
+    code_trust?: 'trusted' | 'untrusted';
+    /**
+     * Durability
+     */
+    durability?: 'ephemeral' | 'reconnectable';
+    /**
+     * Evidence Overrides
+     */
+    evidence_overrides?: Array<ExecutionEvidenceOverride>;
+    /**
+     * Guest Privilege
+     */
+    guest_privilege?: 'unrestricted' | 'contained' | 'unprivileged';
+    /**
+     * Host Filesystem
+     */
+    host_filesystem?: 'unrestricted' | 'isolated' | 'read_only_inputs';
+    /**
+     * Minimum Evidence
+     */
+    minimum_evidence?: 'declared' | 'available' | 'live_verified';
+    /**
+     * Network Access
+     */
+    network_access?: 'unrestricted' | 'deny_by_default' | 'brokered_egress';
+    /**
+     * Real Secret Visibility
+     */
+    real_secret_visibility?: 'allowed' | 'non_possession';
+};
 
 /**
  * FinalOutputContainsAssertionSpec
@@ -3372,6 +4106,38 @@ export type Provenance = {
 };
 
 /**
+ * ProviderManifest
+ */
+export type ProviderManifest = {
+    /**
+     * Implementation
+     */
+    implementation: string;
+    implementation_provenance: RegistrationProvenance;
+    /**
+     * Is Default
+     */
+    is_default: boolean;
+    /**
+     * Model Patterns
+     */
+    model_patterns: Array<string>;
+    /**
+     * Name
+     */
+    name: string;
+    registration_provenance: RegistrationProvenance;
+    /**
+     * Supports Native Structured Output
+     */
+    supports_native_structured_output: boolean;
+    /**
+     * Usage Dialect
+     */
+    usage_dialect: string;
+};
+
+/**
  * PublishedAssertionResult
  */
 export type PublishedAssertionResult = {
@@ -3451,6 +4217,127 @@ export type PublishedChildStatusDetail = {
      * Min Count
      */
     min_count: number;
+};
+
+/**
+ * PublishedEvalCaseResult
+ */
+export type PublishedEvalCaseResult = {
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Case Revision
+     */
+    case_revision: string;
+    /**
+     * Duration Ms
+     */
+    duration_ms: number;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Trials
+     */
+    trials: Array<PublishedEvalTrialResult>;
+};
+
+/**
+ * PublishedEvalRun
+ */
+export type PublishedEvalRun = {
+    /**
+     * Cases
+     */
+    cases: Array<PublishedEvalCaseResult>;
+    /**
+     * Corpus Revision
+     */
+    corpus_revision: string;
+    /**
+     * Duration Ms
+     */
+    duration_ms: number;
+    /**
+     * Evidence Policy Revision
+     */
+    evidence_policy_revision: string;
+    /**
+     * Pricing Profile Fingerprint
+     */
+    pricing_profile_fingerprint?: string | null;
+    /**
+     * Revision
+     */
+    revision: string;
+    /**
+     * Schema Version
+     */
+    schema_version: 2;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Suite Id
+     */
+    suite_id: string;
+    /**
+     * Suite Revision
+     */
+    suite_revision: string;
+    /**
+     * Target Key
+     */
+    target_key: string;
+};
+
+/**
+ * PublishedEvalTrialResult
+ */
+export type PublishedEvalTrialResult = {
+    /**
+     * Assertions
+     */
+    assertions: Array<PublishedAssertionResult>;
+    code: EvalTrialDiagnosticCode;
+    /**
+     * Duration Ms
+     */
+    duration_ms: number;
+    /**
+     * Evidence Complete
+     */
+    evidence_complete: boolean;
+    /**
+     * Message
+     */
+    message: string;
+    output: EvalTrialOutputPreviewV1;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Trial Number
+     */
+    trial_number: number;
+    usage?: PublishedUsageSummaryV1 | null;
 };
 
 /**
@@ -3647,6 +4534,42 @@ export type PublishedUsageRecordedDetail = {
      * Minimum
      */
     minimum: number;
+};
+
+/**
+ * PublishedUsageSummaryV1
+ */
+export type PublishedUsageSummaryV1 = {
+    /**
+     * Model Steps
+     */
+    model_steps: number;
+    /**
+     * Tool Calls
+     */
+    tool_calls: number;
+    /**
+     * Total Tokens
+     */
+    total_tokens: string;
+};
+
+/**
+ * RegistrationProvenance
+ */
+export type RegistrationProvenance = {
+    /**
+     * Kind
+     */
+    kind: 'project' | 'built_in' | 'external' | 'dynamic' | 'unavailable';
+    /**
+     * Location
+     */
+    location?: string | null;
+    /**
+     * Symbol
+     */
+    symbol: string;
 };
 
 /**
@@ -3887,6 +4810,69 @@ export type RunLimits = {
      * Scope
      */
     scope?: 'session' | 'run';
+};
+
+/**
+ * RuntimeManifest
+ */
+export type RuntimeManifest = {
+    /**
+     * Budget Policy
+     */
+    budget_policy: string | null;
+    /**
+     * Context Counting
+     */
+    context_counting: string;
+    /**
+     * Dispatcher
+     */
+    dispatcher: string;
+    /**
+     * Event Sinks
+     */
+    event_sinks: Array<string>;
+    /**
+     * Loop Policies
+     */
+    loop_policies: Array<string>;
+    /**
+     * Max Environment Lifecycle Owners
+     */
+    max_environment_lifecycle_owners: number;
+    /**
+     * Max File Attachment Bytes
+     */
+    max_file_attachment_bytes: number;
+    /**
+     * Max File Attachments Per Request
+     */
+    max_file_attachments_per_request: number;
+    /**
+     * Max Parallel Tool Calls
+     */
+    max_parallel_tool_calls: number;
+    /**
+     * Max Total File Attachment Bytes
+     */
+    max_total_file_attachment_bytes: number;
+    /**
+     * Mcp Manifest Policy
+     */
+    mcp_manifest_policy: string | null;
+    /**
+     * Retry Policy
+     */
+    retry_policy: string | null;
+    /**
+     * Runtime Hooks
+     */
+    runtime_hooks: Array<string>;
+    tool_result_projection_policy: ToolResultProjectionPolicyManifest | null;
+    /**
+     * Tool Timeout Seconds
+     */
+    tool_timeout_seconds: number | null;
 };
 
 /**
@@ -4476,6 +5462,36 @@ export type SseFrameExamples = {
 };
 
 /**
+ * StoreManifest
+ */
+export type StoreManifest = {
+    /**
+     * Budget
+     */
+    budget: string;
+    /**
+     * Budget Ledger
+     */
+    budget_ledger: string;
+    /**
+     * Event Watcher
+     */
+    event_watcher: string;
+    /**
+     * Knowledge
+     */
+    knowledge: string | null;
+    /**
+     * Session
+     */
+    session: string;
+    /**
+     * Task
+     */
+    task: string | null;
+};
+
+/**
  * StructuredOutputSpec
  *
  * Provider-neutral JSON structured output requirement.
@@ -4917,6 +5933,70 @@ export type ToolCalledAssertionSpec = {
      * Tool Name
      */
     tool_name: string;
+};
+
+/**
+ * ToolManifest
+ */
+export type ToolManifest = {
+    /**
+     * Command Policy
+     */
+    command_policy?: string | null;
+    /**
+     * Description
+     */
+    description: string;
+    /**
+     * Effect
+     */
+    effect: string;
+    implementation_provenance: RegistrationProvenance;
+    /**
+     * Input Schema
+     */
+    input_schema?: {
+        [key: string]: unknown;
+    };
+    /**
+     * Name
+     */
+    name: string;
+    /**
+     * Parallel Safe
+     */
+    parallel_safe: boolean;
+    /**
+     * Policy Coverage
+     */
+    policy_coverage: 'allowed' | 'denied' | 'approval_required' | 'conditional' | 'unknown';
+    registration_provenance: RegistrationProvenance;
+};
+
+/**
+ * ToolResultProjectionPolicyManifest
+ */
+export type ToolResultProjectionPolicyManifest = {
+    /**
+     * Identity
+     */
+    identity: string;
+    /**
+     * Max Inline Bytes
+     */
+    max_inline_bytes?: number | null;
+    /**
+     * Max Inline Token Estimate
+     */
+    max_inline_token_estimate?: number | null;
+    /**
+     * Preview Bytes
+     */
+    preview_bytes?: number | null;
+    /**
+     * Token Estimation Method
+     */
+    token_estimation_method?: string | null;
 };
 
 /**
@@ -6136,6 +7216,352 @@ export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses = {
 
 export type GetEnvironmentApiEnvironmentsEnvironmentNameGetResponse = GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses[keyof GetEnvironmentApiEnvironmentsEnvironmentNameGetResponses];
 
+export type CompareEvalRunsApiEvalsComparisonsPostData = {
+    /**
+     * EvalComparisonRequest
+     */
+    body: {
+        /**
+         * Baseline Run Id
+         */
+        baseline_run_id: string;
+        /**
+         * Current Run Id
+         */
+        current_run_id: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/evals/comparisons';
+};
+
+export type CompareEvalRunsApiEvalsComparisonsPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type CompareEvalRunsApiEvalsComparisonsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalComparisonResponse;
+};
+
+export type CompareEvalRunsApiEvalsComparisonsPostResponse = CompareEvalRunsApiEvalsComparisonsPostResponses[keyof CompareEvalRunsApiEvalsComparisonsPostResponses];
+
+export type ListEvalCorporaApiEvalsCorporaGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Result Bytes
+         */
+        max_result_bytes?: number;
+    };
+    url: '/api/evals/corpora';
+};
+
+export type ListEvalCorporaApiEvalsCorporaGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalCorporaApiEvalsCorporaGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalCorpusCatalogPage;
+};
+
+export type ListEvalCorporaApiEvalsCorporaGetResponse = ListEvalCorporaApiEvalsCorporaGetResponses[keyof ListEvalCorporaApiEvalsCorporaGetResponses];
+
+export type ImportEvalCorpusApiEvalsCorporaPostData = {
+    body: EvalCorpusDocument;
+    path?: never;
+    query?: never;
+    url: '/api/evals/corpora';
+};
+
+export type ImportEvalCorpusApiEvalsCorporaPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ImportEvalCorpusApiEvalsCorporaPostResponses = {
+    /**
+     * Successful Response
+     */
+    201: EvalCorpusCatalogEntry;
+};
+
+export type ImportEvalCorpusApiEvalsCorporaPostResponse = ImportEvalCorpusApiEvalsCorporaPostResponses[keyof ImportEvalCorpusApiEvalsCorporaPostResponses];
+
+export type GetEvalCorpusApiEvalsCorporaCorpusRevisionGetData = {
+    body?: never;
+    path: {
+        /**
+         * Corpus Revision
+         */
+        corpus_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/corpora/{corpus_revision}';
+};
+
+export type GetEvalCorpusApiEvalsCorporaCorpusRevisionGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetEvalCorpusApiEvalsCorporaCorpusRevisionGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalCorpusDocument;
+};
+
+export type GetEvalCorpusApiEvalsCorporaCorpusRevisionGetResponse = GetEvalCorpusApiEvalsCorporaCorpusRevisionGetResponses[keyof GetEvalCorpusApiEvalsCorporaCorpusRevisionGetResponses];
+
+export type DownloadEvalCorpusApiEvalsCorporaCorpusRevisionDownloadGetData = {
+    body?: never;
+    path: {
+        /**
+         * Corpus Revision
+         */
+        corpus_revision: string;
+    };
+    query?: never;
+    url: '/api/evals/corpora/{corpus_revision}/download';
+};
+
+export type DownloadEvalCorpusApiEvalsCorporaCorpusRevisionDownloadGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type DownloadEvalCorpusApiEvalsCorporaCorpusRevisionDownloadGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData = {
+    body?: never;
+    path: {
+        /**
+         * Corpus Revision
+         */
+        corpus_revision: string;
+    };
+    query?: {
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Result Bytes
+         */
+        max_result_bytes?: number;
+    };
+    url: '/api/evals/corpora/{corpus_revision}/suites';
+};
+
+export type ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalSuiteCatalogPage;
+};
+
+export type ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetResponse = ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetResponses[keyof ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetResponses];
+
+export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetData = {
+    body?: never;
+    path: {
+        /**
+         * Corpus Revision
+         */
+        corpus_revision: string;
+        /**
+         * Suite Id
+         */
+        suite_id: string;
+    };
+    query?: {
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Result Bytes
+         */
+        max_result_bytes?: number;
+    };
+    url: '/api/evals/corpora/{corpus_revision}/suites/{suite_id}/cases';
+};
+
+export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalCaseCatalogPage;
+};
+
+export type ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponse = ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponses[keyof ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetResponses];
+
 export type ExportEvaluationPromotionApiEvalsPromotionSessionsSessionIdExportPostData = {
     body: EvaluationPromotionExportRequest;
     path: {
@@ -6225,6 +7651,345 @@ export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewP
 };
 
 export type PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponse = PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses[keyof PreviewEvaluationPromotionApiEvalsPromotionSessionsSessionIdPreviewPostResponses];
+
+export type ListEvalRunsApiEvalsRunsGetData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Status
+         */
+        status?: EvalRunStatus | null;
+        /**
+         * Corpus Revision
+         */
+        corpus_revision?: string | null;
+        /**
+         * Cursor
+         */
+        cursor?: string | null;
+        /**
+         * Limit
+         */
+        limit?: number;
+        /**
+         * Max Result Bytes
+         */
+        max_result_bytes?: number;
+    };
+    url: '/api/evals/runs';
+};
+
+export type ListEvalRunsApiEvalsRunsGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type ListEvalRunsApiEvalsRunsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalRunPage;
+};
+
+export type ListEvalRunsApiEvalsRunsGetResponse = ListEvalRunsApiEvalsRunsGetResponses[keyof ListEvalRunsApiEvalsRunsGetResponses];
+
+export type CreateEvalRunApiEvalsRunsPostData = {
+    /**
+     * EvalRunCreateRequest
+     *
+     * Authority-free request to execute one stored suite on the attached target.
+     */
+    body: {
+        /**
+         * Corpus Revision
+         */
+        corpus_revision: string;
+        /**
+         * Max Concurrency
+         */
+        max_concurrency?: number;
+        /**
+         * Suite Id
+         */
+        suite_id: string;
+    };
+    headers: {
+        /**
+         * Idempotency-Key
+         */
+        'Idempotency-Key': string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/evals/runs';
+};
+
+export type CreateEvalRunApiEvalsRunsPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type CreateEvalRunApiEvalsRunsPostResponses = {
+    /**
+     * Successful Response
+     */
+    202: EvalRunRecord;
+};
+
+export type CreateEvalRunApiEvalsRunsPostResponse = CreateEvalRunApiEvalsRunsPostResponses[keyof CreateEvalRunApiEvalsRunsPostResponses];
+
+export type GetEvalRunApiEvalsRunsRunIdGetData = {
+    body?: never;
+    path: {
+        /**
+         * Run Id
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/api/evals/runs/{run_id}';
+};
+
+export type GetEvalRunApiEvalsRunsRunIdGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetEvalRunApiEvalsRunsRunIdGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalRunRecord;
+};
+
+export type GetEvalRunApiEvalsRunsRunIdGetResponse = GetEvalRunApiEvalsRunsRunIdGetResponses[keyof GetEvalRunApiEvalsRunsRunIdGetResponses];
+
+export type CancelEvalRunApiEvalsRunsRunIdCancelPostData = {
+    body?: never;
+    path: {
+        /**
+         * Run Id
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/api/evals/runs/{run_id}/cancel';
+};
+
+export type CancelEvalRunApiEvalsRunsRunIdCancelPostErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type CancelEvalRunApiEvalsRunsRunIdCancelPostResponses = {
+    /**
+     * Successful Response
+     */
+    202: EvalRunRecord;
+};
+
+export type CancelEvalRunApiEvalsRunsRunIdCancelPostResponse = CancelEvalRunApiEvalsRunsRunIdCancelPostResponses[keyof CancelEvalRunApiEvalsRunsRunIdCancelPostResponses];
+
+export type DownloadEvalHtmlReportApiEvalsRunsRunIdReportHtmlGetData = {
+    body?: never;
+    path: {
+        /**
+         * Run Id
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/api/evals/runs/{run_id}/report.html';
+};
+
+export type DownloadEvalHtmlReportApiEvalsRunsRunIdReportHtmlGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type DownloadEvalHtmlReportApiEvalsRunsRunIdReportHtmlGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type DownloadEvalJsonReportApiEvalsRunsRunIdReportJsonGetData = {
+    body?: never;
+    path: {
+        /**
+         * Run Id
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/api/evals/runs/{run_id}/report.json';
+};
+
+export type DownloadEvalJsonReportApiEvalsRunsRunIdReportJsonGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type DownloadEvalJsonReportApiEvalsRunsRunIdReportJsonGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type GetEvalResultApiEvalsRunsRunIdResultGetData = {
+    body?: never;
+    path: {
+        /**
+         * Run Id
+         */
+        run_id: string;
+    };
+    query?: never;
+    url: '/api/evals/runs/{run_id}/result';
+};
+
+export type GetEvalResultApiEvalsRunsRunIdResultGetErrors = {
+    /**
+     * The request is incompatible with the attached eval target.
+     */
+    400: unknown;
+    /**
+     * The requested eval resource does not exist.
+     */
+    404: unknown;
+    /**
+     * The requested eval lifecycle transition is not currently valid.
+     */
+    409: unknown;
+    /**
+     * The request or bounded store result exceeds its byte limit.
+     */
+    413: unknown;
+    /**
+     * The request is invalid or contains unsafe public data.
+     */
+    422: unknown;
+};
+
+export type GetEvalResultApiEvalsRunsRunIdResultGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: EvalResultResponse;
+};
+
+export type GetEvalResultApiEvalsRunsRunIdResultGetResponse = GetEvalResultApiEvalsRunsRunIdResultGetResponses[keyof GetEvalResultApiEvalsRunsRunIdResultGetResponses];
 
 export type HealthApiHealthGetData = {
     body?: never;

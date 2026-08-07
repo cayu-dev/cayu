@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, TypeVar, cast
 from unicodedata import category as unicode_category
 from urllib.parse import quote
 from uuid import uuid4
@@ -63,7 +64,17 @@ from cayu.core.events import (
 )
 from cayu.core.messages import Message, MessageRole
 from cayu.core.thinking import ThinkingConfig
-from cayu.evals.corpus import EvalCaseSpec, EvalSuiteSpec
+from cayu.evals.corpus import EvalCaseSpec, EvalCorpusDocument, EvalSuiteSpec, eval_corpus_to_json
+from cayu.evals.execution import (
+    _validate_corpus_target_compatibility,
+    compile_corpus_suite,
+    evaluation_target_identity,
+)
+from cayu.evals.execution_comparison import corpus_execution_compatibility
+from cayu.evals.execution_reporting import (
+    corpus_execution_result_to_json,
+    render_corpus_execution_html,
+)
 from cayu.evals.models import Trajectory
 from cayu.evals.promotion import (
     PromotionCandidateV1,
@@ -72,6 +83,29 @@ from cayu.evals.promotion import (
     corpus_from_promotion_candidate,
     export_promotion_corpus,
     score_promotion_candidate,
+)
+from cayu.evals.store import (
+    EVAL_STORE_DEFAULT_PAGE_BYTES,
+    EVAL_STORE_DEFAULT_PAGE_SIZE,
+    EVAL_STORE_MAX_CURSOR_BYTES,
+    EVAL_STORE_MAX_PAGE_BYTES,
+    EVAL_STORE_MAX_PAGE_SIZE,
+    EvalCaseCatalogPage,
+    EvalCaseCatalogQuery,
+    EvalCatalogQuery,
+    EvalCorpusCatalogEntry,
+    EvalCorpusCatalogPage,
+    EvalCorpusConflict,
+    EvalRunAdmissionConflict,
+    EvalRunPage,
+    EvalRunQuery,
+    EvalRunRecord,
+    EvalRunRequest,
+    EvalRunStatus,
+    EvalStorePublicationRejected,
+    EvalStoreResultTooLarge,
+    EvalSuiteCatalogPage,
+    EvalSuiteCatalogQuery,
 )
 from cayu.evals.trajectory import (
     SessionTrajectoryError,
@@ -192,19 +226,21 @@ from cayu.runtime.user_input import UserInputRecoveryRequest, UserInputResponse
 from cayu.server._capabilities import inspect_control_plane_capabilities
 from cayu.server._diagnostics import inspect_system_diagnostics
 from cayu.server.auth import AuthContext, AuthDependency, server_auth_dependency
-from cayu.server.config import EvaluationPromotionConfig, normalize_api_path
+from cayu.server.config import EvalsConfig, EvaluationPromotionConfig, normalize_api_path
 from cayu.server.contracts import (
     AGGREGATE_ENDPOINT_RESPONSES,
     ARTIFACT_CONTENT_ENDPOINT_RESPONSES,
     ARTIFACT_ENDPOINT_ERROR_RESPONSES,
     BOUNDED_STREAMING_ENDPOINT_RESPONSES,
     CAUSAL_BUDGET_SUMMARY_ENDPOINT_RESPONSES,
+    EVALS_ENDPOINT_RESPONSES,
     EVALUATION_PROMOTION_ENDPOINT_RESPONSES,
     MAX_CONTROL_PLANE_METADATA_BYTES,
     MAX_CONTROL_PLANE_METADATA_MEMBERS,
     MAX_CONTROL_PLANE_METADATA_NESTING,
     MAX_CONTROL_PLANE_PROMPT_BYTES,
     MAX_CONTROL_PLANE_REQUEST_BYTES,
+    MAX_EVALS_REQUEST_BYTES,
     MAX_EVALUATION_PROMOTION_REQUEST_BYTES,
     MAX_SESSION_TOPOLOGY_REQUEST_BYTES,
     MAX_SYSTEM_ARTIFACT_STORE_REGISTRATIONS,
@@ -226,6 +262,10 @@ from cayu.server.contracts import (
     CausalBudgetSummaryResponse,
     ClientGenerationContract,
     EnvironmentsResponse,
+    EvalComparisonRequest,
+    EvalComparisonResponse,
+    EvalResultResponse,
+    EvalRunCreateRequest,
     EvaluationPromotionDraft,
     EvaluationPromotionExportRequest,
     EvaluationPromotionPreviewRequest,
@@ -251,6 +291,7 @@ from cayu.server.contracts import (
     UsageRollupRequest,
     UsageRollupResponse,
 )
+from cayu.server.evals_worker import EvalRunCoordinator
 from cayu.server.sse import (
     SSE_ERROR_TEXT_MAX_BYTES,
     SSE_OBSERVER_MAX_BYTES,
@@ -326,6 +367,78 @@ def _parse_json_without_duplicate_keys(body: bytes) -> object:
     )
 
 
+def _validated_model_json(value: BaseModel, model_type: type[BaseModel]) -> bytes:
+    validated = model_type.model_validate(value.model_dump(mode="python"))
+    return validated.model_dump_json().encode("utf-8")
+
+
+def _render_utf8(renderer: Callable[[Any], str], value: Any) -> bytes:
+    return renderer(value).encode("utf-8")
+
+
+async def _model_json_response(
+    value: BaseModel,
+    model_type: type[BaseModel],
+    *,
+    status_code: int = 200,
+) -> Response:
+    """Serialize a bounded validated response without occupying the server loop."""
+
+    content = await asyncio.to_thread(_validated_model_json, value, model_type)
+    return Response(
+        content=content,
+        media_type="application/json",
+        status_code=status_code,
+    )
+
+
+@dataclass(frozen=True)
+class _PreparsedPrivateJsonBody:
+    """One private JSON body parsed before FastAPI request validation."""
+
+    value: object
+
+
+_PREPARSED_PRIVATE_JSON_SCOPE_KEY = "cayu.preparsed_private_json_body"
+_PrivateBodyModel = TypeVar("_PrivateBodyModel", bound=BaseModel)
+
+
+async def _validated_private_json_body(
+    request: Request,
+    model_type: type[_PrivateBodyModel],
+    *,
+    invalid_detail: str,
+) -> _PrivateBodyModel:
+    content_type = request.headers.get("content-type")
+    if content_type is not None:
+        media_type = content_type.partition(";")[0].strip().lower()
+        if media_type != "application/json" and not (
+            media_type.startswith("application/") and media_type.endswith("+json")
+        ):
+            raise HTTPException(status_code=422, detail=invalid_detail)
+    parsed_body = request.scope.get(_PREPARSED_PRIVATE_JSON_SCOPE_KEY)
+    if not isinstance(parsed_body, _PreparsedPrivateJsonBody):
+        raise HTTPException(status_code=422, detail=invalid_detail)
+    try:
+        return await asyncio.to_thread(model_type.model_validate, parsed_body.value)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise HTTPException(status_code=422, detail=invalid_detail) from exc
+
+
+def _json_request_openapi(model: str | type[BaseModel]) -> dict[str, Any]:
+    schema = (
+        {"$ref": f"#/components/schemas/{model}"}
+        if isinstance(model, str)
+        else model.model_json_schema()
+    )
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": schema}},
+        }
+    }
+
+
 class _BoundedPrivateJsonBodyRoute(APIRoute):
     """Bound and sanitize a private JSON body before validation can expose input."""
 
@@ -333,6 +446,7 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
     invalid_request_detail: str
     oversized_request_detail: str
     reject_duplicate_json_keys = False
+    preparse_auth: AuthDependency | None = None
 
     def _invalid_request_response(self) -> JSONResponse:
         return _private_no_store_error_response(422, self.invalid_request_detail)
@@ -343,8 +457,44 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
         invalid_request_response = self._invalid_request_response
         oversized_request_detail = self.oversized_request_detail
         reject_duplicate_json_keys = self.reject_duplicate_json_keys
+        preparse_auth_dependency = (
+            None if self.preparse_auth is None else server_auth_dependency(self.preparse_auth)
+        )
 
         async def bounded_route_handler(request: Request) -> Response:
+            original_receive = request.receive
+            auth_received = bytearray()
+            auth_body_complete = False
+
+            if preparse_auth_dependency is not None:
+
+                async def bounded_auth_receive():
+                    nonlocal auth_body_complete
+                    message = await original_receive()
+                    if message["type"] == "http.request":
+                        chunk = message.get("body", b"")
+                        if len(auth_received) + len(chunk) > max_request_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=oversized_request_detail,
+                            )
+                        auth_received.extend(chunk)
+                        if not message.get("more_body", False):
+                            auth_body_complete = True
+                    return message
+
+                auth_request = Request(request.scope, receive=bounded_auth_receive)
+                try:
+                    await preparse_auth_dependency(auth_request)
+                except HTTPException as exc:
+                    headers = dict(exc.headers or {})
+                    headers["Cache-Control"] = "private, no-store"
+                    raise HTTPException(
+                        status_code=exc.status_code,
+                        detail=exc.detail,
+                        headers=headers,
+                    ) from exc
+
             content_length = request.headers.get("content-length")
             if content_length is not None:
                 try:
@@ -359,9 +509,47 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
                         oversized_request_detail,
                     )
 
-            original_receive = request.receive
+            if preparse_auth_dependency is not None:
+                received = auth_received
+                try:
+                    while not auth_body_complete:
+                        message = await bounded_auth_receive()
+                        if message["type"] != "http.request":
+                            return invalid_request_response()
+                    raw_body = bytes(received)
+                    if reject_duplicate_json_keys and raw_body:
+                        parsed = await asyncio.to_thread(
+                            _parse_json_without_duplicate_keys,
+                            raw_body,
+                        )
+                        request.scope[_PREPARSED_PRIVATE_JSON_SCOPE_KEY] = (
+                            _PreparsedPrivateJsonBody(parsed)
+                        )
+                except HTTPException as exc:
+                    if exc.status_code != 413:
+                        raise
+                    return _private_no_store_error_response(
+                        413,
+                        oversized_request_detail,
+                    )
+                except (UnicodeDecodeError, ValueError, RecursionError):
+                    return invalid_request_response()
 
-            if reject_duplicate_json_keys:
+                replayed = False
+
+                async def replay_receive():
+                    nonlocal replayed
+                    if replayed:
+                        return {"type": "http.disconnect"}
+                    replayed = True
+                    return {
+                        "type": "http.request",
+                        "body": raw_body,
+                        "more_body": False,
+                    }
+
+                bounded_request = Request(request.scope, receive=replay_receive)
+            elif reject_duplicate_json_keys:
                 received = bytearray()
                 try:
                     while True:
@@ -377,8 +565,15 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
                         received.extend(chunk)
                         if not message.get("more_body", False):
                             break
-                    if received:
-                        _parse_json_without_duplicate_keys(bytes(received))
+                    raw_body = bytes(received)
+                    if raw_body:
+                        parsed = await asyncio.to_thread(
+                            _parse_json_without_duplicate_keys,
+                            raw_body,
+                        )
+                        request.scope[_PREPARSED_PRIVATE_JSON_SCOPE_KEY] = (
+                            _PreparsedPrivateJsonBody(parsed)
+                        )
                 except (UnicodeDecodeError, ValueError, RecursionError):
                     return invalid_request_response()
 
@@ -391,7 +586,7 @@ class _BoundedPrivateJsonBodyRoute(APIRoute):
                     replayed = True
                     return {
                         "type": "http.request",
-                        "body": bytes(received),
+                        "body": raw_body,
                         "more_body": False,
                     }
 
@@ -454,6 +649,22 @@ class _BoundedEvaluationPromotionRoute(_BoundedPrivateJsonBodyRoute):
     invalid_request_detail = "Invalid evaluation promotion request."
     oversized_request_detail = "Evaluation promotion request exceeds the server byte limit."
     reject_duplicate_json_keys = True
+
+
+class _BoundedEvalsRoute(_BoundedPrivateJsonBodyRoute):
+    """Bound eval corpus and lifecycle bodies before parsing or durable writes."""
+
+    max_request_bytes = MAX_EVALS_REQUEST_BYTES
+    invalid_request_detail = "Invalid Evals request."
+    oversized_request_detail = "Evals request exceeds the server byte limit."
+    reject_duplicate_json_keys = True
+
+
+def _bounded_evals_route_class(auth: AuthDependency) -> type[_BoundedEvalsRoute]:
+    class _AuthenticatedBoundedEvalsRoute(_BoundedEvalsRoute):
+        preparse_auth = staticmethod(auth)
+
+    return _AuthenticatedBoundedEvalsRoute
 
 
 class _BoundedUsageRollupRoute(_BoundedPrivateJsonBodyRoute):
@@ -3012,6 +3223,7 @@ def create_router(
     dashboard_pricing_metadata: tuple[str, str] | None = None,
     evaluation_promotion: EvaluationPromotionConfig | None = None,
     evaluation_promotion_pricing: PriceBook | None = None,
+    evals: EvalsConfig | None = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -3051,6 +3263,9 @@ def create_router(
             policy. When absent, no promotion route or enabled capability exists.
         evaluation_promotion_pricing: Optional already-validated dashboard price
             book reused for captured cost evidence.
+        evals: Complete authenticated durable execution wiring for the one
+            explicitly attached corpus target. When absent, no durable Evals
+            route, worker, or enabled capability exists.
     """
 
     if (
@@ -3090,10 +3305,47 @@ def create_router(
     if evaluation_promotion is None and evaluation_promotion_pricing is not None:
         raise ValueError("evaluation_promotion_pricing requires evaluation_promotion.")
 
+    if evals is not None:
+        if type(evals) is not EvalsConfig:
+            raise TypeError("evals must be an exact EvalsConfig or None.")
+        try:
+            evals = EvalsConfig(
+                target=evals.target,
+                store=evals.store,
+                lease_seconds=evals.lease_seconds,
+                poll_interval_seconds=evals.poll_interval_seconds,
+                shutdown_grace_seconds=evals.shutdown_grace_seconds,
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("evals configuration is invalid.") from exc
+        if auth is None:
+            raise ValueError("evals requires authenticated API access.")
+        if evals.target.app is not cayu_app:
+            raise ValueError("evals.target must reference the attached CayuApp instance.")
+        try:
+            evaluation_target_identity(evals.target)
+        except Exception as exc:
+            raise ValueError("evals target identity is unavailable.") from exc
+
     api_prefix = normalize_api_path(api_path, field_name="api_path")
-    router = APIRouter(prefix=api_prefix)
+
+    @contextlib.asynccontextmanager
+    async def evals_lifespan(_app):
+        coordinator = None if evals is None else EvalRunCoordinator(evals)
+        if coordinator is not None:
+            coordinator.start()
+        try:
+            yield
+        finally:
+            if coordinator is not None:
+                await coordinator.stop()
+
+    router = APIRouter(prefix=api_prefix, lifespan=evals_lifespan)
     bounded_control_plane_router = APIRouter(route_class=_BoundedControlPlaneRequestRoute)
     bounded_evaluation_promotion_router = APIRouter(route_class=_BoundedEvaluationPromotionRoute)
+    bounded_evals_router = APIRouter(
+        route_class=(_BoundedEvalsRoute if auth is None else _bounded_evals_route_class(auth))
+    )
     auth_context_openapi_schema = AuthContext.model_json_schema()
     capability_snapshot = inspect_control_plane_capabilities(
         dashboard_configured=dashboard_configured,
@@ -3108,6 +3360,7 @@ def create_router(
             and session_store.supports_terminal_session_evidence
             and session_store.supports_session_lineage
         ),
+        evals_configured=evals is not None,
     )
     if dashboard_access_authenticated is None and dashboard_configured:
         dashboard_access_authenticated = auth is not None
@@ -3663,6 +3916,480 @@ def create_router(
                     )
                 },
             )
+
+    if evals is not None:
+        eval_store = evals.store
+        eval_target = evals.target
+
+        def _eval_query_error() -> NoReturn:
+            raise HTTPException(status_code=422, detail="Invalid Evals query.")
+
+        async def _load_eval_corpus(corpus_revision: str) -> EvalCorpusDocument:
+            try:
+                corpus = await eval_store.load_corpus(corpus_revision)
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval corpus exceeds the server byte limit.",
+                ) from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+            if corpus is None:
+                raise HTTPException(status_code=404, detail="Eval corpus not found.")
+            if corpus.target_key != eval_target.key:
+                raise HTTPException(status_code=404, detail="Eval corpus not found.")
+            return corpus
+
+        async def _load_eval_run(run_id: str):
+            try:
+                run = await eval_store.load_run(run_id)
+            except (TypeError, ValueError):
+                _eval_query_error()
+            if run is None:
+                raise HTTPException(status_code=404, detail="Eval run not found.")
+            if run.spec.target_key != eval_target.key:
+                raise HTTPException(status_code=404, detail="Eval run not found.")
+            return run
+
+        async def _load_eval_result(run_id: str):
+            # Authorize the run before hydrating its potentially large result.
+            await _load_eval_run(run_id)
+            try:
+                result = await eval_store.load_result(run_id)
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval result exceeds the server byte limit.",
+                ) from exc
+            if result is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Eval run has no completed result.",
+                )
+            # Result publication and run terminalization are one store transaction.
+            # Reload after the result becomes visible so a concurrent publication
+            # cannot pair it with the active record observed above.
+            run = await _load_eval_run(run_id)
+            return run, result
+
+        @bounded_evals_router.post(
+            "/evals/corpora",
+            response_model=EvalCorpusCatalogEntry,
+            status_code=201,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+            openapi_extra=_json_request_openapi("EvalCorpusDocument"),
+        )
+        async def import_eval_corpus(request: Request):
+            corpus = await _validated_private_json_body(
+                request,
+                EvalCorpusDocument,
+                invalid_detail="Invalid Evals request.",
+            )
+            try:
+                await asyncio.to_thread(
+                    evaluation_target_identity,
+                    eval_target,
+                )
+                await asyncio.to_thread(
+                    _validate_corpus_target_compatibility,
+                    corpus,
+                    eval_target,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval corpus is incompatible with the attached target.",
+                ) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Attached eval target is unavailable.",
+                ) from exc
+            try:
+                return await eval_store.save_corpus(
+                    corpus,
+                    redact_json=eval_target.app.redact_json,
+                )
+            except EvalCorpusConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Eval corpus revision conflicts with stored content.",
+                ) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Eval corpus contains unsafe public data.",
+                ) from exc
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval corpus exceeds the server byte limit.",
+                ) from exc
+
+        @bounded_evals_router.get(
+            "/evals/corpora",
+            response_model=EvalCorpusCatalogPage,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def list_eval_corpora(
+            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
+            limit: Annotated[
+                int,
+                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
+            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
+            max_result_bytes: Annotated[
+                int,
+                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
+            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ):
+            try:
+                return await eval_store.list_corpora(
+                    EvalCatalogQuery(
+                        target_key=eval_target.key,
+                        cursor=cursor,
+                        limit=limit,
+                        max_result_bytes=max_result_bytes,
+                    )
+                )
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval catalog page exceeds the requested byte limit.",
+                ) from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+
+        @bounded_evals_router.get(
+            "/evals/corpora/{corpus_revision}",
+            response_model=EvalCorpusDocument,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def get_eval_corpus(corpus_revision: str):
+            corpus = await _load_eval_corpus(corpus_revision)
+            return await _model_json_response(corpus, EvalCorpusDocument)
+
+        @bounded_evals_router.get(
+            "/evals/corpora/{corpus_revision}/download",
+            response_class=Response,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def download_eval_corpus(corpus_revision: str) -> Response:
+            corpus = await _load_eval_corpus(corpus_revision)
+            corpus_json = await asyncio.to_thread(_render_utf8, eval_corpus_to_json, corpus)
+            return Response(
+                content=corpus_json,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="{corpus.target_key}-{corpus.revision[7:19]}.eval.json"'
+                    )
+                },
+            )
+
+        @bounded_evals_router.get(
+            "/evals/corpora/{corpus_revision}/suites",
+            response_model=EvalSuiteCatalogPage,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def list_eval_suites(
+            corpus_revision: str,
+            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
+            limit: Annotated[
+                int,
+                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
+            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
+            max_result_bytes: Annotated[
+                int,
+                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
+            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ):
+            await _load_eval_corpus(corpus_revision)
+            try:
+                page = await eval_store.list_suites(
+                    EvalSuiteCatalogQuery(
+                        corpus_revision=corpus_revision,
+                        cursor=cursor,
+                        limit=limit,
+                        max_result_bytes=max_result_bytes,
+                    )
+                )
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval suite page exceeds the requested byte limit.",
+                ) from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+            return await _model_json_response(page, EvalSuiteCatalogPage)
+
+        @bounded_evals_router.get(
+            "/evals/corpora/{corpus_revision}/suites/{suite_id}/cases",
+            response_model=EvalCaseCatalogPage,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def list_eval_cases(
+            corpus_revision: str,
+            suite_id: str,
+            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
+            limit: Annotated[
+                int,
+                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
+            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
+            max_result_bytes: Annotated[
+                int,
+                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
+            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ):
+            corpus = await _load_eval_corpus(corpus_revision)
+            if all(suite.id != suite_id for suite in corpus.suites):
+                raise HTTPException(status_code=404, detail="Eval suite not found.")
+            try:
+                page = await eval_store.list_cases(
+                    EvalCaseCatalogQuery(
+                        corpus_revision=corpus_revision,
+                        suite_id=suite_id,
+                        cursor=cursor,
+                        limit=limit,
+                        max_result_bytes=max_result_bytes,
+                    )
+                )
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval case page exceeds the requested byte limit.",
+                ) from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+            return await _model_json_response(page, EvalCaseCatalogPage)
+
+        @bounded_evals_router.post(
+            "/evals/runs",
+            response_model=EvalRunRecord,
+            status_code=202,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+            openapi_extra=_json_request_openapi(EvalRunCreateRequest),
+        )
+        async def create_eval_run(
+            request: Request,
+            idempotency_key: Annotated[
+                str,
+                Header(alias="Idempotency-Key", min_length=1, max_length=512),
+            ],
+        ):
+            body = await _validated_private_json_body(
+                request,
+                EvalRunCreateRequest,
+                invalid_detail="Invalid Evals request.",
+            )
+            corpus = await _load_eval_corpus(body.corpus_revision)
+            try:
+                idempotency_key = require_clean_nonblank(
+                    idempotency_key,
+                    "Idempotency-Key",
+                )
+                require_unicode_scalar_text(idempotency_key, "Idempotency-Key")
+                compiled = await asyncio.to_thread(
+                    compile_corpus_suite,
+                    corpus,
+                    eval_target,
+                    body.suite_id,
+                )
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval run is incompatible with the attached target.",
+                ) from exc
+            if body.max_concurrency > eval_target.limits.max_concurrency:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Eval run exceeds the attached target concurrency limit.",
+                )
+            digest = (
+                "sha256:"
+                + hashlib.sha256(
+                    b"cayu-server-eval-idempotency-v1\0"
+                    + eval_target.key.encode("ascii")
+                    + b"\0"
+                    + idempotency_key.encode("utf-8")
+                ).hexdigest()
+            )
+            run_request = EvalRunRequest(
+                run_id=f"eval-{uuid4().hex}",
+                corpus_revision=corpus.revision,
+                target_key=eval_target.key,
+                suite_id=compiled.run_contract.suite_id,
+                suite_revision=compiled.run_contract.suite_revision,
+                max_concurrency=body.max_concurrency,
+                idempotency_key=digest,
+            )
+            try:
+                return await eval_store.admit_run(
+                    run_request,
+                    redact_json=eval_target.app.redact_json,
+                )
+            except EvalRunAdmissionConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotency-Key is already bound to another eval run request.",
+                ) from exc
+            except EvalStorePublicationRejected as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Eval run request contains unsafe public data.",
+                ) from exc
+
+        @bounded_evals_router.get(
+            "/evals/runs",
+            response_model=EvalRunPage,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def list_eval_runs(
+            status: EvalRunStatus | None = None,
+            corpus_revision: str | None = None,
+            cursor: Annotated[str | None, Query(max_length=EVAL_STORE_MAX_CURSOR_BYTES)] = None,
+            limit: Annotated[
+                int,
+                Query(ge=1, le=EVAL_STORE_MAX_PAGE_SIZE),
+            ] = EVAL_STORE_DEFAULT_PAGE_SIZE,
+            max_result_bytes: Annotated[
+                int,
+                Query(ge=1_024, le=EVAL_STORE_MAX_PAGE_BYTES),
+            ] = EVAL_STORE_DEFAULT_PAGE_BYTES,
+        ):
+            try:
+                return await eval_store.list_runs(
+                    EvalRunQuery(
+                        target_key=eval_target.key,
+                        status=status,
+                        corpus_revision=corpus_revision,
+                        cursor=cursor,
+                        limit=limit,
+                        max_result_bytes=max_result_bytes,
+                    )
+                )
+            except EvalStoreResultTooLarge as exc:
+                raise HTTPException(
+                    status_code=413,
+                    detail="Eval run page exceeds the requested byte limit.",
+                ) from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+
+        @bounded_evals_router.get(
+            "/evals/runs/{run_id}",
+            response_model=EvalRunRecord,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def get_eval_run(run_id: str):
+            return await _load_eval_run(run_id)
+
+        @bounded_evals_router.post(
+            "/evals/runs/{run_id}/cancel",
+            response_model=EvalRunRecord,
+            status_code=202,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def cancel_eval_run(run_id: str):
+            await _load_eval_run(run_id)
+            try:
+                return await eval_store.request_cancel(run_id)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail="Eval run not found.") from exc
+            except (TypeError, ValueError):
+                _eval_query_error()
+
+        @bounded_evals_router.get(
+            "/evals/runs/{run_id}/result",
+            response_model=EvalResultResponse,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def get_eval_result(run_id: str) -> Response:
+            run, result = await _load_eval_result(run_id)
+            response = await asyncio.to_thread(EvalResultResponse, run=run, result=result)
+            return await _model_json_response(response, EvalResultResponse)
+
+        @bounded_evals_router.get(
+            "/evals/runs/{run_id}/report.json",
+            response_class=Response,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def download_eval_json_report(run_id: str) -> Response:
+            _, result = await _load_eval_result(run_id)
+            report = await asyncio.to_thread(
+                _render_utf8,
+                corpus_execution_result_to_json,
+                result,
+            )
+            return Response(
+                content=report,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{run_id}.eval-result.json"'
+                },
+            )
+
+        @bounded_evals_router.get(
+            "/evals/runs/{run_id}/report.html",
+            response_class=Response,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+        )
+        async def download_eval_html_report(run_id: str) -> Response:
+            _, result = await _load_eval_result(run_id)
+            report = await asyncio.to_thread(
+                _render_utf8,
+                render_corpus_execution_html,
+                result,
+            )
+            return Response(
+                content=report,
+                media_type="text/html",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{run_id}.eval-report.html"'
+                },
+            )
+
+        @bounded_evals_router.post(
+            "/evals/comparisons",
+            response_model=EvalComparisonResponse,
+            responses=EVALS_ENDPOINT_RESPONSES,
+            dependencies=protected,
+            openapi_extra=_json_request_openapi(EvalComparisonRequest),
+        )
+        async def compare_eval_runs(request: Request) -> Response:
+            body = await _validated_private_json_body(
+                request,
+                EvalComparisonRequest,
+                invalid_detail="Invalid Evals request.",
+            )
+            baseline_run, baseline = await _load_eval_result(body.baseline_run_id)
+            if body.current_run_id == body.baseline_run_id:
+                current_run, current = baseline_run, baseline
+            else:
+                current_run, current = await _load_eval_result(body.current_run_id)
+            compatibility = await asyncio.to_thread(
+                corpus_execution_compatibility,
+                baseline,
+                current,
+            )
+            response = EvalComparisonResponse(
+                baseline=baseline_run,
+                current=current_run,
+                compatibility=compatibility,
+            )
+            return await _model_json_response(response, EvalComparisonResponse)
 
     @router.get(
         "/system/diagnostics",
@@ -6521,4 +7248,5 @@ def create_router(
 
     router.include_router(bounded_control_plane_router)
     router.include_router(bounded_evaluation_promotion_router)
+    router.include_router(bounded_evals_router)
     return router

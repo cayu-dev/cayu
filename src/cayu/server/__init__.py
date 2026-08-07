@@ -54,6 +54,7 @@ try:
         CorsConfig,
         DashboardConfig,
         DocsConfig,
+        EvalsConfig,
         EvaluationPromotionConfig,
         OpenAccess,
         ServerAccessConfig,
@@ -95,6 +96,7 @@ __all__ = [
     "DashboardConfig",
     "DashboardStaticFiles",
     "DocsConfig",
+    "EvalsConfig",
     "EvaluationPromotionConfig",
     "OpenAccess",
     "ServerAccessConfig",
@@ -311,6 +313,7 @@ def create_server(
             dashboard_pricing_metadata=pricing_metadata,
             evaluation_promotion=resolved_config.evaluation_promotion,
             evaluation_promotion_pricing=evaluation_promotion_pricing,
+            evals=resolved_config.evals,
         )
         server.include_router(router)
 
@@ -373,6 +376,7 @@ def mount_cayu(
     access: ServerAccessConfig,
     dashboard_config: dict[str, Any] | None = None,
     evaluation_promotion: EvaluationPromotionConfig | None = None,
+    evals: EvalsConfig | None = None,
     replay_idle_timeout_s: float = DEFAULT_REPLAY_IDLE_TIMEOUT_SECONDS,
     event_side_effect_startup_timeout_seconds: float = (
         DEFAULT_EVENT_SIDE_EFFECT_STARTUP_TIMEOUT_SECONDS
@@ -402,7 +406,8 @@ def mount_cayu(
     ``dashboard_config`` must be a JSON object. Cayu validates and copies it
     before modifying the host application. ``evaluation_promotion`` remains
     disabled unless a complete configuration is supplied and requires
-    authenticated ``access``.
+    authenticated ``access``. Durable eval execution likewise remains disabled
+    unless complete ``evals`` wiring is supplied.
     """
     auth = auth_dependency_for(access)
     mount_path = normalize_dashboard_path(path, field_name="path")
@@ -467,6 +472,7 @@ def mount_cayu(
             if prepared_dashboard is None or evaluation_promotion is None
             else _configured_dashboard_price_book(resolved_dashboard_config)
         ),
+        evals=evals,
     )
 
     # All caller-controlled values and route construction are validated before

@@ -14,6 +14,8 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
+    StrictInt,
     TypeAdapter,
     ValidationError,
     field_serializer,
@@ -31,6 +33,8 @@ from cayu._validation import (
     thaw_json_value,
 )
 from cayu.evals.corpus import EvaluationEvidencePolicySpec
+from cayu.evals.execution import CorpusTarget
+from cayu.evals.store import EVAL_STORE_MAX_LEASE_SECONDS, EvalStore
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest, SessionStatus
 from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
 
@@ -59,6 +63,7 @@ __all__ = [
     "CorsConfig",
     "DashboardConfig",
     "DocsConfig",
+    "EvalsConfig",
     "EvaluationPromotionConfig",
     "OpenAccess",
     "ServerAccessConfig",
@@ -324,6 +329,70 @@ class EvaluationPromotionConfig(BaseModel):
         return EvaluationEvidencePolicySpec.model_validate(value)
 
 
+class EvalsConfig(BaseModel):
+    """Authenticated durable execution for one explicitly attached eval target.
+
+    ``target`` and ``store`` are trusted runtime wiring. They are excluded from
+    representations and serialization so application objects, provider
+    configuration, credentials, and database handles cannot cross diagnostics
+    or configuration boundaries.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    target: CorpusTarget = Field(exclude=True, repr=False)
+    store: EvalStore = Field(exclude=True, repr=False)
+    lease_seconds: StrictInt = Field(default=300, ge=1, le=EVAL_STORE_MAX_LEASE_SECONDS)
+    poll_interval_seconds: StrictFloat = Field(default=1.0, gt=0, le=60)
+    shutdown_grace_seconds: StrictFloat = Field(default=30.0, gt=0, le=300)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def validate_runtime_wiring(cls, value: Any, handler: Any) -> EvalsConfig:
+        config = _validate_with_redacted_errors(
+            cls.__name__,
+            value,
+            handler,
+            message="Invalid Evals configuration.",
+            preserve_messages=True,
+        )
+        if type(config.target) is not CorpusTarget:
+            message = "target must be an exact CorpusTarget."
+            location = "target"
+        elif not isinstance(config.store, EvalStore):
+            message = "store must implement EvalStore."
+            location = "store"
+        elif not config.store.durable:
+            message = "store must be durable."
+            location = "store"
+        else:
+            return config
+        _raise_redacted_config_error(
+            cls.__name__,
+            [
+                InitErrorDetails(
+                    type="value_error",
+                    loc=(location,),
+                    input=None,
+                    ctx={"error": ValueError(message)},
+                )
+            ],
+        )
+
+    @field_validator("poll_interval_seconds", "shutdown_grace_seconds")
+    @classmethod
+    def validate_finite_seconds(cls, value: float, info) -> float:
+        if isinstance(value, bool) or not isfinite(value):
+            raise ValueError(f"{info.field_name} must be a finite positive number.")
+        return float(value)
+
+
 class DocsConfig(BaseModel):
     """FastAPI OpenAPI and interactive documentation exposure."""
 
@@ -435,6 +504,7 @@ class ServerConfig(BaseModel):
     api: ServerApiConfig = Field(default_factory=ServerApiConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     evaluation_promotion: EvaluationPromotionConfig | None = None
+    evals: EvalsConfig | None = None
     docs: DocsConfig = Field(default_factory=DocsConfig)
     cors: CorsConfig = Field(default_factory=CorsConfig)
     lifecycle: ServerLifecycleConfig = Field(default_factory=ServerLifecycleConfig)
@@ -484,6 +554,11 @@ class ServerConfig(BaseModel):
                 raise ValueError("evaluation_promotion requires api.enabled.")
             if not isinstance(self.access, AuthenticatedAccess):
                 raise ValueError("evaluation_promotion requires authenticated API access.")
+        if self.evals is not None:
+            if not self.api.enabled:
+                raise ValueError("evals requires api.enabled.")
+            if not isinstance(self.access, AuthenticatedAccess):
+                raise ValueError("evals requires authenticated API access.")
         if (
             self.dashboard.enabled
             and self.docs.enabled
@@ -527,6 +602,7 @@ class ServerConfig(BaseModel):
         cors: CorsConfig | None = None,
         lifecycle: ServerLifecycleConfig | None = None,
         evaluation_promotion: EvaluationPromotionConfig | None = None,
+        evals: EvalsConfig | None = None,
     ) -> ServerConfig:
         """Build a protected configuration around an application auth dependency."""
 
@@ -539,6 +615,7 @@ class ServerConfig(BaseModel):
             cors=cors or CorsConfig(),
             lifecycle=lifecycle or ServerLifecycleConfig(),
             evaluation_promotion=evaluation_promotion,
+            evals=evals,
         )
 
     def safe_summary(self) -> dict[str, Any]:
@@ -556,6 +633,7 @@ class ServerConfig(BaseModel):
                 "access": dashboard_access.kind,
             },
             "evaluation_promotion": {"configured": self.evaluation_promotion is not None},
+            "evals": {"configured": self.evals is not None},
             "docs": {"enabled": self.docs.enabled},
             "cors": {
                 "allowed_origins": list(self.cors.allowed_origins),

@@ -3761,6 +3761,9 @@
         "dashboard": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
+        "evals": {
+          "$ref": "#/components/schemas/OptionalSurfaceCapability"
+        },
         "evaluation_promotion": {
           "$ref": "#/components/schemas/OptionalSurfaceCapability"
         },
@@ -3794,7 +3797,8 @@
         "artifacts",
         "usage",
         "pricing",
-        "evaluation_promotion"
+        "evaluation_promotion",
+        "evals"
       ],
       "title": "ControlPlaneSurfaceCapabilities",
       "type": "object"
@@ -5607,7 +5611,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "7",
+          "default": "8",
           "title": "Contract Version",
           "type": "string"
         },
@@ -8880,7 +8884,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "7",
+          "default": "8",
           "title": "Contract Version",
           "type": "string"
         }

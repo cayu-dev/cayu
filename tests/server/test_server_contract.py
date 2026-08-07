@@ -153,8 +153,8 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
     assert response.status_code == 200
     body = response.json()
     assert body["api_prefix"] == "/api"
-    assert body["contract_version"] == "7"
-    assert body["versioning"]["contract_version"] == "7"
+    assert body["contract_version"] == "8"
+    assert body["versioning"]["contract_version"] == "8"
     assert body["versioning"]["breaking_change_requires"] == [
         "openapi_snapshot_update",
         "client_regeneration",
@@ -215,6 +215,11 @@ def test_contract_endpoint_declares_versioning_sse_and_client_generation() -> No
             "mutate": {"enabled": False, "unavailable_reason": "unsupported"},
         },
         "evaluation_promotion": {
+            "configured": False,
+            "read": {"enabled": False, "unavailable_reason": "not_configured"},
+            "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
+        },
+        "evals": {
             "configured": False,
             "read": {"enabled": False, "unavailable_reason": "not_configured"},
             "mutate": {"enabled": False, "unavailable_reason": "not_configured"},
@@ -284,7 +289,7 @@ def test_contract_reports_configured_optional_capabilities_and_redacted_actor(tm
     assert capabilities["actor"] == {"subject": "operator-a", "tenant": "tenant-a"}
     assert "must-not-appear" not in response.text
     for name, surface in capabilities["surfaces"].items():
-        if name == "evaluation_promotion":
+        if name in {"evaluation_promotion", "evals"}:
             assert surface == {
                 "configured": False,
                 "read": {"enabled": False, "unavailable_reason": "not_configured"},
@@ -367,7 +372,7 @@ def test_system_diagnostics_reports_bounded_protected_runtime_state(tmp_path) ->
         "dashboard_enabled": True,
         "docs_enabled": False,
     }
-    assert body["versions"]["server_contract"] == "7"
+    assert body["versions"]["server_contract"] == "8"
     assert body["versions"]["cayu"] == body["capabilities"]["cayu_version"]
     assert body["capabilities"]["actor"] == {
         "subject": "operator-a",

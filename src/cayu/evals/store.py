@@ -35,6 +35,7 @@ from cayu.evals.corpus import (
     EVAL_CORPUS_MAX_TIMEOUT_SECONDS,
     EVAL_CORPUS_MAX_TRIALS,
     EvalCorpusDocument,
+    EvalCorpusInspectionV1,
     EvalCorpusSuiteInspectionV1,
     EvalSuiteSpec,
     _bounded_durable_text,
@@ -1032,6 +1033,32 @@ def case_catalog_entries(corpus: EvalCorpusDocument) -> tuple[EvalCaseCatalogEnt
             assertion_count=len(case.assertions),
         )
         for case in validated.cases
+    )
+
+
+def _prepare_corpus_catalog_for_store(
+    corpus: EvalCorpusDocument,
+    *,
+    redact_json: Callable[[Any], Any],
+) -> tuple[
+    EvalCorpusDocument,
+    bytes,
+    EvalCorpusInspectionV1,
+    tuple[EvalSuiteCatalogEntry, ...],
+    tuple[EvalCaseCatalogEntry, ...],
+]:
+    """Prepare one immutable corpus and its catalog projections in one CPU phase."""
+
+    validated, document = _prepare_corpus_for_store(
+        corpus,
+        redact_json=redact_json,
+    )
+    return (
+        validated,
+        document,
+        inspect_eval_corpus(validated),
+        suite_catalog_entries(validated),
+        case_catalog_entries(validated),
     )
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar, LiteralString, cast
@@ -11,7 +11,7 @@ from cayu.evals.corpus import (
     EvalCorpusDocument,
     _portable_id,
     _sha256_revision,
-    inspect_eval_corpus,
+    eval_corpus_from_json,
 )
 from cayu.evals.execution import CORPUS_EXECUTION_RESULT_MAX_BYTES, CorpusExecutionResult
 from cayu.evals.execution_reporting import corpus_execution_result_from_json
@@ -50,18 +50,16 @@ from cayu.evals.store import (
     _copy_query,
     _exact_model,
     _lease_seconds,
-    _prepare_corpus_for_store,
+    _prepare_corpus_catalog_for_store,
     _prepare_result_for_store,
     _prepare_run_request_for_store,
     _read_limit,
     _store_identifier,
-    case_catalog_entries,
     decode_case_cursor,
     decode_corpus_cursor,
     decode_run_cursor,
     decode_suite_cursor,
     result_summary,
-    suite_catalog_entries,
     validate_result_for_run,
 )
 from cayu.storage.postgres import _PostgresStoreBase
@@ -167,15 +165,13 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         *,
         redact_json: Callable[[Any], Any],
     ) -> EvalCorpusCatalogEntry:
-        corpus, document = _prepare_corpus_for_store(
+        corpus, document, inspection, suites, cases = await asyncio.to_thread(
+            _prepare_corpus_catalog_for_store,
             corpus,
             redact_json=redact_json,
         )
         document_text = document.decode("utf-8")
         document_bytes = len(document)
-        inspection = inspect_eval_corpus(corpus)
-        suites = suite_catalog_entries(corpus)
-        cases = case_catalog_entries(corpus)
         await self._ensure_ready()
         async with self._connection() as conn:
             try:
@@ -298,7 +294,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             row = await cur.fetchone()
             if row is None:
                 raise RuntimeError("Immutable eval corpus disappeared during a read.")
-            return EvalCorpusDocument.model_validate(json.loads(row[0]))
+            return await asyncio.to_thread(eval_corpus_from_json, row[0])
 
     async def list_corpora(
         self,
@@ -723,7 +719,8 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
-        result, result_document = _prepare_result_for_store(
+        result, result_document = await asyncio.to_thread(
+            _prepare_result_for_store,
             result,
             redact_json=redact_json,
         )
@@ -736,7 +733,12 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
                     row = await self._require_run_row(cur, claim.run_id, for_update=True)
                     request = _request_from_row(row)
                     corpus = await self._load_corpus_document(cur, request.corpus_revision)
-                    validated = validate_result_for_run(request, result, corpus)
+                    validated = await asyncio.to_thread(
+                        validate_result_for_run,
+                        request,
+                        result,
+                        corpus,
+                    )
                     status = EvalRunStatus(row[7])
                     if status is EvalRunStatus.COMPLETED:
                         await cur.execute(
@@ -892,7 +894,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             row = await cur.fetchone()
             if row is None:
                 raise RuntimeError("Immutable eval result disappeared during a read.")
-            return corpus_execution_result_from_json(row[0])
+            return await asyncio.to_thread(corpus_execution_result_from_json, row[0])
 
     async def _terminalize_without_result(
         self,
@@ -1027,7 +1029,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         row = await cur.fetchone()
         if row is None:
             raise RuntimeError("Eval run references a missing immutable corpus.")
-        return EvalCorpusDocument.model_validate(json.loads(row[0]))
+        return await asyncio.to_thread(eval_corpus_from_json, row[0])
 
     @staticmethod
     def _corpus_entry_from_row(row: Any) -> EvalCorpusCatalogEntry:

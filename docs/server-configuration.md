@@ -67,6 +67,8 @@ Vite origin. `deployment_name="development"` alone does none of those things.
   access override (otherwise it inherits the server access policy);
 - `evaluation_promotion`: an optional authenticated, stateless policy for
   reviewing and exporting captured sessions as portable eval cases;
+- `evals`: optional authenticated runtime wiring for one trusted corpus target,
+  one durable eval store, and the embedded fenced execution coordinator;
 - `docs`: generated OpenAPI, Swagger UI, and ReDoc exposure;
 - `cors`: allowed origins, methods, headers, and credential behavior; and
 - `lifecycle`: replay timeout, startup recovery, inactivity fencing, durable
@@ -159,6 +161,24 @@ exported eval. Configure the same nested fields through `ServerSettings` with
 `CAYU_SERVER_EVALUATION_PROMOTION__TARGET_KEY`,
 `CAYU_SERVER_EVALUATION_PROMOTION__SOURCE_AGENT_NAME`, and
 `CAYU_SERVER_EVALUATION_PROMOTION__APPLICATION_RELEASE_ID`.
+
+## Durable Evals execution
+
+Fresh Evals execution is also off by default and requires authenticated API
+access. Applications construct `EvalsConfig(target=..., store=...)` with the
+exact `CorpusTarget` whose `CayuApp` is supplied to `create_server(...)`, plus a
+durable `SQLiteEvalStore` or `PostgresEvalStore`, then pass it through
+`ServerConfig.protected(..., evals=...)`. The server authenticates and bounds
+the catalog/run/result/report routes, persists admission before dispatch, and
+runs one embedded coordinator using the eval store's lease and fencing
+contract. Cancellation and controlled shutdown stop fresh execution before the
+owned run is cancelled or released.
+
+This wiring is intentionally programmatic. `ServerSettings` cannot construct an
+application, provider, PriceBook, database handle, or executable target from
+environment text. `EvalsConfig.target` and `.store` are excluded from model
+serialization and safe summaries. See [runtime-native evals](evals.md#server-attached-durable-execution)
+for the complete API, authority, target-isolation, and recovery contract.
 
 The resolved model is immutable, owns nested runtime JSON, and is evaluated
 once when the server is created. A non-secret effective summary is available
@@ -256,6 +276,7 @@ mount_cayu(
     cayu_app,
     path="/internal/cayu",
     access=AuthenticatedAccess(dependency=require_operator),
+    # evals=resolved_evals_config,
 )
 ```
 

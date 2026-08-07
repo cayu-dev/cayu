@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import filecmp
 import importlib.metadata
 import json
@@ -49,8 +50,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _openapi_json() -> str:
-    from cayu import AgentSpec, CayuApp
-    from cayu.server import EvaluationPromotionConfig, ServerConfig, create_server
+    from cayu import AgentSpec, CayuApp, CorpusTarget, RunRequest, SQLiteEvalStore
+    from cayu.server import EvalsConfig, EvaluationPromotionConfig, ServerConfig, create_server
 
     app = CayuApp()
     app.register_agent(AgentSpec(name="assistant", model="schema-only"))
@@ -58,18 +59,33 @@ def _openapi_json() -> str:
     def schema_auth(_request):
         return {"subject": "schema-generator"}
 
-    server = create_server(
-        app,
-        config=ServerConfig.protected(
-            schema_auth,
-            evaluation_promotion=EvaluationPromotionConfig(
-                target_key="schema",
-                source_agent_name="assistant",
-                application_release_id="schema",
-            ),
-        ),
-    )
-    return json.dumps(server.openapi(), indent=2, sort_keys=True) + "\n"
+    with tempfile.TemporaryDirectory(prefix="cayu-openapi-evals-") as evals_temp_dir:
+        eval_store = SQLiteEvalStore(Path(evals_temp_dir) / "evals.db")
+        try:
+            server = create_server(
+                app,
+                config=ServerConfig.protected(
+                    schema_auth,
+                    evaluation_promotion=EvaluationPromotionConfig(
+                        target_key="schema",
+                        source_agent_name="assistant",
+                        application_release_id="schema",
+                    ),
+                    evals=EvalsConfig(
+                        target=CorpusTarget(
+                            key="schema",
+                            app=app,
+                            request_base=RunRequest(agent_name="assistant", messages=[]),
+                            application_release_id="schema",
+                        ),
+                        store=eval_store,
+                    ),
+                ),
+            )
+            schema = server.openapi()
+        finally:
+            asyncio.run(eval_store.close())
+    return json.dumps(schema, indent=2, sort_keys=True) + "\n"
 
 
 def _release_metadata() -> bytes:

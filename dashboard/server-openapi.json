@@ -1,6 +1,158 @@
 {
   "components": {
     "schemas": {
+      "AgentAuthoringState": {
+        "description": "Explicit application-authoring state carried by an agent specification.",
+        "enum": [
+          "unfinished_generated_tracer_bullet"
+        ],
+        "title": "AgentAuthoringState",
+        "type": "string"
+      },
+      "AgentManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "authoring_state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentAuthoringState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "configured_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configured Provider"
+          },
+          "context_overflow_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Context Overflow Policy"
+          },
+          "context_policy": {
+            "title": "Context Policy",
+            "type": "string"
+          },
+          "execution_requirements": {
+            "$ref": "#/components/schemas/ExecutionRequirements"
+          },
+          "has_system_prompt": {
+            "title": "Has System Prompt",
+            "type": "boolean"
+          },
+          "implementation_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "loop_policies": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Loop Policies",
+            "type": "array"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "provider_candidates": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Provider Candidates",
+            "type": "array"
+          },
+          "provider_resolution": {
+            "enum": [
+              "explicit",
+              "model_pattern",
+              "default",
+              "missing",
+              "ambiguous"
+            ],
+            "title": "Provider Resolution",
+            "type": "string"
+          },
+          "registration_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "resolved_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved Provider"
+          },
+          "runtime_hooks": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Runtime Hooks",
+            "type": "array"
+          },
+          "tool_policy": {
+            "title": "Tool Policy",
+            "type": "string"
+          },
+          "tools": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ToolManifest"
+            },
+            "title": "Tools",
+            "type": "array"
+          },
+          "workflow_tool_names": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Workflow Tool Names",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "model",
+          "has_system_prompt",
+          "configured_provider",
+          "resolved_provider",
+          "provider_resolution",
+          "execution_requirements",
+          "tool_policy",
+          "context_policy",
+          "context_overflow_policy",
+          "registration_provenance",
+          "implementation_provenance"
+        ],
+        "title": "AgentManifest",
+        "type": "object"
+      },
       "AgentsResponse": {
         "additionalProperties": false,
         "properties": {
@@ -2848,6 +3000,103 @@
         "title": "ApiTranscriptMessage",
         "type": "object"
       },
+      "AppManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/AgentManifest"
+            },
+            "title": "Agents",
+            "type": "array"
+          },
+          "capabilities": {
+            "items": {
+              "$ref": "#/components/schemas/CapabilityManifest"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "defaults": {
+            "$ref": "#/components/schemas/ApplicationDefaultsManifest"
+          },
+          "environments": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentManifest"
+            },
+            "title": "Environments",
+            "type": "array"
+          },
+          "fingerprint": {
+            "title": "Fingerprint",
+            "type": "string"
+          },
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/ProviderManifest"
+            },
+            "title": "Providers",
+            "type": "array"
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/RuntimeManifest"
+          },
+          "schema_version": {
+            "const": "7",
+            "default": "7",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "stores": {
+            "$ref": "#/components/schemas/StoreManifest"
+          }
+        },
+        "required": [
+          "fingerprint",
+          "agents",
+          "providers",
+          "environments",
+          "stores",
+          "defaults",
+          "runtime",
+          "capabilities"
+        ],
+        "title": "AppManifest",
+        "type": "object"
+      },
+      "ApplicationDefaultsManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "environment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "environment"
+        ],
+        "title": "ApplicationDefaultsManifest",
+        "type": "object"
+      },
       "ArtifactReadResponse": {
         "additionalProperties": false,
         "properties": {
@@ -3480,6 +3729,42 @@
           }
         },
         "title": "BudgetWindow",
+        "type": "object"
+      },
+      "CapabilityManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "declared": {
+            "title": "Declared",
+            "type": "boolean"
+          },
+          "live_verified": {
+            "const": "not_run",
+            "default": "not_run",
+            "title": "Live Verified",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "process_available": {
+            "const": "not_checked",
+            "default": "not_checked",
+            "title": "Process Available",
+            "type": "string"
+          },
+          "resolved": {
+            "title": "Resolved",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "declared",
+          "resolved"
+        ],
+        "title": "CapabilityManifest",
         "type": "object"
       },
       "CapabilityOperation": {
@@ -4147,6 +4432,9 @@
           "dashboard": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
+          "evals": {
+            "$ref": "#/components/schemas/OptionalSurfaceCapability"
+          },
           "evaluation_promotion": {
             "$ref": "#/components/schemas/OptionalSurfaceCapability"
           },
@@ -4180,9 +4468,93 @@
           "artifacts",
           "usage",
           "pricing",
-          "evaluation_promotion"
+          "evaluation_promotion",
+          "evals"
         ],
         "title": "ControlPlaneSurfaceCapabilities",
+        "type": "object"
+      },
+      "CorpusComparisonCompatibility": {
+        "additionalProperties": false,
+        "description": "Typed precondition result for later regression comparison and UI adapters.",
+        "properties": {
+          "baseline_result_revision": {
+            "title": "Baseline Result Revision",
+            "type": "string"
+          },
+          "comparable": {
+            "title": "Comparable",
+            "type": "boolean"
+          },
+          "current_result_revision": {
+            "title": "Current Result Revision",
+            "type": "string"
+          },
+          "reasons": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/CorpusComparisonReason"
+            },
+            "title": "Reasons",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "baseline_result_revision",
+          "current_result_revision",
+          "comparable"
+        ],
+        "title": "CorpusComparisonCompatibility",
+        "type": "object"
+      },
+      "CorpusComparisonReason": {
+        "description": "Stable reason that two published executions cannot be compared as one contract.",
+        "enum": [
+          "target_key_mismatch",
+          "corpus_revision_mismatch",
+          "suite_id_mismatch",
+          "suite_revision_mismatch",
+          "evidence_policy_revision_mismatch",
+          "pricing_profile_fingerprint_mismatch",
+          "case_contract_mismatch",
+          "assertion_contract_mismatch"
+        ],
+        "title": "CorpusComparisonReason",
+        "type": "string"
+      },
+      "CorpusExecutionResult": {
+        "additionalProperties": false,
+        "description": "Safe published run plus the fresh target identity used to produce it.",
+        "properties": {
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "run": {
+            "$ref": "#/components/schemas/PublishedEvalRun"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target": {
+            "$ref": "#/components/schemas/EvaluationTargetIdentity"
+          }
+        },
+        "required": [
+          "revision",
+          "target",
+          "run"
+        ],
+        "title": "CorpusExecutionResult",
         "type": "object"
       },
       "CorpusUserMessageSpec": {
@@ -4484,6 +4856,130 @@
         "title": "EnqueueSessionMessageBody",
         "type": "object"
       },
+      "EnvironmentManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "artifact_store": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact Store"
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Binding"
+          },
+          "credential_proxy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Credential Proxy"
+          },
+          "factory_backed": {
+            "title": "Factory Backed",
+            "type": "boolean"
+          },
+          "implementation_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "is_default": {
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "knowledge_store": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge Store"
+          },
+          "mcp_servers": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Mcp Servers",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "registration_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "runner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner"
+          },
+          "vault": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vault"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "name",
+          "is_default",
+          "factory_backed",
+          "workspace",
+          "runner",
+          "artifact_store",
+          "vault",
+          "credential_proxy",
+          "binding",
+          "knowledge_store",
+          "mcp_servers",
+          "registration_provenance",
+          "implementation_provenance"
+        ],
+        "title": "EnvironmentManifest",
+        "type": "object"
+      },
       "EnvironmentsResponse": {
         "additionalProperties": false,
         "properties": {
@@ -4505,6 +5001,99 @@
           "total_count"
         ],
         "title": "EnvironmentsResponse",
+        "type": "object"
+      },
+      "EvalCaseCatalogEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "assertion_count": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Assertion Count",
+            "type": "integer"
+          },
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "message_count": {
+            "maximum": 16.0,
+            "minimum": 1.0,
+            "title": "Message Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "corpus_revision",
+          "id",
+          "revision",
+          "suite_id",
+          "name",
+          "message_count",
+          "assertion_count"
+        ],
+        "title": "EvalCaseCatalogEntry",
+        "type": "object"
+      },
+      "EvalCaseCatalogPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseCatalogEntry"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalCaseCatalogPage",
         "type": "object"
       },
       "EvalCaseSpec": {
@@ -4616,6 +5205,576 @@
         "title": "EvalCaseSpec",
         "type": "object"
       },
+      "EvalComparisonResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/EvalRunRecord"
+          },
+          "compatibility": {
+            "$ref": "#/components/schemas/CorpusComparisonCompatibility"
+          },
+          "current": {
+            "$ref": "#/components/schemas/EvalRunRecord"
+          }
+        },
+        "required": [
+          "baseline",
+          "current",
+          "compatibility"
+        ],
+        "title": "EvalComparisonResponse",
+        "type": "object"
+      },
+      "EvalCorpusCatalogEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "assertion_count": {
+            "maximum": 64000.0,
+            "minimum": 1.0,
+            "title": "Assertion Count",
+            "type": "integer"
+          },
+          "case_count": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Case Count",
+            "type": "integer"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "document_bytes": {
+            "maximum": 8388608.0,
+            "minimum": 1.0,
+            "title": "Document Bytes",
+            "type": "integer"
+          },
+          "evidence_policy_revision": {
+            "title": "Evidence Policy Revision",
+            "type": "string"
+          },
+          "expanded_assertion_result_count": {
+            "maximum": 640000.0,
+            "minimum": 1.0,
+            "title": "Expanded Assertion Result Count",
+            "type": "integer"
+          },
+          "pricing_profile_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Profile Fingerprint"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "suite_count": {
+            "maximum": 64.0,
+            "minimum": 1.0,
+            "title": "Suite Count",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "target_key",
+          "evidence_policy_revision",
+          "suite_count",
+          "case_count",
+          "assertion_count",
+          "expanded_assertion_result_count",
+          "document_bytes",
+          "created_at"
+        ],
+        "title": "EvalCorpusCatalogEntry",
+        "type": "object"
+      },
+      "EvalCorpusCatalogPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCorpusCatalogEntry"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalCorpusCatalogPage",
+        "type": "object"
+      },
+      "EvalCorpusDocument": {
+        "additionalProperties": false,
+        "description": "One canonical, authority-free corpus for exactly one trusted target key.",
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/EvalCaseSpec"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "evidence_policy": {
+            "$ref": "#/components/schemas/EvaluationEvidencePolicySpec"
+          },
+          "pricing_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PricingProfileIdentityV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "suites": {
+            "items": {
+              "$ref": "#/components/schemas/EvalSuiteSpec"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Suites",
+            "type": "array"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "target_key",
+          "evidence_policy",
+          "suites",
+          "cases"
+        ],
+        "title": "EvalCorpusDocument",
+        "type": "object"
+      },
+      "EvalResultResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "result": {
+            "$ref": "#/components/schemas/CorpusExecutionResult"
+          },
+          "run": {
+            "$ref": "#/components/schemas/EvalRunRecord"
+          }
+        },
+        "required": [
+          "run",
+          "result"
+        ],
+        "title": "EvalResultResponse",
+        "type": "object"
+      },
+      "EvalRunFailureCode": {
+        "description": "Safe terminal diagnostics; arbitrary exception text is never persisted.",
+        "enum": [
+          "target_unavailable",
+          "corpus_unavailable",
+          "execution_failed",
+          "worker_interrupted"
+        ],
+        "title": "EvalRunFailureCode",
+        "type": "string"
+      },
+      "EvalRunOwnership": {
+        "additionalProperties": false,
+        "properties": {
+          "epoch": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 1.0,
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "lease_expires_at": {
+            "format": "date-time",
+            "title": "Lease Expires At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "epoch",
+          "lease_expires_at"
+        ],
+        "title": "EvalRunOwnership",
+        "type": "object"
+      },
+      "EvalRunPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalRunRecord"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalRunPage",
+        "type": "object"
+      },
+      "EvalRunRecord": {
+        "additionalProperties": false,
+        "properties": {
+          "cancel_requested_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel Requested At"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunFailureCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "ownership": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunOwnership"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EvalRunResultSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "spec": {
+            "$ref": "#/components/schemas/EvalRunSpec"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/EvalRunStatus"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "spec",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "EvalRunRecord",
+        "type": "object"
+      },
+      "EvalRunResultSummary": {
+        "additionalProperties": false,
+        "properties": {
+          "duration_ms": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "status",
+          "duration_ms"
+        ],
+        "title": "EvalRunResultSummary",
+        "type": "object"
+      },
+      "EvalRunSpec": {
+        "additionalProperties": false,
+        "properties": {
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "max_concurrency": {
+            "maximum": 32.0,
+            "minimum": 1.0,
+            "title": "Max Concurrency",
+            "type": "integer"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "corpus_revision",
+          "target_key",
+          "suite_id",
+          "suite_revision",
+          "max_concurrency"
+        ],
+        "title": "EvalRunSpec",
+        "type": "object"
+      },
+      "EvalRunStatus": {
+        "enum": [
+          "queued",
+          "running",
+          "cancelling",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "title": "EvalRunStatus",
+        "type": "string"
+      },
+      "EvalSuiteCatalogEntry": {
+        "additionalProperties": false,
+        "properties": {
+          "assertion_count": {
+            "maximum": 64000.0,
+            "minimum": 1.0,
+            "title": "Assertion Count",
+            "type": "integer"
+          },
+          "case_count": {
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Case Count",
+            "type": "integer"
+          },
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "trials": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trials",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "corpus_revision",
+          "id",
+          "revision",
+          "name",
+          "case_count",
+          "assertion_count",
+          "trials",
+          "timeout_seconds"
+        ],
+        "title": "EvalSuiteCatalogEntry",
+        "type": "object"
+      },
+      "EvalSuiteCatalogPage": {
+        "additionalProperties": false,
+        "properties": {
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EvalSuiteCatalogEntry"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "EvalSuiteCatalogPage",
+        "type": "object"
+      },
       "EvalSuiteSpec": {
         "additionalProperties": false,
         "description": "Reusable execution settings; case membership remains mergeable by suite_id.",
@@ -4653,6 +5812,86 @@
           "name"
         ],
         "title": "EvalSuiteSpec",
+        "type": "object"
+      },
+      "EvalTrialDiagnosticCode": {
+        "description": "Stable, non-secret reason for one fresh trial's terminal outcome.",
+        "enum": [
+          "passed",
+          "assertion_failed",
+          "assertion_evidence_unavailable",
+          "terminal_evidence_unavailable",
+          "interrupted_evidence_unavailable",
+          "child_evidence_unavailable",
+          "execution_failed",
+          "session_failed",
+          "terminal_evidence_failed",
+          "evidence_preparation_failed",
+          "assertion_evaluation_failed",
+          "case_timeout"
+        ],
+        "title": "EvalTrialDiagnosticCode",
+        "type": "string"
+      },
+      "EvalTrialOutputPreviewV1": {
+        "additionalProperties": false,
+        "description": "Bounded redacted output evidence retained for safe result inspection.",
+        "properties": {
+          "evidence_state": {
+            "enum": [
+              "complete",
+              "unavailable",
+              "limit_exceeded"
+            ],
+            "title": "Evidence State",
+            "type": "string"
+          },
+          "preview_truncated": {
+            "default": false,
+            "title": "Preview Truncated",
+            "type": "boolean"
+          },
+          "retained_bytes": {
+            "maximum": 262144.0,
+            "minimum": 0.0,
+            "title": "Retained Bytes",
+            "type": "integer"
+          },
+          "retained_chars": {
+            "maximum": 65536.0,
+            "minimum": 0.0,
+            "title": "Retained Chars",
+            "type": "integer"
+          },
+          "retained_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained Sha256"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "text": {
+            "default": "",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "evidence_state",
+          "retained_chars",
+          "retained_bytes"
+        ],
+        "title": "EvalTrialOutputPreviewV1",
         "type": "object"
       },
       "EvaluationEvidencePolicySpec": {
@@ -5010,6 +6249,36 @@
         "title": "EvaluationSourceIdentityV1",
         "type": "object"
       },
+      "EvaluationTargetIdentity": {
+        "additionalProperties": false,
+        "description": "Public diagnostic identity of the fresh application used for execution.",
+        "properties": {
+          "app_manifest": {
+            "$ref": "#/components/schemas/AppManifest"
+          },
+          "application_release_id": {
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_key",
+          "application_release_id",
+          "app_manifest"
+        ],
+        "title": "EvaluationTargetIdentity",
+        "type": "object"
+      },
       "EventOrder": {
         "enum": [
           "sequence_asc",
@@ -5017,6 +6286,135 @@
         ],
         "title": "EventOrder",
         "type": "string"
+      },
+      "ExecutionEvidenceOverride": {
+        "additionalProperties": false,
+        "description": "A capability-specific minimum that overrides the workload default.",
+        "properties": {
+          "capability": {
+            "maxLength": 96,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "title": "Capability",
+            "type": "string"
+          },
+          "minimum_evidence": {
+            "enum": [
+              "declared",
+              "available",
+              "live_verified"
+            ],
+            "title": "Minimum Evidence",
+            "type": "string"
+          }
+        },
+        "required": [
+          "capability",
+          "minimum_evidence"
+        ],
+        "title": "ExecutionEvidenceOverride",
+        "type": "object"
+      },
+      "ExecutionRequirements": {
+        "additionalProperties": false,
+        "description": "Provider-neutral security and lifecycle requirements for one workload.",
+        "properties": {
+          "cancellation": {
+            "default": "best_effort",
+            "enum": [
+              "best_effort",
+              "confirmed"
+            ],
+            "title": "Cancellation",
+            "type": "string"
+          },
+          "cleanup": {
+            "default": "best_effort",
+            "enum": [
+              "best_effort",
+              "confirmed"
+            ],
+            "title": "Cleanup",
+            "type": "string"
+          },
+          "code_trust": {
+            "default": "trusted",
+            "enum": [
+              "trusted",
+              "untrusted"
+            ],
+            "title": "Code Trust",
+            "type": "string"
+          },
+          "durability": {
+            "default": "ephemeral",
+            "enum": [
+              "ephemeral",
+              "reconnectable"
+            ],
+            "title": "Durability",
+            "type": "string"
+          },
+          "evidence_overrides": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutionEvidenceOverride"
+            },
+            "maxItems": 64,
+            "title": "Evidence Overrides",
+            "type": "array"
+          },
+          "guest_privilege": {
+            "default": "unrestricted",
+            "enum": [
+              "unrestricted",
+              "contained",
+              "unprivileged"
+            ],
+            "title": "Guest Privilege",
+            "type": "string"
+          },
+          "host_filesystem": {
+            "default": "unrestricted",
+            "enum": [
+              "unrestricted",
+              "isolated",
+              "read_only_inputs"
+            ],
+            "title": "Host Filesystem",
+            "type": "string"
+          },
+          "minimum_evidence": {
+            "default": "declared",
+            "enum": [
+              "declared",
+              "available",
+              "live_verified"
+            ],
+            "title": "Minimum Evidence",
+            "type": "string"
+          },
+          "network_access": {
+            "default": "unrestricted",
+            "enum": [
+              "unrestricted",
+              "deny_by_default",
+              "brokered_egress"
+            ],
+            "title": "Network Access",
+            "type": "string"
+          },
+          "real_secret_visibility": {
+            "default": "allowed",
+            "enum": [
+              "allowed",
+              "non_possession"
+            ],
+            "title": "Real Secret Visibility",
+            "type": "string"
+          }
+        },
+        "title": "ExecutionRequirements",
+        "type": "object"
       },
       "FinalOutputContainsAssertionSpec": {
         "additionalProperties": false,
@@ -6512,6 +7910,56 @@
         "title": "Provenance",
         "type": "object"
       },
+      "ProviderManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "implementation": {
+            "title": "Implementation",
+            "type": "string"
+          },
+          "implementation_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "is_default": {
+            "title": "Is Default",
+            "type": "boolean"
+          },
+          "model_patterns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Model Patterns",
+            "type": "array"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "registration_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "supports_native_structured_output": {
+            "title": "Supports Native Structured Output",
+            "type": "boolean"
+          },
+          "usage_dialect": {
+            "title": "Usage Dialect",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "model_patterns",
+          "is_default",
+          "implementation",
+          "usage_dialect",
+          "supports_native_structured_output",
+          "registration_provenance",
+          "implementation_provenance"
+        ],
+        "title": "ProviderManifest",
+        "type": "object"
+      },
       "PublishedAssertionResult": {
         "additionalProperties": false,
         "properties": {
@@ -6681,6 +8129,248 @@
           "min_count"
         ],
         "title": "PublishedChildStatusDetail",
+        "type": "object"
+      },
+      "PublishedEvalCaseResult": {
+        "additionalProperties": false,
+        "properties": {
+          "case_id": {
+            "title": "Case Id",
+            "type": "string"
+          },
+          "case_revision": {
+            "title": "Case Revision",
+            "type": "string"
+          },
+          "duration_ms": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trials": {
+            "items": {
+              "$ref": "#/components/schemas/PublishedEvalTrialResult"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Trials",
+            "type": "array"
+          }
+        },
+        "required": [
+          "case_id",
+          "case_revision",
+          "status",
+          "trials",
+          "duration_ms"
+        ],
+        "title": "PublishedEvalCaseResult",
+        "type": "object"
+      },
+      "PublishedEvalRun": {
+        "additionalProperties": false,
+        "properties": {
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/PublishedEvalCaseResult"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "title": "Cases",
+            "type": "array"
+          },
+          "corpus_revision": {
+            "title": "Corpus Revision",
+            "type": "string"
+          },
+          "duration_ms": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "evidence_policy_revision": {
+            "title": "Evidence Policy Revision",
+            "type": "string"
+          },
+          "pricing_profile_fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Profile Fingerprint"
+          },
+          "revision": {
+            "title": "Revision",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 2,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "suite_id": {
+            "title": "Suite Id",
+            "type": "string"
+          },
+          "suite_revision": {
+            "title": "Suite Revision",
+            "type": "string"
+          },
+          "target_key": {
+            "title": "Target Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "revision",
+          "corpus_revision",
+          "target_key",
+          "suite_id",
+          "suite_revision",
+          "evidence_policy_revision",
+          "status",
+          "cases",
+          "duration_ms"
+        ],
+        "title": "PublishedEvalRun",
+        "type": "object"
+      },
+      "PublishedEvalTrialResult": {
+        "additionalProperties": false,
+        "properties": {
+          "assertions": {
+            "items": {
+              "$ref": "#/components/schemas/PublishedAssertionResult"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "title": "Assertions",
+            "type": "array"
+          },
+          "code": {
+            "$ref": "#/components/schemas/EvalTrialDiagnosticCode"
+          },
+          "duration_ms": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Duration Ms",
+            "type": "integer"
+          },
+          "evidence_complete": {
+            "title": "Evidence Complete",
+            "type": "boolean"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "output": {
+            "$ref": "#/components/schemas/EvalTrialOutputPreviewV1"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "trial_number": {
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Trial Number",
+            "type": "integer"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublishedUsageSummaryV1"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "trial_number",
+          "status",
+          "assertions",
+          "evidence_complete",
+          "duration_ms",
+          "output",
+          "code",
+          "message"
+        ],
+        "title": "PublishedEvalTrialResult",
         "type": "object"
       },
       "PublishedFinalOutputContainsDetail": {
@@ -7070,6 +8760,72 @@
           "minimum"
         ],
         "title": "PublishedUsageRecordedDetail",
+        "type": "object"
+      },
+      "PublishedUsageSummaryV1": {
+        "additionalProperties": false,
+        "properties": {
+          "model_steps": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Model Steps",
+            "type": "integer"
+          },
+          "tool_calls": {
+            "maximum": 9.223372036854776e+18,
+            "minimum": 0.0,
+            "title": "Tool Calls",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "pattern": "^(0|[1-9]\\d*)$",
+            "title": "Total Tokens",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model_steps",
+          "tool_calls",
+          "total_tokens"
+        ],
+        "title": "PublishedUsageSummaryV1",
+        "type": "object"
+      },
+      "RegistrationProvenance": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "enum": [
+              "project",
+              "built_in",
+              "external",
+              "dynamic",
+              "unavailable"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "location": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Location"
+          },
+          "symbol": {
+            "title": "Symbol",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "symbol"
+        ],
+        "title": "RegistrationProvenance",
         "type": "object"
       },
       "ResolutionActor": {
@@ -7520,6 +9276,133 @@
         "title": "RunLimits",
         "type": "object"
       },
+      "RuntimeManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "budget_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Policy"
+          },
+          "context_counting": {
+            "title": "Context Counting",
+            "type": "string"
+          },
+          "dispatcher": {
+            "title": "Dispatcher",
+            "type": "string"
+          },
+          "event_sinks": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Event Sinks",
+            "type": "array"
+          },
+          "loop_policies": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Loop Policies",
+            "type": "array"
+          },
+          "max_environment_lifecycle_owners": {
+            "title": "Max Environment Lifecycle Owners",
+            "type": "integer"
+          },
+          "max_file_attachment_bytes": {
+            "title": "Max File Attachment Bytes",
+            "type": "integer"
+          },
+          "max_file_attachments_per_request": {
+            "title": "Max File Attachments Per Request",
+            "type": "integer"
+          },
+          "max_parallel_tool_calls": {
+            "title": "Max Parallel Tool Calls",
+            "type": "integer"
+          },
+          "max_total_file_attachment_bytes": {
+            "title": "Max Total File Attachment Bytes",
+            "type": "integer"
+          },
+          "mcp_manifest_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Manifest Policy"
+          },
+          "retry_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Policy"
+          },
+          "runtime_hooks": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Runtime Hooks",
+            "type": "array"
+          },
+          "tool_result_projection_policy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolResultProjectionPolicyManifest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tool_timeout_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Timeout Seconds"
+          }
+        },
+        "required": [
+          "dispatcher",
+          "retry_policy",
+          "budget_policy",
+          "runtime_hooks",
+          "loop_policies",
+          "event_sinks",
+          "mcp_manifest_policy",
+          "tool_result_projection_policy",
+          "context_counting",
+          "max_file_attachment_bytes",
+          "max_total_file_attachment_bytes",
+          "max_file_attachments_per_request",
+          "tool_timeout_seconds",
+          "max_parallel_tool_calls",
+          "max_environment_lifecycle_owners"
+        ],
+        "title": "RuntimeManifest",
+        "type": "object"
+      },
       "ServerContractActor": {
         "additionalProperties": false,
         "description": "Bounded actor projection that deliberately excludes arbitrary claims.",
@@ -7563,7 +9446,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "7",
+            "default": "8",
             "title": "Contract Version",
             "type": "string"
           },
@@ -8581,6 +10464,59 @@
         "title": "SseFrameExamples",
         "type": "object"
       },
+      "StoreManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "budget": {
+            "title": "Budget",
+            "type": "string"
+          },
+          "budget_ledger": {
+            "title": "Budget Ledger",
+            "type": "string"
+          },
+          "event_watcher": {
+            "title": "Event Watcher",
+            "type": "string"
+          },
+          "knowledge": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Knowledge"
+          },
+          "session": {
+            "title": "Session",
+            "type": "string"
+          },
+          "task": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task"
+          }
+        },
+        "required": [
+          "session",
+          "task",
+          "knowledge",
+          "budget",
+          "budget_ledger",
+          "event_watcher"
+        ],
+        "title": "StoreManifest",
+        "type": "object"
+      },
       "StructuredOutputSpec": {
         "additionalProperties": false,
         "description": "Provider-neutral JSON structured output requirement.",
@@ -9446,6 +11382,129 @@
           "tool_name"
         ],
         "title": "ToolCalledAssertionSpec",
+        "type": "object"
+      },
+      "ToolManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "command_policy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command Policy"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "effect": {
+            "title": "Effect",
+            "type": "string"
+          },
+          "implementation_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          },
+          "input_schema": {
+            "additionalProperties": true,
+            "title": "Input Schema",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "parallel_safe": {
+            "title": "Parallel Safe",
+            "type": "boolean"
+          },
+          "policy_coverage": {
+            "enum": [
+              "allowed",
+              "denied",
+              "approval_required",
+              "conditional",
+              "unknown"
+            ],
+            "title": "Policy Coverage",
+            "type": "string"
+          },
+          "registration_provenance": {
+            "$ref": "#/components/schemas/RegistrationProvenance"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "effect",
+          "parallel_safe",
+          "policy_coverage",
+          "registration_provenance",
+          "implementation_provenance"
+        ],
+        "title": "ToolManifest",
+        "type": "object"
+      },
+      "ToolResultProjectionPolicyManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "max_inline_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Inline Bytes"
+          },
+          "max_inline_token_estimate": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Inline Token Estimate"
+          },
+          "preview_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview Bytes"
+          },
+          "token_estimation_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Estimation Method"
+          }
+        },
+        "required": [
+          "identity"
+        ],
+        "title": "ToolResultProjectionPolicyManifest",
         "type": "object"
       },
       "ToolRoundRecoveryBody": {
@@ -10992,7 +13051,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "7",
+            "default": "8",
             "title": "Contract Version",
             "type": "string"
           }
@@ -11786,6 +13845,448 @@
         "summary": "Get Environment"
       }
     },
+    "/api/evals/comparisons": {
+      "post": {
+        "operationId": "compare_eval_runs_api_evals_comparisons_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "baseline_run_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                    "title": "Baseline Run Id",
+                    "type": "string"
+                  },
+                  "current_run_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                    "title": "Current Run Id",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "baseline_run_id",
+                  "current_run_id"
+                ],
+                "title": "EvalComparisonRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalComparisonResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Compare Eval Runs"
+      }
+    },
+    "/api/evals/corpora": {
+      "get": {
+        "operationId": "list_eval_corpora_api_evals_corpora_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalCorpusCatalogPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Corpora"
+      },
+      "post": {
+        "operationId": "import_eval_corpus_api_evals_corpora_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvalCorpusDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalCorpusCatalogEntry"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Import Eval Corpus"
+      }
+    },
+    "/api/evals/corpora/{corpus_revision}": {
+      "get": {
+        "operationId": "get_eval_corpus_api_evals_corpora__corpus_revision__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "corpus_revision",
+            "required": true,
+            "schema": {
+              "title": "Corpus Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalCorpusDocument"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Eval Corpus"
+      }
+    },
+    "/api/evals/corpora/{corpus_revision}/download": {
+      "get": {
+        "operationId": "download_eval_corpus_api_evals_corpora__corpus_revision__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "corpus_revision",
+            "required": true,
+            "schema": {
+              "title": "Corpus Revision",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Download Eval Corpus"
+      }
+    },
+    "/api/evals/corpora/{corpus_revision}/suites": {
+      "get": {
+        "operationId": "list_eval_suites_api_evals_corpora__corpus_revision__suites_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "corpus_revision",
+            "required": true,
+            "schema": {
+              "title": "Corpus Revision",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalSuiteCatalogPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Suites"
+      }
+    },
+    "/api/evals/corpora/{corpus_revision}/suites/{suite_id}/cases": {
+      "get": {
+        "operationId": "list_eval_cases_api_evals_corpora__corpus_revision__suites__suite_id__cases_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "corpus_revision",
+            "required": true,
+            "schema": {
+              "title": "Corpus Revision",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "suite_id",
+            "required": true,
+            "schema": {
+              "title": "Suite Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalCaseCatalogPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Cases"
+      }
+    },
     "/api/evals/promotion/sessions/{session_id}/export": {
       "post": {
         "operationId": "export_evaluation_promotion_api_evals_promotion_sessions__session_id__export_post",
@@ -11899,6 +14400,404 @@
           }
         },
         "summary": "Preview Evaluation Promotion"
+      }
+    },
+    "/api/evals/runs": {
+      "get": {
+        "operationId": "list_eval_runs_api_evals_runs_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/EvalRunStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "corpus_revision",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Corpus Revision"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_result_bytes",
+            "required": false,
+            "schema": {
+              "default": 1048576,
+              "maximum": 8388608,
+              "minimum": 1024,
+              "title": "Max Result Bytes",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "List Eval Runs"
+      },
+      "post": {
+        "operationId": "create_eval_run_api_evals_runs_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Idempotency-Key",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Authority-free request to execute one stored suite on the attached target.",
+                "properties": {
+                  "corpus_revision": {
+                    "maxLength": 71,
+                    "minLength": 71,
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                    "title": "Corpus Revision",
+                    "type": "string"
+                  },
+                  "max_concurrency": {
+                    "default": 1,
+                    "maximum": 32,
+                    "minimum": 1,
+                    "title": "Max Concurrency",
+                    "type": "integer"
+                  },
+                  "suite_id": {
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "pattern": "^[a-z][a-z0-9._-]{0,127}$",
+                    "title": "Suite Id",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "corpus_revision",
+                  "suite_id"
+                ],
+                "title": "EvalRunCreateRequest",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Create Eval Run"
+      }
+    },
+    "/api/evals/runs/{run_id}": {
+      "get": {
+        "operationId": "get_eval_run_api_evals_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Eval Run"
+      }
+    },
+    "/api/evals/runs/{run_id}/cancel": {
+      "post": {
+        "operationId": "cancel_eval_run_api_evals_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalRunRecord"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Cancel Eval Run"
+      }
+    },
+    "/api/evals/runs/{run_id}/report.html": {
+      "get": {
+        "operationId": "download_eval_html_report_api_evals_runs__run_id__report_html_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Download Eval Html Report"
+      }
+    },
+    "/api/evals/runs/{run_id}/report.json": {
+      "get": {
+        "operationId": "download_eval_json_report_api_evals_runs__run_id__report_json_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Download Eval Json Report"
+      }
+    },
+    "/api/evals/runs/{run_id}/result": {
+      "get": {
+        "operationId": "get_eval_result_api_evals_runs__run_id__result_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvalResultResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "The request is incompatible with the attached eval target."
+          },
+          "404": {
+            "description": "The requested eval resource does not exist."
+          },
+          "409": {
+            "description": "The requested eval lifecycle transition is not currently valid."
+          },
+          "413": {
+            "description": "The request or bounded store result exceeds its byte limit."
+          },
+          "422": {
+            "description": "The request is invalid or contains unsafe public data."
+          }
+        },
+        "summary": "Get Eval Result"
       }
     },
     "/api/health": {

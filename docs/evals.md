@@ -677,7 +677,7 @@ must survive beyond the promotion request. `SQLiteEvalStore` is restart-durable
 for one embedded database; `PostgresEvalStore` supports shared multi-worker
 claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
-schema revision 32. Corpus saves, run admission, and result publication require
+schema revision 33. Corpus saves, run admission, and result publication require
 the active application's complete JSON redaction boundary. A configured workload
 secret or redaction failure rejects before any write; the store never retains
 the redaction function or secret registry.
@@ -738,7 +738,9 @@ publish, fail, cancel, or release another worker's run. Ordinary run reads never
 contain the private claim token or admission idempotency digest.
 Workers must heartbeat active claims before their lease expires, stop work when
 cancellation is requested, and release still-owned work during a controlled
-shutdown. Those execution-loop policies are deliberately outside the store.
+shutdown. Those execution-loop policies are deliberately outside the store;
+the server-attached coordinator described below provides the built-in durable
+implementation.
 
 Catalog and run lists use opaque keyset cursors plus caller-controlled item and
 byte ceilings. Full corpus and result reads check their exact stored UTF-8 size
@@ -749,6 +751,71 @@ exception text. Claim APIs do not accept or persist worker labels; private,
 random claim tokens and fenced epochs provide ownership. `EvalStore` owns
 persistence and coordination only—the caller still supplies the trusted target
 and performs execution.
+
+### Server-attached durable execution
+
+An authenticated Cayu server can attach exactly one trusted `CorpusTarget` to a
+durable `SQLiteEvalStore` or `PostgresEvalStore`. `EvalsConfig` is complete,
+programmatic runtime wiring and is off by default:
+
+```python
+from cayu import SQLiteEvalStore
+from cayu.server import BasicAuth, EvalsConfig, ServerConfig, create_server
+from cayu.storage.migrations import SchemaMode
+
+eval_store = SQLiteEvalStore("cayu.db", schema_mode=SchemaMode.MIGRATE)
+server = create_server(
+    target.app,
+    config=ServerConfig.protected(
+        BasicAuth(username="operator", password=resolved_password),
+        evals=EvalsConfig(
+            target=target,
+            store=eval_store,
+        ),
+    ),
+)
+```
+
+The target must reference the exact `CayuApp` attached to the server. Open
+access, a disabled API, an in-memory store, incomplete wiring, or an unavailable
+target identity rejects during construction and mounts no Evals execution
+surface. `target` and `store` are excluded from configuration serialization and
+diagnostics. `ServerSettings` does not deserialize application objects,
+credentials, database handles, or executable targets from environment values;
+applications resolve those trusted objects before constructing `EvalsConfig`.
+
+The protected `/api/evals` surface imports and downloads immutable corpora,
+lists corpora/suites/cases, creates and lists runs, reads status and terminal
+results, requests cancellation, checks comparison compatibility, and downloads
+deterministic JSON or standalone HTML reports. Run admission requires an
+`Idempotency-Key` header; Cayu persists only a target-scoped SHA-256 digest of
+that value. HTTP documents can select only a stored corpus revision, suite, and
+bounded concurrency. They cannot carry an application, import path, provider
+credential, callback, PriceBook, tool/environment wiring, request template, or
+another target.
+
+Every Evals request authenticates before its handler runs, and JSON request
+bodies cross a byte ceiling before parsing. Corpus import compiles every suite
+against the attached target before the immutable revision is saved. Run
+creation repeats the selected-suite compatibility check before persisting
+admission, and the provider is never invoked in either path. A shared store is
+filtered at its query and claim boundaries by target key; another target's
+corpora and runs are neither exposed nor claimed by this server.
+
+The embedded coordinator claims persisted work with the store's private token,
+epoch, and expiring lease, then invokes the same compiled execution core used by
+the SDK/CLI `run_corpus_suite(...)` entry point. It heartbeats ownership,
+observes durable cancellation, cancels fresh execution cooperatively, and
+atomically publishes one credential-scanned terminal result. Ownership loss
+stops local work without publishing. Controlled shutdown cancels and releases
+still-owned work so another process or restart can claim it; an unclean stop
+remains recoverable after lease expiry. No partial run is ever represented as
+passed.
+
+SQLite is the embedded single-database choice. PostgreSQL permits multiple
+server processes to compete safely for the same target's queued work through
+fenced claims. This is not an arbitrary target registry, generic queue, remote
+worker protocol, or hosted eval service.
 
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable
