@@ -72,6 +72,7 @@ class SyncBindingContext:
 class _SyncBindingState:
     source_paths: tuple[str, ...]
     target_baseline_paths: tuple[str, ...]
+    source_resource_key: tuple[object, ...]
     target_id: str
     target_resource_key: tuple[object, ...]
     phase: Literal["active", "finalizing"] = "active"
@@ -716,7 +717,10 @@ class SyncBinding(WorkspaceBinding):
             metadata=request_metadata,
         )
         target = await self._target_workspace(context)
-        target_resource_key = _reject_same_or_indeterminate_target(workspace, target)
+        source_resource_key, target_resource_key = _reject_same_or_indeterminate_target(
+            workspace,
+            target,
+        )
         state_key = uuid4().hex
         # Reserve every resolved target before any mutating await. The module-level registry
         # composes fixed targets, factory targets, and separate SyncBinding instances into one
@@ -795,6 +799,7 @@ class SyncBinding(WorkspaceBinding):
                 _SyncBindingState(
                     source_paths=source_paths,
                     target_baseline_paths=target_baseline_paths,
+                    source_resource_key=source_resource_key,
                     target_id=target.id,
                     target_resource_key=target_resource_key,
                 ),
@@ -929,6 +934,7 @@ class SyncBinding(WorkspaceBinding):
             state = self._states.get(state_key)
             if state is None:
                 raise ValueError("SyncBinding deferred release requires in-process bind state.")
+            _validate_sync_generation_ownership(bound, state)
             if state.phase != "active":
                 raise RuntimeError("SyncBinding release cannot be deferred during finalization.")
             self._states[state_key] = replace(state, defer_finalize_release=True)
@@ -940,7 +946,11 @@ class SyncBinding(WorkspaceBinding):
         if state_key is None:
             return False
         with self._state_lock:
-            return state_key in self._states
+            state = self._states.get(state_key)
+            if state is None:
+                return False
+            _validate_sync_generation_ownership(bound, state)
+            return True
 
     def _record_sync_state(self, state_key: str, state: _SyncBindingState) -> None:
         with self._state_lock:
@@ -969,6 +979,7 @@ class SyncBinding(WorkspaceBinding):
             with self._state_lock:
                 state = self._states.get(state_key)
                 if state is not None:
+                    _validate_sync_generation_ownership(bound, state)
                     if state.phase == "finalizing":
                         raise RuntimeError("SyncBinding state is already being finalized.")
                     finalizing = replace(state, phase="finalizing")
@@ -1018,6 +1029,7 @@ class SyncBinding(WorkspaceBinding):
             state = self._states.get(state_key)
             if state is None:
                 return
+            _validate_sync_generation_ownership(bound, state)
             if state.phase == "finalizing":
                 raise RuntimeError("SyncBinding state cannot be abandoned during finalization.")
             self._remove_state_locked(state_key)
@@ -1100,7 +1112,7 @@ def _validate_finalize_request(
 def _reject_same_or_indeterminate_target(
     source: Workspace,
     target: Workspace,
-) -> tuple[object, ...]:
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
     """Refuse a SyncBinding whose target is, or might be, the same resource as the source.
 
     Fails closed: when either workspace cannot report a stable ``resource_key`` the identity is
@@ -1112,7 +1124,23 @@ def _reject_same_or_indeterminate_target(
     target_key = _validated_workspace_resource_key(target)
     if source_key == target_key:
         raise ValueError(SYNC_DISTINCT_WORKSPACES_ERROR)
-    return target_key
+    return source_key, target_key
+
+
+def _validate_sync_generation_ownership(
+    bound: BoundWorkspace,
+    state: _SyncBindingState,
+) -> None:
+    source = bound.source_workspace
+    if source is None or _validated_workspace_resource_key(source) != state.source_resource_key:
+        raise ValueError(
+            "SyncBinding bound source workspace does not match the original bind generation."
+        )
+    target = bound.workspace
+    if target is None or _validated_workspace_resource_key(target) != state.target_resource_key:
+        raise ValueError(
+            "SyncBinding bound target workspace does not match the original bind generation."
+        )
 
 
 def _validated_workspace_resource_key(workspace: Workspace) -> tuple[object, ...]:

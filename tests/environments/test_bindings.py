@@ -8,7 +8,7 @@ import sys
 import tarfile
 import threading
 import time
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import Any
 
@@ -1092,6 +1092,120 @@ def test_sync_binding_can_finalize_from_copied_bound_workspace(tmp_path) -> None
     assert final_snapshot is not None
     assert (source_root / "a.txt").read_text(encoding="utf-8") == "after"
     assert binding._states == {}
+
+
+def test_sync_binding_rejects_substituted_source_before_real_filesystem_write(
+    tmp_path,
+) -> None:
+    source_root = tmp_path / "source"
+    substituted_root = tmp_path / "substituted"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    substituted_root.mkdir()
+    target_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    substituted = LocalWorkspace(substituted_root, workspace_id="substituted")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_sync_owner")
+        await target.write_bytes("a.txt", b"after")
+        forged = replace(bound, source_workspace=substituted)
+
+        with pytest.raises(ValueError, match="source workspace"):
+            await binding.finalize(forged, outcome="completed")
+
+        assert (source_root / "a.txt").read_text(encoding="utf-8") == "before"
+        assert not (substituted_root / "a.txt").exists()
+        assert binding._states[bound.state_key].phase == "active"
+        assert binding._fixed_target_owners == {"target": bound.state_key}
+
+        await binding.finalize(bound, outcome="completed")
+
+    asyncio.run(run())
+
+    assert (source_root / "a.txt").read_text(encoding="utf-8") == "after"
+    assert not (substituted_root / "a.txt").exists()
+    assert binding._states == {}
+    assert binding._fixed_target_owners == {}
+
+
+def test_sync_binding_rejects_substituted_target_before_generation_release(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    substituted_root = tmp_path / "substituted"
+    source_root.mkdir()
+    target_root.mkdir()
+    substituted_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    substituted = LocalWorkspace(substituted_root, workspace_id="substituted")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_sync_owner")
+        forged = replace(bound, workspace=substituted)
+
+        with pytest.raises(ValueError, match="target workspace"):
+            await binding.finalize(forged, outcome="completed")
+
+        assert binding._states[bound.state_key].phase == "active"
+        assert binding._fixed_target_owners == {"target": bound.state_key}
+        binding.abandon(bound)
+
+    asyncio.run(run())
+
+    assert binding._states == {}
+    assert binding._fixed_target_owners == {}
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("abandon", "defer-release", "quiescence"),
+)
+@pytest.mark.parametrize("substituted_resource", ("source", "target"))
+def test_sync_binding_lifecycle_rejects_substituted_resource_ownership(
+    tmp_path,
+    operation: str,
+    substituted_resource: str,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    substituted_root = tmp_path / "substituted"
+    source_root.mkdir()
+    target_root.mkdir()
+    substituted_root.mkdir()
+    (source_root / "a.txt").write_text("before", encoding="utf-8")
+    source = LocalWorkspace(source_root, workspace_id="source")
+    target = LocalWorkspace(target_root, workspace_id="target")
+    substituted = LocalWorkspace(substituted_root, workspace_id="substituted")
+    binding = SyncBinding(target_workspace=target)
+
+    async def run() -> None:
+        bound = await binding.bind(source, None, session_id="sess_sync_owner")
+        forged = replace(
+            bound,
+            source_workspace=substituted if substituted_resource == "source" else source,
+            workspace=substituted if substituted_resource == "target" else target,
+        )
+
+        expected = f"{substituted_resource} workspace"
+        with pytest.raises(ValueError, match=expected):
+            if operation == "abandon":
+                binding.abandon(forged)
+            elif operation == "defer-release":
+                binding._defer_finalize_release(forged)
+            else:
+                binding._requires_mutation_quiescence(forged)
+
+        assert binding._states[bound.state_key].phase == "active"
+        assert binding._fixed_target_owners == {"target": bound.state_key}
+        binding.abandon(bound)
+
+    asyncio.run(run())
 
 
 def test_sync_binding_rejects_concurrent_bind_on_fixed_target(tmp_path) -> None:
