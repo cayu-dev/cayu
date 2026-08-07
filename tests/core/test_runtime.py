@@ -20955,6 +20955,48 @@ def test_after_tool_call_modify_applies_on_short_circuit_result():
     assert transcript[2].content[0].content == "rewritten-cached"
 
 
+def test_before_tool_call_decision_copies_synthetic_result_payload() -> None:
+    original = ToolResult(
+        content="cached",
+        structured={"nested": {"status": "original"}},
+        artifacts=[{"id": "artifact-1", "metadata": {"source": "original"}}],
+        is_error=True,
+    )
+
+    decision = BeforeToolCallDecision(action="short_circuit", synthetic_result=original)
+
+    assert decision.synthetic_result is not original
+    original.structured["nested"]["status"] = "mutated"  # type: ignore[index]
+    original.artifacts[0]["metadata"]["source"] = "mutated"  # type: ignore[index]
+    assert decision.synthetic_result == ToolResult(
+        content="cached",
+        structured={"nested": {"status": "original"}},
+        artifacts=[{"id": "artifact-1", "metadata": {"source": "original"}}],
+        is_error=True,
+    )
+
+
+def test_after_tool_call_decision_copies_modified_result_payload() -> None:
+    original = ToolResult(
+        content="rewritten",
+        structured={"nested": {"status": "original"}},
+        artifacts=[{"id": "artifact-1", "metadata": {"source": "original"}}],
+        is_error=False,
+    )
+
+    decision = AfterToolCallDecision(action="modify", modified_result=original)
+
+    assert decision.modified_result is not original
+    original.structured["nested"]["status"] = "mutated"  # type: ignore[index]
+    original.artifacts[0]["metadata"]["source"] = "mutated"  # type: ignore[index]
+    assert decision.modified_result == ToolResult(
+        content="rewritten",
+        structured={"nested": {"status": "original"}},
+        artifacts=[{"id": "artifact-1", "metadata": {"source": "original"}}],
+        is_error=False,
+    )
+
+
 def test_before_tool_call_decision_rejects_stray_block_reason():
     with pytest.raises(ValidationError, match="block_reason is only valid with block"):
         BeforeToolCallDecision(action="proceed", block_reason="nope")

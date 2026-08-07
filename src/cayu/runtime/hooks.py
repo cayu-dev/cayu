@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 from enum import StrEnum
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import (
     copy_json_value,
@@ -343,6 +343,11 @@ class BeforeToolCallDecision(BaseModel):
     synthetic_result: ToolResult | None = None
     block_reason: str | None = None
 
+    @field_validator("synthetic_result")
+    @classmethod
+    def _copy_synthetic_result(cls, value: ToolResult | None) -> ToolResult | None:
+        return None if value is None else _copy_tool_result(value)
+
     @model_validator(mode="after")
     def _check_payload(self) -> BeforeToolCallDecision:
         if self.action == "proceed_modified" and self.modified_arguments is None:
@@ -371,6 +376,11 @@ class AfterToolCallDecision(BaseModel):
 
     action: Literal["pass_through", "modify"]
     modified_result: ToolResult | None = None
+
+    @field_validator("modified_result")
+    @classmethod
+    def _copy_modified_result(cls, value: ToolResult | None) -> ToolResult | None:
+        return None if value is None else _copy_tool_result(value)
 
     @model_validator(mode="after")
     def _check_payload(self) -> AfterToolCallDecision:
