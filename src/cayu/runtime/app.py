@@ -727,10 +727,6 @@ class CayuApp:
         """Return a JSON-compatible value with configured secret values redacted."""
         return self._secret_redactor.redact_json(value)
 
-    def redact_json_values(self, value: Any) -> Any:
-        """Redact JSON string values without rewriting protocol object keys."""
-        return self._secret_redactor.redact_json_values(value)
-
     def project_event_record_for_exposure(self, record: EventRecord) -> EventRecord:
         """Project a caller-supplied record without granting persisted authority."""
 

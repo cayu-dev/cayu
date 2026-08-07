@@ -17,14 +17,14 @@ _NO_SECRETS = SecretRedactor()
 async def _save_corpus(store, corpus):
     return await store.save_corpus(
         corpus,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
 
 
 async def _admit_run(store, request):
     return await store.admit_run(
         request,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
 
 
@@ -32,7 +32,7 @@ async def _publish_result(store, claim, result):
     return await store.publish_result(
         claim,
         result,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
 
 

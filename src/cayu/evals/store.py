@@ -48,6 +48,7 @@ from cayu.evals.execution import (
     CORPUS_EXECUTION_RESULT_MAX_BYTES,
     CorpusExecutionResult,
 )
+from cayu.evals.published import _validate_published_eval_run_for_corpus
 
 EVAL_STORE_DEFAULT_PAGE_SIZE = 50
 EVAL_STORE_MAX_PAGE_SIZE = 200
@@ -145,13 +146,13 @@ class EvalRunClaimLost(RuntimeError):
 def _require_publication_safe(
     document: dict[str, Any],
     *,
-    redact_json_values: Callable[[Any], Any],
+    redact_json: Callable[[Any], Any],
     resource_name: str,
 ) -> None:
-    if not callable(redact_json_values):
-        raise TypeError("redact_json_values must be callable.")
+    if not callable(redact_json):
+        raise TypeError("redact_json must be callable.")
     try:
-        redacted = redact_json_values(document)
+        redacted = redact_json(document)
     except Exception:
         raise EvalStorePublicationRejected(
             f"{resource_name} could not cross the credential-redaction boundary."
@@ -165,7 +166,7 @@ def _require_publication_safe(
 def _prepare_corpus_for_store(
     corpus: EvalCorpusDocument,
     *,
-    redact_json_values: Callable[[Any], Any],
+    redact_json: Callable[[Any], Any],
 ) -> tuple[EvalCorpusDocument, bytes]:
     """Validate and serialize one corpus after a fail-closed credential scan."""
 
@@ -173,7 +174,7 @@ def _prepare_corpus_for_store(
     document = validated.model_dump(mode="json")
     _require_publication_safe(
         document,
-        redact_json_values=redact_json_values,
+        redact_json=redact_json,
         resource_name="Eval corpus",
     )
     wire_document = json.dumps(
@@ -190,12 +191,12 @@ def _prepare_corpus_for_store(
 def _prepare_run_request_for_store(
     request: EvalRunRequest,
     *,
-    redact_json_values: Callable[[Any], Any],
+    redact_json: Callable[[Any], Any],
 ) -> EvalRunRequest:
     validated = _exact_model(request, EvalRunRequest, "request")
     _require_publication_safe(
         validated.model_dump(mode="json"),
-        redact_json_values=redact_json_values,
+        redact_json=redact_json,
         resource_name="Eval run request",
     )
     return validated
@@ -204,13 +205,13 @@ def _prepare_run_request_for_store(
 def _prepare_result_for_store(
     result: CorpusExecutionResult,
     *,
-    redact_json_values: Callable[[Any], Any],
+    redact_json: Callable[[Any], Any],
 ) -> tuple[CorpusExecutionResult, bytes]:
     validated = _exact_model(result, CorpusExecutionResult, "result")
     document = validated.model_dump(mode="json")
     _require_publication_safe(
         document,
-        redact_json_values=redact_json_values,
+        redact_json=redact_json,
         resource_name="Eval result",
     )
     wire_document = json.dumps(
@@ -1038,17 +1039,27 @@ def validate_run_request_for_corpus(
 def validate_result_for_run(
     request: EvalRunRequest,
     result: CorpusExecutionResult,
+    corpus: EvalCorpusDocument,
 ) -> CorpusExecutionResult:
-    validated = _exact_model(result, CorpusExecutionResult, "result")
-    if validated.target.target_key != request.target_key:
+    if type(result) is not CorpusExecutionResult:
+        raise TypeError("result must be an exact CorpusExecutionResult.")
+    if type(corpus) is not EvalCorpusDocument:
+        raise TypeError("corpus must be an exact EvalCorpusDocument.")
+    if result.target.target_key != request.target_key:
         raise EvalRunStateConflict("Eval result target key does not match its run request.")
-    if validated.run.corpus_revision != request.corpus_revision:
+    if result.run.corpus_revision != request.corpus_revision:
         raise EvalRunStateConflict("Eval result corpus revision does not match its run request.")
-    if validated.run.suite_id != request.suite_id:
+    if result.run.suite_id != request.suite_id:
         raise EvalRunStateConflict("Eval result suite id does not match its run request.")
-    if validated.run.suite_revision != request.suite_revision:
+    if result.run.suite_revision != request.suite_revision:
         raise EvalRunStateConflict("Eval result suite revision does not match its run request.")
-    return validated
+    try:
+        _validate_published_eval_run_for_corpus(corpus, result.run)
+    except ValueError:
+        raise EvalRunStateConflict(
+            "Eval result does not match its immutable corpus suite contract."
+        ) from None
+    return result
 
 
 def result_summary(result: CorpusExecutionResult) -> EvalRunResultSummary:
@@ -1080,7 +1091,7 @@ class EvalStore(ABC):
         self,
         corpus: EvalCorpusDocument,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalCorpusCatalogEntry:
         """Scan and atomically save one complete immutable corpus revision."""
 
@@ -1113,7 +1124,7 @@ class EvalStore(ABC):
         self,
         request: EvalRunRequest,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         """Atomically admit or replay one logical run request."""
 
@@ -1152,7 +1163,7 @@ class EvalStore(ABC):
         claim: EvalRunClaim,
         result: CorpusExecutionResult,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         """Atomically publish exactly one immutable safe terminal result."""
 
@@ -1229,11 +1240,11 @@ class InMemoryEvalStore(EvalStore):
         self,
         corpus: EvalCorpusDocument,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalCorpusCatalogEntry:
         validated, document = _prepare_corpus_for_store(
             corpus,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         suites = tuple(sorted(suite_catalog_entries(validated), key=lambda item: item.id))
         cases = tuple(sorted(case_catalog_entries(validated), key=lambda item: item.id))
@@ -1340,11 +1351,11 @@ class InMemoryEvalStore(EvalStore):
         self,
         request: EvalRunRequest,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         request = _prepare_run_request_for_store(
             request,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         async with self._lock:
             duplicate_id = self._run_ids_by_idempotency_key.get(request.idempotency_key)
@@ -1499,16 +1510,23 @@ class InMemoryEvalStore(EvalStore):
         claim: EvalRunClaim,
         result: CorpusExecutionResult,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
         validated_result, _ = _prepare_result_for_store(
             result,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         async with self._lock:
             state = self._require_run(claim.run_id)
-            validated_result = validate_result_for_run(state.request, validated_result)
+            corpus = EvalCorpusDocument.model_validate(
+                json.loads(self._corpus_documents[state.request.corpus_revision])
+            )
+            validated_result = validate_result_for_run(
+                state.request,
+                validated_result,
+                corpus,
+            )
             if state.status is EvalRunStatus.COMPLETED:
                 if (
                     self._historical_claim_matches(state, claim)

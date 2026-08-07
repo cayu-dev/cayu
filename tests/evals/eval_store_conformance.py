@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -9,8 +10,12 @@ from cayu.evals.corpus import (
     EvalCaseSpec,
     EvalCorpusDocument,
     RunInputSpec,
+    _content_revision,
 )
-from cayu.evals.execution import CorpusExecutionResult
+from cayu.evals.execution import (
+    CorpusExecutionResult,
+    EvaluationTargetIdentity,
+)
 from cayu.evals.store import (
     EvalCaseCatalogQuery,
     EvalCatalogQuery,
@@ -25,6 +30,7 @@ from cayu.evals.store import (
     EvalStoreResultTooLarge,
     EvalSuiteCatalogQuery,
 )
+from cayu.runtime.manifest import AppManifest, ToolManifest
 from cayu.vaults.redaction import SecretRedactor
 
 _NO_SECRETS = SecretRedactor()
@@ -54,6 +60,81 @@ def _broken_redaction_boundary(_value):
     raise RuntimeError("must not cross the store boundary")
 
 
+def _result_with_run_update(result: CorpusExecutionResult, **updates) -> CorpusExecutionResult:
+    changed = result.run.model_copy(update=updates)
+    revision_document = changed.model_dump(mode="json", exclude={"revision"})
+    changed = changed.model_copy(
+        update={"revision": _content_revision(revision_document, "published eval run")}
+    )
+    return CorpusExecutionResult.create(target=result.target, run=changed)
+
+
+def _result_with_secret_manifest_key(
+    result: CorpusExecutionResult,
+    secret: str,
+) -> CorpusExecutionResult:
+    manifest = result.target.app_manifest
+    agent = manifest.agents[0]
+    tool = ToolManifest(
+        name="credential-key-probe",
+        description="Credential-key publication regression.",
+        effect="read",
+        parallel_safe=True,
+        input_schema={secret: {"type": "string"}},
+        policy_coverage="allowed",
+        registration_provenance=agent.registration_provenance,
+        implementation_provenance=agent.implementation_provenance,
+    )
+    document = manifest.model_dump(mode="json")
+    document["agents"][0]["tools"] = [tool.model_dump(mode="json")]
+    document.pop("fingerprint")
+    canonical = json.dumps(
+        document,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    document["fingerprint"] = hashlib.sha256(canonical).hexdigest()
+    target = EvaluationTargetIdentity(
+        target_key=result.target.target_key,
+        application_release_id=result.target.application_release_id,
+        app_manifest=AppManifest.model_validate(document),
+    )
+    return CorpusExecutionResult.create(target=target, run=result.run)
+
+
+def _results_with_conflicting_corpus_contract(
+    result: CorpusExecutionResult,
+) -> tuple[CorpusExecutionResult, ...]:
+    wrong_revision = "sha256:" + "f" * 64
+    case = result.run.cases[0]
+    trial = case.trials[0]
+    assertion = trial.assertions[0]
+    contradictory_detail = assertion.detail.model_copy(
+        update={"expected": "failed", "actual": "failed"}
+    )
+    contradictory_assertion = assertion.model_copy(update={"detail": contradictory_detail})
+    contradictory_trial = trial.model_copy(
+        update={"assertions": (contradictory_assertion, *trial.assertions[1:])}
+    )
+    contradictory_case = case.model_copy(update={"trials": (contradictory_trial, *case.trials[1:])})
+    return (
+        _result_with_run_update(result, evidence_policy_revision=wrong_revision),
+        _result_with_run_update(result, pricing_profile_fingerprint=wrong_revision),
+        _result_with_run_update(
+            result,
+            cases=(
+                case.model_copy(update={"case_revision": wrong_revision}),
+                *result.run.cases[1:],
+            ),
+        ),
+        _result_with_run_update(
+            result,
+            cases=(contradictory_case, *result.run.cases[1:]),
+        ),
+    )
+
+
 def _request(corpus, *, suffix: str, concurrency: int = 1) -> EvalRunRequest:
     suite = corpus.suites[0]
     digest_character = {"a": "a", "b": "b", "c": "c"}[suffix]
@@ -78,12 +159,12 @@ async def assert_eval_store_conformance(
 
     saved = await store.save_corpus(
         corpus,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
     assert (
         await store.save_corpus(
             corpus,
-            redact_json_values=_NO_SECRETS.redact_json_values,
+            redact_json=_NO_SECRETS.redact_json,
         )
         == saved
     )
@@ -105,13 +186,13 @@ async def assert_eval_store_conformance(
     with pytest.raises(EvalStorePublicationRejected, match="configured workload secret"):
         await store.save_corpus(
             unsafe,
-            redact_json_values=SecretRedactor(secret).redact_json_values,
+            redact_json=SecretRedactor(secret).redact_json,
         )
     assert await store.load_corpus(unsafe.revision) is None
     with pytest.raises(EvalStorePublicationRejected, match="could not cross"):
         await store.save_corpus(
             corpus,
-            redact_json_values=_broken_redaction_boundary,
+            redact_json=_broken_redaction_boundary,
         )
 
     corpora = await store.list_corpora(EvalCatalogQuery(limit=1))
@@ -135,17 +216,17 @@ async def assert_eval_store_conformance(
     with pytest.raises(EvalStorePublicationRejected, match="configured workload secret"):
         await store.admit_run(
             cancel_request,
-            redact_json_values=SecretRedactor(cancel_request.run_id).redact_json_values,
+            redact_json=SecretRedactor(cancel_request.run_id).redact_json,
         )
     assert await store.load_run(cancel_request.run_id) is None
     admitted = await store.admit_run(
         cancel_request,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
     assert (
         await store.admit_run(
             cancel_request.model_copy(update={"run_id": "conformance-a-retry"}),
-            redact_json_values=_NO_SECRETS.redact_json_values,
+            redact_json=_NO_SECRETS.redact_json,
         )
         == admitted
     )
@@ -167,7 +248,7 @@ async def assert_eval_store_conformance(
         await store.publish_result(
             claim,
             result,
-            redact_json_values=_NO_SECRETS.redact_json_values,
+            redact_json=_NO_SECRETS.redact_json,
         )
     cancelled = await store.finish_cancel(claim)
     assert cancelled.status is EvalRunStatus.CANCELLED
@@ -176,7 +257,7 @@ async def assert_eval_store_conformance(
     result_request = _request(corpus, suffix="b")
     await store.admit_run(
         result_request,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
     result_claimed = await store.claim_run()
     assert result_claimed is not None
@@ -185,24 +266,36 @@ async def assert_eval_store_conformance(
         await store.publish_result(
             result_claim,
             result,
-            redact_json_values=SecretRedactor(
-                result.target.application_release_id
-            ).redact_json_values,
+            redact_json=SecretRedactor(result.target.application_release_id).redact_json,
         )
+    secret_key = "workload-secret-key-canary-ABCDEFGHIJKLMNOP"
+    with pytest.raises(EvalStorePublicationRejected, match="configured workload secret"):
+        await store.publish_result(
+            result_claim,
+            _result_with_secret_manifest_key(result, secret_key),
+            redact_json=SecretRedactor(secret_key).redact_json,
+        )
+    for conflicting_result in _results_with_conflicting_corpus_contract(result):
+        with pytest.raises(EvalRunStateConflict, match="immutable corpus suite contract"):
+            await store.publish_result(
+                result_claim,
+                conflicting_result,
+                redact_json=_NO_SECRETS.redact_json,
+            )
     still_running = await store.load_run(result_claim.run_id)
     assert still_running is not None
     assert still_running.status is EvalRunStatus.RUNNING
     completed = await store.publish_result(
         result_claim,
         result,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
     assert completed.status is EvalRunStatus.COMPLETED
     assert (
         await store.publish_result(
             result_claim,
             result,
-            redact_json_values=_NO_SECRETS.redact_json_values,
+            redact_json=_NO_SECRETS.redact_json,
         )
         == completed
     )
@@ -221,7 +314,7 @@ async def assert_eval_store_conformance(
     failure_request = _request(corpus, suffix="c")
     await store.admit_run(
         failure_request,
-        redact_json_values=_NO_SECRETS.redact_json_values,
+        redact_json=_NO_SECRETS.redact_json,
     )
     failure_claimed = await store.claim_run()
     assert failure_claimed is not None

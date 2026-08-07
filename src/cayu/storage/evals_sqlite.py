@@ -202,11 +202,11 @@ class SQLiteEvalStore(EvalStore):
         self,
         corpus: EvalCorpusDocument,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalCorpusCatalogEntry:
         corpus, document = _prepare_corpus_for_store(
             corpus,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         document_text = document.decode("utf-8")
         suites = suite_catalog_entries(corpus)
@@ -445,11 +445,11 @@ class SQLiteEvalStore(EvalStore):
         self,
         request: EvalRunRequest,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         request = _prepare_run_request_for_store(
             request,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
 
         def operation(connection: sqlite3.Connection) -> EvalRunRecord:
@@ -747,12 +747,12 @@ class SQLiteEvalStore(EvalStore):
         claim: EvalRunClaim,
         result: CorpusExecutionResult,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
         result, document = _prepare_result_for_store(
             result,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         document_text = document.decode("utf-8")
 
@@ -762,7 +762,8 @@ class SQLiteEvalStore(EvalStore):
                 now = datetime.now(UTC)
                 row = self._require_run_row(connection, claim.run_id)
                 request = _request_from_row(row)
-                validated = validate_result_for_run(request, result)
+                corpus = self._load_corpus_document(connection, request.corpus_revision)
+                validated = validate_result_for_run(request, result, corpus)
                 status = EvalRunStatus(row["status"])
                 if status is EvalRunStatus.COMPLETED:
                     existing = connection.execute(
@@ -1043,6 +1044,19 @@ class SQLiteEvalStore(EvalStore):
             (revision,),
         ).fetchone()
         return None if row is None else cls._corpus_entry_from_row(row)
+
+    @staticmethod
+    def _load_corpus_document(
+        connection: sqlite3.Connection,
+        revision: str,
+    ) -> EvalCorpusDocument:
+        row = connection.execute(
+            "SELECT document_json FROM cayu_eval_corpora WHERE revision = ?",
+            (revision,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Eval run references a missing immutable corpus.")
+        return EvalCorpusDocument.model_validate(json.loads(row["document_json"]))
 
     @staticmethod
     def _corpus_entry_from_row(row: sqlite3.Row) -> EvalCorpusCatalogEntry:

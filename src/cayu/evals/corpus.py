@@ -1090,23 +1090,34 @@ def eval_run_contract_for_corpus(
         model_type=EvalCorpusDocument,
         field_name="eval corpus",
     )
+    return _eval_run_contract_for_validated_corpus(validated, suite_id)
+
+
+def _eval_run_contract_for_validated_corpus(
+    corpus: EvalCorpusDocument,
+    suite_id: str,
+) -> EvalRunContractV1:
+    """Build a run contract from an already validated exact corpus snapshot."""
+
+    if type(corpus) is not EvalCorpusDocument:
+        raise TypeError("corpus must be an exact EvalCorpusDocument.")
     validated_suite_id = _portable_id(suite_id, "suite_id")
-    suite = next((item for item in validated.suites if item.id == validated_suite_id), None)
+    suite = next((item for item in corpus.suites if item.id == validated_suite_id), None)
     if suite is None:
         raise ValueError(f"Eval corpus does not contain suite {validated_suite_id!r}.")
-    cases = tuple(case for case in validated.cases if case.suite_id == suite.id)
+    cases = tuple(case for case in corpus.cases if case.suite_id == suite.id)
     uses_pricing = any(
         assertion.kind == "max_estimated_cost" for case in cases for assertion in case.assertions
     )
     return EvalRunContractV1(
-        corpus_revision=validated.revision,
-        target_key=validated.target_key,
+        corpus_revision=corpus.revision,
+        target_key=corpus.target_key,
         suite_id=suite.id,
         suite_revision=suite.revision,
-        evidence_policy_revision=validated.evidence_policy.revision,
+        evidence_policy_revision=corpus.evidence_policy.revision,
         pricing_profile_fingerprint=(
-            validated.pricing_profile.fingerprint
-            if uses_pricing and validated.pricing_profile is not None
+            corpus.pricing_profile.fingerprint
+            if uses_pricing and corpus.pricing_profile is not None
             else None
         ),
         trials=suite.trial_request.trials,

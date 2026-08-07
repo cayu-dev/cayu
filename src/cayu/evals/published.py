@@ -44,6 +44,7 @@ from cayu.evals.corpus import (
     _bounded_durable_text,
     _canonical_decimal_text,
     _content_revision,
+    _eval_run_contract_for_validated_corpus,
     _model_content_revision,
     _ordered_sequence_input,
     _portable_id,
@@ -777,6 +778,81 @@ def _assertion_contract(assertion: PublishedAssertionResult) -> tuple[object, ..
     else:
         static_detail = (detail.kind, detail.maximum, detail.currency)
     return assertion.assertion_id, assertion.assertion_revision, *static_detail
+
+
+def _assertion_spec_contract(spec: AssertionSpec) -> tuple[object, ...]:
+    base: tuple[object, ...] = (
+        spec.id,
+        _model_content_revision(spec, "assertion spec"),
+        spec.kind,
+    )
+    if type(spec) is RootStatusAssertionSpec:
+        return (*base, spec.expected)
+    if type(spec) is ChildStatusAssertionSpec:
+        return (*base, spec.expected, spec.min_count, spec.max_count)
+    if type(spec) in {FinalOutputEqualsAssertionSpec, FinalOutputContainsAssertionSpec}:
+        return base
+    if type(spec) is ToolCalledAssertionSpec:
+        return (*base, spec.tool_name, spec.min_count, spec.max_count)
+    if type(spec) is ToolsCalledInOrderAssertionSpec:
+        return (*base, len(spec.tool_names))
+    if isinstance(spec, (MaxToolCallsAssertionSpec, MaxModelStepsAssertionSpec)):
+        return (*base, spec.maximum)
+    if type(spec) is UsageRecordedAssertionSpec:
+        return (*base, spec.min_total_tokens)
+    if type(spec) is MaxTotalTokensAssertionSpec:
+        return (*base, spec.maximum)
+    if type(spec) is MaxEstimatedCostAssertionSpec:
+        return (*base, spec.maximum, spec.currency)
+    raise AssertionError("Unreachable portable assertion specification type.")
+
+
+def _validate_published_eval_run_for_corpus(
+    corpus: EvalCorpusDocument,
+    run: PublishedEvalRun,
+) -> PublishedEvalRun:
+    """Bind a self-consistent public result to one complete immutable corpus suite."""
+
+    if type(corpus) is not EvalCorpusDocument:
+        raise TypeError("corpus must be an exact EvalCorpusDocument.")
+    if type(run) is not PublishedEvalRun:
+        raise TypeError("run must be an exact PublishedEvalRun.")
+    expected = _eval_run_contract_for_validated_corpus(corpus, run.suite_id)
+    if (
+        run.corpus_revision,
+        run.target_key,
+        run.suite_id,
+        run.suite_revision,
+        run.evidence_policy_revision,
+        run.pricing_profile_fingerprint,
+    ) != (
+        expected.corpus_revision,
+        expected.target_key,
+        expected.suite_id,
+        expected.suite_revision,
+        expected.evidence_policy_revision,
+        expected.pricing_profile_fingerprint,
+    ):
+        raise ValueError("Published eval run identity does not match its immutable corpus suite.")
+
+    case_specs = tuple(case for case in corpus.cases if case.suite_id == run.suite_id)
+    if tuple((case.case_id, case.case_revision) for case in run.cases) != tuple(
+        (case.id, case.revision) for case in case_specs
+    ):
+        raise ValueError("Published eval run cases do not match its immutable corpus suite.")
+    for case_spec, published_case in zip(case_specs, run.cases, strict=True):
+        if len(published_case.trials) != expected.trials:
+            raise ValueError("Published eval run trial counts do not match its corpus suite.")
+        expected_assertions = tuple(_assertion_spec_contract(spec) for spec in case_spec.assertions)
+        if any(
+            tuple(_assertion_contract(assertion) for assertion in trial.assertions)
+            != expected_assertions
+            for trial in published_case.trials
+        ):
+            raise ValueError(
+                "Published eval run assertions do not match its immutable corpus cases."
+            )
+    return run
 
 
 def _validate_trial_observations(

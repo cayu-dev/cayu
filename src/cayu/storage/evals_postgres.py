@@ -164,11 +164,11 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         self,
         corpus: EvalCorpusDocument,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalCorpusCatalogEntry:
         corpus, document = _prepare_corpus_for_store(
             corpus,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         document_text = document.decode("utf-8")
         document_bytes = len(document)
@@ -402,11 +402,11 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         self,
         request: EvalRunRequest,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         request = _prepare_run_request_for_store(
             request,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -704,12 +704,12 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         claim: EvalRunClaim,
         result: CorpusExecutionResult,
         *,
-        redact_json_values: Callable[[Any], Any],
+        redact_json: Callable[[Any], Any],
     ) -> EvalRunRecord:
         claim = _exact_model(claim, EvalRunClaim, "claim")
         result, result_document = _prepare_result_for_store(
             result,
-            redact_json_values=redact_json_values,
+            redact_json=redact_json,
         )
         result_text = result_document.decode("utf-8")
         result_bytes = len(result_document)
@@ -718,7 +718,9 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
             try:
                 async with conn.cursor() as cur:
                     row = await self._require_run_row(cur, claim.run_id, for_update=True)
-                    validated = validate_result_for_run(_request_from_row(row), result)
+                    request = _request_from_row(row)
+                    corpus = await self._load_corpus_document(cur, request.corpus_revision)
+                    validated = validate_result_for_run(request, result, corpus)
                     status = EvalRunStatus(row[7])
                     if status is EvalRunStatus.COMPLETED:
                         await cur.execute(
@@ -946,10 +948,7 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
     async def _load_run_row(cur: Any, run_id: str, *, for_update: bool = False) -> Any:
         suffix = " FOR UPDATE" if for_update else ""
         await cur.execute(
-            cast(
-                "LiteralString",
-                f"SELECT {_RUN_COLUMNS} FROM cayu_eval_runs WHERE run_id = %s{suffix}",
-            ),
+            f"SELECT {_RUN_COLUMNS} FROM cayu_eval_runs WHERE run_id = %s{suffix}",
             (run_id,),
         )
         return await cur.fetchone()
@@ -1002,6 +1001,17 @@ class PostgresEvalStore(_PostgresStoreBase, EvalStore):
         )
         row = await cur.fetchone()
         return None if row is None else cls._corpus_entry_from_row(row)
+
+    @staticmethod
+    async def _load_corpus_document(cur: Any, revision: str) -> EvalCorpusDocument:
+        await cur.execute(
+            "SELECT document FROM cayu_eval_corpora WHERE revision = %s",
+            (revision,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise RuntimeError("Eval run references a missing immutable corpus.")
+        return EvalCorpusDocument.model_validate(json.loads(row[0]))
 
     @staticmethod
     def _corpus_entry_from_row(row: Any) -> EvalCorpusCatalogEntry:

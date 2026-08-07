@@ -678,9 +678,9 @@ for one embedded database; `PostgresEvalStore` supports shared multi-worker
 claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
 tests and transient SDK workflows only. SQLite and PostgreSQL require storage
 schema revision 32. Corpus saves, run admission, and result publication require
-the active application's value-redaction boundary. A configured workload secret
-or redaction failure rejects before any write; the store never retains the
-redaction function or secret registry.
+the active application's complete JSON redaction boundary. A configured workload
+secret or redaction failure rejects before any write; the store never retains
+the redaction function or secret registry.
 
 ```python
 from cayu import EvalRunFailureCode, EvalRunRequest, EvalRunStatus, SQLiteEvalStore
@@ -690,7 +690,7 @@ from cayu.storage.migrations import SchemaMode
 store = SQLiteEvalStore("cayu.db", schema_mode=SchemaMode.MIGRATE)
 await store.save_corpus(
     corpus,
-    redact_json_values=target.app.redact_json_values,
+    redact_json=target.app.redact_json,
 )
 
 request = EvalRunRequest(
@@ -704,7 +704,7 @@ request = EvalRunRequest(
 )
 await store.admit_run(
     request,
-    redact_json_values=target.app.redact_json_values,
+    redact_json=target.app.redact_json,
 )
 
 lease = await store.claim_run()
@@ -727,7 +727,7 @@ if lease is not None:
             await store.publish_result(
                 lease.claim,
                 result,
-                redact_json_values=target.app.redact_json_values,
+                redact_json=target.app.redact_json,
             )
 ```
 
