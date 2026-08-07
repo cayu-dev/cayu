@@ -2067,7 +2067,9 @@ non-`complete` decision wins. Supported decisions:
 
 - `complete`: allow normal session completion.
 - `continue`: append the returned user `Message` to the durable transcript and
-  call the model again, as long as another model step remains.
+  call the model again, as long as another model step remains. If the decision
+  is selected on the final allowed step, Cayu leaves the message unappended and
+  uses the normal resumable model-step limit interruption.
 - `interrupt`: mark the session `interrupted` with a durable
   `session.interrupted` event so the caller can resume later.
 - `fail`: fail the session through the normal `session.failed` path.

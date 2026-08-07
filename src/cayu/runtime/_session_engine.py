@@ -8854,10 +8854,20 @@ class SessionEngine:
                     if before_stop_decision is not None:
                         if before_stop_decision.action == BeforeStopAction.CONTINUE:
                             if step >= max_steps:
-                                raise RuntimeError(
-                                    "Before-stop policy requested continue, but maximum "
-                                    "model steps were reached."
-                                )
+                                async for event in self._stop_session_for_model_step_limit(
+                                    session=session,
+                                    registered_agent=registered_agent,
+                                    registered_environment=registered_environment,
+                                    environment_name=environment_name,
+                                    messages=messages,
+                                    step=step,
+                                    max_steps=max_steps,
+                                    run_started_at=run_started_at,
+                                    turn_usage_tracker=turn_usage_tracker,
+                                    active_run=active_run,
+                                ):
+                                    yield event
+                                return
                             if before_stop_decision.message is None:
                                 raise RuntimeError(
                                     "Before-stop continue decision requires a message."

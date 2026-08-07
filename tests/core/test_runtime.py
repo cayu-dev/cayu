@@ -8604,6 +8604,7 @@ def test_cayu_app_before_stop_policy_can_continue_with_durable_message():
                 agent_name="assistant",
                 session_id="sess_before_stop_continue",
                 messages=[Message.text("user", "answer")],
+                max_steps=2,
                 loop_policies=(policy,),
             ),
         )
@@ -8621,6 +8622,109 @@ def test_cayu_app_before_stop_policy_can_continue_with_durable_message():
     assert [message.role for message in transcript] == ["user", "assistant", "user", "assistant"]
     assert transcript[2].content[0].text == "Return a corrected final answer."
     assert provider.requests[1].messages[-1].content[0].text == "Return a corrected final answer."
+
+
+def test_cayu_app_before_stop_continue_at_max_steps_interrupts_and_resumes():
+    async def run():
+        store = InMemorySessionStore()
+        provider = FakeProvider(
+            [
+                [
+                    ModelStreamEvent.text_delta("draft"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("resumed final"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        policy = ContinueBeforeStopPolicy("Do not persist this at the boundary.")
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        initial_events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_before_stop_continue_at_limit",
+                messages=[Message.text("user", "answer")],
+                max_steps=1,
+                loop_policies=(policy,),
+            ),
+        )
+        interrupted_session = await store.load("sess_before_stop_continue_at_limit")
+        interrupted_transcript = await store.load_transcript("sess_before_stop_continue_at_limit")
+        resumed_events = await collect_resume_events(
+            app,
+            ResumeRequest(
+                session_id="sess_before_stop_continue_at_limit",
+                messages=[Message.text("user", "resume")],
+                max_steps=1,
+            ),
+        )
+        resumed_session = await store.load("sess_before_stop_continue_at_limit")
+        resumed_transcript = await store.load_transcript("sess_before_stop_continue_at_limit")
+        return (
+            initial_events,
+            interrupted_session,
+            interrupted_transcript,
+            resumed_events,
+            resumed_session,
+            resumed_transcript,
+            provider,
+            policy,
+        )
+
+    (
+        initial_events,
+        interrupted_session,
+        interrupted_transcript,
+        resumed_events,
+        resumed_session,
+        resumed_transcript,
+        provider,
+        policy,
+    ) = asyncio.run(run())
+
+    assert [event.type for event in initial_events] == [
+        EventType.SESSION_STARTED,
+        EventType.MODEL_STARTED,
+        EventType.MODEL_TEXT_DELTA,
+        EventType.MODEL_COMPLETED,
+        "custom.loop.before_stop.started",
+        "custom.loop.before_stop.completed",
+        "custom.loop.before_stop.selected",
+        EventType.SESSION_LIMIT_REACHED,
+        EventType.TURN_COMPLETED,
+        EventType.SESSION_INTERRUPTED,
+    ]
+    assert_model_step_limit_interruption(
+        initial_events,
+        maximum=1,
+        actual=1,
+        cumulative_model_steps=1,
+    )
+    selected = initial_events[-4]
+    assert selected.payload["scope"] == "request"
+    assert selected.payload["action"] == "continue"
+    assert policy.calls == 1
+    assert interrupted_session is not None
+    assert interrupted_session.status == SessionStatus.INTERRUPTED
+    assert [message.role for message in interrupted_transcript] == ["user", "assistant"]
+
+    assert resumed_events[0].type == EventType.SESSION_RESUMED
+    assert resumed_events[-1].type == EventType.SESSION_COMPLETED
+    assert resumed_session is not None
+    assert resumed_session.status == SessionStatus.COMPLETED
+    assert [message.role for message in resumed_transcript] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert len(provider.requests) == 2
 
 
 def test_cayu_app_before_stop_policy_can_interrupt_and_resume():
