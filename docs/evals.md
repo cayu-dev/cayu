@@ -670,6 +670,86 @@ change, or stale candidate returns a conflict and requires a fresh preview. The
 adapter stores no draft or corpus and does not run providers, tools,
 environments, hooks, or the exported eval.
 
+### Durable eval catalog and run state
+
+Use an `EvalStore` when promoted corpora, queued work, and published results
+must survive beyond the promotion request. `SQLiteEvalStore` is restart-durable
+for one embedded database; `PostgresEvalStore` supports shared multi-worker
+claims; `InMemoryEvalStore` is intentionally process-local and is suitable for
+tests and transient SDK workflows only. SQLite and PostgreSQL require storage
+schema revision 32. Corpus saves, run admission, and result publication require
+the active application's value-redaction boundary. A configured workload secret
+or redaction failure rejects before any write; the store never retains the
+redaction function or secret registry.
+
+```python
+from cayu import EvalRunFailureCode, EvalRunRequest, EvalRunStatus, SQLiteEvalStore
+from cayu.evals.execution import run_corpus_suite
+from cayu.storage.migrations import SchemaMode
+
+store = SQLiteEvalStore("cayu.db", schema_mode=SchemaMode.MIGRATE)
+await store.save_corpus(
+    corpus,
+    redact_json_values=target.app.redact_json_values,
+)
+
+request = EvalRunRequest(
+    run_id="refund-regression-2026-08-07",
+    idempotency_key="sha256:" + request_digest,
+    corpus_revision=corpus.revision,
+    target_key=corpus.target_key,
+    suite_id=corpus.suites[0].id,
+    suite_revision=corpus.suites[0].revision,
+    max_concurrency=4,
+)
+await store.admit_run(
+    request,
+    redact_json_values=target.app.redact_json_values,
+)
+
+lease = await store.claim_run()
+if lease is not None:
+    if lease.run.status is EvalRunStatus.CANCELLING:
+        await store.finish_cancel(lease.claim)
+    else:
+        try:
+            result = await run_corpus_suite(
+                target,
+                corpus,
+                lease.run.spec.suite_id,
+                max_concurrency=lease.run.spec.max_concurrency,
+            )
+        except Exception:
+            # Persist a closed diagnostic code; do not persist exception text.
+            await store.fail_run(lease.claim, EvalRunFailureCode.EXECUTION_FAILED)
+            raise
+        else:
+            await store.publish_result(
+                lease.claim,
+                result,
+                redact_json_values=target.app.redact_json_values,
+            )
+```
+
+Corpus revisions and results are immutable. Admission is idempotent, claims use
+expiring fenced epochs, cancellation intent is durable, and publication is
+atomic with terminal run state. A retry with a stale lease cannot heartbeat,
+publish, fail, cancel, or release another worker's run. Ordinary run reads never
+contain the private claim token or admission idempotency digest.
+Workers must heartbeat active claims before their lease expires, stop work when
+cancellation is requested, and release still-owned work during a controlled
+shutdown. Those execution-loop policies are deliberately outside the store.
+
+Catalog and run lists use opaque keyset cursors plus caller-controlled item and
+byte ceilings. Full corpus and result reads check their exact stored UTF-8 size
+before hydrating the document. The durable result is the bounded,
+credential-redacted `CorpusExecutionResult`; stores never retain trajectories,
+provider request payloads, credentials, executable targets, or arbitrary
+exception text. Claim APIs do not accept or persist worker labels; private,
+random claim tokens and fenced epochs provide ownership. `EvalStore` owns
+persistence and coordination only—the caller still supplies the trusted target
+and performs execution.
+
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable
 transcript order rather than scheduler event timing, so parallel tool execution

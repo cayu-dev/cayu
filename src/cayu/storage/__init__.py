@@ -73,11 +73,13 @@ __all__ = [
     "PostgresBudgetLedger",
     "PostgresEmbeddingBackfillResult",
     "PostgresEmbeddingKnowledgeStore",
+    "PostgresEvalStore",
     "PostgresEventWatcherStore",
     "PostgresKnowledgeStore",
     "PostgresSessionStore",
     "PostgresTaskStore",
     "SQLiteBudgetLedger",
+    "SQLiteEvalStore",
     "SQLiteEventWatcherStore",
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
@@ -88,15 +90,24 @@ __all__ = [
 def __getattr__(name: str):
     # Postgres stores require the optional ``postgres`` extra (psycopg). Import
     # them lazily so the base package import does not depend on psycopg.
+    if name == "SQLiteEvalStore":
+        from cayu.storage.evals_sqlite import SQLiteEvalStore
+
+        return SQLiteEvalStore
     if name in {
         "PostgresBudgetLedger",
         "PostgresEmbeddingBackfillResult",
         "PostgresEmbeddingKnowledgeStore",
+        "PostgresEvalStore",
         "PostgresEventWatcherStore",
         "PostgresKnowledgeStore",
         "PostgresSessionStore",
         "PostgresTaskStore",
     }:
+        if name == "PostgresEvalStore":
+            from cayu.storage.evals_postgres import PostgresEvalStore
+
+            return PostgresEvalStore
         from cayu.storage import postgres
 
         return getattr(postgres, name)

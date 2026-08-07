@@ -13,15 +13,15 @@ generated clients together: the server contract advances from version 4 to
 version 6, and the public application manifest and generator plan advance to
 schema version 7.
 
-The storage schema advances from revision 23 to revision 31. Revision 26 is a
+The storage schema advances from revision 23 to revision 32. Revision 26 is a
 deliberate prerelease boundary: migration rejects a populated pre-26 Cayu
 session database instead of attempting to rewrite its durable interaction
 history. Stop all older workers, take an application-consistent backup, and
 recreate populated prerelease Cayu session databases before starting rc5.
 Empty stores migrate normally. Run `cayu storage status` and
 `cayu storage migrate` against every explicitly configured SQLite or PostgreSQL
-session store and budget ledger, then confirm revision 31 with no pending
-migrations. Do not run mixed rc4/rc5 workers.
+session store, budget ledger, and eval store, then confirm revision 32 with no
+pending migrations. Do not run mixed rc4/rc5 workers.
 
 After deployment, verify `cayu version`, run `cayu check --json`, execute the
 application's test suite, and exercise a durable session through process
@@ -33,6 +33,9 @@ deployments must use one consistent public-authority alias keyring.
 - Durable interaction admission, replay, approval, model-budget settlement,
   and terminal recovery now retain bounded, attributable evidence across
   crashes and retries.
+- The eval-store contract retains immutable corpus revisions, fenced run
+  lifecycle state, cancellation intent, and safe published results. SQLite and
+  PostgreSQL are durable; the memory implementation is explicitly transient.
 - `cayu serve` and `cayu worker` provide stable entrypoints for configured
   projects, while bounded topology, workflow, usage, and event projections
   support control-plane inspection without exposing private authority.
