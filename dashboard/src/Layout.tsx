@@ -8,6 +8,7 @@ import {
   Boxes,
   CircleAlert,
   FileArchive,
+  FlaskConical,
   LayoutDashboard,
   List,
   ListTodo,
@@ -41,6 +42,12 @@ const navSections = [
         capability: DASHBOARD_ROUTE_REQUIREMENTS["/"],
       },
       { to: "/sessions", label: "Sessions", icon: List },
+      {
+        to: "/evals",
+        label: "Evals",
+        icon: FlaskConical,
+        capability: DASHBOARD_ROUTE_REQUIREMENTS["/evals"],
+      },
       {
         to: "/tasks",
         label: "Tasks",

@@ -13,6 +13,7 @@ import { CapabilityRoute } from "./components/dashboard/server-contract"
 import { Layout } from "./Layout"
 import { dashboardConfig } from "./lib/config"
 import { DASHBOARD_ROUTE_REQUIREMENTS } from "./lib/dashboard-capabilities"
+import { validateEvalsSearch } from "./lib/evals-search"
 import { parseDashboardSearch, stringifyDashboardSearch } from "./lib/search-params"
 import { validateSessionHistorySearch } from "./lib/session-history-search"
 import { validateSessionIndexSearch } from "./lib/session-index-search"
@@ -26,6 +27,7 @@ const EnvironmentsPage = lazyRouteComponent(
   () => import("./routes/environments"),
   "EnvironmentsPage",
 )
+const EvalsPage = lazyRouteComponent(() => import("./routes/evals"), "EvalsPage")
 const KnowledgePage = lazyRouteComponent(() => import("./routes/knowledge"), "KnowledgePage")
 const PendingActionsPage = lazyRouteComponent(
   () => import("./routes/pending-actions"),
@@ -80,6 +82,17 @@ const usageRoute = createRoute({
   component: () => (
     <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/usage"]} title="Usage">
       <UsagePage />
+    </CapabilityRoute>
+  ),
+})
+
+const evalsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/evals",
+  validateSearch: validateEvalsSearch,
+  component: () => (
+    <CapabilityRoute requirement={DASHBOARD_ROUTE_REQUIREMENTS["/evals"]} title="Evals">
+      <EvalsPage />
     </CapabilityRoute>
   ),
 })
@@ -174,6 +187,7 @@ const systemRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   dashboardRoute,
   sessionsRoute,
+  evalsRoute,
   usageRoute,
   tasksRoute,
   pendingActionsRoute,

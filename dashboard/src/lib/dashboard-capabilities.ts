@@ -32,6 +32,7 @@ export const DASHBOARD_ROUTE_REQUIREMENTS = {
   "/usage": { kind: "surface", surface: "usage" },
   "/knowledge": { kind: "surface", surface: "reviewed_knowledge" },
   "/artifacts": { kind: "surface", surface: "artifacts" },
+  "/evals": { kind: "surface", surface: "evals" },
   "/sessions/$sessionId/workflow": { kind: "surface", surface: "workflow" },
   "/run": { kind: "mutation", mutation: "session_execution" },
 } as const satisfies Record<string, DashboardCapabilityRequirement>

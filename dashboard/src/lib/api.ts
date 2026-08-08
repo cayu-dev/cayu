@@ -18,6 +18,16 @@ import type {
   ArtifactReadResponse,
   ArtifactsResponse,
   EnvironmentsResponse,
+  EvalCaseCatalogPage,
+  EvalComparisonResponse,
+  EvalCorpusCatalogEntry,
+  EvalCorpusCatalogPage,
+  EvalCorpusDocument,
+  EvalResultResponse,
+  EvalRunPage,
+  EvalRunRecord,
+  EvalRunStatus,
+  EvalSuiteCatalogPage,
   EvaluationPromotionDraft,
   EvaluationPromotionExportRequest,
   EvaluationPromotionPreviewResponse,
@@ -38,6 +48,10 @@ import type {
   GetUsageRollupApiUsageRollupPostResponse,
   InterruptSessionBody,
   ListArtifactsApiArtifactsGetData,
+  ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetData,
+  ListEvalCorporaApiEvalsCorporaGetData,
+  ListEvalRunsApiEvalsRunsGetData,
+  ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData,
   ListPendingActionsApiPendingActionsGetData,
   ListPendingActionsApiPendingActionsGetResponse,
   ListPendingKnowledgeApiKnowledgePendingGetData,
@@ -154,6 +168,29 @@ export type SessionInterrupt = InterruptSessionBody
 export type EvaluationPromotionPreview = EvaluationPromotionPreviewResponse
 export type EvaluationPromotionCandidateDraft = EvaluationPromotionDraft
 export type EvaluationPromotionExport = EvaluationPromotionExportRequest
+export type EvalCorpus = EvalCorpusDocument
+export type EvalCorpusEntry = EvalCorpusCatalogEntry
+export type EvalCorporaPage = EvalCorpusCatalogPage
+export type EvalSuitesPage = EvalSuiteCatalogPage
+export type EvalCasesPage = EvalCaseCatalogPage
+export type EvalRun = EvalRunRecord
+export type EvalRunsPage = EvalRunPage
+export type EvalStatus = EvalRunStatus
+export type EvalResult = EvalResultResponse
+export type EvalComparison = EvalComparisonResponse
+export type EvalCorporaQuery = NonNullable<ListEvalCorporaApiEvalsCorporaGetData["query"]>
+export type EvalSuitesQuery = NonNullable<
+  ListEvalSuitesApiEvalsCorporaCorpusRevisionSuitesGetData["query"]
+>
+export type EvalCasesQuery = NonNullable<
+  ListEvalCasesApiEvalsCorporaCorpusRevisionSuitesSuiteIdCasesGetData["query"]
+>
+export type EvalRunsQuery = NonNullable<ListEvalRunsApiEvalsRunsGetData["query"]>
+
+export type DownloadedFile = {
+  blob: Blob
+  filename: string
+}
 
 type ErrorEnvelope = {
   detail?: unknown
@@ -375,7 +412,7 @@ export async function exportEvaluationPromotion(
   sessionId: string,
   body: EvaluationPromotionExport,
   signal?: AbortSignal,
-): Promise<{ blob: Blob; filename: string }> {
+): Promise<DownloadedFile> {
   const response = await requestResponse(
     `/evals/promotion/sessions/${encodeURIComponent(sessionId)}/export`,
     {
@@ -388,6 +425,161 @@ export async function exportEvaluationPromotion(
     blob: await response.blob(),
     filename: evaluationPromotionFilename(response.headers.get("content-disposition")),
   }
+}
+
+export async function fetchEvalCorpora(
+  query: EvalCorporaQuery = {},
+  signal?: AbortSignal,
+): Promise<EvalCorporaPage> {
+  return requestJson<EvalCorporaPage>(`/evals/corpora${queryString(query)}`, { signal })
+}
+
+export async function importEvalCorpus(
+  corpus: EvalCorpus,
+  signal?: AbortSignal,
+): Promise<EvalCorpusEntry> {
+  return requestJson<EvalCorpusEntry>("/evals/corpora", {
+    method: "POST",
+    body: JSON.stringify(corpus),
+    signal,
+  })
+}
+
+export async function fetchEvalCorpus(
+  corpusRevision: string,
+  signal?: AbortSignal,
+): Promise<EvalCorpus> {
+  return requestJson<EvalCorpus>(`/evals/corpora/${encodeURIComponent(corpusRevision)}`, { signal })
+}
+
+export async function downloadEvalCorpus(
+  corpusRevision: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  return downloadFile(
+    `/evals/corpora/${encodeURIComponent(corpusRevision)}/download`,
+    "cayu-eval-corpus.json",
+    signal,
+  )
+}
+
+export async function fetchEvalSuites(
+  corpusRevision: string,
+  query: EvalSuitesQuery = {},
+  signal?: AbortSignal,
+): Promise<EvalSuitesPage> {
+  return requestJson<EvalSuitesPage>(
+    `/evals/corpora/${encodeURIComponent(corpusRevision)}/suites${queryString(query)}`,
+    { signal },
+  )
+}
+
+export async function fetchEvalCases(
+  corpusRevision: string,
+  suiteId: string,
+  query: EvalCasesQuery = {},
+  signal?: AbortSignal,
+): Promise<EvalCasesPage> {
+  return requestJson<EvalCasesPage>(
+    `/evals/corpora/${encodeURIComponent(corpusRevision)}/suites/${encodeURIComponent(suiteId)}/cases${queryString(query)}`,
+    { signal },
+  )
+}
+
+export async function fetchEvalRuns(
+  query: EvalRunsQuery = {},
+  signal?: AbortSignal,
+): Promise<EvalRunsPage> {
+  return requestJson<EvalRunsPage>(`/evals/runs${queryString(query)}`, { signal })
+}
+
+export async function createEvalRun(
+  request: { corpus_revision: string; suite_id: string; max_concurrency: number },
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<EvalRun> {
+  return requestJson<EvalRun>("/evals/runs", {
+    method: "POST",
+    headers: { "Idempotency-Key": idempotencyKey },
+    body: JSON.stringify(request),
+    signal,
+  })
+}
+
+export async function fetchEvalRun(runId: string, signal?: AbortSignal): Promise<EvalRun> {
+  return requestJson<EvalRun>(`/evals/runs/${encodeURIComponent(runId)}`, { signal })
+}
+
+export async function cancelEvalRun(runId: string, signal?: AbortSignal): Promise<EvalRun> {
+  return requestJson<EvalRun>(`/evals/runs/${encodeURIComponent(runId)}/cancel`, {
+    method: "POST",
+    signal,
+  })
+}
+
+export async function fetchEvalResult(runId: string, signal?: AbortSignal): Promise<EvalResult> {
+  return requestJson<EvalResult>(`/evals/runs/${encodeURIComponent(runId)}/result`, { signal })
+}
+
+export async function compareEvalRuns(
+  baselineRunId: string,
+  currentRunId: string,
+  signal?: AbortSignal,
+): Promise<EvalComparison> {
+  return requestJson<EvalComparison>("/evals/comparisons", {
+    method: "POST",
+    body: JSON.stringify({ baseline_run_id: baselineRunId, current_run_id: currentRunId }),
+    signal,
+  })
+}
+
+export async function downloadEvalResultJson(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  return downloadFile(
+    `/evals/runs/${encodeURIComponent(runId)}/report.json`,
+    `${safeDownloadStem(runId)}.eval-result.json`,
+    signal,
+  )
+}
+
+export async function downloadEvalResultHtml(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  return downloadFile(
+    `/evals/runs/${encodeURIComponent(runId)}/report.html`,
+    `${safeDownloadStem(runId)}.eval-report.html`,
+    signal,
+  )
+}
+
+async function downloadFile(
+  path: string,
+  fallbackFilename: string,
+  signal?: AbortSignal,
+): Promise<DownloadedFile> {
+  const response = await requestResponse(path, { signal })
+  return {
+    blob: await response.blob(),
+    filename: responseDownloadFilename(
+      response.headers.get("content-disposition"),
+      fallbackFilename,
+    ),
+  }
+}
+
+function responseDownloadFilename(contentDisposition: string | null, fallback: string): string {
+  const match = /^attachment; filename="([A-Za-z0-9][A-Za-z0-9._-]{0,191})"$/.exec(
+    contentDisposition ?? "",
+  )
+  return match?.[1] ?? fallback
+}
+
+function safeDownloadStem(value: string): string {
+  const stem = value.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 128)
+  return stem || "cayu-eval"
 }
 
 function evaluationPromotionFilename(contentDisposition: string | null): string {
