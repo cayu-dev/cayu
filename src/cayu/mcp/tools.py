@@ -18,6 +18,7 @@ from cayu.mcp.base import (
     McpSession,
     McpToolDefinition,
     McpToolResult,
+    copy_mcp_server_spec,
 )
 from cayu.mcp.http import HttpMcpClient
 from cayu.mcp.stdio import StdioMcpClient
@@ -353,14 +354,17 @@ class McpToolset:
         *,
         client: McpClient | None = None,
     ) -> McpToolset:
-        if type(server) is not McpServerSpec:
-            raise TypeError("server must be an McpServerSpec.")
-        mcp_client = client if client is not None else _default_client_for(server)
-        session = await mcp_client.connect(server)
+        authoritative_server = copy_mcp_server_spec(server)
+        mcp_client = client if client is not None else _default_client_for(authoritative_server)
+        session = await mcp_client.connect(copy_mcp_server_spec(authoritative_server))
         sanitized_error: McpProtocolError | None = None
         try:
             definitions = await session.list_tools()
-            return cls(server=server, session=session, definitions=definitions)
+            return cls(
+                server=authoritative_server,
+                session=session,
+                definitions=definitions,
+            )
         except asyncio.CancelledError:
             await _close_session_after_failed_toolset_connect(session)
             raise

@@ -47,6 +47,7 @@ from cayu.mcp._jsonrpc import (
     jsonrpc_request_payload,
     merge_jsonrpc_authority_mapping,
     resource_definition_from_payload,
+    resource_result_from_payload,
     result_from_jsonrpc_response,
     safely_redact_jsonrpc_response,
     tool_definition_from_payload,
@@ -64,6 +65,7 @@ from cayu.mcp.base import (
     McpSession,
     McpToolDefinition,
     McpToolResult,
+    copy_mcp_server_spec,
 )
 from cayu.vaults import (
     SecretRedactor,
@@ -120,8 +122,7 @@ class HttpMcpClient(McpClient):
         self.secret_resolver = secret_resolver
 
     async def connect(self, server: McpServerSpec) -> McpSession:
-        if type(server) is not McpServerSpec:
-            raise TypeError("server must be an McpServerSpec.")
+        server = copy_mcp_server_spec(server)
         if server.url is None:
             raise ValueError("HttpMcpClient requires an MCP server url.")
         if server.command is not None:
@@ -216,6 +217,7 @@ class HttpMcpSession(McpSession):
         max_list_items: int = DEFAULT_MCP_MAX_LIST_ITEMS,
         secret_redactor: SecretRedactor | None = None,
     ) -> None:
+        server = copy_mcp_server_spec(server)
         self.server = server
         self._secret_redactor = secret_redactor or SecretRedactor()
         self.client_name = client_name
@@ -246,14 +248,16 @@ class HttpMcpSession(McpSession):
         )
         if type(result) is not dict:
             raise McpProtocolError("MCP initialize result must be an object.")
-        self._initialize_result = initialize_result_from_payload(result)
+        initialize_result = initialize_result_from_payload(result)
         validation_error: McpProtocolError | None = None
         try:
-            validate_negotiated_protocol_version(self._initialize_result.protocol_version)
+            validate_negotiated_protocol_version(initialize_result.protocol_version)
         except McpProtocolError as exc:
             validation_error = McpProtocolError(self._secret_redactor.redact_text(str(exc)))
         if validation_error is not None:
-            raise validation_error
+            del initialize_result
+            raise validation_error from None
+        self._initialize_result = initialize_result
         await self._notify("notifications/initialized", {})
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
@@ -381,10 +385,7 @@ class HttpMcpSession(McpSession):
         )
         if type(result) is not dict:
             raise McpProtocolError("MCP resources/read result must be an object.")
-        contents = result.get("contents", [])
-        if not isinstance(contents, list):
-            raise McpProtocolError("MCP resources/read result contents must be a list.")
-        return McpResourceResult(contents=contents)
+        return resource_result_from_payload(result)
 
     async def close(self) -> None:
         # Run cleanup in a shielded task so the DELETE + aclose still complete even

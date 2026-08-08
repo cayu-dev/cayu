@@ -6,10 +6,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from cayu._validation import (
-    copy_json_value,
-    require_clean_nonblank,
+    copy_durable_json_object,
+    copy_durable_json_value,
     require_clean_nonblank_keys,
-    require_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+    require_durable_text,
 )
 from cayu.vaults import SecretRedactor, SecretRef, copy_secret_ref
 
@@ -17,7 +19,7 @@ from cayu.vaults import SecretRedactor, SecretRef, copy_secret_ref
 class McpServerSpec(BaseModel):
     """Configuration for an external MCP server."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     # Stable, operator-assigned identity for this logical connection. Runtime
@@ -35,7 +37,10 @@ class McpServerSpec(BaseModel):
     @field_validator("secret_env", "secret_headers", mode="before")
     @classmethod
     def validate_secret_config_keys(cls, value, info):
-        return require_clean_nonblank_keys(value, info.field_name)
+        copied = require_clean_nonblank_keys(value, info.field_name)
+        for key in copied:
+            require_durable_text(key, f"{info.field_name} key")
+        return copied
 
     @field_validator("secret_env", "secret_headers")
     @classmethod
@@ -45,7 +50,7 @@ class McpServerSpec(BaseModel):
     @field_validator("env", "headers", "metadata", mode="before")
     @classmethod
     def copy_json_config_data(cls, value, info):
-        copied = copy_json_value(value, info.field_name)
+        copied = copy_durable_json_object(value, info.field_name)
         if info.field_name in {"env", "headers"}:
             require_clean_nonblank_keys(copied, info.field_name)
         return copied
@@ -53,23 +58,23 @@ class McpServerSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("connection_id", "url")
     @classmethod
     def validate_optional_nonblank_strings(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("command")
     @classmethod
     def validate_command_items(cls, value: list[str] | None) -> list[str] | None:
         if value is None:
             return None
-        for item in value:
-            require_nonblank(item, "command")
-        return value
+        return [
+            require_durable_nonblank(item, f"command[{index}]") for index, item in enumerate(value)
+        ]
 
     @model_validator(mode="after")
     def validate_transport(self) -> McpServerSpec:
@@ -96,10 +101,18 @@ class McpServerSpec(BaseModel):
         return self
 
 
+def copy_mcp_server_spec(spec: McpServerSpec) -> McpServerSpec:
+    """Revalidate and copy a public server spec before any connection side effect."""
+
+    if type(spec) is not McpServerSpec:
+        raise TypeError("server must be an McpServerSpec.")
+    return McpServerSpec.model_validate(spec.model_dump(mode="python", warnings=False))
+
+
 class McpInitializeResult(BaseModel):
     """Server metadata returned by MCP initialize."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     protocol_version: str
     server_name: str | None = None
@@ -110,25 +123,25 @@ class McpInitializeResult(BaseModel):
     @field_validator("protocol_version")
     @classmethod
     def validate_protocol_version(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("server_name", "server_version", "instructions")
     @classmethod
     def validate_optional_strings(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("capabilities", mode="before")
     @classmethod
     def copy_capabilities(cls, value):
-        return copy_json_value(value, "capabilities")
+        return copy_durable_json_object(value, "capabilities")
 
 
 class McpToolDefinition(BaseModel):
     """Tool definition advertised by an MCP server."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     description: str = ""
@@ -138,25 +151,25 @@ class McpToolDefinition(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("description")
     @classmethod
     def validate_description(cls, value: str) -> str:
         if type(value) is not str:
             raise TypeError("description must be a string.")
-        return value
+        return require_durable_text(value, "description")
 
     @field_validator("input_schema", "annotations", mode="before")
     @classmethod
     def copy_json_data(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_object(value, info.field_name)
 
 
 class McpToolResult(BaseModel):
     """Result returned by an MCP tools/call request."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     content: list[dict[str, Any]] = Field(default_factory=list)
     structured_content: dict[str, Any] | None = None
@@ -165,13 +178,13 @@ class McpToolResult(BaseModel):
     @field_validator("content", "structured_content", mode="before")
     @classmethod
     def copy_json_data(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
 
 class McpResourceDefinition(BaseModel):
     """Resource definition advertised by an MCP server."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     uri: str
     name: str | None = None
@@ -182,32 +195,32 @@ class McpResourceDefinition(BaseModel):
     @field_validator("uri")
     @classmethod
     def validate_uri(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("name", "description", "mime_type")
     @classmethod
     def validate_optional_strings(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_nonblank(value, info.field_name)
+        return require_durable_nonblank(value, info.field_name)
 
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value):
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
 
 class McpResourceResult(BaseModel):
     """Result returned by an MCP resources/read request."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     contents: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("contents", mode="before")
     @classmethod
     def copy_contents(cls, value):
-        return copy_json_value(value, "contents")
+        return copy_durable_json_value(value, "contents")
 
 
 class McpSession(ABC):

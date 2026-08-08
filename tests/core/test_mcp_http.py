@@ -57,6 +57,8 @@ class FakeMcpHttpServer:
         bad_jsonrpc_on: str | None = None,
         raw_json_on: str | None = None,
         raw_json_document: str | None = None,
+        invalid_portable_result_on: str | None = None,
+        invalid_portable_canary: str = "",
         fold_sse: bool = False,
         paginate: bool = False,
     ) -> None:
@@ -79,6 +81,8 @@ class FakeMcpHttpServer:
         self.bad_jsonrpc_on = bad_jsonrpc_on
         self.raw_json_on = raw_json_on
         self.raw_json_document = raw_json_document
+        self.invalid_portable_result_on = invalid_portable_result_on
+        self.invalid_portable_canary = invalid_portable_canary
         self.calls: list[tuple[str, dict[str, str]]] = []  # (method, lowercased headers)
         self.initialized = False
         self.deleted = False
@@ -126,6 +130,13 @@ class FakeMcpHttpServer:
 
     def _result_for(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         params = params or {}
+        if method == self.invalid_portable_result_on:
+            invalid_text = f"{self.invalid_portable_canary}\x00"
+            if method == "tools/call":
+                return {"content": [{"type": "text", "text": invalid_text}]}
+            if method == "resources/read":
+                return {"contents": [{"text": invalid_text}]}
+            raise AssertionError(f"Unsupported invalid portable result method: {method}")
         if method == "initialize":
             result = {
                 "protocolVersion": self.protocol_version,
@@ -230,6 +241,44 @@ def test_http_json_transport_lists_and_calls_tools() -> None:
     assert resources[0].uri == "file://x"
     assert resource.contents[0]["text"] == "hi"
     assert server.initialized is True
+
+
+@pytest.mark.parametrize(
+    ("method", "error_match"),
+    [
+        ("tools/call", "tools/call result contained invalid data"),
+        ("resources/read", "resources/read result contained invalid data"),
+    ],
+)
+def test_http_invalid_result_models_raise_detached_protocol_errors(
+    method: str,
+    error_match: str,
+) -> None:
+    secret = f"mcp-http-{method}-portable-canary"
+    server = FakeMcpHttpServer(
+        invalid_portable_result_on=method,
+        invalid_portable_canary=secret,
+    )
+
+    async def run() -> McpProtocolError:
+        session = await HttpMcpClient(
+            transport=server.transport,
+            secret_resolver=StaticVault({"token": secret}),
+        ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        try:
+            with pytest.raises(McpProtocolError, match=error_match) as excinfo:
+                if method == "tools/call":
+                    await session.call_tool("search", {})
+                else:
+                    await session.read_resource("file://x")
+            return excinfo.value
+        finally:
+            await session.close()
+
+    error = asyncio.run(run())
+
+    assert server.deleted is True
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
 
 
 def test_http_sse_transport_returns_matching_response() -> None:
@@ -374,6 +423,75 @@ def test_http_invalid_initialize_envelope_does_not_retain_secret_config() -> Non
     error = asyncio.run(run())
 
     _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+def test_http_invalid_initialize_text_does_not_retain_resolved_secret() -> None:
+    secret = "mcp-http-initialize-portable-canary"
+    server = FakeMcpHttpServer(protocol_version=f"{secret}\x00")
+    vault = StaticVault({"token": secret})
+
+    async def run() -> McpProtocolError:
+        with pytest.raises(
+            McpProtocolError, match="initialize result contained invalid data"
+        ) as excinfo:
+            await HttpMcpClient(
+                transport=server.transport,
+                secret_resolver=vault,
+            ).connect(_server_spec(secret_headers={"authorization": SecretRef(name="token")}))
+        return excinfo.value
+
+    error = asyncio.run(run())
+
+    assert server.deleted is True
+    _assert_cayu_traceback_does_not_retain_secret(error, secret)
+
+
+def test_http_session_constructor_revalidates_server_before_request() -> None:
+    fake_server = FakeMcpHttpServer()
+
+    async def run() -> None:
+        http_client = httpx.AsyncClient(transport=fake_server.transport)
+        server = _server_spec()
+        server.url = "invalid-http-session\x00"
+        try:
+            with pytest.raises(ValueError):
+                HttpMcpSession(
+                    server=server,
+                    http_client=http_client,
+                    url="https://mcp.example/rpc",
+                    client_name="cayu",
+                    client_version="0.1.0",
+                )
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(run())
+
+    assert fake_server.calls == []
+
+
+def test_http_session_constructor_owns_server_snapshot() -> None:
+    async def run() -> tuple[McpServerSpec, McpServerSpec]:
+        server = _server_spec()
+        expected = server.model_copy(deep=True)
+        session = HttpMcpSession(
+            server=server,
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200))
+            ),
+            url="https://mcp.example/rpc",
+            client_name="cayu",
+            client_version="0.1.0",
+        )
+        server.name = "caller-mutated-server"
+        try:
+            return expected, session.server
+        finally:
+            await session.close()
+
+    expected, retained = asyncio.run(run())
+
+    assert retained == expected
 
 
 def test_http_sends_session_id_protocol_and_accept_headers() -> None:

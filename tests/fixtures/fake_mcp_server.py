@@ -123,21 +123,35 @@ def main() -> None:
                         "result": {result_key: items},
                     }
                 )
+            elif structural_response == "invalid_portable_result":
+                invalid_text = f"{canary}\x00"
+                if structural_method == "tools/call":
+                    result = {"content": [{"type": "text", "text": invalid_text}]}
+                elif structural_method == "resources/read":
+                    result = {"contents": [{"text": invalid_text}]}
+                else:
+                    raise ValueError(
+                        "invalid_portable_result requires tools/call or resources/read"
+                    )
+                _write({"jsonrpc": "2.0", "id": request_id, "result": result})
             else:
                 raise ValueError(
                     f"Unsupported CAYU_FAKE_MCP_STRUCTURAL_RESPONSE: {structural_response}"
                 )
             continue
         if method == "initialize":
+            protocol_version = os.environ.get(
+                "CAYU_FAKE_MCP_PROTOCOL_VERSION",
+                "2025-06-18",
+            )
+            if os.environ.get("CAYU_FAKE_MCP_INVALID_PROTOCOL_TEXT") == "1":
+                protocol_version += "\x00"
             _write(
                 {
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "result": {
-                        "protocolVersion": os.environ.get(
-                            "CAYU_FAKE_MCP_PROTOCOL_VERSION",
-                            "2025-06-18",
-                        ),
+                        "protocolVersion": protocol_version,
                         "capabilities": {
                             "tools": {},
                             "resources": {},

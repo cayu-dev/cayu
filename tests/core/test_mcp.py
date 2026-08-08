@@ -3804,6 +3804,70 @@ def test_stdio_mcp_client_rejects_unsupported_negotiated_protocol_version() -> N
         asyncio.run(StdioMcpClient().connect(spec))
 
 
+def test_stdio_session_constructor_revalidates_server_before_background_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_calls = 0
+
+    def forbidden_create_task(coroutine: Any) -> Any:
+        nonlocal task_calls
+        task_calls += 1
+        coroutine.close()
+        raise AssertionError("background tasks must not start for invalid MCP configuration")
+
+    monkeypatch.setattr(asyncio, "create_task", forbidden_create_task)
+    server = McpServerSpec(name="server", command=["server"])
+    server.command[0] = "invalid-stdio-session\x00"
+
+    with pytest.raises(ValueError):
+        StdioMcpSession(
+            server=server,
+            process=None,  # type: ignore[arg-type]
+            request_timeout_s=1.0,
+            write_timeout_s=1.0,
+            graceful_shutdown_timeout_s=1.0,
+            cancellation_notification_timeout_s=1.0,
+            client_name="cayu",
+            client_version="0.1.0",
+        )
+
+    assert task_calls == 0
+
+
+def test_stdio_session_constructor_owns_server_snapshot() -> None:
+    async def run() -> tuple[McpServerSpec, McpServerSpec, int | None]:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(_FAKE_SERVER),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        server = McpServerSpec(name="server", command=[sys.executable, str(_FAKE_SERVER)])
+        expected = server.model_copy(deep=True)
+        session = StdioMcpSession(
+            server=server,
+            process=process,
+            request_timeout_s=1.0,
+            write_timeout_s=1.0,
+            graceful_shutdown_timeout_s=1.0,
+            cancellation_notification_timeout_s=1.0,
+            client_name="cayu",
+            client_version="0.1.0",
+        )
+        server.name = "caller-mutated-server"
+        try:
+            retained = session.server
+        finally:
+            await session.close()
+        return expected, retained, process.returncode
+
+    expected, retained, returncode = asyncio.run(run())
+
+    assert retained == expected
+    assert returncode is not None
+
+
 def test_stdio_mcp_client_accepts_older_supported_protocol_version() -> None:
     spec = McpServerSpec(
         name="local-mcp",
@@ -4983,6 +5047,87 @@ def test_stdio_invalid_initialize_envelope_does_not_retain_secret_config() -> No
 
     error = asyncio.run(run())
 
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+def test_stdio_invalid_initialize_text_does_not_retain_resolved_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "mcp-stdio-initialize-portable-canary"
+    spec = McpServerSpec(
+        name="invalid-initialize-text",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={"CAYU_FAKE_MCP_INVALID_PROTOCOL_TEXT": "1"},
+        secret_env={
+            "CAYU_FAKE_MCP_PROTOCOL_VERSION": SecretRef(name="token"),
+        },
+    )
+    original_spawn = asyncio.create_subprocess_exec
+    spawned_process: asyncio.subprocess.Process | None = None
+
+    async def capture_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        nonlocal spawned_process
+        spawned_process = await original_spawn(*args, **kwargs)
+        return spawned_process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_spawn)
+
+    async def run() -> McpProtocolError:
+        with pytest.raises(
+            McpProtocolError,
+            match="initialize result contained invalid data",
+        ) as excinfo:
+            await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
+        return excinfo.value
+
+    error = asyncio.run(run())
+
+    assert spawned_process is not None
+    assert spawned_process.returncode is not None
+    _assert_mcp_traceback_does_not_retain_secret(error, secret)
+
+
+@pytest.mark.parametrize(
+    ("method", "error_match"),
+    [
+        ("tools/call", "tools/call result contained invalid data"),
+        ("resources/read", "resources/read result contained invalid data"),
+    ],
+)
+def test_stdio_invalid_result_models_raise_detached_protocol_errors(
+    method: str,
+    error_match: str,
+) -> None:
+    secret = f"mcp-stdio-{method}-portable-canary"
+    spec = McpServerSpec(
+        name="invalid-result-model",
+        command=[sys.executable, str(_FAKE_SERVER)],
+        env={
+            "CAYU_FAKE_MCP_STRUCTURAL_RESPONSE": "invalid_portable_result",
+            "CAYU_FAKE_MCP_STRUCTURAL_METHOD": method,
+        },
+        secret_env={
+            "CAYU_FAKE_MCP_STRUCTURAL_CANARY": SecretRef(name="token"),
+        },
+    )
+
+    async def run() -> tuple[McpProtocolError, int | None]:
+        session = await StdioMcpClient(secret_resolver=StaticVault({"token": secret})).connect(spec)
+        assert isinstance(session, StdioMcpSession)
+        try:
+            with pytest.raises(McpProtocolError, match=error_match) as excinfo:
+                if method == "tools/call":
+                    await session.call_tool("echo", {})
+                else:
+                    await session.read_resource("file:///hello.txt")
+            error = excinfo.value
+        finally:
+            await session.close()
+        return error, session.process.returncode
+
+    error, returncode = asyncio.run(run())
+
+    assert returncode is not None
     _assert_mcp_traceback_does_not_retain_secret(error, secret)
 
 

@@ -4831,6 +4831,17 @@ MCP is an interoperability layer, not the required custom tool model. Applicatio
 Python tools should use Cayu's native `Tool` contract. External or separately packaged
 tool servers can be connected through MCP.
 
+Public MCP server metadata, environment and header maps, tool schemas and annotations,
+resource metadata, initialize capabilities, and tool/resource result payloads satisfy Cayu's
+portable durable JSON contract at model construction. MCP server identity, URL, command,
+environment/header keys and values, secret mapping keys, definition text, and initialize text
+reject NUL and lone surrogate code points while retaining ordinary Unicode. These constructor
+boundaries take defensive copies before definitions can enter model requests or results can
+enter transcript and durable publication paths. Stdio and HTTP clients revalidate and copy a
+server specification before secret resolution, subprocess creation, or HTTP connection setup,
+so mutation after construction cannot move invalid configuration past the public boundary or
+trigger a connection side effect.
+
 The first MCP implementation supports stdio servers:
 
 - `StdioMcpClient` launches an explicit argv command and speaks newline-delimited

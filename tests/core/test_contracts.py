@@ -2419,8 +2419,11 @@ def test_mcp_server_rejects_invalid_config_maps_with_validation_error():
         def __iter__(self):
             raise RuntimeError("secret map iteration should not run")
 
-    with pytest.raises(ValidationError, match="dictionary"):
+    with pytest.raises(ValidationError) as env_error:
         McpServerSpec(name="local", command=["node"], env=None)  # type: ignore[arg-type]
+    durable_error = extract_durable_value_error(env_error.value)
+    assert durable_error is not None
+    assert durable_error.code == "invalid_json_object"
 
     with pytest.raises(ValidationError, match="dictionary"):
         McpServerSpec(
@@ -2429,12 +2432,15 @@ def test_mcp_server_rejects_invalid_config_maps_with_validation_error():
             secret_env=None,  # type: ignore[arg-type]
         )
 
-    with pytest.raises(ValidationError, match="dictionary"):
+    with pytest.raises(ValidationError) as headers_error:
         McpServerSpec(
             name="remote",
             url="https://example.com",
             headers=None,  # type: ignore[arg-type]
         )
+    durable_error = extract_durable_value_error(headers_error.value)
+    assert durable_error is not None
+    assert durable_error.code == "invalid_json_object"
 
     with pytest.raises(ValidationError, match="dictionary"):
         McpServerSpec(

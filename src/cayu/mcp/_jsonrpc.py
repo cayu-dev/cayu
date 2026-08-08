@@ -10,13 +10,14 @@ import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from cayu._exception_groups import rebuild_exception_group
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
 from cayu.mcp.base import (
     McpInitializeResult,
     McpResourceDefinition,
+    McpResourceResult,
     McpToolDefinition,
     McpToolResult,
 )
@@ -41,6 +42,8 @@ DEFAULT_MCP_CLIENT_VERSION = "0.1.0"
 DEFAULT_MCP_MAX_LIST_PAGES = 100
 DEFAULT_MCP_MAX_LIST_ITEMS = 10_000
 JSONRPC_METHOD_NOT_FOUND = -32601
+
+_ParsedMcpModel = TypeVar("_ParsedMcpModel")
 
 
 class McpProtocolError(RuntimeError):
@@ -573,7 +576,38 @@ def _safe_redacted_base_exception_args(
     return tuple(copied)
 
 
+def _consume_model_payload(
+    payload: dict[str, Any],
+    parser: Callable[[dict[str, Any]], _ParsedMcpModel],
+    *,
+    failure_message: str,
+) -> _ParsedMcpModel:
+    """Parse one transport result without retaining rejected response data."""
+
+    parsed: _ParsedMcpModel | None = None
+    parse_failed = False
+    try:
+        parsed = parser(payload)
+    except (McpProtocolError, TypeError, ValueError):
+        parse_failed = True
+    finally:
+        payload.clear()
+    if parse_failed:
+        raise McpProtocolError(failure_message) from None
+    if parsed is None:
+        raise AssertionError("MCP model parser returned no result or error.")
+    return parsed
+
+
 def initialize_result_from_payload(payload: dict[str, Any]) -> McpInitializeResult:
+    return _consume_model_payload(
+        payload,
+        _initialize_result_from_payload,
+        failure_message="MCP initialize result contained invalid data.",
+    )
+
+
+def _initialize_result_from_payload(payload: dict[str, Any]) -> McpInitializeResult:
     protocol_version = payload.get("protocolVersion")
     if not isinstance(protocol_version, str):
         raise McpProtocolError("MCP initialize protocolVersion must be a string.")
@@ -621,6 +655,14 @@ def tool_definition_from_payload(payload: object, server_name: str) -> McpToolDe
 
 
 def tool_result_from_payload(payload: dict[str, Any]) -> McpToolResult:
+    return _consume_model_payload(
+        payload,
+        _tool_result_from_payload,
+        failure_message="MCP tools/call result contained invalid data.",
+    )
+
+
+def _tool_result_from_payload(payload: dict[str, Any]) -> McpToolResult:
     content = payload.get("content", [])
     if not isinstance(content, list):
         raise McpProtocolError("MCP tool result content must be a list.")
@@ -635,6 +677,21 @@ def tool_result_from_payload(payload: dict[str, Any]) -> McpToolResult:
         structured_content=structured_content,
         is_error=is_error,
     )
+
+
+def resource_result_from_payload(payload: dict[str, Any]) -> McpResourceResult:
+    return _consume_model_payload(
+        payload,
+        _resource_result_from_payload,
+        failure_message="MCP resources/read result contained invalid data.",
+    )
+
+
+def _resource_result_from_payload(payload: dict[str, Any]) -> McpResourceResult:
+    contents = payload.get("contents", [])
+    if not isinstance(contents, list):
+        raise McpProtocolError("MCP resources/read result contents must be a list.")
+    return McpResourceResult(contents=contents)
 
 
 def resource_definition_from_payload(payload: object, server_name: str) -> McpResourceDefinition:

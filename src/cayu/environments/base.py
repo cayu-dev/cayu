@@ -15,7 +15,7 @@ from cayu._validation import (
 )
 from cayu.artifacts import ArtifactStore
 from cayu.environments.bindings import WorkspaceBinding
-from cayu.mcp import McpServerSpec
+from cayu.mcp.base import McpServerSpec, copy_mcp_server_spec
 from cayu.proxies import CredentialProxy
 from cayu.runners import Runner
 from cayu.vaults import ResolvedSecret, SecretRef, Vault, VaultError
@@ -252,12 +252,6 @@ def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
         name=spec.name,
         metadata=copy_json_value(spec.metadata, "metadata"),
     )
-
-
-def copy_mcp_server_spec(spec: McpServerSpec) -> McpServerSpec:
-    if not isinstance(spec, McpServerSpec):
-        raise TypeError("MCP server entries must be McpServerSpec instances.")
-    return type(spec).model_validate(spec.model_dump())
 
 
 def copy_workspace_instructions_input(
