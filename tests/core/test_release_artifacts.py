@@ -68,6 +68,7 @@ def _valid_wheel_names(sidecar: dict[str, bytes] | None = None) -> set[str]:
         "cayu/guides/application-anatomy.md",
         "cayu/guides/authoring.md",
         "cayu/guides/diagnostics.md",
+        "cayu/guides/providers.md",
         "cayu/guides/tool-effects.md",
         _WHEEL_DASHBOARD_SOURCE,
         *{f"cayu/server/dashboard/{name}" for name in compiled_dashboard},
@@ -209,6 +210,16 @@ def test_validate_wheel_requires_application_anatomy_guide(tmp_path: Path) -> No
     names.remove("cayu/guides/application-anatomy.md")
     _write_wheel(wheel, names)
     with pytest.raises(ValueError, match=r"missing required wheel files: .*application-anatomy"):
+        validate_wheel(wheel)
+
+
+def test_validate_wheel_requires_provider_compatibility_guide(tmp_path: Path) -> None:
+    wheel = tmp_path / "cayu.whl"
+    names = _valid_wheel_names() | {"cayu/guides/providers.md"}
+    names.remove("cayu/guides/providers.md")
+    _write_wheel(wheel, names)
+
+    with pytest.raises(ValueError, match=r"missing required wheel files: .*providers\.md"):
         validate_wheel(wheel)
 
 

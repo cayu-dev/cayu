@@ -35,6 +35,16 @@ def test_authoring_guide_is_the_canonical_cayu_map() -> None:
     assert "https://github.com/cayu-dev/cayu/blob/main/examples/README.md" in guide
 
 
+def test_readme_routes_provider_searches_to_the_canonical_compatibility_guide() -> None:
+    readme = " ".join((ROOT / "README.md").read_text(encoding="utf-8").split())
+
+    assert "Compatible Chat Completions" in readme
+    assert "cayu guide providers#compatible-chat-completions" in readme
+    assert "src/cayu/guides/providers.md#compatible-chat-completions" in readme
+    for service in ("OpenRouter", "Fireworks", "Baseten", "OpenCode Go"):
+        assert service in readme
+
+
 def test_examples_index_routes_from_simple_to_advanced_examples() -> None:
     index_path = ROOT / "examples" / "README.md"
     index = index_path.read_text(encoding="utf-8")

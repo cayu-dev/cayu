@@ -63,6 +63,7 @@ _WHEEL_REQUIRED = {
     "cayu/guides/application-anatomy.md",
     "cayu/guides/authoring.md",
     "cayu/guides/diagnostics.md",
+    "cayu/guides/providers.md",
     "cayu/guides/tool-effects.md",
     "cayu/server/dashboard/LICENSE",
     "cayu/server/dashboard/NOTICE",

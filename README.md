@@ -315,6 +315,13 @@ typed failures behind one runtime contract. Applications register providers
 explicitly and may add deterministic model-pattern routing; an arbitrary model
 name never selects a provider.
 
+Cayu focuses on OpenAI, Anthropic, Google, Bedrock, and Vertex. Compatible Chat
+Completions services such as OpenRouter, Fireworks, Baseten Model APIs, and
+OpenCode Go also work through the generic adapter even though they are not
+scaffold choices. Run `cayu guide providers#compatible-chat-completions` or use
+the [package guide](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md#compatible-chat-completions)
+for exact setup.
+
 For local development without separate OpenAI API billing, users can sign in
 with their own ChatGPT subscription:
 
@@ -425,6 +432,7 @@ Start with the document that matches the job:
 | Goal | Guide |
 | --- | --- |
 | Choose Cayu concepts and build an application, by hand or with an AI coding agent | `cayu guide authoring#cayu-map` |
+| Configure primary or compatible model services | `cayu guide providers` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/providers.md)) |
 | Classify and verify tool mutation and replay behavior | `cayu guide tool-effects` |
 | Understand factories, process roles, and lifecycle | `cayu guide anatomy` ([source](https://github.com/cayu-dev/cayu/blob/main/src/cayu/guides/application-anatomy.md)) |
 | Choose how work starts | [Triggering runs](https://github.com/cayu-dev/cayu/blob/main/docs/triggering-runs.md) |

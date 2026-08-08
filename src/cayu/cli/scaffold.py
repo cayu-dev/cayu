@@ -11,7 +11,8 @@ from pathlib import Path
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 _TEMPLATE_TOKEN_RE = re.compile(
-    r"__(?:PROJECT_NAME|AGENT_NAME|CAYU_VERSION|PROVIDER_DISPLAY|PROVIDER_LITERAL)__"
+    r"__(?:PROJECT_NAME|AGENT_NAME|CAYU_VERSION|PROVIDER_DISPLAY|PROVIDER_LITERAL|"
+    r"PROVIDER_GUIDE_POINTER)__"
 )
 
 GENERATED_IMPORTS_START = "# <cayu:generated-imports>"
@@ -349,6 +350,10 @@ path = "data/cayu.db"
 pythonpath = ["."]
 """
 
+_PROVIDER_GUIDE_POINTER = """OpenRouter, Fireworks, Baseten, OpenCode Go, and other compatible endpoints work
+through Cayu even though they are not scaffold choices. Run
+`uv run cayu guide providers#compatible-chat-completions` for exact setup."""
+
 _README = """# __PROJECT_NAME__
 
 A model-only Cayu agent scaffold. It starts with one agent, one deterministic
@@ -402,6 +407,8 @@ Provider intent is explicit. This scaffold defaults to `__PROVIDER_DISPLAY__`;
 override it with `CAYU_PROVIDER=openai`, `anthropic`, or
 `openai-subscription`. API-key variables authenticate that choice and never
 select it automatically.
+
+__PROVIDER_GUIDE_POINTER__
 
 OpenAI Platform API:
 
@@ -472,6 +479,8 @@ Use the Cayu Map to choose only the concepts the job needs:
 
 If another capability is required, use the smallest package-shipped reference
 from `uv run cayu guide references`.
+
+__PROVIDER_GUIDE_POINTER__
 
 This scaffold is for local development. Deployment is a separate task.
 
@@ -563,6 +572,7 @@ def project_files(
             "__CAYU_VERSION__": _installed_cayu_version(),
             "__PROVIDER_DISPLAY__": provider_display,
             "__PROVIDER_LITERAL__": provider_literal,
+            "__PROVIDER_GUIDE_POINTER__": _PROVIDER_GUIDE_POINTER,
         }
         return _TEMPLATE_TOKEN_RE.sub(
             lambda match: replacements[match.group(0)],

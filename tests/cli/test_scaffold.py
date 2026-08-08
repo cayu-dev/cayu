@@ -34,6 +34,7 @@ _RESERVED_TEMPLATE_TOKENS = (
     "__CAYU_VERSION__",
     "__PROVIDER_DISPLAY__",
     "__PROVIDER_LITERAL__",
+    "__PROVIDER_GUIDE_POINTER__",
 )
 
 
@@ -446,6 +447,20 @@ def test_cayu_new_emits_safe_agent_instructions_and_credential_free_proof(
     assert "Clarify users, jobs, triggers" not in instructions
     assert "cayu generate slice" not in instructions
     assert "uv run cayu generate tool TOOL_NAME --agent myproj --effect EFFECT" in instructions
+
+
+def test_cayu_new_routes_provider_questions_to_the_package_compatibility_guide(
+    tmp_path: Path,
+) -> None:
+    assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myproj"
+
+    for relative_path in ("README.md", "AGENTS.md"):
+        text = " ".join((project / relative_path).read_text(encoding="utf-8").split())
+        assert "work through Cayu even though they are not scaffold choices" in text
+        assert "uv run cayu guide providers#compatible-chat-completions" in text
+        for service in ("OpenRouter", "Fireworks", "Baseten", "OpenCode Go"):
+            assert service in text
 
 
 def test_cayu_new_uses_supported_hyphenated_project_name_for_the_agent(

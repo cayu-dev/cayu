@@ -1,78 +1,74 @@
-# Explicit provider and model selection
+# Cayu providers
 
-Provider intent must be configuration, not a guess based on which credential
-happens to be present. Credentials authenticate a selected provider.
+Cayu focuses on official OpenAI, Anthropic, Google, AWS, and Vertex AI
+endpoints. Services that expose OpenAI Chat Completions also work through
+`ChatCompletionsProvider`.
 
-A generated application accepts `CAYU_PROVIDER=openai`, `anthropic`, or
-`openai-subscription`; `cayu new --provider ...` can bake in the default.
-`CAYU_MODEL` overrides the compatible model selected with that provider. With
-no provider selection, inspection, checks, tests, and evals remain available,
-while live `run.py` execution fails with a setup message.
+Provider selection is explicit. `CAYU_PROVIDER` is only a scaffold convenience
+for `openai`, `anthropic`, and `openai-subscription`; it is not the complete Cayu
+provider surface. Credentials authenticate a provider but never select one.
 
-## OpenAI
+## Primary integrations
 
-```python
-provider = OpenAIProvider(api_key=os.environ["OPENAI_API_KEY"])
-app.register_provider(provider, default=True)
-agent = AgentSpec(name="assistant", model="gpt-5.6-luna", provider_name="openai")
-```
+| Service | Cayu provider | Setup |
+| --- | --- | --- |
+| OpenAI Platform | `OpenAIProvider()` | `OPENAI_API_KEY`; use an OpenAI model ID |
+| Anthropic API | `AnthropicProvider()` | `ANTHROPIC_API_KEY`; use an Anthropic model ID |
+| Google AI Studio | `ChatCompletionsProvider(name="google", api_key_env="GEMINI_API_KEY", base_url="https://generativelanguage.googleapis.com/v1beta/openai")` | Use a Gemini API model ID |
+| Amazon Bedrock | `BedrockProvider(region_name=...)` | Install `cayu[aws]`; use AWS credentials and a Bedrock model or inference-profile ID |
+| Anthropic on Vertex AI | `VertexProvider(project_id=..., region=...)` | Install `cayu[vertex]`; use Google credentials and a Vertex Claude model ID |
+| OpenAI subscription | `OpenAISubscriptionProvider()` | Run `cayu auth openai login`; local development and evaluation only |
 
-## Anthropic
+Google AI Studio automatically uses Gemini usage accounting. For Gemini through
+another OpenAI-compatible Vertex or gateway endpoint, pass
+`usage_dialect=UsageDialect.GEMINI` explicitly.
 
-```python
-provider = AnthropicProvider(api_key=os.environ["ANTHROPIC_API_KEY"])
-app.register_provider(provider, default=True)
-agent = AgentSpec(
-    name="assistant",
-    model="claude-sonnet-4-6",
-    provider_name="anthropic",
-)
-```
+## Compatible Chat Completions
 
-## OpenAI subscription
-
-Run `cayu auth openai login`, select `openai-subscription`, and use
-`OpenAISubscriptionProvider`. This experimental path is for the subscription
-holder's own local development and evaluation, not production or multi-user
-services.
-
-Register multiple providers under distinct names when an application truly
-routes across them. Set `AgentSpec.provider_name` for an explicit per-agent
-route, or register one provider with `default=True`. Model-pattern routing must
-resolve to exactly one provider; `cayu check` reports missing or ambiguous
-routes without calling a provider.
-
-## Gemini through an OpenAI-compatible endpoint
-
-Gemini thinking models can report visible candidate output in
-`completion_tokens` while `total_tokens` also includes hidden, billable thinking
-tokens. `ChatCompletionsProvider` automatically selects `UsageDialect.GEMINI`
-for Google's AI Studio OpenAI-compatible endpoint.
-
-Vertex AI and gateway endpoints require an explicit commercial usage contract.
-Vertex uses the same OpenAI-compatible endpoint family for Gemini and
-non-Gemini models, so its hostname alone cannot select accounting semantics
-safely:
+OpenRouter, Fireworks, Baseten Model APIs, OpenCode Go, and other compatible
+endpoints work through Cayu even though they are not scaffold choices. Register
+the generic adapter and route the agent to its name:
 
 ```python
-from cayu import ChatCompletionsProvider, UsageDialect
+from cayu import AgentSpec, CayuApp, ChatCompletionsProvider
 
 provider = ChatCompletionsProvider(
-    name="vertex-gemini",
-    api_key_env="GEMINI_API_KEY",
-    base_url=(
-        "https://us-central1-aiplatform.googleapis.com/v1/projects/"
-        "PROJECT_ID/locations/us-central1/endpoints/openapi"
-    ),
-    usage_dialect=UsageDialect.GEMINI,
+    name="fireworks",
+    api_key_env="FIREWORKS_API_KEY",
+    base_url="https://api.fireworks.ai/inference/v1",
+)
+app = CayuApp()
+app.register_provider(provider, default=True)
+app.register_agent(
+    AgentSpec(
+        name="assistant",
+        model="accounts/fireworks/models/YOUR_MODEL_ID",
+        provider_name="fireworks",
+        system_prompt="Help the user.",
+    )
 )
 ```
 
-The Gemini dialect attributes the positive difference between total tokens and
-reported prompt plus visible completion tokens to reasoning output, billing it
-once as output. Ordinary OpenAI-compatible endpoints retain
-`UsageDialect.OPENAI` and unexplained total mismatches fail closed.
+Change the provider name, base URL, API-key environment variable, and model ID
+together:
 
-Provider subclasses can continue declaring `usage_dialect` as a class
-attribute. An explicit constructor value takes precedence over that declaration
-and automatic endpoint detection.
+| Service | Base URL and credential | Model ID |
+| --- | --- | --- |
+| OpenRouter | `https://openrouter.ai/api/v1`; `OPENROUTER_API_KEY` | Provider slug such as `vendor/model` |
+| Fireworks | `https://api.fireworks.ai/inference/v1`; `FIREWORKS_API_KEY` | `accounts/fireworks/models/...` |
+| Baseten Model APIs | `https://inference.baseten.co/v1`; `BASETEN_API_KEY` | Baseten catalog model ID |
+| OpenCode Go | `https://opencode.ai/zen/go/v1`; `OPENCODE_API_KEY` | Raw API ID such as `grok-4.5`, never `opencode-go/...` |
+| Together AI | `https://api.together.ai/v1`; `TOGETHER_API_KEY` | Together catalog model ID |
+| Mistral AI | `https://api.mistral.ai/v1`; `MISTRAL_API_KEY` | Mistral catalog model ID |
+| Ollama | Commonly `http://127.0.0.1:11434/v1`; placeholder key | Pulled model name |
+| vLLM | Commonly `http://127.0.0.1:8000/v1`; server key or placeholder | Served model name |
+
+For local HTTP endpoints such as Ollama or vLLM, pass `allow_http=True`. OpenCode
+Go models span multiple protocols: use `ChatCompletionsProvider` for its Chat
+Completions models and the matching Cayu protocol adapter for its other models.
+Always use the raw API model ID.
+
+Set `AgentSpec.provider_name` when routing explicitly, or register one provider
+with `default=True`. Keep credentials out of `AgentSpec`, model IDs, and source
+files. `cayu check` reports missing or ambiguous provider routes without calling
+a provider.

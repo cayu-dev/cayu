@@ -10,7 +10,10 @@ _GUIDES = {
     "anatomy": ("application-anatomy.md", "Application lifecycle and process roles."),
     "authoring": ("authoring.md", "Concept map and the supported authoring loop."),
     "diagnostics": ("diagnostics.md", "Stable `cayu check` findings and fixes."),
-    "providers": ("providers.md", "Explicit provider and compatible model selection."),
+    "providers": (
+        "providers.md",
+        "Primary integrations and compatible Chat Completions endpoints.",
+    ),
     "references": ("references.md", "Offline references for optional capabilities."),
     "structured-output": (
         "structured-output.md",

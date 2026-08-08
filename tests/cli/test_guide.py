@@ -21,7 +21,7 @@ def test_bare_guide_lists_topics_and_help_describes_them(capsys) -> None:
     assert excinfo.value.code == 0
     help_output = capsys.readouterr().out
     assert "TOPIC[#SECTION]" in help_output
-    assert "Explicit provider and compatible model selection." in help_output
+    assert "Primary integrations and compatible Chat Completions endpoints." in help_output
 
 
 def test_guide_accepts_emitted_section_anchors(capsys) -> None:
@@ -164,7 +164,62 @@ def test_structured_output_and_provider_guides_are_credential_free_and_public(ca
     assert "outcome.structured_output.output" in structured
     assert "cayu.runtime" not in structured
 
-    assert main(["guide", "providers#anthropic"]) == 0
+    assert main(["guide", "providers#primary-integrations"]) == 0
     providers = capsys.readouterr().out
     assert "AnthropicProvider" in providers
     assert "ANTHROPIC_API_KEY" in providers
+
+
+def test_package_shipped_provider_guide_is_short_and_agent_discoverable(capsys) -> None:
+    assert main(["guide", "providers"]) == 0
+    guide = capsys.readouterr().out
+
+    assert "# Cayu providers" in guide
+    for primary_service in (
+        "OpenAI Platform",
+        "Anthropic API",
+        "Google AI Studio",
+        "Amazon Bedrock",
+        "Anthropic on Vertex AI",
+    ):
+        assert primary_service in guide
+
+    compatible_services = (
+        "OpenRouter",
+        "Fireworks",
+        "Baseten Model APIs",
+        "OpenCode Go",
+        "Together AI",
+        "Mistral AI",
+        "Google AI Studio",
+        "Ollama",
+        "vLLM",
+    )
+    for service in compatible_services:
+        assert service in guide
+
+    for configuration_value in (
+        "https://openrouter.ai/api/v1",
+        "OPENROUTER_API_KEY",
+        "https://api.fireworks.ai/inference/v1",
+        "FIREWORKS_API_KEY",
+        "https://inference.baseten.co/v1",
+        "BASETEN_API_KEY",
+        "https://opencode.ai/zen/go/v1",
+        "OPENCODE_API_KEY",
+    ):
+        assert configuration_value in guide
+
+    assert "`CAYU_PROVIDER` is only a scaffold convenience" in guide
+    assert "ChatCompletionsProvider" in guide
+    assert "AgentSpec.provider_name" in guide
+    assert "`opencode-go/...`" in guide
+    assert "authenticated live inference" not in guide
+    assert "Route/auth only" not in guide
+    assert len(guide.splitlines()) < 140
+
+    assert main(["guide", "providers#compatible-chat-completions"]) == 0
+    compatible = capsys.readouterr().out
+    assert compatible.startswith("## Compatible Chat Completions")
+    assert "OpenRouter" in compatible
+    assert "OpenCode Go" in compatible
