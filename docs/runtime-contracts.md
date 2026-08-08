@@ -3261,11 +3261,14 @@ borrows authority from a later resumed or replacement run epoch.
 
 The provider-issued operation id and stream protocol are publicly inspectable;
 the bounded durable recovery metadata is retained only in the internal event
-record. Recovery metadata is a typed provider-neutral cursor (a strict
-nonnegative signed-64-bit integer), not an arbitrary dictionary or text field.
-Provider adapters translate that cursor into API-specific continuation fields.
-Cayu rejects extra fields and all string content, so credentials, raw requests,
-response bodies, and hidden reasoning cannot be stored there.
+record. Recovery metadata has a runtime-owned monotonic cursor (a strict
+nonnegative signed-64-bit integer) and at most 4 KiB of portable opaque JSON
+owned by the adapter. Cayu never interprets provider-specific names inside that
+opaque value; the same adapter translates it into its API's continuation
+parameters. Extra top-level fields, non-portable values, oversized opaque state,
+and values or data-owned keys matching registered workload secrets are rejected.
+Adapters must not put credentials, raw requests or responses, or hidden
+reasoning in recovery metadata.
 
 When a worker disappears after `provider.operation.started` but before any
 provider output crosses a durable Cayu boundary, the next run-epoch owner may
@@ -3273,8 +3276,9 @@ retrieve that exact operation. Cayu binds the operation evidence to the active
 model-completion stage and original model attempt before invoking the adapter.
 Text, thinking, error, completion, or discarded-attempt evidence after the
 operation identity makes this path ineligible and requires manual
-reconciliation; retrieval is never used to overwrite or infer an already
-accepted partial stream.
+reconciliation unless each accepted event has the cursor contract described
+below; retrieval is never used to overwrite or infer an untracked partial
+stream.
 Queued and in-progress results remain attached to that stage and never authorize
 a replacement request. They retain their publication-eligible session state
 after a recovery poll, so a later poll can commit the same operation's terminal
@@ -3288,9 +3292,27 @@ completion event, transcript update, and usage record. Native structured-output
 decoding cannot yet resume at this boundary and fails closed to manual
 reconciliation; the provider-neutral structured-output tool path retains and
 validates its original contract. Repeated or competing recovery converges
-through the stage publication and run-epoch fences. This offline-completion path
-intentionally covers only the no-accepted-output boundary; durable partial-stream
-cursor advancement and replay deduplication are separate contracts.
+through the stage publication and run-epoch fences.
+
+For a reconnectable stream, every normalized provider event carries recovery
+metadata. Cayu accepts cursor `N + 1` only after cursor `N`; a gap, conflicting
+reuse, cross-operation state, or stale run epoch fails closed. The private
+normalized event and latest continuation state share one fenced store
+transaction. Text and readable thinking use their ordinary durable runtime
+events; tool calls and opaque thinking state use a private
+`provider.operation.progress` event until terminal publication materializes the
+assistant step. The terminal cursor rides on the atomically staged
+`model.completed` event, transcript update, and usage material.
+
+After worker loss, the new owner reconstructs assistant text, thinking state,
+and tool calls from those accepted events, calls `reconnect(...)` with the last
+committed recovery metadata, and processes only later boundaries. Providers may
+replay an inclusive boundary: an exact event at or before the committed cursor
+is acknowledged without another event, transcript part, tool call, usage entry,
+or terminal publication. A conflicting reuse or unknown regression is rejected.
+Repeated exact terminal frames converge, and competing owners are separated by
+the run-epoch and model-stage publication fences. Legacy partial output without
+recovery metadata still requires manual reconciliation.
 
 Provider-operation reconnection is distinct from Cayu boundary replay. Boundary
 replay redelivers already durable Cayu events and never proves that provider

@@ -1318,10 +1318,54 @@ def test_scripted_provider_retrieves_the_same_completed_background_operation():
         assert first == replay
         assert first.state.operation_id == connection.state.operation_id
         assert first.status is ProviderOperationStatus.COMPLETED
+        recovery_metadata = [event.recovery_metadata for event in first.events]
+        assert all(metadata is not None for metadata in recovery_metadata)
+        assert [metadata.cursor for metadata in recovery_metadata if metadata is not None] == [1, 2]
+        first_metadata = first.events[0].recovery_metadata
+        assert first_metadata is not None
+        progressed_state = connection.state.model_copy(update={"recovery_metadata": first_metadata})
+        reconnected = await adapter.reconnect(progressed_state)
+        inclusive_replay = [event async for event in reconnected.events]
+        assert reconnected.state == progressed_state
+        replay_metadata = [event.recovery_metadata for event in inclusive_replay]
+        assert [metadata.cursor for metadata in replay_metadata if metadata is not None] == [1, 2]
         assert len(provider.requests) == 1
         assert provider.background_operation_ids == (connection.state.operation_id,)
 
     asyncio.run(scenario())
+
+
+def test_scripted_provider_background_mode_runs_through_cursor_boundary():
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.text_delta("background complete"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ],
+        background=True,
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+
+    async def run():
+        return [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="agent",
+                    session_id="scripted-background-cursor-run",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        ]
+
+    events = asyncio.run(run())
+
+    assert len(provider.requests) == 1
+    assert [
+        event.payload["delta"] for event in events if event.type is EventType.MODEL_TEXT_DELTA
+    ] == ["background complete"]
+    assert sum(event.type is EventType.MODEL_COMPLETED for event in events) == 1
 
 
 def test_event_not_occurred_pass_message_reads_naturally():

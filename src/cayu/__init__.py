@@ -384,6 +384,7 @@ from cayu.mcp import (
 )
 from cayu.observability import TRACE_LEVEL, LoggingEventSink, OpenTelemetryEventSink
 from cayu.providers import (
+    PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES,
     AnthropicProvider,
     BedrockProvider,
     CacheBreakpoint,
@@ -1149,6 +1150,7 @@ __all__ = [
     "PROMOTION_CANDIDATE_MAX_BYTES",
     "PROMOTION_CANDIDATE_SCHEMA_VERSION",
     "PROMOTION_SOURCE_SCHEMA_VERSION",
+    "PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES",
     "PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID_ENV",
     "PUBLIC_AUTHORITY_ALIAS_KEYS_ENV",
     "PUBLIC_AUTHORITY_ALIAS_MAX_KEYS",

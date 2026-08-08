@@ -80,6 +80,7 @@ from cayu.providers.openai_subscription import (
     OpenAISubscriptionProvider,
 )
 from cayu.providers.operations import (
+    PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES,
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
@@ -104,6 +105,7 @@ from cayu.providers.vertex import (
 
 __all__ = [
     "DEFAULT_OPENAI_SUBSCRIPTION_BASE_URL",
+    "PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES",
     "AnthropicAPIError",
     "AnthropicContextOverflowError",
     "AnthropicError",

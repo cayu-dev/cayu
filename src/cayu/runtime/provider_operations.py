@@ -2,12 +2,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from hashlib import sha256
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from cayu._validation import require_durable_clean_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
+    require_durable_clean_nonblank,
+)
 from cayu.core.events import Event, EventType
-from cayu.providers import ProviderOperationState, ProviderOperationStatus
+from cayu.providers import (
+    ModelStreamEvent,
+    ModelStreamEventType,
+    ProviderOperationRecoveryMetadata,
+    ProviderOperationState,
+    ProviderOperationStatus,
+    copy_model_stream_event,
+)
 from cayu.providers.operations import (
     PROVIDER_OPERATION_ID_MAX_CHARS,
     PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS,
@@ -17,6 +30,7 @@ from cayu.runtime.sessions import (
     EventOrder,
     EventQuery,
     ModelCompletionStage,
+    SessionOperationPublication,
     SessionStore,
 )
 from cayu.runtime.usage import is_conversational_model_completion_payload
@@ -50,7 +64,19 @@ _RECOVERY_OUTPUT_EVENT_TYPES = (
     EventType.MODEL_ERROR,
     EventType.MODEL_COMPLETED,
     EventType.MODEL_ATTEMPT_DISCARDED,
+    EventType.PROVIDER_OPERATION_PROGRESS,
 )
+_PROVIDER_OPERATION_PROGRESS_EVENT_TYPES = (
+    EventType.MODEL_TEXT_DELTA,
+    EventType.MODEL_THINKING_DELTA,
+    EventType.MODEL_ERROR,
+    EventType.MODEL_COMPLETED,
+    EventType.PROVIDER_OPERATION_PROGRESS,
+)
+_PROVIDER_OPERATION_PROGRESS_RECORD_TYPE = "cayu.provider-operation-progress"
+_PROVIDER_OPERATION_PROGRESS_SCHEMA_VERSION = 1
+_PROVIDER_OPERATION_PROGRESS_KEY_PREFIX = "cayu.provider-operation-progress:v1:"
+_PROVIDER_OPERATION_PROGRESS_PAGE_SIZE = 1000
 
 
 class ProviderOperationInspectionStatus(StrEnum):
@@ -82,6 +108,67 @@ class ProviderOperationEvidenceError(RuntimeError):
     """Durable provider-operation evidence is malformed or contradictory."""
 
 
+class ProviderOperationProgressEnvelope(BaseModel):
+    """Runtime-private normalized provider event and its exact operation identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    state_version: Literal[1] = 1
+    operation_id: str = Field(max_length=PROVIDER_OPERATION_ID_MAX_CHARS)
+    stream_protocol: str = Field(max_length=PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS)
+    stream_event: ModelStreamEvent
+
+    @model_validator(mode="after")
+    def require_recovery_metadata(self) -> ProviderOperationProgressEnvelope:
+        if self.stream_event.recovery_metadata is None:
+            raise ValueError("Provider-operation progress requires recovery metadata.")
+        if self.stream_event.recovery_metadata.cursor is None:
+            raise ValueError("Provider-operation progress requires a monotonic cursor.")
+        return self
+
+    @property
+    def recovery_metadata(self) -> ProviderOperationRecoveryMetadata:
+        metadata = self.stream_event.recovery_metadata
+        if metadata is None:  # pragma: no cover - model validator owns this invariant
+            raise AssertionError("Validated provider progress lost recovery metadata.")
+        return metadata
+
+
+class _ProviderOperationProgressRecord(BaseModel):
+    """Bounded latest accepted provider event for one active completion stage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    record_type: Literal["cayu.provider-operation-progress"] = (
+        _PROVIDER_OPERATION_PROGRESS_RECORD_TYPE
+    )
+    schema_version: Literal[1] = _PROVIDER_OPERATION_PROGRESS_SCHEMA_VERSION
+    session_id: str
+    stage_id: str
+    model_step_id: str
+    model_attempt_id: str
+    state_version: Literal[1] = 1
+    operation_id: str = Field(max_length=PROVIDER_OPERATION_ID_MAX_CHARS)
+    stream_protocol: str = Field(max_length=PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS)
+    recovery_metadata: ProviderOperationRecoveryMetadata
+    event_id: str
+    event_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderOperationProgressCommit:
+    """One newly committed provider boundary or an exact replay of it."""
+
+    state: ProviderOperationState
+    event: Event
+    replayed: bool
+
+
+class _ProviderOperationProgressReplay(RuntimeError):
+    """Internal transaction-abort signal for an exact already-durable event."""
+
+
 @dataclass(frozen=True, slots=True)
 class RecoverableProviderOperation:
     """Exact durable operation identity bound to one active completion stage."""
@@ -96,6 +183,7 @@ class RecoverableProviderOperation:
     attempt: int
     max_attempts: int
     source_run_epoch: int
+    accepted_stream_events: tuple[ModelStreamEvent, ...] = ()
 
 
 class ProviderOperationRecoveryStatus(StrEnum):
@@ -167,6 +255,248 @@ def _completion_scope(event: Event, *, label: str) -> tuple[str, str]:
     return provider, model
 
 
+def provider_operation_progress_storage_key(stage_id: str) -> str:
+    """Return the private latest-progress key for one immutable model stage."""
+
+    stage_id = require_durable_clean_nonblank(stage_id, "stage_id")
+    return _PROVIDER_OPERATION_PROGRESS_KEY_PREFIX + sha256(stage_id.encode()).hexdigest()
+
+
+def provider_operation_progress_event_id(stage_id: str, cursor: int) -> str:
+    """Return a stable event id so inclusive provider replay has one identity."""
+
+    stage_id = require_durable_clean_nonblank(stage_id, "stage_id")
+    if type(cursor) is not int or not 0 <= cursor <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Provider-operation progress cursor is invalid.")
+    material = canonical_durable_json_bytes(
+        {"schema_version": 1, "stage_id": stage_id, "cursor": cursor},
+        "provider_operation_progress_identity",
+    )
+    return f"provider-progress:v1:{sha256(material).hexdigest()}"
+
+
+def provider_operation_progress_envelope(
+    state: ProviderOperationState,
+    stream_event: ModelStreamEvent,
+) -> ProviderOperationProgressEnvelope:
+    """Copy one normalized reconnectable event into its private durable envelope."""
+
+    if type(state) is not ProviderOperationState:
+        raise TypeError("Provider-operation progress requires ProviderOperationState.")
+    return ProviderOperationProgressEnvelope(
+        state_version=state.version,
+        operation_id=state.operation_id,
+        stream_protocol=state.stream_protocol,
+        stream_event=copy_model_stream_event(stream_event),
+    )
+
+
+def provider_operation_progress_payload(
+    state: ProviderOperationState,
+    stream_event: ModelStreamEvent,
+) -> dict[str, Any]:
+    """Return the exact internal payload attached to the corresponding runtime event."""
+
+    return provider_operation_progress_envelope(state, stream_event).model_dump(mode="json")
+
+
+def _provider_operation_progress_digest(
+    envelope: ProviderOperationProgressEnvelope,
+) -> str:
+    return sha256(
+        canonical_durable_json_bytes(
+            envelope.model_dump(mode="json"),
+            "provider_operation_progress",
+        )
+    ).hexdigest()
+
+
+def _provider_operation_progress_record(
+    *,
+    stage: ModelCompletionStage,
+    model_attempt_identity: ModelAttemptIdentity,
+    envelope: ProviderOperationProgressEnvelope,
+    event: Event,
+) -> _ProviderOperationProgressRecord:
+    return _ProviderOperationProgressRecord(
+        session_id=stage.session_id,
+        stage_id=stage.stage_id,
+        model_step_id=model_attempt_identity.model_step_id,
+        model_attempt_id=model_attempt_identity.model_attempt_id,
+        state_version=envelope.state_version,
+        operation_id=envelope.operation_id,
+        stream_protocol=envelope.stream_protocol,
+        recovery_metadata=envelope.recovery_metadata,
+        event_id=event.id,
+        event_digest=_provider_operation_progress_digest(envelope),
+    )
+
+
+def _parse_progress_envelope(event: Event) -> ProviderOperationProgressEnvelope:
+    try:
+        return ProviderOperationProgressEnvelope.model_validate(
+            event.payload.get("provider_operation_progress")
+        )
+    except (TypeError, ValueError):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation progress evidence is malformed."
+        ) from None
+
+
+async def commit_provider_operation_progress(
+    session_store: SessionStore,
+    *,
+    stage: ModelCompletionStage,
+    model_attempt_identity: ModelAttemptIdentity,
+    current_state: ProviderOperationState,
+    stream_event: ModelStreamEvent,
+    event: Event,
+    expected_run_epoch: int,
+) -> ProviderOperationProgressCommit:
+    """Atomically accept one normalized event and advance its reconnect state.
+
+    The latest state record and corresponding runtime event share the store's
+    fenced session-operation transaction. Exact inclusive replay aborts that
+    transaction before append and returns the already-durable event instead.
+    """
+
+    if type(stage) is not ModelCompletionStage:
+        raise TypeError("stage must be a ModelCompletionStage.")
+    if type(model_attempt_identity) is not ModelAttemptIdentity:
+        raise TypeError("model_attempt_identity must be a ModelAttemptIdentity.")
+    if type(current_state) is not ProviderOperationState:
+        raise TypeError("current_state must be a ProviderOperationState.")
+    if type(event) is not Event:
+        raise TypeError("event must be an Event.")
+    if event.session_id != stage.session_id:
+        raise ValueError("Provider-operation progress event belongs to another session.")
+    envelope = provider_operation_progress_envelope(current_state, stream_event)
+    expected_payload = envelope.model_dump(mode="json")
+    if event.payload.get("provider_operation_progress") != expected_payload:
+        raise ValueError("Provider-operation progress event lost its exact private envelope.")
+    cursor = envelope.recovery_metadata.cursor
+    if cursor is None:  # pragma: no cover - envelope validation owns this invariant
+        raise AssertionError("Validated provider-operation cursor disappeared.")
+    expected_event_id = provider_operation_progress_event_id(stage.stage_id, cursor)
+    if event.id != expected_event_id:
+        raise ValueError("Provider-operation progress event id is not cursor-stable.")
+
+    storage_key = provider_operation_progress_storage_key(stage.stage_id)
+    requested = _provider_operation_progress_record(
+        stage=stage,
+        model_attempt_identity=model_attempt_identity,
+        envelope=envelope,
+        event=event,
+    )
+    outcome: dict[str, _ProviderOperationProgressRecord | bool] = {}
+
+    def transform(_session, checkpoint, current_record):
+        if checkpoint is None:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation progress requires a durable session checkpoint."
+            )
+        if current_record is None:
+            current_cursor = current_state.recovery_metadata.cursor
+            current_cursor = -1 if current_cursor is None else current_cursor
+        else:
+            try:
+                current = _ProviderOperationProgressRecord.model_validate(current_record)
+            except (TypeError, ValueError):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation latest-progress evidence is malformed."
+                ) from None
+            if (
+                current.session_id != stage.session_id
+                or current.stage_id != stage.stage_id
+                or current.model_step_id != model_attempt_identity.model_step_id
+                or current.model_attempt_id != model_attempt_identity.model_attempt_id
+                or current.state_version != current_state.version
+                or current.operation_id != current_state.operation_id
+                or current.stream_protocol != current_state.stream_protocol
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation latest progress belongs to another operation."
+                )
+            current_cursor = current.recovery_metadata.cursor
+            if current_cursor is None:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation latest progress has no monotonic cursor."
+                )
+            if cursor <= current_cursor:
+                outcome["replayed"] = True
+                outcome["record"] = current
+                raise _ProviderOperationProgressReplay
+            if current_state.recovery_metadata != current.recovery_metadata:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation progress advanced from stale continuation state."
+                )
+        if cursor != current_cursor + 1:
+            raise ProviderOperationEvidenceError("Provider-operation cursor advanced with a gap.")
+        outcome["replayed"] = False
+        outcome["record"] = requested
+        return SessionOperationPublication(
+            checkpoint=checkpoint,
+            operation_records={storage_key: requested.model_dump(mode="json")},
+        )
+
+    try:
+        await session_store.publish_session_operation_guarded(
+            stage.session_id,
+            idempotency_key=storage_key,
+            operation_transform=transform,
+            commit_guard=lambda: None,
+            events=[event],
+            expected_run_epoch=expected_run_epoch,
+        )
+    except _ProviderOperationProgressReplay:
+        record = outcome.get("record")
+        if type(record) is not _ProviderOperationProgressRecord:
+            raise AssertionError("Provider-operation replay lost its durable record.") from None
+        records = await session_store.query_events(
+            EventQuery(session_id=stage.session_id, event_id=event.id, limit=2)
+        )
+        if len(records) != 1:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation replay has no unique durable event."
+            ) from None
+        historical_event = records[0].event
+        historical_digest = _provider_operation_progress_digest(
+            _parse_progress_envelope(historical_event)
+        )
+        if historical_digest != requested.event_digest:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation cursor regressed or was reused for different output."
+            ) from None
+        record_cursor = record.recovery_metadata.cursor
+        if record_cursor == cursor and (
+            record.event_id != event.id or record.event_digest != requested.event_digest
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation latest progress conflicts with its durable event."
+            ) from None
+        return ProviderOperationProgressCommit(
+            state=ProviderOperationState(
+                version=record.state_version,
+                operation_id=record.operation_id,
+                stream_protocol=record.stream_protocol,
+                recovery_metadata=record.recovery_metadata,
+            ),
+            event=historical_event,
+            replayed=True,
+        )
+
+    return ProviderOperationProgressCommit(
+        state=ProviderOperationState(
+            version=requested.state_version,
+            operation_id=requested.operation_id,
+            stream_protocol=requested.stream_protocol,
+            recovery_metadata=requested.recovery_metadata,
+        ),
+        event=event,
+        replayed=False,
+    )
+
+
 def _parse_operation_event(event: Event) -> RecoverableProviderOperation:
     try:
         _model_identity(event, label="Provider-operation recovery evidence")
@@ -226,6 +556,159 @@ def _parse_operation_event(event: Event) -> RecoverableProviderOperation:
     )
 
 
+def _progress_event_matches_stream_type(
+    event_type: EventType | str,
+    stream_type: ModelStreamEventType,
+) -> bool:
+    return (
+        (
+            event_type == EventType.MODEL_TEXT_DELTA
+            and stream_type is ModelStreamEventType.TEXT_DELTA
+        )
+        or (
+            event_type == EventType.MODEL_THINKING_DELTA
+            and stream_type is ModelStreamEventType.THINKING
+        )
+        or (event_type == EventType.MODEL_ERROR and stream_type is ModelStreamEventType.ERROR)
+        or (
+            event_type == EventType.MODEL_COMPLETED
+            and stream_type is ModelStreamEventType.COMPLETED
+        )
+        or (
+            event_type == EventType.PROVIDER_OPERATION_PROGRESS
+            and stream_type in {ModelStreamEventType.TOOL_CALL, ModelStreamEventType.THINKING}
+        )
+    )
+
+
+async def _load_accepted_provider_operation_progress(
+    session_store: SessionStore,
+    *,
+    stage: ModelCompletionStage,
+    operation: RecoverableProviderOperation,
+    after_sequence: int,
+) -> tuple[ProviderOperationState, tuple[ModelStreamEvent, ...]]:
+    accepted: list[ModelStreamEvent] = []
+    latest_sequence = after_sequence
+    initial_cursor = operation.state.recovery_metadata.cursor
+    expected_cursor: int = -1 if initial_cursor is None else initial_cursor
+    expected_model_identity = (
+        operation.interaction_id,
+        operation.step,
+        operation.attempt,
+        operation.max_attempts,
+        operation.model_attempt_identity.model_step_id,
+        operation.model_attempt_identity.model_attempt_id,
+    )
+    while True:
+        page = await session_store.query_events(
+            EventQuery(
+                session_id=stage.session_id,
+                event_types=_PROVIDER_OPERATION_PROGRESS_EVENT_TYPES,
+                after_sequence=latest_sequence,
+                order_by=EventOrder.SEQUENCE_ASC,
+                limit=_PROVIDER_OPERATION_PROGRESS_PAGE_SIZE,
+            )
+        )
+        if not page:
+            break
+        for record in page:
+            latest_sequence = record.sequence
+            event = record.event
+            if (
+                event.payload.get("model_step_id") != operation.model_attempt_identity.model_step_id
+                or event.payload.get("model_attempt_id")
+                != operation.model_attempt_identity.model_attempt_id
+            ):
+                continue
+            if (
+                _model_identity(event, label="Provider-operation progress evidence")
+                != expected_model_identity
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation progress changed its owning interaction or attempt."
+                )
+            envelope = _parse_progress_envelope(event)
+            if (
+                envelope.state_version != operation.state.version
+                or envelope.operation_id != operation.state.operation_id
+                or envelope.stream_protocol != operation.state.stream_protocol
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation progress changed operation identity."
+                )
+            if not _progress_event_matches_stream_type(event.type, envelope.stream_event.type):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation progress event type conflicts with normalized output."
+                )
+            cursor = envelope.recovery_metadata.cursor
+            if cursor is None:  # pragma: no cover - envelope validation owns this invariant
+                raise AssertionError("Validated provider progress lost its cursor.")
+            if cursor != expected_cursor + 1:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation durable progress is not monotonic and contiguous."
+                )
+            if event.id != provider_operation_progress_event_id(stage.stage_id, cursor):
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation progress event identity conflicts with its cursor."
+                )
+            expected_cursor = cursor
+            accepted.append(copy_model_stream_event(envelope.stream_event))
+        if len(page) < _PROVIDER_OPERATION_PROGRESS_PAGE_SIZE:
+            break
+
+    storage_key = provider_operation_progress_storage_key(stage.stage_id)
+    raw_latest = await session_store.load_session_operation(stage.session_id, storage_key)
+    if not accepted:
+        if raw_latest is not None:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation latest progress has no corresponding durable event."
+            )
+        return operation.state, ()
+    try:
+        latest = _ProviderOperationProgressRecord.model_validate(raw_latest)
+    except (TypeError, ValueError):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation latest-progress evidence is malformed."
+        ) from None
+    final_event = accepted[-1]
+    final_metadata = final_event.recovery_metadata
+    if final_metadata is None:  # pragma: no cover - envelope validation owns this invariant
+        raise AssertionError("Accepted provider progress lost recovery metadata.")
+    final_cursor = final_metadata.cursor
+    if final_cursor is None:  # pragma: no cover - envelope validation owns this invariant
+        raise AssertionError("Accepted provider progress lost its cursor.")
+    final_envelope = provider_operation_progress_envelope(operation.state, final_event)
+    if (
+        latest.session_id != stage.session_id
+        or latest.stage_id != stage.stage_id
+        or latest.model_step_id != operation.model_attempt_identity.model_step_id
+        or latest.model_attempt_id != operation.model_attempt_identity.model_attempt_id
+        or latest.state_version != operation.state.version
+        or latest.operation_id != operation.state.operation_id
+        or latest.stream_protocol != operation.state.stream_protocol
+        or latest.recovery_metadata != final_metadata
+        or latest.event_id != provider_operation_progress_event_id(stage.stage_id, final_cursor)
+        or latest.event_digest != _provider_operation_progress_digest(final_envelope)
+    ):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation latest progress conflicts with durable event history."
+        )
+    if final_event.type in {ModelStreamEventType.ERROR, ModelStreamEventType.COMPLETED}:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation terminal output already crossed Cayu's durable boundary."
+        )
+    return (
+        ProviderOperationState(
+            version=operation.state.version,
+            operation_id=operation.state.operation_id,
+            stream_protocol=operation.state.stream_protocol,
+            recovery_metadata=final_metadata,
+        ),
+        tuple(accepted),
+    )
+
+
 async def load_recoverable_provider_operation(
     session_store: SessionStore,
     stage: ModelCompletionStage,
@@ -254,28 +737,108 @@ async def load_recoverable_provider_operation(
         or latest.source_run_epoch != stage.source_run_epoch
     ):
         return None
+    started_records = await session_store.query_events(
+        EventQuery(
+            session_id=stage.session_id,
+            event_type=EventType.MODEL_STARTED,
+            before_sequence=records[0].sequence,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    if not started_records:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation recovery evidence has no authoritative model-started owner."
+        )
+    started_event = started_records[0].event
+    started_identity = _model_identity(
+        started_event,
+        label="Authoritative model-started evidence",
+    )
+    started_scope = _provider_scope(
+        started_event,
+        label="Authoritative model-started evidence",
+    )
+    if (
+        started_identity[-2] != stage.logical_step_id
+        or started_identity[-1] != raw_attempt_id
+        or started_scope != (raw_provider, raw_model)
+    ):
+        return None
+    operation_identity = _model_identity(
+        records[0].event,
+        label="Provider-operation recovery evidence",
+    )
+    if operation_identity != started_identity or (latest.provider, latest.model) != started_scope:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation recovery evidence does not match its authoritative "
+            "model-started owner."
+        )
     if len(records) > 1:
         prior = _parse_operation_event(records[1].event)
         if prior.model_attempt_identity == latest.model_attempt_identity:
             raise ProviderOperationEvidenceError(
                 "Active model attempt has more than one durable provider-operation identity."
             )
-    for event_type in _RECOVERY_OUTPUT_EVENT_TYPES:
-        accepted = await session_store.query_events(
+    state, accepted_stream_events = await _load_accepted_provider_operation_progress(
+        session_store,
+        stage=stage,
+        operation=latest,
+        after_sequence=records[0].sequence,
+    )
+    expected_output_identity = (
+        latest.interaction_id,
+        latest.step,
+        latest.attempt,
+        latest.max_attempts,
+        latest.model_attempt_identity.model_step_id,
+        latest.model_attempt_identity.model_attempt_id,
+    )
+    output_sequence = records[0].sequence
+    while True:
+        output_page = await session_store.query_events(
             EventQuery(
                 session_id=stage.session_id,
-                event_type=event_type,
-                after_sequence=records[0].sequence,
+                event_types=_RECOVERY_OUTPUT_EVENT_TYPES,
+                after_sequence=output_sequence,
                 order_by=EventOrder.SEQUENCE_ASC,
-                limit=1,
+                limit=_PROVIDER_OPERATION_PROGRESS_PAGE_SIZE,
             )
         )
-        if accepted:
-            raise ProviderOperationEvidenceError(
-                "Provider-operation recovery is unsafe after provider output crossed "
-                "Cayu's durable event boundary."
+        if not output_page:
+            break
+        for output_record in output_page:
+            output_sequence = output_record.sequence
+            output_event = output_record.event
+            output_identity = _model_identity(
+                output_event,
+                label="Provider-operation output evidence",
             )
-    return latest
+            if output_identity != expected_output_identity:
+                continue
+            if (
+                output_event.type == EventType.MODEL_ATTEMPT_DISCARDED
+                or output_event.payload.get("provider_operation_progress") is None
+            ):
+                raise ProviderOperationEvidenceError(
+                    "Legacy provider-operation recovery is unsafe after provider output crossed "
+                    "Cayu's durable event boundary without reconnect metadata."
+                )
+        if len(output_page) < _PROVIDER_OPERATION_PROGRESS_PAGE_SIZE:
+            break
+    return RecoverableProviderOperation(
+        interaction_id=latest.interaction_id,
+        provider=latest.provider,
+        model=latest.model,
+        model_attempt_identity=latest.model_attempt_identity,
+        state=state,
+        status=latest.status,
+        step=latest.step,
+        attempt=latest.attempt,
+        max_attempts=latest.max_attempts,
+        source_run_epoch=latest.source_run_epoch,
+        accepted_stream_events=accepted_stream_events,
+    )
 
 
 async def inspect_provider_operation(

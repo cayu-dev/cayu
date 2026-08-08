@@ -86,7 +86,14 @@ class _OfflineOperationAdapter(ProviderOperationAdapter):
         async def events() -> AsyncIterator[ModelStreamEvent]:
             if self.start_events is None:  # pragma: no cover - captured above
                 raise AssertionError("start events disappeared")
-            for event in self.start_events:
+            for cursor, event in enumerate(self.start_events, start=1):
+                if event.recovery_metadata is None:
+                    event = ModelStreamEvent.model_validate(
+                        {
+                            **event.model_dump(mode="python"),
+                            "recovery_metadata": {"cursor": cursor},
+                        }
+                    )
                 yield event
 
         return ProviderOperationConnection(

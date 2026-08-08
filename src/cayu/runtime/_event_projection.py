@@ -1389,7 +1389,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "model_attempt_id",
         "model_step_id",
         "step",
+        "provider_operation_progress",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        internal_keys={"provider_operation_progress"},
+        exact_internal_keys={"provider_operation_progress"},
     )
     policies[EventType.MODEL_TEXT_DELTA] = model_delta
     policies[EventType.MODEL_THINKING_DELTA] = model_delta
@@ -1425,6 +1428,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "operation_id",
         "provider_debug",
         "provider_name",
+        "provider_operation_progress",
         "purpose",
         "reason",
         "rejected_usage_evidence",
@@ -1458,6 +1462,8 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
             }
         ),
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        internal_keys={"provider_operation_progress"},
+        exact_internal_keys={"provider_operation_progress"},
         nested_authority_paths=_MODEL_BUDGET_SETTLEMENT_AUTHORITY_PATHS,
         untrusted_container_keys={
             "details",
@@ -1491,7 +1497,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.MODEL_ERROR] = _policy(
         *model_failure_keys,
+        "provider_operation_progress",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
+        internal_keys={"provider_operation_progress"},
+        exact_internal_keys={"provider_operation_progress"},
     )
     policies[EventType.MODEL_RETRY] = _policy(
         *model_failure_keys,
@@ -1551,6 +1560,21 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         public_authority_keys={"operation_id", "stream_protocol"},
         internal_keys={"recovery_metadata"},
         exact_internal_keys={"recovery_metadata"},
+    )
+    policies[EventType.PROVIDER_OPERATION_PROGRESS] = _policy(
+        "attempt",
+        "max_attempts",
+        "model_attempt_id",
+        "model_step_id",
+        "operation_id",
+        "provider",
+        "provider_operation_progress",
+        "step",
+        "stream_protocol",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+        internal_keys={"provider_operation_progress"},
+        exact_internal_keys={"provider_operation_progress"},
     )
     provider_operation_recovery_keys = (
         "attempt",

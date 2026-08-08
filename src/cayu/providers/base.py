@@ -19,7 +19,11 @@ from cayu._validation import (
 from cayu.core.billing import BillingIdentity
 from cayu.core.messages import Message, detach_message
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
-from cayu.providers.operations import ProviderOperationAdapter, ProviderOperationMode
+from cayu.providers.operations import (
+    ProviderOperationAdapter,
+    ProviderOperationMode,
+    ProviderOperationRecoveryMetadata,
+)
 
 _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS = frozenset(
     {
@@ -410,6 +414,16 @@ class ModelRequest(BaseModel):
         return require_durable_clean_nonblank(value, info.field_name)
 
 
+def _copy_provider_operation_recovery_metadata(
+    value: ProviderOperationRecoveryMetadata | dict[str, Any] | None,
+) -> ProviderOperationRecoveryMetadata | None:
+    if value is None:
+        return None
+    if type(value) is ProviderOperationRecoveryMetadata:
+        value = value.model_dump(mode="python")
+    return ProviderOperationRecoveryMetadata.model_validate(value)
+
+
 class ModelStreamEvent(BaseModel):
     """Provider-native stream event.
 
@@ -424,6 +438,10 @@ class ModelStreamEvent(BaseModel):
     delta: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
     completion: ModelCompletion | None = None
+    recovery_metadata: ProviderOperationRecoveryMetadata | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("payload", mode="before")
     @classmethod
@@ -454,8 +472,17 @@ class ModelStreamEvent(BaseModel):
         return self
 
     @classmethod
-    def text_delta(cls, delta: str) -> ModelStreamEvent:
-        return cls(type=ModelStreamEventType.TEXT_DELTA, delta=delta)
+    def text_delta(
+        cls,
+        delta: str,
+        *,
+        recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
+    ) -> ModelStreamEvent:
+        return cls(
+            type=ModelStreamEventType.TEXT_DELTA,
+            delta=delta,
+            recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
+        )
 
     @classmethod
     def thinking(
@@ -463,6 +490,7 @@ class ModelStreamEvent(BaseModel):
         delta: str = "",
         *,
         provider_state: dict[str, Any] | None = None,
+        recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
     ) -> ModelStreamEvent:
         """A reasoning/thinking event.
 
@@ -478,7 +506,12 @@ class ModelStreamEvent(BaseModel):
             if not isinstance(provider_state, dict):
                 raise ValueError("`provider_state` must be a dictionary.")
             payload["provider_state"] = copy_json_value(provider_state, "provider_state")
-        return cls(type=ModelStreamEventType.THINKING, delta=delta, payload=payload)
+        return cls(
+            type=ModelStreamEventType.THINKING,
+            delta=delta,
+            payload=payload,
+            recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
+        )
 
     @classmethod
     def tool_call(
@@ -487,6 +520,7 @@ class ModelStreamEvent(BaseModel):
         name: str,
         arguments: dict[str, Any],
         id: str | None = None,
+        recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
     ) -> ModelStreamEvent:
         if not isinstance(arguments, dict):
             raise ValueError("`arguments` must be a dictionary.")
@@ -496,18 +530,34 @@ class ModelStreamEvent(BaseModel):
         }
         if id is not None:
             payload["id"] = require_clean_nonblank(id, "id")
-        return cls(type=ModelStreamEventType.TOOL_CALL, payload=payload)
+        return cls(
+            type=ModelStreamEventType.TOOL_CALL,
+            payload=payload,
+            recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
+        )
 
     @classmethod
-    def completed(cls, payload: dict[str, Any] | None = None) -> ModelStreamEvent:
+    def completed(
+        cls,
+        payload: dict[str, Any] | None = None,
+        *,
+        recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
+    ) -> ModelStreamEvent:
         payload = {} if payload is None else payload
         return cls(
             type=ModelStreamEventType.COMPLETED,
             payload=payload,
+            recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
         )
 
     @classmethod
-    def error(cls, message: str, *, cause: Exception | None = None) -> ModelStreamEvent:
+    def error(
+        cls,
+        message: str,
+        *,
+        cause: Exception | None = None,
+        recovery_metadata: ProviderOperationRecoveryMetadata | dict[str, Any] | None = None,
+    ) -> ModelStreamEvent:
         """An error event; `cause` preserves typed classification in the payload.
 
         When `cause` is a `ModelProviderError`, its structured fields (provider,
@@ -531,6 +581,7 @@ class ModelStreamEvent(BaseModel):
         return cls(
             type=ModelStreamEventType.ERROR,
             payload=payload,
+            recovery_metadata=_copy_provider_operation_recovery_metadata(recovery_metadata),
         )
 
 
@@ -549,6 +600,13 @@ def copy_model_stream_event(event: ModelStreamEvent) -> ModelStreamEvent:
         delta=require_durable_text(event.delta, "delta"),
         payload=copy_durable_json_value(event.payload, "payload"),
         completion=copy_model_completion(event.completion),
+        recovery_metadata=(
+            None
+            if event.recovery_metadata is None
+            else ProviderOperationRecoveryMetadata.model_validate(
+                event.recovery_metadata.model_dump(mode="python")
+            )
+        ),
     )
 
 

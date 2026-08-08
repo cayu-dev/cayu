@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextvars import Context
 from copy import deepcopy
@@ -61,12 +62,19 @@ from cayu.core.billing import (
     copy_billing_identity,
     resolved_billing_identity,
 )
-from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
+from cayu.core.events import (
+    Event,
+    EventType,
+    copy_event,
+    event_with_runtime_generated_id,
+    event_with_runtime_payload_authority,
+)
 from cayu.core.messages import (
     FilePart,
     Message,
     MessageRole,
     ProviderStatePart,
+    ThinkingPart,
     ToolCallPart,
     ToolResultPart,
     detach_message,
@@ -87,6 +95,7 @@ from cayu.providers import (
     ProviderOperationAdapter,
     ProviderOperationConnection,
     ProviderOperationMode,
+    ProviderOperationRecoveryMetadata,
     ProviderOperationSnapshot,
     ProviderOperationStartRequest,
     ProviderOperationState,
@@ -97,11 +106,14 @@ from cayu.providers import (
     copy_model_stream_event,
     copy_provider_operation_connection,
     copy_provider_operation_snapshot,
+    copy_provider_operation_state,
     normalize_model_completion,
 )
+from cayu.providers._credential_boundary import aclosing_provider_stream
 from cayu.providers.base import copy_model_completion
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _transcript as transcript_helpers
+from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
 from cayu.runtime._completion_projection import portable_model_completion_projection
 from cayu.runtime._event_writer import RuntimeEventWriter
 from cayu.runtime._message_redaction import (
@@ -196,9 +208,14 @@ from cayu.runtime.model_steps import (
 )
 from cayu.runtime.provider_operations import (
     ProviderOperationEvidenceError,
+    ProviderOperationProgressCommit,
+    ProviderOperationProgressEnvelope,
     ProviderOperationRecoveryResult,
     ProviderOperationRecoveryStatus,
     RecoverableProviderOperation,
+    commit_provider_operation_progress,
+    provider_operation_progress_envelope,
+    provider_operation_progress_event_id,
 )
 from cayu.runtime.request_footprints import (
     PromptContributionManifest,
@@ -264,6 +281,29 @@ MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS = 32
 _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES = 512
 _MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS = 128
 _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES = 256
+
+
+def _provider_operation_progress_contains_secret(
+    envelope: ProviderOperationProgressEnvelope,
+    *,
+    redactor: SecretRedactor,
+) -> bool:
+    """Check adapter-owned continuation and output without scanning schema keys."""
+
+    stream_event = envelope.stream_event
+    return (
+        redactor.redact_text(stream_event.delta) != stream_event.delta
+        or durable_value_contains_secret(
+            stream_event.payload,
+            redactor=redactor,
+            path=("provider_operation_stream_payload",),
+        )
+        or durable_value_contains_secret(
+            envelope.recovery_metadata.opaque,
+            redactor=redactor,
+            path=("provider_operation_recovery_opaque",),
+        )
+    )
 
 
 class ModelCompletionRecoveryContext(BaseModel):
@@ -416,7 +456,7 @@ async def _cancel_provider_operation_after_definite_absence(
     cancellation: asyncio.CancelledError | None = None,
 ) -> tuple[asyncio.CancelledError | None, ProviderOperationSnapshot | None]:
     async def cancel():
-        return await adapter.cancel(state)
+        return await adapter.cancel(copy_provider_operation_state(state))
 
     cleanup_task = asyncio.create_task(cancel())
     outcome = await await_shielded_task_outcome(
@@ -1095,7 +1135,7 @@ def _combine_post_completion_failures(
     if current is None or current is subsequent:
         return subsequent
     return BaseExceptionGroup(
-        "Model provider iteration and iterator cleanup both failed after completion.",
+        "Model completion encountered multiple terminal failures.",
         [current, subsequent],
     )
 
@@ -1113,6 +1153,13 @@ class _ModelStreamBoundaryValue:
     accounting_usage_metrics: dict[str, Any] | None = None
     accounting_usage_rejected: bool = False
     usage_normalization_failed: bool = False
+
+
+@dataclass(frozen=True)
+class _AssistantStreamBoundaryValue:
+    event: ModelStreamEvent
+    tool_call: runtime_records.ToolCallRequest | None = None
+    tool_call_part: ToolCallPart | None = None
 
 
 @dataclass(frozen=True)
@@ -1410,6 +1457,133 @@ class ModelStepExecutor:
 
         task.add_done_callback(settled)
 
+    def _provider_operation_progress_event(
+        self,
+        *,
+        stage: ModelCompletionStage,
+        state: ProviderOperationState,
+        stream_event: ModelStreamEvent,
+        runtime_event: Event | None,
+        session: Session,
+        interaction_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+        model_attempt_identity: ModelAttemptIdentity,
+    ) -> Event:
+        """Attach private reconnect state to its corresponding normalized event."""
+
+        metadata = stream_event.recovery_metadata
+        if metadata is None or metadata.cursor is None:
+            raise ProviderOperationEvidenceError(
+                "Reconnectable provider events must carry a monotonic recovery cursor."
+            )
+        event_id = provider_operation_progress_event_id(stage.stage_id, metadata.cursor)
+        progress_envelope = provider_operation_progress_envelope(state, stream_event)
+        if _provider_operation_progress_contains_secret(
+            progress_envelope,
+            redactor=self._secret_redactor,
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation recovery metadata or normalized output contains a "
+                "workload secret and cannot cross the durable recovery boundary."
+            )
+        envelope = progress_envelope.model_dump(mode="json")
+        if runtime_event is None:
+            event = _event_with_model_identity_authority(
+                Event(
+                    id=event_id,
+                    type=EventType.PROVIDER_OPERATION_PROGRESS,
+                    session_id=session.id,
+                    interaction_id=interaction_id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "provider": registered_provider.name,
+                        "step": step,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        **model_attempt_identity.payload(),
+                        "operation_id": state.operation_id,
+                        "stream_protocol": state.stream_protocol,
+                        "provider_operation_progress": envelope,
+                    },
+                ),
+                model_attempt_identity,
+            )
+            event = event_with_runtime_payload_authority(
+                event,
+                "operation_id",
+                "stream_protocol",
+            )
+        else:
+            event = copy_event(runtime_event)
+            if event.interaction_id not in {None, interaction_id}:
+                raise ProviderOperationEvidenceError(
+                    "Provider-operation progress changed its owning interaction."
+                )
+            payload = copy_durable_json_object(event.payload, "event.payload")
+            payload["provider_operation_progress"] = envelope
+            event = event.model_copy(
+                update={
+                    "id": event_id,
+                    "interaction_id": interaction_id,
+                    "payload": payload,
+                },
+                deep=True,
+            )
+        return event_with_runtime_generated_id(event)
+
+    async def _commit_provider_operation_stream_event(
+        self,
+        *,
+        stage: ModelCompletionStage,
+        state: ProviderOperationState,
+        stream_event: ModelStreamEvent,
+        runtime_event: Event | None,
+        session: Session,
+        interaction_id: str,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+        model_attempt_identity: ModelAttemptIdentity,
+    ) -> tuple[ProviderOperationProgressCommit, Event | None]:
+        event = self._provider_operation_progress_event(
+            stage=stage,
+            state=state,
+            stream_event=stream_event,
+            runtime_event=runtime_event,
+            session=session,
+            interaction_id=interaction_id,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=environment_name,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            model_attempt_identity=model_attempt_identity,
+        )
+        prepared = self._event_writer.prepare(event)
+        commit = await commit_provider_operation_progress(
+            self._session_store,
+            stage=stage,
+            model_attempt_identity=model_attempt_identity,
+            current_state=state,
+            stream_event=stream_event,
+            event=prepared,
+            expected_run_epoch=session.run_epoch,
+        )
+        if commit.replayed:
+            return commit, None
+        [emitted] = await self._event_writer.fan_out_persisted([commit.event])
+        return commit, emitted
+
     async def recover_provider_operation(
         self,
         *,
@@ -1438,6 +1612,8 @@ class ModelStepExecutor:
             )
         if operation.provider != registered_provider.name:
             raise RuntimeError("Provider-operation recovery resolved a different provider.")
+        if operation.model != session.model:
+            raise RuntimeError("Provider-operation recovery resolved a different model.")
         if operation.model_attempt_identity.model_step_id != stage.logical_step_id:
             raise RuntimeError("Provider-operation recovery belongs to a different model stage.")
         if (
@@ -1452,6 +1628,20 @@ class ModelStepExecutor:
         ):
             raise ProviderOperationEvidenceError(
                 "Offline recovery of native structured output requires manual reconciliation."
+            )
+        if durable_value_contains_secret(
+            operation.state.recovery_metadata.opaque,
+            redactor=self._secret_redactor,
+            path=("provider_operation_recovery_opaque",),
+        ) or any(
+            _provider_operation_progress_contains_secret(
+                provider_operation_progress_envelope(operation.state, accepted_event),
+                redactor=self._secret_redactor,
+            )
+            for accepted_event in operation.accepted_stream_events
+        ):
+            raise ProviderOperationEvidenceError(
+                "Stored provider-operation recovery state conflicts with a current workload secret."
             )
 
         async def require_recovery_owner() -> None:
@@ -1510,31 +1700,6 @@ class ModelStepExecutor:
                 status=operation.status.value,
             )
         )
-        await require_recovery_owner()
-        snapshot = copy_provider_operation_snapshot(await adapter.retrieve(operation.state))
-        if snapshot.state != operation.state:
-            raise RuntimeError("Provider operation retrieval returned a different identity.")
-        await require_recovery_owner()
-        if snapshot.status in {
-            ProviderOperationStatus.QUEUED,
-            ProviderOperationStatus.IN_PROGRESS,
-        }:
-            rescheduled = await self._event_writer.emit(
-                recovery_event(
-                    EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
-                    status=snapshot.status.value,
-                )
-            )
-            return ProviderOperationRecoveryResult(
-                status=ProviderOperationRecoveryStatus.PENDING,
-                events=(scheduled, started, rescheduled),
-            )
-        if snapshot.status is not ProviderOperationStatus.COMPLETED:
-            raise RuntimeError(
-                "Provider operation cannot be recovered automatically from terminal status: "
-                f"{snapshot.status.value}."
-            )
-
         assistant_parts: list[
             transcript_helpers.AssistantTextPart
             | transcript_helpers.AssistantThinkingPart
@@ -1543,8 +1708,53 @@ class ModelStepExecutor:
         tool_calls: list[runtime_records.ToolCallRequest] = []
         completed_boundary = None
         completed_event: ModelStreamEvent | None = None
-        for raw_event in snapshot.events:
+        completion_diagnostics: dict[str, Any] = {}
+        terminal_progress_verified = False
+        current_state = operation.state
+        recovered_events: list[Event] = [scheduled, started]
+        recovery_task = asyncio.current_task()
+        recovery_cancellation_baseline = 0 if recovery_task is None else recovery_task.cancelling()
+        post_completion_failure: BaseException | None = None
+
+        async def pending_recovery_result(
+            status: ProviderOperationStatus,
+        ) -> ProviderOperationRecoveryResult:
+            await require_recovery_owner()
+            rescheduled = await self._event_writer.emit(
+                recovery_event(
+                    EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+                    status=status.value,
+                )
+            )
+            recovered_events.append(rescheduled)
+            return ProviderOperationRecoveryResult(
+                status=ProviderOperationRecoveryStatus.PENDING,
+                events=tuple(recovered_events),
+            )
+
+        def retain_post_completion_failure(failure: BaseException) -> None:
+            nonlocal post_completion_failure
+            post_completion_failure = _combine_post_completion_failures(
+                post_completion_failure,
+                failure,
+            )
+
+        async def accept_recovered_event(
+            raw_event: object,
+            *,
+            persist_progress: bool,
+        ) -> None:
+            nonlocal completed_boundary, completed_event, completion_diagnostics
+            nonlocal current_state, terminal_progress_verified
             if completed_event is not None:
+                candidate = _validate_stream_event(
+                    raw_event,
+                    provider_name=registered_provider.name,
+                    requested_model=session.model,
+                    usage_dialect=registered_provider.usage_dialect,
+                ).event
+                if candidate == completed_event:
+                    return
                 raise RuntimeError("Recovered provider operation emitted output after completion.")
             boundary = _validate_stream_event(
                 raw_event,
@@ -1552,18 +1762,85 @@ class ModelStepExecutor:
                 requested_model=session.model,
                 usage_dialect=registered_provider.usage_dialect,
             )
-            stream_event = boundary.event
+            assistant_boundary = _validate_assistant_stream_event(
+                boundary.event,
+                generated_tool_call_id=_provider_operation_generated_tool_call_id(
+                    stage,
+                    boundary.event,
+                ),
+            )
+            stream_event = assistant_boundary.event
+            if (
+                stream_event.type
+                in {
+                    ModelStreamEventType.THINKING,
+                    ModelStreamEventType.TOOL_CALL,
+                }
+                and recovery_context is None
+            ):
+                kind = (
+                    "thinking transcript policy"
+                    if (stream_event.type is ModelStreamEventType.THINKING)
+                    else "a tool continuation"
+                )
+                raise ProviderOperationEvidenceError(
+                    f"Legacy provider-operation evidence cannot safely reconstruct {kind}."
+                )
+            recovered_provider_error = (
+                model_provider_error_from_payload(
+                    stream_event.payload,
+                    fallback_provider=registered_provider.name,
+                )
+                if stream_event.type is ModelStreamEventType.ERROR
+                else None
+            )
+            if persist_progress and stream_event.type is not ModelStreamEventType.COMPLETED:
+                runtime_event = None
+                if stream_event.type in {
+                    ModelStreamEventType.TEXT_DELTA,
+                    ModelStreamEventType.ERROR,
+                } or (
+                    stream_event.type is ModelStreamEventType.THINKING and bool(stream_event.delta)
+                ):
+                    runtime_event = _model_stream_event_to_runtime_event(
+                        stream_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        provider_name=registered_provider.name,
+                        step=operation.step,
+                        attempt=operation.attempt,
+                        max_attempts=operation.max_attempts,
+                        model_attempt_identity=operation.model_attempt_identity,
+                        usage_dialect=registered_provider.usage_dialect,
+                    )
+                progress, emitted = await self._commit_provider_operation_stream_event(
+                    stage=stage,
+                    state=current_state,
+                    stream_event=stream_event,
+                    runtime_event=runtime_event,
+                    session=session,
+                    interaction_id=operation.interaction_id,
+                    registered_agent=registered_agent,
+                    registered_provider=registered_provider,
+                    environment_name=environment_name,
+                    step=operation.step,
+                    attempt=operation.attempt,
+                    max_attempts=operation.max_attempts,
+                    model_attempt_identity=operation.model_attempt_identity,
+                )
+                current_state = progress.state
+                if progress.replayed:
+                    return
+                if emitted is not None:
+                    recovered_events.append(emitted)
             if stream_event.type is ModelStreamEventType.TEXT_DELTA:
                 transcript_helpers.append_assistant_text_delta(
                     assistant_parts,
                     stream_event.delta,
                 )
             elif stream_event.type is ModelStreamEventType.THINKING:
-                if recovery_context is None:
-                    raise ProviderOperationEvidenceError(
-                        "Legacy provider-operation evidence cannot safely reconstruct thinking "
-                        "transcript policy."
-                    )
+                assert recovery_context is not None
                 transcript_helpers.append_assistant_thinking_delta(
                     assistant_parts,
                     stream_event.delta,
@@ -1575,57 +1852,212 @@ class ModelStepExecutor:
                     ),
                 )
             elif stream_event.type is ModelStreamEventType.TOOL_CALL:
-                if recovery_context is None:
-                    raise ProviderOperationEvidenceError(
-                        "Legacy provider-operation evidence cannot safely reconstruct a tool "
-                        "continuation."
-                    )
-                tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
+                assert recovery_context is not None
+                tool_call = assistant_boundary.tool_call
+                tool_call_part = assistant_boundary.tool_call_part
+                if tool_call is None or tool_call_part is None:  # pragma: no cover - helper owns it
+                    raise AssertionError("Validated tool-call projection disappeared.")
                 tool_calls.append(tool_call)
-                assistant_parts.append(transcript_helpers.tool_call_part(tool_call))
+                assistant_parts.append(tool_call_part)
             elif stream_event.type is ModelStreamEventType.ERROR:
-                provider_error = model_provider_error_from_payload(
-                    stream_event.payload,
-                    fallback_provider=registered_provider.name,
+                raise recovered_provider_error or RuntimeError(
+                    "Recovered provider operation failed."
                 )
-                raise provider_error or RuntimeError("Recovered provider operation failed.")
             elif stream_event.type is ModelStreamEventType.COMPLETED:
+                completed_boundary = boundary
+                completed_event = stream_event
+                if persist_progress:
+                    envelope = provider_operation_progress_envelope(
+                        current_state,
+                        stream_event,
+                    )
+                    if _provider_operation_progress_contains_secret(
+                        envelope,
+                        redactor=self._secret_redactor,
+                    ):
+                        retain_post_completion_failure(
+                            ProviderOperationEvidenceError(
+                                "Provider-operation terminal recovery state contains a workload "
+                                "secret."
+                            )
+                        )
+                    else:
+                        terminal_cursor = envelope.recovery_metadata.cursor
+                        current_cursor = current_state.recovery_metadata.cursor
+                        current_cursor = -1 if current_cursor is None else current_cursor
+                        if terminal_cursor != current_cursor + 1:
+                            retain_post_completion_failure(
+                                ProviderOperationEvidenceError(
+                                    "Provider-operation terminal cursor is not the next boundary."
+                                )
+                            )
+                        else:
+                            terminal_progress_verified = True
                 if boundary.completion_error is not None:
-                    raise ModelProviderError(
+                    code, path = safe_durable_value_error_details(boundary.completion_error)
+                    completion_error = ModelProviderError(
                         "Recovered provider operation returned invalid completion metadata.",
                         provider=registered_provider.name,
                         error_type="DurableValueError",
                         error_code="invalid_model_completion_value",
                         retryable=False,
                     )
-                completed_boundary = boundary
-                completed_event = stream_event
+                    completion_diagnostics = {
+                        "completion_outcome": "invalid_metadata",
+                        "completion_error": {
+                            "error": str(completion_error),
+                            "error_type": type(completion_error).__name__,
+                            "durable_value_error_code": code,
+                            "durable_value_path": path,
+                            **completion_error.error_payload_fields(),
+                        },
+                    }
+                    retain_post_completion_failure(completion_error)
             else:  # pragma: no cover - boundary validation owns the closed event vocabulary
                 raise RuntimeError("Recovered provider operation returned an unsupported event.")
-        if completed_event is None or completed_boundary is None:
-            raise RuntimeError("Completed provider operation returned no completed event.")
 
-        _require_unique_tool_call_ids(tool_calls)
-        provider_state_parts = transcript_helpers.provider_state_parts(completed_event.payload)
-        assistant_message = transcript_helpers.assistant_message(
-            content_parts=assistant_parts,
-            provider_state_parts=provider_state_parts,
-        )
-        step_result = _assistant_step_result(
-            session_id=session.id,
-            step=operation.step,
-            model_attempt_identity=operation.model_attempt_identity,
-            assistant_message=assistant_message,
-            tool_calls=tool_calls,
-            completion=_stream_event_completion(completed_event),
-        )
-        classification = classify_assistant_step(step_result)
-        billing_identity = resolve_completion_billing_identity(
-            provider,
-            (None if recovery_context is None else recovery_context.billing_identity),
-            copy_durable_json_object(completed_event.payload, "completed_payload"),
-            provider_name=registered_provider.name,
-        )
+        for accepted_event in operation.accepted_stream_events:
+            await accept_recovered_event(accepted_event, persist_progress=False)
+
+        await require_recovery_owner()
+        if operation.accepted_stream_events:
+            raw_connection = await adapter.reconnect(copy_provider_operation_state(operation.state))
+            try:
+                connection = copy_provider_operation_connection(raw_connection)
+            except BaseException:
+                if type(raw_connection) is ProviderOperationConnection:
+                    async with aclosing_provider_stream(raw_connection.events):
+                        raise
+                raise
+            try:
+                async with aclosing_provider_stream(connection.events) as reconnect_events:
+                    if connection.state != operation.state:
+                        raise RuntimeError(
+                            "Provider reconnection returned a different operation state."
+                        )
+                    recovery_status = connection.status
+                    async for raw_event in reconnect_events:
+                        await require_recovery_owner()
+                        await accept_recovered_event(raw_event, persist_progress=True)
+                        if completed_event is not None:
+                            break
+            except BaseException as stream_failure:
+                if completed_event is None:
+                    raise
+                retain_post_completion_failure(stream_failure)
+        else:
+            snapshot = copy_provider_operation_snapshot(
+                await adapter.retrieve(copy_provider_operation_state(operation.state))
+            )
+            if snapshot.state != operation.state:
+                raise RuntimeError("Provider operation retrieval returned a different identity.")
+            recovery_status = snapshot.status
+            if snapshot.status in {
+                ProviderOperationStatus.QUEUED,
+                ProviderOperationStatus.IN_PROGRESS,
+            }:
+                return await pending_recovery_result(snapshot.status)
+            try:
+                for raw_event in snapshot.events:
+                    await accept_recovered_event(raw_event, persist_progress=False)
+            except BaseException as snapshot_failure:
+                if completed_event is None:
+                    raise
+                retain_post_completion_failure(snapshot_failure)
+
+        try:
+            await require_recovery_owner()
+        except (SessionInterruptedByRequest, asyncio.CancelledError) as recovery_failure:
+            if completed_event is None:
+                raise
+            post_completion_failure = _combine_post_completion_failures(
+                post_completion_failure,
+                recovery_failure,
+            )
+        if completed_event is None or completed_boundary is None:
+            if recovery_status in {
+                ProviderOperationStatus.QUEUED,
+                ProviderOperationStatus.IN_PROGRESS,
+            }:
+                return await pending_recovery_result(recovery_status)
+            raise RuntimeError("Completed provider operation returned no completed event.")
+        if recovery_status not in {
+            ProviderOperationStatus.QUEUED,
+            ProviderOperationStatus.IN_PROGRESS,
+            ProviderOperationStatus.COMPLETED,
+        }:
+            retain_post_completion_failure(
+                RuntimeError(
+                    "Provider operation returned completion output with conflicting terminal "
+                    f"status: {recovery_status.value}."
+                )
+            )
+
+        completion_semantics_valid = completed_boundary.completion_error is None
+        billing_identity = None if recovery_context is None else recovery_context.billing_identity
+        if completion_semantics_valid:
+            try:
+                billing_identity = resolve_completion_billing_identity(
+                    provider,
+                    billing_identity,
+                    copy_durable_json_object(completed_event.payload, "completed_payload"),
+                    provider_name=registered_provider.name,
+                )
+            except ModelProviderError as billing_error:
+                completion_semantics_valid = False
+                completion_diagnostics = {
+                    "completion_outcome": "billing_identity_resolution_failed",
+                    "completion_error": {
+                        "error": str(billing_error),
+                        "error_type": type(billing_error).__name__,
+                        "stage": "billing_identity_for_completion",
+                        **billing_error.error_payload_fields(),
+                    },
+                }
+                retain_post_completion_failure(billing_error)
+
+        assistant_message: Message | None = None
+        step_result: AssistantStepResult | None = None
+        classification = None
+        if completion_semantics_valid:
+            try:
+                _require_unique_tool_call_ids(tool_calls)
+                provider_state_parts = transcript_helpers.provider_state_parts(
+                    completed_event.payload
+                )
+                assistant_message = transcript_helpers.assistant_message(
+                    content_parts=assistant_parts,
+                    provider_state_parts=provider_state_parts,
+                )
+                step_result = _assistant_step_result(
+                    session_id=session.id,
+                    step=operation.step,
+                    model_attempt_identity=operation.model_attempt_identity,
+                    assistant_message=assistant_message,
+                    tool_calls=tool_calls,
+                    completion=_stream_event_completion(completed_event),
+                )
+                classification = classify_assistant_step(step_result)
+            except (TypeError, ValueError):
+                completion_semantics_valid = False
+                transcript_error = ModelProviderError(
+                    "Recovered provider operation returned invalid completion transcript state.",
+                    provider=registered_provider.name,
+                    error_type="ValueError",
+                    error_code="invalid_model_completion_transcript",
+                    retryable=False,
+                )
+                completion_diagnostics = {
+                    "completion_outcome": "invalid_transcript_state",
+                    "completion_error": {
+                        "error": str(transcript_error),
+                        "error_type": type(transcript_error).__name__,
+                        "stage": "completion_transcript_projection",
+                        **transcript_error.error_payload_fields(),
+                    },
+                }
+                retain_post_completion_failure(transcript_error)
+
         completion_event = _model_stream_event_to_runtime_event(
             completed_event,
             session=session,
@@ -1636,8 +2068,8 @@ class ModelStepExecutor:
             attempt=operation.attempt,
             max_attempts=operation.max_attempts,
             model_attempt_identity=operation.model_attempt_identity,
-            tool_round_identity=step_result.tool_round_identity,
-            classification=classification.payload(),
+            tool_round_identity=(None if step_result is None else step_result.tool_round_identity),
+            classification=None if classification is None else classification.payload(),
             transcript_cursor_after_completion=(
                 stage.source_transcript_cursor
                 + int(assistant_message is not None and not tool_calls)
@@ -1647,49 +2079,125 @@ class ModelStepExecutor:
             accounting_usage_metrics=completed_boundary.accounting_usage_metrics,
             accounting_usage_rejected=completed_boundary.accounting_usage_rejected,
             usage_normalization_failed=completed_boundary.usage_normalization_failed,
+            completion_diagnostics=completion_diagnostics,
         )
-        completion_event = self._event_writer.prepare(completion_event)
-        durable_step_result = _durable_assistant_step_result(
-            step_result,
-            redactor=self._secret_redactor,
+        if terminal_progress_verified:
+            completion_event = self._provider_operation_progress_event(
+                stage=stage,
+                state=current_state,
+                stream_event=completed_event,
+                runtime_event=completion_event,
+                session=session,
+                interaction_id=operation.interaction_id,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=operation.step,
+                attempt=operation.attempt,
+                max_attempts=operation.max_attempts,
+                model_attempt_identity=operation.model_attempt_identity,
+            )
+        publication_cancellation = _take_model_completion_cancellation(
+            post_completion_failure,
+            cancellation_baseline=recovery_cancellation_baseline,
         )
+        if publication_cancellation is not None and post_completion_failure is None:
+            post_completion_failure = publication_cancellation
+        elif publication_cancellation is None and isinstance(
+            post_completion_failure,
+            asyncio.CancelledError,
+        ):
+            post_completion_failure = unexpected_child_cancellation_error(
+                post_completion_failure,
+                operation="Provider operation recovery stream",
+            )
+        durable_step_result = None
+        if step_result is not None:
+            try:
+                durable_step_result = _durable_assistant_step_result(
+                    step_result,
+                    redactor=self._secret_redactor,
+                )
+            except (TypeError, ValueError):
+                durable_boundary_error = ModelProviderError(
+                    "Recovered provider operation returned assistant output that cannot cross "
+                    "the durable publication boundary.",
+                    provider=registered_provider.name,
+                    error_type="DurableBoundaryError",
+                    error_code="invalid_model_completion_transcript",
+                    retryable=False,
+                )
+                retain_post_completion_failure(durable_boundary_error)
         structured_output_validation = None
         if (
-            recovery_context is not None
+            post_completion_failure is None
+            and recovery_context is not None
             and recovery_context.structured_output is not None
             and recovery_context.structured_output.strategy is StructuredOutputStrategy.TOOL
             and any(call.name == STRUCTURED_OUTPUT_TOOL_NAME for call in tool_calls)
         ):
-            structured_output_validation = _redact_structured_output_validation(
-                _validate_structured_output_tool_round(
-                    tool_calls=tool_calls,
-                    spec=recovery_context.structured_output,
-                ),
-                self._secret_redactor,
-            )
+            try:
+                structured_output_validation = _redact_structured_output_validation(
+                    _validate_structured_output_tool_round(
+                        tool_calls=tool_calls,
+                        spec=recovery_context.structured_output,
+                    ),
+                    self._secret_redactor,
+                )
+            except (TypeError, ValueError):
+                structured_output_error = ModelProviderError(
+                    "Recovered provider operation returned invalid structured output.",
+                    provider=registered_provider.name,
+                    error_type="ValueError",
+                    error_code="invalid_model_completion_transcript",
+                    retryable=False,
+                )
+                retain_post_completion_failure(structured_output_error)
         request_fingerprint = stage.intent.get("request_fingerprint")
         if type(request_fingerprint) is not str:
             raise RuntimeError("Provider-operation stage lost its request fingerprint.")
+        authoritative_assistant_message = (
+            durable_step_result.assistant_message
+            if durable_step_result is not None and post_completion_failure is None
+            else None
+        )
+        publication_event = (
+            completion_event
+            if post_completion_failure is None
+            else _non_turn_model_completion_event(
+                completion_event,
+                failure=post_completion_failure,
+                cancellation=publication_cancellation,
+                transcript_cursor=stage.source_transcript_cursor,
+            )
+        )
+        publication_event = self._event_writer.prepare(publication_event)
         publication = ModelCompletionPublicationRequest(
             dispatch=ModelCompletionDispatch(
                 stage=stage,
                 request_fingerprint=request_fingerprint,
             ),
             assistant_step_result=durable_step_result,
-            completion_event=completion_event,
-            authoritative_assistant_message=durable_step_result.assistant_message,
-            defer_assistant_message=bool(tool_calls),
+            completion_event=publication_event,
+            authoritative_assistant_message=authoritative_assistant_message,
+            defer_assistant_message=bool(
+                durable_step_result is not None
+                and durable_step_result.tool_calls
+                and post_completion_failure is None
+            ),
             structured_output_validation=structured_output_validation,
         )
         await _publish_model_completion(
             model_completion_publisher,
             publication,
-            terminal_failure=None,
-            publication_cancellation=None,
+            terminal_failure=post_completion_failure,
+            publication_cancellation=publication_cancellation,
         )
+        if post_completion_failure is not None:
+            raise post_completion_failure
         reconciled = recovery_event(
             EventType.PROVIDER_OPERATION_RECONCILED,
-            status=snapshot.status.value,
+            status=recovery_status.value,
         )
         try:
             reconciled = await self._event_writer.emit(reconciled)
@@ -1701,10 +2209,11 @@ class ModelStepExecutor:
                 operation.state.operation_id,
                 type(delivery_error).__name__,
             )
+        recovered_events.append(reconciled)
         return ProviderOperationRecoveryResult(
             status=ProviderOperationRecoveryStatus.RECONCILED,
-            events=(scheduled, started, reconciled),
-            completion_event=completion_event,
+            events=tuple(recovered_events),
+            completion_event=publication_event,
         )
 
     def create_run(
@@ -2543,10 +3052,13 @@ class ModelStepExecutor:
         else:
             completion_dispatch = await prepare_model_completion_dispatch(model_request)
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
+        provider_operation_state: ProviderOperationState | None = None
+        provider_operation_interaction_id: str | None = None
         provider_exhausted = False
         background_dispatch_invoked = False
         durable_stream_failure: ModelAttemptFailed | None = None
         provider_control_failure: ModelProviderError | None = None
+        provider_control_error_emitted = False
         post_completion_failure: BaseException | None = None
         try:
             provider_operation_mode = provider.provider_operation_mode
@@ -2588,6 +3100,11 @@ class ModelStepExecutor:
                 )
                 emitted_starting_event = await self._event_writer.emit(starting_event)
                 yield emitted_starting_event, None
+                provider_operation_interaction_id = emitted_starting_event.interaction_id
+                if provider_operation_interaction_id is None:
+                    raise RuntimeError(
+                        "Provider-operation dispatch requires an owning interaction."
+                    )
 
                 async def start_provider_operation() -> ProviderOperationConnection:
                     return await provider_operation_adapter.start(
@@ -2642,107 +3159,118 @@ class ModelStepExecutor:
                 )
                 if start_outcome.timed_out:
                     start_task.cancel()
-                    if (
-                        start_outcome.cancellation is None
-                    ):  # pragma: no cover - timeout is armed by cancellation
+                    start_cancellation = start_outcome.cancellation
+                    if start_cancellation is None:  # pragma: no cover - armed by cancellation
                         raise RuntimeError("Provider operation start settlement timed out.")
 
-                    async def reconcile_late_start() -> None:
-                        late_outcome = await await_shielded_task_outcome(start_task)
-                        if late_outcome.error is not None or late_outcome.result is None:
-                            return
-                        late_operation = copy_provider_operation_connection(late_outcome.result)
-                        try:
-                            (
-                                _,
-                                cancellation_snapshot,
-                            ) = await _cancel_provider_operation_after_definite_absence(
-                                adapter=provider_operation_adapter,
-                                state=late_operation.state,
-                                failure=RuntimeError(
-                                    "Caller cancellation preceded provider start acknowledgement."
-                                ),
+                async def reconcile_late_start() -> None:
+                    late_outcome = await await_shielded_task_outcome(start_task)
+                    if late_outcome.error is not None or late_outcome.result is None:
+                        return
+                    raw_late_operation = late_outcome.result
+                    try:
+                        late_operation = copy_provider_operation_connection(raw_late_operation)
+                    except BaseException:
+                        if type(raw_late_operation) is ProviderOperationConnection:
+                            async with aclosing_provider_stream(raw_late_operation.events):
+                                raise
+                        raise
+                    try:
+                        (
+                            _,
+                            cancellation_snapshot,
+                        ) = await _cancel_provider_operation_after_definite_absence(
+                            adapter=provider_operation_adapter,
+                            state=late_operation.state,
+                            failure=RuntimeError(
+                                "Caller cancellation preceded provider start acknowledgement."
+                            ),
+                        )
+                        reconciled_status = (
+                            late_operation.status
+                            if cancellation_snapshot is None
+                            else cancellation_snapshot.status
+                        )
+                        reconciliation_event = self._event_writer.prepare(
+                            operation_event_for(
+                                late_operation.state,
+                                reconciled_status,
                             )
-                            reconciled_status = (
-                                late_operation.status
-                                if cancellation_snapshot is None
-                                else cancellation_snapshot.status
-                            )
-                            reconciliation_event = self._event_writer.prepare(
-                                operation_event_for(
-                                    late_operation.state,
-                                    reconciled_status,
-                                )
-                            )
+                        )
 
-                            def preserve_checkpoint(
-                                _current: Session,
-                                checkpoint: dict[str, Any] | None,
-                            ) -> dict[str, Any]:
-                                if checkpoint is None:
-                                    raise RuntimeError(
-                                        "Late provider-operation reconciliation requires an "
-                                        "existing session checkpoint."
-                                    )
-                                copied = copy_json_value(checkpoint, "checkpoint")
-                                if type(copied) is not dict:
-                                    raise TypeError("Session checkpoint must be an object.")
-                                return copied
-
-                            for publication_attempt in range(2):
-                                reconciliation_session = await self._session_store.load(session.id)
-                                if reconciliation_session is None:
-                                    return
-                                if reconciliation_session.run_epoch == session.run_epoch:
-                                    eligible_statuses = {
-                                        SessionStatus.RUNNING,
-                                        SessionStatus.INTERRUPTING,
-                                    }
-                                elif reconciliation_session.run_epoch == session.run_epoch + 1:
-                                    eligible_statuses = {
-                                        SessionStatus.INTERRUPTED,
-                                        SessionStatus.FAILED,
-                                    }
-                                else:
-                                    return
-                                try:
-                                    await self._session_store.publish_checkpoint_and_events(
-                                        session.id,
-                                        checkpoint_transform=preserve_checkpoint,
-                                        events=[reconciliation_event],
-                                        expected_statuses=eligible_statuses,
-                                        expected_run_epoch=reconciliation_session.run_epoch,
-                                    )
-                                    break
-                                except (SessionRunFenced, SessionStatusConflict):
-                                    if publication_attempt == 1:
-                                        raise
-                            persisted = await self._session_store.query_events(
-                                EventQuery(
-                                    session_id=session.id,
-                                    event_id=reconciliation_event.id,
-                                    limit=1,
-                                )
-                            )
-                            if len(persisted) != 1 or persisted[0].event != reconciliation_event:
+                        def preserve_checkpoint(
+                            _current: Session,
+                            checkpoint: dict[str, Any] | None,
+                        ) -> dict[str, Any]:
+                            if checkpoint is None:
                                 raise RuntimeError(
-                                    "Late provider-operation reconciliation readback did not "
-                                    "match its durable event."
+                                    "Late provider-operation reconciliation requires an "
+                                    "existing session checkpoint."
                                 )
-                            await self._event_writer.fan_out_persisted([persisted[0].event])
-                        finally:
-                            await _close_async_iterator(late_outcome.result.events)
+                            copied = copy_json_value(checkpoint, "checkpoint")
+                            if type(copied) is not dict:
+                                raise TypeError("Session checkpoint must be an object.")
+                            return copied
 
+                        for publication_attempt in range(2):
+                            reconciliation_session = await self._session_store.load(session.id)
+                            if reconciliation_session is None:
+                                return
+                            if reconciliation_session.run_epoch == session.run_epoch:
+                                eligible_statuses = {
+                                    SessionStatus.RUNNING,
+                                    SessionStatus.INTERRUPTING,
+                                }
+                            elif reconciliation_session.run_epoch == session.run_epoch + 1:
+                                eligible_statuses = {
+                                    SessionStatus.INTERRUPTED,
+                                    SessionStatus.FAILED,
+                                }
+                            else:
+                                return
+                            try:
+                                await self._session_store.publish_checkpoint_and_events(
+                                    session.id,
+                                    checkpoint_transform=preserve_checkpoint,
+                                    events=[reconciliation_event],
+                                    expected_statuses=eligible_statuses,
+                                    expected_run_epoch=reconciliation_session.run_epoch,
+                                )
+                                break
+                            except (SessionRunFenced, SessionStatusConflict):
+                                if publication_attempt == 1:
+                                    raise
+                        persisted = await self._session_store.query_events(
+                            EventQuery(
+                                session_id=session.id,
+                                event_id=reconciliation_event.id,
+                                limit=1,
+                            )
+                        )
+                        if len(persisted) != 1 or persisted[0].event != reconciliation_event:
+                            raise RuntimeError(
+                                "Late provider-operation reconciliation readback did not "
+                                "match its durable event."
+                            )
+                        await self._event_writer.fan_out_persisted([persisted[0].event])
+                    finally:
+                        await _close_async_iterator(raw_late_operation.events)
+
+                if start_outcome.timed_out:
+                    start_cancellation = start_outcome.cancellation
+                    if start_cancellation is None:  # pragma: no cover - validated above
+                        raise AssertionError("Timed-out provider start lost caller cancellation.")
                     reconciliation_task = asyncio.create_task(
                         reconcile_late_start(),
                         context=Context(),
                     )
                     self._retain_provider_operation_reconciliation(reconciliation_task)
-                    start_outcome.cancellation.add_note(
+                    start_cancellation.add_note(
                         "Provider operation start remained in flight after bounded cancellation "
                         "settlement; durable starting evidence prevents automatic retry."
                     )
-                    raise start_outcome.cancellation
+                    raise start_cancellation
+
                 start_error = start_outcome.error
                 if (
                     isinstance(start_error, asyncio.CancelledError)
@@ -2764,7 +3292,16 @@ class ModelStepExecutor:
                 try:
                     if start_outcome.result is None:
                         raise RuntimeError("Provider operation start returned no connection.")
-                    provider_operation = copy_provider_operation_connection(start_outcome.result)
+                    raw_provider_operation = start_outcome.result
+                    try:
+                        provider_operation = copy_provider_operation_connection(
+                            raw_provider_operation
+                        )
+                    except BaseException:
+                        if type(raw_provider_operation) is ProviderOperationConnection:
+                            async with aclosing_provider_stream(raw_provider_operation.events):
+                                raise
+                        raise
                 except Exception as start_validation_error:
                     if start_outcome.cancellation is not None:
                         raise start_outcome.cancellation from start_validation_error
@@ -2773,6 +3310,11 @@ class ModelStepExecutor:
                         cause=start_validation_error,
                     ) from start_validation_error
                 operation_state = provider_operation.state
+                provider_operation_state = operation_state
+                if completion_dispatch is None:
+                    raise RuntimeError(
+                        "Background provider operations require a durable model-completion stage."
+                    )
                 operation_event = operation_event_for(
                     provider_operation.state,
                     provider_operation.status,
@@ -2891,9 +3433,25 @@ class ModelStepExecutor:
                     requested_model=session.model,
                     usage_dialect=registered_provider.usage_dialect,
                 )
-                stream_event = boundary_value.event
+                generated_tool_call_id = None
+                if provider_operation_state is not None and completion_dispatch is not None:
+                    generated_tool_call_id = _provider_operation_generated_tool_call_id(
+                        completion_dispatch.stage,
+                        boundary_value.event,
+                    )
+                assistant_boundary = _validate_assistant_stream_event(
+                    boundary_value.event,
+                    generated_tool_call_id=generated_tool_call_id,
+                )
+                stream_event = assistant_boundary.event
                 await interrupt_poll.raise_if_interrupted()
                 if model_completed:
+                    if (
+                        provider_operation_state is not None
+                        and completed_stream_event is not None
+                        and stream_event == completed_stream_event
+                    ):
+                        continue
                     message = f"Model provider emitted event after completed: {stream_event.type}"
                     raise ModelAttemptFailed(
                         message=message,
@@ -2903,18 +3461,131 @@ class ModelStepExecutor:
                         completion_observed=model_completion_publisher is not None,
                     )
 
+                progress_emitted_event: Event | None = None
+
                 if stream_event.type == ModelStreamEventType.TOOL_CALL:
-                    tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
+                    if provider_operation_state is not None:
+                        if completion_dispatch is None:  # pragma: no cover - checked at start
+                            raise AssertionError("Background operation lost its completion stage.")
+                        if provider_operation_interaction_id is None:  # pragma: no cover
+                            raise AssertionError("Background operation lost its interaction.")
+                        (
+                            progress,
+                            progress_emitted_event,
+                        ) = await self._commit_provider_operation_stream_event(
+                            stage=completion_dispatch.stage,
+                            state=provider_operation_state,
+                            stream_event=stream_event,
+                            runtime_event=None,
+                            session=session,
+                            interaction_id=provider_operation_interaction_id,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            environment_name=environment_name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                        )
+                        provider_operation_state = progress.state
+                        if progress.replayed:
+                            continue
+                    tool_call = assistant_boundary.tool_call
+                    tool_call_part = assistant_boundary.tool_call_part
+                    if tool_call is None or tool_call_part is None:  # pragma: no cover
+                        raise AssertionError("Validated tool-call projection disappeared.")
                     tool_calls.append(tool_call)
-                    assistant_parts.append(transcript_helpers.tool_call_part(tool_call))
+                    assistant_parts.append(tool_call_part)
+                    if progress_emitted_event is not None:
+                        yield progress_emitted_event, None
                     continue
 
                 if stream_event.type == ModelStreamEventType.TEXT_DELTA:
+                    if provider_operation_state is not None:
+                        if completion_dispatch is None:  # pragma: no cover - checked at start
+                            raise AssertionError("Background operation lost its completion stage.")
+                        if provider_operation_interaction_id is None:  # pragma: no cover
+                            raise AssertionError("Background operation lost its interaction.")
+                        progress_runtime_event = _model_stream_event_to_runtime_event(
+                            stream_event,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            provider_name=registered_provider.name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                            usage_dialect=registered_provider.usage_dialect,
+                        )
+                        (
+                            progress,
+                            progress_emitted_event,
+                        ) = await self._commit_provider_operation_stream_event(
+                            stage=completion_dispatch.stage,
+                            state=provider_operation_state,
+                            stream_event=stream_event,
+                            runtime_event=progress_runtime_event,
+                            session=session,
+                            interaction_id=provider_operation_interaction_id,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            environment_name=environment_name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                        )
+                        provider_operation_state = progress.state
+                        if progress.replayed:
+                            continue
                     transcript_helpers.append_assistant_text_delta(
                         assistant_parts,
                         stream_event.delta,
                     )
                 elif stream_event.type == ModelStreamEventType.THINKING:
+                    if provider_operation_state is not None:
+                        if completion_dispatch is None:  # pragma: no cover - checked at start
+                            raise AssertionError("Background operation lost its completion stage.")
+                        if provider_operation_interaction_id is None:  # pragma: no cover
+                            raise AssertionError("Background operation lost its interaction.")
+                        progress_runtime_event = (
+                            _model_stream_event_to_runtime_event(
+                                stream_event,
+                                session=session,
+                                registered_agent=registered_agent,
+                                environment_name=environment_name,
+                                provider_name=registered_provider.name,
+                                step=step,
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                model_attempt_identity=model_attempt_identity,
+                                usage_dialect=registered_provider.usage_dialect,
+                            )
+                            if stream_event.delta
+                            else None
+                        )
+                        (
+                            progress,
+                            progress_emitted_event,
+                        ) = await self._commit_provider_operation_stream_event(
+                            stage=completion_dispatch.stage,
+                            state=provider_operation_state,
+                            stream_event=stream_event,
+                            runtime_event=progress_runtime_event,
+                            session=session,
+                            interaction_id=provider_operation_interaction_id,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            environment_name=environment_name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                        )
+                        provider_operation_state = progress.state
+                        if progress.replayed:
+                            continue
                     transcript_helpers.append_assistant_thinking_delta(
                         assistant_parts,
                         stream_event.delta,
@@ -2924,8 +3595,35 @@ class ModelStepExecutor:
                     if not stream_event.delta:
                         # Opaque/redacted thinking state belongs in the transcript,
                         # but an empty readable delta should not reach consumers.
+                        if progress_emitted_event is not None:
+                            yield progress_emitted_event, None
                         continue
                 elif stream_event.type == ModelStreamEventType.COMPLETED:
+                    terminal_progress_failure: BaseException | None = None
+                    terminal_progress_verified = False
+                    if provider_operation_state is not None:
+                        envelope = provider_operation_progress_envelope(
+                            provider_operation_state,
+                            stream_event,
+                        )
+                        if _provider_operation_progress_contains_secret(
+                            envelope,
+                            redactor=self._secret_redactor,
+                        ):
+                            terminal_progress_failure = ProviderOperationEvidenceError(
+                                "Provider-operation terminal recovery state contains a workload "
+                                "secret."
+                            )
+                        else:
+                            terminal_cursor = envelope.recovery_metadata.cursor
+                            current_cursor = provider_operation_state.recovery_metadata.cursor
+                            current_cursor = -1 if current_cursor is None else current_cursor
+                            if terminal_cursor != current_cursor + 1:
+                                terminal_progress_failure = ProviderOperationEvidenceError(
+                                    "Provider-operation terminal cursor is not the next boundary."
+                                )
+                            else:
+                                terminal_progress_verified = True
                     completion_terminal_error: ModelProviderError | None = None
                     completion_diagnostics: dict[str, Any] = {}
                     if boundary_value.completion_error is not None:
@@ -3045,11 +3743,44 @@ class ModelStepExecutor:
                         usage_normalization_failed=(boundary_value.usage_normalization_failed),
                         completion_diagnostics=completion_diagnostics,
                     )
+                    if provider_operation_state is not None and terminal_progress_verified:
+                        if completion_dispatch is None:  # pragma: no cover - checked at start
+                            raise AssertionError("Background operation lost its completion stage.")
+                        if provider_operation_interaction_id is None:  # pragma: no cover
+                            raise AssertionError("Background operation lost its interaction.")
+                        completion_event = self._provider_operation_progress_event(
+                            stage=completion_dispatch.stage,
+                            state=provider_operation_state,
+                            stream_event=stream_event,
+                            runtime_event=completion_event,
+                            session=session,
+                            interaction_id=provider_operation_interaction_id,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            environment_name=environment_name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                        )
                     if model_completion_publisher is None:
                         completion_event = record_model_completion(completion_event)
                         yield await self._event_writer.emit(completion_event), None
+                    if terminal_progress_failure is not None:
+                        post_completion_failure = _combine_post_completion_failures(
+                            post_completion_failure,
+                            terminal_progress_failure,
+                        )
                     if completion_terminal_error is not None:
-                        provider_control_failure = completion_terminal_error
+                        if post_completion_failure is None:
+                            provider_control_failure = completion_terminal_error
+                        else:
+                            post_completion_failure = _combine_post_completion_failures(
+                                post_completion_failure,
+                                completion_terminal_error,
+                            )
+                        break
+                    if provider_operation_state is not None:
                         break
                     continue
 
@@ -3058,25 +3789,70 @@ class ModelStepExecutor:
                         stream_event.payload,
                         fallback_provider=registered_provider.name,
                     )
-                    if isinstance(provider_error, ModelContextOverflowError):
+                    if (
+                        isinstance(provider_error, ModelContextOverflowError)
+                        and provider_operation_state is None
+                    ):
                         # Providers may flatten a typed overflow into an error
                         # event. Rehydrate it so bounded recovery can shrink the
                         # request instead of spending generic retries on it.
                         raise provider_error
 
-                event = _model_stream_event_to_runtime_event(
-                    stream_event,
-                    session=session,
-                    registered_agent=registered_agent,
-                    environment_name=environment_name,
-                    provider_name=registered_provider.name,
-                    step=step,
-                    attempt=attempt,
-                    max_attempts=max_attempts,
-                    model_attempt_identity=model_attempt_identity,
-                    usage_dialect=registered_provider.usage_dialect,
-                )
-                emitted_event = await self._event_writer.emit(event)
+                    if provider_operation_state is not None:
+                        if completion_dispatch is None:  # pragma: no cover - checked at start
+                            raise AssertionError("Background operation lost its completion stage.")
+                        if provider_operation_interaction_id is None:  # pragma: no cover
+                            raise AssertionError("Background operation lost its interaction.")
+                        progress_runtime_event = _model_stream_event_to_runtime_event(
+                            stream_event,
+                            session=session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            provider_name=registered_provider.name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                            usage_dialect=registered_provider.usage_dialect,
+                        )
+                        (
+                            progress,
+                            progress_emitted_event,
+                        ) = await self._commit_provider_operation_stream_event(
+                            stage=completion_dispatch.stage,
+                            state=provider_operation_state,
+                            stream_event=stream_event,
+                            runtime_event=progress_runtime_event,
+                            session=session,
+                            interaction_id=provider_operation_interaction_id,
+                            registered_agent=registered_agent,
+                            registered_provider=registered_provider,
+                            environment_name=environment_name,
+                            step=step,
+                            attempt=attempt,
+                            max_attempts=max_attempts,
+                            model_attempt_identity=model_attempt_identity,
+                        )
+                        provider_operation_state = progress.state
+                        if progress.replayed:
+                            continue
+
+                if progress_emitted_event is None:
+                    event = _model_stream_event_to_runtime_event(
+                        stream_event,
+                        session=session,
+                        registered_agent=registered_agent,
+                        environment_name=environment_name,
+                        provider_name=registered_provider.name,
+                        step=step,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                        usage_dialect=registered_provider.usage_dialect,
+                    )
+                    emitted_event = await self._event_writer.emit(event)
+                else:
+                    emitted_event = progress_emitted_event
                 if stream_event.type == ModelStreamEventType.ERROR:
                     message = str(stream_event.payload.get("error") or "Model provider error")
                     provider_error = model_provider_error_from_payload(
@@ -3085,6 +3861,12 @@ class ModelStepExecutor:
                         fallback_message=message,
                     )
                     yield emitted_event, None
+                    if provider_operation_state is not None and isinstance(
+                        provider_error, ModelContextOverflowError
+                    ):
+                        provider_control_failure = provider_error
+                        provider_control_error_emitted = True
+                        break
                     raise ModelAttemptFailed(
                         message=message,
                         payload=copy_json_value(stream_event.payload, "payload"),
@@ -3215,15 +3997,36 @@ class ModelStepExecutor:
             post_completion_failure = exc
         finally:
             if provider_events is not None and not provider_exhausted:
-                try:
-                    await _close_async_iterator(provider_events)
-                except BaseException as exc:
-                    if model_completion_publisher is None or not model_completed:
-                        raise
-                    post_completion_failure = _combine_post_completion_failures(
-                        post_completion_failure,
-                        exc,
-                    )
+                active_failure = sys.exception()
+                if background_dispatch_invoked and model_completed:
+                    try:
+                        async with aclosing_provider_stream(provider_events):
+                            pass
+                    except BaseException as cleanup_failure:
+                        primary_failure = (
+                            post_completion_failure
+                            or provider_control_failure
+                            or durable_stream_failure
+                            or active_failure
+                        )
+                        post_completion_failure = (
+                            cleanup_failure
+                            if primary_failure is None or primary_failure is cleanup_failure
+                            else _combine_post_completion_failures(
+                                primary_failure,
+                                cleanup_failure,
+                            )
+                        )
+                else:
+                    try:
+                        await _close_async_iterator(provider_events)
+                    except BaseException as exc:
+                        if model_completion_publisher is None or not model_completed:
+                            raise
+                        post_completion_failure = _combine_post_completion_failures(
+                            post_completion_failure,
+                            exc,
+                        )
 
         if model_completed and model_completion_publisher is not None:
             if completed_stream_event is None:
@@ -3353,7 +4156,7 @@ class ModelStepExecutor:
                     "error": str(post_dispatch_failure),
                     "error_type": type(provider_control_failure).__name__,
                 },
-                emitted_error_event=False,
+                emitted_error_event=provider_control_error_emitted,
                 cause=post_dispatch_failure,
                 automatic_retry_disabled=True,
             ) from post_dispatch_failure
@@ -6722,18 +7525,74 @@ def _validate_stream_event(
                 )
             completion = ModelCompletion(finish_reason=ModelFinishReason.UNKNOWN)
 
+    recovery_metadata = (
+        None
+        if value.recovery_metadata is None
+        else ProviderOperationRecoveryMetadata.model_validate(
+            value.recovery_metadata.model_dump(mode="python")
+        )
+    )
+
     return _ModelStreamBoundaryValue(
         event=ModelStreamEvent.model_construct(
             type=ModelStreamEventType.COMPLETED,
             delta=delta,
             payload=payload,
             completion=completion,
+            recovery_metadata=recovery_metadata,
         ),
         completion_error=completion_error,
         accounting_usage_metrics=accounting_usage_metrics,
         accounting_usage_rejected=accounting_usage_rejected,
         usage_normalization_failed=usage_normalization_failed,
     )
+
+
+def _validate_assistant_stream_event(
+    stream_event: ModelStreamEvent,
+    *,
+    generated_tool_call_id: str | None = None,
+) -> _AssistantStreamBoundaryValue:
+    """Validate transcript semantics before a reconnect cursor can advance."""
+
+    if stream_event.type is ModelStreamEventType.TOOL_CALL:
+        if stream_event.payload.get("id") is None and generated_tool_call_id is not None:
+            payload = copy_durable_json_object(stream_event.payload, "payload")
+            payload["id"] = generated_tool_call_id
+            stream_event = copy_model_stream_event(
+                stream_event.model_copy(update={"payload": payload})
+            )
+        tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
+        tool_call_part = transcript_helpers.tool_call_part(tool_call)
+        if stream_event.payload.get("id") is None:
+            payload = copy_durable_json_object(stream_event.payload, "payload")
+            payload["id"] = tool_call.id
+            stream_event = copy_model_stream_event(
+                stream_event.model_copy(update={"payload": payload})
+            )
+        return _AssistantStreamBoundaryValue(
+            event=stream_event,
+            tool_call=tool_call,
+            tool_call_part=tool_call_part,
+        )
+    if stream_event.type is ModelStreamEventType.THINKING:
+        ThinkingPart(
+            text=stream_event.delta,
+            provider_state=stream_event.payload.get("provider_state"),
+        )
+    return _AssistantStreamBoundaryValue(event=stream_event)
+
+
+def _provider_operation_generated_tool_call_id(
+    stage: ModelCompletionStage,
+    stream_event: ModelStreamEvent,
+) -> str | None:
+    if stream_event.type is not ModelStreamEventType.TOOL_CALL:
+        return None
+    metadata = stream_event.recovery_metadata
+    if metadata is None or metadata.cursor is None:
+        return None
+    return provider_operation_progress_event_id(stage.stage_id, metadata.cursor)
 
 
 def _copy_model_request_for_counting(request: ModelRequest) -> ModelRequest:

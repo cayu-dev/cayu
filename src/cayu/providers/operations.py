@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
+    copy_durable_json_object,
     copy_durable_json_value,
     require_durable_clean_nonblank,
 )
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
 
 PROVIDER_OPERATION_ID_MAX_CHARS = 512
 PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS = 128
+PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES = 4096
 
 
 class ProviderOperationMode(StrEnum):
@@ -47,10 +50,11 @@ class ProviderOperationStatus(StrEnum):
 class ProviderOperationRecoveryMetadata(BaseModel):
     """Small provider-neutral continuation state, never request or response data.
 
-    Runtime core deliberately admits only one opaque cursor. Provider adapters
-    translate it to their own API parameter names; arbitrary metadata objects
-    cannot smuggle credentials, request bodies, reasoning, or response content
-    into durable recovery state.
+    ``cursor`` is the runtime-owned monotonic boundary number. ``opaque`` is a
+    bounded adapter-owned continuation value: Cayu copies and stores it without
+    interpreting provider-specific field names, and gives it back only to the
+    same operation adapter. Provider adapters must not put credentials, raw
+    request or response bodies, or model reasoning in it.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True, frozen=True)
@@ -62,6 +66,26 @@ class ProviderOperationRecoveryMetadata(BaseModel):
         ]
         | None
     ) = None
+    opaque: dict[str, object] = Field(default_factory=dict, exclude_if=lambda value: not value)
+
+    @field_validator("opaque", mode="before")
+    @classmethod
+    def validate_opaque(cls, value: object) -> dict[str, object]:
+        copied = copy_durable_json_object(value, "recovery_metadata.opaque")
+        if (
+            len(
+                canonical_durable_json_bytes(
+                    copied,
+                    "recovery_metadata.opaque",
+                )
+            )
+            > PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES
+        ):
+            raise ValueError(
+                "recovery_metadata.opaque exceeds the durable byte limit of "
+                f"{PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES}."
+            )
+        return copied
 
 
 class ProviderOperationState(BaseModel):
@@ -98,8 +122,9 @@ class ProviderOperationState(BaseModel):
             metadata = ProviderOperationRecoveryMetadata.model_validate(value)
         except ValueError:
             raise ValueError(
-                "recovery_metadata must contain only a bounded provider-operation cursor "
-                "and must not contain credentials, requests, reasoning, or responses."
+                "recovery_metadata must contain only a monotonic cursor and bounded opaque "
+                "adapter state, and must not contain credentials, requests, reasoning, or "
+                "responses."
             ) from None
         copied = copy_durable_json_value(
             metadata.model_dump(mode="python", exclude_none=True),
@@ -204,6 +229,7 @@ def copy_provider_operation_snapshot(
 
 __all__ = [
     "PROVIDER_OPERATION_ID_MAX_CHARS",
+    "PROVIDER_OPERATION_RECOVERY_OPAQUE_MAX_BYTES",
     "PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS",
     "ProviderOperationAdapter",
     "ProviderOperationConnection",

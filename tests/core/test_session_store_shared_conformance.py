@@ -47,6 +47,8 @@ from cayu.providers import (
     ModelProvider,
     ModelRequest,
     ModelStreamEvent,
+    ProviderOperationState,
+    ProviderOperationStatus,
     UsageDialect,
     bedrock_billing_identity,
     completed_bedrock_billing_identity,
@@ -149,6 +151,13 @@ from cayu.runtime.checkpoints import (
 )
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
+from cayu.runtime.execution_units import ModelAttemptIdentity
+from cayu.runtime.provider_operations import (
+    commit_provider_operation_progress,
+    load_recoverable_provider_operation,
+    provider_operation_progress_event_id,
+    provider_operation_progress_payload,
+)
 from cayu.runtime.sessions import (
     MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
@@ -11148,6 +11157,167 @@ def test_session_store_conformance_operation_commit_guard_is_atomic(
             assert await store.load_session_operation(created.id, "guarded-request") is None
             assert await store.load_events(created.id) == []
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_provider_progress_event_and_cursor_are_atomic(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = "sess_provider_progress_conformance"
+        interaction_id = "interaction-provider-progress-conformance"
+        try:
+            created = await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[],
+                ),
+                identity=_identity(),
+                interaction_started_event=Event(
+                    id="provider-progress-conformance-interaction-started",
+                    type=EventType.INTERACTION_STARTED,
+                    session_id=session_id,
+                    interaction_id=interaction_id,
+                ),
+                interaction_source_messages=[],
+            )
+            await store.checkpoint(created.id, {})
+            identity = ModelAttemptIdentity(
+                model_step_id="mstep_" + "a" * 32,
+                model_attempt_id="matt_" + "b" * 32,
+            )
+            stage_result = await store.prepare_model_completion_stage(
+                created.id,
+                request=ModelCompletionStageRequest(
+                    stage_id=f"{identity.model_step_id}:dispatch:0",
+                    logical_step_id=identity.model_step_id,
+                    dispatch_ordinal=0,
+                    intent={
+                        **identity.payload(),
+                        "provider_name": "conformance-provider",
+                        "requested_model": "conformance-model",
+                    },
+                ),
+                expected_statuses={created.status},
+                expected_run_epoch=created.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            state = ProviderOperationState(
+                operation_id="provider-operation-conformance",
+                stream_protocol="conformance-v1",
+                recovery_metadata={"cursor": 0, "opaque": {"page": "start"}},
+            )
+            await store.append_events(
+                created.id,
+                [
+                    Event(
+                        type=EventType.MODEL_STARTED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload={
+                            "provider": "conformance-provider",
+                            "model": "conformance-model",
+                            "step": 1,
+                            "attempt": 1,
+                            "max_attempts": 1,
+                            **identity.payload(),
+                        },
+                    ),
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_STARTED,
+                        session_id=created.id,
+                        interaction_id=interaction_id,
+                        agent_name="assistant",
+                        payload={
+                            "provider": "conformance-provider",
+                            "model": "conformance-model",
+                            "step": 1,
+                            "attempt": 1,
+                            "max_attempts": 1,
+                            **identity.payload(),
+                            "source_run_epoch": created.run_epoch,
+                            "start_id": f"provider-operation:{identity.model_attempt_id}",
+                            "state_version": state.version,
+                            "operation_id": state.operation_id,
+                            "stream_protocol": state.stream_protocol,
+                            "status": ProviderOperationStatus.IN_PROGRESS.value,
+                            "recovery_metadata": state.recovery_metadata.model_dump(mode="json"),
+                        },
+                    ),
+                ],
+            )
+
+            async def commit(delta: str, cursor: int, current: ProviderOperationState):
+                stream_event = ModelStreamEvent.text_delta(
+                    delta,
+                    recovery_metadata={
+                        "cursor": cursor,
+                        "opaque": {"page": f"after-{cursor}"},
+                    },
+                )
+                event = Event(
+                    id=provider_operation_progress_event_id(
+                        stage_result.stage.stage_id,
+                        cursor,
+                    ),
+                    type=EventType.MODEL_TEXT_DELTA,
+                    session_id=created.id,
+                    interaction_id=interaction_id,
+                    agent_name="assistant",
+                    payload={
+                        "delta": delta,
+                        "step": 1,
+                        "attempt": 1,
+                        "max_attempts": 1,
+                        **identity.payload(),
+                        "provider_operation_progress": provider_operation_progress_payload(
+                            current,
+                            stream_event,
+                        ),
+                    },
+                )
+                return await commit_provider_operation_progress(
+                    store,
+                    stage=stage_result.stage,
+                    model_attempt_identity=identity,
+                    current_state=current,
+                    stream_event=stream_event,
+                    event=event,
+                    expected_run_epoch=created.run_epoch,
+                )
+
+            first = await commit("hel", 1, state)
+            replay = await commit("hel", 1, state)
+            second = await commit("lo", 2, first.state)
+
+            assert first.replayed is False
+            assert replay.replayed is True
+            assert second.replayed is False
+            assert second.state.recovery_metadata.cursor == 2
+            text_events = [
+                event
+                for event in await store.load_events(created.id)
+                if event.type == EventType.MODEL_TEXT_DELTA
+            ]
+            assert [event.payload["delta"] for event in text_events] == ["hel", "lo"]
+            recovered = await load_recoverable_provider_operation(
+                store,
+                stage_result.stage,
+            )
+            assert recovered is not None
+            assert recovered.state.recovery_metadata.cursor == 2
+            assert recovered.state.recovery_metadata.opaque == {"page": "after-2"}
+            assert [event.delta for event in recovered.accepted_stream_events] == [
+                "hel",
+                "lo",
+            ]
+        finally:
+            await store.release_run_fence(session_id)
             await _close_store(store)
 
     asyncio.run(run())

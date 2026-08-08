@@ -18,6 +18,7 @@ from cayu.providers import (
     ProviderOperationStartRequest,
     ProviderOperationState,
     ProviderOperationStatus,
+    copy_model_stream_event,
 )
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
@@ -120,12 +121,36 @@ class _ScriptedProviderOperationAdapter(ProviderOperationAdapter):
             operation = self.operations[state.operation_id]
         except KeyError:
             raise KeyError(f"Unknown scripted provider operation: {state.operation_id}") from None
-        if operation.state != state:
+        if (
+            operation.state.version != state.version
+            or operation.state.operation_id != state.operation_id
+            or operation.state.stream_protocol != state.stream_protocol
+        ):
             raise ValueError("Scripted provider operation state does not match its identity.")
+        cursor = state.recovery_metadata.cursor
+        if cursor is None or cursor > len(operation.events):
+            raise ValueError("Scripted provider operation cursor is unavailable.")
+        expected_metadata = (
+            operation.state.recovery_metadata
+            if cursor == 0
+            else operation.events[cursor - 1].recovery_metadata
+        )
+        if expected_metadata is None or state.recovery_metadata != expected_metadata:
+            raise ValueError("Scripted provider operation cursor state is inconsistent.")
         return operation
 
     async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
-        batch = self.provider._consume_batch(request.request)
+        batch = tuple(
+            copy_model_stream_event(event).model_copy(
+                update={
+                    "recovery_metadata": ProviderOperationRecoveryMetadata(cursor=cursor),
+                }
+            )
+            for cursor, event in enumerate(
+                self.provider._consume_batch(request.request),
+                start=1,
+            )
+        )
         operation_id = f"scripted-operation-{len(self.operations)}"
         state = ProviderOperationState(
             operation_id=operation_id,
@@ -137,8 +162,9 @@ class _ScriptedProviderOperationAdapter(ProviderOperationAdapter):
 
         async def events() -> AsyncIterator[ModelStreamEvent]:
             for event in operation.events:
+                if event.type is ModelStreamEventType.COMPLETED:
+                    operation.status = ProviderOperationStatus.COMPLETED
                 yield event
-            operation.status = ProviderOperationStatus.COMPLETED
 
         return ProviderOperationConnection(
             state=state,
@@ -149,7 +175,7 @@ class _ScriptedProviderOperationAdapter(ProviderOperationAdapter):
     async def retrieve(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
         operation = self._require_operation(state)
         return ProviderOperationSnapshot(
-            state=operation.state,
+            state=state,
             status=operation.status,
             events=(
                 operation.events if operation.status is ProviderOperationStatus.COMPLETED else ()
@@ -158,13 +184,19 @@ class _ScriptedProviderOperationAdapter(ProviderOperationAdapter):
 
     async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
         operation = self._require_operation(state)
+        cursor = state.recovery_metadata.cursor
+        if cursor is None:  # pragma: no cover - _require_operation owns this invariant
+            raise AssertionError("Validated scripted cursor disappeared.")
+        start_index = 0 if cursor == 0 else cursor - 1
 
         async def events() -> AsyncIterator[ModelStreamEvent]:
-            for event in operation.events:
+            for event in operation.events[start_index:]:
+                if event.type is ModelStreamEventType.COMPLETED:
+                    operation.status = ProviderOperationStatus.COMPLETED
                 yield event
 
         return ProviderOperationConnection(
-            state=operation.state,
+            state=state,
             status=operation.status,
             events=events(),
         )
@@ -174,7 +206,7 @@ class _ScriptedProviderOperationAdapter(ProviderOperationAdapter):
         if not operation.status.terminal:
             operation.status = ProviderOperationStatus.CANCELLED
         return ProviderOperationSnapshot(
-            state=operation.state,
+            state=state,
             status=operation.status,
         )
 
