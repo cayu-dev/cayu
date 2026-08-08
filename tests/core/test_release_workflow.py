@@ -55,23 +55,30 @@ def test_release_jobs_pin_every_external_action_to_immutable_commit() -> None:
     assert all(_COMMIT_PIN.fullmatch(reference) for reference in references), references
 
 
-def test_pull_requests_use_balanced_shards_behind_the_stable_test_gate() -> None:
+def test_every_ref_uses_balanced_shards_behind_the_stable_test_gate() -> None:
     workflow = _CI_WORKFLOW.read_text()
     shards = _job_block(workflow, "test_shards")
     specialists = _job_block(workflow, "test_specialists")
     test_gate = _job_block(workflow, "test")
 
-    assert "if: github.event_name == 'pull_request'" in shards
+    assert "github.event_name == 'pull_request'" not in shards
     assert "shard: [1, 2, 3, 4]" in shards
     assert "--splits 4" in shards
     assert '--group "${{ matrix.shard }}"' in shards
     assert "--splitting-algorithm least_duration" in shards
     assert '-m "not (stress or process or postgres)"' in shards
+    assert "--cov=cayu" in shards
+    assert "--cov-branch" in shards
+    assert "uses: actions/upload-artifact@" in shards
 
+    assert "github.event_name == 'pull_request'" not in specialists
     assert "marker: stress" in specialists
     assert "marker: process" in specialists
     assert "marker: postgres" in specialists
     assert '-m "${{ matrix.marker }}"' in specialists
+    assert "--cov=cayu" in specialists
+    assert "--cov-branch" in specialists
+    assert "uses: actions/upload-artifact@" in specialists
 
     assert "name: Test (Python 3.14)" in test_gate
     assert "needs: [test_shards, test_specialists]" in test_gate
@@ -79,12 +86,15 @@ def test_pull_requests_use_balanced_shards_behind_the_stable_test_gate() -> None
     assert 'test "$SPECIALIST_RESULT" = "success"' in test_gate
 
 
-def test_main_and_tag_tests_use_file_level_parallelism_with_combined_coverage() -> None:
+def test_stable_test_gate_combines_coverage_from_every_lane() -> None:
     test_gate = _job_block(_CI_WORKFLOW.read_text(), "test")
 
-    assert "-n 3 --dist loadfile" in test_gate
-    assert "--cov=cayu" in test_gate
-    assert "--cov-branch" in test_gate
+    assert "uses: actions/download-artifact@" in test_gate
+    assert "pattern: coverage-${{ github.run_attempt }}-*" in test_gate
+    assert "merge-multiple: true" in test_gate
+    assert "coverage combine coverage-data" in test_gate
+    assert "coverage report" in test_gate
+    assert "pytest" not in test_gate
 
 
 def test_privileged_jobs_share_release_tag_verifier() -> None:

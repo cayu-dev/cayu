@@ -69,9 +69,8 @@ jobs:
 
   test_shards:
     name: Test shard ${{ matrix.shard }}/4 (Python 3.14)
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +79,7 @@ jobs:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      COVERAGE_FILE: coverage.${{ github.run_attempt }}.general-${{ matrix.shard }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
@@ -92,13 +92,22 @@ jobs:
             --splits 4 \
             --group "${{ matrix.shard }}" \
             --splitting-algorithm least_duration \
-            --durations=20
+            --durations=20 \
+            --cov=cayu \
+            --cov-branch \
+            --cov-report=
+      - name: Upload shard coverage data
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-${{ github.run_attempt }}-general-${{ matrix.shard }}
+          path: coverage.${{ github.run_attempt }}.general-${{ matrix.shard }}
+          if-no-files-found: error
+          retention-days: 1
 
   test_specialists:
     name: Test specialist ${{ matrix.lane }} (Python 3.14)
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -113,13 +122,27 @@ jobs:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      COVERAGE_FILE: coverage.${{ github.run_attempt }}.specialist-${{ matrix.lane }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - run: uv python install 3.14
       - run: uv sync --frozen --extra dev --extra server --python 3.14
       - name: Test specialist lane
-        run: uv run pytest -q -m "${{ matrix.marker }}" --durations=20
+        run: |
+          uv run pytest -q \
+            -m "${{ matrix.marker }}" \
+            --durations=20 \
+            --cov=cayu \
+            --cov-branch \
+            --cov-report=
+      - name: Upload specialist coverage data
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-${{ github.run_attempt }}-specialist-${{ matrix.lane }}
+          path: coverage.${{ github.run_attempt }}.specialist-${{ matrix.lane }}
+          if-no-files-found: error
+          retention-days: 1
 
   test:
     name: Test (Python 3.14)
@@ -131,33 +154,33 @@ jobs:
       CAYU_REQUIRE_POSTGRES: "1"
       CAYU_REQUIRE_DOCKER_RUNNER: "1"
       CAYU_REQUIRE_DOCKER_EGRESS: "1"
+      COVERAGE_FILE: coverage
     steps:
-      - name: Require every pull request shard
-        if: github.event_name == 'pull_request'
+      - name: Require every test lane
         env:
           SHARD_RESULT: ${{ needs.test_shards.result }}
           SPECIALIST_RESULT: ${{ needs.test_specialists.result }}
         run: |
           test "$SHARD_RESULT" = "success"
           test "$SPECIALIST_RESULT" = "success"
-      - if: github.event_name != 'pull_request'
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - if: github.event_name != 'pull_request'
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
-      - if: github.event_name != 'pull_request'
-        run: uv python install 3.14
-      - if: github.event_name != 'pull_request'
-        run: uv sync --frozen --extra dev --extra server --python 3.14
-      - name: Test with coverage visibility
-        if: github.event_name != 'pull_request'
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv python install 3.14
+      - run: uv sync --frozen --extra dev --extra server --python 3.14
+      - name: Download test coverage data
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: coverage-${{ github.run_attempt }}-*
+          path: coverage-data
+          merge-multiple: true
+      - name: Report combined coverage
         run: |
-          uv run pytest -q \
-            -n 3 --dist loadfile \
-            --durations=20 \
-            --cov=cayu \
-            --cov-branch \
-            --cov-report=term-missing:skip-covered \
-            --cov-report=markdown-append:${GITHUB_STEP_SUMMARY}
+          uv run coverage combine coverage-data
+          uv run coverage report --show-missing --skip-covered
+          uv run coverage report \
+            --format=markdown \
+            --show-missing \
+            --skip-covered >> "$GITHUB_STEP_SUMMARY"
 
   sqlite-cancellation:
     name: SQLite cancellation (Python ${{ matrix.python-version }})

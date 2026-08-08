@@ -744,7 +744,7 @@ def test_complex_corpus_import_cannot_starve_an_active_eval_lease(
 
     def blocking_prepare(*args, **kwargs):
         preparation_started.set()
-        if not release_preparation.wait(timeout=5):
+        if not release_preparation.wait(timeout=15):
             raise AssertionError("Timed out waiting to release corpus preparation.")
         return original_prepare(*args, **kwargs)
 
@@ -778,7 +778,7 @@ def test_complex_corpus_import_cannot_starve_an_active_eval_lease(
                 },
             )
             assert admitted.status_code == 202
-            assert provider.started.wait(timeout=2)
+            assert provider.started.wait(timeout=10)
 
             monkeypatch.setattr(
                 evals_sqlite_module,
@@ -796,7 +796,7 @@ def test_complex_corpus_import_cannot_starve_an_active_eval_lease(
 
             import_thread = threading.Thread(target=import_complex_corpus)
             import_thread.start()
-            assert preparation_started.wait(timeout=2)
+            assert preparation_started.wait(timeout=10)
 
             time.sleep(1.1)
             competing_lease = asyncio.run(
@@ -805,13 +805,13 @@ def test_complex_corpus_import_cannot_starve_an_active_eval_lease(
             assert competing_lease is None
 
             release_preparation.set()
-            import_thread.join(timeout=5)
+            import_thread.join(timeout=15)
             assert not import_thread.is_alive()
             assert import_outcome == {"status_code": 201}
     finally:
         release_preparation.set()
         if import_thread is not None:
-            import_thread.join(timeout=5)
+            import_thread.join(timeout=15)
         asyncio.run(competing_store.close())
         asyncio.run(store.close())
 

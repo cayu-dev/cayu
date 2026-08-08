@@ -885,7 +885,7 @@ class _SlowAssertion(EvalAssertion):
 
     async def evaluate(self, context):
         self.started = True
-        await asyncio.sleep(1)
+        await asyncio.Event().wait()
         self.completed = True
         return self.passed("Slow assertion completed.")
 
@@ -1034,14 +1034,14 @@ def test_case_timeout_bounds_assertion_evaluation():
         assertions=[assertion],
     )
 
-    result = asyncio.run(run_eval_case(app, case, suite_id="timeout", timeout_seconds=0.1))
+    result = asyncio.run(run_eval_case(app, case, suite_id="timeout", timeout_seconds=1.0))
 
     assert result.case_id == "slow-assertion"
     assert result.status == EvalStatus.ERROR
     assert result.authored_session_id == "slow-assertion-session"
     trial = result.trials[0]
     assert trial.session_id != "slow-assertion-session"
-    assert trial.error == "Eval case timed out after 0.1 seconds."
+    assert trial.error == "Eval case timed out after 1.0 seconds."
     assert trial.assertions[0].outcome == EvalOutcome.ERROR
     # Terminal evidence, probes, and children were complete before assertion
     # evaluation timed out. The error describes evaluation, not missing evidence.

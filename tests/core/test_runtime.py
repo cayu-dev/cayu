@@ -17900,13 +17900,13 @@ def test_pending_interruption_startup_bounds_healthy_external_claim_recovery():
 
         scheduled = await asyncio.wait_for(
             app.resume_pending_interruption_cascades(),
-            timeout=0.2,
+            timeout=2,
         )
         active_tasks = len(app._background_interruption_coordinator._tasks)
         # Each candidate now performs a bounded root-version guard before
         # projecting the marker. Keep the drain bounded without making
         # scheduler timing, rather than concurrency, the assertion.
-        drained = await app.drain_background_interruptions(timeout_s=0.1)
+        drained = await app.drain_background_interruptions(timeout_s=1)
         return root_count, scheduled, active_tasks, drained
 
     root_count, scheduled, active_tasks, drained = asyncio.run(run())
