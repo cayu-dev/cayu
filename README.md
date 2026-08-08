@@ -407,6 +407,13 @@ Cayu makes safety boundaries explicit, but configuration still matters:
   filter or isolate Cayu data. See [Server authentication and tenant
   isolation](https://github.com/cayu-dev/cayu/blob/main/docs/recipes/server-auth-tenancy.md).
   Generated API documentation is a separate exposure decision.
+- Public or multi-user product routes need a separate customer authorization
+  boundary; operator authentication does not make the raw Cayu surface
+  tenant-scoped. Start new services with
+  `cayu new NAME --template service`, then require both
+  `cayu check --deploy --fail-on warning --json` and the generated
+  `tests/test_public_service_security.py`. Cayu reports arbitrary host-owned
+  ASGI routes outside that maintained factory as unverified.
 - When embedding with `mount_cayu(..., path="/your/path")` or the lower-level
   `mount_dashboard(...)`, use `/your/path/` as the canonical dashboard URL.
   Cayu redirects an exact GET or HEAD of the slashless non-root mount after a

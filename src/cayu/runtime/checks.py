@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from enum import StrEnum
 from types import MappingProxyType
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from cayu.core.agents import AgentAuthoringState
 from cayu.runtime.manifest import AppManifest, FrozenJsonObject
+from cayu.runtime.service_manifest import (
+    PublicServiceManifest,
+    RuntimeStoreDurability,
+    ServiceMode,
+)
 
-CHECK_REPORT_SCHEMA_VERSION = "1"
+CHECK_REPORT_SCHEMA_VERSION = "2"
 AVAILABLE_CHECK_TAGS = frozenset({"authoring", "configuration", "deploy", "providers", "security"})
 BUILTIN_DIAGNOSTIC_CODES = (
     "AGENT_GENERATED_TRACER_BULLET_UNFINISHED",
@@ -21,6 +27,13 @@ BUILTIN_DIAGNOSTIC_CODES = (
     "APP_NO_AGENTS",
     "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
     "EXTERNAL_TOOL_UNGUARDED",
+    "PUBLIC_SERVICE_DEVELOPMENT_MODE",
+    "PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
+    "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+    "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+    "PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE",
+    "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
+    "PUBLIC_SERVICE_TASK_STORE_REQUIRED",
     "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
 )
 _WORKSPACE_TOOL_NAMES = frozenset(
@@ -57,17 +70,32 @@ class ProjectDiagnostic(BaseModel):
     verification_command: str
 
 
+class ServiceCheckEvidence(BaseModel):
+    """Bounded claims for the maintained public-service deployment path."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    control_plane_access: Literal["not_evaluated", "verified_authenticated", "verified_unsafe"]
+    service_contract: Literal["not_declared", "verified_maintained"]
+    application_security: Literal["not_evaluated", "generated_suite_required"]
+    configuration: Literal["not_applicable", "supported", "unsupported"]
+    host_owned_behavior: Literal["unverified_outside_contract"]
+    security_verification_command: Literal["pytest -q tests/test_public_service_security.py"]
+
+
 class ProjectCheckReport(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: str = CHECK_REPORT_SCHEMA_VERSION
+    schema_version: Literal["2"] = CHECK_REPORT_SCHEMA_VERSION
     manifest_fingerprint: str
     diagnostics: tuple[ProjectDiagnostic, ...]
+    service_evidence: ServiceCheckEvidence
 
 
 def check_manifest(
     manifest: AppManifest,
     *,
+    service_manifest: PublicServiceManifest | None = None,
     tags: frozenset[str] | None = None,
     deploy_only: bool = False,
 ) -> ProjectCheckReport:
@@ -82,6 +110,8 @@ def check_manifest(
         raise ValueError(f"Unknown check tags: {names}.")
 
     diagnostics: list[ProjectDiagnostic] = []
+    if service_manifest is not None:
+        diagnostics.extend(_check_public_service(service_manifest))
     if not manifest.agents:
         diagnostics.append(
             ProjectDiagnostic(
@@ -384,6 +414,169 @@ def check_manifest(
     return ProjectCheckReport(
         manifest_fingerprint=manifest.fingerprint,
         diagnostics=tuple(selected),
+        service_evidence=_service_evidence(service_manifest, diagnostics),
+    )
+
+
+def _check_public_service(manifest: PublicServiceManifest) -> list[ProjectDiagnostic]:
+    if not isinstance(manifest, PublicServiceManifest):
+        raise TypeError("service_manifest must be a PublicServiceManifest.")
+    diagnostics: list[ProjectDiagnostic] = []
+    verification = "cayu check --deploy --fail-on warning --json"
+    if manifest.mode is not ServiceMode.PRODUCTION:
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="PUBLIC_SERVICE_DEVELOPMENT_MODE",
+                severity=DiagnosticSeverity.WARNING,
+                subject="public_service",
+                path="service.mode",
+                message="The maintained public service is assembled in development mode.",
+                hint="Build and serve the service with mode='production'.",
+                tags=("deploy", "security"),
+                documentation_anchor="cayu guide diagnostics#public-service-development-mode",
+                verification_command=verification,
+            )
+        )
+    if manifest.product_access != "authenticated":
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+                severity=DiagnosticSeverity.ERROR,
+                subject="public_service",
+                path="service.product_access",
+                message="The product API does not use configured production authentication.",
+                hint="Configure AuthenticatedProductAccess with trusted tenant resolution.",
+                tags=("deploy", "security"),
+                parameters={"configured": manifest.product_access},
+                documentation_anchor="cayu guide diagnostics#public-service-product-access-unsafe",
+                verification_command=verification,
+            )
+        )
+    if manifest.operator_access != "authenticated":
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+                severity=DiagnosticSeverity.ERROR,
+                subject="public_service",
+                path="service.operator_access",
+                message="The Cayu operator control plane is not authenticated.",
+                hint="Configure AuthenticatedAccess for the separate operator policy.",
+                tags=("deploy", "security"),
+                parameters={"configured": manifest.operator_access},
+                documentation_anchor="cayu guide diagnostics#public-service-operator-access-unsafe",
+                verification_command=verification,
+            )
+        )
+    if manifest.identity_store != "durable":
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
+                severity=DiagnosticSeverity.ERROR,
+                subject="public_service",
+                path="service.identity_store",
+                message="The product identity mapping uses development-only state.",
+                hint="Use durable application-owned tenant-qualified product storage.",
+                tags=("deploy", "security"),
+                parameters={"configured": manifest.identity_store.value},
+                documentation_anchor=(
+                    "cayu guide diagnostics#public-service-identity-store-not-durable"
+                ),
+                verification_command=verification,
+            )
+        )
+    if manifest.runtime_session_store is not RuntimeStoreDurability.DURABLE:
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE",
+                severity=DiagnosticSeverity.ERROR,
+                subject="public_service",
+                path="service.runtime_session_store",
+                message="The public agent service uses a non-durable Cayu session store.",
+                hint="Construct CayuApp with a durable SessionStore for public service work.",
+                tags=("deploy", "security"),
+                parameters={"configured": manifest.runtime_session_store.value},
+                documentation_anchor=(
+                    "cayu guide diagnostics#public-service-session-store-not-durable"
+                ),
+                verification_command=verification,
+            )
+        )
+    if manifest.runtime_task_store == "missing":
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="PUBLIC_SERVICE_TASK_STORE_REQUIRED",
+                severity=DiagnosticSeverity.ERROR,
+                subject="public_service",
+                path="service.runtime_task_store",
+                message="The public agent service has no Cayu task store.",
+                hint="Construct CayuApp with a durable TaskStore for public service work.",
+                tags=("deploy", "security"),
+                documentation_anchor="cayu guide diagnostics#public-service-task-store-required",
+                verification_command=verification,
+            )
+        )
+    elif manifest.runtime_task_store is not RuntimeStoreDurability.DURABLE:
+        diagnostics.append(
+            ProjectDiagnostic(
+                code="PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
+                severity=DiagnosticSeverity.ERROR,
+                subject="public_service",
+                path="service.runtime_task_store",
+                message="The public agent service uses a non-durable Cayu task store.",
+                hint="Construct CayuApp with a durable TaskStore for public service work.",
+                tags=("deploy", "security"),
+                parameters={"configured": manifest.runtime_task_store.value},
+                documentation_anchor=(
+                    "cayu guide diagnostics#public-service-task-store-not-durable"
+                ),
+                verification_command=verification,
+            )
+        )
+    return diagnostics
+
+
+def check_public_service_deployment(
+    manifest: PublicServiceManifest,
+) -> tuple[ProjectDiagnostic, ...]:
+    """Return stable fail-closed findings for a maintained service manifest."""
+
+    return tuple(_check_public_service(manifest))
+
+
+def _service_evidence(
+    manifest: PublicServiceManifest | None,
+    diagnostics: list[ProjectDiagnostic],
+) -> ServiceCheckEvidence:
+    if manifest is None:
+        return ServiceCheckEvidence(
+            control_plane_access="not_evaluated",
+            service_contract="not_declared",
+            application_security="not_evaluated",
+            configuration="not_applicable",
+            host_owned_behavior="unverified_outside_contract",
+            security_verification_command="pytest -q tests/test_public_service_security.py",
+        )
+    unsafe_codes = {
+        "PUBLIC_SERVICE_DEVELOPMENT_MODE",
+        "PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+        "PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_TASK_STORE_REQUIRED",
+    }
+    configured = not any(item.code in unsafe_codes for item in diagnostics)
+    return ServiceCheckEvidence(
+        control_plane_access=(
+            "verified_authenticated"
+            if manifest.operator_access == "authenticated"
+            else "verified_unsafe"
+        ),
+        service_contract="verified_maintained",
+        application_security="generated_suite_required",
+        configuration="supported" if configured else "unsupported",
+        host_owned_behavior="unverified_outside_contract",
+        security_verification_command="pytest -q tests/test_public_service_security.py",
     )
 
 

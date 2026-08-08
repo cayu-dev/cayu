@@ -48,6 +48,9 @@ MANIFEST_TOP_LEVEL_EXPORTS = (
     "DiagnosticSeverity",
     "ProjectCheckReport",
     "ProjectDiagnostic",
+    "PublicServiceManifest",
+    "RuntimeStoreDurability",
+    "ServiceCheckEvidence",
     "check_manifest",
 )
 

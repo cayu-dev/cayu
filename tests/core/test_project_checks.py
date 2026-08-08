@@ -30,7 +30,7 @@ from cayu import (
     WriteFileTool,
     check_manifest,
 )
-from cayu.runtime import BUILTIN_DIAGNOSTIC_CODES
+from cayu.runtime import BUILTIN_DIAGNOSTIC_CODES, PublicServiceManifest
 
 
 class _ExternalTool(Tool):
@@ -93,9 +93,39 @@ def test_builtin_diagnostic_codes_are_unique_and_compatibility_pinned() -> None:
         "APP_NO_AGENTS",
         "EXTERNAL_TOOL_COVERAGE_UNKNOWN",
         "EXTERNAL_TOOL_UNGUARDED",
+        "PUBLIC_SERVICE_DEVELOPMENT_MODE",
+        "PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+        "PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_TASK_STORE_REQUIRED",
         "TOOL_INPUT_SCHEMA_UNCONSTRAINED",
     )
     assert len(BUILTIN_DIAGNOSTIC_CODES) == len(set(BUILTIN_DIAGNOSTIC_CODES))
+
+
+def test_public_service_deployment_rejects_in_memory_runtime_stores() -> None:
+    report = check_manifest(
+        CayuApp(enable_logging=False).describe(),
+        service_manifest=PublicServiceManifest(
+            mode="production",
+            product_access="authenticated",
+            operator_access="authenticated",
+            identity_store="durable",
+            runtime_session_store="development",
+            runtime_task_store="development",
+            product_api_path="/api",
+            control_plane_path="/cayu",
+        ),
+        deploy_only=True,
+    )
+
+    assert [item.code for item in report.diagnostics] == [
+        "PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE",
+        "PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE",
+    ]
+    assert report.service_evidence.configuration == "unsupported"
 
 
 def test_workflow_tool_references_must_match_that_agents_registered_tools() -> None:
@@ -420,6 +450,38 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
     unconstrained_codes = {
         item.code for item in check_manifest(unconstrained.describe()).diagnostics
     }
+    public_service_codes = {
+        item.code
+        for item in check_manifest(
+            unconstrained.describe(),
+            service_manifest=PublicServiceManifest(
+                mode="development",
+                product_access="placeholder",
+                operator_access="open",
+                identity_store="development",
+                runtime_session_store="development",
+                runtime_task_store="missing",
+                product_api_path="/api",
+                control_plane_path="/cayu",
+            ),
+        ).diagnostics
+    }
+    nondurable_task_service_codes = {
+        item.code
+        for item in check_manifest(
+            unconstrained.describe(),
+            service_manifest=PublicServiceManifest(
+                mode="production",
+                product_access="authenticated",
+                operator_access="authenticated",
+                identity_store="durable",
+                runtime_session_store="durable",
+                runtime_task_store="development",
+                product_api_path="/api",
+                control_plane_path="/cayu",
+            ),
+        ).diagnostics
+    }
 
     assert (
         empty_codes
@@ -431,6 +493,8 @@ def test_every_builtin_diagnostic_has_a_seeded_misconfiguration() -> None:
         | structurally_incomplete_codes
         | unfinished_codes
         | unconstrained_codes
+        | public_service_codes
+        | nondurable_task_service_codes
         == set(BUILTIN_DIAGNOSTIC_CODES)
     )
 

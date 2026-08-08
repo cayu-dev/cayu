@@ -96,6 +96,70 @@ properties, required fields, and `additionalProperties` behavior in
 public `Tool.schema` property; Cayu treats that property as authoritative when
 the tool is registered.
 
+## public-service-development-mode
+
+`PUBLIC_SERVICE_DEVELOPMENT_MODE` means the maintained public-service factory
+was assembled with its explicit local-development profile. Development access
+may accept caller-selected test identities and an open operator mount, so it is
+restricted to `cayu serve --dev` on a loopback listener. Build the same service
+factory with `mode="production"` before deployment.
+
+## public-service-product-access-unsafe
+
+`PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE` means the maintained product API uses a
+development or fail-closed placeholder access adapter rather than configured
+production authentication. Configure `AuthenticatedProductAccess` so its
+server-side dependency returns a trusted `ProductPrincipal`. Tenant identity
+must not come from the product request body, query, Cayu labels or metadata,
+model output, or tool input.
+
+## public-service-operator-access-unsafe
+
+`PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE` means the separately mounted `/cayu/`
+operator control plane uses `OpenAccess` or a fail-closed placeholder because
+production authentication is missing or invalid. Configure
+`AuthenticatedAccess` for production. Operator authentication protects the raw
+control plane; it does not make that surface customer-facing or tenant-scoped.
+
+## public-service-identity-store-not-durable
+
+`PUBLIC_SERVICE_IDENTITY_STORE_NOT_DURABLE` means the public-to-private identity
+mapping declares development-only process state. Use durable application-owned
+storage that atomically reserves idempotency identities and performs
+tenant-qualified resource lookup before any Cayu operation. Cayu session IDs,
+task IDs, labels, and metadata are not product authorization state.
+
+## public-service-session-store-not-durable
+
+`PUBLIC_SERVICE_SESSION_STORE_NOT_DURABLE` means the maintained service uses a
+development-only, read-only, or unverified Cayu session store. Public-service
+sessions must survive process restarts and accept runtime writes, so configure
+a built-in durable `SessionStore` or a custom store that explicitly declares
+`service_durability = RuntimeStoreDurability.DURABLE` after its durability
+contract is verified.
+
+## public-service-task-store-required
+
+`PUBLIC_SERVICE_TASK_STORE_REQUIRED` means the maintained public service's
+`CayuApp` has no task store, so it cannot bind and run the private task identity
+reserved by the application-owned product mapping. Configure a durable
+`TaskStore` before deployment.
+
+## public-service-task-store-not-durable
+
+`PUBLIC_SERVICE_TASK_STORE_NOT_DURABLE` means a task store is configured but it
+is development-only or has not declared verified durability. Configure a
+built-in durable `TaskStore` or a custom store that explicitly declares
+`service_durability = RuntimeStoreDurability.DURABLE` after its durability
+contract is verified.
+
+These findings apply only to the inspectable service returned by Cayu's
+maintained factory contract. The check intentionally reports host-owned routes
+outside that contract as unverified; it does not scan arbitrary ASGI source or
+claim to prove its authorization behavior. Run the generated assembled-app
+suite with `pytest -q tests/test_public_service_security.py` in addition to the
+deployment check.
+
 Tool implementations must also declare `run` with `async def`. Cayu validates
 that contract during agent registration so a synchronous implementation fails
 before a session starts.

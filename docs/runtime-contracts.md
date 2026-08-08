@@ -132,6 +132,67 @@ local-development profile or a resolved authentication target; incomplete-
 session startup recovery remains disabled unless bounded statuses and an
 inactivity threshold are configured. See [project server](project-server.md).
 
+A project may additionally declare a synchronous `service_factory` using
+Cayu's maintained public-agent service contract. The factory accepts the
+explicit `ServiceMode` selected by serving or deployment inspection and returns
+one `CayuService`: a process-scoped `CayuApp`, the assembled ASGI application,
+and a content-free `PublicServiceManifest`. The maintained assembler owns the
+narrow product routes and separately mounts the raw `/cayu/` control plane. It
+disables product OpenAPI/docs and CORS by default. Production serving fails
+closed unless product access and operator access are separately authenticated
+and the application-owned identity store declares durable state.
+
+Product authorization remains outside Cayu's native stores. The authenticated
+product dependency returns trusted subject and tenant identity; the product
+store atomically binds tenant, public resource, idempotency fingerprint, opaque
+work identity, and private Cayu session/task identities. Existing-resource
+operations perform a tenant-qualified product lookup before using either Cayu
+identity. Before reservation, the maintained assembler compares every
+caller-controlled value that will cross this durable boundary—the trusted tenant
+identity, idempotency key, and request text—against the application's configured
+workload-secret registry. A collision is rejected without writing; the assembler
+does not persist a raw secret or replace executable request text with a redaction
+marker. Background execution receives only the opaque work identity and
+atomically claims ownership while reloading request state from the product
+store. Before creating Cayu work, the executor recomputes the canonical
+agent/request fingerprint and rejects a worker assembled for a different agent,
+releasing its exact claim for an eligible worker. The claim is leased and
+heartbeated through terminal settlement. While that lease remains valid, another
+delivery cannot acquire the operation. An atomic ownership check immediately
+before provider execution rejects the worker if the store reports that its claim
+is no longer current. Terminal rows retain the settling claim identity. Claim,
+heartbeat, and settlement writes use that identity to reconstruct committed
+state after ambiguous acknowledgement loss and prevent a stale claim from
+overwriting another worker's terminal result.
+This boundary does not promise exactly-once provider effects if a process stalls
+beyond its lease or dies after external work begins; complete worker-replacement
+and external-effect reconciliation remain application concerns. Redelivery can
+create or verify the exact initial pending Cayu task. If that task or its session
+has already advanced, the maintained assembler leaves the product operation
+pending, atomically releases its exact execution claim, and does not redispatch
+provider work or invent a terminal public result. Claim release is idempotent
+after acknowledgement loss and cannot clear a successor's claim. The
+application-owned worker-recovery path must reconcile that durable outcome.
+The maintained synchronous execution path consumes the runtime stream without
+retaining complete events or unbounded text deltas; it keeps only the bounded
+final model turn. It redacts across model-delta boundaries before that result
+enters product storage and applies the bound only to stable redacted output, so
+chunking and truncation cannot expose a complete or partial secret. Product
+responses apply the current workload-secret registry again on every POST and GET
+projection. A secret collision in a public authority identifier fails closed
+instead of changing the identifier.
+Cayu labels, metadata, `AuthContext.tenant`, model/tool values, and raw runtime
+identifiers are never authorization inputs.
+
+`cayu check --deploy` evaluates only this declarative service manifest and
+emits stable findings for development mode, unsafe product access, open
+operator access, non-durable product identity state, and missing,
+development-only, read-only, or unverified runtime session/task stores. Its
+machine-readable evidence marks the generated assembled-ASGI security suite as
+separately required and host-owned behavior outside the contract as unverified.
+Arbitrary ASGI source is not scanned, mirrored into `AppManifest`, or silently
+certified.
+
 `cayu worker <name>` is a process-role adapter over this same factory contract.
 It discovers the nearest configured project, enters its import context, and
 builds the app exactly once. The named worker receives only the app and a

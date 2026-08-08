@@ -21,6 +21,7 @@ from cayu.vaults.local_env import LocalEnvVault
 from cayu.vaults.redaction import (
     REDACTED_SECRET,
     SecretRedactionCapacityError,
+    SecretRedactionStream,
     SecretRedactionTail,
     SecretRedactor,
     contains_redacted_secret,
@@ -36,6 +37,7 @@ __all__ = [
     "SecretEnv",
     "SecretNotFound",
     "SecretRedactionCapacityError",
+    "SecretRedactionStream",
     "SecretRedactionTail",
     "SecretRedactor",
     "SecretRef",

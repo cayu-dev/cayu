@@ -70,3 +70,40 @@ non-goals because they require an importable server factory and separate
 process-lifecycle decisions. Project-side `SystemExit` during import or
 construction is reported as a labeled startup error; Uvicorn's own intentional
 process exit keeps its status.
+
+## Serve a maintained public-agent service
+
+Projects generated with `cayu new NAME --template service` also declare:
+
+```toml
+[tool.cayu]
+factory = "app:build_app"
+service_factory = "service:build_service"
+```
+
+For these projects, `cayu serve` loads the service factory with an explicit
+`development` or `production` mode and serves its assembled FastAPI product app
+on the same listener as the separately mounted `/cayu/` operator control plane.
+The service factory, not `[tool.cayu.serve].auth`, owns the distinct customer
+and operator policies. Supplying both configurations is rejected rather than
+silently choosing one.
+
+`cayu serve --dev` remains loopback-only and selects the generated development
+adapters. Without `--dev`, serving refuses to start if the service manifest
+reports development or placeholder product access, open or placeholder operator
+access, a development-only product identity store, a non-durable runtime session
+store, or a missing or non-durable runtime task store. Run
+`cayu check --deploy --fail-on warning --json` for the stable diagnostic codes.
+Passing an arbitrary ASGI object from `service_factory` is rejected as
+unverified; Cayu does not scan host route source or claim authorization it
+cannot observe.
+
+Maintained product creation accepts at most 1 MiB of encoded JSON and rejects
+duplicate object keys before FastAPI validation. Product responses are marked
+`Cache-Control: private, no-store`.
+
+The built-in listener uses HTTP. A production public service must run behind a
+trusted TLS-terminating ingress or reverse proxy with the backend listener
+restricted to that trusted network. Expose only HTTPS to customers and
+operators; neither bearer policy is safe over a directly exposed HTTP
+connection.

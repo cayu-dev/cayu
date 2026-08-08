@@ -101,6 +101,7 @@ from cayu.runtime.execution_units import (
     copy_tool_round_identity,
 )
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
@@ -5885,6 +5886,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_session_lineage: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
+    service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
 
@@ -5911,6 +5913,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             max_size=max_size,
             schema_mode=schema_mode,
             read_only=read_only,
+        )
+        self.service_durability = (
+            RuntimeStoreDurability.READ_ONLY if read_only else RuntimeStoreDurability.DURABLE
         )
         self._public_authority_alias_codec = public_authority_alias_codec
         self._public_authority_alias_backfill_lock = asyncio.Lock()
@@ -13460,6 +13465,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     """Postgres-backed task store for durable multi-tenant work items."""
 
     supports_task_topology: ClassVar[bool] = True
+    service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = 27
 
     async def create_task(self, request: TaskCreate) -> Task:

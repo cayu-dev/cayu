@@ -30,6 +30,7 @@ from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import ResolutionActor, resolution_actor_payload
 from cayu.runtime.execution_units import ToolRoundIdentity, copy_tool_round_identity
 from cayu.runtime.public_authority import PublicAuthorityAliasCodec
+from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.sessions import (
     _TERMINAL_PUBLICATION_EVIDENCE_EVENT_TYPES,
     _TERMINAL_PUBLICATION_EVIDENCE_QUERY_LIMIT,
@@ -996,6 +997,15 @@ class SQLiteSessionStore(SessionStore):
             raise TypeError("schema_mode must be a SchemaMode.")
         if not isinstance(read_only, bool):
             raise TypeError("read_only must be a bool.")
+        self.service_durability = (
+            RuntimeStoreDurability.READ_ONLY
+            if read_only
+            else (
+                RuntimeStoreDurability.DEVELOPMENT
+                if str(db_path) == ":memory:"
+                else RuntimeStoreDurability.DURABLE
+            )
+        )
         if public_authority_alias_codec is not None and not isinstance(
             public_authority_alias_codec,
             PublicAuthorityAliasCodec,
@@ -8503,6 +8513,11 @@ class SQLiteTaskStore(TaskStore):
             db_path = Path(require_nonblank(path, "path"))
         else:
             raise TypeError("SQLiteTaskStore path must be a string or Path.")
+        self.service_durability = (
+            RuntimeStoreDurability.DEVELOPMENT
+            if str(db_path) == ":memory:"
+            else RuntimeStoreDurability.DURABLE
+        )
         if not isinstance(schema_mode, schema.SchemaMode):
             raise TypeError("schema_mode must be a SchemaMode.")
 

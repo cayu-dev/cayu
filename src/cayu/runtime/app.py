@@ -286,6 +286,7 @@ from cayu.runtime.user_input import (
 )
 from cayu.storage.memory import KnowledgeStore
 from cayu.vaults import (
+    SecretRedactionStream,
     SecretRedactor,
 )
 
@@ -746,6 +747,17 @@ class CayuApp:
     def redact_json(self, value: Any) -> Any:
         """Return a JSON-compatible value with configured secret values redacted."""
         return self._secret_redactor.redact_json(value)
+
+    def stream_redacted_bytes(
+        self,
+        *,
+        max_retained_bytes: int | None = None,
+    ) -> SecretRedactionStream:
+        """Create a chunk-safe redaction stream for application exposure boundaries."""
+
+        return self._secret_redactor.stream_bytes(
+            max_retained_bytes=max_retained_bytes,
+        )
 
     def project_event_record_for_exposure(self, record: EventRecord) -> EventRecord:
         """Project a caller-supplied record without granting persisted authority."""

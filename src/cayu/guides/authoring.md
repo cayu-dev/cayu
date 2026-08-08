@@ -48,6 +48,7 @@ only when the requested behavior requires it.
 | Usage limits or cost control | usage events, run limits, budgets, pricing | `cayu guide references#cost-control` |
 | Developer and operator inspection | `cayu inspect`, `cayu check`, console, dashboard, tracing | `cayu guide references#observability` |
 | An HTTP control plane | `cayu[server]`, authenticated FastAPI application | `cayu guide references#server` |
+| A public or multi-user agent product | `cayu new NAME --template service`, maintained tenant-safe service factory | `cayu guide references#server` |
 | Advanced authority, isolation, caching, or speculation | composed runtime strategies with explicit evidence boundaries | `cayu guide references#advanced-runtime` |
 
 This map is a menu, not a checklist. A conversational, classification,
@@ -65,6 +66,14 @@ application that already owns FastAPI embeds Cayu explicitly with
 `mount_cayu(..., path="/cayu")`. Never use `OpenAccess()` on a public listener.
 Client-IP and forwarded-header checks are not authentication; public or deployed
 mounts require `AuthenticatedAccess(...)` with application-owned authorization.
+
+For a public or multi-user product, start with
+`cayu new NAME --template service`. That template keeps customer authentication,
+tenant-qualified application storage, public identifiers, allow-listed product
+responses, and the operator-only `/cayu/` mount in one maintained service
+factory. Its deployment check proves only the declarative factory posture; the
+generated assembled-ASGI security suite proves the product behavior. Arbitrary
+host-owned routes remain outside Cayu's verification boundary.
 
 Online, the repository's
 [examples index](https://github.com/cayu-dev/cayu/blob/main/examples/README.md)

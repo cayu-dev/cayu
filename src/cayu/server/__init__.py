@@ -43,6 +43,12 @@ try:
     from fastapi import Request  # noqa: TC002 - FastAPI resolves endpoint annotations at runtime
     from starlette.responses import RedirectResponse
 
+    from cayu.runtime.service_manifest import (
+        PublicServiceManifest,
+        RuntimeStoreDurability,
+        ServiceIdentityStoreKind,
+        ServiceMode,
+    )
     from cayu.server._diagnostics import dashboard_pricing_metadata
     from cayu.server.auth import AuthContext, AuthDependency, BasicAuth
     from cayu.server.config import (
@@ -68,6 +74,24 @@ try:
     )
     from cayu.server.contracts import SERVER_API_PREFIX, validate_usage_rollup_price_book
     from cayu.server.routes import create_router
+    from cayu.server.service import (
+        AuthenticatedProductAccess,
+        CayuService,
+        DevelopmentProductAccess,
+        OperatorAccess,
+        PlaceholderOperatorAccess,
+        PlaceholderProductAccess,
+        ProductAccess,
+        ProductExecutionClaimLost,
+        ProductIdempotencyConflict,
+        ProductOperation,
+        ProductOperationExecutionClaim,
+        ProductOperationReservation,
+        ProductOperationSettlementConflict,
+        ProductOperationStore,
+        ProductPrincipal,
+        create_agent_service,
+    )
     from cayu.server.sse import event_to_sse_data
     from cayu.server.static import DashboardStaticFiles
 except ModuleNotFoundError as exc:
@@ -91,18 +115,38 @@ __all__ = [
     "AuthContext",
     "AuthDependency",
     "AuthenticatedAccess",
+    "AuthenticatedProductAccess",
     "BasicAuth",
+    "CayuService",
     "CorsConfig",
     "DashboardConfig",
     "DashboardStaticFiles",
+    "DevelopmentProductAccess",
     "DocsConfig",
     "EvalsConfig",
     "EvaluationPromotionConfig",
     "OpenAccess",
+    "OperatorAccess",
+    "PlaceholderOperatorAccess",
+    "PlaceholderProductAccess",
+    "ProductAccess",
+    "ProductExecutionClaimLost",
+    "ProductIdempotencyConflict",
+    "ProductOperation",
+    "ProductOperationExecutionClaim",
+    "ProductOperationReservation",
+    "ProductOperationSettlementConflict",
+    "ProductOperationStore",
+    "ProductPrincipal",
+    "PublicServiceManifest",
+    "RuntimeStoreDurability",
     "ServerAccessConfig",
     "ServerApiConfig",
     "ServerConfig",
     "ServerLifecycleConfig",
+    "ServiceIdentityStoreKind",
+    "ServiceMode",
+    "create_agent_service",
     "create_router",
     "create_server",
     "event_to_sse_data",

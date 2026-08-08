@@ -145,6 +145,7 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
 )
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
+from cayu.runtime.service_manifest import RuntimeStoreDurability
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
@@ -5130,6 +5131,7 @@ class SessionStore(ABC):
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_terminal_session_evidence: ClassVar[bool] = False
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
+    service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @property
     def public_authority_alias_codec(self) -> PublicAuthorityAliasCodec | None:
@@ -6448,6 +6450,7 @@ class InMemorySessionStore(SessionStore):
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
+    service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
         self,

@@ -6,7 +6,13 @@ import sys
 from typing import Any
 
 from cayu.cli._output import add_output_options, output_destination
-from cayu.cli.project import ProjectError, build_project_app, project_context, resolve_project
+from cayu.cli.project import (
+    ProjectError,
+    build_project_app,
+    build_project_service,
+    project_context,
+    resolve_project,
+)
 from cayu.runtime.checks import (
     AVAILABLE_CHECK_TAGS,
     DiagnosticSeverity,
@@ -69,10 +75,24 @@ def _run_check(args: argparse.Namespace) -> int:
     try:
         project = resolve_project(args.target, command="cayu check")
         with project_context(project.root):
-            app = build_project_app(project.target, command="Check")
+            service = (
+                None
+                if project.service_target is None
+                else build_project_service(
+                    project.service_target,
+                    mode="production",
+                    command="Check",
+                )
+            )
+            app = (
+                build_project_app(project.target, command="Check")
+                if service is None
+                else service.cayu_app
+            )
             manifest = app.describe(project_root=project.root)
         report = check_manifest(
             manifest,
+            service_manifest=None if service is None else service.manifest,
             tags=requested_tags,
             deploy_only=args.deploy,
         )

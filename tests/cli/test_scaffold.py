@@ -39,6 +39,14 @@ _RESERVED_TEMPLATE_TOKENS = (
 
 
 def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> None:
+    class FalsySessionStore(InMemorySessionStore):
+        def __bool__(self) -> bool:
+            return False
+
+    class FalsyTaskStore(InMemoryTaskStore):
+        def __bool__(self) -> bool:
+            return False
+
     assert main(["new", "myproj", "--dir", str(tmp_path)]) == 0
     proj = tmp_path / "myproj"
     for filename in (
@@ -64,10 +72,12 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert hasattr(module, "build_app")
     assert not any(isinstance(value, CayuApp) for value in vars(module).values())
 
+    session_store = FalsySessionStore()
+    task_store = FalsyTaskStore()
     first_app = module.build_app(
         provider=ScriptedModelProvider([]),
-        session_store=InMemorySessionStore(),
-        task_store=InMemoryTaskStore(),
+        session_store=session_store,
+        task_store=task_store,
     )
     second_app = module.build_app(
         provider=ScriptedModelProvider([]),
@@ -75,6 +85,8 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
         task_store=InMemoryTaskStore(),
     )
     assert first_app is not second_app
+    assert first_app.session_store is session_store
+    assert first_app.task_store is task_store
 
     app_source = (proj / "app.py").read_text(encoding="utf-8")
     configuration_source = (proj / "configuration.py").read_text(encoding="utf-8")
@@ -90,7 +102,7 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
     assert '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"' in pyproject
-    assert 'SQLiteSessionStore(\n            "data/cayu.db",' in app_source
+    assert 'else SQLiteSessionStore(\n                "data/cayu.db",' in app_source
     assert "public_authority_alias_codec_from_environment()" in app_source
     assert 'SQLiteTaskStore("data/cayu.db")' in app_source
     assert "sessions.sqlite" not in app_source
@@ -127,6 +139,138 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "uv run cayu serve --dev" in output
     assert "http://127.0.0.1:8000/cayu/" in output
     assert "none selected" in output
+
+
+def test_cayu_new_service_emits_the_supported_secure_product_shell(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    assert main(["new", "myservice", "--template", "service", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "myservice"
+
+    for filename in (
+        "service.py",
+        "product_store.py",
+        "tests/test_public_service_security.py",
+    ):
+        assert (project / filename).is_file()
+    pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'dependencies = ["cayu[server]>=0.1.0"]' in pyproject
+    assert 'dev = ["pytest", "ruff>=0.15.15,<0.16"]' in pyproject
+    assert 'service_factory = "service:build_service"' in pyproject
+    assert 'factory = "app:build_app"' in pyproject
+
+    service_source = (project / "service.py").read_text(encoding="utf-8")
+    product_store_source = (project / "product_store.py").read_text(encoding="utf-8")
+    assert "create_agent_service(" in service_source
+    assert "await asyncio.to_thread" in product_store_source
+    assert "claim_execution" in product_store_source
+    assert "heartbeat_execution" in product_store_source
+    assert "release_execution" in product_store_source
+    assert "execution_claim_id" in product_store_source
+    assert "ProductExecutionClaimLost" in product_store_source
+    assert "AuthenticatedProductAccess" in service_source
+    assert "AuthenticatedAccess" in service_source
+    assert "PlaceholderOperatorAccess" in service_source
+    assert "ProductPrincipal" in service_source
+    assert "PRODUCT_AUTH_TOKENS_JSON" in service_source
+    assert "CAYU_OPERATOR_BEARER_TOKEN" in service_source
+    assert "@app." not in service_source
+    assert "create_agent_service(" in service_source
+
+    security_test = (project / "tests/test_public_service_security.py").read_text(encoding="utf-8")
+    for phrase in (
+        "anonymous",
+        "cross_tenant",
+        "idempotency",
+        "control_plane",
+        "redact",
+        "background",
+        "oversized",
+    ):
+        assert phrase in security_test
+
+    readme = (project / "README.md").read_text(encoding="utf-8")
+    agents = (project / "AGENTS.md").read_text(encoding="utf-8")
+    for guidance in (readme, agents):
+        assert "cayu check --deploy --fail-on warning --json" in guidance
+        assert "pytest -q tests/test_public_service_security.py" in guidance
+        assert "customer" in guidance
+        assert "operator" in guidance
+        assert "tenant-qualified" in guidance
+        assert "arbitrary ASGI" in guidance
+    assert "TLS-terminating" in readme
+    assert "Never send either bearer token" in readme
+    assert "at most 1 MiB of encoded JSON" in readme
+    assert "private, no-store" in readme
+
+    output = capsys.readouterr().out
+    assert "cayu check --deploy --fail-on warning --json" in output
+    assert "pytest -q tests/test_public_service_security.py" in output
+    assert "Product API: http://127.0.0.1:8000/api/operations" in output
+    assert "Operator control plane: http://127.0.0.1:8000/cayu/" in output
+
+
+def test_scaffolded_service_deploy_check_fails_closed_then_accepts_configured_auth(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    assert main(["new", "service", "--template", "service", "--dir", str(tmp_path)]) == 0
+    project = tmp_path / "service"
+    capsys.readouterr()
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("PRODUCT_AUTH_TOKENS_JSON", raising=False)
+    monkeypatch.delenv("CAYU_OPERATOR_BEARER_TOKEN", raising=False)
+
+    assert main(["check", "--deploy", "--json"]) == 1
+    unsafe = json.loads(capsys.readouterr().out)
+    assert [item["code"] for item in unsafe["diagnostics"]] == [
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE",
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE",
+    ]
+
+    monkeypatch.setenv("PRODUCT_AUTH_TOKENS_JSON", '{"customer-token":null}')
+    monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "operator-token")
+    assert main(["check", "--deploy", "--json"]) == 1
+    invalid_principal = json.loads(capsys.readouterr().out)
+    assert [item["code"] for item in invalid_principal["diagnostics"]] == [
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE"
+    ]
+
+    monkeypatch.setenv(
+        "PRODUCT_AUTH_TOKENS_JSON",
+        json.dumps({"tøk": {"tenant_id": "tenant-a", "subject_id": "alice"}}),
+    )
+    assert main(["check", "--deploy", "--json"]) == 1
+    invalid_product_token = json.loads(capsys.readouterr().out)
+    assert [item["code"] for item in invalid_product_token["diagnostics"]] == [
+        "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE"
+    ]
+
+    monkeypatch.setenv(
+        "PRODUCT_AUTH_TOKENS_JSON",
+        '{"customer-token":{"tenant_id":"tenant-a","subject_id":"alice"}}',
+    )
+    monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "øperator-token")
+    assert main(["check", "--deploy", "--json"]) == 1
+    invalid_operator_token = json.loads(capsys.readouterr().out)
+    assert [item["code"] for item in invalid_operator_token["diagnostics"]] == [
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE"
+    ]
+
+    monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "customer-token")
+    assert main(["check", "--deploy", "--json"]) == 1
+    overlapping = json.loads(capsys.readouterr().out)
+    assert [item["code"] for item in overlapping["diagnostics"]] == [
+        "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE"
+    ]
+
+    monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "operator-token")
+    assert main(["check", "--deploy", "--fail-on", "warning", "--json"]) == 0
+    supported = json.loads(capsys.readouterr().out)
+    assert supported["diagnostics"] == []
+    assert supported["service_evidence"]["configuration"] == "supported"
 
 
 def test_scaffold_subscription_mode_selects_a_compatible_model(

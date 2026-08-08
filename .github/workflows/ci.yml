@@ -478,6 +478,39 @@ jobs:
           check = json.loads(Path("completed-check.json").read_text())
           assert check["diagnostics"] == []
           PY
+      - name: Check built-wheel secure public-service contract
+        run: |
+          uv pip install --python .release-server-venv/bin/python pytest 'ruff>=0.15.15,<0.16'
+          service_root="$(mktemp -d)"
+          .release-server-venv/bin/cayu new proof-service \
+            --template service --dir "$service_root"
+          cd "$service_root/proof-service"
+          unset PYTHONPATH
+          export PRODUCT_AUTH_TOKENS_JSON='{"customer-token":{"tenant_id":"tenant-a","subject_id":"alice"}}'
+          export CAYU_OPERATOR_BEARER_TOKEN='operator-token'
+          "$GITHUB_WORKSPACE/.release-server-venv/bin/cayu" \
+            check --deploy --fail-on warning --json > deployment-check.json
+          "$GITHUB_WORKSPACE/.release-server-venv/bin/python" - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("deployment-check.json").read_text())
+          assert report["diagnostics"] == []
+          assert report["service_evidence"] == {
+              "application_security": "generated_suite_required",
+              "configuration": "supported",
+              "control_plane_access": "verified_authenticated",
+              "host_owned_behavior": "unverified_outside_contract",
+              "security_verification_command": (
+                  "pytest -q tests/test_public_service_security.py"
+              ),
+              "service_contract": "verified_maintained",
+          }
+          PY
+          "$GITHUB_WORKSPACE/.release-server-venv/bin/python" \
+            -m pytest -q tests/test_public_service_security.py
+          "$GITHUB_WORKSPACE/.release-server-venv/bin/ruff" check .
+          "$GITHUB_WORKSPACE/.release-server-venv/bin/ruff" format --check .
       - run: .release-venv/bin/cayu console --help
       - name: Check optional console dependency guidance
         run: |

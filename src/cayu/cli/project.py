@@ -22,6 +22,7 @@ from cayu.runtime.app import CayuApp
 class CayuProject:
     root: Path
     target: str
+    service_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class _ConfiguredCayuProject:
     root: Path
     pyproject: Path
     factory_target: str
+    service_factory_target: str | None
     config: dict[str, Any]
 
 
@@ -198,6 +200,15 @@ def _discover_configured_project(
             root=discovered.root,
             pyproject=discovered.pyproject,
             factory_target=factory_target,
+            service_factory_target=(
+                None
+                if "service_factory" not in discovered.config
+                else _configured_target(
+                    discovered.config["service_factory"],
+                    pyproject=discovered.pyproject,
+                    key="service_factory",
+                )
+            ),
             config=discovered.config,
         )
 
@@ -224,7 +235,11 @@ def resolve_project(
         configuration_example='[tool.cayu] factory = "module:build_app"',
         explicit_target_example=("module:build_app" if suggest_explicit_target else None),
     )
-    return CayuProject(root=configured.root, target=configured.factory_target)
+    return CayuProject(
+        root=configured.root,
+        target=configured.factory_target,
+        service_target=configured.service_factory_target,
+    )
 
 
 def resolve_eval_project(
@@ -352,3 +367,62 @@ def build_project_app(target: str, *, command: str = "Project") -> CayuApp:
     if not isinstance(app, CayuApp):
         raise ProjectError(f"{command} factory must return a CayuApp.")
     return app
+
+
+def build_project_service(
+    target: str,
+    *,
+    mode: str,
+    command: str = "Project",
+):
+    """Build one maintained public service using its explicit profile parameter."""
+
+    from cayu.server import ServiceMode
+    from cayu.server.service import _is_maintained_service
+
+    try:
+        factory = load_target(
+            target,
+            label=f"{command} service factory target",
+            normalize_errors=True,
+        )
+    except TargetResolutionError as exc:
+        raise ProjectError(str(exc)) from exc
+    if not callable(factory):
+        raise ProjectError(f"{command} service factory target must be callable.")
+    if inspect.iscoroutinefunction(factory):
+        raise ProjectError(f"{command} service factory must be synchronous.")
+    try:
+        signature = inspect.signature(factory)
+    except (TypeError, ValueError) as exc:
+        raise ProjectError(
+            f"{command} service factory must expose a keyword 'mode' parameter."
+        ) from exc
+    mode_parameter = signature.parameters.get("mode")
+    if mode_parameter is None or mode_parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+        raise ProjectError(f"{command} service factory must accept a keyword 'mode' parameter.")
+    unexpected_required = [
+        parameter.name
+        for parameter in signature.parameters.values()
+        if parameter.name != "mode"
+        and parameter.default is inspect.Parameter.empty
+        and parameter.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    ]
+    if unexpected_required:
+        raise ProjectError(
+            f"{command} service factory has unsupported required parameters: "
+            f"{', '.join(unexpected_required)}."
+        )
+
+    service = factory(mode=ServiceMode(mode))
+    if inspect.iscoroutine(service):
+        service.close()
+    if inspect.isawaitable(service):
+        raise ProjectError(f"{command} service factory returned an awaitable.")
+    if not _is_maintained_service(service):
+        raise ProjectError(
+            f"{command} service factory must return the unmodified result of "
+            "create_agent_service(); arbitrary ASGI apps are unverified, and fabricated "
+            "CayuService instances are unverified."
+        )
+    return service

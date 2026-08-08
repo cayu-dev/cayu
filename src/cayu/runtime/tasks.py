@@ -34,6 +34,7 @@ from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
 from cayu.runtime.aggregates import EXACT_AGGREGATE, AggregateAccuracy, AggregateCount
+from cayu.runtime.service_manifest import RuntimeStoreDurability
 
 
 class TaskStatus(StrEnum):
@@ -805,6 +806,7 @@ class TaskStore(ABC):
     """Persistent store for durable work items."""
 
     supports_task_topology: ClassVar[bool] = False
+    service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @abstractmethod
     async def create_task(self, request: TaskCreate) -> Task:
@@ -987,6 +989,7 @@ class InMemoryTaskStore(TaskStore):
     """In-process task store for tests, local development, and examples."""
 
     supports_task_topology: ClassVar[bool] = True
+    service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()

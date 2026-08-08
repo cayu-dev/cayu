@@ -105,6 +105,7 @@ from cayu.runtime.checks import (
     DiagnosticSeverity,
     ProjectCheckReport,
     ProjectDiagnostic,
+    ServiceCheckEvidence,
     check_manifest,
 )
 from cayu.runtime.context import (
@@ -307,6 +308,7 @@ from cayu.runtime.retry_policy import (
     copy_retry_policy,
     retry_decision,
 )
+from cayu.runtime.service_manifest import PublicServiceManifest, RuntimeStoreDurability
 from cayu.runtime.sessions import (
     DEFAULT_PENDING_ACTION_RESULT_MAX_BYTES,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
@@ -767,6 +769,7 @@ __all__ = [
     "ProviderOperationInspectionStatus",
     "PublicAuthorityAliasCodec",
     "PublicAuthorityAliasKeyring",
+    "PublicServiceManifest",
     "RecentTurnsContextPolicy",
     "RegisteredAgent",
     "RegisteredEnvironment",
@@ -811,7 +814,9 @@ __all__ = [
     "RuntimePublicationReceipt",
     "RuntimePublicationRequest",
     "RuntimePublicationResult",
+    "RuntimeStoreDurability",
     "SerializedRecordSummary",
+    "ServiceCheckEvidence",
     "Session",
     "SessionAggregateFilter",
     "SessionBudgetInspection",

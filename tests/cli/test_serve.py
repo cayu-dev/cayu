@@ -3,12 +3,15 @@ from __future__ import annotations
 import sys
 from base64 import b64encode
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
+import cayu.cli.serve as serve_cli
 from cayu.cli import main
+from cayu.cli.scaffold import project_files
 from cayu.runtime.sessions import SessionStatus
 
 
@@ -50,6 +53,138 @@ def test_serve_fails_closed_before_building_an_unauthenticated_app(
     assert "Refusing to start an unauthenticated server" in error
     assert "secure default" not in error
     assert "must_not_build" not in sys.modules
+
+
+def test_serve_uses_the_maintained_service_factory_for_explicit_local_development(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    for relative, content in project_files("service", template="service").items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    launched: dict[str, Any] = {}
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.run = lambda server, *, host, port: launched.update(  # type: ignore[attr-defined]
+        server=server,
+        host=host,
+        port=port,
+    )
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["serve", "--dev", "--port", "8123"]) == 0
+
+    assert launched["host"] == "127.0.0.1"
+    assert launched["port"] == 8123
+    manifest = launched["server"].state.cayu_public_service_manifest
+    assert manifest.mode == "development"
+    assert manifest.product_access == "development"
+    assert manifest.operator_access == "open"
+    output = capsys.readouterr().out
+    assert "Cayu product service: http://127.0.0.1:8123/api/operations" in output
+    assert "Cayu operator control plane: http://127.0.0.1:8123/cayu/" in output
+
+
+def test_serve_reports_custom_product_and_control_plane_paths(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        """[tool.cayu]
+factory = "unused:build_app"
+service_factory = "unused:build_service"
+""",
+        encoding="utf-8",
+    )
+    service = SimpleNamespace(
+        asgi_app=object(),
+        manifest=SimpleNamespace(
+            product_api_path="/product/v1",
+            control_plane_path="/operators",
+        ),
+    )
+    monkeypatch.setattr(
+        serve_cli,
+        "build_project_service",
+        lambda _target, *, mode, command: service,
+    )
+    launched: dict[str, Any] = {}
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.run = lambda server, *, host, port: launched.update(  # type: ignore[attr-defined]
+        server=server,
+        host=host,
+        port=port,
+    )
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["serve", "--dev", "--host", "::1", "--port", "8124"]) == 0
+
+    assert launched["server"] is service.asgi_app
+    assert launched["host"] == "::1"
+    output = capsys.readouterr().out
+    assert "Cayu product service: http://[::1]:8124/product/v1/operations" in output
+    assert "Cayu operator control plane: http://[::1]:8124/operators/" in output
+
+
+def test_serve_refuses_unsafe_production_service_before_starting_listener(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    for relative, content in project_files("service", template="service").items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.run = lambda *args, **kwargs: pytest.fail("unsafe service must not listen")  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+    monkeypatch.delenv("PRODUCT_AUTH_TOKENS_JSON", raising=False)
+    monkeypatch.delenv("CAYU_OPERATOR_BEARER_TOKEN", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["serve", "--host", "0.0.0.0"]) == 1
+
+    error = capsys.readouterr().err
+    assert "Refusing to start an unsafe public service" in error
+    assert "PUBLIC_SERVICE_PRODUCT_ACCESS_UNSAFE" in error
+    assert "PUBLIC_SERVICE_OPERATOR_ACCESS_UNSAFE" in error
+
+
+def test_serve_starts_supported_production_service_on_one_listener(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    for relative, content in project_files("service", template="service").items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    launched: dict[str, Any] = {}
+    uvicorn = ModuleType("uvicorn")
+    uvicorn.run = lambda server, *, host, port: launched.update(  # type: ignore[attr-defined]
+        server=server,
+        host=host,
+        port=port,
+    )
+    monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
+    monkeypatch.setenv(
+        "PRODUCT_AUTH_TOKENS_JSON",
+        '{"customer-token":{"tenant_id":"tenant-a","subject_id":"alice"}}',
+    )
+    monkeypatch.setenv("CAYU_OPERATOR_BEARER_TOKEN", "operator-token")
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["serve", "--host", "0.0.0.0", "--port", "9000"]) == 0
+
+    assert launched["host"] == "0.0.0.0"
+    assert launched["port"] == 9000
+    manifest = launched["server"].state.cayu_public_service_manifest
+    assert manifest.mode == "production"
+    assert manifest.product_access == "authenticated"
+    assert manifest.operator_access == "authenticated"
 
 
 def test_serve_discovers_project_and_runs_one_local_process(

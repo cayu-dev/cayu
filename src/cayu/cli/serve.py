@@ -13,6 +13,7 @@ from typing import Any, cast
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import (
     build_project_app,
+    build_project_service,
     discover_cayu_project_configuration,
     project_context,
     resolve_project,
@@ -75,7 +76,7 @@ def run_serve(args: argparse.Namespace) -> int:
         )
         settings = _serve_settings(project.root)
         auth_target = settings.auth_target if args.auth is None else args.auth
-        if not args.dev and auth_target is None:
+        if project.service_target is None and not args.dev and auth_target is None:
             raise ServeError(
                 "Refusing to start an unauthenticated server. Pass --dev only for "
                 "trusted local development or configure an authentication target."
@@ -92,28 +93,64 @@ def run_serve(args: argparse.Namespace) -> int:
                         "Cayu serve requires the server extra. "
                         'Install it with: pip install "cayu[server]"'
                     ) from exc
-                auth = None if args.dev else _load_auth(auth_target)
-                app = build_project_app(project.target, command="Serve")
-                lifecycle = server_module.ServerLifecycleConfig(
-                    startup_recovery_statuses=settings.startup_recovery_statuses,
-                    recovery_inactive_after_seconds=settings.recovery_inactive_after_seconds,
-                )
-                config = (
-                    server_module.ServerConfig.local_development(lifecycle=lifecycle)
-                    if args.dev
-                    else server_module.ServerConfig.protected(auth, lifecycle=lifecycle)
-                )
-                server = server_module.create_server(app, config=config)
+                if project.service_target is not None:
+                    if args.auth is not None or settings.auth_target is not None:
+                        raise ServeError(
+                            "A maintained public service owns its separate product and operator "
+                            "access policies; do not configure [tool.cayu.serve].auth or --auth."
+                        )
+                    service = build_project_service(
+                        project.service_target,
+                        mode="development" if args.dev else "production",
+                        command="Serve",
+                    )
+                    if not args.dev:
+                        from cayu.runtime.checks import check_public_service_deployment
+
+                        findings = check_public_service_deployment(service.manifest)
+                        if findings:
+                            codes = ", ".join(item.code for item in findings)
+                            raise ServeError(
+                                "Refusing to start an unsafe public service: "
+                                f"{codes}. Run `cayu check --deploy --fail-on warning --json`."
+                            )
+                    server = service.asgi_app
+                    config = None
+                else:
+                    auth = None if args.dev else _load_auth(auth_target)
+                    app = build_project_app(project.target, command="Serve")
+                    lifecycle = server_module.ServerLifecycleConfig(
+                        startup_recovery_statuses=settings.startup_recovery_statuses,
+                        recovery_inactive_after_seconds=settings.recovery_inactive_after_seconds,
+                    )
+                    config = (
+                        server_module.ServerConfig.local_development(lifecycle=lifecycle)
+                        if args.dev
+                        else server_module.ServerConfig.protected(auth, lifecycle=lifecycle)
+                    )
+                    server = server_module.create_server(app, config=config)
             except SystemExit as exc:
                 status = exc.code if type(exc.code) is int else 1
                 raise ServeError(
                     f"Serve project startup raised SystemExit with status {status}."
                 ) from exc
             try:
-                print(
-                    "Cayu control plane: "
-                    f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
-                )
+                if project.service_target is None:
+                    assert config is not None
+                    print(
+                        "Cayu control plane: "
+                        f"{_control_plane_url(args.host, args.port, config.dashboard.path)}"
+                    )
+                else:
+                    print(
+                        "Cayu product service: "
+                        f"{_service_endpoint_url(args.host, args.port, service.manifest.product_api_path)}"
+                        "/operations"
+                    )
+                    print(
+                        "Cayu operator control plane: "
+                        f"{_control_plane_url(args.host, args.port, service.manifest.control_plane_path)}"
+                    )
                 uvicorn.run(server, host=args.host, port=args.port)
             except SystemExit as exc:
                 return exc.code if isinstance(exc.code, int) else 1
@@ -239,7 +276,11 @@ def _port(value: str) -> int:
 
 
 def _control_plane_url(host: str, port: int, path: str) -> str:
-    url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
     stripped_path = path.strip("/")
     url_path = "/" if not stripped_path else f"/{stripped_path}/"
-    return f"http://{url_host}:{port}{url_path}"
+    return _service_endpoint_url(host, port, url_path)
+
+
+def _service_endpoint_url(host: str, port: int, path: str) -> str:
+    url_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{url_host}:{port}{path}"

@@ -37,6 +37,37 @@ lookup.
 
 ## Safe application-owned boundary
 
+For new services, generate the maintained tracer bullet first:
+
+```bash
+cayu new my-service --template service
+```
+
+Its `build_service(*, mode=...)` factory is shared by `cayu serve`,
+`cayu check --deploy`, generated documentation, and
+`tests/test_public_service_security.py`. The factory owns a narrow product API,
+separate product and operator authentication policies, an authenticated
+`/cayu/` mount in production, and an inspectable identity-store category. The
+generated SQLite product store demonstrates atomic idempotency and
+tenant-qualified lookup for a single service process. Replace it with an
+equivalent shared application store before multi-process scaling.
+
+The generated `cayu serve` command is an HTTP backend listener. In production,
+place it behind trusted TLS termination, restrict direct access to the backend,
+and expose only the HTTPS endpoint. Product and operator bearer credentials
+must never cross a directly exposed plaintext connection.
+
+Production admission requires both:
+
+```bash
+cayu check --deploy --fail-on warning --json
+pytest -q tests/test_public_service_security.py
+```
+
+The first command checks Cayu-owned declarative exposure facts. The second
+exercises the assembled application. Neither command certifies arbitrary
+FastAPI/ASGI routes added outside the maintained factory.
+
 Expose product-owned routes to end users and authorize a product resource before
 calling Cayu. Keep the association between the public product id, tenant, opaque
 Cayu session id, and durable task id in trusted application storage. Make every
@@ -46,6 +77,11 @@ fingerprint of the accepted creation request with the reservation. The same
 idempotency key and fingerprint return the original row; the same key with a
 different fingerprint is a conflict. A missing Cayu session id must fail closed;
 passing `None` to an optional Cayu query filter means that filter is not applied.
+
+The generated service chooses a stricter globally unique idempotency identity,
+so reuse by another tenant also returns a non-disclosing conflict. An equivalent
+shared store may preserve that rule with a global reservation table while using
+tenant-scoped keys for its product records.
 
 The central query must include the authenticated tenant as a criterion, for
 example:
@@ -59,10 +95,12 @@ WHERE public_id = :public_id AND tenant_id = :authenticated_tenant
 A missing row is denied or reported as not found. Do not load by `public_id`
 first and compare a caller-supplied tenant afterward.
 
-The following application sketch shows where the boundary belongs.
+The following application sketch shows the equivalent boundary for an advanced
+host that deliberately does not adopt the maintained service factory.
 `StartRunBody`, `Principal`, `ProductRunStore`, `IdempotencyConflict`,
 `require_product_principal`, and `require_operator` are application-owned
-symbols; they are intentionally not Cayu abstractions.
+symbols in that custom composition. Cayu reports this host-owned behavior as
+unverified rather than inferring authorization from source.
 `ProductRunStore.reserve(...)` uses an atomic insert-or-load under the unique
 `(tenant_id, idempotency_key)` constraint. On the first call it allocates
 non-null `public_id`, `cayu_session_id`, and `task_id` values and persists the
