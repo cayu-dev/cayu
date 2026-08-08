@@ -32,10 +32,12 @@ import {
 } from "@/components/ui/table"
 import {
   cancelEvalRun,
+  compareEvalRuns,
   createEvalRun,
   downloadEvalCorpus,
   downloadEvalResultHtml,
   downloadEvalResultJson,
+  type EvalComparison,
   type EvalCorpusEntry,
   type EvalResult,
   type EvalRun,
@@ -51,6 +53,7 @@ import {
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
 import {
   createEvalIdempotencyKey,
+  evalComparisonReasonText,
   evalErrorMessage,
   evalRunCanCancel,
   evalRunHasResult,
@@ -697,6 +700,24 @@ function RunsView({
     enabled: evalRunHasResult(selectedRun.data),
     staleTime: Number.POSITIVE_INFINITY,
   })
+  const comparison = useQuery({
+    queryKey: ["evals", "comparison", search.baseline, search.run],
+    queryFn: ({ signal }) => compareEvalRuns(search.baseline ?? "", search.run ?? "", signal),
+    enabled:
+      result.data !== undefined &&
+      search.baseline !== undefined &&
+      search.run !== undefined &&
+      search.baseline !== search.run,
+    staleTime: Number.POSITIVE_INFINITY,
+  })
+  const comparisonCandidates =
+    runs.data?.items.filter(
+      (run) =>
+        run.spec.run_id !== search.run &&
+        run.status === "completed" &&
+        run.result !== null &&
+        run.result !== undefined,
+    ) ?? []
   const selectedRunUpdatedAt = selectedRun.data?.updated_at
 
   useEffect(() => {
@@ -891,11 +912,29 @@ function RunsView({
                 />
               </DataCard>
             ) : result.data ? (
-              <ResultInspector
-                result={result.data}
-                pendingAction={pendingAction}
-                download={downloadResult}
-              />
+              <>
+                <ResultInspector
+                  result={result.data}
+                  pendingAction={pendingAction}
+                  download={downloadResult}
+                />
+                <ComparisonPanel
+                  key={`${search.run}:${search.baseline ?? ""}`}
+                  currentRunId={search.run ?? ""}
+                  baselineRunId={search.baseline}
+                  candidates={comparisonCandidates}
+                  comparison={comparison.data}
+                  loading={comparison.isLoading && comparison.fetchStatus === "fetching"}
+                  error={comparison.error}
+                  retry={() => void comparison.refetch()}
+                  selectBaseline={(baseline) =>
+                    updateSearch((current) => ({
+                      ...evalsSearchWithout(current, "baseline"),
+                      ...(baseline ? { baseline } : {}),
+                    }))
+                  }
+                />
+              </>
             ) : null)}
         </div>
       ) : null}
@@ -1197,6 +1236,164 @@ function ResultInspector({
         </div>
       )}
     </DataCard>
+  )
+}
+
+function ComparisonPanel({
+  currentRunId,
+  baselineRunId,
+  candidates,
+  comparison,
+  loading,
+  error,
+  retry,
+  selectBaseline,
+}: {
+  currentRunId: string
+  baselineRunId?: string
+  candidates: Array<EvalRun>
+  comparison?: EvalComparison
+  loading: boolean
+  error: unknown
+  retry: () => void
+  selectBaseline: (runId?: string) => void
+}) {
+  const [draft, setDraft] = useState(baselineRunId ?? "")
+  const normalizedDraft = draft.trim()
+  const baselineIsSelf = baselineRunId === currentRunId
+  const draftIsValid =
+    normalizedDraft.length > 0 && normalizedDraft.length <= 512 && normalizedDraft !== currentRunId
+
+  return (
+    <DataCard
+      title="Compare runs"
+      description="The server decides whether two immutable results share a compatible eval contract."
+    >
+      <form
+        className="flex min-w-0 flex-wrap items-end gap-2 border-b border-border p-4"
+        onSubmit={(event) => {
+          event.preventDefault()
+          if (draftIsValid) selectBaseline(normalizedDraft)
+        }}
+      >
+        <label className="min-w-64 flex-1 text-xs font-medium text-muted-foreground">
+          Baseline run ID
+          <input
+            type="text"
+            list="eval-baseline-candidates"
+            value={draft}
+            maxLength={512}
+            className="mt-1 h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground"
+            placeholder="Select or paste a completed run ID"
+            aria-invalid={normalizedDraft.length > 0 && !draftIsValid}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <datalist id="eval-baseline-candidates">
+            {candidates.map((run) => (
+              <option key={run.spec.run_id} value={run.spec.run_id}>
+                {run.spec.suite_id} · {run.result?.status}
+              </option>
+            ))}
+          </datalist>
+        </label>
+        <Button type="submit" size="sm" disabled={!draftIsValid || loading}>
+          {loading ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
+          Compare
+        </Button>
+        {baselineRunId && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => selectBaseline(undefined)}
+          >
+            Clear
+          </Button>
+        )}
+      </form>
+
+      {!baselineRunId ? (
+        <StateMessage>
+          Choose another completed result. Different application releases are allowed when the
+          corpus, suite, cases, assertions, evidence policy, and applicable pricing contract match.
+        </StateMessage>
+      ) : baselineIsSelf ? (
+        <StateMessage tone="danger" role="alert">
+          Choose a different completed run as the comparison baseline.
+        </StateMessage>
+      ) : loading ? (
+        <LoadingState label="Checking comparison compatibility..." />
+      ) : error ? (
+        <QueryError message="Could not compare the selected eval runs." retry={retry} />
+      ) : comparison ? (
+        <ComparisonSummary comparison={comparison} />
+      ) : null}
+    </DataCard>
+  )
+}
+
+function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
+  const { compatibility, baseline, current } = comparison
+  const reasons = compatibility.reasons ?? []
+  return (
+    <div className="space-y-4 p-4">
+      <div
+        className={
+          compatibility.comparable
+            ? "rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm text-emerald-700 dark:text-emerald-300"
+            : "rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-700 dark:text-amber-300"
+        }
+        role="status"
+      >
+        <div className="font-medium">
+          {compatibility.comparable
+            ? "These runs are comparable."
+            : "These runs are not comparable as one regression contract."}
+        </div>
+        {!compatibility.comparable && reasons.length > 0 && (
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            {reasons.map((reason) => (
+              <li key={reason}>{evalComparisonReasonText(reason)}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <ComparisonRunSummary label="Baseline" run={baseline} />
+        <ComparisonRunSummary label="Current" run={current} />
+      </div>
+      <div className="grid gap-4 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2">
+        <RunFact
+          label="Baseline result revision"
+          value={shortEvalIdentity(compatibility.baseline_result_revision)}
+        />
+        <RunFact
+          label="Current result revision"
+          value={shortEvalIdentity(compatibility.current_result_revision)}
+        />
+      </div>
+    </div>
+  )
+}
+
+function ComparisonRunSummary({ label, run }: { label: string; run: EvalRun }) {
+  return (
+    <div className="rounded-lg border border-border p-3">
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="font-medium">{label}</div>
+        <EvalStatusBadge run={run} />
+      </div>
+      <div className="grid gap-3 text-sm sm:grid-cols-2">
+        <RunFact label="Run" value={shortEvalIdentity(run.spec.run_id)} />
+        <RunFact label="Suite" value={run.spec.suite_id} />
+        <RunFact label="Score" value={formatScore(run.result?.score)} />
+        <RunFact
+          label="Duration"
+          value={run.result ? formatDuration(run.result.duration_ms) : "unavailable"}
+        />
+      </div>
+    </div>
   )
 }
 

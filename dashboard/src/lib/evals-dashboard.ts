@@ -1,5 +1,8 @@
 import type { EvalCorpus, EvalRun, EvalStatus } from "./api.ts"
-import type { PublishedAssertionResult } from "./generated/server-api/index.ts"
+import type {
+  CorpusComparisonReason,
+  PublishedAssertionResult,
+} from "./generated/server-api/index.ts"
 
 export const MAX_EVAL_CORPUS_FILE_BYTES = 8 * 1024 * 1024
 
@@ -44,6 +47,21 @@ export function evalTrialCostSummary(assertions: Array<PublishedAssertionResult>
     return "unavailable"
   }
   return "not evaluated"
+}
+
+const COMPARISON_REASON_TEXT: Record<CorpusComparisonReason, string> = {
+  target_key_mismatch: "The runs target different attached application keys.",
+  corpus_revision_mismatch: "The runs use different corpus revisions.",
+  suite_id_mismatch: "The runs execute different suites.",
+  suite_revision_mismatch: "The suite contract changed between runs.",
+  evidence_policy_revision_mismatch: "The evidence policy changed between runs.",
+  pricing_profile_fingerprint_mismatch: "The applicable pricing contract changed between runs.",
+  case_contract_mismatch: "At least one case contract changed between runs.",
+  assertion_contract_mismatch: "At least one assertion contract changed between runs.",
+}
+
+export function evalComparisonReasonText(reason: CorpusComparisonReason): string {
+  return COMPARISON_REASON_TEXT[reason]
 }
 
 export async function parseEvalCorpusFile(file: Blob): Promise<EvalCorpus> {

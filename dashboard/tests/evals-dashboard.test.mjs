@@ -3,6 +3,7 @@ import test from "node:test"
 
 import {
   createEvalIdempotencyKey,
+  evalComparisonReasonText,
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
@@ -91,4 +92,15 @@ test("eval trial cost summary distinguishes observed, unavailable, and absent pr
     "unavailable · 2 unpriced model steps",
   )
   assert.equal(evalTrialCostSummary([]), "not evaluated")
+})
+
+test("eval comparison reasons remain specific and operator-readable", () => {
+  assert.equal(
+    evalComparisonReasonText("pricing_profile_fingerprint_mismatch"),
+    "The applicable pricing contract changed between runs.",
+  )
+  assert.equal(
+    evalComparisonReasonText("assertion_contract_mismatch"),
+    "At least one assertion contract changed between runs.",
+  )
 })
