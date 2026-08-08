@@ -22,6 +22,14 @@ export function shortEvalIdentity(value: string, retained = 12): string {
   return digest.length <= retained ? digest : `${digest.slice(0, retained)}…`
 }
 
+export function createEvalIdempotencyKey(): string {
+  const crypto = globalThis.crypto
+  if (typeof crypto?.randomUUID !== "function") {
+    throw new Error("Secure browser randomness is unavailable; the eval run was not submitted.")
+  }
+  return `cayu-dashboard-${crypto.randomUUID()}`
+}
+
 export async function parseEvalCorpusFile(file: Blob): Promise<EvalCorpus> {
   if (file.size > MAX_EVAL_CORPUS_FILE_BYTES) {
     throw new Error("The eval corpus is larger than the supported 8 MiB limit.")

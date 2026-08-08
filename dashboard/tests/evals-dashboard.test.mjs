@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  createEvalIdempotencyKey,
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
@@ -51,4 +52,11 @@ test("eval corpus import preflights bytes and the minimum v1 envelope", async ()
 test("eval identities are compact without discarding short identifiers", () => {
   assert.equal(shortEvalIdentity("sha256:1234567890abcdef"), "1234567890ab…")
   assert.equal(shortEvalIdentity("suite-1"), "suite-1")
+})
+
+test("eval launch idempotency keys use secure browser UUIDs", () => {
+  assert.match(
+    createEvalIdempotencyKey(),
+    /^cayu-dashboard-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
 })
