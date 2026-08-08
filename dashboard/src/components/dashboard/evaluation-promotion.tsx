@@ -1,3 +1,5 @@
+import { useQueryClient } from "@tanstack/react-query"
+import { Link } from "@tanstack/react-router"
 import {
   AlertTriangle,
   CheckCircle2,
@@ -6,6 +8,7 @@ import {
   LoaderCircle,
   Plus,
   RotateCcw,
+  Save,
   Trash2,
   XCircle,
 } from "lucide-react"
@@ -28,9 +31,11 @@ import {
   type EvaluationPromotionCandidateDraft,
   type EvaluationPromotionPreview,
   exportEvaluationPromotion,
+  importEvalCorpus,
   previewEvaluationPromotion,
 } from "@/lib/api"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
+import { parseEvalCorpusFile, shortEvalIdentity } from "@/lib/evals-dashboard"
 import {
   createPromotionAssertion,
   PROMOTION_ASSERTION_KINDS,
@@ -64,11 +69,19 @@ export function EvaluationPromotionAction({
     surface: "evaluation_promotion",
     operation: "mutate",
   })
+  const evalsMutateCapability = useDashboardCapability({
+    kind: "surface",
+    surface: "evals",
+    operation: "mutate",
+  })
+  const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
   const [preview, setPreview] = useState<EvaluationPromotionPreview | null>(null)
   const [draft, setDraft] = useState<EvaluationPromotionCandidateDraft | null>(null)
   const [previewing, setPreviewing] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [savedRevision, setSavedRevision] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const previewRequestRef = useRef<{ generation: number; controller: AbortController } | null>(null)
   const exportControllerRef = useRef<AbortController | null>(null)
@@ -99,6 +112,7 @@ export function EvaluationPromotionAction({
       generationRef.current = generation
       previewRequestRef.current = { generation, controller }
       setPreviewing(true)
+      setSavedRevision(null)
       setError(null)
       try {
         const response = await previewEvaluationPromotion(sessionId, nextDraft, controller.signal)
@@ -129,6 +143,8 @@ export function EvaluationPromotionAction({
     setError(null)
     setPreviewing(false)
     setExporting(false)
+    setSaving(false)
+    setSavedRevision(null)
     setOpen(true)
     void loadPreview()
   }
@@ -139,6 +155,7 @@ export function EvaluationPromotionAction({
       cancelRequests()
       setPreviewing(false)
       setExporting(false)
+      setSaving(false)
     }
   }
 
@@ -147,6 +164,7 @@ export function EvaluationPromotionAction({
     const next = structuredClone(draft)
     edit(next)
     setDraft(next)
+    setSavedRevision(null)
     setError(null)
   }
 
@@ -157,6 +175,19 @@ export function EvaluationPromotionAction({
     validation?.ok === true &&
     previewMatchesDraft(preview, draft)
   const mutationUnavailable = dashboardCapabilityUnavailableText(mutateCapability)
+  const evalsMutationUnavailable = dashboardCapabilityUnavailableText(evalsMutateCapability)
+
+  const exportPreviewedCandidate = (signal: AbortSignal) => {
+    if (!previewIsCurrent || preview === null) return null
+    return exportEvaluationPromotion(
+      sessionId,
+      {
+        candidate: preview.candidate,
+        expected_candidate_revision: preview.candidate.revision,
+      },
+      signal,
+    )
+  }
 
   const exportCandidate = async () => {
     if (!previewIsCurrent || preview === null) return
@@ -166,14 +197,8 @@ export function EvaluationPromotionAction({
     setExporting(true)
     setError(null)
     try {
-      const exported = await exportEvaluationPromotion(
-        sessionId,
-        {
-          candidate: preview.candidate,
-          expected_candidate_revision: preview.candidate.revision,
-        },
-        controller.signal,
-      )
+      const exported = await exportPreviewedCandidate(controller.signal)
+      if (exported === null) return
       if (controller.signal.aborted) return
       downloadBlob(exported.blob, exported.filename)
     } catch (exportError) {
@@ -191,6 +216,39 @@ export function EvaluationPromotionAction({
     }
   }
 
+  const saveCandidate = async () => {
+    if (!previewIsCurrent || preview === null) return
+    exportControllerRef.current?.abort()
+    const controller = new AbortController()
+    exportControllerRef.current = controller
+    setSaving(true)
+    setSavedRevision(null)
+    setError(null)
+    let exportCompleted = false
+    try {
+      const exported = await exportPreviewedCandidate(controller.signal)
+      if (exported === null || controller.signal.aborted) return
+      exportCompleted = true
+      const corpus = await parseEvalCorpusFile(exported.blob)
+      const imported = await importEvalCorpus(corpus, controller.signal)
+      if (controller.signal.aborted) return
+      setSavedRevision(imported.revision)
+      await queryClient.invalidateQueries({ queryKey: ["evals", "corpora"] })
+    } catch (saveError) {
+      if (controller.signal.aborted) return
+      if (!exportCompleted && isPromotionConflict(saveError)) {
+        setPreview(null)
+        setDraft(null)
+      }
+      setError(promotionErrorMessage(saveError))
+    } finally {
+      if (exportControllerRef.current === controller) {
+        exportControllerRef.current = null
+        setSaving(false)
+      }
+    }
+  }
+
   if (!readCapability.enabled || !ELIGIBLE_STATUSES.has(status)) return null
 
   return (
@@ -203,13 +261,13 @@ export function EvaluationPromotionAction({
         <SheetContent
           className="w-full! gap-0 sm:max-w-4xl!"
           data-testid="promotion-sheet"
-          aria-busy={previewing || exporting}
+          aria-busy={previewing || exporting || saving}
         >
           <SheetHeader className="border-b border-border pr-12">
             <SheetTitle>Promote captured run to an eval</SheetTitle>
             <SheetDescription>
-              Edit a portable candidate, score it against this run, then export the exact previewed
-              version.
+              Edit a portable candidate, score it against this run, then save or export the exact
+              previewed version.
             </SheetDescription>
           </SheetHeader>
 
@@ -233,7 +291,7 @@ export function EvaluationPromotionAction({
                 {preview && (
                   <PromotionEvidenceSummary preview={preview} current={previewIsCurrent} />
                 )}
-                <fieldset className="contents" disabled={previewing || exporting}>
+                <fieldset className="contents" disabled={previewing || exporting || saving}>
                   <PromotionIdentityEditor draft={draft} editDraft={editDraft} />
                   <PromotionInputEditor draft={draft} editDraft={editDraft} />
                   <PromotionAssertionsEditor draft={draft} editDraft={editDraft} />
@@ -251,6 +309,22 @@ export function EvaluationPromotionAction({
                 {error ?? (validation && !validation.ok ? validation.error : null)}
               </div>
             )}
+            {savedRevision && (
+              <div
+                className="mt-4 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm text-emerald-700 dark:text-emerald-300"
+                role="status"
+              >
+                Saved corpus {shortEvalIdentity(savedRevision)} to Evals.{" "}
+                <Link
+                  to="/evals"
+                  search={{ tab: "catalog", corpus: savedRevision }}
+                  className="font-medium underline"
+                  onClick={() => changeOpen(false)}
+                >
+                  Open Evals
+                </Link>
+              </div>
+            )}
           </div>
 
           <SheetFooter className="border-t border-border bg-background sm:flex-row sm:items-center sm:justify-end">
@@ -263,7 +337,9 @@ export function EvaluationPromotionAction({
             <Button
               variant="outline"
               data-testid="promotion-preview"
-              disabled={draft === null || previewing || exporting || validation?.ok !== true}
+              disabled={
+                draft === null || previewing || exporting || saving || validation?.ok !== true
+              }
               onClick={() => draft && void loadPreview(draft)}
             >
               {previewing ? <LoaderCircle className="animate-spin" /> : <FlaskConical />}
@@ -271,11 +347,29 @@ export function EvaluationPromotionAction({
             </Button>
             <Button
               data-testid="promotion-export"
-              disabled={!previewIsCurrent || !mutateCapability.enabled || previewing || exporting}
+              disabled={
+                !previewIsCurrent || !mutateCapability.enabled || previewing || exporting || saving
+              }
               onClick={() => void exportCandidate()}
             >
               {exporting ? <LoaderCircle className="animate-spin" /> : <Download />}
               {exporting ? "Exporting..." : "Export eval JSON"}
+            </Button>
+            <Button
+              data-testid="promotion-save"
+              disabled={
+                !previewIsCurrent ||
+                !mutateCapability.enabled ||
+                !evalsMutateCapability.enabled ||
+                previewing ||
+                exporting ||
+                saving
+              }
+              title={evalsMutationUnavailable ?? undefined}
+              onClick={() => void saveCandidate()}
+            >
+              {saving ? <LoaderCircle className="animate-spin" /> : <Save />}
+              {saving ? "Saving..." : "Save to Evals"}
             </Button>
           </SheetFooter>
         </SheetContent>
