@@ -167,7 +167,7 @@ _INTERNAL_REQUEST_OPTION_KEYS = frozenset(
 class ContextPressureOverhead(BaseModel):
     """Known provider-request overhead included in local context pressure estimates."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     tools: list[dict[str, Any]] = Field(default_factory=list)
     structured_output_instruction: str | None = None
@@ -189,7 +189,7 @@ class ContextPressureOverhead(BaseModel):
     @field_validator("tools", "request_options", mode="before")
     @classmethod
     def copy_json_data(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_value(value, info.field_name)
 
     @field_validator("structured_output_instruction")
     @classmethod
@@ -721,7 +721,7 @@ def estimate_context_pressure(
 class ContextRequest(BaseModel):
     """Input passed to an agent context policy before each model request."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session: Session
     agent: AgentSpec
@@ -752,7 +752,7 @@ class ContextRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("context_usage")
     @classmethod

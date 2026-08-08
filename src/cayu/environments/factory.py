@@ -15,7 +15,6 @@ from cayu._task_wait import await_shielded_task_outcome
 from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
-    copy_json_value,
     copy_label_map,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -581,11 +580,15 @@ class EnvironmentFactoryRequest:
                 require_clean_nonblank(self.causal_budget_id, "causal_budget_id"),
             )
         object.__setattr__(self, "labels", copy_label_map(self.labels, "labels"))
-        object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "metadata",
+            copy_durable_json_object(self.metadata, "metadata"),
+        )
         object.__setattr__(
             self,
             "reconnect_metadata",
-            copy_json_value(self.reconnect_metadata, "reconnect_metadata"),
+            copy_durable_json_object(self.reconnect_metadata, "reconnect_metadata"),
         )
         object.__setattr__(
             self,
@@ -623,11 +626,15 @@ class EnvironmentFactoryResult:
             )
         object.__setattr__(self, "release_timeout_s", float(self.release_timeout_s))
         object.__setattr__(self, "environment", copy_environment(self.environment))
-        object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "metadata",
+            copy_durable_json_object(self.metadata, "metadata"),
+        )
         object.__setattr__(
             self,
             "reconnect_metadata",
-            copy_json_value(self.reconnect_metadata, "reconnect_metadata"),
+            copy_durable_json_object(self.reconnect_metadata, "reconnect_metadata"),
         )
 
 

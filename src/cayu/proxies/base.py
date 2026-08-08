@@ -5,14 +5,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
 from cayu.vaults import ResolvedSecret, SecretRef
 
 
 class ProxyAuthorizationResult(BaseModel):
     """Result of a credential proxy outbound authorization check."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     allowed: StrictBool
     reason: str | None = None
@@ -32,7 +32,7 @@ class ProxyAuthorizationResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @model_validator(mode="after")
     def require_reason_for_denial(self) -> ProxyAuthorizationResult:

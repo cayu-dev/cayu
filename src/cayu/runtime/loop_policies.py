@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
 from cayu.core.messages import Message, MessageRole, copy_message
 
 if TYPE_CHECKING:
@@ -24,7 +24,7 @@ class BeforeStopAction(StrEnum):
 class BeforeStopDecision(BaseModel):
     """Control decision returned before Cayu marks a no-tool-call step complete."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     action: BeforeStopAction = BeforeStopAction.COMPLETE
     reason: str = "complete"
@@ -91,7 +91,7 @@ class BeforeStopDecision(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @model_validator(mode="after")
     def validate_action_payload(self) -> BeforeStopDecision:

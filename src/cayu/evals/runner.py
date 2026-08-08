@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_clean_nonblank
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
@@ -102,7 +102,9 @@ def _format_exception(exc: BaseException) -> str:
 
 
 class EvalCase(BaseModel):
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid", arbitrary_types_allowed=True, hide_input_in_errors=True
+    )
 
     id: str
     request: RunRequest
@@ -146,11 +148,13 @@ class EvalCase(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
 
 class EvalSuite(BaseModel):
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid", arbitrary_types_allowed=True, hide_input_in_errors=True
+    )
 
     id: str
     cases: list[EvalCase]
@@ -190,7 +194,7 @@ class EvalSuite(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
 
 @dataclass(frozen=True)

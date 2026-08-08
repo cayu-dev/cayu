@@ -25,6 +25,7 @@ from pydantic import (
 
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
+    copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
 )
@@ -170,7 +171,9 @@ class EvalOutcome(StrEnum):
 
 
 class EvalAssertionResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
+    model_config = ConfigDict(
+        extra="forbid", revalidate_instances="always", hide_input_in_errors=True
+    )
 
     name: str
     # Portable assertions set this to the exact content revision they evaluated.
@@ -222,7 +225,7 @@ class EvalAssertionResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value):
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("cost_summary")
     @classmethod
@@ -396,7 +399,9 @@ class EvalTrialResult(BaseModel):
 
 
 class EvalCaseResult(BaseModel):
-    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
+    model_config = ConfigDict(
+        extra="forbid", revalidate_instances="always", hide_input_in_errors=True
+    )
 
     case_id: str
     status: EvalStatus
@@ -474,7 +479,7 @@ class EvalCaseResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_json_data(cls, value, info):
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_object(value, info.field_name)
 
     @model_validator(mode="after")
     def validate_aggregate_contract(self) -> EvalCaseResult:
@@ -603,7 +608,9 @@ class EvalRunContractV1(BaseModel):
 
 
 class EvalRun(BaseModel):
-    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
+    model_config = ConfigDict(
+        extra="forbid", revalidate_instances="always", hide_input_in_errors=True
+    )
 
     # Type checkers require the literal token here rather than the exported
     # EVAL_SCHEMA_VERSION constant.
@@ -629,7 +636,7 @@ class EvalRun(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("run_contract", mode="before")
     @classmethod
@@ -1052,7 +1059,9 @@ class Trajectory(BaseModel):
     Distinct from `EvalContext`, which is the assertion's *view* of a Trajectory.
     """
 
-    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
+    model_config = ConfigDict(
+        extra="forbid", revalidate_instances="always", hide_input_in_errors=True
+    )
 
     session: Session | None = None
     events: tuple[Event, ...] = Field(default_factory=tuple)
@@ -1135,7 +1144,7 @@ class Trajectory(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value):
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @model_validator(mode="after")
     def validate_session_attribution(self) -> Trajectory:

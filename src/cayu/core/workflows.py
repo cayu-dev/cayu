@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_clean_nonblank
 from cayu.core.events import Event
 
 # Journaled once per workflow context to fence superseded attempts. The event
@@ -15,7 +15,7 @@ WORKFLOW_ATTEMPT_EVENT_TYPE = "custom.cayu.workflow.attempt"
 
 
 class WorkflowSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -23,7 +23,7 @@ class WorkflowSpec(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("name")
     @classmethod

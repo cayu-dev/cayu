@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_clean_nonblank
 from cayu.egress.credential_kinds import (
     credential_kind_descriptor,
     validate_presented_value,
@@ -32,7 +32,7 @@ class VirtualCredentialGrant(BaseModel):
     grant is therefore safe to log, store, and hand to the sandbox.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     grant_id: str
     session_id: str
@@ -71,7 +71,7 @@ class VirtualCredentialGrant(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     def is_expired(self, now: datetime) -> bool:
         return self.expires_at is not None and now >= self.expires_at

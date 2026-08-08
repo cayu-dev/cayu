@@ -19,8 +19,8 @@ from pydantic import (
 )
 
 from cayu._validation import (
+    copy_durable_json_object,
     copy_durable_json_value,
-    copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
     require_durable_text,
@@ -427,7 +427,12 @@ class KnowledgeStoreHandle(Protocol):
 
 
 class ToolContext(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        arbitrary_types_allowed=True,
+        hide_input_in_errors=True,
+    )
 
     session_id: str
     agent_name: str | None = None
@@ -515,7 +520,7 @@ class ToolContext(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("session_id")
     @classmethod

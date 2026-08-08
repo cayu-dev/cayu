@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from cayu._task_wait import unexpected_child_cancellation_error
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, copy_json_value, require_clean_nonblank
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces import (
     BoundedTarReader,
@@ -65,7 +65,11 @@ class SyncBindingContext:
             )
         if type(self.metadata) is not dict:
             raise TypeError("SyncBindingContext metadata must be a dict.")
-        object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "metadata",
+            copy_durable_json_object(self.metadata, "metadata"),
+        )
 
 
 @dataclass(frozen=True)
@@ -184,7 +188,11 @@ class WorkspaceSnapshot:
             )
         if type(self.metadata) is not dict:
             raise TypeError("WorkspaceSnapshot metadata must be a dict.")
-        object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "metadata",
+            copy_durable_json_object(self.metadata, "metadata"),
+        )
 
 
 @dataclass(frozen=True)
@@ -223,7 +231,11 @@ class BoundWorkspace:
             raise ValueError("BoundWorkspace path cannot be blank.")
         if type(self.metadata) is not dict:
             raise TypeError("BoundWorkspace metadata must be a dict.")
-        object.__setattr__(self, "metadata", copy_json_value(self.metadata, "metadata"))
+        object.__setattr__(
+            self,
+            "metadata",
+            copy_durable_json_object(self.metadata, "metadata"),
+        )
         if self.snapshot is not None and type(self.snapshot) is not WorkspaceSnapshot:
             raise TypeError("BoundWorkspace snapshot must be a WorkspaceSnapshot or None.")
         if self.state_key is not None:

@@ -1529,8 +1529,10 @@ def test_write_eval_run_rejects_nonportable_metadata_before_overwrite(
         EvalStatus.PASSED,
         1.0,
         [_case_result("a", EvalStatus.PASSED, 1.0)],
-        metadata={"nested": {"value": invalid_value}},
     )
+    # EvalRun rejects this value at construction. Mutate the owned public
+    # mapping afterward to retain defense-in-depth coverage at the writer.
+    run.metadata["nested"] = {"value": invalid_value}
 
     with pytest.raises(ValueError):
         write_eval_run_json(run, path)

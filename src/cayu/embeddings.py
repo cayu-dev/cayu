@@ -6,13 +6,18 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
+)
 
 
 class TextEmbeddingRequest(BaseModel):
     """Provider-neutral request to embed one or more text inputs."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     model: str
     texts: list[str]
@@ -48,10 +53,7 @@ class TextEmbeddingRequest(BaseModel):
     @field_validator("options", mode="before")
     @classmethod
     def copy_options(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_json_value(value, "options")
-        if type(copied) is not dict:
-            raise ValueError("`options` must be a dictionary.")
-        return copied
+        return copy_durable_json_object(value, "options")
 
 
 class TextEmbedding(BaseModel):
@@ -90,7 +92,7 @@ class TextEmbedding(BaseModel):
 class TextEmbeddingUsage(BaseModel):
     """Provider-reported token usage for an embedding request when available."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     input_tokens: int | None = Field(default=None, ge=0)
     total_tokens: int | None = Field(default=None, ge=0)
@@ -110,16 +112,13 @@ class TextEmbeddingUsage(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_json_value(value, "metadata")
-        if type(copied) is not dict:
-            raise ValueError("`metadata` must be a dictionary.")
-        return copied
+        return copy_durable_json_object(value, "metadata")
 
 
 class TextEmbeddingResult(BaseModel):
     """Provider-neutral embedding response."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     model: str
     embeddings: list[TextEmbedding]
@@ -134,10 +133,7 @@ class TextEmbeddingResult(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        copied = copy_json_value(value, "metadata")
-        if type(copied) is not dict:
-            raise ValueError("`metadata` must be a dictionary.")
-        return copied
+        return copy_durable_json_object(value, "metadata")
 
     @model_validator(mode="after")
     def validate_embeddings(self) -> TextEmbeddingResult:

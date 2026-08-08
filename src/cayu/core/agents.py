@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_clean_nonblank
 from cayu.core.events import Event
 from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
@@ -21,7 +21,7 @@ class AgentAuthoringState(StrEnum):
 
 
 class AgentSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     model: str
@@ -59,7 +59,7 @@ class AgentSpec(BaseModel):
     @field_validator("metadata", "provider_options", mode="before")
     @classmethod
     def copy_json_mapping(cls, value: dict[str, Any], info) -> dict[str, Any]:
-        return copy_json_value(value, info.field_name)
+        return copy_durable_json_object(value, info.field_name)
 
     @field_validator("name", "model")
     @classmethod

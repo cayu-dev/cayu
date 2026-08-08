@@ -7,7 +7,12 @@ from typing import Any, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
+)
 
 
 class SecretRef(BaseModel):
@@ -17,7 +22,7 @@ class SecretRef(BaseModel):
     should not be placed in model prompt text.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     handle: str | None = None
@@ -26,7 +31,7 @@ class SecretRef(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("name")
     @classmethod
@@ -44,7 +49,7 @@ class SecretRef(BaseModel):
 class SecretEnv(BaseModel):
     """Environment variable whose value must be resolved from a secret ref."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     ref: SecretRef
@@ -53,7 +58,7 @@ class SecretEnv(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("name")
     @classmethod
@@ -94,7 +99,7 @@ class ResolvedSecret(BaseModel):
     possible moment before injecting into a tool/runner environment.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     value: SecretStr
@@ -103,7 +108,7 @@ class ResolvedSecret(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("name")
     @classmethod

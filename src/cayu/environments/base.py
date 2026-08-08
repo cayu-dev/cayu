@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
+    copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
     require_nonblank,
@@ -42,7 +43,7 @@ _KNOWLEDGE_STORE_METHODS = (
 
 
 class EnvironmentSpec(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     name: str
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -65,7 +66,7 @@ class EnvironmentSpec(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("name")
     @classmethod

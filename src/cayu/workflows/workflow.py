@@ -15,7 +15,12 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from cayu._validation import copy_json_value, copy_label_map, require_clean_nonblank
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_json_value,
+    copy_label_map,
+    require_clean_nonblank,
+)
 from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.core.messages import Message, MessageRole, TextPart, ToolCallPart
 from cayu.core.thinking import ThinkingConfig
@@ -91,7 +96,9 @@ class StepRunOptions(BaseModel):
     than exposed here, so parent/child budget roll-ups stay coherent.
     """
 
-    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid", arbitrary_types_allowed=True, hide_input_in_errors=True
+    )
 
     provider_name: str | None = None
     environment_name: str | None = None
@@ -120,7 +127,7 @@ class StepRunOptions(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_json_value(value, "metadata")
+        return copy_durable_json_object(value, "metadata")
 
     @field_validator("limits")
     @classmethod
