@@ -25522,7 +25522,9 @@ def test_tool_round_recovery_post_persist_fanout_failure_stays_resumable(
     assert tool.calls == [{}]
 
 
-def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt() -> None:
+def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class OperatorInterruptStore(FailingTerminalToolEventStore):
         def __init__(self) -> None:
             super().__init__()
@@ -25559,9 +25561,20 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt()
 
     async def scenario() -> None:
         original_fan_out = app._event_writer.fan_out_persisted
+        original_resumable_interrupt = (
+            app._recovery_coordinator._interrupt_for_resumable_manual_recovery
+        )
         failed = False
         interrupt_task: asyncio.Task[list[Event]] | None = None
         store.operator_interrupt_committed = asyncio.Event()
+        resumable_interrupt_started = asyncio.Event()
+        release_resumable_interrupt = asyncio.Event()
+
+        async def block_resumable_interrupt(*args, **kwargs):
+            resumable_interrupt_started.set()
+            await release_resumable_interrupt.wait()
+            async for event in original_resumable_interrupt(*args, **kwargs):
+                yield event
 
         async def fail_after_operator_interrupt(events: list[Event]) -> list[Event]:
             nonlocal failed, interrupt_task
@@ -25582,22 +25595,40 @@ def test_tool_round_recovery_post_persist_failure_preserves_operator_interrupt()
             return await original_fan_out(events)
 
         app._event_writer.fan_out_persisted = fail_after_operator_interrupt
-        recovery_events = await collect_tool_round_recovery_events(
-            app,
-            ToolRoundRecoveryRequest(
-                session_id=session_id,
-                round_id=round_id,
-                tool_call_id="call_1",
-                outcome=ToolApprovalRecoveryOutcome.COMPLETED,
-                message="side effect verified externally",
-            ),
+        monkeypatch.setattr(
+            app._recovery_coordinator,
+            "_interrupt_for_resumable_manual_recovery",
+            block_resumable_interrupt,
         )
+        monkeypatch.setattr(
+            recovery_coordinator_module,
+            "_MANUAL_RECOVERY_INTERRUPT_POLL_INTERVAL_SECONDS",
+            0.01,
+        )
+        try:
+            recovery_events = await asyncio.wait_for(
+                collect_tool_round_recovery_events(
+                    app,
+                    ToolRoundRecoveryRequest(
+                        session_id=session_id,
+                        round_id=round_id,
+                        tool_call_id="call_1",
+                        outcome=ToolApprovalRecoveryOutcome.COMPLETED,
+                        message="side effect verified externally",
+                    ),
+                ),
+                timeout=5,
+            )
+        finally:
+            release_resumable_interrupt.set()
+        assert resumable_interrupt_started.is_set()
         assert interrupt_task is not None
         interrupt_events = await asyncio.wait_for(interrupt_task, timeout=5)
 
         session = await store.load(session_id)
         assert session is not None and session.status == SessionStatus.INTERRUPTED
         assert recovery_events[-1].id == interrupt_events[-1].id
+        assert sum(event.id == interrupt_events[-1].id for event in recovery_events) == 1
         assert recovery_events[-1].payload["interruption_type"] == "operator_requested"
         assert recovery_events[-1].payload["reason"] == "operator requested stop"
         assert recovery_events[-1].payload["metadata"] == {"ticket": "OPS-1"}

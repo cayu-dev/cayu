@@ -904,6 +904,7 @@ class _ManualRecoveryEventDelivery:
 @dataclass(frozen=True)
 class _ManualRecoveryStreamOutcome:
     error: BaseException | None
+    interrupted_event: Event | None = None
 
 
 @dataclass(frozen=True)
@@ -6227,6 +6228,7 @@ class RecoveryCoordinator:
         consumer_stopped = asyncio.Event()
         supervisor_started = asyncio.Event()
         consumer_stop_failure: BaseException | None = None
+        forwarded_interrupted_event_ids: set[str] = set()
 
         def heartbeat_failure() -> BaseException | None:
             if not heartbeat_task.done():
@@ -6275,6 +6277,8 @@ class RecoveryCoordinator:
                     consumed=asyncio.Event(),
                 )
                 await deliveries.put(delivery)
+                if event.type == EventType.SESSION_INTERRUPTED:
+                    forwarded_interrupted_event_ids.add(event.id)
                 await delivery.consumed.wait()
                 if consumer_stopped.is_set():
                     raise asyncio.CancelledError
@@ -6284,6 +6288,7 @@ class RecoveryCoordinator:
             supervisor_runtime_task = asyncio.current_task()
             authoritative_failure: BaseException | None = None
             cleanup_failure: BaseException | None = None
+            durable_interruption_observed = False
             if supervisor_runtime_task is not None:
                 self._session_control.register_active_control_task(
                     claim.session.id,
@@ -6307,6 +6312,11 @@ class RecoveryCoordinator:
                         raise AssertionError(
                             "Recovery interruption watcher completed without an outcome."
                         )
+                    durable_interruption_observed = (
+                        not interruption_watch_task.cancelled()
+                        and interruption_watch_task.exception() is None
+                        and interruption_watch_task.result()
+                    )
                     raise failure
                 if heartbeat_task in done:
                     failure = heartbeat_failure()
@@ -6364,7 +6374,37 @@ class RecoveryCoordinator:
                 except BaseException as cleanup_error:
                     cleanup_failure = cleanup_error
                     authoritative_failure = cleanup_error
-                await deliveries.put(_ManualRecoveryStreamOutcome(error=authoritative_failure))
+                interrupted_event: Event | None = None
+                if durable_interruption_observed and cleanup_failure is None:
+                    try:
+                        candidate = await self._session_control.wait_for_interrupted_event(
+                            claim.session.id
+                        )
+                    except BaseException as lookup_failure:
+                        if authoritative_failure is not None:
+                            authoritative_failure.add_note(
+                                "The durable operator interruption was finalized, but its "
+                                "terminal event could not be reconstructed."
+                            )
+                            _prepend_exception_cause(authoritative_failure, lookup_failure)
+                        else:  # pragma: no cover - the watcher always supplies a failure.
+                            authoritative_failure = lookup_failure
+                    else:
+                        if (
+                            candidate is not None
+                            and candidate.id != interrupted_baseline_id
+                            and candidate.payload.get("interruption_type")
+                            == _INTERRUPTION_TYPE_OPERATOR_REQUESTED
+                        ):
+                            if candidate.id not in forwarded_interrupted_event_ids:
+                                interrupted_event = candidate
+                            authoritative_failure = None
+                await deliveries.put(
+                    _ManualRecoveryStreamOutcome(
+                        error=authoritative_failure,
+                        interrupted_event=interrupted_event,
+                    )
+                )
             finally:
                 if supervisor_runtime_task is not None:
                     self._session_control.unregister_active_control_task(
@@ -6415,6 +6455,8 @@ class RecoveryCoordinator:
                 if isinstance(item, _ManualRecoveryStreamOutcome):
                     if item.error is not None:
                         raise item.error
+                    if item.interrupted_event is not None:
+                        yield item.interrupted_event
                     return
                 pending_delivery = item
                 yield item.event
