@@ -168,6 +168,9 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     assert "claim_execution" in product_store_source
     assert "heartbeat_execution" in product_store_source
     assert "release_execution" in product_store_source
+    assert "record_result_receipt" in product_store_source
+    assert "result_receipt" in product_store_source
+    assert "find_by_session_id" in product_store_source
     assert "execution_claim_id" in product_store_source
     assert "ProductExecutionClaimLost" in product_store_source
     assert "AuthenticatedProductAccess" in service_source

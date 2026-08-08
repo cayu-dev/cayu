@@ -41,6 +41,9 @@ class Store:
     async def find(self, **kwargs):
         raise AssertionError
 
+    async def find_by_session_id(self, **kwargs):
+        raise AssertionError
+
     async def claim_execution(self, **kwargs):
         raise AssertionError
 
@@ -48,6 +51,12 @@ class Store:
         raise AssertionError
 
     async def release_execution(self, **kwargs):
+        raise AssertionError
+
+    async def record_result_receipt(self, **kwargs):
+        raise AssertionError
+
+    async def record_recovery_status(self, **kwargs):
         raise AssertionError
 
     async def finish(self, **kwargs):
@@ -126,6 +135,9 @@ class Store:
     async def find(self, **kwargs):
         raise AssertionError
 
+    async def find_by_session_id(self, **kwargs):
+        raise AssertionError
+
     async def claim_execution(self, **kwargs):
         raise AssertionError
 
@@ -133,6 +145,12 @@ class Store:
         raise AssertionError
 
     async def release_execution(self, **kwargs):
+        raise AssertionError
+
+    async def record_result_receipt(self, **kwargs):
+        raise AssertionError
+
+    async def record_recovery_status(self, **kwargs):
         raise AssertionError
 
     async def finish(self, **kwargs):
@@ -245,6 +263,9 @@ class Store:
     async def find(self, **kwargs):
         raise AssertionError
 
+    async def find_by_session_id(self, **kwargs):
+        raise AssertionError
+
     async def claim_execution(self, **kwargs):
         raise AssertionError
 
@@ -252,6 +273,12 @@ class Store:
         raise AssertionError
 
     async def release_execution(self, **kwargs):
+        raise AssertionError
+
+    async def record_result_receipt(self, **kwargs):
+        raise AssertionError
+
+    async def record_recovery_status(self, **kwargs):
         raise AssertionError
 
     async def finish(self, **kwargs):

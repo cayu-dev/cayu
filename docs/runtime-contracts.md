@@ -184,15 +184,39 @@ is no longer current. Terminal rows retain the settling claim identity. Claim,
 heartbeat, and settlement writes use that identity to reconstruct committed
 state after ambiguous acknowledgement loss and prevent a stale claim from
 overwriting another worker's terminal result.
+Before Cayu commits a successful session transition, the maintained executor's
+request-scoped loop policy writes an application-owned publication receipt. The
+receipt binds the product work, task, session, final conversational model event,
+model attempt, interaction, and bounded public result (or an explicit
+unsafe-result publication failure) into one digest-checked record. Repeating the
+same write reconstructs acknowledgement loss. A current claim may advance the
+receipt only to a greater durable event sequence, so queued input can produce a
+later final candidate while stale workers cannot replace newer evidence.
+Application `ProductOperationStore` implementations provide the exact indexed
+`find_by_session_id`, claim-fenced `record_result_receipt`, and bounded
+`record_recovery_status` operations used by this contract; these are durable
+authority operations, not scans or optional compatibility hooks.
 This boundary does not promise exactly-once provider effects if a process stalls
 beyond its lease or dies after external work begins; complete worker-replacement
 and external-effect reconciliation remain application concerns. Redelivery can
-create or verify the exact initial pending Cayu task. If that task or its session
-has already advanced, the maintained assembler leaves the product operation
-pending, atomically releases its exact execution claim, and does not redispatch
-provider work or invent a terminal public result. Claim release is idempotent
-after acknowledgement loss and cannot clear a successor's claim. The
-application-owned worker-recovery path must reconcile that durable outcome.
+create or verify the exact initial pending Cayu task. It settles a terminal
+completed or failed Cayu task/session from bounded terminal evidence and the
+exact publication receipt without redispatching provider work or parsing a
+transcript. Live, interrupted, contradictory, unsupported, or evidence-bounded
+work remains pending and releases its exact execution claim. Recoverable
+abandoned work is fenced through Cayu's durable incomplete-session recovery and
+resumed on the same session and task. The allow-listed `recovery_status` reports
+active runtime ownership, pending approval, pending user input, interruption, or
+manual reconciliation without exposing raw runtime records. Claim release is
+idempotent after acknowledgement loss and cannot clear a successor's claim.
+The maintained control-plane mount resolves the application-owned operation by
+its exact private session index and attaches a process-local publication policy
+to resume, approval, user-input, and tool-recovery continuations. That policy
+briefly acquires and heartbeats the product execution claim at the before-stop
+boundary, records the same receipt, and releases the claim before Cayu commits
+completion. HTTP callers cannot submit or serialize these policies. A competing
+product worker causes the continuation to remain interrupted rather than
+complete without a receipt.
 The maintained synchronous execution path consumes the runtime stream without
 retaining complete events or unbounded text deltas; it keeps only the bounded
 final model turn. It redacts across model-delta boundaries before that result

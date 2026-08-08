@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from inspect import Parameter, signature
@@ -37,6 +37,7 @@ from typing import Any
 from cayu._validation import require_clean_nonblank, thaw_json_value
 from cayu.runtime.app import CayuApp
 from cayu.runtime.costs import PriceBook
+from cayu.runtime.loop_policies import LoopPolicy
 from cayu.runtime.sessions import IncompleteSessionsRecoveryRequest
 
 try:
@@ -90,6 +91,9 @@ try:
         ProductOperationSettlementConflict,
         ProductOperationStore,
         ProductPrincipal,
+        ProductRecoveryStatus,
+        ProductResultReceipt,
+        ProductResultReceiptConflict,
         create_agent_service,
     )
     from cayu.server.sse import event_to_sse_data
@@ -138,6 +142,9 @@ __all__ = [
     "ProductOperationSettlementConflict",
     "ProductOperationStore",
     "ProductPrincipal",
+    "ProductRecoveryStatus",
+    "ProductResultReceipt",
+    "ProductResultReceiptConflict",
     "PublicServiceManifest",
     "RuntimeStoreDurability",
     "ServerAccessConfig",
@@ -427,6 +434,9 @@ def mount_cayu(
     ),
     interruption_shutdown_grace_seconds: float = DEFAULT_INTERRUPTION_SHUTDOWN_GRACE_SECONDS,
     interruption_recovery_inactive_after_seconds: int = DEFAULT_RECOVERY_INACTIVE_AFTER_SECONDS,
+    continuation_loop_policy_provider: (
+        Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
+    ) = None,
     name: str = "cayu-dashboard",
 ) -> None:
     """Mount CAYU's control plane and dashboard into an existing FastAPI app.
@@ -452,6 +462,9 @@ def mount_cayu(
     disabled unless a complete configuration is supplied and requires
     authenticated ``access``. Durable eval execution likewise remains disabled
     unless complete ``evals`` wiring is supplied.
+    ``continuation_loop_policy_provider`` lets an embedding boundary attach
+    trusted in-process policies to control-plane continuations; HTTP callers
+    cannot supply or serialize those policies.
     """
     auth = auth_dependency_for(access)
     mount_path = normalize_dashboard_path(path, field_name="path")
@@ -517,6 +530,7 @@ def mount_cayu(
             else _configured_dashboard_price_book(resolved_dashboard_config)
         ),
         evals=evals,
+        continuation_loop_policy_provider=continuation_loop_policy_provider,
     )
 
     # All caller-controlled values and route construction are validated before

@@ -13,13 +13,23 @@ import hashlib
 import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping
-from typing import TYPE_CHECKING, Any, Literal, Never, Protocol, TypeGuard, cast, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    Never,
+    Protocol,
+    TypeGuard,
+    TypeVar,
+    cast,
+    runtime_checkable,
+)
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pydantic_core import InitErrorDetails
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
@@ -29,20 +39,35 @@ from cayu._task_wait import (
     unexpected_child_cancellation_error,
 )
 from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
     require_durable_clean_nonblank,
     require_durable_nonblank,
+    require_durable_text,
 )
-from cayu.core.events import EventType
+from cayu.core.events import Event, EventType
 from cayu.core.messages import Message
 from cayu.runtime.app import CayuApp
+from cayu.runtime.loop_policies import BeforeStopContext, BeforeStopDecision, LoopPolicy
 from cayu.runtime.service_manifest import (
     PublicServiceManifest,
     RuntimeStoreDurability,
     ServiceIdentityStoreKind,
     ServiceMode,
 )
-from cayu.runtime.sessions import RunRequest, SessionStatus
+from cayu.runtime.sessions import (
+    EventOrder,
+    EventQuery,
+    EventQueryResultTooLarge,
+    IncompleteSessionRecoveryAction,
+    IncompleteSessionRecoveryRequest,
+    ResumeRequest,
+    RunRequest,
+    SessionStatus,
+    TerminalSessionEvidence,
+    TerminalSessionEvidenceError,
+)
 from cayu.runtime.tasks import Task, TaskCreate, TaskStatus
+from cayu.runtime.usage import is_conversational_model_completion_payload
 from cayu.server.config import (
     AuthenticatedAccess,
     OpenAccess,
@@ -70,6 +95,24 @@ MAX_PRODUCT_REQUEST_BYTES = 1024 * 1024
 PRODUCT_EXECUTION_LEASE_SECONDS = 120
 PRODUCT_EXECUTION_HEARTBEAT_SECONDS = 30
 PRODUCT_EXECUTION_HEARTBEAT_TIMEOUT_SECONDS = 10
+MAX_PRODUCT_RESULT_EVIDENCE_SCAN_EVENTS = 256
+
+_PRODUCT_RESULT_RECEIPT_RECORD_TYPE = "cayu.product-result-receipt"
+_PRODUCT_RESULT_RECEIPT_SCHEMA_VERSION = 1
+_PRODUCT_RECOVERY_MESSAGE = (
+    "Continue this interrupted operation from its durable session state. "
+    "Do not repeat work whose outcome is already recorded."
+)
+
+ProductRecoveryStatus = Literal[
+    "runtime_active",
+    "waiting_for_approval",
+    "waiting_for_user_input",
+    "interrupted",
+    "manual_reconciliation_required",
+]
+
+_ProductExecutionResult = TypeVar("_ProductExecutionResult")
 
 _INVALID_PRODUCT_REQUEST_DETAIL = "Invalid product request."
 _OVERSIZED_PRODUCT_REQUEST_DETAIL = "Product request exceeds the server byte limit."
@@ -87,6 +130,48 @@ def _product_request_fingerprint(*, agent_name: str, request_text: str) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(fingerprint_input).hexdigest()
+
+
+def _product_result_receipt_digest(
+    *,
+    work_id: str,
+    public_id: str,
+    request_fingerprint: str,
+    session_id: str,
+    task_id: str,
+    source_event_id: str,
+    source_event_sequence: int,
+    model_step_id: str,
+    model_attempt_id: str,
+    interaction_id: str,
+    publication_status: Literal["completed", "failed"],
+    result: str | None,
+    failure_code: Literal["unsafe_result"] | None,
+) -> str:
+    document = {
+        "interaction_id": interaction_id,
+        "public_id": public_id,
+        "record_type": _PRODUCT_RESULT_RECEIPT_RECORD_TYPE,
+        "request_fingerprint": request_fingerprint,
+        "result": result,
+        "schema_version": _PRODUCT_RESULT_RECEIPT_SCHEMA_VERSION,
+        "session_id": session_id,
+        "source_event_id": source_event_id,
+        "source_event_sequence": source_event_sequence,
+        "model_step_id": model_step_id,
+        "model_attempt_id": model_attempt_id,
+        "publication_status": publication_status,
+        "failure_code": failure_code,
+        "task_id": task_id,
+        "work_id": work_id,
+    }
+    encoded = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _private_product_error_response(status_code: int, detail: str) -> JSONResponse:
@@ -336,6 +421,126 @@ class PlaceholderOperatorAccess(BaseModel):
 OperatorAccess = ServerAccessConfig | PlaceholderOperatorAccess
 
 
+class ProductResultReceipt(BaseModel):
+    """Application-owned proof of one exact public result projection."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    record_type: Literal["cayu.product-result-receipt"] = _PRODUCT_RESULT_RECEIPT_RECORD_TYPE
+    schema_version: Literal[1] = _PRODUCT_RESULT_RECEIPT_SCHEMA_VERSION
+    work_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    public_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    request_fingerprint: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    session_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    task_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    source_event_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    source_event_sequence: StrictInt = Field(ge=1, le=MAX_DURABLE_JSON_INTEGER)
+    model_step_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    model_attempt_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    interaction_id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
+    publication_status: Literal["completed", "failed"]
+    result: str | None = Field(max_length=MAX_PUBLIC_RESULT_CHARS)
+    failure_code: Literal["unsafe_result"] | None = None
+    receipt_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        work_id: str,
+        public_id: str,
+        request_fingerprint: str,
+        session_id: str,
+        task_id: str,
+        source_event_id: str,
+        source_event_sequence: int,
+        model_step_id: str,
+        model_attempt_id: str,
+        interaction_id: str,
+        publication_status: Literal["completed", "failed"],
+        result: str | None,
+        failure_code: Literal["unsafe_result"] | None = None,
+    ) -> ProductResultReceipt:
+        return cls(
+            work_id=work_id,
+            public_id=public_id,
+            request_fingerprint=request_fingerprint,
+            session_id=session_id,
+            task_id=task_id,
+            source_event_id=source_event_id,
+            source_event_sequence=source_event_sequence,
+            model_step_id=model_step_id,
+            model_attempt_id=model_attempt_id,
+            interaction_id=interaction_id,
+            publication_status=publication_status,
+            result=result,
+            failure_code=failure_code,
+            receipt_digest=_product_result_receipt_digest(
+                work_id=work_id,
+                public_id=public_id,
+                request_fingerprint=request_fingerprint,
+                session_id=session_id,
+                task_id=task_id,
+                source_event_id=source_event_id,
+                source_event_sequence=source_event_sequence,
+                model_step_id=model_step_id,
+                model_attempt_id=model_attempt_id,
+                interaction_id=interaction_id,
+                publication_status=publication_status,
+                result=result,
+                failure_code=failure_code,
+            ),
+        )
+
+    @field_validator(
+        "work_id",
+        "public_id",
+        "request_fingerprint",
+        "session_id",
+        "task_id",
+        "source_event_id",
+        "model_step_id",
+        "model_attempt_id",
+        "interaction_id",
+    )
+    @classmethod
+    def validate_clean_identity(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("result")
+    @classmethod
+    def validate_result(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_text(value, "result")
+
+    @model_validator(mode="after")
+    def validate_digest(self) -> ProductResultReceipt:
+        if self.publication_status == "completed":
+            if self.result is None or self.failure_code is not None:
+                raise ValueError("Completed publication receipts require only a result.")
+        elif self.result is not None or self.failure_code != "unsafe_result":
+            raise ValueError("Failed publication receipts require an unsafe-result code.")
+        expected = _product_result_receipt_digest(
+            work_id=self.work_id,
+            public_id=self.public_id,
+            request_fingerprint=self.request_fingerprint,
+            session_id=self.session_id,
+            task_id=self.task_id,
+            source_event_id=self.source_event_id,
+            source_event_sequence=self.source_event_sequence,
+            model_step_id=self.model_step_id,
+            model_attempt_id=self.model_attempt_id,
+            interaction_id=self.interaction_id,
+            publication_status=self.publication_status,
+            result=self.result,
+            failure_code=self.failure_code,
+        )
+        if self.receipt_digest != expected:
+            raise ValueError("receipt_digest does not match the result receipt content.")
+        return self
+
+
 class ProductOperation(BaseModel):
     """Application-owned binding between public identity and private Cayu authority."""
 
@@ -351,6 +556,8 @@ class ProductOperation(BaseModel):
     request_text: str = Field(max_length=100_000)
     status: Literal["pending", "completed", "failed"]
     result: str | None = Field(max_length=100_000)
+    result_receipt: ProductResultReceipt | None = None
+    recovery_status: ProductRecoveryStatus | None = None
 
     @field_validator(
         "tenant_id",
@@ -369,6 +576,31 @@ class ProductOperation(BaseModel):
     @classmethod
     def validate_request_text(cls, value: str) -> str:
         return require_durable_nonblank(value, "request_text")
+
+    @model_validator(mode="after")
+    def validate_result_state(self) -> ProductOperation:
+        receipt = self.result_receipt
+        if receipt is not None and (
+            receipt.work_id != self.work_id
+            or receipt.public_id != self.public_id
+            or receipt.request_fingerprint != self.request_fingerprint
+            or receipt.session_id != self.session_id
+            or receipt.task_id != self.task_id
+        ):
+            raise ValueError("result_receipt does not belong to this product operation.")
+        if self.status == "pending" and self.result is not None:
+            raise ValueError("Pending product operations cannot expose a terminal result.")
+        if self.status == "completed" and (
+            receipt is None
+            or receipt.publication_status != "completed"
+            or self.result != receipt.result
+        ):
+            raise ValueError("Completed product operations require their exact result receipt.")
+        if self.status == "failed" and self.result is not None:
+            raise ValueError("Failed product operations cannot expose a result.")
+        if self.status != "pending" and self.recovery_status is not None:
+            raise ValueError("Terminal product operations cannot retain recovery status.")
+        return self
 
 
 class ProductOperationReservation(BaseModel):
@@ -418,6 +650,28 @@ def _validated_product_store_operation(
     return operation
 
 
+def _validated_product_result_receipt(
+    value: object,
+    *,
+    expected: ProductResultReceipt,
+    source: str,
+) -> ProductResultReceipt:
+    if not isinstance(value, ProductResultReceipt):
+        raise TypeError(f"Product store must return ProductResultReceipt from {source}().")
+    try:
+        receipt = ProductResultReceipt.model_validate(
+            {
+                field_name: getattr(value, field_name)
+                for field_name in ProductResultReceipt.model_fields
+            }
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise TypeError(f"Product store returned an invalid receipt from {source}().") from None
+    if receipt != expected:
+        raise RuntimeError(f"Product store returned inconsistent receipt from {source}().")
+    return receipt
+
+
 class ProductIdempotencyConflict(Exception):
     """An idempotency identity is already bound to different trusted work."""
 
@@ -428,6 +682,10 @@ class ProductExecutionClaimLost(Exception):
 
 class ProductOperationSettlementConflict(Exception):
     """A product operation already has a different terminal result."""
+
+
+class ProductResultReceiptConflict(Exception):
+    """Product work is already bound to a different result receipt."""
 
 
 @runtime_checkable
@@ -457,6 +715,15 @@ class ProductOperationStore(Protocol):
     ) -> ProductOperationReservation: ...
 
     async def find(self, *, tenant_id: str, public_id: str) -> ProductOperation | None: ...
+
+    async def find_by_session_id(self, *, session_id: str) -> ProductOperation | None:
+        """Load private product authority for an internal continuation hook.
+
+        This lookup is never exposed as a product API and must use the exact
+        application-owned unique session index rather than Cayu labels,
+        metadata, or a scan.
+        """
+        ...
 
     async def claim_execution(
         self,
@@ -500,6 +767,39 @@ class ProductOperationStore(Protocol):
         """
         ...
 
+    async def record_result_receipt(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        receipt: ProductResultReceipt,
+    ) -> ProductResultReceipt:
+        """Insert or reconstruct the exact result receipt owned by ``claim_id``.
+
+        Repeating the same content-bound receipt after an ambiguous
+        acknowledgement must return the existing receipt. While work remains
+        pending, its current execution owner may replace a candidate only with
+        one carrying a greater durable source-event sequence. This permits a
+        queued message to advance the same session after an earlier before-stop
+        candidate without allowing stale workers to overwrite newer evidence.
+        """
+        ...
+
+    async def record_recovery_status(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        recovery_status: ProductRecoveryStatus,
+    ) -> ProductOperation:
+        """Record bounded pending-work evidence under the current execution claim.
+
+        Repeating the same status after an ambiguous acknowledgement must
+        reconstruct the current operation. Terminal work and stale claims must
+        reject the update.
+        """
+        ...
+
     async def finish(
         self,
         *,
@@ -508,7 +808,11 @@ class ProductOperationStore(Protocol):
         status: Literal["completed", "failed"],
         result: str | None,
     ) -> ProductOperation:
-        """Conditionally settle owned work or reconstruct the same terminal write."""
+        """Conditionally settle owned work or reconstruct the same terminal write.
+
+        Completed settlement must match the operation's recorded result receipt.
+        Failed settlement must persist no public result.
+        """
         ...
 
 
@@ -531,6 +835,10 @@ class PublicOperationResponse(BaseModel):
     id: str = Field(max_length=MAX_PRODUCT_IDENTITY_CHARS)
     status: Literal["pending", "completed", "failed"]
     result: str | None = Field(max_length=100_000)
+    recovery_status: ProductRecoveryStatus | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class CayuService:
@@ -586,6 +894,30 @@ class CayuService:
     def agent_name(self) -> str:
         return self._agent_name
 
+    async def _continuation_loop_policies(
+        self,
+        session_id: str,
+    ) -> tuple[LoopPolicy, ...]:
+        operation = await self.product_store.find_by_session_id(session_id=session_id)
+        if operation is None:
+            return ()
+        operation = _validated_product_store_operation(
+            operation,
+            source="find_by_session_id",
+            expected={"session_id": session_id},
+            validate_complete=True,
+        )
+        if operation.status != "pending":
+            return ()
+        if operation.request_fingerprint != _product_request_fingerprint(
+            agent_name=self.agent_name,
+            request_text=operation.request_text,
+        ):
+            raise RuntimeError(
+                "Product continuation does not match this service's agent and request contract."
+            )
+        return (_ProductContinuationReceiptPolicy(service=self, operation=operation),)
+
     async def execute_work(self, work_id: str) -> ProductOperation | None:
         """Reload trusted ownership from product storage, then run opaque queued work."""
 
@@ -634,24 +966,13 @@ class CayuService:
                     operation=operation,
                 )
             except _ProductWorkReconciliationRequired as reconciliation_error:
-                try:
-                    await _release_product_execution_claim_resisting_cancellation(
-                        self.product_store,
-                        work_id=operation.work_id,
-                        claim_id=claim_id,
-                    )
-                except asyncio.CancelledError as release_cancellation:
-                    _raise_cancellation_with_failure(
-                        release_cancellation,
-                        reconciliation_error,
-                        operation="product operation reconciliation handoff",
-                    )
-                except BaseException as release_error:
-                    raise BaseExceptionGroup(
-                        "Product work reconciliation and execution-claim release both failed.",
-                        [reconciliation_error, release_error],
-                    ) from None
-                raise
+                await _release_product_claim_after_failure(
+                    product_store=self.product_store,
+                    operation=operation,
+                    claim_id=claim_id,
+                    failure=reconciliation_error,
+                    action="product operation reconciliation handoff",
+                )
             except (BaseExceptionGroup, Exception, asyncio.CancelledError) as execution_error:
                 await _terminalize_failed_product_operation(
                     self.product_store,
@@ -660,30 +981,58 @@ class CayuService:
                     execution_error,
                 )
             if not task_is_ready:
-                # Once Cayu work has advanced beyond the initial pending task,
-                # reconstructing its public result belongs to the application's
-                # worker-recovery contract. Preserve the honest pending product
-                # state without redispatching provider work or falsely failing it.
-                await _release_product_execution_claim_resisting_cancellation(
-                    self.product_store,
-                    work_id=operation.work_id,
+                try:
+                    reconciled = await _recover_progressed_product_work(
+                        service=self,
+                        operation=operation,
+                        claim_id=claim_id,
+                    )
+                except BaseException as recovery_error:
+                    await _release_product_claim_after_failure(
+                        product_store=self.product_store,
+                        operation=operation,
+                        claim_id=claim_id,
+                        failure=recovery_error,
+                        action="product operation recovery handoff",
+                    )
+                if isinstance(reconciled, ProductOperation):
+                    return reconciled
+                await _record_product_recovery_status(
+                    service=self,
+                    operation=operation,
+                    claim_id=claim_id,
+                    recovery_status=reconciled,
+                )
+                return await _release_and_reload_pending_product_operation(
+                    service=self,
+                    operation=operation,
                     claim_id=claim_id,
                 )
-                return operation
             try:
                 await _retain_product_execution_claim(
                     service=self,
                     operation=operation,
                     claim_id=claim_id,
                 )
-                outcome_status, final_text = await _run_product_operation_bounded(
+                receipt_policy = _ProductResultReceiptPolicy(
+                    service=self,
+                    operation=operation,
+                    claim_id=claim_id,
+                )
+                (
+                    outcome_status,
+                    result_receipt,
+                    recovery_status,
+                ) = await _run_product_operation_bounded(
                     self.cayu_app,
                     RunRequest(
                         agent_name=self.agent_name,
                         messages=[Message.text("user", operation.request_text)],
                         session_id=operation.session_id,
                         task_id=operation.task_id,
+                        loop_policies=(receipt_policy,),
                     ),
+                    receipt_policy=receipt_policy,
                 )
             except (BaseExceptionGroup, Exception, asyncio.CancelledError) as execution_error:
                 await _terminalize_failed_product_operation(
@@ -692,12 +1041,13 @@ class CayuService:
                     claim_id,
                     execution_error,
                 )
-            return await _finish_product_operation_resisting_cancellation(
-                self.product_store,
-                work_id=operation.work_id,
+            return await _settle_product_run_outcome(
+                service=self,
+                operation=operation,
                 claim_id=claim_id,
-                status=("completed" if outcome_status is SessionStatus.COMPLETED else "failed"),
-                result=(final_text if outcome_status is SessionStatus.COMPLETED else None),
+                outcome_status=outcome_status,
+                result_receipt=result_receipt,
+                recovery_status=recovery_status,
             )
 
         return await _run_product_operation_with_heartbeat(
@@ -708,31 +1058,139 @@ class CayuService:
         )
 
 
+async def _settle_product_run_outcome(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    claim_id: str,
+    outcome_status: SessionStatus,
+    result_receipt: ProductResultReceipt | None,
+    recovery_status: ProductRecoveryStatus | None,
+) -> ProductOperation:
+    if outcome_status is SessionStatus.INTERRUPTED:
+        await _record_product_recovery_status(
+            service=service,
+            operation=operation,
+            claim_id=claim_id,
+            recovery_status=recovery_status or "interrupted",
+        )
+        return await _release_and_reload_pending_product_operation(
+            service=service,
+            operation=operation,
+            claim_id=claim_id,
+        )
+    if outcome_status is SessionStatus.COMPLETED:
+        if result_receipt is None:
+            raise RuntimeError("Completed product work has no publication receipt.")
+        status = result_receipt.publication_status
+        result = result_receipt.result if status == "completed" else None
+    elif outcome_status is SessionStatus.FAILED:
+        status = "failed"
+        result = None
+    else:
+        raise RuntimeError(f"Unsupported product runtime outcome: {outcome_status.value}.")
+    return await _finish_product_operation_resisting_cancellation(
+        service.product_store,
+        work_id=operation.work_id,
+        claim_id=claim_id,
+        status=status,
+        result=result,
+    )
+
+
+async def _release_and_reload_pending_product_operation(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    claim_id: str,
+) -> ProductOperation:
+    await _release_product_execution_claim_resisting_cancellation(
+        service.product_store,
+        work_id=operation.work_id,
+        claim_id=claim_id,
+    )
+    reloaded = await service.product_store.find(
+        tenant_id=operation.tenant_id,
+        public_id=operation.public_id,
+    )
+    if reloaded is None:
+        raise RuntimeError("Product work disappeared after execution-claim release.")
+    return _validated_product_store_operation(
+        reloaded,
+        source="find",
+        expected={
+            "tenant_id": operation.tenant_id,
+            "public_id": operation.public_id,
+            "work_id": operation.work_id,
+            "idempotency_key": operation.idempotency_key,
+            "request_fingerprint": operation.request_fingerprint,
+            "session_id": operation.session_id,
+            "task_id": operation.task_id,
+            "request_text": operation.request_text,
+        },
+        validate_complete=True,
+    )
+
+
+async def _record_product_recovery_status(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    claim_id: str,
+    recovery_status: ProductRecoveryStatus,
+) -> ProductOperation:
+    stored = await _reconcile_ambiguous_product_store_write(
+        lambda: service.product_store.record_recovery_status(
+            work_id=operation.work_id,
+            claim_id=claim_id,
+            recovery_status=recovery_status,
+        ),
+        operation="product recovery status",
+    )
+    return _validated_product_store_operation(
+        stored,
+        source="record_recovery_status",
+        expected={
+            "tenant_id": operation.tenant_id,
+            "public_id": operation.public_id,
+            "work_id": operation.work_id,
+            "idempotency_key": operation.idempotency_key,
+            "request_fingerprint": operation.request_fingerprint,
+            "session_id": operation.session_id,
+            "task_id": operation.task_id,
+            "request_text": operation.request_text,
+            "status": "pending",
+            "recovery_status": recovery_status,
+        },
+        validate_complete=True,
+    )
+
+
 async def _run_product_operation_bounded(
     app: CayuApp,
-    request: RunRequest,
-) -> tuple[SessionStatus, str]:
+    request: RunRequest | ResumeRequest,
+    *,
+    receipt_policy: _ProductResultReceiptPolicy,
+) -> tuple[
+    SessionStatus,
+    ProductResultReceipt | None,
+    ProductRecoveryStatus | None,
+]:
     """Consume one run without retaining its complete event or delta history."""
 
     status = SessionStatus.INTERRUPTED
+    recovery_status: ProductRecoveryStatus | None = None
     terminal_observed = False
-    current_turn_text = _BoundedProductResultCapture(app)
-    final_text = ""
+    if type(request) is RunRequest:
+        stream = app.run(request)
+    elif type(request) is ResumeRequest:
+        stream = app.resume(request)
+    else:
+        raise TypeError("Product execution requires an exact run or resume request.")
     try:
-        async for event in app.run(request):
-            payload = event.payload or {}
-            if event.type == EventType.MODEL_STARTED:
-                current_turn_text.abort()
-                current_turn_text = _BoundedProductResultCapture(app)
-                final_text = ""
-            elif event.type == EventType.MODEL_TEXT_DELTA:
-                delta = payload.get("delta")
-                if isinstance(delta, str):
-                    current_turn_text.append(delta)
-            elif event.type == EventType.MODEL_COMPLETED:
-                captured_text = current_turn_text.finish_complete()
-                final_text = captured_text if captured_text is not None else ""
-            elif event.type == EventType.SESSION_COMPLETED:
+        async for event in stream:
+            receipt_policy.observe(event)
+            if event.type == EventType.SESSION_COMPLETED:
                 status = SessionStatus.COMPLETED
                 terminal_observed = True
             elif event.type == EventType.SESSION_FAILED:
@@ -740,15 +1198,24 @@ async def _run_product_operation_bounded(
                 terminal_observed = True
             elif event.type == EventType.SESSION_INTERRUPTED:
                 status = SessionStatus.INTERRUPTED
+                interruption_type = (event.payload or {}).get("interruption_type")
+                if interruption_type == "tool_approval_required":
+                    recovery_status = "waiting_for_approval"
+                elif interruption_type == "user_input_required":
+                    recovery_status = "waiting_for_user_input"
+                else:
+                    recovery_status = "interrupted"
                 terminal_observed = True
     except Exception:
         if not terminal_observed:
             status = SessionStatus.FAILED
     finally:
-        current_turn_text.abort()
-    if current_turn_text.failed and status is SessionStatus.COMPLETED:
+        receipt_policy.close()
+    if receipt_policy.capture_failed and status is SessionStatus.COMPLETED:
         status = SessionStatus.FAILED
-    return status, final_text
+    if status is SessionStatus.COMPLETED and receipt_policy.receipt is None:
+        status = SessionStatus.FAILED
+    return status, receipt_policy.receipt, recovery_status
 
 
 class _BoundedProductResultCapture:
@@ -836,6 +1303,258 @@ def _bounded_public_result_text(value: str) -> str:
     return value[:MAX_PUBLIC_RESULT_CHARS]
 
 
+class _ProductResultReceiptPolicy(LoopPolicy):
+    """Publish the final public result before Cayu commits session completion."""
+
+    def __init__(
+        self,
+        *,
+        service: CayuService,
+        operation: ProductOperation,
+        claim_id: str,
+    ) -> None:
+        self._service = service
+        self._operation = operation
+        self._claim_id = claim_id
+        self._capture = _BoundedProductResultCapture(service.cayu_app)
+        self._captured_result: str | None = None
+        self._receipt: ProductResultReceipt | None = None
+
+    @property
+    def name(self) -> str:
+        return "product-result-publication"
+
+    @property
+    def capture_failed(self) -> bool:
+        return self._capture.failed
+
+    @property
+    def receipt(self) -> ProductResultReceipt | None:
+        return self._receipt
+
+    def observe(self, event: Event) -> None:
+        payload = event.payload or {}
+        if event.type == EventType.MODEL_STARTED:
+            self._capture.abort()
+            self._capture = _BoundedProductResultCapture(self._service.cayu_app)
+            self._captured_result = None
+        elif event.type == EventType.MODEL_TEXT_DELTA:
+            delta = payload.get("delta")
+            if isinstance(delta, str):
+                self._capture.append(delta)
+        elif event.type == EventType.MODEL_COMPLETED:
+            self._captured_result = self._capture.finish_complete()
+
+    def close(self) -> None:
+        self._capture.abort()
+
+    async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
+        result = self._captured_result
+        if self._capture.failed:
+            publication_status: Literal["completed", "failed"] = "failed"
+            failure_code: Literal["unsafe_result"] | None = "unsafe_result"
+            result = None
+        else:
+            redacted_result = self._service.cayu_app.redact_json(context.step_result.text_content)
+            if (
+                result is None
+                or type(redacted_result) is not str
+                or len(result) > MAX_PUBLIC_RESULT_CHARS
+                or self._service.cayu_app.redact_json(result) != result
+                or _bounded_public_result_text(redacted_result) != result
+            ):
+                raise RuntimeError("Product result does not match its safe runtime projection.")
+            publication_status = "completed"
+            failure_code = None
+        if result is not None and self._service.cayu_app.redact_json(result) != result:
+            raise RuntimeError("Product result does not match its safe runtime projection.")
+        self._receipt = await _record_product_result_receipt(
+            service=self._service,
+            operation=self._operation,
+            claim_id=self._claim_id,
+            model_step_id=context.step_result.model_step_id,
+            model_attempt_id=context.step_result.model_attempt_id,
+            publication_status=publication_status,
+            result=result,
+            failure_code=failure_code,
+        )
+        return BeforeStopDecision.complete(reason="product result receipt recorded")
+
+
+class _ProductContinuationReceiptPolicy(LoopPolicy):
+    """Publish a receipt for operator-driven continuation of product work."""
+
+    def __init__(self, *, service: CayuService, operation: ProductOperation) -> None:
+        self._service = service
+        self._operation = operation
+
+    @property
+    def name(self) -> str:
+        return "product-continuation-publication"
+
+    async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
+        if context.session.id != self._operation.session_id:
+            raise RuntimeError("Product continuation policy received a different session.")
+        claim_id = f"claim_{uuid4().hex}"
+        claim = await _reconcile_ambiguous_product_store_write(
+            lambda: self._service.product_store.claim_execution(
+                work_id=self._operation.work_id,
+                claim_id=claim_id,
+                lease_seconds=PRODUCT_EXECUTION_LEASE_SECONDS,
+            ),
+            operation="product continuation execution claim",
+        )
+        if not isinstance(claim, ProductOperationExecutionClaim):
+            raise TypeError(
+                "Product store must return ProductOperationExecutionClaim from claim_execution()."
+            )
+        if type(claim.acquired) is not bool:
+            raise TypeError("Product store returned an invalid execution claim.")
+        claimed_operation = _validated_product_store_operation(
+            claim.operation,
+            source="claim_execution",
+            expected={
+                "tenant_id": self._operation.tenant_id,
+                "public_id": self._operation.public_id,
+                "work_id": self._operation.work_id,
+                "idempotency_key": self._operation.idempotency_key,
+                "request_fingerprint": self._operation.request_fingerprint,
+                "session_id": self._operation.session_id,
+                "task_id": self._operation.task_id,
+                "request_text": self._operation.request_text,
+            },
+            validate_complete=True,
+        )
+        if claimed_operation.status != "pending":
+            return BeforeStopDecision.complete(reason="product operation already terminal")
+        if not claim.acquired:
+            return BeforeStopDecision.interrupt(
+                "product publication claim is held by another worker"
+            )
+
+        capture = _BoundedProductResultCapture(self._service.cayu_app)
+        try:
+            capture.append(context.step_result.text_content)
+            result = capture.finish_complete()
+            if capture.failed:
+                publication_status: Literal["completed", "failed"] = "failed"
+                failure_code: Literal["unsafe_result"] | None = "unsafe_result"
+                result = None
+            else:
+                if result is None or self._service.cayu_app.redact_json(result) != result:
+                    raise RuntimeError(
+                        "Product continuation result does not match its safe projection."
+                    )
+                publication_status = "completed"
+                failure_code = None
+
+            async def publish_receipt() -> ProductResultReceipt:
+                await _retain_product_execution_claim(
+                    service=self._service,
+                    operation=claimed_operation,
+                    claim_id=claim_id,
+                )
+                return await _record_product_result_receipt(
+                    service=self._service,
+                    operation=claimed_operation,
+                    claim_id=claim_id,
+                    model_step_id=context.step_result.model_step_id,
+                    model_attempt_id=context.step_result.model_attempt_id,
+                    publication_status=publication_status,
+                    result=result,
+                    failure_code=failure_code,
+                )
+
+            await _run_product_operation_with_heartbeat(
+                service=self._service,
+                operation=claimed_operation,
+                claim_id=claim_id,
+                execute_and_settle=publish_receipt,
+            )
+        except BaseException as publication_error:
+            await _release_product_claim_after_failure(
+                product_store=self._service.product_store,
+                operation=claimed_operation,
+                claim_id=claim_id,
+                failure=publication_error,
+                action="product continuation publication cleanup",
+            )
+        finally:
+            capture.abort()
+        await _release_product_execution_claim_resisting_cancellation(
+            self._service.product_store,
+            work_id=claimed_operation.work_id,
+            claim_id=claim_id,
+        )
+        return BeforeStopDecision.complete(reason="product continuation receipt recorded")
+
+
+async def _record_product_result_receipt(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    claim_id: str,
+    model_step_id: str,
+    model_attempt_id: str,
+    publication_status: Literal["completed", "failed"],
+    result: str | None,
+    failure_code: Literal["unsafe_result"] | None,
+) -> ProductResultReceipt:
+    """Bind one safe public result to its exact durable conversational completion."""
+
+    records = await service.cayu_app.session_store.query_events(
+        EventQuery(
+            session_id=operation.session_id,
+            event_type=EventType.MODEL_COMPLETED,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    if len(records) != 1:
+        raise RuntimeError("Product result source event is not durably available.")
+    source = records[0]
+    durable_event = source.event
+    interaction_id = durable_event.interaction_id
+    if (
+        durable_event.session_id != operation.session_id
+        or durable_event.agent_name != service.agent_name
+        or not is_conversational_model_completion_payload(durable_event.payload)
+        or durable_event.payload.get("model_step_id") != model_step_id
+        or durable_event.payload.get("model_attempt_id") != model_attempt_id
+        or type(interaction_id) is not str
+    ):
+        raise RuntimeError("Product result source event conflicts with durable runtime evidence.")
+    interaction_id = require_durable_clean_nonblank(interaction_id, "interaction_id")
+    receipt = ProductResultReceipt.create(
+        work_id=operation.work_id,
+        public_id=operation.public_id,
+        request_fingerprint=operation.request_fingerprint,
+        session_id=operation.session_id,
+        task_id=operation.task_id,
+        source_event_id=durable_event.id,
+        source_event_sequence=source.sequence,
+        model_step_id=model_step_id,
+        model_attempt_id=model_attempt_id,
+        interaction_id=interaction_id,
+        publication_status=publication_status,
+        result=result,
+        failure_code=failure_code,
+    )
+    stored = await _reconcile_ambiguous_product_store_write(
+        lambda: service.product_store.record_result_receipt(
+            work_id=operation.work_id,
+            claim_id=claim_id,
+            receipt=receipt,
+        ),
+        operation="product result receipt",
+    )
+    return _validated_product_result_receipt(
+        stored,
+        expected=receipt,
+        source="record_result_receipt",
+    )
+
+
 async def _create_or_verify_product_task(
     *,
     service: CayuService,
@@ -896,22 +1615,11 @@ def _product_task_is_safe_to_start(
 ) -> bool:
     """Validate stable task authority and classify its initial lifecycle state."""
 
-    if not isinstance(task, Task):
-        raise TypeError("Task store returned an invalid product task.")
-    try:
-        task = Task.model_validate(
-            {field_name: getattr(task, field_name) for field_name in Task.model_fields}
-        )
-    except (AttributeError, TypeError, ValueError):
-        raise TypeError("Task store returned an invalid product task.") from None
-    if (
-        task.id != operation.task_id
-        or task.type != "public_agent_operation"
-        or task.session_id != operation.session_id
-        or task.parent_task_id is not None
-        or task.assigned_agent_name != agent_name
-    ):
-        raise RuntimeError("Existing Cayu task conflicts with product work authority.")
+    task = _validated_product_task(
+        task,
+        operation=operation,
+        agent_name=agent_name,
+    )
     if task.status != TaskStatus.PENDING:
         return False
     return not (
@@ -930,18 +1638,300 @@ def _product_task_is_safe_to_start(
     )
 
 
+def _validated_product_task(
+    task: object,
+    *,
+    operation: ProductOperation,
+    agent_name: str,
+) -> Task:
+    if not isinstance(task, Task):
+        raise TypeError("Task store returned an invalid product task.")
+    try:
+        task = Task.model_validate(
+            {field_name: getattr(task, field_name) for field_name in Task.model_fields}
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise TypeError("Task store returned an invalid product task.") from None
+    if (
+        task.id != operation.task_id
+        or task.type != "public_agent_operation"
+        or task.session_id != operation.session_id
+        or task.parent_task_id is not None
+        or task.assigned_agent_name != agent_name
+    ):
+        raise RuntimeError("Existing Cayu task conflicts with product work authority.")
+    return task
+
+
+async def _recover_progressed_product_work(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    claim_id: str,
+) -> ProductOperation | ProductRecoveryStatus:
+    """Reconcile terminal work or continue one safely abandoned session."""
+
+    await _retain_product_execution_claim(
+        service=service,
+        operation=operation,
+        claim_id=claim_id,
+    )
+    reconciled = await _reconcile_terminal_product_work(
+        service=service,
+        operation=operation,
+        claim_id=claim_id,
+    )
+    if reconciled is not None:
+        return reconciled
+    if await service.cayu_app.session_store.load_state(operation.session_id) is None:
+        return "manual_reconciliation_required"
+
+    recovery = await service.cayu_app.recover_incomplete_session(
+        IncompleteSessionRecoveryRequest(
+            session_id=operation.session_id,
+            reason="product_worker_recovered_incomplete_session",
+        )
+    )
+    reconciled = await _reconcile_terminal_product_work(
+        service=service,
+        operation=operation,
+        claim_id=claim_id,
+    )
+    if reconciled is not None:
+        return reconciled
+    if recovery.pending_approval_id is not None:
+        return "waiting_for_approval"
+    if recovery.pending_user_input_id is not None:
+        return "waiting_for_user_input"
+    if IncompleteSessionRecoveryAction.SKIPPED_ACTIVE in recovery.actions:
+        return "runtime_active"
+    if (
+        recovery.status is not SessionStatus.INTERRUPTED
+        or IncompleteSessionRecoveryAction.INTERRUPTED_ABANDONED not in recovery.actions
+    ):
+        if recovery.status is SessionStatus.INTERRUPTED:
+            return "interrupted"
+        return "manual_reconciliation_required"
+
+    await _retain_product_execution_claim(
+        service=service,
+        operation=operation,
+        claim_id=claim_id,
+    )
+    receipt_policy = _ProductResultReceiptPolicy(
+        service=service,
+        operation=operation,
+        claim_id=claim_id,
+    )
+    outcome_status, result_receipt, recovery_status = await _run_product_operation_bounded(
+        service.cayu_app,
+        ResumeRequest(
+            session_id=operation.session_id,
+            messages=[Message.text("user", _PRODUCT_RECOVERY_MESSAGE)],
+            loop_policies=(receipt_policy,),
+        ),
+        receipt_policy=receipt_policy,
+    )
+    return await _settle_product_run_outcome(
+        service=service,
+        operation=operation,
+        claim_id=claim_id,
+        outcome_status=outcome_status,
+        result_receipt=result_receipt,
+        recovery_status=recovery_status,
+    )
+
+
+async def _reconcile_terminal_product_work(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    claim_id: str,
+) -> ProductOperation | None:
+    """Settle terminal Cayu work from bounded evidence without redispatch."""
+
+    task_store = service.cayu_app.task_store
+    if task_store is None:
+        raise RuntimeError("task_store is required to reconcile product work.")
+    task = await task_store.load_task(operation.task_id)
+    if task is None:
+        return None
+    task = _validated_product_task(
+        task,
+        operation=operation,
+        agent_name=service.agent_name,
+    )
+    state = await service.cayu_app.session_store.load_state(operation.session_id)
+    if state is None:
+        return None
+    if not getattr(
+        service.cayu_app.session_store,
+        "supports_terminal_session_evidence",
+        False,
+    ):
+        return None
+    if state.status not in {SessionStatus.COMPLETED, SessionStatus.FAILED}:
+        return None
+    expected_task_status = (
+        TaskStatus.COMPLETED if state.status is SessionStatus.COMPLETED else TaskStatus.FAILED
+    )
+    if task.status is not expected_task_status:
+        return None
+    try:
+        evidence = await service.cayu_app.session_store.load_terminal_session_evidence(
+            operation.session_id
+        )
+    except (NotImplementedError, TerminalSessionEvidenceError):
+        return None
+    if (
+        evidence.session.id != operation.session_id
+        or evidence.session.agent_name != service.agent_name
+        or evidence.session.status is not state.status
+        or evidence.terminal_event.event.session_id != operation.session_id
+    ):
+        return None
+    if state.status is SessionStatus.FAILED:
+        if evidence.terminal_event.event.type != EventType.SESSION_FAILED:
+            return None
+        return await _finish_product_operation_resisting_cancellation(
+            service.product_store,
+            work_id=operation.work_id,
+            claim_id=claim_id,
+            status="failed",
+            result=None,
+        )
+    receipt = operation.result_receipt
+    if receipt is None or not await _terminal_evidence_matches_product_receipt(
+        service=service,
+        operation=operation,
+        receipt=receipt,
+        evidence=evidence,
+    ):
+        return None
+    return await _finish_product_operation_resisting_cancellation(
+        service.product_store,
+        work_id=operation.work_id,
+        claim_id=claim_id,
+        status=receipt.publication_status,
+        result=(receipt.result if receipt.publication_status == "completed" else None),
+    )
+
+
+async def _terminal_evidence_matches_product_receipt(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    receipt: ProductResultReceipt,
+    evidence: TerminalSessionEvidence,
+) -> bool:
+    if (
+        evidence.terminal_event.event.type != EventType.SESSION_COMPLETED
+        or receipt.work_id != operation.work_id
+        or receipt.public_id != operation.public_id
+        or receipt.request_fingerprint != operation.request_fingerprint
+        or receipt.session_id != operation.session_id
+        or receipt.task_id != operation.task_id
+    ):
+        return False
+    records = await service.cayu_app.session_store.query_events(
+        EventQuery(
+            session_id=operation.session_id,
+            event_id=receipt.source_event_id,
+            order_by=EventOrder.SEQUENCE_ASC,
+            limit=2,
+        )
+    )
+    if len(records) != 1:
+        return False
+    source = records[0]
+    event = source.event
+    if (
+        event.type != EventType.MODEL_COMPLETED
+        or event.session_id != operation.session_id
+        or event.agent_name != service.agent_name
+        or not is_conversational_model_completion_payload(event.payload)
+        or event.payload.get("model_step_id") != receipt.model_step_id
+        or event.payload.get("model_attempt_id") != receipt.model_attempt_id
+        or source.sequence != receipt.source_event_sequence
+        or event.interaction_id != receipt.interaction_id
+        or source.sequence >= evidence.boundary.terminal_event_sequence
+    ):
+        return False
+    try:
+        latest_completion = await _latest_conversational_model_completion(
+            service=service,
+            session_id=operation.session_id,
+            before_sequence=evidence.boundary.terminal_event_sequence,
+        )
+    except EventQueryResultTooLarge:
+        return False
+    if latest_completion is None or latest_completion[0] != source.sequence:
+        return False
+    lifecycle_sequences = [
+        record.sequence
+        for record in evidence.events
+        if record.event.type
+        in {
+            EventType.SESSION_STARTED,
+            EventType.SESSION_RESUMED,
+            EventType.SESSION_FORKED,
+        }
+    ]
+    if not lifecycle_sequences or source.sequence <= max(lifecycle_sequences):
+        return False
+    interaction_lifecycle_ids = {
+        record.event.interaction_id
+        for record in evidence.lifecycle_events
+        if record.event.interaction_id is not None
+    }
+    return receipt.interaction_id in interaction_lifecycle_ids
+
+
+async def _latest_conversational_model_completion(
+    *,
+    service: CayuService,
+    session_id: str,
+    before_sequence: int,
+) -> tuple[int, Event] | None:
+    """Find the latest ordinary completion within a strict auxiliary-event bound."""
+
+    remaining = MAX_PRODUCT_RESULT_EVIDENCE_SCAN_EVENTS
+    cursor = before_sequence
+    while remaining > 0:
+        page_size = min(16, remaining)
+        records = await service.cayu_app.session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_type=EventType.MODEL_COMPLETED,
+                before_sequence=cursor,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=page_size,
+            )
+        )
+        if not records:
+            return None
+        for record in records:
+            if is_conversational_model_completion_payload(record.event.payload):
+                return record.sequence, record.event
+        remaining -= len(records)
+        if len(records) < page_size:
+            return None
+        cursor = records[-1].sequence
+    return None
+
+
 async def _run_product_operation_with_heartbeat(
     *,
     service: CayuService,
     operation: ProductOperation,
     claim_id: str,
-    execute_and_settle: Callable[[], Awaitable[ProductOperation]],
-) -> ProductOperation:
+    execute_and_settle: Callable[[], Awaitable[_ProductExecutionResult]],
+) -> _ProductExecutionResult:
     """Retain authoritative ownership through runtime work and terminal settlement."""
 
     stop_heartbeat = asyncio.Event()
 
-    async def execute() -> ProductOperation:
+    async def execute() -> _ProductExecutionResult:
         try:
             return await execute_and_settle()
         finally:
@@ -1216,6 +2206,48 @@ async def _release_product_execution_claim_resisting_cancellation(
         raise outcome.cancellation
 
 
+async def _release_product_claim_after_failure(
+    *,
+    product_store: ProductOperationStore,
+    operation: ProductOperation,
+    claim_id: str,
+    failure: BaseException,
+    action: str,
+) -> Never:
+    """Release failed pending work without hiding either failure or cancellation."""
+
+    try:
+        await _release_product_execution_claim_resisting_cancellation(
+            product_store,
+            work_id=operation.work_id,
+            claim_id=claim_id,
+        )
+    except asyncio.CancelledError as release_cancellation:
+        if isinstance(failure, asyncio.CancelledError):
+            _raise_cancellation_with_failure(
+                failure,
+                release_cancellation,
+                operation=action,
+            )
+        _raise_cancellation_with_failure(
+            release_cancellation,
+            failure,
+            operation=action,
+        )
+    except BaseException as release_error:
+        if isinstance(failure, asyncio.CancelledError):
+            _raise_cancellation_with_failure(
+                failure,
+                release_error,
+                operation=action,
+            )
+        raise BaseExceptionGroup(
+            f"{action.capitalize()} and execution-claim release both failed.",
+            [failure, release_error],
+        ) from None
+    raise failure
+
+
 async def _reconcile_ambiguous_product_store_write(
     write: Callable[[], Awaitable[Any]],
     *,
@@ -1225,7 +2257,11 @@ async def _reconcile_ambiguous_product_store_write(
 
     try:
         return await write()
-    except (ProductExecutionClaimLost, ProductOperationSettlementConflict):
+    except (
+        ProductExecutionClaimLost,
+        ProductOperationSettlementConflict,
+        ProductResultReceiptConflict,
+    ):
         raise
     except asyncio.CancelledError:
         raise
@@ -1235,6 +2271,7 @@ async def _reconcile_ambiguous_product_store_write(
         except (
             ProductExecutionClaimLost,
             ProductOperationSettlementConflict,
+            ProductResultReceiptConflict,
         ) as reconciliation_conflict:
             if reconciliation_conflict.__cause__ is None:
                 raise reconciliation_conflict from first_failure
@@ -1519,6 +2556,7 @@ def create_agent_service(
         app,
         path=control_plane_path,
         access=operator_mount_access,
+        continuation_loop_policy_provider=service._continuation_loop_policies,
     )
     server.state.cayu_public_service = service
     server.state.cayu_public_service_manifest = manifest
@@ -1763,6 +2801,7 @@ def _public_operation(
         id=public_id,
         status=operation.status,
         result=(_bounded_public_result_text(result) if result is not None else None),
+        recovery_status=operation.recovery_status,
     )
 
 

@@ -708,12 +708,16 @@ authorization boundary. SQLite is durable for the generated single-process
 service; replace it with an equivalently atomic shared store before scaling to
 multiple service processes. Execution claims use store-owned lease time, and
 terminal updates are conditional on the current claim so only one valid owner
-can settle an operation.
+can settle an operation. Content-bound publication receipts are written before
+Cayu session completion and are required for a completed product result. The
+private session-id lookup exists only for trusted continuation hooks; product
+HTTP reads remain tenant-qualified by public id.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -727,6 +731,9 @@ from cayu.server import (
     ProductOperationExecutionClaim,
     ProductOperationReservation,
     ProductOperationSettlementConflict,
+    ProductRecoveryStatus,
+    ProductResultReceipt,
+    ProductResultReceiptConflict,
     ServiceIdentityStoreKind,
 )
 
@@ -763,6 +770,8 @@ class SQLiteProductOperationStore:
                     request_text TEXT NOT NULL,
                     status TEXT NOT NULL,
                     result TEXT,
+                    result_receipt TEXT,
+                    recovery_status TEXT,
                     execution_claim_id TEXT,
                     execution_claim_expires_at INTEGER
                 )"""
@@ -875,6 +884,20 @@ class SQLiteProductOperationStore:
                 """SELECT * FROM product_operations
                    WHERE tenant_id = ? AND public_id = ?""",
                 (tenant_id, public_id),
+            ).fetchone()
+        return None if row is None else self._operation(row)
+
+    async def find_by_session_id(self, *, session_id: str) -> ProductOperation | None:
+        return await asyncio.to_thread(
+            self._find_by_session_id_sync,
+            session_id=session_id,
+        )
+
+    def _find_by_session_id_sync(self, *, session_id: str) -> ProductOperation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM product_operations WHERE session_id = ?",
+                (session_id,),
             ).fetchone()
         return None if row is None else self._operation(row)
 
@@ -1032,6 +1055,144 @@ class SQLiteProductOperationStore:
                 )
             return True
 
+    async def record_result_receipt(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        receipt: ProductResultReceipt,
+    ) -> ProductResultReceipt:
+        return await asyncio.to_thread(
+            self._record_result_receipt_sync,
+            work_id=work_id,
+            claim_id=claim_id,
+            receipt=receipt,
+        )
+
+    def _record_result_receipt_sync(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        receipt: ProductResultReceipt,
+    ) -> ProductResultReceipt:
+        receipt = ProductResultReceipt.model_validate(receipt.model_dump(mode="python"))
+        encoded = json.dumps(
+            receipt.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Product work disappeared during result publication."
+                )
+            operation = self._operation(row)
+            if operation.status != "pending" or row["execution_claim_id"] != claim_id:
+                if (
+                    operation.status != "pending"
+                    and row["execution_claim_id"] == claim_id
+                    and operation.result_receipt == receipt
+                ):
+                    return receipt
+                raise ProductExecutionClaimLost(
+                    "Product execution ownership was lost before result publication."
+                )
+            if (
+                receipt.work_id != operation.work_id
+                or receipt.public_id != operation.public_id
+                or receipt.request_fingerprint != operation.request_fingerprint
+                or receipt.session_id != operation.session_id
+                or receipt.task_id != operation.task_id
+            ):
+                raise ProductResultReceiptConflict(
+                    "Result receipt does not belong to this product operation."
+                )
+            if operation.result_receipt is not None:
+                if operation.result_receipt == receipt:
+                    return operation.result_receipt
+                if receipt.source_event_sequence <= (
+                    operation.result_receipt.source_event_sequence
+                ):
+                    raise ProductResultReceiptConflict(
+                        "Product work already has newer result evidence."
+                    )
+            changed = connection.execute(
+                """UPDATE product_operations
+                   SET result_receipt = ?, recovery_status = NULL
+                   WHERE work_id = ?
+                     AND status = 'pending'
+                     AND result_receipt IS ?
+                     AND execution_claim_id = ?""",
+                (encoded, work_id, row["result_receipt"], claim_id),
+            ).rowcount
+            if changed != 1:
+                raise ProductExecutionClaimLost(
+                    "Product execution ownership was lost before result publication."
+                )
+        return receipt
+
+    async def record_recovery_status(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        recovery_status: ProductRecoveryStatus,
+    ) -> ProductOperation:
+        return await asyncio.to_thread(
+            self._record_recovery_status_sync,
+            work_id=work_id,
+            claim_id=claim_id,
+            recovery_status=recovery_status,
+        )
+
+    def _record_recovery_status_sync(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        recovery_status: ProductRecoveryStatus,
+    ) -> ProductOperation:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Product work disappeared during recovery reporting."
+                )
+            operation = self._operation(row)
+            if operation.status != "pending" or row["execution_claim_id"] != claim_id:
+                raise ProductExecutionClaimLost(
+                    "Product execution ownership was lost before recovery reporting."
+                )
+            changed = connection.execute(
+                """UPDATE product_operations
+                   SET recovery_status = ?
+                   WHERE work_id = ?
+                     AND status = 'pending'
+                     AND execution_claim_id = ?""",
+                (recovery_status, work_id, claim_id),
+            ).rowcount
+            if changed != 1:
+                raise ProductExecutionClaimLost(
+                    "Product execution ownership was lost before recovery reporting."
+                )
+            row = connection.execute(
+                "SELECT * FROM product_operations WHERE work_id = ?", (work_id,)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Product work disappeared during recovery reporting."
+                )
+            return self._operation(row)
+
     async def finish(
         self,
         *,
@@ -1064,6 +1225,19 @@ class SQLiteProductOperationStore:
             if row is None:
                 raise RuntimeError("Product work disappeared during completion.")
             operation = self._operation(row)
+            receipt = operation.result_receipt
+            if status == "completed" and (
+                receipt is None
+                or receipt.publication_status != "completed"
+                or receipt.result != result
+            ):
+                raise ProductOperationSettlementConflict(
+                    "Completed product work does not match its result receipt."
+                )
+            if status == "failed" and result is not None:
+                raise ProductOperationSettlementConflict(
+                    "Failed product work cannot persist a public result."
+                )
             if operation.status != "pending":
                 if (
                     row["execution_claim_id"] == claim_id
@@ -1084,7 +1258,8 @@ class SQLiteProductOperationStore:
                 )
             changed = connection.execute(
                 """UPDATE product_operations
-                   SET status = ?, result = ?, execution_claim_expires_at = NULL
+                   SET status = ?, result = ?, recovery_status = NULL,
+                       execution_claim_expires_at = NULL
                    WHERE work_id = ?
                      AND status = 'pending'
                      AND execution_claim_id = ?""",
@@ -1106,6 +1281,10 @@ class SQLiteProductOperationStore:
         fields = dict(row)
         fields.pop("execution_claim_id", None)
         fields.pop("execution_claim_expires_at", None)
+        raw_receipt = fields.get("result_receipt")
+        fields["result_receipt"] = (
+            None if raw_receipt is None else json.loads(raw_receipt)
+        )
         return ProductOperation(**fields)
 '''
 
@@ -1124,10 +1303,17 @@ from cayu import (
     CayuApp,
     InMemorySessionStore,
     InMemoryTaskStore,
+    Message,
     ModelStreamEvent,
+    RunRequest,
     ScriptedModelProvider,
     SecretRedactor,
+    SessionIdentity,
+    SessionStatus,
+    SQLiteSessionStore,
+    SQLiteTaskStore,
     TaskCreate,
+    TaskStatus,
 )
 from cayu.server import (
     AuthenticatedAccess,
@@ -1136,6 +1322,8 @@ from cayu.server import (
     ProductExecutionClaimLost,
     ProductOperationSettlementConflict,
     ProductPrincipal,
+    ProductResultReceipt,
+    ProductResultReceiptConflict,
     ServiceMode,
     create_agent_service,
 )
@@ -1457,6 +1645,9 @@ def test_idempotency_and_public_response_redaction(tmp_path) -> None:
     assert len(provider.requests) == 1
     with store._connect() as connection:
         private = next(iter(connection.execute("SELECT * FROM product_operations")))
+    receipt = json.loads(private["result_receipt"])
+    assert receipt["publication_status"] == "completed"
+    assert receipt["result"] == first.json()["result"]
     projected = repr(first.json())
     for field in ("tenant_id", "work_id", "session_id", "task_id", "idempotency_key"):
         assert private[field] not in projected
@@ -1514,35 +1705,415 @@ def test_control_plane_separation_and_background_ownership_reload(tmp_path) -> N
     assert client.get("/openapi.json").status_code == 404
 
 
-def test_precreated_product_task_is_verified_before_redelivery(tmp_path) -> None:
+@pytest.mark.parametrize("precreate_task", [False, True])
+def test_replacement_worker_recovers_reservation_and_precreated_task(
+    tmp_path,
+    precreate_task,
+) -> None:
     async def scenario() -> None:
-        service, store, provider = assembled_service(tmp_path)
-        reservation = await store.reserve(
-            tenant_id="tenant-a",
-            idempotency_key="task-created-redelivery",
-            request_fingerprint=product_request_fingerprint(
-                "recover work", agent_name=service.agent_name
+        runtime_path = str(tmp_path / f"initial-runtime-{precreate_task}.db")
+        product_path = str(tmp_path / f"initial-product-{precreate_task}.db")
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("allow-listed answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        first_store = SQLiteProductOperationStore(product_path)
+        first_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=SQLiteTaskStore(runtime_path),
+            product_store=first_store,
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
             ),
-            public_id="op_task_created",
-            work_id="work_task_created",
-            session_id="session_task_created",
-            task_id="task_task_created",
+        )
+        reservation = await first_store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key=f"initial-redelivery-{precreate_task}",
+            request_fingerprint=product_request_fingerprint(
+                "recover work", agent_name=first_service.agent_name
+            ),
+            public_id=f"op_initial_{precreate_task}",
+            work_id=f"work_initial_{precreate_task}",
+            session_id=f"session_initial_{precreate_task}",
+            task_id=f"task_initial_{precreate_task}",
             request_text="recover work",
         )
-        await service.cayu_app.create_task(
-            TaskCreate(
-                task_id=reservation.operation.task_id,
-                type="public_agent_operation",
-                session_id=reservation.operation.session_id,
-                assigned_agent_name=service.agent_name,
+        if precreate_task:
+            await first_service.cayu_app.create_task(
+                TaskCreate(
+                    task_id=reservation.operation.task_id,
+                    type="public_agent_operation",
+                    session_id=reservation.operation.session_id,
+                    assigned_agent_name=first_service.agent_name,
+                )
             )
+
+        replacement_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=SQLiteTaskStore(runtime_path),
+            product_store=SQLiteProductOperationStore(product_path),
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        completed = await replacement_service.execute_work(
+            reservation.operation.work_id
+        )
+
+        assert completed is not None
+        assert completed.status == "completed"
+        assert completed.result == "allow-listed answer"
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_replacement_worker_settles_terminal_receipt_without_redispatch(
+    tmp_path,
+) -> None:
+    class FailingSettlementStore(SQLiteProductOperationStore):
+        async def finish(self, **_kwargs):
+            raise RuntimeError("product settlement unavailable")
+
+    async def scenario() -> None:
+        runtime_path = str(tmp_path / "replacement-runtime.db")
+        product_path = str(tmp_path / "replacement-product.db")
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("allow-listed answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        first_store = FailingSettlementStore(product_path)
+        first_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=SQLiteTaskStore(runtime_path),
+            product_store=first_store,
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        reservation = await first_store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="replacement-terminal",
+            request_fingerprint=product_request_fingerprint(
+                "work", agent_name=first_service.agent_name
+            ),
+            public_id="op_replacement_terminal",
+            work_id="work_replacement_terminal",
+            session_id="session_replacement_terminal",
+            task_id="task_replacement_terminal",
+            request_text="work",
+        )
+
+        with pytest.raises(RuntimeError, match="product settlement unavailable"):
+            await first_service.execute_work(reservation.operation.work_id)
+        with first_store._connect() as connection:
+            row = connection.execute(
+                "SELECT status, result_receipt FROM product_operations WHERE work_id = ?",
+                (reservation.operation.work_id,),
+            ).fetchone()
+            assert row["status"] == "pending"
+            assert json.loads(row["result_receipt"])["result"] == "allow-listed answer"
+            connection.execute(
+                "UPDATE product_operations SET execution_claim_expires_at = 0 "
+                "WHERE work_id = ?",
+                (reservation.operation.work_id,),
+            )
+
+        replacement_store = SQLiteProductOperationStore(product_path)
+        replacement_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=SQLiteTaskStore(runtime_path),
+            product_store=replacement_store,
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        completed = await replacement_service.execute_work(
+            reservation.operation.work_id
+        )
+
+        assert completed is not None
+        assert completed.status == "completed"
+        assert completed.result == "allow-listed answer"
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_durable_receipt_and_settlement_acknowledgements_are_reconstructed(
+    tmp_path,
+) -> None:
+    class CommitThenRaiseStore(SQLiteProductOperationStore):
+        receipt_calls = 0
+        finish_calls = 0
+
+        async def record_result_receipt(self, **kwargs):
+            receipt = await super().record_result_receipt(**kwargs)
+            self.receipt_calls += 1
+            if self.receipt_calls == 1:
+                raise RuntimeError("receipt acknowledgement lost")
+            return receipt
+
+        async def finish(self, **kwargs):
+            operation = await super().finish(**kwargs)
+            self.finish_calls += 1
+            if self.finish_calls == 1:
+                raise RuntimeError("settlement acknowledgement lost")
+            return operation
+
+    async def scenario() -> None:
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("allow-listed answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        store = CommitThenRaiseStore(str(tmp_path / "acknowledgements-product.db"))
+        service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(
+                str(tmp_path / "acknowledgements-runtime.db")
+            ),
+            task_store=SQLiteTaskStore(str(tmp_path / "acknowledgements-runtime.db")),
+            product_store=store,
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="acknowledgement-reconstruction",
+            request_fingerprint=product_request_fingerprint(
+                "work", agent_name=service.agent_name
+            ),
+            public_id="op_acknowledgement_reconstruction",
+            work_id="work_acknowledgement_reconstruction",
+            session_id="session_acknowledgement_reconstruction",
+            task_id="task_acknowledgement_reconstruction",
+            request_text="work",
         )
 
         completed = await service.execute_work(reservation.operation.work_id)
 
         assert completed is not None
         assert completed.status == "completed"
+        assert completed.result == "allow-listed answer"
+        assert store.receipt_calls == 2
+        assert store.finish_calls == 2
         assert len(provider.requests) == 1
+        with store._connect() as connection:
+            row = connection.execute(
+                "SELECT status, result, result_receipt FROM product_operations "
+                "WHERE work_id = ?",
+                (reservation.operation.work_id,),
+            ).fetchone()
+        assert row["status"] == "completed"
+        assert row["result"] == "allow-listed answer"
+        assert json.loads(row["result_receipt"])["result"] == "allow-listed answer"
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_durable_replacement_workers_dispatch_once(tmp_path) -> None:
+    class BlockingTaskStore(SQLiteTaskStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.create_started = asyncio.Event()
+            self.allow_create = asyncio.Event()
+
+        async def create_task(self, request):
+            self.create_started.set()
+            await self.allow_create.wait()
+            return await super().create_task(request)
+
+    async def scenario() -> None:
+        runtime_path = str(tmp_path / "concurrent-runtime.db")
+        product_path = str(tmp_path / "concurrent-product.db")
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("single execution"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        first_task_store = BlockingTaskStore(runtime_path)
+        first_store = SQLiteProductOperationStore(product_path)
+        first_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=first_task_store,
+            product_store=first_store,
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        replacement_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=SQLiteTaskStore(runtime_path),
+            product_store=SQLiteProductOperationStore(product_path),
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        reservation = await first_store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="concurrent-replacement",
+            request_fingerprint=product_request_fingerprint(
+                "work", agent_name=first_service.agent_name
+            ),
+            public_id="op_concurrent_replacement",
+            work_id="work_concurrent_replacement",
+            session_id="session_concurrent_replacement",
+            task_id="task_concurrent_replacement",
+            request_text="work",
+        )
+
+        first_execution = asyncio.create_task(
+            first_service.execute_work(reservation.operation.work_id)
+        )
+        await first_task_store.create_started.wait()
+        duplicate = await replacement_service.execute_work(
+            reservation.operation.work_id
+        )
+
+        assert duplicate is not None and duplicate.status == "pending"
+        assert provider.requests == []
+        first_task_store.allow_create.set()
+        completed = await first_execution
+        assert completed is not None and completed.status == "completed"
+        assert completed.result == "single execution"
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
+    async def scenario() -> None:
+        runtime_path = str(tmp_path / "continuation-runtime.db")
+        product_path = str(tmp_path / "continuation-product.db")
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("continued answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ]
+        )
+        first_store = SQLiteProductOperationStore(product_path)
+        first_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=SQLiteTaskStore(runtime_path),
+            product_store=first_store,
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        reservation = await first_store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="replacement-continuation",
+            request_fingerprint=product_request_fingerprint(
+                "recover work", agent_name=first_service.agent_name
+            ),
+            public_id="op_replacement_continuation",
+            work_id="work_replacement_continuation",
+            session_id="session_replacement_continuation",
+            task_id="task_replacement_continuation",
+            request_text="recover work",
+        )
+        original_message = Message.text("user", reservation.operation.request_text)
+        await first_service.cayu_app.task_store.create_task(
+            TaskCreate(
+                task_id=reservation.operation.task_id,
+                type="public_agent_operation",
+                session_id=reservation.operation.session_id,
+                assigned_agent_name=first_service.agent_name,
+            )
+        )
+        await first_service.cayu_app.task_store.start_task(
+            reservation.operation.task_id,
+            session_id=reservation.operation.session_id,
+        )
+        await first_service.cayu_app.session_store.create(
+            RunRequest(
+                agent_name=first_service.agent_name,
+                session_id=reservation.operation.session_id,
+                task_id=reservation.operation.task_id,
+                messages=[original_message],
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="scripted-model",
+            ),
+        )
+        await first_service.cayu_app.session_store.append_transcript_messages(
+            reservation.operation.session_id,
+            [original_message],
+        )
+        await first_service.cayu_app.session_store.update_status(
+            reservation.operation.session_id,
+            SessionStatus.RUNNING,
+        )
+
+        replacement_store = SQLiteProductOperationStore(product_path)
+        replacement_service = build_service(
+            mode=ServiceMode.PRODUCTION,
+            provider=provider,
+            session_store=SQLiteSessionStore(runtime_path),
+            task_store=SQLiteTaskStore(runtime_path),
+            product_store=replacement_store,
+            product_access=AuthenticatedProductAccess(dependency=customer_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+        )
+        completed = await replacement_service.execute_work(
+            reservation.operation.work_id
+        )
+
+        assert completed is not None
+        assert completed.status == "completed"
+        assert completed.result == "continued answer"
+        assert len(provider.requests) == 1
+        assert [
+            part.text
+            for message in provider.requests[0].messages
+            for part in message.content
+        ] == [
+            "recover work",
+            "Continue this interrupted operation from its durable session state. "
+            "Do not repeat work whose outcome is already recorded.",
+        ]
+        task = await replacement_service.cayu_app.task_store.load_task(
+            reservation.operation.task_id
+        )
+        assert task is not None and task.status is TaskStatus.COMPLETED
+        state = await replacement_service.cayu_app.session_store.load_state(
+            reservation.operation.session_id
+        )
+        assert state is not None and state.status is SessionStatus.COMPLETED
 
     asyncio.run(scenario())
 
@@ -1635,11 +2206,15 @@ def test_split_model_secret_is_redacted_before_generated_store_write(tmp_path) -
     assert response.status_code == 201
     assert response.json()["result"] == "[REDACTED_SECRET]"
     with store._connect() as connection:
-        result = connection.execute("SELECT result FROM product_operations").fetchone()[
-            0
-        ]
+        row = connection.execute(
+            "SELECT result, result_receipt FROM product_operations"
+        ).fetchone()
+    result = row["result"]
+    receipt = row["result_receipt"]
     assert result == "[REDACTED_SECRET]"
     assert secret not in result
+    assert secret not in receipt
+    assert json.loads(receipt)["result"] == "[REDACTED_SECRET]"
 
 
 def test_product_execution_claim_and_terminal_settlement_are_authoritative(
@@ -1648,7 +2223,7 @@ def test_product_execution_claim_and_terminal_settlement_are_authoritative(
     store = SQLiteProductOperationStore(str(tmp_path / "claims.db"))
 
     async def scenario() -> None:
-        await store.reserve(
+        reservation = await store.reserve(
             tenant_id="tenant-a",
             idempotency_key="claim",
             request_fingerprint="claim-fingerprint",
@@ -1701,23 +2276,109 @@ def test_product_execution_claim_and_terminal_settlement_are_authoritative(
                 result=None,
             )
 
+        receipt = ProductResultReceipt.create(
+            work_id=reservation.operation.work_id,
+            public_id=reservation.operation.public_id,
+            request_fingerprint=reservation.operation.request_fingerprint,
+            session_id=reservation.operation.session_id,
+            task_id=reservation.operation.task_id,
+            source_event_id="model-completed-one",
+            source_event_sequence=10,
+            model_step_id="model-step-one",
+            model_attempt_id="model-attempt-one",
+            interaction_id="interaction-one",
+            publication_status="completed",
+            result="answer",
+        )
+        assert (
+            await store.record_result_receipt(
+                work_id="work_claim",
+                claim_id="claim-one",
+                receipt=receipt,
+            )
+            == receipt
+        )
+        assert (
+            await store.record_result_receipt(
+                work_id="work_claim",
+                claim_id="claim-one",
+                receipt=receipt,
+            )
+            == receipt
+        )
+        conflicting_receipt = ProductResultReceipt.create(
+            work_id=reservation.operation.work_id,
+            public_id=reservation.operation.public_id,
+            request_fingerprint=reservation.operation.request_fingerprint,
+            session_id=reservation.operation.session_id,
+            task_id=reservation.operation.task_id,
+            source_event_id="model-completed-conflict",
+            source_event_sequence=10,
+            model_step_id="model-step-one",
+            model_attempt_id="model-attempt-conflict",
+            interaction_id="interaction-one",
+            publication_status="completed",
+            result="different answer",
+        )
+        with pytest.raises(ProductResultReceiptConflict):
+            await store.record_result_receipt(
+                work_id="work_claim",
+                claim_id="claim-one",
+                receipt=conflicting_receipt,
+            )
+        foreign_receipt = ProductResultReceipt.create(
+            work_id="other-work",
+            public_id=reservation.operation.public_id,
+            request_fingerprint=reservation.operation.request_fingerprint,
+            session_id=reservation.operation.session_id,
+            task_id=reservation.operation.task_id,
+            source_event_id="model-completed-foreign",
+            source_event_sequence=20,
+            model_step_id="model-step-foreign",
+            model_attempt_id="model-attempt-foreign",
+            interaction_id="interaction-foreign",
+            publication_status="completed",
+            result="foreign answer",
+        )
+        with pytest.raises(ProductResultReceiptConflict):
+            await store.record_result_receipt(
+                work_id="work_claim",
+                claim_id="claim-one",
+                receipt=foreign_receipt,
+            )
+        with store._connect() as connection:
+            connection.execute(
+                "UPDATE product_operations SET execution_claim_expires_at = 0 "
+                "WHERE work_id = 'work_claim'"
+            )
+        replacement = await store.claim_execution(
+            work_id="work_claim", claim_id="claim-two", lease_seconds=120
+        )
+        assert replacement is not None and replacement.acquired
+        with pytest.raises(ProductExecutionClaimLost):
+            await store.record_result_receipt(
+                work_id="work_claim",
+                claim_id="claim-one",
+                receipt=receipt,
+            )
+
         completed = await store.finish(
             work_id="work_claim",
-            claim_id="claim-one",
+            claim_id="claim-two",
             status="completed",
             result="answer",
         )
         assert completed.status == "completed"
         assert await store.heartbeat_execution(
-            work_id="work_claim", claim_id="claim-one", lease_seconds=120
+            work_id="work_claim", claim_id="claim-two", lease_seconds=120
         )
         assert not await store.heartbeat_execution(
-            work_id="work_claim", claim_id="claim-two", lease_seconds=120
+            work_id="work_claim", claim_id="claim-one", lease_seconds=120
         )
         assert (
             await store.finish(
                 work_id="work_claim",
-                claim_id="claim-one",
+                claim_id="claim-two",
                 status="completed",
                 result="answer",
             )
@@ -1726,14 +2387,14 @@ def test_product_execution_claim_and_terminal_settlement_are_authoritative(
         with pytest.raises(ProductExecutionClaimLost):
             await store.finish(
                 work_id="work_claim",
-                claim_id="claim-two",
+                claim_id="claim-one",
                 status="completed",
                 result="answer",
             )
         with pytest.raises(ProductOperationSettlementConflict):
             await store.finish(
                 work_id="work_claim",
-                claim_id="claim-one",
+                claim_id="claim-two",
                 status="failed",
                 result=None,
             )
@@ -1812,6 +2473,24 @@ def test_in_memory_product_store_keeps_one_shared_database() -> None:
             lease_seconds=120,
         )
         assert claim is not None and claim.acquired
+        await store.record_result_receipt(
+            work_id="work_memory",
+            claim_id="memory-claim",
+            receipt=ProductResultReceipt.create(
+                work_id=reservation.operation.work_id,
+                public_id=reservation.operation.public_id,
+                request_fingerprint=reservation.operation.request_fingerprint,
+                session_id=reservation.operation.session_id,
+                task_id=reservation.operation.task_id,
+                source_event_id="model-completed-memory",
+                source_event_sequence=10,
+                model_step_id="model-step-memory",
+                model_attempt_id="model-attempt-memory",
+                interaction_id="interaction-memory",
+                publication_status="completed",
+                result="answer",
+            ),
+        )
         completed = await store.finish(
             work_id="work_memory",
             claim_id="memory-claim",
@@ -1866,12 +2545,26 @@ late heartbeats and acknowledgement reconstruction cannot confuse a successful
 settlement with ownership loss. A queue or worker redelivery must not execute
 live owned work while another claim remains valid or overwrite an existing
 terminal result.
-The maintained executor can create or verify only the exact initial pending Cayu
-task. Once the task or session has advanced, it leaves the product operation
-pending, atomically releases its exact execution claim, and does not redispatch
-provider work or guess a public result. Release is idempotent after acknowledgement
-loss and cannot clear a successor's claim; the application's worker-recovery path
-must reconcile that outcome.
+Before Cayu commits session completion, the maintained executor records a
+content-bound publication receipt for the exact final conversational model
+event and bounded result (or an explicit unsafe-result publication failure).
+The same receipt reconstructs acknowledgement loss; only the current execution
+claim may advance it to a later durable event sequence. A replacement worker can
+therefore settle terminal completed or failed Cayu work from bounded evidence
+without redispatching provider work or scraping a transcript. Live, interrupted,
+contradictory, unsupported, or evidence-bounded work remains pending and releases
+its exact execution claim. Recoverable abandoned work is fenced through Cayu's
+durable incomplete-session recovery and resumed on the same session and task;
+the allow-listed `recovery_status` reports active, approval, input, interrupted,
+or manual-reconciliation states without exposing raw runtime records.
+The maintained control-plane mount attaches this publication contract to
+operator resume, approval, user-input, and tool-recovery continuations. It uses
+the private application-owned session index, acquires and heartbeats the product
+claim only at final publication, and interrupts instead of completing without a
+receipt when another product worker owns that claim. These process-local loop
+policies never cross the HTTP body or durable runtime record boundary.
+Release is idempotent after acknowledgement loss and cannot clear a successor's
+claim.
 This lease does not provide exactly-once provider effects if a process stalls
 beyond its lease or dies after external work begins; applications that require
 that guarantee need an idempotent external-effect and worker-recovery design.

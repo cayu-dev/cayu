@@ -5,6 +5,7 @@ import hashlib
 import json
 import threading
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import pytest
 from fastapi import HTTPException, Request
@@ -15,6 +16,9 @@ from cayu import (
     REDACTED_SECRET,
     AgentSpec,
     CayuApp,
+    EventOrder,
+    EventQuery,
+    EventType,
     InMemorySessionStore,
     InMemoryTaskStore,
     Message,
@@ -22,11 +26,20 @@ from cayu import (
     RunRequest,
     ScriptedModelProvider,
     SecretRedactor,
+    SessionIdentity,
     SessionStatus,
     SQLiteSessionStore,
     SQLiteTaskStore,
     TaskCreate,
     TaskStatus,
+    Tool,
+    ToolContext,
+    ToolPolicy,
+    ToolPolicyDecision,
+    ToolPolicyRequest,
+    ToolPolicyResult,
+    ToolResult,
+    ToolSpec,
     run_to_completion,
 )
 from cayu.server import (
@@ -43,11 +56,14 @@ from cayu.server import (
     ProductOperationReservation,
     ProductOperationSettlementConflict,
     ProductPrincipal,
+    ProductResultReceipt,
+    ProductResultReceiptConflict,
     ServiceIdentityStoreKind,
     ServiceMode,
     create_agent_service,
 )
 from cayu.server.service import (
+    _PRODUCT_RECOVERY_MESSAGE,
     MAX_PRODUCT_REQUEST_BYTES,
     MAX_PUBLIC_RESULT_CHARS,
     _is_maintained_service,
@@ -64,6 +80,7 @@ class MemoryProductStore:
         self.by_idempotency_key: dict[str, ProductOperation] = {}
         self.claimed_work_ids: list[str] = []
         self.execution_claims: dict[str, tuple[str, float]] = {}
+        self.result_receipts: dict[str, ProductResultReceipt] = {}
 
     async def reserve(
         self,
@@ -105,6 +122,16 @@ class MemoryProductStore:
     async def find(self, *, tenant_id: str, public_id: str) -> ProductOperation | None:
         operation = self.by_public_id.get(public_id)
         return operation if operation is not None and operation.tenant_id == tenant_id else None
+
+    async def find_by_session_id(self, *, session_id: str) -> ProductOperation | None:
+        return next(
+            (
+                operation
+                for operation in self.by_work_id.values()
+                if operation.session_id == session_id
+            ),
+            None,
+        )
 
     async def claim_execution(
         self,
@@ -161,6 +188,62 @@ class MemoryProductStore:
             self.execution_claims.pop(work_id)
         return True
 
+    async def record_result_receipt(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        receipt: ProductResultReceipt,
+    ) -> ProductResultReceipt:
+        operation = self.by_work_id[work_id]
+        current_claim = self.execution_claims.get(work_id)
+        existing = self.result_receipts.get(work_id)
+        if operation.status != "pending" or current_claim is None or current_claim[0] != claim_id:
+            if (
+                operation.status != "pending"
+                and current_claim is not None
+                and current_claim[0] == claim_id
+                and existing == receipt
+            ):
+                return receipt
+            raise ProductExecutionClaimLost
+        if (
+            receipt.work_id != operation.work_id
+            or receipt.public_id != operation.public_id
+            or receipt.request_fingerprint != operation.request_fingerprint
+            or receipt.session_id != operation.session_id
+            or receipt.task_id != operation.task_id
+        ):
+            raise ProductResultReceiptConflict
+        if existing is not None:
+            if existing == receipt:
+                return existing
+            if receipt.source_event_sequence <= existing.source_event_sequence:
+                raise ProductResultReceiptConflict
+        updated = operation.model_copy(update={"result_receipt": receipt, "recovery_status": None})
+        self.result_receipts[work_id] = receipt
+        self.by_work_id[work_id] = updated
+        self.by_public_id[operation.public_id] = updated
+        self.by_idempotency_key[operation.idempotency_key] = updated
+        return receipt
+
+    async def record_recovery_status(
+        self,
+        *,
+        work_id: str,
+        claim_id: str,
+        recovery_status: str,
+    ) -> ProductOperation:
+        operation = self.by_work_id[work_id]
+        current_claim = self.execution_claims.get(work_id)
+        if operation.status != "pending" or current_claim is None or current_claim[0] != claim_id:
+            raise ProductExecutionClaimLost
+        updated = operation.model_copy(update={"recovery_status": recovery_status})
+        self.by_work_id[work_id] = updated
+        self.by_public_id[operation.public_id] = updated
+        self.by_idempotency_key[operation.idempotency_key] = updated
+        return updated
+
     async def finish(
         self,
         *,
@@ -170,6 +253,13 @@ class MemoryProductStore:
         result: str | None,
     ) -> ProductOperation:
         operation = self.by_work_id[work_id]
+        receipt = self.result_receipts.get(work_id)
+        if status == "completed" and (
+            receipt is None or receipt.publication_status != "completed" or receipt.result != result
+        ):
+            raise ProductOperationSettlementConflict
+        if status == "failed" and result is not None:
+            raise ProductOperationSettlementConflict
         if operation.status != "pending":
             current = self.execution_claims.get(work_id)
             if current is None or current[0] != claim_id:
@@ -180,7 +270,14 @@ class MemoryProductStore:
         current = self.execution_claims.get(work_id)
         if current is None or current[0] != claim_id:
             raise ProductExecutionClaimLost
-        operation = operation.model_copy(update={"status": status, "result": result})
+        operation = operation.model_copy(
+            update={
+                "status": status,
+                "result": result,
+                "result_receipt": receipt,
+                "recovery_status": None,
+            }
+        )
         self.by_work_id[work_id] = operation
         self.by_public_id[operation.public_id] = operation
         self.by_idempotency_key[operation.idempotency_key] = operation
@@ -282,6 +379,35 @@ def _product_request_fingerprint(request_text: str, *, agent_name: str = "assist
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _product_result_receipt(
+    operation: ProductOperation,
+    *,
+    result: str,
+    source_event_id: str = "model-completed",
+    source_event_sequence: int = 10,
+    model_step_id: str = "model-step-1",
+    model_attempt_id: str = "model-attempt-1",
+    interaction_id: str = "interaction-1",
+    publication_status: Literal["completed", "failed"] = "completed",
+    failure_code: Literal["unsafe_result"] | None = None,
+) -> ProductResultReceipt:
+    return ProductResultReceipt.create(
+        work_id=operation.work_id,
+        public_id=operation.public_id,
+        request_fingerprint=operation.request_fingerprint,
+        session_id=operation.session_id,
+        task_id=operation.task_id,
+        source_event_id=source_event_id,
+        source_event_sequence=source_event_sequence,
+        model_step_id=model_step_id,
+        model_attempt_id=model_attempt_id,
+        interaction_id=interaction_id,
+        publication_status=publication_status,
+        result=result,
+        failure_code=failure_code,
+    )
 
 
 def test_public_service_enforces_tenant_lookup_idempotency_and_safe_projection() -> None:
@@ -537,6 +663,7 @@ def test_existing_session_is_not_redispatched_while_product_task_is_pending() ->
 
         assert redelivered is not None
         assert redelivered.status == "pending"
+        assert redelivered.recovery_status == "manual_reconciliation_required"
         assert store.by_work_id[reservation.operation.work_id].status == "pending"
         task_store = service.cayu_app.task_store
         assert task_store is not None
@@ -555,7 +682,7 @@ def test_existing_session_is_not_redispatched_while_product_task_is_pending() ->
     asyncio.run(scenario())
 
 
-def test_completed_cayu_work_is_not_redispatched_or_falsely_failed() -> None:
+def test_completed_cayu_work_is_settled_from_receipt_without_redispatch() -> None:
     class FailingFinalizationStore(MemoryProductStore):
         fail_finalization = True
 
@@ -594,10 +721,627 @@ def test_completed_cayu_work_is_not_redispatched_or_falsely_failed() -> None:
         redelivered = await service.execute_work(reservation.operation.work_id)
 
         assert redelivered is not None
-        assert redelivered.status == "pending"
+        assert redelivered.status == "completed"
+        assert redelivered.result == "safe product answer"
+        assert redelivered.result_receipt is not None
+        assert store.by_work_id[reservation.operation.work_id] == redelivered
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_failed_cayu_work_is_settled_without_provider_redispatch() -> None:
+    class FailingFinalizationStore(MemoryProductStore):
+        fail_finalization = True
+
+        async def finish(self, **kwargs) -> ProductOperation:
+            if self.fail_finalization:
+                raise RuntimeError("product settlement unavailable")
+            return await super().finish(**kwargs)
+
+    async def scenario() -> None:
+        store = FailingFinalizationStore()
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.error("provider failed"),
+                ModelStreamEvent.completed({"finish_reason": "error"}),
+            ]
+        )
+        service, _store, _provider = _build_service(
+            provider,
+            product_store=store,
+        )
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="failed-redelivery",
+            request_fingerprint=_product_request_fingerprint("fail once"),
+            public_id="op_failed_redelivery",
+            work_id="work_failed_redelivery",
+            session_id="session_failed_redelivery",
+            task_id="task_failed_redelivery",
+            request_text="fail once",
+        )
+
+        with pytest.raises(RuntimeError, match="product settlement unavailable"):
+            await service.execute_work(reservation.operation.work_id)
+        assert len(provider.requests) == 1
         assert store.by_work_id[reservation.operation.work_id].status == "pending"
+        task_store = service.cayu_app.task_store
+        assert task_store is not None
+        failed_task = await task_store.load_task(reservation.operation.task_id)
+        assert failed_task is not None and failed_task.status is TaskStatus.FAILED
+        state = await service.cayu_app.session_store.load_state(reservation.operation.session_id)
+        assert state is not None and state.status is SessionStatus.FAILED
+
+        store.fail_finalization = False
+        store.execution_claims.pop(reservation.operation.work_id)
+        redelivered = await service.execute_work(reservation.operation.work_id)
+
+        assert redelivered is not None and redelivered.status == "failed"
+        assert redelivered.result is None
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_result_receipt_is_durable_before_session_completion() -> None:
+    class BlockingReceiptStore(MemoryProductStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_started = asyncio.Event()
+            self.allow_receipt = asyncio.Event()
+
+        async def record_result_receipt(self, **kwargs) -> ProductResultReceipt:
+            self.receipt_started.set()
+            await self.allow_receipt.wait()
+            return await super().record_result_receipt(**kwargs)
+
+    async def scenario() -> None:
+        store = BlockingReceiptStore()
+        service, _store, provider = _build_service(product_store=store)
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="receipt-before-terminal",
+            request_fingerprint=_product_request_fingerprint("publish once"),
+            public_id="op_receipt_before_terminal",
+            work_id="work_receipt_before_terminal",
+            session_id="session_receipt_before_terminal",
+            task_id="task_receipt_before_terminal",
+            request_text="publish once",
+        )
+
+        execution = asyncio.create_task(service.execute_work(reservation.operation.work_id))
+        await asyncio.wait_for(store.receipt_started.wait(), timeout=1)
+
+        state = await service.cayu_app.session_store.load_state(reservation.operation.session_id)
+        assert state is not None
+        assert state.status == SessionStatus.RUNNING
+        source_events = await service.cayu_app.session_store.query_events(
+            EventQuery(
+                session_id=reservation.operation.session_id,
+                event_type=EventType.MODEL_COMPLETED,
+                order_by=EventOrder.SEQUENCE_ASC,
+                limit=2,
+            )
+        )
+        assert len(source_events) == 1
+        assert store.result_receipts == {}
+
+        store.allow_receipt.set()
+        completed = await execution
+
+        assert completed is not None and completed.status == "completed"
+        assert completed.result_receipt is not None
+        assert completed.result_receipt.source_event_id == source_events[0].event.id
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_result_receipt_acknowledgement_loss_is_reconstructed() -> None:
+    class ReceiptAcknowledgementLossStore(MemoryProductStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_calls = 0
+
+        async def record_result_receipt(self, **kwargs) -> ProductResultReceipt:
+            receipt = await super().record_result_receipt(**kwargs)
+            self.receipt_calls += 1
+            if self.receipt_calls == 1:
+                raise RuntimeError("receipt acknowledgement lost")
+            return receipt
+
+    store = ReceiptAcknowledgementLossStore()
+    service, _store, provider = _build_service(product_store=store)
+    response = TestClient(service.asgi_app).post(
+        "/api/operations",
+        headers={"Authorization": "Bearer tenant-a", "Idempotency-Key": "receipt-lost-ack"},
+        json={"request": "publish once"},
+    )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "completed"
+    operation = next(iter(store.by_work_id.values()))
+    assert operation.result_receipt is not None
+    assert operation.result_receipt == store.result_receipts[operation.work_id]
+    assert store.receipt_calls == 2
+    assert len(provider.requests) == 1
+
+
+def test_result_receipt_advances_only_under_the_current_claim() -> None:
+    async def scenario() -> None:
+        store = MemoryProductStore()
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="receipt-ordering",
+            request_fingerprint=_product_request_fingerprint("work"),
+            public_id="op_receipt_ordering",
+            work_id="work_receipt_ordering",
+            session_id="session_receipt_ordering",
+            task_id="task_receipt_ordering",
+            request_text="work",
+        )
+        claim = await store.claim_execution(
+            work_id=reservation.operation.work_id,
+            claim_id="claim-one",
+            lease_seconds=120,
+        )
+        assert claim is not None and claim.acquired
+        first = _product_result_receipt(
+            reservation.operation,
+            result="first candidate",
+            source_event_id="model-completed-one",
+            source_event_sequence=10,
+        )
+        second = _product_result_receipt(
+            reservation.operation,
+            result="second candidate",
+            source_event_id="model-completed-two",
+            source_event_sequence=20,
+        )
+        conflicting = _product_result_receipt(
+            reservation.operation,
+            result="conflicting candidate",
+            source_event_id="model-completed-conflict",
+            source_event_sequence=10,
+        )
+
+        assert (
+            await store.record_result_receipt(
+                work_id=reservation.operation.work_id,
+                claim_id="claim-one",
+                receipt=first,
+            )
+            == first
+        )
+        assert (
+            await store.record_result_receipt(
+                work_id=reservation.operation.work_id,
+                claim_id="claim-one",
+                receipt=first,
+            )
+            == first
+        )
+        with pytest.raises(ProductResultReceiptConflict):
+            await store.record_result_receipt(
+                work_id=reservation.operation.work_id,
+                claim_id="claim-one",
+                receipt=conflicting,
+            )
+        foreign = ProductResultReceipt.create(
+            work_id="other-work",
+            public_id=reservation.operation.public_id,
+            request_fingerprint=reservation.operation.request_fingerprint,
+            session_id=reservation.operation.session_id,
+            task_id=reservation.operation.task_id,
+            source_event_id="model-completed-foreign",
+            source_event_sequence=30,
+            model_step_id="model-step-foreign",
+            model_attempt_id="model-attempt-foreign",
+            interaction_id="interaction-foreign",
+            publication_status="completed",
+            result="foreign candidate",
+        )
+        with pytest.raises(ProductResultReceiptConflict):
+            await store.record_result_receipt(
+                work_id=reservation.operation.work_id,
+                claim_id="claim-one",
+                receipt=foreign,
+            )
+
+        store.execution_claims.pop(reservation.operation.work_id)
+        replacement = await store.claim_execution(
+            work_id=reservation.operation.work_id,
+            claim_id="claim-two",
+            lease_seconds=120,
+        )
+        assert replacement is not None and replacement.acquired
+        with pytest.raises(ProductExecutionClaimLost):
+            await store.record_result_receipt(
+                work_id=reservation.operation.work_id,
+                claim_id="claim-one",
+                receipt=first,
+            )
+        with pytest.raises(ProductExecutionClaimLost):
+            await store.record_result_receipt(
+                work_id=reservation.operation.work_id,
+                claim_id="claim-one",
+                receipt=second,
+            )
+        assert (
+            await store.record_result_receipt(
+                work_id=reservation.operation.work_id,
+                claim_id="claim-two",
+                receipt=second,
+            )
+            == second
+        )
+
+    asyncio.run(scenario())
+
+
+def test_terminal_redelivery_without_result_receipt_stays_pending() -> None:
+    async def scenario() -> None:
+        store = MemoryProductStore()
+        service, _store, provider = _build_service(product_store=store)
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="terminal-without-receipt",
+            request_fingerprint=_product_request_fingerprint("unreceipted execution"),
+            public_id="op_terminal_without_receipt",
+            work_id="work_terminal_without_receipt",
+            session_id="session_terminal_without_receipt",
+            task_id="task_terminal_without_receipt",
+            request_text="unreceipted execution",
+        )
+        await service.cayu_app.create_task(
+            TaskCreate(
+                task_id=reservation.operation.task_id,
+                type="public_agent_operation",
+                session_id=reservation.operation.session_id,
+                assigned_agent_name=service.agent_name,
+            )
+        )
+        outcome = await run_to_completion(
+            service.cayu_app,
+            RunRequest(
+                agent_name=service.agent_name,
+                messages=[Message.text("user", reservation.operation.request_text)],
+                session_id=reservation.operation.session_id,
+                task_id=reservation.operation.task_id,
+            ),
+        )
+        assert outcome.ok
+        assert len(provider.requests) == 1
+
+        redelivered = await service.execute_work(reservation.operation.work_id)
+
+        assert redelivered is not None and redelivered.status == "pending"
+        assert redelivered.result_receipt is None
+        assert redelivered.recovery_status == "manual_reconciliation_required"
         assert reservation.operation.work_id not in store.execution_claims
         assert len(provider.requests) == 1
+        response = TestClient(service.asgi_app).get(
+            f"/api/operations/{reservation.operation.public_id}",
+            headers={"Authorization": "Bearer tenant-a"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "id": reservation.operation.public_id,
+            "status": "pending",
+            "result": None,
+            "recovery_status": "manual_reconciliation_required",
+        }
+        assert reservation.operation.session_id not in response.text
+        assert reservation.operation.task_id not in response.text
+
+    asyncio.run(scenario())
+
+
+def test_terminal_redelivery_rejects_receipt_with_wrong_source_event() -> None:
+    class FailingFinalizationStore(MemoryProductStore):
+        async def finish(self, **_kwargs) -> ProductOperation:
+            raise RuntimeError("product settlement unavailable")
+
+    async def scenario() -> None:
+        store = FailingFinalizationStore()
+        service, _store, provider = _build_service(product_store=store)
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="wrong-receipt-source",
+            request_fingerprint=_product_request_fingerprint("publish once"),
+            public_id="op_wrong_receipt_source",
+            work_id="work_wrong_receipt_source",
+            session_id="session_wrong_receipt_source",
+            task_id="task_wrong_receipt_source",
+            request_text="publish once",
+        )
+        with pytest.raises(RuntimeError, match="product settlement unavailable"):
+            await service.execute_work(reservation.operation.work_id)
+
+        operation = store.by_work_id[reservation.operation.work_id]
+        assert operation.result_receipt is not None
+        forged = _product_result_receipt(
+            operation,
+            result="safe product answer",
+            source_event_id="missing-turn-completed-event",
+            interaction_id=operation.result_receipt.interaction_id,
+        )
+        pending = operation.model_copy(update={"result_receipt": forged})
+        store.result_receipts[operation.work_id] = forged
+        store.by_work_id[operation.work_id] = pending
+        store.by_public_id[operation.public_id] = pending
+        store.by_idempotency_key[operation.idempotency_key] = pending
+        store.execution_claims.pop(operation.work_id)
+
+        redelivered = await service.execute_work(operation.work_id)
+
+        assert redelivered is not None and redelivered.status == "pending"
+        assert redelivered.result_receipt == forged
+        assert redelivered.recovery_status == "manual_reconciliation_required"
+        assert operation.work_id not in store.execution_claims
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_product_approval_interruption_exposes_bounded_recovery_status() -> None:
+    class ApprovalTool(Tool):
+        spec = ToolSpec(
+            name="approval_tool",
+            description="A consequential operation.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, _ctx: ToolContext, _args: dict) -> ToolResult:
+            raise AssertionError("approval-gated tool must not execute")
+
+    class RequireApproval(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"Approval required for {request.tool_name}.",
+            )
+
+    async def scenario() -> None:
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.tool_call(
+                    id="approval-call",
+                    name="approval_tool",
+                    arguments={},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ]
+        )
+        app = CayuApp(
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ApprovalTool()],
+            tool_policy=RequireApproval(),
+        )
+        store = MemoryProductStore()
+
+        async def product_auth(_request: Request) -> ProductPrincipal:
+            return ProductPrincipal(tenant_id="tenant-a", subject_id="alice")
+
+        service = create_agent_service(
+            app,
+            agent_name="assistant",
+            mode=ServiceMode.PRODUCTION,
+            product_access=AuthenticatedProductAccess(dependency=product_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+            product_store=store,
+        )
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="approval-recovery-status",
+            request_fingerprint=_product_request_fingerprint("perform approved work"),
+            public_id="op_approval_recovery_status",
+            work_id="work_approval_recovery_status",
+            session_id="session_approval_recovery_status",
+            task_id="task_approval_recovery_status",
+            request_text="perform approved work",
+        )
+
+        pending = await service.execute_work(reservation.operation.work_id)
+
+        assert pending is not None and pending.status == "pending"
+        assert pending.recovery_status == "waiting_for_approval"
+        assert reservation.operation.work_id not in store.execution_claims
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_product_approval_continuation_records_receipt_before_terminal_settlement() -> None:
+    class ApprovalTool(Tool):
+        spec = ToolSpec(
+            name="approval_tool",
+            description="A consequential operation.",
+            input_schema={"type": "object", "properties": {}},
+        )
+
+        async def run(self, _ctx: ToolContext, _args: dict) -> ToolResult:
+            return ToolResult(content="approved work completed")
+
+    class RequireApproval(ToolPolicy):
+        async def authorize(self, request: ToolPolicyRequest) -> ToolPolicyResult:
+            return ToolPolicyResult(
+                decision=ToolPolicyDecision.REQUIRE_APPROVAL,
+                reason=f"Approval required for {request.tool_name}.",
+            )
+
+    async def scenario() -> None:
+        provider = ScriptedModelProvider(
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="approval-call",
+                        name="approval_tool",
+                        arguments={},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("approved final answer"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ]
+        )
+        app = CayuApp(
+            session_store=InMemorySessionStore(),
+            task_store=InMemoryTaskStore(),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(name="assistant", model="scripted-model"),
+            tools=[ApprovalTool()],
+            tool_policy=RequireApproval(),
+        )
+        store = MemoryProductStore()
+
+        async def product_auth(_request: Request) -> ProductPrincipal:
+            return ProductPrincipal(tenant_id="tenant-a", subject_id="alice")
+
+        service = create_agent_service(
+            app,
+            agent_name="assistant",
+            mode=ServiceMode.PRODUCTION,
+            product_access=AuthenticatedProductAccess(dependency=product_auth),
+            operator_access=AuthenticatedAccess(
+                dependency=BasicAuth(username="operator", password="operator-secret")
+            ),
+            product_store=store,
+        )
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="approval-continuation-receipt",
+            request_fingerprint=_product_request_fingerprint("perform approved work"),
+            public_id="op_approval_continuation",
+            work_id="work_approval_continuation",
+            session_id="session_approval_continuation",
+            task_id="task_approval_continuation",
+            request_text="perform approved work",
+        )
+        pending = await service.execute_work(reservation.operation.work_id)
+        assert pending is not None
+        assert pending.recovery_status == "waiting_for_approval"
+        approvals = await app.session_store.query_events(
+            EventQuery(
+                session_id=reservation.operation.session_id,
+                event_type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                order_by=EventOrder.SEQUENCE_DESC,
+                limit=1,
+            )
+        )
+        assert len(approvals) == 1
+        public_approval = app.project_event_record_for_exposure(approvals[0]).event
+        payload = public_approval.payload
+        response = TestClient(service.asgi_app).post(
+            "/cayu/api/tool-approvals/resolve",
+            auth=("operator", "operator-secret"),
+            json={
+                "session_id": public_approval.session_id,
+                "approval_id": payload["approval_id"],
+                "tool_round_id": payload["tool_round_id"],
+                "tool_call_id": payload["tool_call_id"],
+                "decision": "approve",
+            },
+        )
+
+        assert response.status_code == 200
+        state = await app.session_store.load_state(reservation.operation.session_id)
+        assert state is not None and state.status is SessionStatus.COMPLETED
+        receipt_pending = store.by_work_id[reservation.operation.work_id]
+        assert receipt_pending.status == "pending"
+        assert receipt_pending.result_receipt is not None
+        assert receipt_pending.result_receipt.result == "approved final answer"
+        assert reservation.operation.work_id not in store.execution_claims
+        completed = await service.execute_work(reservation.operation.work_id)
+        assert completed is not None and completed.status == "completed"
+        assert completed.result == "approved final answer"
+        assert len(provider.requests) == 2
+
+    asyncio.run(scenario())
+
+
+def test_replacement_worker_continues_abandoned_session_without_starting_over() -> None:
+    async def scenario() -> None:
+        store = MemoryProductStore()
+        session_store = InMemorySessionStore()
+        task_store = InMemoryTaskStore()
+        service, _store, provider = _build_service(
+            product_store=store,
+            session_store=session_store,
+            task_store=task_store,
+        )
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="abandoned-session",
+            request_fingerprint=_product_request_fingerprint("repair repository"),
+            public_id="op_abandoned_session",
+            work_id="work_abandoned_session",
+            session_id="session_abandoned_session",
+            task_id="task_abandoned_session",
+            request_text="repair repository",
+        )
+        await task_store.create_task(
+            TaskCreate(
+                task_id=reservation.operation.task_id,
+                type="public_agent_operation",
+                session_id=reservation.operation.session_id,
+                assigned_agent_name=service.agent_name,
+            )
+        )
+        await task_store.start_task(
+            reservation.operation.task_id,
+            session_id=reservation.operation.session_id,
+        )
+        original_message = Message.text("user", reservation.operation.request_text)
+        await session_store.create(
+            RunRequest(
+                agent_name=service.agent_name,
+                messages=[original_message],
+                session_id=reservation.operation.session_id,
+                task_id=reservation.operation.task_id,
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="scripted-model",
+            ),
+        )
+        await session_store.append_transcript_messages(
+            reservation.operation.session_id,
+            [original_message],
+        )
+        await session_store.update_status(
+            reservation.operation.session_id,
+            SessionStatus.RUNNING,
+        )
+
+        completed = await service.execute_work(reservation.operation.work_id)
+
+        assert completed is not None and completed.status == "completed"
+        assert completed.result == "safe product answer"
+        assert completed.result_receipt is not None
+        assert len(provider.requests) == 1
+        assert [message.content[0].text for message in provider.requests[0].messages] == [
+            "repair repository",
+            _PRODUCT_RECOVERY_MESSAGE,
+        ]
+        task = await task_store.load_task(reservation.operation.task_id)
+        assert task is not None and task.status is TaskStatus.COMPLETED
+        state = await session_store.load_state(reservation.operation.session_id)
+        assert state is not None and state.status is SessionStatus.COMPLETED
 
     asyncio.run(scenario())
 
@@ -641,6 +1385,7 @@ def test_progressed_product_work_release_reconciles_lost_acknowledgement() -> No
         redelivered = await service.execute_work(reservation.operation.work_id)
 
         assert redelivered is not None and redelivered.status == "pending"
+        assert redelivered.recovery_status == "manual_reconciliation_required"
         assert store.release_calls == 2
         assert reservation.operation.work_id not in store.execution_claims
         takeover = await store.claim_execution(
@@ -649,6 +1394,53 @@ def test_progressed_product_work_release_reconciles_lost_acknowledgement() -> No
             lease_seconds=120,
         )
         assert takeover is not None and takeover.acquired
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_recovery_status_reconciles_lost_acknowledgement() -> None:
+    class RecoveryStatusAcknowledgementLossStore(MemoryProductStore):
+        recovery_status_calls = 0
+
+        async def record_recovery_status(self, **kwargs) -> ProductOperation:
+            operation = await super().record_recovery_status(**kwargs)
+            self.recovery_status_calls += 1
+            if self.recovery_status_calls == 1:
+                raise RuntimeError("recovery status acknowledgement lost")
+            return operation
+
+    async def scenario() -> None:
+        store = RecoveryStatusAcknowledgementLossStore()
+        service, _store, provider = _build_service(product_store=store)
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="recovery-status-acknowledgement-loss",
+            request_fingerprint=_product_request_fingerprint("recover later"),
+            public_id="op_recovery_status_acknowledgement",
+            work_id="work_recovery_status_acknowledgement",
+            session_id="session_recovery_status_acknowledgement",
+            task_id="task_recovery_status_acknowledgement",
+            request_text="recover later",
+        )
+        task_store = service.cayu_app.task_store
+        assert task_store is not None
+        await task_store.create_task(
+            TaskCreate(
+                task_id=reservation.operation.task_id,
+                type="public_agent_operation",
+                session_id=reservation.operation.session_id,
+                assigned_agent_name=service.agent_name,
+            )
+        )
+        await task_store.start_task(reservation.operation.task_id)
+
+        pending = await service.execute_work(reservation.operation.work_id)
+
+        assert pending is not None and pending.status == "pending"
+        assert pending.recovery_status == "manual_reconciliation_required"
+        assert store.recovery_status_calls == 2
+        assert reservation.operation.work_id not in store.execution_claims
         assert provider.requests == []
 
     asyncio.run(scenario())
@@ -742,6 +1534,77 @@ def test_product_reconciliation_failure_releases_execution_claim() -> None:
         takeover = await store.claim_execution(
             work_id=reservation.operation.work_id,
             claim_id="retry-worker",
+            lease_seconds=120,
+        )
+        assert takeover is not None and takeover.acquired
+        assert provider.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_progressed_recovery_failure_releases_execution_claim(monkeypatch) -> None:
+    async def scenario() -> None:
+        store = MemoryProductStore()
+        service, _store, provider = _build_service(product_store=store)
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="recovery-failure-release",
+            request_fingerprint=_product_request_fingerprint("recover later"),
+            public_id="op_recovery_failure_release",
+            work_id="work_recovery_failure_release",
+            session_id="session_recovery_failure_release",
+            task_id="task_recovery_failure_release",
+            request_text="recover later",
+        )
+        task_store = service.cayu_app.task_store
+        assert task_store is not None
+        await task_store.create_task(
+            TaskCreate(
+                task_id=reservation.operation.task_id,
+                type="public_agent_operation",
+                session_id=reservation.operation.session_id,
+                assigned_agent_name=service.agent_name,
+            )
+        )
+        await task_store.start_task(
+            reservation.operation.task_id,
+            session_id=reservation.operation.session_id,
+        )
+        original_message = Message.text("user", reservation.operation.request_text)
+        await service.cayu_app.session_store.create(
+            RunRequest(
+                agent_name=service.agent_name,
+                messages=[original_message],
+                session_id=reservation.operation.session_id,
+                task_id=reservation.operation.task_id,
+            ),
+            identity=SessionIdentity(
+                provider_name=provider.name,
+                model="scripted-model",
+            ),
+        )
+        await service.cayu_app.session_store.update_status(
+            reservation.operation.session_id,
+            SessionStatus.RUNNING,
+        )
+
+        async def fail_recovery(_request) -> None:
+            raise RuntimeError("recovery backend unavailable")
+
+        monkeypatch.setattr(
+            service.cayu_app,
+            "recover_incomplete_session",
+            fail_recovery,
+        )
+
+        with pytest.raises(RuntimeError, match="recovery backend unavailable"):
+            await service.execute_work(reservation.operation.work_id)
+
+        assert store.by_work_id[reservation.operation.work_id].status == "pending"
+        assert reservation.operation.work_id not in store.execution_claims
+        takeover = await store.claim_execution(
+            work_id=reservation.operation.work_id,
+            claim_id="replacement-worker",
             lease_seconds=120,
         )
         assert takeover is not None and takeover.acquired
@@ -1245,7 +2108,11 @@ def test_public_projection_redacts_durable_result_on_read_and_idempotent_post() 
             request_text="safe work",
         )
     ).operation
-    completed = pending.model_copy(update={"status": "completed", "result": secret})
+    receipt = _product_result_receipt(pending, result=secret)
+    completed = pending.model_copy(
+        update={"status": "completed", "result": secret, "result_receipt": receipt}
+    )
+    store.result_receipts[pending.work_id] = receipt
     store.by_work_id[completed.work_id] = completed
     store.by_public_id[completed.public_id] = completed
     store.by_idempotency_key[completed.idempotency_key] = completed
@@ -1369,14 +2236,72 @@ def test_result_redaction_capacity_fails_product_after_draining_runtime(
     assert response.json()["status"] == "failed"
     assert operation.status == "failed"
     assert operation.result is None
+    assert operation.result_receipt is not None
+    assert operation.result_receipt.publication_status == "failed"
+    assert operation.result_receipt.failure_code == "unsafe_result"
     assert state is not None and state.status is SessionStatus.COMPLETED
     assert len(provider.requests) == 1
+
+
+def test_failed_result_publication_is_reconciled_without_provider_redispatch(
+    monkeypatch,
+) -> None:
+    class FailingFinalizationStore(MemoryProductStore):
+        fail_finalization = True
+
+        async def finish(self, **kwargs) -> ProductOperation:
+            if self.fail_finalization:
+                raise RuntimeError("product settlement unavailable")
+            return await super().finish(**kwargs)
+
+    monkeypatch.setattr("cayu.server.service._PUBLIC_RESULT_CAPTURE_BYTES", 64)
+    secret = "s" * 100
+    provider = ScriptedModelProvider(
+        [
+            ModelStreamEvent.text_delta("s" * 80),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+
+    async def scenario() -> None:
+        store = FailingFinalizationStore()
+        service, _store, _provider = _build_service(
+            provider,
+            product_store=store,
+            secret_redactor=SecretRedactor(secret),
+        )
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="failed-publication-redelivery",
+            request_fingerprint=_product_request_fingerprint("work"),
+            public_id="op_failed_publication",
+            work_id="work_failed_publication",
+            session_id="session_failed_publication",
+            task_id="task_failed_publication",
+            request_text="work",
+        )
+        with pytest.raises(RuntimeError, match="product settlement unavailable"):
+            await service.execute_work(reservation.operation.work_id)
+        pending = store.by_work_id[reservation.operation.work_id]
+        assert pending.result_receipt is not None
+        assert pending.result_receipt.publication_status == "failed"
+
+        store.fail_finalization = False
+        store.execution_claims.pop(reservation.operation.work_id)
+        reconciled = await service.execute_work(reservation.operation.work_id)
+
+        assert reconciled is not None and reconciled.status == "failed"
+        assert reconciled.result is None
+        assert reconciled.result_receipt == pending.result_receipt
+        assert len(provider.requests) == 1
+
+    asyncio.run(scenario())
 
 
 def test_public_projection_fails_closed_when_public_id_contains_a_secret() -> None:
     secret = "workload-secret-value"
     store = MemoryProductStore()
-    operation = ProductOperation(
+    pending = ProductOperation(
         tenant_id="tenant-a",
         public_id=secret,
         work_id="work_unsafe_authority",
@@ -1385,9 +2310,18 @@ def test_public_projection_fails_closed_when_public_id_contains_a_secret() -> No
         session_id="session_unsafe_authority",
         task_id="task_unsafe_authority",
         request_text="safe work",
-        status="completed",
-        result="safe result",
+        status="pending",
+        result=None,
     )
+    receipt = _product_result_receipt(pending, result="safe result")
+    operation = pending.model_copy(
+        update={
+            "status": "completed",
+            "result": "safe result",
+            "result_receipt": receipt,
+        }
+    )
+    store.result_receipts[operation.work_id] = receipt
     store.by_work_id[operation.work_id] = operation
     store.by_public_id[operation.public_id] = operation
     store.by_idempotency_key[operation.idempotency_key] = operation

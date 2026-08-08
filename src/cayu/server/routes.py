@@ -154,6 +154,7 @@ from cayu.runtime.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
     InteractionSummaryEvidence,
 )
+from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import inspect_provider_operation
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
@@ -3226,6 +3227,9 @@ def create_router(
     evaluation_promotion: EvaluationPromotionConfig | None = None,
     evaluation_promotion_pricing: PriceBook | None = None,
     evals: EvalsConfig | None = None,
+    continuation_loop_policy_provider: (
+        Callable[[str], Awaitable[tuple[LoopPolicy, ...]]] | None
+    ) = None,
 ) -> APIRouter:
     """Create an APIRouter with standard cayu endpoints.
 
@@ -3268,7 +3272,16 @@ def create_router(
         evals: Complete authenticated durable execution wiring for the one
             explicitly attached corpus target. When absent, no durable Evals
             route, worker, or enabled capability exists.
+        continuation_loop_policy_provider: Optional internal-session policy
+            resolver used by an embedding application for resume, approval,
+            user-input, and tool-recovery continuations. The returned policies
+            remain process-local and are never accepted from HTTP payloads.
     """
+
+    if continuation_loop_policy_provider is not None and not callable(
+        continuation_loop_policy_provider
+    ):
+        raise TypeError("continuation_loop_policy_provider must be callable or None.")
 
     if (
         isinstance(replay_idle_timeout_s, bool)
@@ -3405,6 +3418,14 @@ def create_router(
             return await cayu_app._resolve_public_session_id(value)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    async def _continuation_loop_policies(session_id: str) -> tuple[LoopPolicy, ...]:
+        if continuation_loop_policy_provider is None:
+            return ()
+        return validate_loop_policies(
+            await continuation_loop_policy_provider(session_id),
+            field_name="continuation_loop_policies",
+        )
 
     async def _resolve_session_query_authority_filters(
         *,
@@ -5003,6 +5024,7 @@ def create_router(
             structured_output=body.structured_output,
             metadata=trace_metadata,
             thinking=body.thinking,
+            loop_policies=await _continuation_loop_policies(session_id),
         )
 
         return await _accepted_event_stream_response(
@@ -5222,6 +5244,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             thinking=body.thinking,
+            loop_policies=await _continuation_loop_policies(session_id),
         )
 
         return await _accepted_event_stream_response(
@@ -5291,6 +5314,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             thinking=body.thinking,
+            loop_policies=await _continuation_loop_policies(session_id),
         )
 
         return await _accepted_event_stream_response(
@@ -5355,6 +5379,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             thinking=body.thinking,
+            loop_policies=await _continuation_loop_policies(session_id),
         )
 
         return await _accepted_event_stream_response(
@@ -5412,6 +5437,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             thinking=body.thinking,
+            loop_policies=await _continuation_loop_policies(session_id),
         )
 
         return await _accepted_event_stream_response(
@@ -5477,6 +5503,7 @@ def create_router(
             retry_policy=body.retry_policy,
             structured_output=body.structured_output,
             thinking=body.thinking,
+            loop_policies=await _continuation_loop_policies(session_id),
         )
 
         return await _accepted_event_stream_response(
