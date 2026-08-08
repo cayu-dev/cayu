@@ -4,6 +4,7 @@ import {
   Ban,
   Database,
   Download,
+  FileJson,
   FlaskConical,
   LoaderCircle,
   Play,
@@ -11,7 +12,13 @@ import {
   Upload,
 } from "lucide-react"
 import { type ChangeEvent, useCallback, useEffect, useRef, useState } from "react"
-import { DataCard, Page, PageHeader, StateMessage } from "@/components/dashboard/layout"
+import {
+  DataCard,
+  Page,
+  PageHeader,
+  PayloadViewer,
+  StateMessage,
+} from "@/components/dashboard/layout"
 import { useDashboardCapability } from "@/components/dashboard/server-contract"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -27,11 +34,15 @@ import {
   cancelEvalRun,
   createEvalRun,
   downloadEvalCorpus,
+  downloadEvalResultHtml,
+  downloadEvalResultJson,
   type EvalCorpusEntry,
+  type EvalResult,
   type EvalRun,
   type EvalStatus,
   fetchEvalCases,
   fetchEvalCorpora,
+  fetchEvalResult,
   fetchEvalRun,
   fetchEvalRuns,
   fetchEvalSuites,
@@ -42,7 +53,9 @@ import {
   createEvalIdempotencyKey,
   evalErrorMessage,
   evalRunCanCancel,
+  evalRunHasResult,
   evalRunIsActive,
+  evalTrialCostSummary,
   parseEvalCorpusFile,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
@@ -678,6 +691,12 @@ function RunsView({
     refetchInterval: (query) => (evalRunIsActive(query.state.data) ? 1_500 : false),
     refetchIntervalInBackground: false,
   })
+  const result = useQuery({
+    queryKey: ["evals", "result", search.run],
+    queryFn: ({ signal }) => fetchEvalResult(search.run ?? "", signal),
+    enabled: evalRunHasResult(selectedRun.data),
+    staleTime: Number.POSITIVE_INFINITY,
+  })
   const selectedRunUpdatedAt = selectedRun.data?.updated_at
 
   useEffect(() => {
@@ -693,6 +712,19 @@ function RunsView({
       queryClient.setQueryData(["evals", "run", run.spec.run_id], cancelled)
       await queryClient.invalidateQueries({ queryKey: ["evals", "runs"] })
       return `Cancellation requested for ${shortEvalIdentity(run.spec.run_id)}.`
+    })
+  }
+
+  const downloadResult = (format: "json" | "html") => {
+    const runId = selectedRun.data?.spec.run_id
+    if (!runId || !result.data || pendingAction !== null) return
+    void runAction(`download-result-${format}`, async (signal) => {
+      const file =
+        format === "json"
+          ? await downloadEvalResultJson(runId, signal)
+          : await downloadEvalResultHtml(runId, signal)
+      downloadBlob(file.blob, file.filename)
+      return `Downloaded the ${format.toUpperCase()} report for ${shortEvalIdentity(runId)}.`
     })
   }
 
@@ -840,13 +872,32 @@ function RunsView({
           />
         </DataCard>
       ) : selectedRun.data ? (
-        <RunLifecycleCard
-          run={selectedRun.data}
-          fetching={selectedRun.isFetching}
-          cancelling={pendingAction === "cancel-run"}
-          canMutate={mutateEnabled}
-          cancel={cancelRun}
-        />
+        <div className="min-w-0 space-y-6">
+          <RunLifecycleCard
+            run={selectedRun.data}
+            fetching={selectedRun.isFetching}
+            cancelling={pendingAction === "cancel-run"}
+            canMutate={mutateEnabled}
+            cancel={cancelRun}
+          />
+          {evalRunHasResult(selectedRun.data) &&
+            (result.isLoading ? (
+              <LoadingState label="Loading the published eval result..." />
+            ) : result.isError ? (
+              <DataCard title="Result unavailable">
+                <QueryError
+                  message="Could not load the published eval result."
+                  retry={() => void result.refetch()}
+                />
+              </DataCard>
+            ) : result.data ? (
+              <ResultInspector
+                result={result.data}
+                pendingAction={pendingAction}
+                download={downloadResult}
+              />
+            ) : null)}
+        </div>
       ) : null}
     </div>
   )
@@ -924,6 +975,239 @@ function RunLifecycleCard({
       )}
     </DataCard>
   )
+}
+
+function ResultInspector({
+  result,
+  pendingAction,
+  download,
+}: {
+  result: EvalResult
+  pendingAction: string | null
+  download: (format: "json" | "html") => void
+}) {
+  const published = result.result.run
+  const [selection, setSelection] = useState({
+    revision: published.revision,
+    caseIndex: 0,
+    trialIndex: 0,
+  })
+  const currentSelection =
+    selection.revision === published.revision
+      ? selection
+      : { revision: published.revision, caseIndex: 0, trialIndex: 0 }
+  const caseIndex = Math.min(currentSelection.caseIndex, published.cases.length - 1)
+  const selectedCase = published.cases[caseIndex]
+  const trialIndex = selectedCase
+    ? Math.min(currentSelection.trialIndex, selectedCase.trials.length - 1)
+    : 0
+  const selectedTrial = selectedCase?.trials[trialIndex]
+
+  return (
+    <DataCard
+      title={
+        <span className="flex items-center gap-2">
+          Published result <OutcomeBadge outcome={published.status} />
+        </span>
+      }
+      description={`Release ${result.result.target.application_release_id} · result ${shortEvalIdentity(published.revision)}`}
+      actions={
+        <>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pendingAction !== null}
+            onClick={() => download("json")}
+          >
+            {pendingAction === "download-result-json" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <FileJson />
+            )}
+            JSON
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={pendingAction !== null}
+            onClick={() => download("html")}
+          >
+            {pendingAction === "download-result-html" ? (
+              <LoaderCircle className="animate-spin" />
+            ) : (
+              <Download />
+            )}
+            HTML
+          </Button>
+        </>
+      }
+    >
+      <div className="grid gap-4 p-4 text-sm sm:grid-cols-2 lg:grid-cols-4">
+        <RunFact label="Score" value={formatScore(published.score)} />
+        <RunFact label="Duration" value={formatDuration(published.duration_ms)} />
+        <RunFact label="Cases" value={formatCount(published.cases.length)} />
+        <RunFact
+          label="App manifest"
+          value={shortEvalIdentity(result.result.target.app_manifest.fingerprint)}
+        />
+      </div>
+
+      {selectedCase && selectedTrial && (
+        <div className="space-y-4 border-t border-border p-4">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="min-w-0 text-xs font-medium text-muted-foreground">
+              Case
+              <select
+                className="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                value={caseIndex}
+                onChange={(event) =>
+                  setSelection({
+                    revision: published.revision,
+                    caseIndex: Number(event.target.value),
+                    trialIndex: 0,
+                  })
+                }
+              >
+                {published.cases.map((evalCase, index) => (
+                  <option key={evalCase.case_id} value={index}>
+                    {evalCase.case_id} — {evalCase.status}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="min-w-0 text-xs font-medium text-muted-foreground">
+              Trial
+              <select
+                className="mt-1 h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                value={trialIndex}
+                onChange={(event) =>
+                  setSelection({
+                    revision: published.revision,
+                    caseIndex,
+                    trialIndex: Number(event.target.value),
+                  })
+                }
+              >
+                {selectedCase.trials.map((trial, index) => (
+                  <option key={trial.trial_number} value={index}>
+                    Trial {trial.trial_number} — {trial.status}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="grid gap-4 rounded-lg border border-border bg-muted/20 p-3 text-sm sm:grid-cols-2 lg:grid-cols-4">
+            <RunFact label="Case outcome" value={selectedCase.status} />
+            <RunFact label="Case score" value={formatScore(selectedCase.score)} />
+            <RunFact label="Trial outcome" value={selectedTrial.status} />
+            <RunFact label="Trial score" value={formatScore(selectedTrial.score)} />
+            <RunFact label="Trial duration" value={formatDuration(selectedTrial.duration_ms)} />
+            <RunFact
+              label="Evidence"
+              value={selectedTrial.evidence_complete ? "complete" : "incomplete"}
+            />
+            <RunFact label="Diagnostic" value={selectedTrial.code.replaceAll("_", " ")} />
+            <RunFact
+              label="Usage"
+              value={
+                selectedTrial.usage
+                  ? `${formatCount(selectedTrial.usage.total_tokens)} tokens · ${formatCount(selectedTrial.usage.model_steps)} model steps · ${formatCount(selectedTrial.usage.tool_calls)} tools`
+                  : "unavailable"
+              }
+            />
+            <RunFact
+              label="Estimated cost"
+              value={evalTrialCostSummary(selectedTrial.assertions)}
+            />
+          </div>
+
+          <div className="text-sm">
+            <div className="text-xs font-medium text-muted-foreground">Trial diagnostic</div>
+            <div className="mt-1">{selectedTrial.message}</div>
+          </div>
+
+          <div>
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div className="text-sm font-medium">Output preview</div>
+              <Badge variant="outline">{selectedTrial.output.evidence_state}</Badge>
+            </div>
+            {selectedTrial.output.text !== undefined ? (
+              <PayloadViewer value={selectedTrial.output.text} maxHeight="max-h-72" />
+            ) : (
+              <StateMessage className="rounded-md border border-border py-6">
+                No output preview is available for this trial.
+              </StateMessage>
+            )}
+            {selectedTrial.output.preview_truncated && (
+              <div className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                The preview is truncated. Its retained SHA-256 fingerprint is{" "}
+                {selectedTrial.output.retained_sha256 ?? "unavailable"}.
+              </div>
+            )}
+          </div>
+
+          <div>
+            <div className="mb-2 text-sm font-medium">
+              Assertions ({formatCount(selectedTrial.assertions.length)})
+            </div>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Assertion</TableHead>
+                  <TableHead>Outcome</TableHead>
+                  <TableHead>Observation</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {selectedTrial.assertions.map((assertion) => (
+                  <TableRow key={assertion.assertion_id}>
+                    <TableCell>
+                      <div className="max-w-52 truncate font-medium" title={assertion.assertion_id}>
+                        {assertion.assertion_id}
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {assertion.detail.kind?.replaceAll("_", " ") ?? "assertion"}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <OutcomeBadge outcome={assertion.outcome} />
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {formatScore(assertion.score)}
+                      </div>
+                    </TableCell>
+                    <TableCell className="min-w-64 whitespace-normal">
+                      <div>{assertion.message}</div>
+                      <details className="mt-2 text-xs">
+                        <summary className="cursor-pointer text-primary">Inspect evidence</summary>
+                        <PayloadViewer
+                          value={assertion.detail}
+                          className="mt-2"
+                          maxHeight="max-h-40"
+                        />
+                      </details>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </div>
+      )}
+    </DataCard>
+  )
+}
+
+function OutcomeBadge({ outcome }: { outcome: string }) {
+  const variant =
+    outcome === "failed" || outcome === "error"
+      ? "destructive"
+      : outcome === "passed" || outcome === "completed"
+        ? "secondary"
+        : "outline"
+  return <Badge variant={variant}>{outcome}</Badge>
 }
 
 function EvalStatusBadge({ run }: { run: EvalRun }) {

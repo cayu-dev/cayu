@@ -6,6 +6,7 @@ import {
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
+  evalTrialCostSummary,
   MAX_EVAL_CORPUS_FILE_BYTES,
   parseEvalCorpusFile,
   shortEvalIdentity,
@@ -59,4 +60,35 @@ test("eval launch idempotency keys use secure browser UUIDs", () => {
     createEvalIdempotencyKey(),
     /^cayu-dashboard-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
   )
+})
+
+test("eval trial cost summary distinguishes observed, unavailable, and absent pricing", () => {
+  assert.equal(
+    evalTrialCostSummary([
+      {
+        detail: {
+          kind: "max_estimated_cost",
+          estimated_cost: "0.0125",
+          currency: "USD",
+          maximum: "0.02",
+        },
+      },
+    ]),
+    "0.0125 USD",
+  )
+  assert.equal(
+    evalTrialCostSummary([
+      {
+        detail: {
+          kind: "max_estimated_cost",
+          estimated_cost: null,
+          currency: "USD",
+          maximum: "0.02",
+          unpriced_model_steps: 2,
+        },
+      },
+    ]),
+    "unavailable · 2 unpriced model steps",
+  )
+  assert.equal(evalTrialCostSummary([]), "not evaluated")
 })

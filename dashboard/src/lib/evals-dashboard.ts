@@ -1,4 +1,5 @@
 import type { EvalCorpus, EvalRun, EvalStatus } from "./api.ts"
+import type { PublishedAssertionResult } from "./generated/server-api/index.ts"
 
 export const MAX_EVAL_CORPUS_FILE_BYTES = 8 * 1024 * 1024
 
@@ -28,6 +29,21 @@ export function createEvalIdempotencyKey(): string {
     throw new Error("Secure browser randomness is unavailable; the eval run was not submitted.")
   }
   return `cayu-dashboard-${crypto.randomUUID()}`
+}
+
+export function evalTrialCostSummary(assertions: Array<PublishedAssertionResult>): string {
+  for (const assertion of assertions) {
+    const detail = assertion.detail
+    if (detail.kind !== "max_estimated_cost") continue
+    if (detail.estimated_cost !== null && detail.estimated_cost !== undefined) {
+      return `${detail.estimated_cost} ${detail.currency}`
+    }
+    if (detail.unpriced_model_steps) {
+      return `unavailable · ${detail.unpriced_model_steps} unpriced model steps`
+    }
+    return "unavailable"
+  }
+  return "not evaluated"
 }
 
 export async function parseEvalCorpusFile(file: Blob): Promise<EvalCorpus> {
