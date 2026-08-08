@@ -7,6 +7,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from cayu._validation import (
+    copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
@@ -248,7 +249,7 @@ class ToolCallHookContext(_HookActionContext):
         self._tool_event = copy_event(tool_event)
         self._tool_name = require_clean_nonblank(tool_name, "tool_name")
         self._tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
-        self._arguments = copy_json_value(arguments, "arguments")
+        self._arguments = copy_durable_json_object(arguments, "arguments")
         self._result = _copy_tool_result(result)
         self._task_id = require_clean_nonblank(task_id, "task_id") if task_id is not None else None
 
@@ -266,7 +267,7 @@ class ToolCallHookContext(_HookActionContext):
 
     @property
     def arguments(self) -> dict[str, Any]:
-        return copy_json_value(self._arguments, "arguments")
+        return copy_durable_json_object(self._arguments, "arguments")
 
     @property
     def result(self) -> ToolResult:
@@ -282,7 +283,8 @@ class BeforeToolCallHookContext(_HookActionContext):
 
     Distinct from `ToolCallHookContext` because before execution there is no result or result
     event. `arguments` is a read-only copy; mutating it is a no-op — a before-hook changes the
-    call only by returning a `BeforeToolCallDecision`.
+    call only by returning a `BeforeToolCallDecision`. Arguments satisfy the portable durable
+    JSON contract before the hook can observe them.
     """
 
     def __init__(
@@ -307,7 +309,7 @@ class BeforeToolCallHookContext(_HookActionContext):
         )
         self._tool_name = require_clean_nonblank(tool_name, "tool_name")
         self._tool_call_id = require_clean_nonblank(tool_call_id, "tool_call_id")
-        self._arguments = copy_json_value(arguments, "arguments")
+        self._arguments = copy_durable_json_object(arguments, "arguments")
         self._task_id = require_clean_nonblank(task_id, "task_id") if task_id is not None else None
 
     @property
@@ -320,7 +322,7 @@ class BeforeToolCallHookContext(_HookActionContext):
 
     @property
     def arguments(self) -> dict[str, Any]:
-        return copy_json_value(self._arguments, "arguments")
+        return copy_durable_json_object(self._arguments, "arguments")
 
     @property
     def task_id(self) -> str | None:
@@ -333,10 +335,11 @@ class BeforeToolCallDecision(BaseModel):
     ``proceed`` runs the tool unchanged; ``proceed_modified`` runs it with ``modified_arguments``;
     ``short_circuit`` skips the tool and uses ``synthetic_result``; ``block`` skips the tool and
     returns an error result carrying ``block_reason``. Returning ``None`` from the hook equals
-    ``proceed``.
+    ``proceed``. Modified arguments are validated and copied as portable durable JSON at
+    construction.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     action: Literal["proceed", "proceed_modified", "short_circuit", "block"]
     modified_arguments: dict[str, Any] | None = None
@@ -347,6 +350,11 @@ class BeforeToolCallDecision(BaseModel):
     @classmethod
     def _copy_synthetic_result(cls, value: ToolResult | None) -> ToolResult | None:
         return None if value is None else _copy_tool_result(value)
+
+    @field_validator("modified_arguments", mode="before")
+    @classmethod
+    def _copy_modified_arguments(cls, value: Any) -> dict[str, Any] | None:
+        return None if value is None else copy_durable_json_object(value, "modified_arguments")
 
     @model_validator(mode="after")
     def _check_payload(self) -> BeforeToolCallDecision:

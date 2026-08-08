@@ -16,7 +16,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, StrictBool, field_validator, model_validator
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    copy_durable_json_object,
+    copy_json_value,
+    require_clean_nonblank,
+    require_nonblank,
+)
 from cayu.core.tools import ToolContext, ToolEffect, ToolResult
 from cayu.runners.base import ExecCommand, Runner
 from cayu.runners.local import LocalRunner
@@ -838,6 +843,8 @@ async def verify_tool_effect(
     both workspace snapshots, tool execution, and cleanup. Expiration raises
     ``TimeoutError`` without returning a verdict. A blocking tool or filesystem
     operation can delay that failure; a hard stop requires a process boundary.
+    Arguments are validated and copied as portable durable JSON before the tool
+    can be invoked.
     """
 
     verification_task = asyncio.current_task()
@@ -850,7 +857,7 @@ async def verify_tool_effect(
     tool_name = require_clean_nonblank(tool_name, "tool_name")
     if not isinstance(arguments, Mapping):
         raise TypeError("arguments must be a mapping")
-    copied_arguments = copy_json_value(dict(arguments), "arguments")
+    copied_arguments = copy_durable_json_object(dict(arguments), "arguments")
     copied_metadata = _copy_metadata(metadata)
     seeded_files = _copy_workspace_files(workspace_files)
     declared_unobserved = _copy_names(unobserved_systems, "unobserved_systems")
