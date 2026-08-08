@@ -61,10 +61,12 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    privacy_safe_provider_option_projection,
 )
 from cayu.providers.cache import (
     CacheBreakpoint,
     CachePolicy,
+    RequestCacheProjection,
     resolve_cache_policy,
 )
 from cayu.proxies import CredentialProxy
@@ -314,6 +316,86 @@ class AnthropicProvider(ModelProvider):
             image_min_tokens=ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS,
             document_min_tokens=ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS,
         )
+
+    def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+        projection = self._request_cache_projection(
+            request,
+            include_conversation_prefix=False,
+        )
+        return None if projection is None else projection.policy.model_copy(deep=True)
+
+    def request_cache_projection(self, request: ModelRequest) -> RequestCacheProjection | None:
+        return self._request_cache_projection(
+            request,
+            include_conversation_prefix=True,
+        )
+
+    def _request_cache_projection(
+        self,
+        request: ModelRequest,
+        *,
+        include_conversation_prefix: bool,
+    ) -> RequestCacheProjection | None:
+        policy = resolve_cache_policy(self.cache_policy, request.options)
+        if policy is None:
+            return None
+        payload = build_anthropic_payload(
+            request,
+            default_max_tokens=self.max_tokens,
+            cache_policy=policy,
+        )
+        applied: list[CacheBreakpoint] = []
+        system = payload.get("system")
+        if (
+            CacheBreakpoint.SYSTEM_PROMPT in policy.breakpoints
+            and isinstance(system, list)
+            and any(isinstance(block, dict) and "cache_control" in block for block in system)
+        ):
+            applied.append(CacheBreakpoint.SYSTEM_PROMPT)
+        tools = payload.get("tools")
+        if (
+            CacheBreakpoint.TOOL_DEFINITIONS in policy.breakpoints
+            and isinstance(tools, list)
+            and any(isinstance(tool, dict) and "cache_control" in tool for tool in tools)
+        ):
+            applied.append(CacheBreakpoint.TOOL_DEFINITIONS)
+        messages = payload.get("messages")
+        conversation_prefix = None
+        if (
+            CacheBreakpoint.CONVERSATION_PREFIX in policy.breakpoints
+            and isinstance(messages, list)
+            and any(
+                isinstance(block, dict) and "cache_control" in block
+                for message in messages
+                if isinstance(message, dict) and isinstance(message.get("content"), list)
+                for block in message["content"]
+            )
+        ):
+            applied.append(CacheBreakpoint.CONVERSATION_PREFIX)
+            if include_conversation_prefix:
+                conversation_prefix = _marked_anthropic_conversation_prefix(payload)
+                if conversation_prefix is None:  # pragma: no cover - shared marker detection.
+                    raise ValueError("Anthropic cache prefix marker could not be projected.")
+        return RequestCacheProjection(
+            policy=policy.model_copy(update={"breakpoints": tuple(applied)}, deep=True),
+            conversation_prefix=conversation_prefix,
+        )
+
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        effective_options = _effective_anthropic_request_options(
+            request.options,
+            default_max_tokens=self.max_tokens,
+        )
+        projected = privacy_safe_provider_option_projection(effective_options)
+        return {"anthropic": projected} if projected else {}
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return {
+            "anthropic": _effective_anthropic_request_options(
+                request.options,
+                default_max_tokens=self.max_tokens,
+            )
+        }
 
     def __init__(
         self,
@@ -651,15 +733,12 @@ def build_anthropic_payload(
 ) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
-    if type(default_max_tokens) is not int:
-        raise TypeError("default_max_tokens must be an integer.")
-    if default_max_tokens <= 0:
-        raise ValueError("default_max_tokens must be greater than zero.")
-
-    options = _anthropic_options(request.options)
+    options = _effective_anthropic_request_options(
+        request.options,
+        default_max_tokens=default_max_tokens,
+    )
     payload: dict[str, Any] = {
         "model": request.model,
-        "max_tokens": _max_tokens(options.pop("max_tokens", default_max_tokens)),
         "messages": [],
     }
     system = _system_text(request.messages)
@@ -678,8 +757,6 @@ def build_anthropic_payload(
     if tools:
         payload["tools"] = tools
     payload.update(options)
-    _apply_thinking_options(payload, request.options.get("thinking"))
-    _reconcile_thinking_budget(payload, default_max_tokens=default_max_tokens)
     if cache_policy is not None:
         _apply_cache_breakpoints(payload, cache_policy)
     return copy_json_value(payload, "anthropic_payload")
@@ -795,6 +872,34 @@ def _mark_conversation_prefix(payload: dict[str, Any], policy: CachePolicy) -> N
         if content[-1].get("type") in {"thinking", "redacted_thinking"}:
             return
         content[-1]["cache_control"] = policy.marker()
+
+
+def _marked_anthropic_conversation_prefix(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], ...] | None:
+    """Copy transmitted messages through the applied marker, without the marker."""
+
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        content = cast("dict[str, Any]", message).get("content")
+        if not isinstance(content, list) or not any(
+            isinstance(block, dict) and "cache_control" in block for block in content
+        ):
+            continue
+        prefix = copy_json_value(messages[: index + 1], "anthropic cache conversation prefix")
+        for prefix_message in prefix:
+            prefix_content = prefix_message.get("content")
+            if not isinstance(prefix_content, list):
+                continue
+            for block in prefix_content:
+                if isinstance(block, dict):
+                    block.pop("cache_control", None)
+        return tuple(prefix)
+    return None
 
 
 def anthropic_response_events(
@@ -1261,6 +1366,25 @@ def _anthropic_options(options: Mapping[str, Any]) -> dict[str, Any]:
         if key in _RESERVED_ANTHROPIC_OPTIONS:
             raise ValueError(f"Anthropic option is reserved: {key}")
     return copied
+
+
+def _effective_anthropic_request_options(
+    options: Mapping[str, Any],
+    *,
+    default_max_tokens: int,
+) -> dict[str, Any]:
+    if type(default_max_tokens) is not int:
+        raise TypeError("default_max_tokens must be an integer.")
+    if default_max_tokens <= 0:
+        raise ValueError("default_max_tokens must be greater than zero.")
+    raw = _anthropic_options(options)
+    effective: dict[str, Any] = {
+        "max_tokens": _max_tokens(raw.pop("max_tokens", default_max_tokens)),
+        **raw,
+    }
+    _apply_thinking_options(effective, options.get("thinking"))
+    _reconcile_thinking_budget(effective, default_max_tokens=default_max_tokens)
+    return effective
 
 
 def _system_text(messages: list[Message]) -> str:

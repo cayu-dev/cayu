@@ -104,6 +104,39 @@ _OK_RESPONSE: dict[str, Any] = {
 }
 
 
+def test_vertex_provider_projects_privacy_safe_anthropic_options() -> None:
+    provider = _provider(RecordingTransport([]))
+    request = ModelRequest(
+        model="claude-sonnet-4-6",
+        messages=[Message.text("user", "Say hello.")],
+        options={
+            "anthropic": {
+                "temperature": 0.5,
+                "metadata": {"private": "provider-option-secret"},
+            }
+        },
+    )
+
+    assert provider.request_footprint_options(request) == {
+        "anthropic": {
+            "max_tokens": provider.max_tokens,
+            "temperature": 0.5,
+        }
+    }
+    assert provider.request_fingerprint_options(request) == {
+        "anthropic": {
+            "max_tokens": provider.max_tokens,
+            "temperature": 0.5,
+            "metadata": {"private": "provider-option-secret"},
+        }
+    }
+
+    different_default = _provider(RecordingTransport([]), max_tokens=1234)
+    assert different_default.request_footprint_options(_request()) == {
+        "anthropic": {"max_tokens": 1234}
+    }
+
+
 @pytest.mark.anyio
 async def test_vertex_provider_emits_text_and_completed_events() -> None:
     transport = RecordingTransport(

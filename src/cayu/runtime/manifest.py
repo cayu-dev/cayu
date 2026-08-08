@@ -15,6 +15,10 @@ from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, PlainValidat
 from cayu._validation import collision_safe_json_object, copy_json_value
 from cayu.core.agents import AgentAuthoringState
 from cayu.environments import ExecutionRequirements
+from cayu.runtime.request_footprints import (
+    REQUEST_FOOTPRINT_CANONICALIZATION_VERSION,
+    REQUEST_FOOTPRINT_SCHEMA_VERSION,
+)
 from cayu.runtime.tool_policy import (
     AllowAllToolPolicy,
     AlwaysRequireApprovalToolPolicy,
@@ -32,7 +36,7 @@ if TYPE_CHECKING:
     from cayu.runtime import _runtime_records as runtime_records
     from cayu.runtime.app import CayuApp
 
-APP_MANIFEST_SCHEMA_VERSION = "7"
+APP_MANIFEST_SCHEMA_VERSION = "8"
 _ABSOLUTE_PATH_PLACEHOLDER = "[ABSOLUTE_PATH]"
 _MEMORY_ADDRESS_PLACEHOLDER = "[MEMORY_ADDRESS]"
 _OBJECT_REPRESENTATION_PLACEHOLDER = "[OBJECT_REPRESENTATION]"
@@ -227,6 +231,14 @@ class ToolResultProjectionPolicyManifest(_ManifestModel):
     token_estimation_method: str | None = None
 
 
+class RequestFootprintConfigManifest(_ManifestModel):
+    enabled: bool
+    fingerprint_key_id: str | None
+    fingerprinting_enabled: bool
+    footprint_schema_version: int
+    canonicalization_version: int
+
+
 class RuntimeManifest(_ManifestModel):
     dispatcher: str
     retry_policy: str | None
@@ -237,6 +249,7 @@ class RuntimeManifest(_ManifestModel):
     mcp_manifest_policy: str | None
     tool_result_projection_policy: ToolResultProjectionPolicyManifest | None
     context_counting: str
+    request_footprint: RequestFootprintConfigManifest
     max_file_attachment_bytes: int
     max_total_file_attachment_bytes: int
     max_file_attachments_per_request: int
@@ -246,7 +259,7 @@ class RuntimeManifest(_ManifestModel):
 
 
 class AppManifest(_ManifestModel):
-    schema_version: Literal["7"] = APP_MANIFEST_SCHEMA_VERSION
+    schema_version: Literal["8"] = APP_MANIFEST_SCHEMA_VERSION
     fingerprint: str
     agents: tuple[AgentManifest, ...]
     providers: tuple[ProviderManifest, ...]
@@ -313,6 +326,13 @@ def describe_app(app: CayuApp, *, project_root: str | Path | None = None) -> App
             app._tool_result_projection_policy
         ),
         context_counting=_type_name(app._context_counting),
+        request_footprint=RequestFootprintConfigManifest(
+            enabled=app._request_footprint.enabled,
+            fingerprint_key_id=app._request_footprint.fingerprint_key_id,
+            fingerprinting_enabled=app._request_footprint.fingerprint_key is not None,
+            footprint_schema_version=REQUEST_FOOTPRINT_SCHEMA_VERSION,
+            canonicalization_version=REQUEST_FOOTPRINT_CANONICALIZATION_VERSION,
+        ),
         max_file_attachment_bytes=app._max_file_attachment_bytes,
         max_total_file_attachment_bytes=app._max_total_file_attachment_bytes,
         max_file_attachments_per_request=app._max_file_attachments_per_request,

@@ -29,6 +29,7 @@ from cayu.providers._http import (
 )
 from cayu.providers.anthropic import (
     _anthropic_overflow_message,
+    _effective_anthropic_request_options,
     anthropic_response_events,
     anthropic_stream_events,
     build_anthropic_payload,
@@ -45,6 +46,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    privacy_safe_provider_option_projection,
 )
 
 if TYPE_CHECKING:
@@ -270,6 +272,22 @@ class VertexProvider(ModelProvider):
 
     name = "vertex"
     usage_dialect = UsageDialect.ANTHROPIC
+
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        effective_options = _effective_anthropic_request_options(
+            request.options,
+            default_max_tokens=self.max_tokens,
+        )
+        projected = privacy_safe_provider_option_projection(effective_options)
+        return {"anthropic": projected} if projected else {}
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return {
+            "anthropic": _effective_anthropic_request_options(
+                request.options,
+                default_max_tokens=self.max_tokens,
+            )
+        }
 
     def __init__(
         self,

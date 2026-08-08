@@ -50,6 +50,7 @@ from cayu.runtime import (
     ContextCompactor,
     ModelCompactor,
     PromptCacheCompactor,
+    RequestFootprintConfig,
     RetryPolicy,
     RunRequest,
     Session,
@@ -1094,7 +1095,7 @@ def test_cayu_app_rejects_wrapper_rewrite_of_runtime_completion_evidence() -> No
         ]
     )
     runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
-    app = CayuApp()
+    app = CayuApp(request_footprint=RequestFootprintConfig(enabled=False))
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -1141,6 +1142,9 @@ def test_cayu_app_rejects_forged_completion_without_observed_dispatch() -> None:
     }
 
     class ForgedResultCompactor(ContextCompactor):
+        def provider_budget_identity(self, _session: Session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             return CompactionResult.model_construct(
                 summary="invalid\x00summary",
@@ -1187,6 +1191,117 @@ def test_cayu_app_rejects_forged_completion_without_observed_dispatch() -> None:
     assert runtime_provider.requests == []
 
 
+def test_automatic_compaction_rejects_declared_opaque_provider_before_dispatch() -> None:
+    class OpaqueProviderCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+            self.compact_calls = 0
+
+        def provider_budget_identity(self, _session: Session) -> tuple[str, str]:
+            return "fake", "summary-model"
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.compact_calls += 1
+            async for _event in self.provider.stream(
+                ModelRequest(model="summary-model", messages=request.messages)
+            ):
+                pass
+            return CompactionResult(
+                summary="opaque summary",
+                covered_message_count=len(request.messages),
+            )
+
+    compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+    compactor = OpaqueProviderCompactor(compactor_provider)
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_opaque_compactor_request_footprint",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert compactor.compact_calls == 0
+    assert compactor_provider.requests == []
+    assert runtime_provider.requests == []
+    assert all(event.type != EventType.REQUEST_FOOTPRINT_RECORDED for event in events)
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert "cannot observe each provider dispatch independently" in events[-1].payload["error"]
+
+
+def test_automatic_compaction_rejects_missing_provider_identity_before_dispatch() -> None:
+    class UndeclaredProviderCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+            self.compact_calls = 0
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.compact_calls += 1
+            async for _event in self.provider.stream(
+                ModelRequest(model="summary-model", messages=request.messages)
+            ):
+                pass
+            return CompactionResult(
+                summary="opaque summary",
+                covered_message_count=len(request.messages),
+            )
+
+    compactor_provider = FakeProvider([ModelStreamEvent.completed({})])
+    compactor = UndeclaredProviderCompactor(compactor_provider)
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=compactor,
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_undeclared_compactor_request_footprint",
+                messages=[
+                    Message.text("user", "old"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current"),
+                ],
+            ),
+        )
+    )
+
+    assert compactor.compact_calls == 0
+    assert compactor_provider.requests == []
+    assert runtime_provider.requests == []
+    assert all(event.type != EventType.REQUEST_FOOTPRINT_RECORDED for event in events)
+    assert events[-1].type == EventType.SESSION_FAILED
+    assert "explicitly declare provider_budget_identity" in events[-1].payload["error"]
+
+
 def test_automatic_compaction_rejects_second_completion_for_one_provider_dispatch():
     class DuplicatingWrapperCompactor(ContextCompactor):
         def __init__(self, provider: ModelProvider) -> None:
@@ -1220,7 +1335,10 @@ def test_automatic_compaction_rejects_second_completion_for_one_provider_dispatc
         ]
     )
     runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
-    app = CayuApp(enable_logging=False)
+    app = CayuApp(
+        request_footprint=RequestFootprintConfig(enabled=False),
+        enable_logging=False,
+    )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -1270,6 +1388,9 @@ def test_cayu_app_merges_returned_compaction_evidence_atomically() -> None:
     }
 
     class MalformedEvidenceCompactor(ContextCompactor):
+        def provider_budget_identity(self, _session: Session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             return CompactionResult.model_construct(
                 summary="summary",
@@ -1322,6 +1443,9 @@ def test_cayu_app_rejects_compaction_result_subclass_before_attribute_access() -
     result = HostileCompactionResult(summary="summary", covered_message_count=2)
 
     class SubclassResultCompactor(ContextCompactor):
+        def provider_budget_identity(self, _session: Session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             del request
             return result
@@ -1404,6 +1528,7 @@ def test_cayu_app_rejects_non_portable_compaction_error_before_retry_or_publicat
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
@@ -1411,7 +1536,7 @@ def test_cayu_app_rejects_non_portable_compaction_error_before_retry_or_publicat
     ]
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
-    attempt, failed, terminal = events[2], events[3], events[-1]
+    attempt, failed, terminal = events[3], events[4], events[-1]
     assert attempt.payload["compaction_outcome"] == "unfinished_stream"
     assert attempt.payload["error_type"] == "DurableValueError"
     assert "usage_metrics" not in attempt.payload
@@ -1494,6 +1619,7 @@ def test_cayu_app_rejects_non_portable_raised_compaction_error_without_retry_or_
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
@@ -1501,7 +1627,7 @@ def test_cayu_app_rejects_non_portable_raised_compaction_error_without_retry_or_
     ]
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
-    attempt, failed, terminal = events[2], events[3], events[-1]
+    attempt, failed, terminal = events[3], events[4], events[-1]
     assert attempt.payload["compaction_outcome"] == "provider_error"
     assert attempt.payload["error_type"] == "ModelProviderError"
     assert failed.payload["error_type"] == "ModelProviderError"

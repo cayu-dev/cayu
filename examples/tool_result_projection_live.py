@@ -39,7 +39,13 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    CachePolicy,
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    RequestCacheProjection,
+)
 
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
 RECEIPT_ID = "projection-live-receipt-001"
@@ -122,6 +128,18 @@ class RecordingProvider(ModelProvider):
     @property
     def context_pressure_profile(self):
         return self.delegate.context_pressure_profile
+
+    def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+        return self.delegate.request_cache_policy(request)
+
+    def request_cache_projection(self, request: ModelRequest) -> RequestCacheProjection | None:
+        return self.delegate.request_cache_projection(request)
+
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return self.delegate.request_footprint_options(request)
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return self.delegate.request_fingerprint_options(request)
 
     async def billing_identity_for_request(self, request: ModelRequest):
         return await self.delegate.billing_identity_for_request(request)

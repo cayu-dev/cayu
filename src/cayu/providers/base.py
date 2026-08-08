@@ -18,7 +18,60 @@ from cayu._validation import (
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.messages import Message, detach_message
+from cayu.providers.cache import CachePolicy, RequestCacheProjection
 from cayu.providers.operations import ProviderOperationAdapter, ProviderOperationMode
+
+_REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "logprobs",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "max_tokens",
+        "n",
+        "output_config",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning",
+        "reasoning_effort",
+        "seed",
+        "service_tier",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "top_k",
+        "top_logprobs",
+        "top_p",
+    }
+)
+
+_DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS = frozenset(
+    {
+        "agent_metadata",
+        "cache_policy",
+        "cayu_file_attachments",
+        "environment_metadata",
+        "step",
+        "structured_output",
+        "thinking",
+    }
+)
+
+
+def privacy_safe_provider_option_projection(value: object) -> dict[str, Any]:
+    """Copy allow-listed provider tuning options without arbitrary metadata."""
+
+    if type(value) is not dict:
+        return {}
+    return {
+        key: copy_json_value(option, f"request footprint provider option {key}")
+        for key, option in value.items()
+        if type(key) is str
+        and key in _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS
+        and option is not None
+    }
 
 
 class ModelStreamEventType(StrEnum):
@@ -665,6 +718,58 @@ class ModelProvider(ABC):
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
         return ModelContextPressureProfile()
+
+    def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+        """Describe the effective provider-visible cache breakpoints, when known.
+
+        Implementations must be deterministic, side-effect free, and perform no I/O.
+        """
+
+        return None
+
+    def request_cache_projection(self, request: ModelRequest) -> RequestCacheProjection | None:
+        """Project the effective cache policy and provider-selected prefix.
+
+        Providers whose message preparation can filter or normalize content should
+        override this hook and return the exact ephemeral prefix through the marker
+        they applied. The default preserves compatibility with policy-only provider
+        extensions and lets the runtime derive a provider-neutral prefix.
+        Implementations must be deterministic, side-effect free, and perform no I/O.
+        """
+
+        policy = self.request_cache_policy(request)
+        if policy is None:
+            return None
+        if type(policy) is not CachePolicy:
+            raise TypeError("ModelProvider.request_cache_policy() must return CachePolicy or None.")
+        return RequestCacheProjection(policy=policy)
+
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        """Project privacy-safe provider-visible options for local measurement.
+
+        Implementations must return copied JSON, omit arbitrary metadata and
+        secret-bearing extension fields, and perform no I/O.
+        """
+
+        return {}
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        """Project complete effective provider-visible options for local analysis.
+
+        The runtime keeps this copied value ephemeral: it supplies keyed HMAC input
+        when configured and identifies which non-allowlisted option categories are
+        active, but the value and its field names are never persisted. Built-in
+        adapters override this hook so ignored namespaces, defaults, and normalized
+        controls follow their payload-building semantics. The default conservatively
+        treats every non-runtime request option as provider-visible.
+        Implementations must be deterministic, side-effect free, and perform no I/O.
+        """
+
+        return {
+            key: copy_json_value(value, f"request fingerprint option {key}")
+            for key, value in request.options.items()
+            if key not in _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS and value is not None
+        }
 
     async def billing_identity_for_request(
         self,

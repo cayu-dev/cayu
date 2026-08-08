@@ -46,6 +46,9 @@ from cayu.runtime import (
     ModelPrice,
     PriceBook,
     PromptCacheCompactor,
+    RequestFootprint,
+    RequestFootprintConfig,
+    RequestVariant,
     ResolutionActor,
     ResumeRequest,
     RetryPolicy,
@@ -171,6 +174,16 @@ def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
         assert checkpoint["future_additive_field"] == {"preserved": True}
         assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 1
         first_request_count = len(provider.requests)
+        first_footprints = [
+            RequestFootprint.model_validate(event.payload)
+            for event in events
+            if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert len(first_footprints) == first_request_count
+        assert all(
+            footprint.request_variant == RequestVariant.CONTEXT_COMPACTION
+            for footprint in first_footprints
+        )
         first_prompts = [request.messages[-1].content[0].text for request in provider.requests]
         assert any("OLDEST_MUST_SURVIVE" in prompt for prompt in first_prompts)
         assert all("LATEST_COMPACTABLE" not in prompt for prompt in first_prompts)
@@ -228,6 +241,12 @@ def test_policy_model_compaction_does_not_acknowledge_omitted_history() -> None:
             request.messages[-1].content[0].text
             for request in provider.requests[first_request_count:]
         ]
+        retry_footprints = [
+            RequestFootprint.model_validate(event.payload)
+            for event in retry_events
+            if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert len(retry_footprints) == len(retry_prompts)
         assert any("OLDEST_MUST_SURVIVE" in prompt for prompt in retry_prompts)
         assert any("LATEST_COMPACTABLE" in prompt for prompt in retry_prompts)
         retry_projection = await policy.build_with_checkpoint(
@@ -1740,6 +1759,9 @@ class BlockingCompactor(ContextCompactor):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    def provider_budget_identity(self, _session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.started.set()
         await self.release.wait()
@@ -1769,20 +1791,16 @@ class BlockingCompactionProvider(ModelProvider):
         )
 
 
-class OverlappingCompactor(ContextCompactor):
+class OverlappingCompactor(ModelCompactor):
     def __init__(self) -> None:
-        self.provider = OverlappingCompactionProvider()
-        self.started = self.provider.started
-        self.release = self.provider.release
-        self.calls = 0
-
-    async def compact(self, request: CompactionRequest) -> CompactionResult:
-        self.calls += 1
-        return await ModelCompactor(
-            provider=self.provider,
+        provider = OverlappingCompactionProvider()
+        super().__init__(
+            provider=provider,
             model="summary-model",
             max_input_chars=100_000,
-        ).compact(request)
+        )
+        self.started = provider.started
+        self.release = provider.release
 
 
 class OverlappingCompactionProvider(ModelProvider):
@@ -2017,6 +2035,9 @@ class FailOnceCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.calls = 0
 
+    def provider_budget_identity(self, _session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.calls += 1
         if self.calls == 1:
@@ -2032,6 +2053,9 @@ class AdversarialTelemetryCompactor(ContextCompactor):
             provider_name="fake-compactor",
             resource_id="summary-model-v1",
         )
+
+    def provider_budget_identity(self, _session) -> None:
+        return None
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         return CompactionResult(
@@ -2955,7 +2979,11 @@ def test_compact_session_rejects_second_completion_for_one_provider_dispatch() -
     async def run() -> None:
         store = InMemorySessionStore()
         provider = UsageCompactionProvider()
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            request_footprint=RequestFootprintConfig(enabled=False),
+            enable_logging=False,
+        )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=CheckpointCompactionContextPolicy(
@@ -3171,13 +3199,17 @@ def test_compact_session_generator_exit_propagates_abandonment_accounting_failur
         ]
         assert [event.type for event in events] == [
             EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
         ]
-        assert events[1].payload["model"] == "summary-model"
-        assert events[1].payload["usage"] == {"input_tokens": 5, "output_tokens": 2}
-        assert events[1].payload["purpose"] == "context_compaction"
-        assert events[2].payload["compaction_outcome"] == "unfinished_stream"
+        assert events[3].payload["model"] == "summary-model"
+        assert events[3].payload["usage"] == {"input_tokens": 5, "output_tokens": 2}
+        assert events[3].payload["purpose"] == "context_compaction"
+        assert events[6].payload["compaction_outcome"] == "unfinished_stream"
         checkpoint = await store.load_checkpoint(session_id)
         assert checkpoint is not None
         assert "context_compaction" not in checkpoint
@@ -4590,6 +4622,9 @@ def test_compact_session_stalled_claim_renewal_is_bounded_by_lease_deadline(
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
 
+        def provider_budget_identity(self, _session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             self.started.set()
             try:
@@ -4707,6 +4742,9 @@ def test_compact_session_stalled_claim_reconciliation_is_bounded_by_lease_deadli
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
 
+        def provider_budget_identity(self, _session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             self.store.block_reconciliation = True
             self.started.set()
@@ -4795,6 +4833,9 @@ def test_sqlite_stalled_claim_renewal_cannot_keep_work_running_after_deadline(
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
+
+        def provider_budget_identity(self, _session) -> None:
+            return None
 
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             self.started.set()
@@ -4948,6 +4989,9 @@ def test_sqlite_caller_cancellation_does_not_wait_for_stalled_claim_write(
         def __init__(self) -> None:
             self.started = asyncio.Event()
             self.cancelled = asyncio.Event()
+
+        def provider_budget_identity(self, _session) -> None:
+            return None
 
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             self.started.set()
@@ -5172,6 +5216,9 @@ def test_compact_session_failure_publication_cannot_terminalize_after_claim_expi
     class FailOnceCompactor(ContextCompactor):
         def __init__(self) -> None:
             self.calls = 0
+
+        def provider_budget_identity(self, _session) -> None:
+            return None
 
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             self.calls += 1
@@ -5561,7 +5608,11 @@ def test_compact_session_claim_loss_retains_concurrent_result_telemetry(monkeypa
         )
         compactor = CompletionReportingCompactor()
         store = ConcurrentClaimLossStore(compactor)
-        app = CayuApp(session_store=store, enable_logging=False)
+        app = CayuApp(
+            session_store=store,
+            request_footprint=RequestFootprintConfig(enabled=False),
+            enable_logging=False,
+        )
         app.register_agent(
             AgentSpec(name="assistant", model="fake-model"),
             context_policy=CheckpointCompactionContextPolicy(
@@ -6092,7 +6143,11 @@ def test_compact_session_recovery_fences_a_late_attempt_and_preserves_its_usage(
         compactor = OverlappingCompactor()
 
         def configured_app(*, now: datetime) -> CayuApp:
-            app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
+            app = CayuApp(
+                session_store=store,
+                enable_logging=False,
+                clock=lambda: now,
+            )
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 context_policy=CheckpointCompactionContextPolicy(
@@ -6171,13 +6226,35 @@ def test_compact_session_recovery_fences_a_late_attempt_and_preserves_its_usage(
             created.id,
             [event.id for event in durable_events],
         )
-        assert len({event.payload["operation_id"] for event in durable_events}) == 1
-        assert len({event.payload["attempt_id"] for event in durable_events}) == 2
+        operation_events = durable_events
+        assert len({event.payload["operation_id"] for event in operation_events}) == 1
+        assert len({event.payload["attempt_id"] for event in operation_events}) == 2
+        footprint_events = [
+            event for event in durable_events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+        ]
+        assert footprint_events
+        assert all("step" not in event.payload for event in footprint_events)
+        model_started_events = [
+            event for event in durable_events if event.type == EventType.MODEL_STARTED
+        ]
+        assert len(model_started_events) == len(footprint_events)
+        for footprint_event in footprint_events:
+            started_event = next(
+                event
+                for event in model_started_events
+                if event.payload["model_attempt_id"] == footprint_event.payload["model_attempt_id"]
+            )
+            assert durable_events.index(footprint_event) < durable_events.index(started_event)
+            assert (
+                started_event.payload["operation_id"] == (footprint_event.payload["operation_id"])
+            )
+            assert started_event.payload["attempt_id"] == footprint_event.payload["attempt_id"]
         model_step_ids = {
             event.payload["model_step_id"]
             for event in durable_events
             if event.type
             in {
+                EventType.REQUEST_FOOTPRINT_RECORDED,
                 EventType.MODEL_COMPLETED,
                 EventType.CONTEXT_COMPACTION_STARTED,
                 EventType.CONTEXT_COMPACTION_COMPLETED,
@@ -6791,6 +6868,8 @@ def test_compact_session_attributes_provider_usage_and_honors_run_limits() -> No
 
         assert [event.type for event in limited_events] == [
             EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
@@ -7064,18 +7143,20 @@ def test_compact_session_preserves_usage_for_durably_invalid_summary() -> None:
             EventType.CONTEXT_COMPACTION_STARTED,
             EventType.BUDGET_CHECKED,
             EventType.BUDGET_RESERVED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.BUDGET_RECONCILED,
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
         assert [event.id for event in replay] == [event.id for event in first]
         assert provider.calls == 1
-        usage_event = first[3]
+        usage_event = first[5]
         assert usage_event.payload["compaction_outcome"] == "invalid_summary"
         assert usage_event.payload["usage_metrics"]["total_tokens"] == 10
         assert "compaction_attempt_id" not in usage_event.payload
-        assert first[4].payload["actual_amount"] == "0.000012"
-        assert first[5].payload["error_type"] == "ContextBuildError"
+        assert first[6].payload["actual_amount"] == "0.000012"
+        assert first[7].payload["error_type"] == "ContextBuildError"
         usage = await app.get_session_usage(created.id)
         assert usage.model_steps == 1
         assert usage.usage.total_tokens == 10
@@ -8026,6 +8107,8 @@ def test_compact_session_usage_counts_against_supplied_cost_budget() -> None:
 
         assert [event.type for event in events] == [
             EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.BUDGET_LIMIT_REACHED,
             EventType.CONTEXT_COMPACTION_FAILED,
@@ -8299,10 +8382,12 @@ def test_compact_session_rejects_completion_billing_identity_rewrite() -> None:
         assert provider.calls == 1
         assert [event.type for event in events] == [
             EventType.CONTEXT_COMPACTION_STARTED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
-        completion = events[1]
+        completion = events[3]
         assert completion.payload["billing_identity"] == identity.model_dump(mode="json")
         assert completion.payload["usage_metrics"]["input_tokens"] == 8
         assert completion.payload["usage_metrics"]["output_tokens"] == 2
@@ -8884,6 +8969,8 @@ def test_compact_session_reconciles_reservations_and_replays_budget_events() -> 
             EventType.CONTEXT_COMPACTION_STARTED,
             EventType.BUDGET_CHECKED,
             EventType.BUDGET_RESERVED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.BUDGET_RECONCILED,
             EventType.BUDGET_CHECKED,
@@ -8892,7 +8979,7 @@ def test_compact_session_reconciles_reservations_and_replays_budget_events() -> 
         ]
         assert [event.id for event in replay] == [event.id for event in first]
         assert provider.calls == 1
-        reconciled = first[4]
+        reconciled = first[6]
         assert reconciled.payload["actual_amount"] == "0.000012"
         assert reconciled.payload["operation_id"]
 
@@ -9170,11 +9257,13 @@ def test_compact_session_preserves_usage_when_final_reservation_renewal_fails() 
             EventType.CONTEXT_COMPACTION_STARTED,
             EventType.BUDGET_CHECKED,
             EventType.BUDGET_RESERVED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.BUDGET_RECONCILED,
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
-        assert events[4].payload["actual_amount"] == "0.000012"
+        assert events[6].payload["actual_amount"] == "0.000012"
         assert provider.calls == 1
         assert ledger.heartbeat_calls == 2
 
@@ -9334,11 +9423,13 @@ def test_compact_session_preserves_usage_returned_while_heartbeat_cancels() -> N
             EventType.CONTEXT_COMPACTION_STARTED,
             EventType.BUDGET_CHECKED,
             EventType.BUDGET_RESERVED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.BUDGET_RECONCILED,
             EventType.CONTEXT_COMPACTION_FAILED,
         ]
-        assert events[4].payload["actual_amount"] == "0.000012"
+        assert events[6].payload["actual_amount"] == "0.000012"
         assert provider.calls == 1
 
     asyncio.run(run())
@@ -9779,6 +9870,8 @@ def test_compact_session_persists_reservation_lifecycle_before_provider_work() -
             EventType.CONTEXT_COMPACTION_STARTED,
             EventType.BUDGET_CHECKED,
             EventType.BUDGET_RESERVED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
         ]
         durable_records_before_close = await store.query_events(
             EventQuery(session_id=created.id, limit=100)
@@ -9795,6 +9888,8 @@ def test_compact_session_persists_reservation_lifecycle_before_provider_work() -
             EventType.CONTEXT_COMPACTION_STARTED,
             EventType.BUDGET_CHECKED,
             EventType.BUDGET_RESERVED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
+            EventType.MODEL_STARTED,
             EventType.MODEL_COMPLETED,
             EventType.BUDGET_RECONCILED,
             EventType.BUDGET_CHECKED,

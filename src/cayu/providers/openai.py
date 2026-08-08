@@ -77,6 +77,7 @@ from cayu.providers.base import (
     ModelStreamEventType,
     NativeStructuredOutputSchemaInvalid,
     UsageDialect,
+    privacy_safe_provider_option_projection,
 )
 
 if TYPE_CHECKING:
@@ -308,6 +309,16 @@ class OpenAIProvider(ModelProvider, TextEmbeddingProvider):
 
     def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
         preflight_openai_native_structured_output_schema(json_schema)
+
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        projected = privacy_safe_provider_option_projection(
+            _effective_openai_request_options(request.options)
+        )
+        return {"openai": projected} if projected else {}
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        effective = _effective_openai_request_options(request.options)
+        return {"openai": effective} if effective else {}
 
     def __init__(
         self,
@@ -594,7 +605,7 @@ def build_openai_payload(
     if type(chain) is not bool:
         raise TypeError("OpenAI payload chain must be a bool.")
 
-    options = _openai_options(request.options)
+    options = _effective_openai_request_options(request.options)
     structured_output_format = _openai_structured_output_format(request.options)
     if structured_output_format is not None and "text" in options:
         raise ValueError("OpenAI option text cannot be combined with native structured output.")
@@ -648,7 +659,6 @@ def build_openai_payload(
     if stream:
         payload["stream"] = True
     payload.update(options)
-    _apply_thinking_options(payload, request.options.get("thinking"))
     return copy_json_value(payload, "openai_payload")
 
 
@@ -1534,6 +1544,12 @@ def _openai_options(options: Mapping[str, Any]) -> dict[str, Any]:
         if key in _RESERVED_OPENAI_OPTIONS:
             raise ValueError(f"OpenAI option is reserved: {key}")
     return copied
+
+
+def _effective_openai_request_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    effective = _openai_options(options)
+    _apply_thinking_options(effective, options.get("thinking"))
+    return effective
 
 
 def preflight_openai_native_structured_output_schema(json_schema: dict[str, Any]) -> None:

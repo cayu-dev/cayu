@@ -82,6 +82,31 @@ class RecordingTransport:
         self.closed = True
 
 
+def test_subscription_provider_projects_privacy_safe_openai_options() -> None:
+    provider = OpenAISubscriptionProvider(
+        auth=StaticSubscriptionAuth(),
+        transport=RecordingTransport(),
+    )
+    request = ModelRequest(
+        model="gpt-5.4",
+        messages=[Message.text("user", "Say hello")],
+        options={
+            "openai": {
+                "reasoning_effort": "medium",
+                "metadata": {"private": "provider-option-secret"},
+            }
+        },
+    )
+
+    assert provider.request_footprint_options(request) == {"openai": {"reasoning_effort": "medium"}}
+    assert provider.request_fingerprint_options(request) == {
+        "openai": {
+            "reasoning_effort": "medium",
+            "metadata": {"private": "provider-option-secret"},
+        }
+    }
+
+
 def test_subscription_provider_uses_codex_endpoint_with_honest_cayu_identity() -> None:
     transport = RecordingTransport()
     provider = OpenAISubscriptionProvider(auth=StaticSubscriptionAuth(), transport=transport)

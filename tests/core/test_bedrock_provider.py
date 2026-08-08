@@ -97,6 +97,30 @@ class FailingBedrockClient:
         raise self.error
 
 
+def test_bedrock_request_footprint_options_include_effective_output_limit() -> None:
+    provider = BedrockProvider(client=FakeBedrockClient([]), max_tokens=1234)
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[Message.text("user", "Say hello")],
+        options={
+            "bedrock": {
+                "inferenceConfig": {"temperature": 0.5},
+                "additionalModelRequestFields": {"custom": "active-value"},
+            }
+        },
+    )
+
+    assert provider.request_footprint_options(request) == {
+        "bedrock": {"inferenceConfig": {"maxTokens": 1234, "temperature": 0.5}}
+    }
+    assert provider.request_fingerprint_options(request) == {
+        "bedrock": {
+            "inferenceConfig": {"maxTokens": 1234, "temperature": 0.5},
+            "additionalModelRequestFields": {"custom": "active-value"},
+        }
+    }
+
+
 def test_bedrock_stream_error_projection_drops_unresolved_credential_strings() -> None:
     canaries = (
         "opaque-provider-field-7f3a9c1e5b2d4f6a8c0e",

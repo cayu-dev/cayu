@@ -92,6 +92,7 @@ class EventType(StrEnum):
     PROVIDER_OPERATION_RECONNECT_SCHEDULED = "provider.operation.reconnect_scheduled"
     PROVIDER_OPERATION_RECONNECT_STARTED = "provider.operation.reconnect_started"
     PROVIDER_OPERATION_RECONCILED = "provider.operation.reconciled"
+    REQUEST_FOOTPRINT_RECORDED = "request.footprint.recorded"
 
     STRUCTURED_OUTPUT_VALIDATED = "structured_output.validated"
     STRUCTURED_OUTPUT_VALIDATING = "structured_output.validating"

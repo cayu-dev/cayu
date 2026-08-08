@@ -207,6 +207,10 @@ from cayu.runtime.public_authority import (
     parse_public_authority_alias,
     public_authority_alias_is_reserved,
 )
+from cayu.runtime.request_footprints import (
+    RequestFootprintConfig,
+    copy_request_footprint_config,
+)
 from cayu.runtime.retry_policy import (
     RetryPolicy,
     copy_retry_policy,
@@ -448,6 +452,7 @@ class CayuApp:
         mcp_manifest_policy: McpManifestPolicy | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
         context_counting: ContextCountingConfig | None = None,
+        request_footprint: RequestFootprintConfig | None = None,
         event_sinks: Iterable[EventSink] | None = None,
         enable_logging: bool = True,
         secret_redactor: SecretRedactor | None = None,
@@ -493,6 +498,7 @@ class CayuApp:
         manifest_policy = copy_mcp_manifest_policy(mcp_manifest_policy)
         result_projection_policy = copy_tool_result_projection_policy(tool_result_projection_policy)
         context_counting_config = copy_context_counting_config(context_counting)
+        request_footprint_config = copy_request_footprint_config(request_footprint)
         resolved_secret_redactor = (
             secret_redactor if secret_redactor is not None else SecretRedactor()
         )
@@ -592,6 +598,7 @@ class CayuApp:
         self._mcp_manifest_policy = manifest_policy
         self._tool_result_projection_policy = result_projection_policy
         self._context_counting = context_counting_config
+        self._request_footprint = request_footprint_config
         self._event_sinks = tuple(sinks)
         self._event_writer = RuntimeEventWriter(
             session_store=self._runtime_session_store,
@@ -629,6 +636,7 @@ class CayuApp:
             session_control=self._session_control,
             run_limit_controller=self._run_limit_controller,
             context_counting=self._context_counting,
+            request_footprint=self._request_footprint,
             max_file_attachment_bytes=self._max_file_attachment_bytes,
             max_total_file_attachment_bytes=self._max_total_file_attachment_bytes,
             max_file_attachments_per_request=self._max_file_attachments_per_request,
@@ -716,6 +724,7 @@ class CayuApp:
             run_limit_controller=self._run_limit_controller,
             session_control=self._session_control,
             model_step_executor=self._model_step_executor,
+            request_footprint=self._request_footprint,
             tool_round_executor=self._tool_round_executor,
             recovery_coordinator=self._recovery_coordinator,
             background_interruption_coordinator=(self._background_interruption_coordinator),

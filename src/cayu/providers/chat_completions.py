@@ -56,6 +56,7 @@ from cayu.providers.base import (
     ModelStreamEventType,
     UsageDialect,
     copy_usage_dialect,
+    privacy_safe_provider_option_projection,
 )
 
 if TYPE_CHECKING:
@@ -337,6 +338,21 @@ class ChatCompletionsProvider(ModelProvider):
         self.clean_schemas = clean_schemas
         self.document_encoding = _validate_document_encoding(document_encoding)
 
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        effective_options = _effective_chat_completions_request_options(
+            request.options,
+            options_key=self.name,
+        )
+        projected = privacy_safe_provider_option_projection(effective_options)
+        return {self.name: projected} if projected else {}
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        effective = _effective_chat_completions_request_options(
+            request.options,
+            options_key=self.name,
+        )
+        return {self.name: effective} if effective else {}
+
     async def aclose(self) -> None:
         """Close the transport's shared HTTP client, if it owns one."""
         await aclose_transport(self.transport)
@@ -480,13 +496,10 @@ def build_chat_completions_payload(
         raise TypeError("clean_schemas must be a bool.")
     document_encoding = _validate_document_encoding(document_encoding)
 
-    options = _chat_completions_options(request.options, options_key)
-    # Cayu models one provider response as one assistant step; n>1 would return
-    # multiple `choices` that the stream loop cannot represent. Reject it.
-    if "n" in options and options["n"] != 1:
-        raise ValueError(
-            "Chat Completions n must be 1 (multi-candidate responses are unsupported)."
-        )
+    options = _effective_chat_completions_request_options(
+        request.options,
+        options_key=options_key,
+    )
     resolved_attachments = resolved_file_attachments_from_options(request.options)
 
     messages: list[dict[str, Any]] = []
@@ -517,7 +530,6 @@ def build_chat_completions_payload(
         if include_usage:
             payload["stream_options"] = {"include_usage": True}
     payload.update(options)
-    _apply_thinking_options(payload, request.options.get("thinking"))
     return copy_json_value(payload, "chat_completions_payload")
 
 
@@ -1198,6 +1210,22 @@ def _chat_completions_options(options: Mapping[str, Any], options_key: str) -> d
         if key in _RESERVED_CHAT_COMPLETIONS_OPTIONS:
             raise ValueError(f"Chat Completions option is reserved: {key}")
     return copied
+
+
+def _effective_chat_completions_request_options(
+    options: Mapping[str, Any],
+    *,
+    options_key: str,
+) -> dict[str, Any]:
+    effective = _chat_completions_options(options, options_key)
+    # Cayu models one provider response as one assistant step; n>1 would return
+    # multiple `choices` that the stream loop cannot represent. Reject it.
+    if "n" in effective and effective["n"] != 1:
+        raise ValueError(
+            "Chat Completions n must be 1 (multi-candidate responses are unsupported)."
+        )
+    _apply_thinking_options(effective, options.get("thinking"))
+    return effective
 
 
 def _require_mapping_string(value: Mapping[str, Any], key: str) -> str:

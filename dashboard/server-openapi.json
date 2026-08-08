@@ -3042,8 +3042,8 @@
             "$ref": "#/components/schemas/RuntimeManifest"
           },
           "schema_version": {
-            "const": "7",
-            "default": "7",
+            "const": "8",
+            "default": "8",
             "title": "Schema Version",
             "type": "string"
           },
@@ -8828,6 +8828,47 @@
         "title": "RegistrationProvenance",
         "type": "object"
       },
+      "RequestFootprintConfigManifest": {
+        "additionalProperties": false,
+        "properties": {
+          "canonicalization_version": {
+            "title": "Canonicalization Version",
+            "type": "integer"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "fingerprint_key_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint Key Id"
+          },
+          "fingerprinting_enabled": {
+            "title": "Fingerprinting Enabled",
+            "type": "boolean"
+          },
+          "footprint_schema_version": {
+            "title": "Footprint Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "enabled",
+          "fingerprint_key_id",
+          "fingerprinting_enabled",
+          "footprint_schema_version",
+          "canonicalization_version"
+        ],
+        "title": "RequestFootprintConfigManifest",
+        "type": "object"
+      },
       "ResolutionActor": {
         "additionalProperties": false,
         "description": "Typed actor identity for trusted runtime operator actions.\n\nStamped into approval, user-input, recovery, and interruption event payloads\nso the audit trail answers who performed an operator action without\nconsulting app-side state. ``reason`` and ``metadata`` on requests remain\ncaller-claimed free-form data; this model is the provenance field.",
@@ -9343,6 +9384,9 @@
             ],
             "title": "Mcp Manifest Policy"
           },
+          "request_footprint": {
+            "$ref": "#/components/schemas/RequestFootprintConfigManifest"
+          },
           "retry_policy": {
             "anyOf": [
               {
@@ -9393,6 +9437,7 @@
           "mcp_manifest_policy",
           "tool_result_projection_policy",
           "context_counting",
+          "request_footprint",
           "max_file_attachment_bytes",
           "max_total_file_attachment_bytes",
           "max_file_attachments_per_request",

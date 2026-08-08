@@ -25,6 +25,7 @@ from cayu import (
     ModelCompactor,
     PriceBook,
     PromptCacheCompactor,
+    RequestFootprintConfig,
     ResumeRequest,
     RunRequest,
     TextPart,
@@ -38,7 +39,13 @@ from cayu import (
     estimate_session_cost,
 )
 from cayu.artifacts import RESOLVED_FILE_ATTACHMENTS_OPTION
-from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
+from cayu.providers import (
+    CachePolicy,
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    RequestCacheProjection,
+)
 
 RETENTION_TOKEN = "CACHE_RETENTION_OK"
 _CACHE_COMPACTION_INSTRUCTION = (
@@ -67,6 +74,18 @@ class RecordingProvider(ModelProvider):
     @property
     def context_pressure_profile(self):
         return self.delegate.context_pressure_profile
+
+    def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+        return self.delegate.request_cache_policy(request)
+
+    def request_cache_projection(self, request: ModelRequest) -> RequestCacheProjection | None:
+        return self.delegate.request_cache_projection(request)
+
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return self.delegate.request_footprint_options(request)
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        return self.delegate.request_fingerprint_options(request)
 
     def preflight_native_structured_output_schema(self, json_schema: dict[str, Any]) -> None:
         self.delegate.preflight_native_structured_output_schema(json_schema)
@@ -352,7 +371,10 @@ async def run_scenario(
     baseline_recorder = RecordingProvider(baseline_provider)
     tool = LoadStableContextTool(stable_context(lines=stable_context_lines))
     cache_fixture = tool.stable_context
-    app = CayuApp(enable_logging=False)
+    app = CayuApp(
+        request_footprint=RequestFootprintConfig(enabled=False),
+        enable_logging=False,
+    )
     app.register_provider(recorder, default=True)
     paired_compactor = PairedPromptCacheCompactor(provider=recorder)
     baseline_options = deepcopy(provider_options) if provider_options is not None else {}

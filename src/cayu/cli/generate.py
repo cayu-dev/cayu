@@ -60,7 +60,7 @@ class GeneratorPrecondition(BaseModel):
 class GeneratorPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["7"] = GENERATOR_PLAN_SCHEMA_VERSION
+    schema_version: Literal["8"] = GENERATOR_PLAN_SCHEMA_VERSION
     status: Literal["ready", "conflict", "manual_action_required", "already_present"]
     slice_name: str
     tool_name: str

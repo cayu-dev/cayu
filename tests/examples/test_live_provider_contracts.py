@@ -11,7 +11,15 @@ from types import ModuleType
 import pytest
 from jsonschema import Draft202012Validator
 
-from cayu import Event, EventType, ScriptedModelProvider, ToolEffect
+from cayu import (
+    CacheBreakpoint,
+    CachePolicy,
+    Event,
+    EventType,
+    Message,
+    ScriptedModelProvider,
+    ToolEffect,
+)
 from cayu.embeddings import (
     TextEmbedding,
     TextEmbeddingProvider,
@@ -381,6 +389,39 @@ def test_tool_result_projection_live_contract_requires_externalization_readback_
         "large_report_calls": 1,
         "total_tokens": 220,
     }
+
+
+def test_tool_result_projection_recording_provider_forwards_request_analysis_hooks() -> None:
+    delegate = tool_result_projection_live.AnthropicProvider(
+        api_key="test-key",
+        max_tokens=321,
+        cache_policy=CachePolicy(
+            breakpoints=(
+                CacheBreakpoint.SYSTEM_PROMPT,
+                CacheBreakpoint.CONVERSATION_PREFIX,
+            ),
+            conversation_prefix_strategy="all_but_last",
+            ttl="extended",
+        ),
+    )
+    provider = tool_result_projection_live.RecordingProvider(delegate)
+    request = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message.text("system", "stable prompt"),
+            Message.text("user", "first"),
+            Message.text("user", "last"),
+        ],
+    )
+
+    assert provider.request_cache_policy(request) == delegate.request_cache_policy(request)
+    assert provider.request_cache_projection(request) == delegate.request_cache_projection(request)
+    assert provider.request_footprint_options(request) == delegate.request_footprint_options(
+        request
+    )
+    assert provider.request_fingerprint_options(request) == delegate.request_fingerprint_options(
+        request
+    )
 
 
 class _ProjectionLiveProvider(ModelProvider):

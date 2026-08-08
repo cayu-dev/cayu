@@ -250,6 +250,84 @@ _SESSION_CHECKPOINT_VALUES = frozenset(
         "usage_triggered_context",
     }
 )
+_REQUEST_VARIANT_VALUES = frozenset(
+    {
+        "initial",
+        "structured_output_repair",
+        "context_overflow_recovery",
+        "context_compaction",
+    }
+)
+_REQUEST_MESSAGE_ROLE_VALUES = frozenset({"user", "assistant", "system", "tool"})
+_REQUEST_MESSAGE_PART_TYPE_VALUES = frozenset(
+    {"text", "tool_call", "tool_result", "provider_state", "thinking", "file"}
+)
+_REQUEST_ATTACHMENT_KIND_VALUES = frozenset({"image", "document"})
+_REQUEST_PROMPT_CONTRIBUTION_AVAILABILITY_VALUES = frozenset({"available", "unavailable"})
+_REQUEST_PROMPT_CONTRIBUTION_KIND_VALUES = frozenset(
+    {"agent_instructions", "workspace_instructions", "cayu_framing"}
+)
+_REQUEST_PROMPT_CONTRIBUTION_UNAVAILABLE_REASON_VALUES = frozenset(
+    {
+        "creation_manifest_unavailable",
+        "system_identity_unavailable",
+        "system_identity_not_comparable",
+        "final_system_changed",
+    }
+)
+_REQUEST_CACHE_BREAKPOINT_KIND_VALUES = frozenset(
+    {"system_prompt", "tool_definitions", "conversation_prefix"}
+)
+_REQUEST_CACHE_BREAKPOINT_TTL_VALUES = frozenset({"standard", "extended"})
+_REQUEST_CONTEXT_METHOD_VALUES = frozenset({"local_full_request_estimate"})
+_REQUEST_CONTEXT_CONFIDENCE_VALUES = frozenset({"estimated"})
+_REQUEST_SAFE_OPTION_KEYS = frozenset(
+    {
+        "frequency_penalty",
+        "logprobs",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "max_tokens",
+        "n",
+        "output_config",
+        "parallel_tool_calls",
+        "presence_penalty",
+        "reasoning",
+        "reasoning_effort",
+        "seed",
+        "service_tier",
+        "stop",
+        "stop_sequences",
+        "temperature",
+        "thinking",
+        "tool_choice",
+        "top_k",
+        "top_logprobs",
+        "top_p",
+    }
+)
+_REQUEST_BUILTIN_OPTION_CATEGORY_VALUES = frozenset(
+    {
+        "cache_policy",
+        "max_output_tokens",
+        "max_tokens",
+        "parallel_tool_calls",
+        "reasoning_effort",
+        "response_format",
+        "stop",
+        "structured_output",
+        "temperature",
+        "tool_choice",
+        "top_k",
+        "top_p",
+        "bedrock.inferenceConfig",
+    }
+    | {
+        f"{namespace}.{key}"
+        for namespace in {"anthropic", "openai", "openai_chat"}
+        for key in _REQUEST_SAFE_OPTION_KEYS
+    }
+)
 _DECLARED_FIXED_CONTROLS: Mapping[
     EventType,
     Mapping[tuple[str, ...], frozenset[Any]],
@@ -281,6 +359,37 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     },
     EventType.MODEL_STARTED: {
         ("purpose",): frozenset({"context_compaction"}),
+    },
+    EventType.REQUEST_FOOTPRINT_RECORDED: {
+        ("schema_version",): frozenset({1}),
+        ("request_variant",): _REQUEST_VARIANT_VALUES,
+        ("messages", "groups", "*", "role"): _REQUEST_MESSAGE_ROLE_VALUES,
+        ("messages", "groups", "*", "part_type"): _REQUEST_MESSAGE_PART_TYPE_VALUES,
+        ("attachments", "groups", "*", "kind"): _REQUEST_ATTACHMENT_KIND_VALUES,
+        ("context_pressure", "method"): _REQUEST_CONTEXT_METHOD_VALUES,
+        ("context_pressure", "confidence"): _REQUEST_CONTEXT_CONFIDENCE_VALUES,
+        ("component_tokens", "method"): _REQUEST_CONTEXT_METHOD_VALUES,
+        ("component_tokens", "confidence"): _REQUEST_CONTEXT_CONFIDENCE_VALUES,
+        (
+            "prompt_contributions",
+            "availability",
+        ): _REQUEST_PROMPT_CONTRIBUTION_AVAILABILITY_VALUES,
+        (
+            "prompt_contributions",
+            "contributions",
+            "*",
+            "kind",
+        ): _REQUEST_PROMPT_CONTRIBUTION_KIND_VALUES,
+        (
+            "prompt_contributions",
+            "unavailable_reason",
+        ): _REQUEST_PROMPT_CONTRIBUTION_UNAVAILABLE_REASON_VALUES,
+        (
+            "cache_breakpoints",
+            "*",
+            "kind",
+        ): _REQUEST_CACHE_BREAKPOINT_KIND_VALUES,
+        ("cache_breakpoints", "*", "ttl"): _REQUEST_CACHE_BREAKPOINT_TTL_VALUES,
     },
     **{
         event_type: {
@@ -583,6 +692,191 @@ _MODEL_CONTEXT_PRESSURE_NESTED_PATHS = frozenset(
         ("context_pressure", "estimated_structured_output_input_tokens"),
         ("context_pressure", "estimated_request_options_input_tokens"),
         ("context_pressure", "estimated_request_overhead_input_tokens"),
+    }
+)
+_REQUEST_SIZE_FIELD_NAMES = frozenset({"characters", "utf8_bytes", "canonical_json_bytes"})
+_REQUEST_FINGERPRINT_FIELD_NAMES = frozenset(
+    {
+        "availability",
+        "value",
+        "algorithm",
+        "key_id",
+        "canonicalization_version",
+        "unavailable_reason",
+    }
+)
+_SESSION_PROMPT_FINGERPRINT_PATHS = (
+    ("prompt_contribution_manifest", "system_fingerprint"),
+    ("prompt_contribution_manifest", "contributions", "*", "fingerprint"),
+)
+_REQUEST_FOOTPRINT_FINGERPRINT_PATHS = (
+    ("fingerprints", "provider_neutral_request"),
+    ("fingerprints", "provider_wire_request"),
+    ("fingerprints", "system"),
+    ("fingerprints", "tool_manifest"),
+    ("fingerprints", "conversation_prefix"),
+    ("cache_breakpoints", "*", "fingerprint"),
+    ("prompt_contributions", "contributions", "*", "fingerprint"),
+)
+_PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS = frozenset(
+    {
+        ("prompt_contribution_manifest", "schema_version"),
+        ("prompt_contribution_manifest", "system"),
+        ("prompt_contribution_manifest", "system", "count"),
+        ("prompt_contribution_manifest", "system", "size"),
+        ("prompt_contribution_manifest", "system_fingerprint"),
+        ("prompt_contribution_manifest", "contributions"),
+        ("prompt_contribution_manifest", "contributions", "*", "kind"),
+        ("prompt_contribution_manifest", "contributions", "*", "size"),
+        ("prompt_contribution_manifest", "contributions", "*", "fingerprint"),
+    }
+    | {
+        ("prompt_contribution_manifest", "system", "size", field_name)
+        for field_name in _REQUEST_SIZE_FIELD_NAMES
+    }
+    | {
+        ("prompt_contribution_manifest", "system_fingerprint", field_name)
+        for field_name in _REQUEST_FINGERPRINT_FIELD_NAMES
+    }
+    | {
+        ("prompt_contribution_manifest", "contributions", "*", "size", field_name)
+        for field_name in _REQUEST_SIZE_FIELD_NAMES
+    }
+    | {
+        (
+            "prompt_contribution_manifest",
+            "contributions",
+            "*",
+            "fingerprint",
+            field_name,
+        )
+        for field_name in _REQUEST_FINGERPRINT_FIELD_NAMES
+    }
+)
+_REQUEST_FOOTPRINT_NESTED_PATHS = frozenset(
+    {
+        ("total", "count"),
+        ("total", "size"),
+        ("messages", "count"),
+        ("messages", "system"),
+        ("messages", "system", "count"),
+        ("messages", "system", "size"),
+        ("messages", "groups"),
+        ("messages", "groups", "*", "role"),
+        ("messages", "groups", "*", "part_type"),
+        ("messages", "groups", "*", "count"),
+        ("messages", "groups", "*", "size"),
+        ("messages", "size"),
+        ("tools", "count"),
+        ("tools", "size"),
+        ("attachments", "count"),
+        ("attachments", "source_bytes"),
+        ("attachments", "groups"),
+        ("attachments", "groups", "*", "kind"),
+        ("attachments", "groups", "*", "count"),
+        ("attachments", "groups", "*", "source_bytes"),
+        ("options", "known_categories"),
+        ("options", "unknown_count"),
+        ("options", "size"),
+        ("prompt_contributions", "availability"),
+        ("prompt_contributions", "contributions"),
+        ("prompt_contributions", "contributions", "*", "kind"),
+        ("prompt_contributions", "contributions", "*", "size"),
+        ("prompt_contributions", "contributions", "*", "fingerprint"),
+        ("prompt_contributions", "unavailable_reason"),
+        ("structured_output", "count"),
+        ("structured_output", "size"),
+        ("cache_breakpoints", "*", "kind"),
+        ("cache_breakpoints", "*", "ttl"),
+        ("cache_breakpoints", "*", "fingerprint"),
+    }
+    | {
+        (*prefix, field_name)
+        for prefix in (
+            ("total", "size"),
+            ("messages", "system", "size"),
+            ("messages", "groups", "*", "size"),
+            ("messages", "size"),
+            ("tools", "size"),
+            ("options", "size"),
+            ("structured_output", "size"),
+        )
+        for field_name in _REQUEST_SIZE_FIELD_NAMES
+    }
+    | {
+        ("component_tokens", field_name)
+        for field_name in {
+            "method",
+            "confidence",
+            "total_input_tokens",
+            "system_message_input_tokens",
+            "non_system_message_input_tokens",
+            "tool_schema_input_tokens",
+            "structured_output_input_tokens",
+            "attachment_input_tokens",
+            "request_options_input_tokens",
+        }
+    }
+    | {
+        ("context_pressure", field_name)
+        for field_name in {
+            "method",
+            "confidence",
+            "observed_context_input_tokens",
+            "estimated_delta_input_tokens",
+            "estimated_message_input_tokens",
+            "estimated_tool_schema_input_tokens",
+            "estimated_structured_output_input_tokens",
+            "estimated_request_options_input_tokens",
+            "estimated_request_overhead_input_tokens",
+            "previous_request_overhead_input_tokens",
+            "estimated_request_overhead_delta_tokens",
+            "estimated_attachment_input_tokens",
+            "estimated_context_input_tokens",
+            "reserved_output_tokens",
+            "estimated_context_window_tokens",
+            "provider_count_input_tokens",
+            "provider_count_context_window_tokens",
+            "anchor_transcript_cursor",
+            "current_transcript_cursor",
+            "estimated_message_count",
+            "chars_per_token",
+            "json_chars_per_token",
+            "binary_bytes_per_token",
+        }
+    }
+    | {
+        ("fingerprints", fingerprint_name)
+        for fingerprint_name in {
+            "provider_neutral_request",
+            "provider_wire_request",
+            "system",
+            "tool_manifest",
+            "conversation_prefix",
+        }
+    }
+    | {
+        ("fingerprints", fingerprint_name, field_name)
+        for fingerprint_name in {
+            "provider_neutral_request",
+            "provider_wire_request",
+            "system",
+            "tool_manifest",
+            "conversation_prefix",
+        }
+        for field_name in _REQUEST_FINGERPRINT_FIELD_NAMES
+    }
+    | {
+        ("cache_breakpoints", "*", "fingerprint", field_name)
+        for field_name in _REQUEST_FINGERPRINT_FIELD_NAMES
+    }
+    | {
+        ("prompt_contributions", "contributions", "*", "size", field_name)
+        for field_name in _REQUEST_SIZE_FIELD_NAMES
+    }
+    | {
+        ("prompt_contributions", "contributions", "*", "fingerprint", field_name)
+        for field_name in _REQUEST_FINGERPRINT_FIELD_NAMES
     }
 )
 _MODEL_COMPLETION_NESTED_PATHS = frozenset(
@@ -1073,18 +1367,21 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     ):
         policies[event_type] = interaction_summary
 
-    model_started = _policy(
-        "attempt",
-        "max_attempts",
-        "model",
-        "model_attempt_id",
-        "model_step_id",
-        "provider",
-        "purpose",
-        "step",
+    model_started = _observed_policy(
+        "actor attempt attempt_id compactor instruction_digest instruction_present max_attempts "
+        "mode model model_attempt_id model_step_id operation_id provider purpose reason request_id "
+        "source_run_epoch source_transcript_cursor step",
+        owned_nested_paths=_resolution_actor_nested_paths("actor"),
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
     )
     policies[EventType.MODEL_STARTED] = model_started
+    policies[EventType.REQUEST_FOOTPRINT_RECORDED] = _observed_policy(
+        "attempt attempt_id attachments cache_breakpoints component_tokens context_pressure "
+        "fingerprints max_attempts messages model model_attempt_id model_step_id observation_id "
+        "operation_id options provider_name prompt_contributions request_variant schema_version "
+        "step structured_output tools total",
+        owned_nested_paths=_REQUEST_FOOTPRINT_NESTED_PATHS,
+    )
     model_delta = _policy(
         "attempt",
         "delta",
@@ -1498,7 +1795,9 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "environment_factory_release",
     }
     policies[EventType.SESSION_STARTED] = _observed_policy(
-        "agent_name input_contract parent_session_id traceparent tracestate",
+        "agent_name input_contract parent_session_id prompt_contribution_manifest "
+        "traceparent tracestate",
+        owned_nested_paths=_PROMPT_CONTRIBUTION_MANIFEST_NESTED_PATHS,
         authority_keys={"input_contract"},
         internal_authority_keys={"input_contract"},
     )
@@ -1986,6 +2285,17 @@ def _prepare_runtime_event(
         redactor=redactor,
         projection_references=projection_references,
     )
+    _restore_publication_safe_request_fingerprints(
+        event,
+        redacted_payload=redacted_payload,
+        redactor=redactor,
+        reject_malformed=True,
+    )
+    _restore_publication_safe_request_option_categories(
+        event,
+        redacted_payload=redacted_payload,
+        reject_malformed=True,
+    )
     for key in policy.exact_internal_keys:
         if key in event.payload and redacted_payload.get(key) != event.payload[key]:
             raise ValueError(
@@ -2236,6 +2546,17 @@ def _project_runtime_event(
         envelope_alias_session_id=event.session_id,
         projection_references=projection_references,
     )
+    _restore_publication_safe_request_fingerprints(
+        event,
+        redacted_payload=redacted_payload,
+        redactor=redactor,
+        reject_malformed=False,
+    )
+    _restore_publication_safe_request_option_categories(
+        event,
+        redacted_payload=redacted_payload,
+        reject_malformed=False,
+    )
     for key in policy.internal_keys:
         redacted_payload.pop(key, None)
     _restore_policy_denial_truncation_markers(
@@ -2324,6 +2645,170 @@ def _validate_inputs(event: Event, redactor: SecretRedactor) -> None:
         raise TypeError("Runtime events must be Event instances.")
     if not isinstance(redactor, SecretRedactor):
         raise TypeError("redactor must be a SecretRedactor.")
+
+
+def _restore_publication_safe_request_fingerprints(
+    event: Event,
+    *,
+    redacted_payload: dict[str, Any],
+    redactor: SecretRedactor,
+    reject_malformed: bool,
+) -> None:
+    """Retain typed content-free fingerprints or downgrade them atomically."""
+
+    source_payload = event.payload
+    paths: tuple[tuple[str, ...], ...]
+    if event.type == EventType.SESSION_STARTED:
+        raw_manifest = source_payload.get("prompt_contribution_manifest")
+        if raw_manifest is None:
+            return
+        from cayu.runtime.request_footprints import PromptContributionManifest
+
+        try:
+            manifest = PromptContributionManifest.model_validate(raw_manifest)
+        except (TypeError, ValueError) as exc:
+            if reject_malformed:
+                raise ValueError("Session prompt contribution manifest is malformed.") from exc
+            redacted_payload.pop("prompt_contribution_manifest", None)
+            return
+        safe_manifest = manifest.model_dump(mode="json", exclude_none=True)
+        redacted_payload["prompt_contribution_manifest"] = safe_manifest
+        source_payload = redacted_payload
+        paths = _SESSION_PROMPT_FINGERPRINT_PATHS
+    elif event.type == EventType.REQUEST_FOOTPRINT_RECORDED:
+        paths = _REQUEST_FOOTPRINT_FINGERPRINT_PATHS
+    else:
+        return
+
+    for path in paths:
+        source_slots = _nested_payload_slots(source_payload, path)
+        target_slots = _nested_payload_slots(redacted_payload, path)
+        if len(source_slots) != len(target_slots):
+            if reject_malformed:
+                raise ValueError("Request fingerprint event structure is malformed.")
+            continue
+        for (source_parent, source_key), (target_parent, target_key) in zip(
+            source_slots,
+            target_slots,
+            strict=True,
+        ):
+            target_parent[target_key] = _publication_safe_request_fingerprint(
+                source_parent[source_key],
+                redactor=redactor,
+                reject_malformed=reject_malformed,
+            )
+
+
+def _nested_payload_slots(
+    payload: dict[str, Any],
+    path: tuple[str, ...],
+) -> list[tuple[dict[str, Any], str]]:
+    slots: list[tuple[dict[str, Any], str]] = []
+
+    def visit(value: Any, remaining: tuple[str, ...]) -> None:
+        segment = remaining[0]
+        if segment == "*":
+            if type(value) is list:
+                for item in value:
+                    visit(item, remaining[1:])
+            return
+        if type(value) is not dict or segment not in value:
+            return
+        if len(remaining) == 1:
+            slots.append((value, segment))
+            return
+        visit(value[segment], remaining[1:])
+
+    visit(payload, path)
+    return slots
+
+
+def _restore_publication_safe_request_option_categories(
+    event: Event,
+    *,
+    redacted_payload: dict[str, Any],
+    reject_malformed: bool,
+) -> None:
+    """Preserve built-in category labels without trusting extension-provided names."""
+
+    if event.type != EventType.REQUEST_FOOTPRINT_RECORDED:
+        return
+    source_options = event.payload.get("options")
+    target_options = redacted_payload.get("options")
+    if type(source_options) is not dict or type(target_options) is not dict:
+        if source_options is not None and reject_malformed:
+            raise ValueError("Request footprint option evidence is malformed.")
+        return
+    source_categories = source_options.get("known_categories")
+    target_categories = target_options.get("known_categories")
+    if type(source_categories) is not list or type(target_categories) is not list:
+        if source_categories is not None and reject_malformed:
+            raise ValueError("Request footprint option categories are malformed.")
+        target_options.pop("known_categories", None)
+        return
+    if len(source_categories) != len(target_categories):
+        if reject_malformed:
+            raise ValueError("Request footprint option categories are malformed.")
+        target_options.pop("known_categories", None)
+        return
+
+    safe_categories: set[str] = set()
+    for source_category, target_category in zip(
+        source_categories,
+        target_categories,
+        strict=True,
+    ):
+        if type(source_category) is not str or type(target_category) is not str:
+            if reject_malformed:
+                raise ValueError("Request footprint option categories are malformed.")
+            continue
+        safe_categories.add(
+            source_category
+            if source_category in _REQUEST_BUILTIN_OPTION_CATEGORY_VALUES
+            else target_category
+        )
+    target_options["known_categories"] = sorted(safe_categories)
+
+
+def _publication_safe_request_fingerprint(
+    value: Any,
+    *,
+    redactor: SecretRedactor,
+    reject_malformed: bool,
+) -> dict[str, Any]:
+    from cayu.runtime.request_footprints import (
+        RequestFingerprint,
+        RequestFingerprintAvailability,
+    )
+
+    try:
+        fingerprint = RequestFingerprint.model_validate(value)
+    except (TypeError, ValueError) as exc:
+        if reject_malformed:
+            raise ValueError("Request fingerprint evidence is malformed.") from exc
+        return _unavailable_request_fingerprint_payload("fingerprint_evidence_malformed")
+
+    if fingerprint.availability == RequestFingerprintAvailability.AVAILABLE:
+        identity_material = (
+            fingerprint.value,
+            fingerprint.key_id,
+        )
+        if any(item is None or redactor.redact_text(item) != item for item in identity_material):
+            return _unavailable_request_fingerprint_payload("fingerprint_evidence_redacted")
+    elif (
+        fingerprint.unavailable_reason is not None
+        and redactor.redact_text(fingerprint.unavailable_reason) != fingerprint.unavailable_reason
+    ):
+        return _unavailable_request_fingerprint_payload("fingerprint_evidence_redacted")
+    return fingerprint.model_dump(mode="json", exclude_none=True)
+
+
+def _unavailable_request_fingerprint_payload(reason: str) -> dict[str, Any]:
+    return {
+        "availability": "unavailable",
+        "canonicalization_version": 1,
+        "unavailable_reason": reason,
+    }
 
 
 def _top_level_controls(controls: Mapping[str, Any]) -> dict[str, Any]:

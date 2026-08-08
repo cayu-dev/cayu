@@ -2607,6 +2607,7 @@ class RunLimitController:
         billing_identity: BillingIdentity | None = None,
         pricing_provider_name: str | None = None,
         reservation_identity_guard: BudgetReservationIdentityGuard | None = None,
+        before_provider_dispatch: Callable[[], Awaitable[None]] | None = None,
     ) -> (
         BudgetedOperationSucceeded[_OperationResultT]
         | BudgetedOperationRejected
@@ -2718,6 +2719,8 @@ class RunLimitController:
             else:
 
                 async def run_dispatched_operation() -> _OperationResultT:
+                    if before_provider_dispatch is not None:
+                        await before_provider_dispatch()
                     deferred_dispatch_failure = await self.mark_reservations_dispatched(
                         lifecycle.reservations,
                         dispatch_id=model_attempt_identity.model_attempt_id,

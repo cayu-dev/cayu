@@ -75,6 +75,7 @@ from cayu.runtime import (
     PersistedEventSideEffectStatus,
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
+    RequestFootprintConfig,
     ResolutionActor,
     ResumeRequest,
     RunLimits,
@@ -438,6 +439,9 @@ class _ConformanceCompactor(ContextCompactor):
         self.fail_next = False
         self.requests: list[CompactionRequest] = []
 
+    def provider_budget_identity(self, _session: Session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.calls += 1
         self.requests.append(request.model_copy(deep=True))
@@ -496,6 +500,9 @@ class _ConformanceBlockingCompactor(ContextCompactor):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
+    def provider_budget_identity(self, _session: Session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.calls += 1
         self.started.set()
@@ -508,6 +515,9 @@ class _ConformanceBlockingCompactor(ContextCompactor):
 
 
 class _ConformancePartialCompactor(ContextCompactor):
+    def provider_budget_identity(self, _session: Session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         return CompactionResult(
             summary=_summary_with_existing(request, "partial coverage"),
@@ -520,6 +530,9 @@ class _ConformancePartialCancellationCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.started = asyncio.Event()
 
+    def provider_budget_identity(self, _session: Session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.started.set()
         await asyncio.Event().wait()
@@ -531,6 +544,9 @@ class _ConformancePartialOverlapCompactor(ContextCompactor):
         self.started = [asyncio.Event(), asyncio.Event()]
         self.release = [asyncio.Event(), asyncio.Event()]
         self.calls = 0
+
+    def provider_budget_identity(self, _session: Session) -> None:
+        return None
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         call = self.calls
@@ -10876,7 +10892,12 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
             compactor = _ConformanceOverlappingCompactor()
 
             def configured_app(*, now: datetime) -> CayuApp:
-                app = CayuApp(session_store=store, enable_logging=False, clock=lambda: now)
+                app = CayuApp(
+                    session_store=store,
+                    request_footprint=RequestFootprintConfig(enabled=False),
+                    enable_logging=False,
+                    clock=lambda: now,
+                )
                 app.register_agent(
                     AgentSpec(name="assistant", model="fake-model"),
                     context_policy=CheckpointCompactionContextPolicy(
@@ -10955,8 +10976,13 @@ def test_session_store_conformance_fences_reclaimed_compaction_attempts(
                 sum(event.type == EventType.SESSION_CHECKPOINTED for event in durable_events) == 1
             )
             assert sum(event.type == EventType.MODEL_COMPLETED for event in durable_events) == 2
-            assert len({event.payload["operation_id"] for event in durable_events}) == 1
-            assert len({event.payload["attempt_id"] for event in durable_events}) == 2
+            operation_events = [
+                event
+                for event in durable_events
+                if event.type != EventType.REQUEST_FOOTPRINT_RECORDED
+            ]
+            assert len({event.payload["operation_id"] for event in operation_events}) == 1
+            assert len({event.payload["attempt_id"] for event in operation_events}) == 2
             delivery_ids = {
                 delivery.event_id
                 for delivery in await store.list_persisted_event_side_effect_deliveries(limit=1000)
@@ -11267,7 +11293,11 @@ def test_session_store_conformance_blocks_delete_during_explicit_compaction(
         store = await _open_store(session_store_case)
         try:
             compactor = _ConformanceOverlappingCompactor()
-            app = CayuApp(session_store=store, enable_logging=False)
+            app = CayuApp(
+                session_store=store,
+                request_footprint=RequestFootprintConfig(enabled=False),
+                enable_logging=False,
+            )
             app.register_agent(
                 AgentSpec(name="assistant", model="fake-model"),
                 context_policy=CheckpointCompactionContextPolicy(

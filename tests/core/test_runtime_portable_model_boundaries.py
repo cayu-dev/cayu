@@ -976,6 +976,9 @@ def test_cayu_app_rejects_hostile_exact_result_field_keys_without_lookup() -> No
     object.__setattr__(result, "__dict__", fields)
 
     class HostileFieldResultCompactor(ContextCompactor):
+        def provider_budget_identity(self, _session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             del request
             return result

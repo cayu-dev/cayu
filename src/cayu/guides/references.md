@@ -139,7 +139,11 @@ configured store read-only with `cayu session`.
 
 Context policies select model-facing history; context counting and pressure
 estimation decide when to trim or compact. Compaction produces a checkpointed
-summary but does not erase the durable transcript. Overflow recovery must be
+summary but does not erase the durable transcript. Default-on privacy-safe
+`RequestFootprint` events describe the final prepared request without retaining
+its content or making a provider call; optional keyed HMAC identities make
+request and cache-prefix equality comparable within one key version. Official
+provider token counting remains separately opt-in. Overflow recovery must be
 bounded and provider-neutral.
 
 ## knowledge
@@ -187,8 +191,11 @@ test the stop boundary. Estimated cost is evidence with provenance, not a bill.
 
 `cayu inspect` and `cayu check` are structural and credential-free. The console
 and dashboard inspect durable state; logging and OpenTelemetry sinks observe
-events. Do not confuse successful export with live provider, network, sandbox,
-or deployment verification.
+events. Read `request.footprint.recorded` for content-free final-request shape
+and typed proof availability; do not treat local estimates or fingerprints as
+billing, exact provider-wire evidence, or proof about hidden provider prompts.
+Do not confuse successful export with live provider, network, sandbox, or
+deployment verification.
 
 ## server
 

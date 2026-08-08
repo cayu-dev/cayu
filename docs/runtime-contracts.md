@@ -399,6 +399,120 @@ instead of duplicating or reordering it. If raw completion metadata cannot cross
 the durable JSON boundary, Cayu discards the unsafe raw fields but retains a
 durable provider/model identity and normalized usage payload for accounting.
 
+## Request Footprints
+
+Every model-provider attempt records a versioned `request.footprint.recorded`
+event from the final detached `ModelRequest` before `model.started` and before
+provider-controlled stream code runs. This includes ordinary retries,
+structured-output repairs, context-overflow recovery, and model-backed
+compaction dispatches. `CayuApp` enables local footprints by default; pass
+`request_footprint=RequestFootprintConfig(enabled=False)` to disable them.
+Footprints never call a provider. Provider-backed input-token counting remains
+the separate, opt-in `ContextCountingConfig(mode="observe")` behavior described
+below.
+
+The per-attempt guarantee also applies to model-backed compaction. Built-in
+compactors expose each provider dispatch through the runtime-owned observation
+boundary. An opaque custom compactor that declares provider work is rejected
+before invocation while footprints are enabled, because one aggregate
+`CompactionResult` cannot prove how many hidden calls occurred. Deterministic
+custom compactors must explicitly return `None` from
+`provider_budget_identity(session)`; applications that intentionally accept an
+opaque provider-backed extension must disable footprints (and cannot combine it
+with run or cost controls that require per-dispatch admission).
+
+`RequestFootprint` contains exact content-free character, UTF-8 byte,
+canonical-JSON byte, and attachment source-byte measurements for the safely
+measurable provider-neutral shape: system and non-system message groups,
+model-visible tools, structured-output wiring, resolved attachment classes,
+and allow-listed provider-option categories. Unknown option categories are
+counted only; neither their names, values, nor value-derived sizes or estimates
+enter persisted measurements. The keyed complete-request fingerprint still
+covers their provider-visible values when fingerprinting is explicitly enabled.
+`component_tokens` labels local estimates for total, system, non-system, tools,
+structured output, attachments, and measured request options. Structured-output
+contribution may overlap the system, tool, or option component that carries it,
+so component estimates are not additive. `context_pressure` remains the single
+canonical full-request estimate consumed by observation and completion evidence.
+Neither model is an official token count, billing fact, or provider invoice. Raw prompts,
+messages, tool descriptions and schemas, arguments and results, attachment
+identities and bytes, metadata, credentials, and provider error bodies are not
+part of the event.
+
+Optional equality evidence uses HMAC-SHA-256 only. Configure both a non-secret
+`fingerprint_key_id` and a secret `fingerprint_key` on
+`RequestFootprintConfig`; Cayu records the algorithm, key ID, canonicalization
+version, and digest but never the key. Without that pair, every fingerprint is
+typed as unavailable—there is no unkeyed deterministic-hash fallback. Digests
+are comparable only when their algorithm, key ID, and canonicalization version
+match. Rotating a key intentionally ends comparability with older evidence.
+Operators must assign a new key ID whenever key material changes so consumers
+cannot mistake two incomparable digest sets for the same identity domain.
+The provider-neutral request fingerprint covers ordered messages and tools and
+canonical mapping order, so ordinary dictionary insertion order does not alter
+it while provider-relevant ordering and content do. JSON numbers are
+canonicalized by value, so equivalent numeric representations reconstructed by
+different durable backends retain the same identity. The provider-wire field
+is unavailable in v1 because Cayu has not attested the adapter's exact
+serialized bytes; the provider may also add hidden server-side instructions
+outside Cayu's evidence boundary.
+
+For a new session, `session.started` carries a content-free
+`PromptContributionManifest` for agent instructions, workspace instructions,
+and Cayu-added framing. Source paths and text are never retained. A later
+footprint exposes that component split only when a keyed system fingerprint
+proves the final system message still matches the creation-time manifest. A
+rewritten, removed, replaced, differently keyed, or unprovable system message
+reports prompt attribution as unavailable rather than reusing stale sizes.
+
+Provider adapters may implement synchronous
+`ModelProvider.request_footprint_options()` to project only provider-visible,
+privacy-safe option fields into these measurements. Built-in adapters use an
+explicit allowlist for sampling, output-limit, reasoning, and tool-choice
+controls; arbitrary provider metadata remains unknown and cannot affect a
+persisted size or estimate. An adapter projection is authoritative when
+present: raw request controls are used only by the provider-less analysis
+fallback, and runtime-owned native structured-output evidence is accounted for
+separately so it cannot replace a provider-owned option with the same name.
+Disabling footprint event recording does not disable this canonical
+provider-aware pressure projection; completion and context-pressure evidence
+continue to use the same estimate without persisting a footprint. Separately,
+`ModelProvider.request_fingerprint_options()` projects the complete effective
+provider-visible option shape into ephemeral local analysis. It identifies
+active-but-unmeasured option categories and, when keyed fingerprinting is
+configured, supplies HMAC input. Built-in adapters use the same defaulting,
+reconciliation, and replacement rules as their payload builders, so ignored
+provider namespaces and shadowed raw values do not change request evidence
+while arbitrary active extension values do. This complete projection is never
+included in an event or durable footprint.
+The complete request identity also covers the normalized cache breakpoints,
+TTL, and selected conversation prefix that the adapter actually applied.
+Providers may also implement synchronous
+`ModelProvider.request_cache_policy()` to describe the effective cache policy
+for a prepared request. When available, the footprint records content-free
+identities for the selected conversation prefix and each cache breakpoint,
+including breakpoint kind and standard or extended TTL. Breakpoint identities
+cover the cumulative provider-neutral prefix through that marker, and adapters
+omit configured markers that their payload preparation did not actually apply.
+Adapters that filter or normalize messages additionally implement
+`ModelProvider.request_cache_projection()`. Its provider-owned conversation
+prefix contains only the ephemeral projected message material through the
+marker actually applied; Cayu fingerprints that material but never persists it.
+Policy-only extensions retain the provider-neutral projection fallback.
+The applied marker shapes also contribute to provider-visible option size,
+total request size, and context-pressure evidence without duplicating the
+selected prefix content; unused raw cache controls do not.
+All hooks must be deterministic and side-effect free and must not perform I/O.
+Absence means unavailable, not zero cacheable content. These are point-in-time
+request facts; retry, lineage, latency, cache-economics, and cost aggregation
+remain derived evidence.
+
+Ordinary agent requests carry their turn `step`. Explicit application-requested
+compaction is not an agent turn, so its footprint omits `step` and instead carries
+the compaction operation ID and operation-attempt ID alongside model-step and
+model-attempt identity. This preserves the explicit-compaction causal-event
+contract without inventing a synthetic turn number.
+
 ## Context Counting
 
 Context counting observes the final provider request after context policy output, knowledge injection, structured-output tool wiring, and file attachment resolution. It is disabled by default. `CayuApp(context_counting=ContextCountingConfig(mode="observe"))` asks the active `ModelProvider` to run `count_input_tokens(ModelRequest)` before each provider attempt.

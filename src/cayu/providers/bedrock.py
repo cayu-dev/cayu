@@ -289,6 +289,29 @@ class BedrockProvider(ModelProvider):
     billing_provider_name = "bedrock"
     usage_dialect = UsageDialect.ANTHROPIC
 
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        inference, _ = _bedrock_request_options(
+            request.options,
+            default_max_tokens=self.max_tokens,
+        )
+        return {
+            "bedrock": {
+                "inferenceConfig": {
+                    key: copy_json_value(value, f"request footprint bedrock option {key}")
+                    for key, value in inference.items()
+                    if key in {"maxTokens", "stopSequences", "temperature", "topP"}
+                    and value is not None
+                }
+            }
+        }
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        inference, options = _bedrock_request_options(
+            request.options,
+            default_max_tokens=self.max_tokens,
+        )
+        return {"bedrock": {"inferenceConfig": inference, **options}}
+
     def __init__(
         self,
         *,
@@ -585,22 +608,10 @@ def build_bedrock_converse_payload(
 ) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
-    if type(default_max_tokens) is not int or default_max_tokens <= 0:
-        raise ValueError("default_max_tokens must be a positive integer.")
-    options = request.options.get("bedrock", {})
-    if options is None:
-        options = {}
-    if type(options) is not dict:
-        raise ValueError("ModelRequest.options['bedrock'] must be an object.")
-    copied_options = copy_json_value(options, "bedrock options")
-    for key in _RESERVED_BEDROCK_OPTIONS:
-        if key in copied_options:
-            raise ValueError(f"Bedrock option {key!r} is owned by BedrockProvider.")
-
-    inference_config = copied_options.pop("inferenceConfig", {})
-    if type(inference_config) is not dict:
-        raise ValueError("Bedrock inferenceConfig must be an object.")
-    inference_config.setdefault("maxTokens", default_max_tokens)
+    inference_config, copied_options = _bedrock_request_options(
+        request.options,
+        default_max_tokens=default_max_tokens,
+    )
 
     resolved_attachments = resolved_file_attachments_from_options(request.options)
     system: list[dict[str, Any]] = []
@@ -634,6 +645,29 @@ def build_bedrock_converse_payload(
     # already copied through Cayu's JSON-safe request/options contracts, and
     # decoded attachment bytes are newly allocated for this payload.
     return payload
+
+
+def _bedrock_request_options(
+    options: Mapping[str, Any],
+    *,
+    default_max_tokens: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if type(default_max_tokens) is not int or default_max_tokens <= 0:
+        raise ValueError("default_max_tokens must be a positive integer.")
+    raw = options.get("bedrock", {})
+    if raw is None:
+        raw = {}
+    if type(raw) is not dict:
+        raise ValueError("ModelRequest.options['bedrock'] must be an object.")
+    copied_options = copy_json_value(raw, "bedrock options")
+    for key in _RESERVED_BEDROCK_OPTIONS:
+        if key in copied_options:
+            raise ValueError(f"Bedrock option {key!r} is owned by BedrockProvider.")
+    inference_config = copied_options.pop("inferenceConfig", {})
+    if type(inference_config) is not dict:
+        raise ValueError("Bedrock inferenceConfig must be an object.")
+    inference_config.setdefault("maxTokens", default_max_tokens)
+    return inference_config, copied_options
 
 
 async def bedrock_converse_stream_events(

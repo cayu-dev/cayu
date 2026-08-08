@@ -62,6 +62,7 @@ MANIFEST_RUNTIME_ONLY_EXPORTS = (
     "EnvironmentManifest",
     "ProviderManifest",
     "RegistrationProvenance",
+    "RequestFootprintConfigManifest",
     "RuntimeManifest",
     "StoreManifest",
     "ToolManifest",

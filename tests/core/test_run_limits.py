@@ -1808,6 +1808,116 @@ def test_controller_rejects_rewritten_compactor_reservation_amount_before_dispat
     assert str(outcome.error) == "Budget ledger reservation result changed its requested amount."
 
 
+def test_controller_releases_compactor_reservation_when_dispatch_observation_fails():
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+    controller = _controller(store, ledger=ledger)
+    observations = 0
+    dispatches = 0
+
+    async def scenario():
+        nonlocal observations, dispatches
+        session = await _running_session(store, "sess_compactor_observation_failure")
+
+        async def observe() -> None:
+            nonlocal observations
+            observations += 1
+            raise RuntimeError("footprint publication failed")
+
+        async def operation() -> str:
+            nonlocal dispatches
+            dispatches += 1
+            return "must not run"
+
+        outcome = await controller.run_automatic_compaction_dispatch(
+            operation,
+            completed_events=list,
+            budget_limits=(_reserved_limit("3"),),
+            session=session,
+            agent_name="assistant",
+            environment_name=None,
+            provider_name="fake",
+            model="fake-model",
+            model_attempt_identity=_model_attempt_identity(),
+            authoritative_failure_types=(),
+            before_provider_dispatch=observe,
+        )
+        assert len(ledger._records) == 1
+        record = next(iter(ledger._records.values()))
+        return outcome, record
+
+    outcome, record = asyncio.run(scenario())
+
+    assert isinstance(outcome, BudgetedOperationFailed)
+    assert observations == 1
+    assert dispatches == 0
+    assert str(outcome.error) == "footprint publication failed"
+    assert record.status == "released"
+    assert [event.type for event in outcome.events] == [
+        EventType.BUDGET_RESERVED,
+        EventType.BUDGET_RESERVATION_RELEASED,
+    ]
+    assert outcome.events[-1].payload["reason"] == "reservation setup failed"
+
+
+def test_controller_releases_compactor_reservation_when_observation_is_cancelled():
+    store = InMemorySessionStore()
+    ledger = InMemoryBudgetLedger(reservation_ttl_seconds=None)
+    controller = _controller(store, ledger=ledger)
+
+    async def scenario():
+        session = await _running_session(store, "sess_compactor_observation_cancelled")
+        observation_started = asyncio.Event()
+        dispatches = 0
+
+        async def observe() -> None:
+            observation_started.set()
+            await asyncio.Event().wait()
+
+        async def operation() -> str:
+            nonlocal dispatches
+            dispatches += 1
+            return "must not run"
+
+        async def invoke() -> None:
+            outcome = await controller.run_automatic_compaction_dispatch(
+                operation,
+                completed_events=list,
+                budget_limits=(_reserved_limit("3"),),
+                session=session,
+                agent_name="assistant",
+                environment_name=None,
+                provider_name="fake",
+                model="fake-model",
+                model_attempt_identity=_model_attempt_identity(),
+                authoritative_failure_types=(),
+                before_provider_dispatch=observe,
+            )
+            assert isinstance(outcome, BudgetedOperationFailed)
+            raise outcome.error
+
+        task = asyncio.create_task(invoke())
+        await observation_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        records = await store.query_events(EventQuery(session_id=session.id, limit=100))
+        return task, dispatches, [record.event for record in records]
+
+    task, dispatches, events = asyncio.run(scenario())
+
+    assert task.cancelling() == 1
+    assert task.cancelled()
+    assert dispatches == 0
+    assert len(ledger._records) == 1
+    assert next(iter(ledger._records.values())).status == "released"
+    assert [event.type for event in events] == [
+        EventType.BUDGET_RESERVED,
+        EventType.BUDGET_RESERVATION_RELEASED,
+    ]
+    assert events[-1].payload["reason"] == "reservation setup cancelled"
+
+
 def test_controller_rejects_reservation_id_reuse_across_compactor_dispatches():
     class ReusingReservationIdLedger(InMemoryBudgetLedger):
         first_reservation_id: str | None = None

@@ -2832,6 +2832,7 @@ def test_cayu_app_can_use_sqlite_session_store(tmp_path):
         assert [event.type for event in events] == [
             EventType.INTERACTION_STARTED,
             EventType.SESSION_STARTED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
@@ -2893,6 +2894,7 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
         assert [event.type for event in resume_events] == [
             EventType.INTERACTION_STARTED,
             EventType.SESSION_RESUMED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
@@ -2914,6 +2916,7 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
         assert [event.type for event in persisted_events] == [
             EventType.INTERACTION_STARTED,
             EventType.SESSION_STARTED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,
@@ -2922,6 +2925,7 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
             EventType.SESSION_COMPLETED,
             EventType.INTERACTION_STARTED,
             EventType.SESSION_RESUMED,
+            EventType.REQUEST_FOOTPRINT_RECORDED,
             EventType.MODEL_STARTED,
             EventType.MODEL_TEXT_DELTA,
             EventType.MODEL_COMPLETED,

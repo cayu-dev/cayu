@@ -54,6 +54,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    privacy_safe_provider_option_projection,
 )
 from cayu.providers.openai import (
     DEFAULT_OPENAI_STREAM_IDLE_TIMEOUT_SECONDS,
@@ -61,6 +62,7 @@ from cayu.providers.openai import (
     OPENAI_CONTEXT_PRESSURE_TOOL_SCHEMA_CHARS_PER_TOKEN,
     HttpxOpenAITransport,
     OpenAITransport,
+    _effective_openai_request_options,
     build_openai_payload,
     openai_stream_events,
     preflight_openai_native_structured_output_schema,
@@ -621,6 +623,16 @@ class OpenAISubscriptionProvider(ModelProvider):
     name = "openai_subscription"
     usage_dialect = UsageDialect.OPENAI
     supports_native_structured_output = True
+
+    def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        projected = privacy_safe_provider_option_projection(
+            _effective_openai_request_options(request.options)
+        )
+        return {"openai": projected} if projected else {}
+
+    def request_fingerprint_options(self, request: ModelRequest) -> dict[str, Any]:
+        effective = _effective_openai_request_options(request.options)
+        return {"openai": effective} if effective else {}
 
     def __init__(
         self,

@@ -17,7 +17,7 @@ import httpx
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 from tests.core._execution_unit_fixtures import model_attempt_identity
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 from tests.provider_traceback_assertions import is_cayu_source_filename
@@ -37,6 +37,7 @@ import cayu.runtime.execution_units as execution_units_module
 import cayu.runtime.sessions as sessions_module
 from cayu.artifacts import (
     RESOLVED_FILE_ATTACHMENTS_OPTION,
+    FileAttachmentKind,
     LocalArtifactStore,
     file_attachment,
 )
@@ -93,6 +94,7 @@ from cayu.providers import (
     bedrock_billing_identity,
     completed_bedrock_billing_identity,
 )
+from cayu.providers.cache import CacheBreakpoint, CachePolicy, RequestCacheProjection
 from cayu.proxies import CredentialProxy, PassthroughProxy, ProxyAuthorizationResult
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
@@ -165,8 +167,12 @@ from cayu.runtime import (
     PriceTier,
     PricingContext,
     PromptCacheCompactor,
+    PromptContributionManifest,
     Provenance,
     RecentTurnsContextPolicy,
+    RequestFootprint,
+    RequestFootprintConfig,
+    RequestVariant,
     RequiredAllowlistRule,
     ResolutionActor,
     ResolutionActorSource,
@@ -559,6 +565,9 @@ class RecordingCompactor(ContextCompactor):
 
 
 class FailingCompactor(ContextCompactor):
+    def provider_budget_identity(self, _session: Session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         raise RuntimeError("compaction unavailable")
 
@@ -1291,6 +1300,11 @@ def _without_interaction_lifecycle(events: list[Event]) -> list[Event]:
     return [event for event in events if event.type not in _INTERACTION_LIFECYCLE_EVENT_TYPES]
 
 
+def _without_request_footprints(events: list[Event]) -> list[Event]:
+    """Keep legacy event-sequence assertions separate from footprint coverage."""
+    return [event for event in events if event.type != EventType.REQUEST_FOOTPRINT_RECORDED]
+
+
 def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
     interaction_ids = {
         event.interaction_id
@@ -1305,6 +1319,14 @@ def _assert_events_share_one_interaction(*event_batches: list[Event]) -> str:
 
 
 async def collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
+    events = [event async for event in app.run(request)]
+    return _without_request_footprints(_without_interaction_lifecycle(events))
+
+
+async def collect_request_footprint_events(
+    app: CayuApp,
+    request: RunRequest,
+) -> list[Event]:
     events = [event async for event in app.run(request)]
     return _without_interaction_lifecycle(events)
 
@@ -1404,7 +1426,7 @@ def _interaction_started_event(
 
 async def collect_resume_events(app: CayuApp, request: ResumeRequest) -> list[Event]:
     events = [event async for event in app.resume(request)]
-    return _without_interaction_lifecycle(events)
+    return _without_request_footprints(_without_interaction_lifecycle(events))
 
 
 def assert_model_step_limit_interruption(
@@ -1495,6 +1517,1000 @@ def test_context_counting_is_off_by_default() -> None:
     assert provider.count_requests == []
     assert EventType.CONTEXT_COUNTED not in {event.type for event in events}
     assert EventType.CONTEXT_COUNT_RECONCILED not in {event.type for event in events}
+
+
+@pytest.fixture(params=("memory", "sqlite"), ids=("memory", "sqlite"))
+def request_footprint_session_store(request, tmp_path):
+    if request.param == "memory":
+        store = InMemorySessionStore()
+    else:
+        import base64
+
+        from cayu.runtime.public_authority import (
+            PublicAuthorityAliasCodec,
+            PublicAuthorityAliasKeyring,
+        )
+
+        alias_codec = PublicAuthorityAliasCodec(
+            PublicAuthorityAliasKeyring(
+                active_key_id="test",
+                keys={
+                    "test": SecretStr(
+                        base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+                    )
+                },
+            )
+        )
+        store = SQLiteSessionStore(
+            tmp_path / "request-footprint-matrix.sqlite",
+            public_authority_alias_codec=alias_codec,
+        )
+    yield store
+    close = getattr(store, "close", None)
+    if close is not None:
+        asyncio.run(close())
+
+
+def test_request_footprint_is_default_on_before_model_start_without_provider_counting(
+    request_footprint_session_store,
+) -> None:
+    user_text = "request footprint raw prompt sentinel"
+    provider = CountingProvider(
+        [
+            ModelStreamEvent.text_delta("done"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    app = CayuApp(
+        session_store=request_footprint_session_store,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_default_on",
+                messages=[Message.text("user", user_text)],
+            ),
+        )
+    )
+
+    event_types = [event.type for event in events]
+    footprint_index = event_types.index(EventType.REQUEST_FOOTPRINT_RECORDED)
+    started_index = event_types.index(EventType.MODEL_STARTED)
+    assert footprint_index < started_index
+    assert event_types.count(EventType.REQUEST_FOOTPRINT_RECORDED) == 1
+    assert provider.count_requests == []
+
+    footprint = events[footprint_index].payload
+    assert footprint["schema_version"] == 1
+    assert footprint["provider_name"] == "fake"
+    assert footprint["model"] == "fake-model"
+    assert footprint["step"] == 1
+    assert footprint["attempt"] == 1
+    assert footprint["request_variant"] == RequestVariant.INITIAL
+    assert footprint["messages"]["count"] == 1
+    assert footprint["context_pressure"]["method"] == "local_full_request_estimate"
+    assert user_text not in json.dumps(footprint, sort_keys=True)
+
+
+def test_request_footprint_reuses_canonical_context_analysis_for_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CountingProvider(
+        [ModelStreamEvent.completed({"finish_reason": "stop"})],
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    def fail_parallel_estimator(*_args, **_kwargs):
+        raise AssertionError("completion path recomputed request context pressure")
+
+    monkeypatch.setattr(
+        model_step_executor_module,
+        "analyze_request_context_pressure",
+        fail_parallel_estimator,
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_reuses_analysis",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert EventType.REQUEST_FOOTPRINT_RECORDED in {event.type for event in events}
+    assert EventType.MODEL_COMPLETED in {event.type for event in events}
+
+
+def test_request_footprint_can_be_disabled_independently_of_context_counting() -> None:
+    class EffectiveOptionsCountingProvider(CountingProvider):
+        supports_native_structured_output = True
+
+        def request_cache_projection(
+            self,
+            _request: ModelRequest,
+        ) -> RequestCacheProjection:
+            return RequestCacheProjection(
+                policy=CachePolicy(breakpoints=(CacheBreakpoint.SYSTEM_PROMPT,))
+            )
+
+        def request_footprint_options(self, _request: ModelRequest) -> dict[str, Any]:
+            return {"custom": {"max_tokens": 4096}}
+
+    def run(*, enabled: bool, session_id: str) -> tuple[list[Event], CountingProvider]:
+        provider = EffectiveOptionsCountingProvider(
+            [
+                ModelStreamEvent.text_delta('{"answer":"ok"}'),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            count_result=InputTokenCountResult(
+                input_tokens=2,
+                method=InputTokenCountMethod.OFFICIAL,
+                confidence=InputTokenCountConfidence.HIGH,
+            ),
+        )
+        app = CayuApp(
+            request_footprint=RequestFootprintConfig(enabled=enabled),
+            context_counting=ContextCountingConfig(mode=ContextCountingMode.OBSERVE),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="private instructions that must not be manifested",
+            )
+        )
+        events = asyncio.run(
+            collect_request_footprint_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                    structured_output=StructuredOutputSpec(
+                        name="answer",
+                        json_schema={
+                            "type": "object",
+                            "properties": {"answer": {"type": "string"}},
+                            "required": ["answer"],
+                            "additionalProperties": False,
+                        },
+                        strategy="native",
+                    ),
+                ),
+            )
+        )
+        return events, provider
+
+    enabled_events, enabled_provider = run(
+        enabled=True,
+        session_id="sess_request_footprint_enabled_pressure",
+    )
+    disabled_events, disabled_provider = run(
+        enabled=False,
+        session_id="sess_request_footprint_disabled",
+    )
+
+    assert EventType.REQUEST_FOOTPRINT_RECORDED in {event.type for event in enabled_events}
+    assert EventType.REQUEST_FOOTPRINT_RECORDED not in {event.type for event in disabled_events}
+    assert len(enabled_provider.count_requests) == 1
+    assert len(disabled_provider.count_requests) == 1
+    assert EventType.CONTEXT_COUNTED in {event.type for event in disabled_events}
+    enabled_footprint_pressure = next(
+        event.payload["context_pressure"]
+        for event in enabled_events
+        if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    )
+    enabled_completion_pressure = next(
+        event.payload["context_pressure"]
+        for event in enabled_events
+        if event.type == EventType.MODEL_COMPLETED
+    )
+    disabled_completion_pressure = next(
+        event.payload["context_pressure"]
+        for event in disabled_events
+        if event.type == EventType.MODEL_COMPLETED
+    )
+    assert enabled_completion_pressure == {
+        key: enabled_footprint_pressure[key] for key in enabled_completion_pressure
+    }
+    assert disabled_completion_pressure == enabled_completion_pressure
+    assert disabled_completion_pressure["estimated_request_options_input_tokens"] > 0
+    assert disabled_completion_pressure["estimated_structured_output_input_tokens"] > 0
+    started = next(event for event in disabled_events if event.type == EventType.SESSION_STARTED)
+    assert "prompt_contribution_manifest" not in started.payload
+
+
+def test_request_footprint_records_each_tool_round(request_footprint_session_store) -> None:
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_footprint",
+                    name="echo",
+                    arguments={"text": "hello"},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(
+        session_store=request_footprint_session_store,
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[EchoTool()],
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_tool_rounds",
+                messages=[Message.text("user", "use the tool")],
+            ),
+        )
+    )
+
+    footprints = [
+        RequestFootprint.model_validate(event.payload)
+        for event in events
+        if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert [footprint.step for footprint in footprints] == [1, 2]
+    assert all(footprint.request_variant == RequestVariant.INITIAL for footprint in footprints)
+    assert footprints[1].messages.count > footprints[0].messages.count
+
+
+def test_request_footprint_records_resolved_attachment_shape_without_identity(
+    tmp_path,
+    request_footprint_session_store,
+) -> None:
+    provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app, _ = _app_with_artifact_store(
+        tmp_path,
+        session_store=request_footprint_session_store,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    image = _valid_png_bytes()
+
+    async def run() -> list[Event]:
+        part = await app.attach_file(
+            image,
+            filename="private-file-name.png",
+            kind="image",
+            session_id="sess_request_footprint_attachment",
+        )
+        return await collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_attachment",
+                messages=[Message(role="user", content=[TextPart(text="describe"), part])],
+            ),
+        )
+
+    events = asyncio.run(run())
+    footprint_event = next(
+        event for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    )
+    footprint = RequestFootprint.model_validate(footprint_event.payload)
+
+    assert footprint.attachments.count == 1
+    assert footprint.attachments.source_bytes == len(image)
+    assert [(group.kind, group.count) for group in footprint.attachments.groups] == [
+        (FileAttachmentKind.IMAGE, 1)
+    ]
+    serialized = json.dumps(footprint.model_dump(mode="json"), sort_keys=True)
+    assert "private-file-name.png" not in serialized
+    assert provider.requests[0].options[RESOLVED_FILE_ATTACHMENTS_OPTION]
+
+
+def test_request_footprint_attributes_matching_creation_time_prompt_manifest() -> None:
+    system_prompt = "private agent instruction sentinel"
+    provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="prompt-key",
+            fingerprint_key=SecretStr("p" * 32),
+        ),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt=system_prompt,
+        )
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_prompt_manifest",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    started = next(event for event in events if event.type == EventType.SESSION_STARTED)
+    manifest = started.payload["prompt_contribution_manifest"]
+    footprint = next(
+        event.payload for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    )
+    assert manifest["schema_version"] == 1
+    assert [item["kind"] for item in manifest["contributions"]] == ["agent_instructions"]
+    assert footprint["prompt_contributions"]["availability"] == "available"
+    assert [item["kind"] for item in footprint["prompt_contributions"]["contributions"]] == [
+        "agent_instructions"
+    ]
+    assert system_prompt not in json.dumps(
+        {"started": started.payload, "footprint": footprint},
+        sort_keys=True,
+    )
+
+
+def test_request_footprint_redaction_collision_preserves_typed_unavailable_evidence() -> None:
+    class CacheAwareProvider(FakeProvider):
+        def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+            return CachePolicy(
+                breakpoints=(
+                    CacheBreakpoint.SYSTEM_PROMPT,
+                    CacheBreakpoint.CONVERSATION_PREFIX,
+                ),
+                conversation_prefix_strategy="all_but_last",
+                ttl="standard",
+            )
+
+        def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
+            return {"custom": {"category": 1}}
+
+    provider = CacheAwareProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="redaction-key-category",
+            fingerprint_key=SecretStr("r" * 32),
+        ),
+        secret_redactor=SecretRedactor("category"),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="private system prompt",
+        )
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_redaction_collision",
+                messages=[
+                    Message.text("user", "hello"),
+                    Message.text("assistant", "previous answer"),
+                    Message.text("user", "continue"),
+                ],
+            ),
+        )
+    )
+
+    assert EventType.SESSION_FAILED not in {event.type for event in events}
+    started = next(event for event in events if event.type == EventType.SESSION_STARTED)
+    manifest = PromptContributionManifest.model_validate(
+        started.payload["prompt_contribution_manifest"]
+    )
+    footprint = RequestFootprint.model_validate(
+        next(
+            event.payload for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+        )
+    )
+    assert manifest.system_fingerprint.availability == "unavailable"
+    assert manifest.system_fingerprint.unavailable_reason == "fingerprint_evidence_redacted"
+    assert footprint.fingerprints.provider_neutral_request.availability == "unavailable"
+    assert footprint.prompt_contributions.availability == "unavailable"
+    assert footprint.prompt_contributions.unavailable_reason == "system_identity_unavailable"
+    assert footprint.request_variant == "initial"
+    assert {group.role for group in footprint.messages.groups} >= {"assistant", "user"}
+    assert {item.kind for item in footprint.prompt_contributions.contributions} == set()
+    assert footprint.context_pressure.method == "local_full_request_estimate"
+    assert footprint.context_pressure.confidence == "estimated"
+    assert footprint.component_tokens.method == "local_full_request_estimate"
+    assert footprint.component_tokens.confidence == "estimated"
+    assert "cache_policy" in footprint.options.known_categories
+    assert "custom.category" not in footprint.options.known_categories
+    assert len(footprint.options.known_categories) == 2
+    assert {item.kind for item in footprint.cache_breakpoints} == {
+        "system_prompt",
+        "conversation_prefix",
+    }
+    assert {item.ttl for item in footprint.cache_breakpoints} == {"standard"}
+
+
+def test_request_footprint_records_effective_provider_cache_breakpoints() -> None:
+    class CacheAwareProvider(FakeProvider):
+        def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
+            return CachePolicy(
+                breakpoints=(
+                    CacheBreakpoint.SYSTEM_PROMPT,
+                    CacheBreakpoint.TOOL_DEFINITIONS,
+                    CacheBreakpoint.CONVERSATION_PREFIX,
+                ),
+                conversation_prefix_strategy="all_but_last",
+                ttl="extended",
+            )
+
+    provider = CacheAwareProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="cache-key",
+            fingerprint_key=SecretStr("c" * 32),
+        ),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(
+            name="assistant",
+            model="fake-model",
+            system_prompt="stable system prompt",
+        )
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_cache_policy",
+                messages=[
+                    Message.text("user", "first"),
+                    Message.text("user", "last"),
+                ],
+            ),
+        )
+    )
+
+    assert events[-1].type != EventType.SESSION_FAILED, events[-1].payload
+    footprint = next(
+        event.payload for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    )
+    assert [item["kind"] for item in footprint["cache_breakpoints"]] == [
+        "conversation_prefix",
+        "system_prompt",
+        "tool_definitions",
+    ]
+    assert all(item["ttl"] == "extended" for item in footprint["cache_breakpoints"])
+    assert footprint["fingerprints"]["conversation_prefix"]["availability"] == "available"
+
+
+def test_request_footprint_retry_keeps_shape_identity_and_changes_attempt_identity(
+    request_footprint_session_store,
+) -> None:
+    class RetryThenCompleteProvider(ModelProvider):
+        name = "retry-footprint"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ModelProviderError(
+                    "provider overloaded",
+                    provider=self.name,
+                    status_code=503,
+                    retryable=True,
+                )
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    provider = RetryThenCompleteProvider()
+    app = CayuApp(
+        session_store=request_footprint_session_store,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="test-key",
+            fingerprint_key=SecretStr("k" * 32),
+        ),
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_retry",
+                messages=[Message.text("user", "retry me")],
+            ),
+        )
+    )
+
+    footprints = [
+        event.payload for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert len(footprints) == 2
+    assert [footprint["attempt"] for footprint in footprints] == [1, 2]
+    assert (
+        footprints[0]["fingerprints"]["provider_neutral_request"]["value"]
+        == footprints[1]["fingerprints"]["provider_neutral_request"]["value"]
+    )
+    durable_footprints = [
+        event.payload
+        for event in asyncio.run(app.session_store.load_events("sess_request_footprint_retry"))
+        if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert durable_footprints[0]["observation_id"] != durable_footprints[1]["observation_id"]
+    assert durable_footprints[0]["model_attempt_id"] != durable_footprints[1]["model_attempt_id"]
+
+
+def test_request_footprint_marks_structured_output_repair_and_contribution(
+    request_footprint_session_store,
+) -> None:
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call-invalid",
+                    name=STRUCTURED_OUTPUT_TOOL_NAME,
+                    arguments={"output": {"wrong": "value"}},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [
+                ModelStreamEvent.tool_call(
+                    id="call-valid",
+                    name=STRUCTURED_OUTPUT_TOOL_NAME,
+                    arguments={"output": {"answer": "fixed"}},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+        ]
+    )
+    app = CayuApp(
+        session_store=request_footprint_session_store,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="structured-key",
+            fingerprint_key=SecretStr("s" * 32),
+        ),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_structured_repair",
+                messages=[Message.text("user", "answer with structured output")],
+                structured_output=StructuredOutputSpec(
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                    max_retries=1,
+                ),
+            ),
+        )
+    )
+
+    footprints = [
+        event.payload for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert [item["request_variant"] for item in footprints] == [
+        "initial",
+        "structured_output_repair",
+    ]
+    assert [item["structured_output"]["count"] for item in footprints] == [1, 1]
+    assert all(item["structured_output"]["size"]["utf8_bytes"] > 0 for item in footprints)
+    assert all(
+        item["component_tokens"]["structured_output_input_tokens"] > 0 for item in footprints
+    )
+    assert (
+        footprints[0]["fingerprints"]["provider_neutral_request"]["value"]
+        != footprints[1]["fingerprints"]["provider_neutral_request"]["value"]
+    )
+
+
+def test_request_footprint_marks_context_overflow_recovery_shape(
+    request_footprint_session_store,
+) -> None:
+    provider = ContextOverflowProvider()
+    app = CayuApp(
+        session_store=request_footprint_session_store,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="overflow-key",
+            fingerprint_key=SecretStr("o" * 32),
+        ),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_overflow_recovery",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("user", "new request"),
+                ],
+            ),
+        )
+    )
+
+    footprints = [
+        event.payload for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert [item["request_variant"] for item in footprints] == [
+        "initial",
+        "context_overflow_recovery",
+    ]
+    assert [item["messages"]["count"] for item in footprints] == [2, 1]
+    assert (
+        footprints[0]["fingerprints"]["provider_neutral_request"]["value"]
+        != footprints[1]["fingerprints"]["provider_neutral_request"]["value"]
+    )
+
+
+def test_request_footprint_records_model_backed_compaction_dispatch(
+    request_footprint_session_store,
+) -> None:
+    class CompactionProvider(FakeProvider):
+        name = "compaction-provider"
+
+    class RuntimeProvider(FakeProvider):
+        name = "runtime-provider"
+
+    compaction_provider = CompactionProvider(
+        [
+            ModelStreamEvent.text_delta("summary"),
+            ModelStreamEvent.completed({"finish_reason": "stop"}),
+        ]
+    )
+    runtime_provider = RuntimeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(
+        session_store=request_footprint_session_store,
+        enable_logging=False,
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="runtime-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compaction_provider,
+                model="summary-model",
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_compaction",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current request"),
+                ],
+            ),
+        )
+    )
+
+    footprints = [
+        event.payload for event in events if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    ]
+    assert [item["request_variant"] for item in footprints] == [
+        "context_compaction",
+        "initial",
+    ]
+    assert [item["provider_name"] for item in footprints] == [
+        "compaction-provider",
+        "runtime-provider",
+    ]
+    assert [item["model"] for item in footprints] == [
+        "summary-model",
+        "runtime-model",
+    ]
+    compaction_footprint = next(
+        event
+        for event in events
+        if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+        and event.payload["request_variant"] == "context_compaction"
+    )
+    compaction_started = next(
+        event
+        for event in events
+        if event.type == EventType.MODEL_STARTED
+        and event.payload["provider"] == "compaction-provider"
+    )
+    assert events.index(compaction_footprint) < events.index(compaction_started)
+    assert (
+        compaction_started.payload["model_step_id"]
+        == (compaction_footprint.payload["model_step_id"])
+    )
+    assert (
+        compaction_started.payload["model_attempt_id"]
+        == (compaction_footprint.payload["model_attempt_id"])
+    )
+    assert len(compaction_provider.requests) == 1
+    assert len(runtime_provider.requests) == 1
+
+
+def test_request_footprint_records_each_model_compaction_retry(
+    request_footprint_session_store,
+) -> None:
+    class RetryCompactionProvider(ModelProvider):
+        name = "retry-compactor"
+
+        def __init__(self) -> None:
+            self.requests: list[ModelRequest] = []
+
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                raise ModelProviderError(
+                    "compactor overloaded",
+                    provider=self.name,
+                    status_code=503,
+                    retryable=True,
+                )
+            yield ModelStreamEvent.text_delta("summary")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+    compaction_provider = RetryCompactionProvider()
+    runtime_provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(
+        session_store=request_footprint_session_store,
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="compaction-key",
+            fingerprint_key=SecretStr("m" * 32),
+        ),
+        enable_logging=False,
+    )
+    app.register_provider(runtime_provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="runtime-model"),
+        context_policy=CheckpointCompactionContextPolicy(
+            compactor=ModelCompactor(
+                provider=compaction_provider,
+                model="summary-model",
+                retry_policy=RetryPolicy(max_attempts=2, initial_delay_s=0.0),
+            ),
+            max_user_turns=1,
+            compact_after_messages=2,
+        ),
+    )
+
+    events = asyncio.run(
+        collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_compaction_retry",
+                messages=[
+                    Message.text("user", "old request"),
+                    Message.text("assistant", "old answer"),
+                    Message.text("user", "current request"),
+                ],
+            ),
+        )
+    )
+
+    compaction_footprints = [
+        event.payload
+        for event in events
+        if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+        and event.payload["request_variant"] == "context_compaction"
+    ]
+    assert [item["attempt"] for item in compaction_footprints] == [1, 2]
+    assert (
+        compaction_footprints[0]["fingerprints"]["provider_neutral_request"]["value"]
+        == compaction_footprints[1]["fingerprints"]["provider_neutral_request"]["value"]
+    )
+    assert len(compaction_provider.requests) == 2
+
+
+def test_request_footprint_key_rotation_is_durable_across_store_backends(
+    request_footprint_session_store,
+) -> None:
+    async def run_with_key(*, key_id: str, key: str, session_id: str) -> None:
+        provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        app = CayuApp(
+            session_store=request_footprint_session_store,
+            request_footprint=RequestFootprintConfig(
+                fingerprint_key_id=key_id,
+                fingerprint_key=SecretStr(key),
+            ),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        await collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "stable request")],
+            ),
+        )
+
+    async def run() -> tuple[RequestFootprint, RequestFootprint]:
+        first_session_id = "sess_request_footprint_rotation_one"
+        second_session_id = "sess_request_footprint_rotation_two"
+        await run_with_key(
+            key_id="rotation-key-one",
+            key="1" * 32,
+            session_id=first_session_id,
+        )
+        await run_with_key(
+            key_id="rotation-key-two",
+            key="2" * 32,
+            session_id=second_session_id,
+        )
+        evidence_store = request_footprint_session_store
+        reopened = None
+        if isinstance(request_footprint_session_store, SQLiteSessionStore):
+            reopened = SQLiteSessionStore(
+                request_footprint_session_store.path,
+                public_authority_alias_codec=(
+                    request_footprint_session_store.public_authority_alias_codec
+                ),
+            )
+            evidence_store = reopened
+        try:
+            footprints: list[RequestFootprint] = []
+            for session_id in (first_session_id, second_session_id):
+                durable = [
+                    event
+                    for event in await evidence_store.load_events(session_id)
+                    if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+                ]
+                assert len(durable) == 1
+                footprints.append(RequestFootprint.model_validate(durable[0].payload))
+            return footprints[0], footprints[1]
+        finally:
+            if reopened is not None:
+                await reopened.close()
+
+    first, second = asyncio.run(run())
+
+    first_identity = first.fingerprints.provider_neutral_request
+    second_identity = second.fingerprints.provider_neutral_request
+    assert first_identity.key_id == "rotation-key-one"
+    assert second_identity.key_id == "rotation-key-two"
+    assert first_identity.value != second_identity.value
+
+
+@pytest.mark.parametrize(
+    ("redactor_secret", "expected_availability"),
+    [
+        (None, "available"),
+        ("sqlitefingerprintcollisiontoken", "unavailable"),
+        ("keycollisionmarker", "unavailable"),
+    ],
+)
+def test_request_footprint_survives_sqlite_reconstruction(
+    tmp_path,
+    redactor_secret: str | None,
+    expected_availability: str,
+) -> None:
+    async def run() -> tuple[str | None, RequestFootprint]:
+        import base64
+
+        from cayu.runtime.public_authority import (
+            PublicAuthorityAliasCodec,
+            PublicAuthorityAliasKeyring,
+        )
+
+        path = tmp_path / "request-footprints.sqlite"
+        alias_codec = PublicAuthorityAliasCodec(
+            PublicAuthorityAliasKeyring(
+                active_key_id="test",
+                keys={
+                    "test": SecretStr(
+                        base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+                    )
+                },
+            )
+        )
+        config = RequestFootprintConfig(
+            fingerprint_key_id=("sqlitefingerprintcollisiontoken-keycollisionmarker-key"),
+            fingerprint_key=SecretStr("q" * 32),
+        )
+        store = SQLiteSessionStore(path, public_authority_alias_codec=alias_codec)
+        provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+        app = CayuApp(
+            session_store=store,
+            request_footprint=config,
+            secret_redactor=SecretRedactor(redactor_secret),
+            enable_logging=False,
+        )
+        app.register_provider(provider, default=True)
+        app.register_agent(
+            AgentSpec(
+                name="assistant",
+                model="fake-model",
+                system_prompt="private reconstructed system prompt",
+            )
+        )
+        returned = await collect_request_footprint_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_request_footprint_sqlite",
+                messages=[Message.text("user", "private reconstructed user prompt")],
+            ),
+        )
+        original = next(
+            event.payload
+            for event in returned
+            if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+        )
+        expected_identity = original["fingerprints"]["provider_neutral_request"].get("value")
+        await store.close()
+
+        reopened = SQLiteSessionStore(path, public_authority_alias_codec=alias_codec)
+        records = await reopened.query_events(
+            EventQuery(
+                session_id="sess_request_footprint_sqlite",
+                event_types=(EventType.REQUEST_FOOTPRINT_RECORDED,),
+            )
+        )
+        await reopened.close()
+        assert len(records) == 1
+        return expected_identity, RequestFootprint.model_validate(records[0].event.payload)
+
+    expected_identity, reconstructed = asyncio.run(run())
+
+    assert reconstructed.schema_version == 1
+    assert reconstructed.fingerprints.provider_neutral_request.canonicalization_version == 1
+    assert reconstructed.fingerprints.provider_neutral_request.value == expected_identity
+    assert reconstructed.fingerprints.provider_neutral_request.availability == (
+        expected_availability
+    )
+    assert reconstructed.prompt_contributions.availability == expected_availability
+    serialized = json.dumps(reconstructed.model_dump(mode="json"), sort_keys=True)
+    assert "private reconstructed system prompt" not in serialized
+    assert "private reconstructed user prompt" not in serialized
 
 
 def test_cayu_app_emits_turn_completed_with_aggregated_usage() -> None:
@@ -4064,7 +5080,7 @@ async def collect_fork_events(app: CayuApp, request: ForkSessionRequest) -> list
 
 async def collect_dispatch_events(app: CayuApp, request: DispatchRequest) -> list[Event]:
     events = [event async for event in app.dispatch_inline(request)]
-    return _without_interaction_lifecycle(events)
+    return _without_request_footprints(_without_interaction_lifecycle(events))
 
 
 async def submit_dispatch(app: CayuApp, request: DispatchRequest) -> DispatchHandle:
@@ -4076,7 +5092,7 @@ async def collect_tool_approval_events(
     request: ToolApprovalRequest,
 ) -> list[Event]:
     events = [event async for event in app.resolve_tool_approval(request)]
-    return _without_interaction_lifecycle(events)
+    return _without_request_footprints(_without_interaction_lifecycle(events))
 
 
 async def collect_user_input_events(
@@ -4084,7 +5100,7 @@ async def collect_user_input_events(
     response: UserInputResponse,
 ) -> list[Event]:
     events = [event async for event in app.resolve_user_input(response)]
-    return _without_interaction_lifecycle(events)
+    return _without_request_footprints(_without_interaction_lifecycle(events))
 
 
 async def collect_tool_approval_recovery_events(
@@ -4092,7 +5108,7 @@ async def collect_tool_approval_recovery_events(
     request: ToolApprovalRecoveryRequest,
 ) -> list[Event]:
     events = [event async for event in app.recover_tool_approval(request)]
-    return _without_interaction_lifecycle(events)
+    return _without_request_footprints(_without_interaction_lifecycle(events))
 
 
 async def collect_tool_round_recovery_events(
@@ -4100,7 +5116,7 @@ async def collect_tool_round_recovery_events(
     request: ToolRoundRecoveryRequest,
 ) -> list[Event]:
     events = [event async for event in app.recover_tool_round(request)]
-    return _without_interaction_lifecycle(events)
+    return _without_request_footprints(_without_interaction_lifecycle(events))
 
 
 def _test_session() -> Session:
@@ -8201,7 +9217,11 @@ def test_cayu_app_runs_text_only_session_and_persists_events():
     assert _without_interaction_lifecycle(sink.events) == _without_interaction_lifecycle(projected)
     session = asyncio.run(store.load("sess_text"))
 
-    assert _without_interaction_lifecycle(projected) == events
+    assert [
+        event
+        for event in _without_interaction_lifecycle(projected)
+        if event.type != EventType.REQUEST_FOOTPRINT_RECORDED
+    ] == events
     assert session is not None
     assert session.status == SessionStatus.COMPLETED
     assert session.provider_name == "fake"
@@ -11070,6 +12090,7 @@ def test_cayu_app_releases_reservation_for_failure_before_provider_dispatch(
 ) -> None:
     provider = FakeProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
     app = CayuApp(
+        request_footprint=RequestFootprintConfig(enabled=False),
         budget_policy=BudgetPolicy(
             limits=(
                 BudgetLimit(
@@ -11082,17 +12103,17 @@ def test_cayu_app_releases_reservation_for_failure_before_provider_dispatch(
                     ),
                 ),
             )
-        )
+        ),
     )
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    def fail_before_dispatch(**_kwargs):
+    def fail_before_dispatch(*_args, **_kwargs):
         raise RuntimeError("request preparation failed")
 
     monkeypatch.setattr(
         model_step_executor_module,
-        "estimate_model_request_context_pressure",
+        "analyze_request_context_pressure",
         fail_before_dispatch,
     )
 
@@ -19287,7 +20308,7 @@ def test_cayu_app_dispatch_returns_inline_handle():
         session_id="sess_dispatch_handle",
         backend="inline",
         status=DispatchStatus.COMPLETED,
-        metadata={"events": 8},
+        metadata={"events": 9},
     )
     assert [message.content[0].text for message in provider.requests[1].messages] == [
         "first request",
@@ -41478,6 +42499,9 @@ def test_automatic_compaction_lost_completion_ack_fails_closed_without_retry() -
 
 def test_automatic_compaction_rejects_unattributed_custom_telemetry_without_leaking():
     class AdversarialAutomaticCompactor(ContextCompactor):
+        def provider_budget_identity(self, _session: Session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             identity = BillingIdentity(
                 provider_name="adversarial-compactor",
@@ -41753,6 +42777,9 @@ def test_automatic_compaction_rejects_conflicting_billing_identity_before_checkp
     )
 
     class ConflictingIdentityCompactor(ContextCompactor):
+        def provider_budget_identity(self, _session: Session) -> None:
+            return None
+
         async def compact(self, request: CompactionRequest) -> CompactionResult:
             return CompactionResult(
                 summary="must not be checkpointed",
@@ -42777,7 +43804,7 @@ def test_prompt_cache_compactor_preserves_attempt_order_after_recovered_invalid_
             ],
         ]
     )
-    app = CayuApp()
+    app = CayuApp(request_footprint=RequestFootprintConfig(enabled=False))
     app.register_provider(provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -43228,6 +44255,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
@@ -43256,19 +44284,19 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "coverage_mode": "pending",
         "chunk_count": 0,
         "bounded_input": True,
-        "model_step_id": events[5].payload["model_step_id"],
+        "model_step_id": events[6].payload["model_step_id"],
     }
-    assert events[2].payload == {
+    assert events[3].payload == {
         "finish_reason": "stop",
         "model": "summary-model",
         "provider_name": "fake",
         "requested_model": "summary-model",
         "purpose": "context_compaction",
         "compactor": "ModelCompactor",
-        "model_step_id": events[5].payload["model_step_id"],
-        "model_attempt_id": events[2].payload["model_attempt_id"],
+        "model_step_id": events[6].payload["model_step_id"],
+        "model_attempt_id": events[3].payload["model_attempt_id"],
     }
-    assert events[3].payload == {
+    assert events[4].payload == {
         "checkpoint": "context_compaction",
         "compactor": "ModelCompactor",
         "compacted_transcript_cursor": 2,
@@ -43286,9 +44314,9 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
         "chunk_mode": "single_request",
         "bounded_input": False,
         "compaction_failed": False,
-        "model_step_id": events[5].payload["model_step_id"],
+        "model_step_id": events[6].payload["model_step_id"],
     }
-    assert "model summary" not in str(events[3].payload)
+    assert "model summary" not in str(events[4].payload)
 
     provider_context = runtime_provider.requests[0].messages
     assert [message.role for message in provider_context] == ["user", "user"]
@@ -43299,7 +44327,7 @@ def test_cayu_app_checkpoint_compaction_can_use_model_compactor():
 
     checkpoint = asyncio.run(store.load_checkpoint("sess_model_compaction"))
     private_compaction_completion = asyncio.run(
-        _private_events_for_public_events(store, "sess_model_compaction", [events[2]])
+        _private_events_for_public_events(store, "sess_model_compaction", [events[3]])
     )[0]
     assert checkpoint_without_model_step_publication(checkpoint) == {
         CHECKPOINT_SCHEMA_VERSION_KEY: 2,
@@ -43441,6 +44469,7 @@ def test_cayu_app_stops_before_main_model_when_compaction_reaches_token_limit(
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
@@ -43448,10 +44477,10 @@ def test_cayu_app_stops_before_main_model_when_compaction_reaches_token_limit(
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
-    assert events[5].payload["limit"] == "total_tokens"
-    assert events[5].payload["actual"] == 20
-    assert events[5].payload["maximum"] == 15
-    assert events[6].payload["token_usage"]["total_tokens"] == 20
+    assert events[6].payload["limit"] == "total_tokens"
+    assert events[6].payload["actual"] == 20
+    assert events[6].payload["maximum"] == 15
+    assert events[7].payload["token_usage"]["total_tokens"] == 20
     assert len(compactor_provider.requests) == 1
     assert runtime_provider.requests == []
     checkpoint = asyncio.run(store.load_checkpoint(session_id))
@@ -43650,6 +44679,7 @@ def test_cayu_app_stops_before_main_model_when_compaction_reaches_app_budget():
         EventType.BUDGET_CHECKED,
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.BUDGET_CHECKED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
@@ -43659,9 +44689,9 @@ def test_cayu_app_stops_before_main_model_when_compaction_reaches_app_budget():
         EventType.TURN_COMPLETED,
         EventType.SESSION_INTERRUPTED,
     ]
-    assert Decimal(events[7].payload["actual"]) == Decimal("0.00002")
-    assert events[8].payload["scope"] == "app"
-    assert events[9].payload["limit"] == "estimated_cost"
+    assert Decimal(events[8].payload["actual"]) == Decimal("0.00002")
+    assert events[9].payload["scope"] == "app"
+    assert events[10].payload["limit"] == "estimated_cost"
     assert runtime_provider.requests == []
     checkpoint = asyncio.run(store.load_checkpoint("sess_compaction_app_budget"))
     assert checkpoint is not None
@@ -43825,6 +44855,8 @@ def test_cayu_app_rejects_automatic_compaction_before_provider_dispatch() -> Non
 
     assert compactor_provider.requests == []
     assert runtime_provider.requests == []
+    assert EventType.REQUEST_FOOTPRINT_RECORDED not in [event.type for event in events]
+    assert EventType.MODEL_STARTED not in [event.type for event in events]
     assert EventType.BUDGET_RESERVATION_FAILED in [event.type for event in events]
     assert EventType.BUDGET_RESERVED not in [event.type for event in events]
     assert EventType.BUDGET_RECONCILED not in [event.type for event in events]
@@ -45676,7 +46708,11 @@ def test_cayu_app_keeps_invalid_summary_spend_before_rejecting_custom_recovery()
             ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}}),
         ]
     )
-    app = CayuApp(session_store=store, budget_store=budget_store)
+    app = CayuApp(
+        session_store=store,
+        budget_store=budget_store,
+        request_footprint=RequestFootprintConfig(enabled=False),
+    )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -45757,7 +46793,11 @@ def test_cayu_app_keeps_successful_inner_compaction_spend_when_wrapper_fails():
         ]
     )
     runtime_provider = FakeProvider([ModelStreamEvent.completed({})])
-    app = CayuApp(session_store=store, budget_store=budget_store)
+    app = CayuApp(
+        session_store=store,
+        budget_store=budget_store,
+        request_footprint=RequestFootprintConfig(enabled=False),
+    )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -45786,16 +46826,17 @@ def test_cayu_app_keeps_successful_inner_compaction_spend_when_wrapper_fails():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    completed = events[2]
+    completed = events[3]
     assert completed.payload["usage_metrics"]["input_tokens"] == 10
     assert completed.payload["usage_metrics"]["output_tokens"] == 2
-    assert events[3].payload["error_type"] == "RuntimeError"
-    assert "error" not in events[3].payload
+    assert events[4].payload["error_type"] == "RuntimeError"
+    assert "error" not in events[4].payload
     assert runtime_provider.requests == []
     usage = asyncio.run(app.get_session_usage("sess_failed_compaction_wrapper"))
     assert usage.model_steps == 1
@@ -45941,7 +46982,10 @@ def test_cayu_app_preserves_provider_order_when_wrapper_recovers_earlier_draft()
             ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}}),
         ]
     )
-    app = CayuApp(budget_store=budget_store)
+    app = CayuApp(
+        budget_store=budget_store,
+        request_footprint=RequestFootprintConfig(enabled=False),
+    )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -46056,7 +47100,10 @@ def test_cayu_app_rejects_returned_only_completion_and_keeps_anchored_inner_call
             ModelStreamEvent.completed({"usage": {"input_tokens": 3, "output_tokens": 1}}),
         ]
     )
-    app = CayuApp(budget_store=budget_store)
+    app = CayuApp(
+        budget_store=budget_store,
+        request_footprint=RequestFootprintConfig(enabled=False),
+    )
     app.register_provider(runtime_provider, default=True)
     app.register_agent(
         AgentSpec(name="assistant", model="fake-model"),
@@ -46194,12 +47241,13 @@ def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_n
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    completed = events[2]
+    completed = events[3]
     assert completed.payload["provider_name"] == "fake"
     assert completed.payload["requested_model"] == "summary-model"
     assert completed.payload["model"] == "summary-model"
@@ -46219,8 +47267,8 @@ def test_cayu_app_retains_only_authoritative_usage_when_completion_metadata_is_n
     assert completed.payload["compaction_outcome"] == "invalid_completion_metadata"
     assert secret_key not in completed.payload
     assert "compaction_attempt_id" not in completed.payload
-    assert events[3].payload["error_type"] == "DurableValueError"
-    assert "error" not in events[3].payload
+    assert events[4].payload["error_type"] == "DurableValueError"
+    assert "error" not in events[4].payload
     assert events[-1].payload == {
         "error": "Operation failed with a non-portable diagnostic.",
         "error_type": "DurableValueError",
@@ -46340,12 +47388,13 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    completed = events[2]
+    completed = events[3]
     assert completed.payload["purpose"] == "context_compaction"
     assert completed.payload["compactor"] == "ModelCompactor"
     assert completed.payload["compaction_outcome"] == "invalid_summary"
@@ -46368,20 +47417,20 @@ def test_cayu_app_counts_completed_compaction_with_invalid_summary(
             "uncached_input_tokens": 100,
         },
     }
-    assert events[3].payload["error_type"] == expected_error_type
-    assert "error" not in events[3].payload
-    assert events[4].payload["step_count"] == 1
-    assert events[4].payload["token_usage"]["input_tokens"] == 100
+    assert events[4].payload["error_type"] == expected_error_type
+    assert "error" not in events[4].payload
+    assert events[5].payload["step_count"] == 1
+    assert events[5].payload["token_usage"]["input_tokens"] == 100
     if expected_error_type == "DurableValueError":
         assert expected_error_code is not None
-        assert events[5].payload == {
+        assert events[6].payload == {
             "error": "Operation failed with a non-portable diagnostic.",
             "error_type": expected_error_type,
             "durable_value_error_code": expected_error_code,
             "durable_value_error_path": "$",
         }
     else:
-        assert events[5].payload == {
+        assert events[6].payload == {
             "error": expected_error,
             "error_type": expected_error_type,
         }
@@ -46497,12 +47546,13 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    completed = events[2]
+    completed = events[3]
     assert completed.payload["purpose"] == "context_compaction"
     assert completed.payload["compactor"] == "ModelCompactor"
     assert completed.payload["compaction_outcome"] == "rejected_tool_call"
@@ -46510,11 +47560,11 @@ def test_cayu_app_counts_completed_compaction_rejected_for_tool_call():
     assert completed.payload["usage_metrics"]["input_tokens"] == 80
     assert completed.payload["usage_metrics"]["output_tokens"] == 6
     assert "compaction_attempt_id" not in completed.payload
-    assert events[3].payload["error_type"] == "_CompactionToolCallError"
-    assert "error" not in events[3].payload
-    assert events[4].payload["step_count"] == 1
-    assert events[4].payload["token_usage"]["total_tokens"] == 86
-    assert events[5].payload["error"] == "Compaction model must not call tools."
+    assert events[4].payload["error_type"] == "_CompactionToolCallError"
+    assert "error" not in events[4].payload
+    assert events[5].payload["step_count"] == 1
+    assert events[5].payload["token_usage"]["total_tokens"] == 86
+    assert events[6].payload["error"] == "Compaction model must not call tools."
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_rejected_compaction_tool_call")) == {
         CHECKPOINT_SCHEMA_VERSION_KEY: 2
@@ -46627,19 +47677,20 @@ def test_cayu_app_does_not_invent_usage_for_unfinished_compaction_stream(
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.CONTEXT_COMPACTION_FAILED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
-    uncertain = events[2]
+    uncertain = events[3]
     assert uncertain.payload["compaction_outcome"] == expected_outcome
     assert uncertain.payload["usage_unavailable_reason"]
     assert "usage_metrics" not in uncertain.payload
-    assert events[3].payload["error_type"] in {"RuntimeError", "_CompactionToolCallError"}
-    assert "error" not in events[3].payload
-    assert events[4].payload["step_count"] == 1
-    assert events[5].payload["error"] == expected_error
+    assert events[4].payload["error_type"] in {"RuntimeError", "_CompactionToolCallError"}
+    assert "error" not in events[4].payload
+    assert events[5].payload["step_count"] == 1
+    assert events[6].payload["error"] == expected_error
     assert runtime_provider.requests == []
     assert asyncio.run(store.load_checkpoint("sess_unfinished_compaction")) == {
         CHECKPOINT_SCHEMA_VERSION_KEY: 2
@@ -47094,13 +48145,14 @@ def test_cayu_app_emits_compaction_events_before_checkpoint_failure():
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
         EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.TURN_COMPLETED,
         EventType.SESSION_FAILED,
     ]
     assert EventType.CONTEXT_COMPACTION_COMPLETED not in {event.type for event in events}
     assert EventType.SESSION_CHECKPOINTED not in {event.type for event in events}
-    assert events[4].payload == {
+    assert events[5].payload == {
         "error": "checkpoint unavailable",
         "error_type": "RuntimeError",
     }
@@ -50614,6 +51666,11 @@ def test_cayu_app_validates_native_structured_output_final_text():
         )
     )
     transcript = asyncio.run(store.load_transcript("sess_structured_output_native_valid"))
+    footprint = next(
+        event.payload
+        for event in asyncio.run(store.load_events("sess_structured_output_native_valid"))
+        if event.type == EventType.REQUEST_FOOTPRINT_RECORDED
+    )
 
     assert [event.type for event in events] == [
         EventType.SESSION_STARTED,
@@ -50630,6 +51687,17 @@ def test_cayu_app_validates_native_structured_output_final_text():
     assert provider.requests[0].tools == []
     assert [message.role for message in provider.requests[0].messages] == ["user"]
     assert [message.role for message in transcript] == ["user", "assistant"]
+    pressure = footprint["context_pressure"]
+    assert pressure["estimated_structured_output_input_tokens"] > 0
+    assert pressure["estimated_request_overhead_input_tokens"] == (
+        pressure["estimated_tool_schema_input_tokens"]
+        + pressure["estimated_structured_output_input_tokens"]
+        + pressure["estimated_request_options_input_tokens"]
+    )
+    assert (
+        footprint["component_tokens"]["total_input_tokens"]
+        == pressure["estimated_context_input_tokens"]
+    )
 
 
 def test_cayu_app_retries_invalid_native_structured_output_final_text():

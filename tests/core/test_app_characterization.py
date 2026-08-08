@@ -202,6 +202,7 @@ def test_g1_full_multi_tool_round_run() -> None:
     assert _types(events) == [
         EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.CONTEXT_PRESSURE_ESTIMATED,
         EventType.CONTEXT_COUNTED,
         EventType.MODEL_STARTED,
@@ -210,6 +211,7 @@ def test_g1_full_multi_tool_round_run() -> None:
         EventType.CONTEXT_COUNT_RECONCILED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.CONTEXT_PRESSURE_ESTIMATED,
         EventType.CONTEXT_COUNTED,
         EventType.MODEL_STARTED,
@@ -343,6 +345,7 @@ def test_g2a_user_input_pause_then_resume() -> None:
     assert _types(pause_events) == [
         EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
@@ -392,6 +395,7 @@ def test_g2a_user_input_pause_then_resume() -> None:
         EventType.SESSION_RESUMED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
@@ -457,6 +461,7 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
     assert _types(pause_events) == [
         EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
@@ -473,14 +478,14 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
     )
     approval_id = approval_event.payload["approval"]["approval_id"]
     assert approval_event.payload["approval_id"] == approval_id
-    assert approval_event.payload["tool_call_id"] == "cayu_event_6:tool_call_id"
+    assert approval_event.payload["tool_call_id"] == "cayu_event_7:tool_call_id"
     completed_event = next(
         event for event in pause_events if event.type == EventType.MODEL_COMPLETED
     )
     assert {key: approval_event.payload[key] for key in ("model_step_id", "model_attempt_id")} == {
         key: completed_event.payload[key] for key in ("model_step_id", "model_attempt_id")
     }
-    assert approval_event.payload["tool_round_id"] == "cayu_event_6:tool_round_id"
+    assert approval_event.payload["tool_round_id"] == "cayu_event_7:tool_round_id"
     assert completed_event.payload["tool_round_id"] == "[PRIVATE_EVENT_AUTHORITY]"
 
     resume_events = asyncio.run(
@@ -504,6 +509,7 @@ def test_g2b_tool_approval_pause_then_resume() -> None:
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
         EventType.SESSION_CHECKPOINTED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_TEXT_DELTA,
         EventType.MODEL_COMPLETED,
@@ -567,10 +573,12 @@ def test_g3a_run_limit_trip() -> None:
     assert _types(events) == [
         EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.TOOL_CALL_STARTED,
         EventType.TOOL_CALL_COMPLETED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,
@@ -640,6 +648,7 @@ def test_g3b_budget_trip() -> None:
     assert _types(events) == [
         EventType.INTERACTION_STARTED,
         EventType.SESSION_STARTED,
+        EventType.REQUEST_FOOTPRINT_RECORDED,
         EventType.MODEL_STARTED,
         EventType.MODEL_COMPLETED,
         EventType.SESSION_LIMIT_REACHED,

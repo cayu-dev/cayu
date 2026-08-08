@@ -1550,7 +1550,7 @@ export type AppManifest = {
     /**
      * Schema Version
      */
-    schema_version?: '7';
+    schema_version?: '8';
     stores: StoreManifest;
 };
 
@@ -4573,6 +4573,32 @@ export type RegistrationProvenance = {
 };
 
 /**
+ * RequestFootprintConfigManifest
+ */
+export type RequestFootprintConfigManifest = {
+    /**
+     * Canonicalization Version
+     */
+    canonicalization_version: number;
+    /**
+     * Enabled
+     */
+    enabled: boolean;
+    /**
+     * Fingerprint Key Id
+     */
+    fingerprint_key_id: string | null;
+    /**
+     * Fingerprinting Enabled
+     */
+    fingerprinting_enabled: boolean;
+    /**
+     * Footprint Schema Version
+     */
+    footprint_schema_version: number;
+};
+
+/**
  * ResolutionActor
  *
  * Typed actor identity for trusted runtime operator actions.
@@ -4860,6 +4886,7 @@ export type RuntimeManifest = {
      * Mcp Manifest Policy
      */
     mcp_manifest_policy: string | null;
+    request_footprint: RequestFootprintConfigManifest;
     /**
      * Retry Policy
      */

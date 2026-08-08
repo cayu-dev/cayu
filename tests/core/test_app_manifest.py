@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from cayu import (
     AgentAuthoringState,
@@ -19,6 +19,7 @@ from cayu import (
     ExecCommandTool,
     ExecutionRequirements,
     ProcessCommandPolicy,
+    RequestFootprintConfig,
     ScriptedModelProvider,
     SecretRedactor,
     Tool,
@@ -152,7 +153,7 @@ def test_describe_returns_a_deterministic_public_application_manifest() -> None:
     manifest = _described_app().describe()
     reversed_manifest = _described_app(reverse=True).describe()
 
-    assert manifest.schema_version == "7"
+    assert manifest.schema_version == "8"
     assert manifest.defaults.provider == "primary"
     assert manifest.defaults.environment == "local"
     assert [agent.name for agent in manifest.agents] == ["reviewer", "writer"]
@@ -176,6 +177,31 @@ def test_environment_owner_capacity_is_manifested_and_fingerprinted() -> None:
     assert first.runtime.max_environment_lifecycle_owners == 1
     assert second.runtime.max_environment_lifecycle_owners == 2
     assert first.fingerprint != second.fingerprint
+
+
+def test_request_footprint_config_is_safely_manifested_and_fingerprinted() -> None:
+    enabled = CayuApp(
+        request_footprint=RequestFootprintConfig(
+            fingerprint_key_id="manifest-key",
+            fingerprint_key=SecretStr("m" * 32),
+        ),
+        enable_logging=False,
+    ).describe()
+    disabled = CayuApp(
+        request_footprint=RequestFootprintConfig(enabled=False),
+        enable_logging=False,
+    ).describe()
+
+    assert enabled.runtime.request_footprint.model_dump(mode="json") == {
+        "enabled": True,
+        "fingerprint_key_id": "manifest-key",
+        "fingerprinting_enabled": True,
+        "footprint_schema_version": 1,
+        "canonicalization_version": 1,
+    }
+    assert disabled.runtime.request_footprint.enabled is False
+    assert enabled.fingerprint != disabled.fingerprint
+    assert "m" * 32 not in enabled.model_dump_json()
 
 
 def test_tool_result_projection_policy_is_manifested_and_fingerprinted() -> None:
@@ -405,7 +431,7 @@ def test_manifest_is_public_versioned_redacted_and_deeply_read_only(tmp_path: Pa
     payload = manifest.model_dump_json()
     schema = AppManifest.model_json_schema(mode="serialization")
 
-    assert schema["properties"]["schema_version"]["const"] == "7"
+    assert schema["properties"]["schema_version"]["const"] == "8"
     assert "manifest-secret" not in payload
     assert str(tmp_path) not in payload
     assert factory.called is False
@@ -514,7 +540,7 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
     with pytest.raises(ValidationError, match="JSON-compatible"):
         AppManifest.model_validate(
             {
-                "schema_version": "7",
+                "schema_version": "8",
                 "fingerprint": "0" * 64,
                 "agents": [
                     {
@@ -576,6 +602,13 @@ def test_manifest_rejects_non_json_schema_payloads() -> None:
                     "event_sinks": [],
                     "mcp_manifest_policy": None,
                     "context_counting": "ContextCountingConfig",
+                    "request_footprint": {
+                        "enabled": True,
+                        "fingerprint_key_id": None,
+                        "fingerprinting_enabled": False,
+                        "footprint_schema_version": 1,
+                        "canonicalization_version": 1,
+                    },
                     "max_file_attachment_bytes": 1,
                     "max_total_file_attachment_bytes": 1,
                     "max_file_attachments_per_request": 1,

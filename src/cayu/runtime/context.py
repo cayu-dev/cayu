@@ -520,6 +520,11 @@ class ObservedDeltaContextEstimator:
             elif type(part) is ToolCallPart:
                 total += self._estimate_text(part.tool_name)
                 total += self._estimate_json(part.arguments)
+            elif type(part) is FilePart:
+                # FilePart is a runtime lookup reference, not provider-visible
+                # prompt text. Its provider-facing descriptor and payload are
+                # accounted for exactly once by the attachment estimator.
+                continue
             elif type(part) is ToolResultPart:
                 total += self._estimate_text(part.content)
             elif type(part) is ProviderStatePart:
@@ -589,10 +594,8 @@ class ObservedDeltaContextEstimator:
         document_min_tokens: int,
         document_bytes_per_token: int,
     ) -> int:
-        metadata_tokens = (
-            self._estimate_text(attachment.filename)
-            + self._estimate_text(attachment.content_type)
-            + self._estimate_json(attachment.metadata)
+        descriptor_tokens = self._estimate_text(attachment.filename) + self._estimate_text(
+            attachment.content_type
         )
         if attachment.kind == FileAttachmentKind.IMAGE:
             # Providers account for image blocks with modality-specific formulas.
@@ -602,15 +605,15 @@ class ObservedDeltaContextEstimator:
                 image_min_tokens,
                 math.ceil(attachment.size_bytes / 16),
             )
-            return metadata_tokens + payload_tokens
+            return descriptor_tokens + payload_tokens
         if attachment.kind == FileAttachmentKind.DOCUMENT:
             payload_tokens = max(
                 document_min_tokens,
                 math.ceil(attachment.size_bytes / document_bytes_per_token),
             )
-            return metadata_tokens + payload_tokens
+            return descriptor_tokens + payload_tokens
         payload_tokens = math.ceil(attachment.size_bytes / self.binary_bytes_per_token)
-        return metadata_tokens + payload_tokens
+        return descriptor_tokens + payload_tokens
 
     def _estimate_request_options(self, options: dict[str, Any]) -> int:
         visible_options: dict[str, Any] = {}
@@ -2523,10 +2526,15 @@ _CONTEXT_SECRET_REDACTOR: ContextVar[SecretRedactor | None] = ContextVar(
 
 _AutomaticCompactionDispatchRunner = Callable[
     [
+        ModelProvider,
+        str,
         str,
         str,
         UsageDialect,
         BillingIdentity | None,
+        ModelRequest,
+        int,
+        int,
         Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
     ],
     Awaitable[tuple[str, dict[str, Any]]],
@@ -4568,10 +4576,15 @@ async def _run_compaction_model(
                     summary, completed_metadata = await dispatch()
                 else:
                     summary, completed_metadata = await run_dispatch(
+                        provider,
+                        provider_name,
                         pricing_provider_name,
                         request_template.model,
                         usage_dialect,
                         billing_identity,
+                        _detach_compaction_model_request(request_template),
+                        attempt,
+                        retry_policy.max_attempts,
                         dispatch,
                     )
                 completion_payloads = copy_durable_json_value(

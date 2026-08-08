@@ -62,6 +62,8 @@ from cayu.environments import (
     EnvironmentFactoryOperation,
 )
 from cayu.providers import (
+    ModelProvider,
+    ModelRequest,
     ProviderOperationMode,
     UsageDialect,
     copy_usage_dialect,
@@ -89,7 +91,7 @@ from cayu.runtime._diagnostics import (
 from cayu.runtime._environment_lifecycle import (
     EnvironmentLifecycle,
     exception_failure_payload,
-    render_initial_system_prompt,
+    render_initial_system_prompt_with_contributions,
 )
 from cayu.runtime._event_writer import (
     RuntimeEventWriter,
@@ -123,6 +125,7 @@ from cayu.runtime._model_step_executor import (
     ModelStepExecutor,
     ModelStepFlowOutcome,
     ModelStepLimitEvaluationRequest,
+    _detach_model_request,
     _session_agent_spec,
 )
 from cayu.runtime._recovery_coordinator import (
@@ -263,6 +266,14 @@ from cayu.runtime.model_steps import (
     classify_assistant_step,
     completion_requests_follow_up,
 )
+from cayu.runtime.request_footprints import (
+    PromptContributionManifest,
+    RequestFootprintConfig,
+    RequestVariant,
+    analyze_request_footprint,
+    build_prompt_contribution_manifest,
+    copy_request_footprint_config,
+)
 from cayu.runtime.retry_policy import (
     RetryPolicy,
     copy_retry_policy,
@@ -356,6 +367,7 @@ from cayu.runtime.tool_policy import (
     taint_labels_from_metadata,
 )
 from cayu.runtime.usage import (
+    ModelCompletionPurpose,
     SessionUsageSummary,
     aggregate_usage_metrics_payload,
     combine_session_usage_summaries,
@@ -1726,6 +1738,7 @@ class SessionEngine:
         run_limit_controller: RunLimitController,
         session_control: SessionControl[SessionUsageTracker],
         model_step_executor: ModelStepExecutor,
+        request_footprint: RequestFootprintConfig,
         tool_round_executor: ToolRoundExecutor,
         recovery_coordinator: RecoveryCoordinator,
         background_interruption_coordinator: BackgroundInterruptionCoordinator,
@@ -1755,6 +1768,7 @@ class SessionEngine:
         self._run_limit_controller = run_limit_controller
         self._session_control = session_control
         self._model_step_executor = model_step_executor
+        self._request_footprint = copy_request_footprint_config(request_footprint)
         self._tool_round_executor = tool_round_executor
         self._recovery_coordinator = recovery_coordinator
         self._background_interruption_coordinator = background_interruption_coordinator
@@ -2764,6 +2778,7 @@ class SessionEngine:
         pre_run_task_started = False
         interaction_started = True
         messages: list[Message] | None = None
+        prompt_contribution_manifest: PromptContributionManifest | None = None
         try:
             await self._event_writer.fan_out_persisted([interaction_started_event])
             yield interaction_started_event
@@ -2821,11 +2836,21 @@ class SessionEngine:
                         registered_environment,
                     )
                 )
+            (
+                rendered_system_prompt,
+                prompt_contributions,
+            ) = render_initial_system_prompt_with_contributions(
+                agent_system_prompt=registered_agent.spec.system_prompt,
+                workspace_instructions=workspace_instructions,
+            )
+            if self._request_footprint.enabled:
+                prompt_contribution_manifest = build_prompt_contribution_manifest(
+                    rendered_system_prompt=rendered_system_prompt,
+                    contributions=prompt_contributions,
+                    config=self._request_footprint,
+                )
             messages = transcript_helpers.initial_messages(
-                system_prompt=render_initial_system_prompt(
-                    agent_system_prompt=registered_agent.spec.system_prompt,
-                    workspace_instructions=workspace_instructions,
-                ),
+                system_prompt=rendered_system_prompt,
                 request_messages=request.messages,
             )
             await self.session_store.replace_initial_transcript_messages(
@@ -3031,6 +3056,15 @@ class SessionEngine:
                     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY: session_input_contract_evidence(
                         request,
                         message_start_index=len(messages) - len(request.messages),
+                    ),
+                    **(
+                        {}
+                        if prompt_contribution_manifest is None
+                        else {
+                            "prompt_contribution_manifest": (
+                                prompt_contribution_manifest.model_dump(mode="json")
+                            )
+                        }
                     ),
                 },
                 start_task_on_enter=not pre_run_task_started,
@@ -3503,12 +3537,23 @@ class SessionEngine:
             or candidate_request_budget_limits
             or has_run_limits(request.limits)
         )
-        if uses_forced_dispatch_boundary or has_compaction_accounting_limits:
+        if (
+            uses_forced_dispatch_boundary
+            or has_compaction_accounting_limits
+            or self._request_footprint.enabled
+        ):
             try:
                 provider_budget_identity = context_policy.compactor.provider_budget_identity(
                     loaded_session
                 )
             except NotImplementedError as exc:
+                if self._request_footprint.enabled:
+                    raise RuntimeError(
+                        "Explicit compaction with request footprints requires the "
+                        "ContextCompactor to explicitly declare "
+                        "provider_budget_identity(session), returning provider/model or None "
+                        "for deterministic execution."
+                    ) from exc
                 if not has_compaction_accounting_limits:
                     provider_budget_identity = None
                 else:
@@ -3538,6 +3583,14 @@ class SessionEngine:
                     provider_budget_identity[1],
                     "compactor_model",
                 )
+                if self._request_footprint.enabled and not uses_forced_dispatch_boundary:
+                    raise RuntimeError(
+                        "Explicit provider-backed compaction with request footprints cannot "
+                        f"safely run opaque provider-backed compactor "
+                        f"{type(context_policy.compactor).__name__}: Cayu cannot observe each "
+                        "provider dispatch independently. Use an unmodified built-in provider "
+                        "compactor or disable request footprints."
+                    )
         if compactor_provider_name is None:
             app_policy_budget_limits: tuple[BudgetLimit, ...] = ()
             budget_limits: tuple[BudgetLimit, ...] = ()
@@ -4099,6 +4152,76 @@ class SessionEngine:
             compaction_ids_by_model_attempt_id: dict[str, str] = {}
             issued_compaction_model_attempts: dict[str, ModelAttemptIdentity] = {}
 
+            async def record_compaction_footprint(
+                *,
+                provider: ModelProvider,
+                provider_name: str,
+                model_request: ModelRequest,
+                dispatch_attempt: int,
+                max_dispatch_attempts: int,
+                model_attempt_identity: ModelAttemptIdentity,
+            ) -> None:
+                detached_request = _detach_model_request(model_request)
+                if self._request_footprint.enabled:
+                    footprint = analyze_request_footprint(
+                        detached_request,
+                        provider=provider,
+                        provider_name=provider_name,
+                        step=None,
+                        attempt=dispatch_attempt,
+                        max_attempts=max_dispatch_attempts,
+                        request_variant=RequestVariant.CONTEXT_COMPACTION,
+                        observation_id=str(uuid4()),
+                        model_step_id=model_attempt_identity.model_step_id,
+                        model_attempt_id=model_attempt_identity.model_attempt_id,
+                        config=self._request_footprint,
+                        operation_id=operation_id,
+                        operation_attempt_id=attempt_id,
+                    )
+                    attempt_events.append(
+                        event_with_runtime_payload_authority(
+                            Event(
+                                type=EventType.REQUEST_FOOTPRINT_RECORDED,
+                                session_id=loaded_session.id,
+                                agent_name=registered_agent.spec.name,
+                                environment_name=environment_name,
+                                payload=footprint.model_dump(mode="json", exclude_none=True),
+                            ),
+                            "observation_id",
+                            "model_step_id",
+                            "model_attempt_id",
+                            "operation_id",
+                            "attempt_id",
+                        )
+                    )
+                attempt_events.append(
+                    event_with_runtime_payload_authority(
+                        _application_compaction_ledger_event(
+                            event_type=EventType.MODEL_STARTED,
+                            payload={
+                                "model": detached_request.model,
+                                "provider": provider_name,
+                                "attempt": dispatch_attempt,
+                                "max_attempts": max_dispatch_attempts,
+                                "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                                **model_attempt_identity.payload(),
+                            },
+                            request=request,
+                            operation_id=operation_id,
+                            attempt_id=attempt_id,
+                            session=loaded_session,
+                            registered_agent=registered_agent,
+                            environment_name=environment_name,
+                            compactor=compactor_name,
+                        ),
+                        "model_step_id",
+                        "model_attempt_id",
+                        "operation_id",
+                        "attempt_id",
+                    )
+                )
+                await publish_dispatch_budget_events()
+
             def identify_compaction_completion_payload(
                 payload: dict[str, Any],
                 *,
@@ -4415,10 +4538,15 @@ class SessionEngine:
                     ]
 
             async def _run_provider_dispatch(
+                provider: ModelProvider,
+                actual_provider_name: str,
                 actual_pricing_provider_name: str,
                 actual_model: str,
                 actual_usage_dialect: UsageDialect,
                 billing_identity: BillingIdentity | None,
+                model_request: ModelRequest,
+                dispatch_attempt: int,
+                max_dispatch_attempts: int,
                 dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
                 *,
                 model_attempt_identity: ModelAttemptIdentity,
@@ -4522,6 +4650,14 @@ class SessionEngine:
 
                 async def tracked_dispatch() -> tuple[str, dict[str, Any]]:
                     nonlocal provider_dispatch_started
+                    await record_compaction_footprint(
+                        provider=provider,
+                        provider_name=actual_provider_name,
+                        model_request=model_request,
+                        dispatch_attempt=dispatch_attempt,
+                        max_dispatch_attempts=max_dispatch_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                    )
                     deferred_dispatch_failure = (
                         await self._run_limit_controller.mark_reservations_dispatched(
                             dispatch_reservations,
@@ -4705,10 +4841,15 @@ class SessionEngine:
                 return dispatch_result
 
             async def run_provider_dispatch(
+                provider: ModelProvider,
+                actual_provider_name: str,
                 actual_pricing_provider_name: str,
                 actual_model: str,
                 actual_usage_dialect: UsageDialect,
                 billing_identity: BillingIdentity | None,
+                model_request: ModelRequest,
+                dispatch_attempt: int,
+                max_dispatch_attempts: int,
                 dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
             ) -> tuple[str, dict[str, Any]]:
                 nonlocal active_compaction_model_attempt_identity
@@ -4721,10 +4862,15 @@ class SessionEngine:
                 )
                 try:
                     return await _run_provider_dispatch(
+                        provider,
+                        actual_provider_name,
                         actual_pricing_provider_name,
                         actual_model,
                         actual_usage_dialect,
                         billing_identity,
+                        model_request,
+                        dispatch_attempt,
+                        max_dispatch_attempts,
                         dispatch,
                         model_attempt_identity=model_attempt_identity,
                     )
@@ -4736,10 +4882,15 @@ class SessionEngine:
                     active_compaction_model_attempt_identity = None
 
             async def run_identity_only_dispatch(
+                provider: ModelProvider,
+                actual_provider_name: str,
                 actual_pricing_provider_name: str,
                 actual_model: str,
                 actual_usage_dialect: UsageDialect,
                 billing_identity: BillingIdentity | None,
+                model_request: ModelRequest,
+                dispatch_attempt: int,
+                max_dispatch_attempts: int,
                 dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
             ) -> tuple[str, dict[str, Any]]:
                 """Identify a built-in dispatch reached through an opaque compactor."""
@@ -4764,6 +4915,14 @@ class SessionEngine:
                     model_attempt_identity
                 )
                 try:
+                    await record_compaction_footprint(
+                        provider=provider,
+                        provider_name=actual_provider_name,
+                        model_request=model_request,
+                        dispatch_attempt=dispatch_attempt,
+                        max_dispatch_attempts=max_dispatch_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                    )
                     with _compaction_model_attempt_identity_scope(model_attempt_identity):
                         return await dispatch()
                 finally:
@@ -8458,6 +8617,11 @@ class SessionEngine:
                     step=step,
                     messages=messages,
                     model_step_identity=model_step_identity,
+                    request_variant=(
+                        RequestVariant.STRUCTURED_OUTPUT_REPAIR
+                        if structured_output_retries
+                        else RequestVariant.INITIAL
+                    ),
                 )
                 try:
                     async for event, flow_outcome in model_step_events:

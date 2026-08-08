@@ -24,7 +24,7 @@ from cayu import (
     RunRequest,
     file_attachment,
 )
-from cayu.core.messages import FilePart, TextPart, ToolCallPart
+from cayu.core.messages import FilePart, TextPart, ThinkingPart, ToolCallPart
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
 from cayu.providers import (
     AnthropicAPIError,
@@ -96,6 +96,34 @@ class RecordingTransport:
         if not self.responses:
             raise AssertionError("No fake Anthropic response queued.")
         return self.responses.pop(0)
+
+
+def test_anthropic_request_footprint_options_include_effective_output_limit() -> None:
+    request = ModelRequest(
+        model="claude-test",
+        messages=[Message.text("user", "Say hello")],
+        options={"anthropic": {"temperature": 0.5}},
+    )
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=RecordingTransport([]),
+        max_tokens=1234,
+    )
+
+    projected = provider.request_footprint_options(request)
+    payload = build_anthropic_payload(request, default_max_tokens=provider.max_tokens)
+
+    assert projected == {
+        "anthropic": {
+            "max_tokens": payload["max_tokens"],
+            "temperature": payload["temperature"],
+        }
+    }
+    assert provider.request_fingerprint_options(request) == {
+        "anthropic": {
+            key: value for key, value in payload.items() if key not in {"model", "messages"}
+        }
+    }
 
 
 class BlankFailingTransport:
@@ -1586,6 +1614,71 @@ def test_resolve_cache_policy_merges_partial_override_onto_default() -> None:
     solo = resolve_cache_policy(None, {"cache_policy": {"breakpoints": ["system_prompt"]}})
     assert solo is not None
     assert solo.breakpoints == (CacheBreakpoint.SYSTEM_PROMPT,)
+
+
+def test_anthropic_request_cache_policy_reports_detached_effective_policy() -> None:
+    default = CachePolicy(
+        breakpoints=(CacheBreakpoint.CONVERSATION_PREFIX,),
+        conversation_prefix_strategy="all_but_last_n",
+        conversation_prefix_n=2,
+        ttl="extended",
+    )
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=RecordingTransport([]),
+        cache_policy=default,
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message.text("system", "You are helpful."),
+            Message.text("user", "hello"),
+        ],
+        options={"cache_policy": {"breakpoints": ["system_prompt"]}},
+    )
+
+    effective = provider.request_cache_policy(request)
+
+    assert effective is not None
+    assert effective is not default
+    assert effective.breakpoints == (CacheBreakpoint.SYSTEM_PROMPT,)
+    assert effective.conversation_prefix_strategy == "all_but_last_n"
+    assert effective.conversation_prefix_n == 2
+    assert effective.ttl == "extended"
+
+
+def test_anthropic_request_cache_policy_drops_unapplied_thinking_boundary() -> None:
+    policy = CachePolicy(breakpoints=(CacheBreakpoint.CONVERSATION_PREFIX,))
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=RecordingTransport([]),
+        cache_policy=policy,
+    )
+    request = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message.text("user", "first"),
+            Message(
+                role="assistant",
+                content=(
+                    ThinkingPart(
+                        text="reasoning",
+                        provider_state={"type": "thinking", "signature": "signature"},
+                    ),
+                ),
+            ),
+            Message.text("user", "next"),
+        ],
+    )
+
+    payload = build_anthropic_payload(request, cache_policy=policy)
+    effective = provider.request_cache_policy(request)
+
+    assert not any(
+        "cache_control" in block for message in payload["messages"] for block in message["content"]
+    )
+    assert effective is not None
+    assert effective.breakpoints == ()
 
 
 @pytest.mark.anyio

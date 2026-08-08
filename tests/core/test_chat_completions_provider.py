@@ -324,6 +324,30 @@ def test_build_chat_completions_payload_passes_provider_options() -> None:
     assert payload["reasoning_effort"] == "low"
 
 
+def test_chat_completions_fingerprint_options_follow_dynamic_payload_namespace() -> None:
+    provider = ChatCompletionsProvider(api_key="test-key", name="gemini")
+    request = ModelRequest(
+        model="gemini-test",
+        messages=[Message.text("user", "Hi.")],
+        options={
+            "gemini": {
+                "temperature": 0,
+                "metadata": {"route": "active"},
+            },
+            "openai": {"metadata": {"route": "inactive"}},
+            "thinking": {"enabled": True, "effort": "high"},
+        },
+    )
+
+    assert provider.request_fingerprint_options(request) == {
+        "gemini": {
+            "temperature": 0,
+            "metadata": {"route": "active"},
+            "reasoning_effort": "high",
+        }
+    }
+
+
 def test_build_chat_completions_payload_rejects_reserved_option() -> None:
     request = ModelRequest(
         model="gemini-test",

@@ -44,7 +44,7 @@ from cayu.providers.bedrock import (
     build_bedrock_converse_payload,
     completed_bedrock_billing_identity,
 )
-from cayu.providers.cache import CacheBreakpoint, CachePolicy
+from cayu.providers.cache import CacheBreakpoint, CachePolicy, RequestCacheProjection
 from cayu.providers.chat_completions import (
     ChatCompletionsAPIError,
     ChatCompletionsContextOverflowError,
@@ -160,6 +160,7 @@ __all__ = [
     "ProviderOperationStartRequest",
     "ProviderOperationState",
     "ProviderOperationStatus",
+    "RequestCacheProjection",
     "UsageDialect",
     "VertexAPIError",
     "VertexContextOverflowError",

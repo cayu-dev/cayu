@@ -80,6 +80,9 @@ class _CapturingCompactor(ContextCompactor):
         self.requests: list[CompactionRequest] = []
         self.fail = fail
 
+    def provider_budget_identity(self, _session) -> None:
+        return None
+
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         self.requests.append(request.model_copy(deep=True))
         if self.fail:
@@ -147,6 +150,9 @@ class _IdentityProbeCompactor(ContextCompactor):
 class _BlockingCompactor(ContextCompactor):
     def __init__(self) -> None:
         self.started = asyncio.Event()
+
+    def provider_budget_identity(self, _session) -> None:
+        return None
 
     async def compact(self, request: CompactionRequest) -> CompactionResult:
         del request
@@ -309,6 +315,143 @@ def test_explicit_custom_compactor_binds_projected_legacy_summary() -> None:
         assert checkpoint is not None
         assert checkpoint["context_compaction"]["summary"] == "safe compacted summary"
         assert checkpoint["context_compaction"]["compacted_transcript_cursor"] == 4
+
+    asyncio.run(scenario())
+
+
+def test_explicit_compaction_rejects_declared_opaque_provider_before_dispatch() -> None:
+    class OpaqueProviderCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+            self.compact_calls = 0
+
+        def provider_budget_identity(self, _session) -> tuple[str, str]:
+            return "explicit-compaction-capture", "summary-model"
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.compact_calls += 1
+            async for _event in self.provider.stream(
+                ModelRequest(model="summary-model", messages=request.messages)
+            ):
+                pass
+            return CompactionResult(
+                summary="opaque summary",
+                covered_message_count=len(request.messages),
+            )
+
+    async def scenario() -> None:
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        store = InMemorySessionStore()
+        provider = _CapturingProvider()
+        compactor = OpaqueProviderCompactor(provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=compactor,
+                max_user_turns=1,
+            ),
+        )
+        completed = await _create_completed_session(
+            store,
+            session_id="sess_explicit_opaque_compactor_footprint",
+            transcript=transcript,
+        )
+        before_events = await store.query_events(EventQuery(session_id=completed.id, limit=100))
+
+        with pytest.raises(
+            RuntimeError,
+            match="cannot observe each provider dispatch independently",
+        ):
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=completed.id,
+                    idempotency_key="reject-opaque-provider",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
+
+        assert compactor.compact_calls == 0
+        assert provider.requests == []
+        assert (
+            await store.query_events(EventQuery(session_id=completed.id, limit=100))
+            == before_events
+        )
+        assert await store.load_session_operation(completed.id, "reject-opaque-provider") is None
+
+    asyncio.run(scenario())
+
+
+def test_explicit_compaction_rejects_missing_provider_identity_before_dispatch() -> None:
+    class UndeclaredProviderCompactor(ContextCompactor):
+        def __init__(self, provider: ModelProvider) -> None:
+            self.provider = provider
+            self.compact_calls = 0
+
+        async def compact(self, request: CompactionRequest) -> CompactionResult:
+            self.compact_calls += 1
+            async for _event in self.provider.stream(
+                ModelRequest(model="summary-model", messages=request.messages)
+            ):
+                pass
+            return CompactionResult(
+                summary="opaque summary",
+                covered_message_count=len(request.messages),
+            )
+
+    async def scenario() -> None:
+        transcript = [
+            Message.text("user", "old request"),
+            Message.text("assistant", "old answer"),
+            Message.text("user", "current request"),
+        ]
+        store = InMemorySessionStore()
+        provider = _CapturingProvider()
+        compactor = UndeclaredProviderCompactor(provider)
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_agent(
+            AgentSpec(name="assistant", model="fake-model"),
+            context_policy=CheckpointCompactionContextPolicy(
+                compactor=compactor,
+                max_user_turns=1,
+            ),
+        )
+        completed = await _create_completed_session(
+            store,
+            session_id="sess_explicit_undeclared_compactor_footprint",
+            transcript=transcript,
+        )
+        before_events = await store.query_events(EventQuery(session_id=completed.id, limit=100))
+
+        with pytest.raises(
+            RuntimeError,
+            match="explicitly declare provider_budget_identity",
+        ):
+            async for _event in app.compact_session(
+                CompactSessionRequest(
+                    session_id=completed.id,
+                    idempotency_key="reject-undeclared-provider",
+                    expected_run_epoch=completed.run_epoch,
+                    expected_transcript_cursor=len(transcript),
+                )
+            ):
+                pass
+
+        assert compactor.compact_calls == 0
+        assert provider.requests == []
+        assert (
+            await store.query_events(EventQuery(session_id=completed.id, limit=100))
+            == before_events
+        )
+        assert (
+            await store.load_session_operation(completed.id, "reject-undeclared-provider") is None
+        )
 
     asyncio.run(scenario())
 

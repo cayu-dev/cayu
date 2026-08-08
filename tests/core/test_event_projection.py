@@ -14,7 +14,13 @@ from pydantic import SecretStr
 
 import cayu.core.events as events_module
 import cayu.runtime._event_projection as event_projection_module
-from cayu import CayuApp
+from cayu import (
+    CayuApp,
+    PromptContributionKind,
+    PromptContributionManifest,
+    RequestFootprintConfig,
+    build_prompt_contribution_manifest,
+)
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core.events import (
     Event,
@@ -333,6 +339,116 @@ def test_replacing_a_generated_event_id_loses_generated_authority_provenance() -
             replaced,
             redactor=SecretRedactor("caller-secret-id"),
         )
+
+
+def test_prompt_fingerprints_preserve_fixed_fields_and_downgrade_identity_collisions() -> None:
+    manifest = build_prompt_contribution_manifest(
+        rendered_system_prompt="system prompt",
+        contributions={PromptContributionKind.AGENT_INSTRUCTIONS: ("system prompt",)},
+        config=RequestFootprintConfig(
+            fingerprint_key_id="manifestkey",
+            fingerprint_key=SecretStr("k" * 32),
+        ),
+    )
+    assert manifest is not None
+    event = Event(
+        type=EventType.SESSION_STARTED,
+        session_id="session_fingerprint_redaction",
+        payload={"prompt_contribution_manifest": manifest.model_dump(mode="json")},
+    )
+
+    prepared = prepare_new_runtime_event(event, redactor=SecretRedactor("-"))
+    reconstructed = PromptContributionManifest.model_validate(
+        prepared.payload["prompt_contribution_manifest"]
+    )
+    public = _project_runtime_event(prepared, sequence=1, redactor=SecretRedactor("-"))
+    public_reconstructed = PromptContributionManifest.model_validate(
+        public.payload["prompt_contribution_manifest"]
+    )
+
+    fingerprints = [
+        reconstructed.system_fingerprint,
+        *(item.fingerprint for item in reconstructed.contributions),
+        public_reconstructed.system_fingerprint,
+        *(item.fingerprint for item in public_reconstructed.contributions),
+    ]
+    assert all(item.availability == "available" for item in fingerprints)
+    assert all(
+        item.value is not None and item.algorithm == "hmac-sha256" and item.key_id == "manifestkey"
+        for item in fingerprints
+    )
+
+    original_values = {
+        manifest.system_fingerprint.value,
+        *(item.fingerprint.value for item in manifest.contributions),
+    }
+    assert None not in original_values and len(original_values) == 2
+    digest_collision_candidates = set.intersection(
+        *(set(value) for value in original_values if value is not None)
+    ) - set("hmac-sha256manifestkey")
+    assert digest_collision_candidates
+    digest_secret = sorted(digest_collision_candidates)[0]
+    digest_prepared = prepare_new_runtime_event(
+        event,
+        redactor=SecretRedactor(digest_secret),
+    )
+    digest_manifest = PromptContributionManifest.model_validate(
+        digest_prepared.payload["prompt_contribution_manifest"]
+    )
+    assert digest_manifest.system_fingerprint.availability == "unavailable"
+    assert all(
+        item.fingerprint.availability == "unavailable" for item in digest_manifest.contributions
+    )
+
+
+@pytest.mark.parametrize("version_path", ["manifest", "fingerprint"])
+def test_prompt_manifest_versions_fail_closed_on_wrong_json_types(version_path: str) -> None:
+    manifest = build_prompt_contribution_manifest(
+        rendered_system_prompt="system prompt",
+        contributions={PromptContributionKind.AGENT_INSTRUCTIONS: ("system prompt",)},
+        config=RequestFootprintConfig(),
+    )
+    assert manifest is not None
+    payload = manifest.model_dump(mode="json")
+    if version_path == "manifest":
+        payload["schema_version"] = True
+    else:
+        payload["system_fingerprint"]["canonicalization_version"] = True
+    event = Event(
+        type=EventType.SESSION_STARTED,
+        session_id="session_malformed_fingerprint_version",
+        payload={"prompt_contribution_manifest": payload},
+    )
+
+    with pytest.raises(ValueError, match="manifest is malformed"):
+        prepare_new_runtime_event(event, redactor=SecretRedactor())
+    public = _project_runtime_event(event, sequence=1, redactor=SecretRedactor())
+    assert "prompt_contribution_manifest" not in public.payload
+
+
+@pytest.mark.parametrize("version_path", ["manifest", "fingerprint"])
+def test_prompt_manifest_versions_fail_closed_when_missing(version_path: str) -> None:
+    manifest = build_prompt_contribution_manifest(
+        rendered_system_prompt="system prompt",
+        contributions={PromptContributionKind.AGENT_INSTRUCTIONS: ("system prompt",)},
+        config=RequestFootprintConfig(),
+    )
+    assert manifest is not None
+    payload = manifest.model_dump(mode="json")
+    if version_path == "manifest":
+        del payload["schema_version"]
+    else:
+        del payload["system_fingerprint"]["canonicalization_version"]
+    event = Event(
+        type=EventType.SESSION_STARTED,
+        session_id="session_missing_fingerprint_version",
+        payload={"prompt_contribution_manifest": payload},
+    )
+
+    with pytest.raises(ValueError, match="manifest is malformed"):
+        prepare_new_runtime_event(event, redactor=SecretRedactor())
+    public = _project_runtime_event(event, sequence=1, redactor=SecretRedactor())
+    assert "prompt_contribution_manifest" not in public.payload
 
 
 def test_runtime_envelope_authority_survives_short_secret_collisions_only_with_provenance() -> None:

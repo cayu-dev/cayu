@@ -170,8 +170,8 @@ from cayu.runtime.context import (
     _defer_billing_identity_cancellation_scope,
     context_build_termination_compaction_telemetry,
     copy_context_messages,
+    copy_context_pressure_estimate,
     estimate_context_pressure,
-    estimate_model_request_context_pressure,
     noteify_unresolvable_prompt_files,
     sanitize_context_build_error_checkpoint,
     sanitize_context_build_result_checkpoint,
@@ -199,6 +199,15 @@ from cayu.runtime.provider_operations import (
     ProviderOperationRecoveryResult,
     ProviderOperationRecoveryStatus,
     RecoverableProviderOperation,
+)
+from cayu.runtime.request_footprints import (
+    PromptContributionManifest,
+    RequestFootprint,
+    RequestFootprintConfig,
+    RequestVariant,
+    analyze_request_context_pressure,
+    analyze_request_footprint,
+    copy_request_footprint_config,
 )
 from cayu.runtime.retry_policy import (
     RetryDecision,
@@ -237,6 +246,7 @@ from cayu.runtime.structured_output import (
     structured_output_tool_spec,
 )
 from cayu.runtime.usage import (
+    ModelCompletionPurpose,
     durable_model_completed_payload,
     is_conversational_model_completion_payload,
     normalize_usage_metrics,
@@ -1365,6 +1375,7 @@ class ModelStepExecutor:
         session_control: SessionControl[SessionUsageTracker],
         run_limit_controller: RunLimitController,
         context_counting: ContextCountingConfig,
+        request_footprint: RequestFootprintConfig,
         max_file_attachment_bytes: int,
         max_total_file_attachment_bytes: int,
         max_file_attachments_per_request: int,
@@ -1379,6 +1390,7 @@ class ModelStepExecutor:
         self._session_control = session_control
         self._run_limit_controller = run_limit_controller
         self._context_counting = context_counting.model_copy(deep=True)
+        self._request_footprint = copy_request_footprint_config(request_footprint)
         self._max_file_attachment_bytes = max_file_attachment_bytes
         self._max_total_file_attachment_bytes = max_total_file_attachment_bytes
         self._max_file_attachments_per_request = max_file_attachments_per_request
@@ -1941,6 +1953,7 @@ class ModelStepExecutor:
         registered_provider: runtime_records.RegisteredProvider,
         environment_name: str | None,
         step: int,
+        request_variant: RequestVariant = RequestVariant.INITIAL,
         model_step_identity: ModelStepIdentity,
         initial_model_attempt_identity: ModelAttemptIdentity | None,
         retry_policy: RetryPolicy,
@@ -1962,6 +1975,7 @@ class ModelStepExecutor:
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
         retry_policy = copy_retry_policy(retry_policy)
+        request_variant = RequestVariant(request_variant)
         structured_output = copy_structured_output_spec(structured_output)
         model_step_identity = copy_model_step_identity(model_step_identity)
         next_model_attempt_identity = (
@@ -1976,6 +1990,11 @@ class ModelStepExecutor:
             raise ValueError("Initial model attempt belongs to a different logical step.")
         attempt = 1
         prior_retry_failure: ModelAttemptFailed | None = None
+        prompt_contribution_manifest = (
+            await self._load_prompt_contribution_manifest(session.id)
+            if self._request_footprint.enabled
+            else None
+        )
         while True:
             model_attempt_identity = (
                 model_step_identity.new_attempt()
@@ -2017,6 +2036,31 @@ class ModelStepExecutor:
             # mutation cannot corrupt a later attempt.
             attempt_model_request = _detach_model_request(model_request)
 
+            request_footprint, request_footprint_event = await self._observe_request_footprint(
+                model_request=attempt_model_request,
+                session=session,
+                registered_agent=registered_agent,
+                registered_provider=registered_provider,
+                environment_name=environment_name,
+                step=step,
+                attempt=attempt,
+                max_attempts=retry_policy.max_attempts,
+                request_variant=request_variant,
+                model_attempt_identity=model_attempt_identity,
+                prompt_contribution_manifest=prompt_contribution_manifest,
+                structured_output=structured_output,
+            )
+            if request_footprint_event is not None:
+                yield request_footprint_event, None
+            request_context_pressure = (
+                request_footprint.context_pressure
+                if request_footprint is not None
+                else analyze_request_context_pressure(
+                    attempt_model_request,
+                    provider=registered_provider.provider,
+                )
+            )
+
             (
                 context_pressure_observation,
                 context_pressure_event,
@@ -2030,6 +2074,7 @@ class ModelStepExecutor:
                 attempt=attempt,
                 max_attempts=retry_policy.max_attempts,
                 model_attempt_identity=model_attempt_identity,
+                estimate=request_context_pressure,
             )
             if context_pressure_event is not None:
                 yield context_pressure_event, None
@@ -2085,6 +2130,7 @@ class ModelStepExecutor:
                 before_provider_dispatch=before_provider_dispatch,
                 billing_identity=billing_identity,
                 structured_output=structured_output,
+                context_pressure_estimate=request_context_pressure,
                 prepare_model_completion_dispatch=prepare_model_completion_dispatch,
                 model_completion_publisher=model_completion_publisher,
             )
@@ -2207,6 +2253,78 @@ class ModelStepExecutor:
             finally:
                 await _close_async_iterator(attempt_events)
 
+    async def _observe_request_footprint(
+        self,
+        *,
+        model_request: ModelRequest,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        step: int,
+        attempt: int,
+        max_attempts: int,
+        request_variant: RequestVariant,
+        model_attempt_identity: ModelAttemptIdentity,
+        prompt_contribution_manifest: PromptContributionManifest | None,
+        structured_output: StructuredOutputSpec | None,
+    ) -> tuple[RequestFootprint | None, Event | None]:
+        if not self._request_footprint.enabled:
+            return None, None
+        footprint = analyze_request_footprint(
+            model_request,
+            provider=registered_provider.provider,
+            provider_name=registered_provider.name,
+            step=step,
+            attempt=attempt,
+            max_attempts=max_attempts,
+            request_variant=request_variant,
+            observation_id=str(uuid4()),
+            model_step_id=model_attempt_identity.model_step_id,
+            model_attempt_id=model_attempt_identity.model_attempt_id,
+            config=self._request_footprint,
+            prompt_contribution_manifest=prompt_contribution_manifest,
+            structured_output_instruction=(
+                structured_output_tool_instruction(structured_output)
+                if (
+                    structured_output is not None
+                    and structured_output.strategy == StructuredOutputStrategy.TOOL
+                )
+                else None
+            ),
+        )
+        event = await self._event_writer.emit(
+            _context_observation_event(
+                Event(
+                    type=EventType.REQUEST_FOOTPRINT_RECORDED,
+                    session_id=session.id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload=footprint.model_dump(mode="json", exclude_none=True),
+                )
+            )
+        )
+        return footprint, event
+
+    async def _load_prompt_contribution_manifest(
+        self,
+        session_id: str,
+    ) -> PromptContributionManifest | None:
+        records = await self._session_store.query_events(
+            EventQuery(
+                session_id=session_id,
+                event_types=(EventType.SESSION_STARTED,),
+                order_by=EventOrder.SEQUENCE_ASC,
+                limit=1,
+            )
+        )
+        if not records:
+            return None
+        payload = records[0].event.payload.get("prompt_contribution_manifest")
+        if payload is None:
+            return None
+        return PromptContributionManifest.model_validate(payload)
+
     async def _observe_context_pressure(
         self,
         *,
@@ -2219,20 +2337,16 @@ class ModelStepExecutor:
         attempt: int,
         max_attempts: int,
         model_attempt_identity: ModelAttemptIdentity,
+        estimate: ContextPressureEstimate | None = None,
     ) -> tuple[_ContextPressureObservation | None, Event | None]:
         if self._context_counting.mode == ContextCountingMode.OFF:
             return None, None
         observation_id = str(uuid4())
-        profile = copy_model_context_pressure_profile(
-            registered_provider.provider.context_pressure_profile
-        )
-        estimate = estimate_model_request_context_pressure(
-            model_request=model_request,
-            image_min_tokens=profile.image_min_tokens,
-            document_min_tokens=profile.document_min_tokens,
-            document_bytes_per_token=profile.document_bytes_per_token,
-            tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
-        )
+        if estimate is None:
+            estimate = analyze_request_context_pressure(
+                model_request,
+                provider=registered_provider.provider,
+            )
         observation = _ContextPressureObservation(
             estimate=estimate,
             observation_id=observation_id,
@@ -2377,6 +2491,7 @@ class ModelStepExecutor:
         before_provider_dispatch: Callable[[ModelAttemptIdentity], Awaitable[None]],
         billing_identity: BillingIdentity | None,
         structured_output: StructuredOutputSpec | None,
+        context_pressure_estimate: ContextPressureEstimate | None,
         prepare_model_completion_dispatch: Callable[
             [ModelRequest],
             Awaitable[ModelCompletionDispatch],
@@ -2402,16 +2517,12 @@ class ModelStepExecutor:
         completion_event: Event | None = None
         completion_dispatch: ModelCompletionDispatch | None = None
         model_completed = False
-        profile = copy_model_context_pressure_profile(
-            registered_provider.provider.context_pressure_profile
-        )
-        context_pressure_estimate = estimate_model_request_context_pressure(
-            model_request=model_request,
-            image_min_tokens=profile.image_min_tokens,
-            document_min_tokens=profile.document_min_tokens,
-            document_bytes_per_token=profile.document_bytes_per_token,
-            tool_schema_chars_per_token=profile.tool_schema_chars_per_token,
-        )
+        context_pressure_estimate = copy_context_pressure_estimate(context_pressure_estimate)
+        if context_pressure_estimate is None:
+            context_pressure_estimate = analyze_request_context_pressure(
+                model_request,
+                provider=registered_provider.provider,
+            )
         interrupt_poll = self._session_control.stream_interrupt_poll(session.id)
         if (prepare_model_completion_dispatch is None) != (model_completion_publisher is None):
             raise RuntimeError(
@@ -3464,8 +3575,10 @@ class ModelStepRun:
         step: int,
         messages: list[Message],
         model_step_identity: ModelStepIdentity,
+        request_variant: RequestVariant = RequestVariant.INITIAL,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        request_variant = RequestVariant(request_variant)
         context_messages: list[Message]
         compaction_budget_events: list[Event] = []
         published_compaction_attempt_ids: set[str] = set()
@@ -3503,6 +3616,7 @@ class ModelStepRun:
                     completed_payloads=completed_payloads,
                     budget_events=compaction_budget_events,
                     messages=messages,
+                    step=step,
                     model_step_identity=model_step_identity,
                     compaction_identity_ledger=compaction_identity_ledger,
                 )
@@ -3669,6 +3783,7 @@ class ModelStepRun:
             step=step,
             messages=messages,
             model_step_identity=model_step_identity,
+            request_variant=request_variant,
         )
         try:
             async for event, outcome in request_events:
@@ -3683,8 +3798,10 @@ class ModelStepRun:
         step: int,
         messages: list[Message],
         model_step_identity: ModelStepIdentity,
+        request_variant: RequestVariant = RequestVariant.INITIAL,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        request_variant = RequestVariant(request_variant)
         initial_model_attempt_identity = model_step_identity.new_attempt()
         controller = self._executor._run_limit_controller
         try:
@@ -4003,6 +4120,7 @@ class ModelStepRun:
             model_request=model_request,
             messages=messages,
             step=step,
+            request_variant=request_variant,
             model_step_identity=model_step_identity,
             initial_model_attempt_identity=initial_model_attempt_identity,
             transcript_cursor_before_request=len(messages),
@@ -4161,6 +4279,7 @@ class ModelStepRun:
         model_request: ModelRequest,
         messages: list[Message],
         step: int,
+        request_variant: RequestVariant,
         model_step_identity: ModelStepIdentity,
         initial_model_attempt_identity: ModelAttemptIdentity,
         transcript_cursor_before_request: int,
@@ -4180,6 +4299,7 @@ class ModelStepRun:
         model_completion_publisher: ModelCompletionPublisher | None,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
         model_step_identity = copy_model_step_identity(model_step_identity)
+        request_variant = RequestVariant(request_variant)
         initial_model_attempt_identity = copy_model_attempt_identity(initial_model_attempt_identity)
         if initial_model_attempt_identity.model_step_id != model_step_identity.model_step_id:
             raise ValueError("Initial provider attempt belongs to a different model step.")
@@ -4199,6 +4319,7 @@ class ModelStepRun:
             request: ModelRequest,
             *,
             initial_identity: ModelAttemptIdentity | None = None,
+            attempt_variant: RequestVariant,
         ) -> AsyncIterator[tuple[Event | None, AssistantStepResult | None]]:
             return self._executor.run_with_retries(
                 provider=provider,
@@ -4208,6 +4329,7 @@ class ModelStepRun:
                 registered_provider=self._registered_provider,
                 environment_name=self._environment_name,
                 step=step,
+                request_variant=attempt_variant,
                 model_step_identity=model_step_identity,
                 initial_model_attempt_identity=initial_identity,
                 retry_policy=self._retry_policy,
@@ -4225,6 +4347,7 @@ class ModelStepRun:
         attempt_events = run_attempt(
             model_request,
             initial_identity=initial_model_attempt_identity,
+            attempt_variant=request_variant,
         )
         try:
             try:
@@ -4294,6 +4417,7 @@ class ModelStepRun:
                     completed_payloads=completed_payloads,
                     budget_events=compaction_budget_events,
                     messages=messages,
+                    step=step,
                     model_step_identity=model_step_identity,
                     compaction_identity_ledger=compaction_identity_ledger,
                 )
@@ -4518,7 +4642,10 @@ class ModelStepRun:
             ),
             None,
         )
-        recovery_events = run_attempt(recovery_request)
+        recovery_events = run_attempt(
+            recovery_request,
+            attempt_variant=RequestVariant.CONTEXT_OVERFLOW_RECOVERY,
+        )
         try:
             try:
                 async for event, result in recovery_events:
@@ -5643,6 +5770,7 @@ class ModelStepRun:
         completed_payloads: Callable[[], list[dict[str, Any]]],
         budget_events: list[Event],
         messages: list[Message],
+        step: int,
         model_step_identity: ModelStepIdentity,
         compaction_identity_ledger: _CompactionExecutionIdentityLedger,
     ) -> CompactionResult:
@@ -5666,11 +5794,80 @@ class ModelStepRun:
             and any(price.pricing_context is not None for price in limit.pricing.prices)
         )
 
+        async def record_compaction_footprint(
+            *,
+            provider: ModelProvider,
+            provider_name: str,
+            model_request: ModelRequest,
+            attempt: int,
+            max_attempts: int,
+            model_attempt_identity: ModelAttemptIdentity,
+        ) -> None:
+            provider_name = require_durable_clean_nonblank(
+                provider_name,
+                "compactor_request_provider_name",
+            )
+            detached_request = _detach_model_request(model_request)
+            if self._executor._request_footprint.enabled:
+                footprint = analyze_request_footprint(
+                    detached_request,
+                    provider=provider,
+                    provider_name=provider_name,
+                    step=step,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    request_variant=RequestVariant.CONTEXT_COMPACTION,
+                    observation_id=str(uuid4()),
+                    model_step_id=model_attempt_identity.model_step_id,
+                    model_attempt_id=model_attempt_identity.model_attempt_id,
+                    config=self._executor._request_footprint,
+                )
+                budget_events.append(
+                    await self._executor._event_writer.emit(
+                        _context_observation_event(
+                            Event(
+                                type=EventType.REQUEST_FOOTPRINT_RECORDED,
+                                session_id=self._session.id,
+                                agent_name=self._registered_agent.spec.name,
+                                environment_name=self._environment_name,
+                                payload=footprint.model_dump(mode="json", exclude_none=True),
+                            )
+                        )
+                    )
+                )
+            budget_events.append(
+                await self._executor._event_writer.emit(
+                    _event_with_model_identity_authority(
+                        Event(
+                            type=EventType.MODEL_STARTED,
+                            session_id=self._session.id,
+                            agent_name=self._registered_agent.spec.name,
+                            environment_name=self._environment_name,
+                            payload={
+                                "model": detached_request.model,
+                                "provider": provider_name,
+                                "step": step,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                "purpose": ModelCompletionPurpose.CONTEXT_COMPACTION.value,
+                                **model_attempt_identity.payload(),
+                            },
+                        ),
+                        model_attempt_identity,
+                    )
+                )
+            )
+
         async def run_identity_only_dispatch(
+            provider: ModelProvider,
+            actual_provider_name: str,
             actual_pricing_provider_name: str,
             actual_model: str,
             actual_usage_dialect: UsageDialect,
             billing_identity: BillingIdentity | None,
+            model_request: ModelRequest,
+            attempt: int,
+            max_attempts: int,
             dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
         ) -> tuple[str, dict[str, Any]]:
             """Identify a built-in dispatch reached through an opaque wrapper."""
@@ -5683,6 +5880,14 @@ class ModelStepRun:
             )
             model_attempt_identity = compaction_identity_ledger.begin_dispatch()
             try:
+                await record_compaction_footprint(
+                    provider=provider,
+                    provider_name=actual_provider_name,
+                    model_request=model_request,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    model_attempt_identity=model_attempt_identity,
+                )
                 with _compaction_model_attempt_identity_scope(model_attempt_identity):
                     return await dispatch()
             finally:
@@ -5691,6 +5896,13 @@ class ModelStepRun:
         try:
             identity = compactor._provider_budget_identity_for_request(compaction_request)
         except NotImplementedError as exc:
+            if self._executor._request_footprint.enabled:
+                raise RuntimeError(
+                    "Automatic compaction with request footprints requires the "
+                    "ContextCompactor to explicitly declare "
+                    "provider_budget_identity(session), returning provider/model or None "
+                    "for deterministic execution."
+                ) from exc
             if not has_accounting_limits:
                 with _automatic_compaction_dispatch_runner_scope(run_identity_only_dispatch):
                     return await execute()
@@ -5737,13 +5949,16 @@ class ModelStepRun:
             for limit in all_limits
             if limit.reservation is not None or limit in contextual_limits
         )
-        if not uses_dispatch_boundary and has_accounting_limits:
+        if not uses_dispatch_boundary and (
+            has_accounting_limits or self._executor._request_footprint.enabled
+        ):
             raise RuntimeError(
-                "Automatic provider-backed compaction under run or budget limits cannot "
+                "Automatic provider-backed compaction with request footprints or accounting "
+                "limits cannot "
                 f"safely run opaque provider-backed compactor {type(compactor).__name__}: "
-                "Cayu cannot admit each provider dispatch independently. Use an "
-                "unmodified built-in provider compactor or remove the applicable "
-                "run and budget limits."
+                "Cayu cannot observe each provider dispatch independently. Use an unmodified "
+                "built-in provider compactor, disable request footprints, or remove the "
+                "applicable run and budget limits."
             )
         # A wrapper around a built-in compactor is opaque for admission: Cayu
         # cannot prove that it exposes *every* provider call. When no accounting
@@ -5762,10 +5977,15 @@ class ModelStepRun:
         )
 
         async def run_provider_dispatch(
+            provider: ModelProvider,
+            actual_provider_name: str,
             actual_pricing_provider_name: str,
             actual_model: str,
             actual_usage_dialect: UsageDialect,
             billing_identity: BillingIdentity | None,
+            model_request: ModelRequest,
+            attempt: int,
+            max_attempts: int,
             dispatch: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
         ) -> tuple[str, dict[str, Any]]:
             del actual_usage_dialect
@@ -5842,7 +6062,26 @@ class ModelStepRun:
                     raise _AutomaticCompactionAdmissionStopped(limit_evaluation=limit_evaluation)
                 budget_events.extend(limit_evaluation.events)
                 if not limits:
+                    await record_compaction_footprint(
+                        provider=provider,
+                        provider_name=actual_provider_name,
+                        model_request=model_request,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                    )
                     return await identified_dispatch()
+
+                async def publish_dispatch_observation() -> None:
+                    await record_compaction_footprint(
+                        provider=provider,
+                        provider_name=actual_provider_name,
+                        model_request=model_request,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        model_attempt_identity=model_attempt_identity,
+                    )
+
                 outcome = await controller.run_automatic_compaction_dispatch(
                     identified_dispatch,
                     completed_events=completed_events,
@@ -5858,6 +6097,7 @@ class ModelStepRun:
                     pricing_provider_name=pricing_provider_name,
                     authoritative_failure_types=(ContextBuildError,),
                     reservation_identity_guard=self._reservation_identity_guard,
+                    before_provider_dispatch=publish_dispatch_observation,
                 )
                 budget_events.extend(outcome.events)
                 if isinstance(outcome, BudgetedOperationSucceeded):
