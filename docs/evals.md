@@ -670,6 +670,13 @@ change, or stale candidate returns a conflict and requires a fresh preview. The
 adapter stores no draft or corpus and does not run providers, tools,
 environments, hooks, or the exported eval.
 
+When the authenticated server also exposes a writable Evals surface, **Save to
+Evals** sends the same exact previewed candidate through the export boundary and
+imports the resulting portable corpus. The browser does not construct a second
+corpus shape or retain a server-side draft. Equal content resolves to the same
+immutable revision; import incompatibility or a stale promotion remains visible
+and cannot silently fall back to a download-only workflow.
+
 ### Durable eval catalog and run state
 
 Use an `EvalStore` when promoted corpora, queued work, and published results
@@ -816,6 +823,46 @@ SQLite is the embedded single-database choice. PostgreSQL permits multiple
 server processes to compete safely for the same target's queued work through
 fenced claims. This is not an arbitrary target registry, generic queue, remote
 worker protocol, or hosted eval service.
+
+### First-class dashboard Evals area
+
+When `surfaces.evals.read` is enabled, the bundled dashboard exposes an
+**Evals** navigation area backed only by the authenticated APIs above. The
+catalog pages through immutable corpus revisions, suites, and cases without
+hydrating complete corpus documents. Operators can import an 8 MiB-or-smaller
+corpus file, download canonical corpus JSON, select a suite, choose bounded
+concurrency, and launch a durable run against the one attached target. After a
+bounded browser preflight, import forwards the selected file bytes unchanged so
+the server's strict duplicate-key, UTF-8, portable-JSON, and corpus validation
+remains authoritative. Mutation controls remain disabled when
+`surfaces.evals.mutate` is unavailable even when catalog reads are allowed.
+
+Launches use a cryptographically random `Idempotency-Key`. If a response is
+ambiguous, retrying the unchanged launch reuses that key rather than duplicating
+provider work. The dashboard follows queued, running, and cancelling records by
+their durable run ID; cancellation is a server request, not a fabricated local
+terminal state. Opaque catalog/run cursors and selected corpus, suite, run,
+status, and comparison identities remain in bounded URL state. Superseded reads
+are cancelled and a changed corpus never reuses another corpus's suite or case
+projection.
+
+A completed run exposes the complete safe published graph. The result view
+shows target release/AppManifest identity, run/case/trial status and score,
+duration, evidence completeness, output availability/truncation, usage,
+observed or unavailable cost, diagnostics, and every assertion's structural
+evidence. Cases and trials are selected rather than rendering as many as 10,000
+assertion results into the DOM at once. JSON and standalone HTML downloads come
+from the server's deterministic report endpoints. Only the actively viewed
+complete result graph is retained by the query cache; switching runs or leaving
+the result view evicts it immediately.
+
+Comparison also remains server-authoritative. The operator selects or pastes a
+completed baseline run ID; the dashboard displays the server's typed
+compatibility verdict and immutable summaries side by side. Different
+application releases are allowed, while changed corpus, suite, case, assertion,
+evidence-policy, target-key, or applicable-pricing contracts are explicitly
+incomparable. The browser does not choose a baseline automatically or invent a
+universal regression score.
 
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable

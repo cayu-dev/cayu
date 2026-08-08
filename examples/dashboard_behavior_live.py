@@ -28,6 +28,7 @@ from cayu import (
     AgentSpec,
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
+    CorpusTarget,
     Event,
     EventType,
     InMemoryTaskStore,
@@ -36,6 +37,7 @@ from cayu import (
     ModelPrice,
     PriceBook,
     RunRequest,
+    SQLiteEvalStore,
     TaskCreate,
     TextPart,
     ThinkingPart,
@@ -45,6 +47,7 @@ from cayu import (
     ToolResult,
     ToolSpec,
 )
+from cayu._server_contract_version import SERVER_CONTRACT_VERSION
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -56,6 +59,7 @@ from cayu.runtime import EventQuery, InMemorySessionStore, SessionIdentity, Sess
 from cayu.server import (
     BasicAuth,
     DashboardConfig,
+    EvalsConfig,
     EvaluationPromotionConfig,
     ServerConfig,
     create_server,
@@ -80,6 +84,8 @@ DISCOVERY_ENVIRONMENT = "dashboard-contract-production"
 DISCOVERY_BUDGET_ID = "dashboard-contract-budget"
 SLOW_SESSION_QUERY = "dashboard-contract-slow-query"
 SLOW_USAGE_AGENT = "dashboard-contract-slow-usage-agent"
+DASHBOARD_MODEL_STEP_ID = f"mstep_{'1' * 32}"
+DASHBOARD_MODEL_ATTEMPT_ID = f"matt_{'2' * 32}"
 AGENT_NAME = "dashboard-contract-agent"
 AUTH_USERNAME = "dashboard-contract-operator"
 AUTH_PASSWORD = "dashboard-contract-password"
@@ -122,6 +128,8 @@ class DashboardContractProvider(ModelProvider):
         self._direct_started = asyncio.Condition()
         self._direct_releases: asyncio.Queue[None] = asyncio.Queue()
         self._replay_releases: asyncio.Queue[str] = asyncio.Queue()
+        self.block_next_promotion_run = False
+        self.blocked_promotion_run_started = asyncio.Event()
 
     async def wait_for_direct_requests(self, count: int) -> None:
         async with self._direct_started:
@@ -145,6 +153,10 @@ class DashboardContractProvider(ModelProvider):
             if isinstance(part, TextPart)
         )
         if "promote this captured dashboard run" in request_text.lower():
+            if self.block_next_promotion_run:
+                self.block_next_promotion_run = False
+                self.blocked_promotion_run_started.set()
+                await asyncio.Event().wait()
             yield ModelStreamEvent.text_delta("dashboard eval promotion output")
             yield ModelStreamEvent.completed({"finish_reason": "stop"})
             return
@@ -296,6 +308,9 @@ async def main() -> None:
     )
     app, provider, store, task_store = await _seed_app()
     price_book = _dashboard_price_book()
+    evals_directory = tempfile.TemporaryDirectory(prefix="cayu-dashboard-evals-")
+    eval_store = SQLiteEvalStore(Path(evals_directory.name) / "evals.sqlite")
+    provider.block_next_promotion_run = True
     server_app = MutationDisconnectFaults(
         create_server(
             app,
@@ -309,6 +324,17 @@ async def main() -> None:
                     source_agent_name=AGENT_NAME,
                     application_release_id="dashboard-browser-contract",
                 ),
+                evals=EvalsConfig(
+                    target=CorpusTarget(
+                        key="dashboard.regressions",
+                        app=app,
+                        request_base=RunRequest(agent_name=AGENT_NAME, messages=[]),
+                        application_release_id="dashboard-browser-contract",
+                        price_book=price_book,
+                    ),
+                    store=eval_store,
+                    poll_interval_seconds=0.05,
+                ),
             ),
         ),
         provider,
@@ -320,7 +346,7 @@ async def main() -> None:
         uvicorn.Config(
             server_app,
             log_level="warning",
-            lifespan="off",
+            lifespan="on",
         )
     )
     server_task = asyncio.create_task(server.serve(sockets=[listener]))
@@ -424,6 +450,8 @@ async def main() -> None:
         except TimeoutError:
             server_task.cancel()
             await asyncio.gather(server_task, return_exceptions=True)
+        await eval_store.close()
+        evals_directory.cleanup()
 
 
 async def _seed_app() -> tuple[
@@ -470,15 +498,32 @@ async def _seed_app() -> tuple[
                 type=EventType.MODEL_STARTED,
                 session_id=SESSION_ID,
                 agent_name=AGENT_NAME,
-                payload={"provider_name": PROVIDER_NAME, "model": MODEL_NAME},
+                interaction_id="dashboard-contract-interaction",
+                payload={
+                    "provider": PROVIDER_NAME,
+                    "model": MODEL_NAME,
+                    "step": 1,
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "model_step_id": DASHBOARD_MODEL_STEP_ID,
+                    "model_attempt_id": DASHBOARD_MODEL_ATTEMPT_ID,
+                },
             ),
             Event(
                 id="dashboard-model-completed",
                 type=EventType.MODEL_COMPLETED,
                 session_id=SESSION_ID,
                 agent_name=AGENT_NAME,
+                interaction_id="dashboard-contract-interaction",
                 payload={
                     "contract_marker": PAYLOAD_MARKER,
+                    "provider_name": PROVIDER_NAME,
+                    "requested_model": MODEL_NAME,
+                    "step": 1,
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "model_step_id": DASHBOARD_MODEL_STEP_ID,
+                    "model_attempt_id": DASHBOARD_MODEL_ATTEMPT_ID,
                     "usage_metrics": {
                         "provider_name": PROVIDER_NAME,
                         "requested_model": MODEL_NAME,
@@ -934,10 +979,31 @@ async def _run_browser_contract(
                 "each recovered browser run must close exactly one replay SSE observer; "
                 f"observed={run_observer_aborts!r}",
             )
+            eval_query_aborts = [
+                detail for detail in expected_query_aborts if "/api/evals/runs?" in detail
+            ]
+            eval_catalog_root_query_aborts = [
+                detail for detail in expected_query_aborts if "/api/evals/corpora?" in detail
+            ]
+            eval_catalog_projection_aborts = [
+                detail for detail in expected_query_aborts if "/api/evals/corpora/" in detail
+            ]
             require_equal(
-                len(expected_query_aborts),
+                len(expected_query_aborts)
+                - len(eval_query_aborts)
+                - len(eval_catalog_root_query_aborts)
+                - len(eval_catalog_projection_aborts),
                 3,
-                "the superseded session, usage, and Workflow queries must each abort one browser request",
+                "the superseded session, usage, and Workflow queries must each abort one "
+                "browser request",
+            )
+            require(
+                bool(eval_query_aborts),
+                "leaving a refreshing Evals run list must abort its superseded browser read",
+            )
+            require(
+                bool(eval_catalog_root_query_aborts),
+                "leaving an importing Evals page must abort its superseded catalog read",
             )
             require_equal(
                 len(expected_edit_rejections),
@@ -990,6 +1056,10 @@ async def _run_browser_contract(
             "sessions_list",
             "session_detail",
             "evaluation_promotion",
+            "eval_catalog_save_and_download",
+            "eval_durable_launch_and_cancellation",
+            "eval_result_inspection_and_reports",
+            "eval_compatible_comparison",
             "session_annotation_editing",
             "event_detail",
             "event_filters",
@@ -1124,7 +1194,12 @@ async def _exercise_dashboard(
     await expect(include_thinking).to_be_checked()
     await expect(thinking_payload).to_be_visible()
     await _exercise_existing_session_mutations(page, base_url, provider)
-    await _exercise_evaluation_promotion(page, base_url)
+    await _exercise_evaluation_promotion(
+        page,
+        base_url,
+        provider,
+        expected_query_aborts,
+    )
     await _exercise_workflow(
         page,
         base_url,
@@ -1134,7 +1209,12 @@ async def _exercise_dashboard(
     )
 
 
-async def _exercise_evaluation_promotion(page: Page, base_url: str) -> None:
+async def _exercise_evaluation_promotion(
+    page: Page,
+    base_url: str,
+    provider: DashboardContractProvider,
+    expected_query_aborts: list[str],
+) -> None:
     await page.goto(
         f"{base_url}/cayu/sessions/{WORKFLOW_ACTIVE_SESSION_ID}",
         wait_until="networkidle",
@@ -1197,6 +1277,244 @@ async def _exercise_evaluation_promotion(page: Page, base_url: str) -> None:
         PROMOTION_SESSION_ID not in json.dumps(corpus, sort_keys=True),
         "promotion export must not disclose its source session identity",
     )
+
+    save = sheet.get_by_test_id("promotion-save")
+    await expect(save).to_be_enabled()
+    await save.click()
+    await expect(sheet.get_by_text(re.compile(r"Saved corpus .* to Evals\."))).to_be_visible()
+    await sheet.get_by_role("link", name="Open Evals").click()
+
+    await expect(page).to_have_url(re.compile(r"/cayu/evals\?"))
+    await expect(page.get_by_role("heading", name="Evals")).to_be_visible()
+    await expect(page.locator("#evals-panel-catalog")).to_have_count(1)
+    await expect(page.locator("#evals-panel-runs")).to_have_count(1)
+    suite_name = corpus["suites"][0]["name"]
+    suite_id = corpus["suites"][0]["id"]
+    await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
+
+    await page.get_by_test_id("eval-import-file").set_input_files(
+        {
+            "name": "dashboard-browser-contract.eval.json",
+            "mimeType": "application/json",
+            "buffer": json.dumps(corpus).encode(),
+        }
+    )
+    await expect(page.get_by_text(re.compile(r"Imported corpus .*\."))).to_be_visible()
+    async with page.expect_download() as corpus_download_info:
+        await page.get_by_role("button", name="Download JSON", exact=True).click()
+    corpus_download = await corpus_download_info.value
+    require_equal(
+        corpus_download.suggested_filename,
+        f"{corpus['target_key']}-{corpus['revision'][7:19]}.eval.json",
+        "the dashboard must preserve the server-owned corpus filename",
+    )
+    await page.wait_for_load_state("networkidle")
+
+    async def launch_saved_suite() -> str:
+        await page.get_by_role(
+            "button",
+            name=f"Run suite {suite_name} ({suite_id})",
+            exact=True,
+        ).click()
+        await expect(page).to_have_url(re.compile(r"[?&]tab=runs(?:&|$)"))
+        run_ids = parse_qs(urlsplit(page.url).query).get("run", [])
+        require_equal(len(run_ids), 1, "a dashboard launch must select its exact durable run")
+        await expect(
+            page.get_by_text(
+                re.compile(
+                    r"^Opened eval run .+ "
+                    r"\((queued|running|cancelling|completed|failed|cancelled)\)\.$"
+                )
+            )
+        ).to_be_visible()
+        return run_ids[0]
+
+    tab_keyboard_contract_checked = False
+
+    async def reopen_catalog() -> None:
+        nonlocal tab_keyboard_contract_checked
+        runs_tab = page.get_by_role("tab", name="Runs", exact=True)
+        catalog_tab = page.get_by_role("tab", name="Catalog", exact=True)
+        await runs_tab.focus()
+        if tab_keyboard_contract_checked:
+            await page.keyboard.press("ArrowLeft")
+            await expect(catalog_tab).to_have_attribute("aria-selected", "true")
+            await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
+            await page.wait_for_load_state("networkidle")
+            return
+
+        await page.keyboard.press("ArrowRight")
+        await expect(catalog_tab).to_have_attribute("aria-selected", "true")
+        await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
+        await page.wait_for_load_state("networkidle")
+        await catalog_tab.focus()
+        await page.keyboard.press("ArrowLeft")
+        await expect(runs_tab).to_have_attribute("aria-selected", "true")
+        await page.keyboard.press("Home")
+        await expect(catalog_tab).to_have_attribute("aria-selected", "true")
+        await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
+        await page.wait_for_load_state("networkidle")
+        await page.keyboard.press("End")
+        await expect(runs_tab).to_have_attribute("aria-selected", "true")
+        await page.keyboard.press("Home")
+        await expect(catalog_tab).to_have_attribute("aria-selected", "true")
+        await expect(page.get_by_role("button", name=suite_name, exact=True)).to_be_visible()
+        await page.wait_for_load_state("networkidle")
+        tab_keyboard_contract_checked = True
+
+    cancelled_run_id = await launch_saved_suite()
+    await asyncio.wait_for(provider.blocked_promotion_run_started.wait(), timeout=10)
+    run_status = page.get_by_test_id("eval-run-status-announcement")
+    await expect(run_status).to_have_text("Eval run status: running.")
+    status_mutations = await run_status.evaluate(
+        """
+        element => new Promise(resolve => {
+          let mutations = 0
+          const observer = new MutationObserver(records => {
+            mutations += records.length
+          })
+          observer.observe(element, { characterData: true, childList: true, subtree: true })
+          window.setTimeout(() => {
+            observer.disconnect()
+            resolve(mutations)
+          }, 1800)
+        })
+        """
+    )
+    require_equal(
+        status_mutations,
+        0,
+        "background polling must not mutate the run-status live region",
+    )
+    cancel = page.get_by_role("button", name="Cancel run", exact=True)
+    await expect(cancel).to_be_visible(timeout=15_000)
+    await cancel.click()
+    await expect(page.get_by_role("cell", name="cancelled", exact=True)).to_be_visible(
+        timeout=15_000
+    )
+    await expect(run_status).to_have_text("Eval run status: cancelled.")
+    require(
+        cancelled_run_id in page.url,
+        "cancellation must retain the selected durable run identity",
+    )
+
+    await reopen_catalog()
+    baseline_run_id = await launch_saved_suite()
+    published_result = page.locator('[data-slot="card-title"]').filter(has_text="Published result")
+    await expect(published_result).to_be_visible(timeout=20_000)
+    await expect(
+        page.locator("pre").filter(has_text="dashboard eval promotion output")
+    ).to_be_visible()
+    await expect(page.get_by_text("Estimated cost", exact=True)).to_be_visible()
+
+    async with page.expect_download() as json_download_info:
+        await page.get_by_role("button", name="JSON", exact=True).click()
+    json_download = await json_download_info.value
+    require_equal(
+        json_download.suggested_filename,
+        f"{baseline_run_id}.eval-result.json",
+        "the dashboard must preserve the server-owned eval JSON filename",
+    )
+    async with page.expect_download() as html_download_info:
+        await page.get_by_role("button", name="HTML", exact=True).click()
+    html_download = await html_download_info.value
+    require_equal(
+        html_download.suggested_filename,
+        f"{baseline_run_id}.eval-report.html",
+        "the dashboard must preserve the server-owned eval HTML filename",
+    )
+
+    await reopen_catalog()
+    current_run_id = await launch_saved_suite()
+    await expect(published_result).to_be_visible(timeout=20_000)
+    require(
+        current_run_id != baseline_run_id,
+        "two explicit dashboard launches must create distinct durable runs",
+    )
+    await page.get_by_label("Baseline run ID").fill(baseline_run_id)
+    await page.get_by_role("button", name="Compare", exact=True).click()
+    await expect(page.get_by_text("These runs are comparable.", exact=True)).to_be_visible()
+
+    await reopen_catalog()
+    await page.get_by_role("button", name=suite_name, exact=True).click()
+
+    async def expose_all_catalog_pagination(route, request) -> None:
+        if request.method != "GET":
+            await route.continue_()
+            return
+        response = await route.fetch()
+        body = await response.json()
+        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
+            await route.fulfill(response=response)
+            return
+        body["has_more"] = True
+        body["next_cursor"] = "dashboard-next-page"
+        await route.fulfill(response=response, json=body)
+
+    corpus_path = "**/api/evals/corpora*"
+    nested_catalog_path = "**/api/evals/corpora/**"
+    await page.route(corpus_path, expose_all_catalog_pagination)
+    await page.route(nested_catalog_path, expose_all_catalog_pagination)
+    try:
+        await page.reload(wait_until="networkidle")
+        for scope in ("corpus catalog", "corpus suites", "suite cases"):
+            await expect(
+                page.get_by_role("navigation", name=f"{scope} pagination", exact=True)
+            ).to_be_visible()
+            await expect(
+                page.get_by_role("button", name=f"First {scope} page", exact=True)
+            ).to_be_visible()
+            await expect(
+                page.get_by_role("button", name=f"Next {scope} page", exact=True)
+            ).to_be_visible()
+    finally:
+        await page.unroute(nested_catalog_path, expose_all_catalog_pagination)
+        await page.unroute(corpus_path, expose_all_catalog_pagination)
+
+    catalog_refresh_started = asyncio.Event()
+    release_catalog_refresh = asyncio.Event()
+    catalog_refresh_continued = asyncio.Event()
+
+    async def delay_abandoned_catalog_refresh(route, request) -> None:
+        if request.method != "GET":
+            await route.continue_()
+            return
+        catalog_refresh_started.set()
+        await release_catalog_refresh.wait()
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+        finally:
+            catalog_refresh_continued.set()
+
+    aborted_before = len(expected_query_aborts)
+    await page.route(corpus_path, delay_abandoned_catalog_refresh)
+    try:
+        await page.get_by_test_id("eval-import-file").set_input_files(
+            {
+                "name": "dashboard-abandoned-import.eval.json",
+                "mimeType": "application/json",
+                "buffer": json.dumps(corpus).encode(),
+            }
+        )
+        await asyncio.wait_for(catalog_refresh_started.wait(), timeout=5)
+        await page.get_by_role("link", name="Sessions", exact=True).click()
+        await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
+        await expect(page.get_by_role("heading", name="Sessions").first).to_be_visible()
+    finally:
+        release_catalog_refresh.set()
+        if catalog_refresh_started.is_set():
+            await asyncio.wait_for(catalog_refresh_continued.wait(), timeout=5)
+        await page.unroute(corpus_path, delay_abandoned_catalog_refresh)
+
+    deadline = asyncio.get_running_loop().time() + 5
+    while len(expected_query_aborts) == aborted_before:
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("leaving Evals did not abort the delayed catalog refresh")
+        await asyncio.sleep(0.05)
+    await page.wait_for_timeout(250)
+    await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
 
 
 async def _exercise_workflow(
@@ -1739,17 +2057,17 @@ async def _exercise_workflow(
 
 async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
     api_requests_beyond_contract: list[str] = []
+    previous_contract_version = str(int(SERVER_CONTRACT_VERSION) - 1)
 
     async def serve_incompatible_contract(route, request) -> None:
         path = urlsplit(request.url).path
         if path == "/api/contract":
             response = await route.fetch()
             body = await response.json()
-            # Reconstruct the immediately preceding valid v5 response. It
-            # predates the native-tool trust contract and must be
+            # Reconstruct the immediately preceding valid response. It must be
             # rejected before navigation evaluates any capability requirement.
-            body["contract_version"] = "5"
-            body["versioning"]["contract_version"] = "5"
+            body["contract_version"] = previous_contract_version
+            body["versioning"]["contract_version"] = previous_contract_version
             await route.fulfill(
                 response=response,
                 json=body,
@@ -1766,13 +2084,14 @@ async def _exercise_contract_version_gate(page: Page, base_url: str) -> None:
     try:
         await page.goto(f"{base_url}/cayu/usage", wait_until="networkidle")
         await expect(page.get_by_test_id("dashboard-contract-gate")).to_contain_text(
-            "Dashboard expects CAYU server contract v6, but the server reports v5."
+            f"Dashboard expects CAYU server contract v{SERVER_CONTRACT_VERSION}, "
+            f"but the server reports v{previous_contract_version}."
         )
         await expect(page.get_by_role("heading", name="Usage", exact=True)).to_have_count(0)
         require_equal(
             api_requests_beyond_contract,
             [],
-            "a previous valid v5 contract must not start route-specific API requests",
+            "a previous valid contract must not start route-specific API requests",
         )
     finally:
         await page.unroute("**/api/**", serve_incompatible_contract)
@@ -1969,7 +2288,7 @@ async def _exercise_system_page(page: Page, base_url: str) -> None:
             "does not probe databases, workers, networks, or external services"
         )
         await expect(page.get_by_text("Server contract", exact=True)).to_be_visible()
-        await expect(page.get_by_text("v6", exact=True)).to_be_visible()
+        await expect(page.get_by_text(f"v{SERVER_CONTRACT_VERSION}", exact=True)).to_be_visible()
         require_equal(diagnostics_requests, 1, "the System page must load one initial snapshot")
 
         await page.wait_for_timeout(5_500)
@@ -2912,6 +3231,20 @@ def _record_browser_failures(
             if agent_name == SLOW_USAGE_AGENT and request.failure == "net::ERR_ABORTED":
                 expected_query_aborts.append(detail)
                 return
+        if (
+            request.method == "GET"
+            and path == "/api/evals/runs"
+            and request.failure == "net::ERR_ABORTED"
+        ):
+            expected_query_aborts.append(detail)
+            return
+        if (
+            request.method == "GET"
+            and (path == "/api/evals/corpora" or path.startswith("/api/evals/corpora/"))
+            and request.failure == "net::ERR_ABORTED"
+        ):
+            expected_query_aborts.append(detail)
+            return
         if (
             request.method == "POST"
             and path == f"/api/sessions/{WORKFLOW_FOCUS_SESSION_ID}/topology"

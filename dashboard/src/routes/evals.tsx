@@ -11,7 +11,14 @@ import {
   RotateCcw,
   Upload,
 } from "lucide-react"
-import { type ChangeEvent, useCallback, useEffect, useRef, useState } from "react"
+import {
+  type ChangeEvent,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react"
 import {
   DataCard,
   Page,
@@ -31,6 +38,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import {
+  ApiClientError,
   cancelEvalRun,
   compareEvalRuns,
   createEvalRun,
@@ -50,22 +58,29 @@ import {
   fetchEvalSuites,
   importEvalCorpus,
 } from "@/lib/api"
+import { dashboardConfig } from "@/lib/config"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
 import {
-  createEvalIdempotencyKey,
+  EVAL_RESULT_QUERY_RETENTION,
+  EvalLaunchIdempotencyRegistry,
+  evalCancellationNotice,
   evalComparisonReasonText,
   evalErrorMessage,
+  evalLaunchFailureIsDefinitive,
+  evalLaunchNotice,
+  evalLaunchRequestIdentity,
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
   evalTrialCostSummary,
-  parseEvalCorpusFile,
+  preflightEvalCorpusFile,
   shortEvalIdentity,
 } from "@/lib/evals-dashboard"
-import { type EvalsSearch, evalsSearchWithout } from "@/lib/evals-search"
+import { type EvalsSearch, evalRunIdIsValid, evalsSearchWithout } from "@/lib/evals-search"
 import { formatBytes, formatCount, formatDateTime } from "@/lib/format"
 
 const PAGE_LIMIT = 25
+type UpdateEvalsSearch = (next: (current: EvalsSearch) => EvalsSearch) => Promise<void>
 
 export function EvalsPage() {
   const search = useSearch({ from: "/evals" })
@@ -78,6 +93,8 @@ export function EvalsPage() {
   })
   const mutationUnavailable = dashboardCapabilityUnavailableText(mutateCapability)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const catalogTabRef = useRef<HTMLButtonElement>(null)
+  const runsTabRef = useRef<HTMLButtonElement>(null)
   const actionControllerRef = useRef<AbortController | null>(null)
   const [pendingAction, setPendingAction] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
@@ -115,9 +132,7 @@ export function EvalsPage() {
   )
 
   const updateSearch = useCallback(
-    (next: (current: EvalsSearch) => EvalsSearch) => {
-      void navigate({ search: next, resetScroll: false })
-    },
+    (next: (current: EvalsSearch) => EvalsSearch) => navigate({ search: next, resetScroll: false }),
     [navigate],
   )
 
@@ -126,16 +141,53 @@ export function EvalsPage() {
     event.target.value = ""
     if (!file || pendingAction !== null) return
     void runAction("import", async (signal) => {
-      const corpus = await parseEvalCorpusFile(file)
-      const imported = await importEvalCorpus(corpus, signal)
+      await preflightEvalCorpusFile(file)
+      if (signal.aborted) return
+      const imported = await importEvalCorpus(file, signal)
+      if (signal.aborted) return
       await queryClient.invalidateQueries({ queryKey: ["evals", "corpora"] })
-      updateSearch((current) => ({
+      if (signal.aborted) return
+      await updateSearch((current) => ({
         ...evalsSearchWithout(current, "suite", "suites_cursor", "cases_cursor", "corpora_cursor"),
         tab: "catalog",
         corpus: imported.revision,
       }))
       return `Imported corpus ${shortEvalIdentity(imported.revision)}.`
     })
+  }
+
+  const activeTab = search.tab ?? "catalog"
+  const showCatalog = () =>
+    updateSearch((current) => ({
+      ...evalsSearchWithout(current, "run", "baseline", "runs_cursor", "status"),
+      tab: "catalog",
+    }))
+  const showRuns = () =>
+    updateSearch((current) => ({
+      ...evalsSearchWithout(current, "suite", "suites_cursor", "cases_cursor", "corpora_cursor"),
+      tab: "runs",
+    }))
+  const moveTabFocus = (event: KeyboardEvent<HTMLDivElement>) => {
+    const focusedTab = document.activeElement === runsTabRef.current ? "runs" : "catalog"
+    const nextTab =
+      event.key === "Home"
+        ? "catalog"
+        : event.key === "End"
+          ? "runs"
+          : event.key === "ArrowLeft" || event.key === "ArrowRight"
+            ? focusedTab === "catalog"
+              ? "runs"
+              : "catalog"
+            : null
+    if (nextTab === null) return
+    event.preventDefault()
+    if (nextTab === "catalog") {
+      catalogTabRef.current?.focus()
+      void showCatalog()
+    } else {
+      runsTabRef.current?.focus()
+      void showRuns()
+    }
   }
 
   return (
@@ -167,38 +219,35 @@ export function EvalsPage() {
         }
       />
 
-      <div className="flex gap-2 border-b border-border" role="tablist" aria-label="Evals views">
+      <div
+        className="flex gap-2 border-b border-border"
+        role="tablist"
+        aria-label="Evals views"
+        onKeyDown={moveTabFocus}
+      >
         <Button
+          ref={catalogTabRef}
+          id="evals-tab-catalog"
           role="tab"
-          aria-selected={(search.tab ?? "catalog") === "catalog"}
+          aria-controls="evals-panel-catalog"
+          aria-selected={activeTab === "catalog"}
+          tabIndex={activeTab === "catalog" ? 0 : -1}
           variant="ghost"
           className="rounded-b-none"
-          onClick={() =>
-            updateSearch((current) => ({
-              ...evalsSearchWithout(current, "run", "baseline", "runs_cursor", "status"),
-              tab: "catalog",
-            }))
-          }
+          onClick={() => void showCatalog()}
         >
           <Database /> Catalog
         </Button>
         <Button
+          ref={runsTabRef}
+          id="evals-tab-runs"
           role="tab"
-          aria-selected={search.tab === "runs"}
+          aria-controls="evals-panel-runs"
+          aria-selected={activeTab === "runs"}
+          tabIndex={activeTab === "runs" ? 0 : -1}
           variant="ghost"
           className="rounded-b-none"
-          onClick={() =>
-            updateSearch((current) => ({
-              ...evalsSearchWithout(
-                current,
-                "suite",
-                "suites_cursor",
-                "cases_cursor",
-                "corpora_cursor",
-              ),
-              tab: "runs",
-            }))
-          }
+          onClick={() => void showRuns()}
         >
           <FlaskConical /> Runs
         </Button>
@@ -228,23 +277,38 @@ export function EvalsPage() {
         </div>
       )}
 
-      {(search.tab ?? "catalog") === "catalog" ? (
-        <CatalogView
-          search={search}
-          updateSearch={updateSearch}
-          pendingAction={pendingAction}
-          runAction={runAction}
-          mutateEnabled={mutateCapability.enabled}
-        />
-      ) : (
-        <RunsView
-          search={search}
-          updateSearch={updateSearch}
-          pendingAction={pendingAction}
-          runAction={runAction}
-          mutateEnabled={mutateCapability.enabled}
-        />
-      )}
+      <div
+        id="evals-panel-catalog"
+        role="tabpanel"
+        aria-labelledby="evals-tab-catalog"
+        hidden={activeTab !== "catalog"}
+      >
+        {activeTab === "catalog" && (
+          <CatalogView
+            search={search}
+            updateSearch={updateSearch}
+            pendingAction={pendingAction}
+            runAction={runAction}
+            mutateEnabled={mutateCapability.enabled}
+          />
+        )}
+      </div>
+      <div
+        id="evals-panel-runs"
+        role="tabpanel"
+        aria-labelledby="evals-tab-runs"
+        hidden={activeTab !== "runs"}
+      >
+        {activeTab === "runs" && (
+          <RunsView
+            search={search}
+            updateSearch={updateSearch}
+            pendingAction={pendingAction}
+            runAction={runAction}
+            mutateEnabled={mutateCapability.enabled}
+          />
+        )}
+      </div>
     </Page>
   )
 }
@@ -257,7 +321,7 @@ function CatalogView({
   mutateEnabled,
 }: {
   search: EvalsSearch
-  updateSearch: (next: (current: EvalsSearch) => EvalsSearch) => void
+  updateSearch: UpdateEvalsSearch
   pendingAction: string | null
   runAction: (
     name: string,
@@ -267,7 +331,7 @@ function CatalogView({
 }) {
   const queryClient = useQueryClient()
   const [maxConcurrency, setMaxConcurrency] = useState("1")
-  const launchKeysRef = useRef(new Map<string, string>())
+  const launchRegistryRef = useRef<EvalLaunchIdempotencyRegistry | null>(null)
   const corpora = useQuery({
     queryKey: ["evals", "corpora", search.corpora_cursor],
     queryFn: ({ signal }) =>
@@ -311,6 +375,7 @@ function CatalogView({
     if (!search.corpus || pendingAction !== null) return
     void runAction("download-corpus", async (signal) => {
       const file = await downloadEvalCorpus(search.corpus ?? "", signal)
+      if (signal.aborted) return
       downloadBlob(file.blob, file.filename)
       return `Downloaded corpus ${shortEvalIdentity(search.corpus ?? "")}.`
     })
@@ -320,29 +385,35 @@ function CatalogView({
     if (!search.corpus || pendingAction !== null || !mutateEnabled || !concurrencyIsValid) {
       return
     }
-    const requestIdentity = `${search.corpus}\0${suiteId}\0${parsedConcurrency}`
+    const requestIdentity = evalLaunchRequestIdentity(search.corpus, suiteId, parsedConcurrency)
     void runAction(`launch:${suiteId}`, async (signal) => {
-      let idempotencyKey = launchKeysRef.current.get(requestIdentity)
-      if (!idempotencyKey) {
-        idempotencyKey = createEvalIdempotencyKey()
-        if (launchKeysRef.current.size >= 32) {
-          const oldest = launchKeysRef.current.keys().next().value
-          if (oldest !== undefined) launchKeysRef.current.delete(oldest)
+      const registry =
+        launchRegistryRef.current ??
+        new EvalLaunchIdempotencyRegistry(window.sessionStorage, dashboardConfig.apiBaseUrl)
+      launchRegistryRef.current = registry
+      const idempotencyKey = registry.keyFor(requestIdentity)
+      let run: EvalRun
+      try {
+        run = await createEvalRun(
+          {
+            corpus_revision: search.corpus ?? "",
+            suite_id: suiteId,
+            max_concurrency: parsedConcurrency,
+          },
+          idempotencyKey,
+          signal,
+        )
+      } catch (error) {
+        if (error instanceof ApiClientError && evalLaunchFailureIsDefinitive(error.status)) {
+          registry.resolve(requestIdentity)
         }
-        launchKeysRef.current.set(requestIdentity, idempotencyKey)
+        throw error
       }
-      const run = await createEvalRun(
-        {
-          corpus_revision: search.corpus ?? "",
-          suite_id: suiteId,
-          max_concurrency: parsedConcurrency,
-        },
-        idempotencyKey,
-        signal,
-      )
+      if (signal.aborted) return
       queryClient.setQueryData(["evals", "run", run.spec.run_id], run)
       await queryClient.invalidateQueries({ queryKey: ["evals", "runs"] })
-      updateSearch((current) => ({
+      if (signal.aborted) return
+      await updateSearch((current) => ({
         ...evalsSearchWithout(
           current,
           "suite",
@@ -356,8 +427,9 @@ function CatalogView({
         corpus: run.spec.corpus_revision,
         run: run.spec.run_id,
       }))
-      launchKeysRef.current.delete(requestIdentity)
-      return `Started eval run ${shortEvalIdentity(run.spec.run_id)}.`
+      if (signal.aborted) return
+      registry.resolve(requestIdentity)
+      return evalLaunchNotice(run)
     })
   }
 
@@ -424,6 +496,7 @@ function CatalogView({
           <StateMessage>No eval corpora have been saved or imported yet.</StateMessage>
         ) : null}
         <PageControls
+          scope="corpus catalog"
           cursor={search.corpora_cursor}
           nextCursor={corpora.data?.next_cursor}
           fetching={corpora.isFetching}
@@ -547,6 +620,7 @@ function CatalogView({
                         <Button
                           type="button"
                           size="sm"
+                          aria-label={`Run suite ${suite.name} (${suite.id})`}
                           disabled={!mutateEnabled || !concurrencyIsValid || pendingAction !== null}
                           onClick={() => launchSuite(suite.id)}
                         >
@@ -573,6 +647,7 @@ function CatalogView({
                 <StateMessage>This corpus contains no suites.</StateMessage>
               ) : null}
               <PageControls
+                scope="corpus suites"
                 cursor={search.suites_cursor}
                 nextCursor={suites.data?.next_cursor}
                 fetching={suites.isFetching}
@@ -635,6 +710,7 @@ function CatalogView({
                   <StateMessage>This suite contains no cases.</StateMessage>
                 ) : null}
                 <PageControls
+                  scope="suite cases"
                   cursor={search.cases_cursor}
                   nextCursor={cases.data?.next_cursor}
                   fetching={cases.isFetching}
@@ -662,7 +738,7 @@ function RunsView({
   mutateEnabled,
 }: {
   search: EvalsSearch
-  updateSearch: (next: (current: EvalsSearch) => EvalsSearch) => void
+  updateSearch: UpdateEvalsSearch
   pendingAction: string | null
   runAction: (
     name: string,
@@ -698,7 +774,7 @@ function RunsView({
     queryKey: ["evals", "result", search.run],
     queryFn: ({ signal }) => fetchEvalResult(search.run ?? "", signal),
     enabled: evalRunHasResult(selectedRun.data),
-    staleTime: Number.POSITIVE_INFINITY,
+    ...EVAL_RESULT_QUERY_RETENTION,
   })
   const comparison = useQuery({
     queryKey: ["evals", "comparison", search.baseline, search.run],
@@ -730,9 +806,11 @@ function RunsView({
     if (!run || !evalRunCanCancel(run) || pendingAction !== null || !mutateEnabled) return
     void runAction("cancel-run", async (signal) => {
       const cancelled = await cancelEvalRun(run.spec.run_id, signal)
+      if (signal.aborted) return
       queryClient.setQueryData(["evals", "run", run.spec.run_id], cancelled)
       await queryClient.invalidateQueries({ queryKey: ["evals", "runs"] })
-      return `Cancellation requested for ${shortEvalIdentity(run.spec.run_id)}.`
+      if (signal.aborted) return
+      return evalCancellationNotice(cancelled)
     })
   }
 
@@ -744,6 +822,7 @@ function RunsView({
         format === "json"
           ? await downloadEvalResultJson(runId, signal)
           : await downloadEvalResultHtml(runId, signal)
+      if (signal.aborted) return
       downloadBlob(file.blob, file.filename)
       return `Downloaded the ${format.toUpperCase()} report for ${shortEvalIdentity(runId)}.`
     })
@@ -844,7 +923,7 @@ function RunsView({
                   </div>
                   {run.result && (
                     <div className="mt-1 text-xs text-muted-foreground">
-                      {formatScore(run.result.score)}
+                      {run.result.status} · {formatScore(run.result.score)}
                     </div>
                   )}
                 </TableCell>
@@ -864,6 +943,7 @@ function RunsView({
           <StateMessage>No eval runs match these filters.</StateMessage>
         ) : null}
         <PageControls
+          scope="eval runs"
           cursor={search.runs_cursor}
           nextCursor={runs.data?.next_cursor}
           fetching={runs.isFetching}
@@ -896,7 +976,6 @@ function RunsView({
         <div className="min-w-0 space-y-6">
           <RunLifecycleCard
             run={selectedRun.data}
-            fetching={selectedRun.isFetching}
             cancelling={pendingAction === "cancel-run"}
             canMutate={mutateEnabled}
             cancel={cancelRun}
@@ -944,13 +1023,11 @@ function RunsView({
 
 function RunLifecycleCard({
   run,
-  fetching,
   cancelling,
   canMutate,
   cancel,
 }: {
   run: EvalRun
-  fetching: boolean
   cancelling: boolean
   canMutate: boolean
   cancel: () => void
@@ -1003,13 +1080,19 @@ function RunLifecycleCard({
           <RunFact label="Duration" value={formatDuration(run.result.duration_ms)} />
         </div>
       )}
+      <span
+        className="sr-only"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        data-testid="eval-run-status-announcement"
+      >
+        Eval run status: {run.status}.
+      </span>
       {evalRunIsActive(run) && (
-        <div
-          className="border-t border-border px-4 py-3 text-xs text-muted-foreground"
-          role="status"
-        >
-          <LoaderCircle className="mr-1.5 inline h-3.5 w-3.5 animate-spin" />
-          Following durable status{fetching ? "..." : "."}
+        <div className="border-t border-border px-4 py-3 text-xs text-muted-foreground">
+          <LoaderCircle className="mr-1.5 inline h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+          Following durable status.
         </div>
       )}
     </DataCard>
@@ -1173,7 +1256,8 @@ function ResultInspector({
               <div className="text-sm font-medium">Output preview</div>
               <Badge variant="outline">{selectedTrial.output.evidence_state}</Badge>
             </div>
-            {selectedTrial.output.text !== undefined ? (
+            {selectedTrial.output.evidence_state !== "unavailable" &&
+            selectedTrial.output.text !== undefined ? (
               <PayloadViewer value={selectedTrial.output.text} maxHeight="max-h-72" />
             ) : (
               <StateMessage className="rounded-md border border-border py-6">
@@ -1261,8 +1345,7 @@ function ComparisonPanel({
   const [draft, setDraft] = useState(baselineRunId ?? "")
   const normalizedDraft = draft.trim()
   const baselineIsSelf = baselineRunId === currentRunId
-  const draftIsValid =
-    normalizedDraft.length > 0 && normalizedDraft.length <= 512 && normalizedDraft !== currentRunId
+  const draftIsValid = evalRunIdIsValid(normalizedDraft) && normalizedDraft !== currentRunId
 
   return (
     <DataCard
@@ -1282,7 +1365,7 @@ function ComparisonPanel({
             type="text"
             list="eval-baseline-candidates"
             value={draft}
-            maxLength={512}
+            maxLength={128}
             className="mt-1 h-9 w-full rounded-md border border-input bg-background px-3 text-sm text-foreground"
             placeholder="Select or paste a completed run ID"
             aria-invalid={normalizedDraft.length > 0 && !draftIsValid}
@@ -1382,7 +1465,7 @@ function ComparisonRunSummary({ label, run }: { label: string; run: EvalRun }) {
     <div className="rounded-lg border border-border p-3">
       <div className="mb-3 flex items-center justify-between gap-2">
         <div className="font-medium">{label}</div>
-        <EvalStatusBadge run={run} />
+        <OutcomeBadge outcome={run.result?.status ?? run.status} />
       </div>
       <div className="grid gap-3 text-sm sm:grid-cols-2">
         <RunFact label="Run" value={shortEvalIdentity(run.spec.run_id)} />
@@ -1408,13 +1491,9 @@ function OutcomeBadge({ outcome }: { outcome: string }) {
 }
 
 function EvalStatusBadge({ run }: { run: EvalRun }) {
-  const status = run.result?.status ?? run.status
+  const status = run.status
   const variant =
-    status === "failed" || status === "error"
-      ? "destructive"
-      : status === "completed" || status === "passed"
-        ? "secondary"
-        : "outline"
+    status === "failed" ? "destructive" : status === "completed" ? "secondary" : "outline"
   return <Badge variant={variant}>{status}</Badge>
 }
 
@@ -1459,12 +1538,14 @@ function QueryError({ message, retry }: { message: string; retry: () => void }) 
 }
 
 function PageControls({
+  scope,
   cursor,
   nextCursor,
   fetching,
   first,
   next,
 }: {
+  scope: string
   cursor?: string
   nextCursor?: string | null
   fetching: boolean
@@ -1473,11 +1554,15 @@ function PageControls({
 }) {
   if (!cursor && !nextCursor) return null
   return (
-    <div className="flex items-center justify-end gap-2 border-t border-border p-3">
+    <nav
+      aria-label={`${scope} pagination`}
+      className="flex items-center justify-end gap-2 border-t border-border p-3"
+    >
       <Button
         type="button"
         size="sm"
         variant="outline"
+        aria-label={`First ${scope} page`}
         disabled={!cursor || fetching}
         onClick={first}
       >
@@ -1487,12 +1572,13 @@ function PageControls({
         type="button"
         size="sm"
         variant="outline"
+        aria-label={`Next ${scope} page`}
         disabled={!nextCursor || fetching}
         onClick={() => nextCursor && next(nextCursor)}
       >
         Next page
       </Button>
-    </div>
+    </nav>
   )
 }
 

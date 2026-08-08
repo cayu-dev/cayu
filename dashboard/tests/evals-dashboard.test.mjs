@@ -1,17 +1,43 @@
 import assert from "node:assert/strict"
 import test from "node:test"
+import { QueryClient, QueryObserver } from "@tanstack/react-query"
 
 import {
   createEvalIdempotencyKey,
+  EVAL_RESULT_QUERY_RETENTION,
+  EvalLaunchIdempotencyRegistry,
+  evalCancellationNotice,
   evalComparisonReasonText,
+  evalLaunchFailureIsDefinitive,
+  evalLaunchNotice,
+  evalLaunchRequestIdentity,
   evalRunCanCancel,
   evalRunHasResult,
   evalRunIsActive,
   evalTrialCostSummary,
   MAX_EVAL_CORPUS_FILE_BYTES,
-  parseEvalCorpusFile,
+  preflightEvalCorpusFile,
   shortEvalIdentity,
 } from "../src/lib/evals-dashboard.ts"
+
+const evalLaunchRegistryKey = (scope) =>
+  `cayu.eval-launch-idempotency.v1:${encodeURIComponent(scope)}`
+
+class MemoryStorage {
+  items = new Map()
+
+  getItem(key) {
+    return this.items.get(key) ?? null
+  }
+
+  setItem(key, value) {
+    this.items.set(key, value)
+  }
+
+  removeItem(key) {
+    this.items.delete(key)
+  }
+}
 
 function run(status, result = null) {
   return { status, result }
@@ -29,7 +55,69 @@ test("eval lifecycle helpers distinguish active, cancellable, and published runs
   assert.equal(evalRunHasResult(run("failed", { revision: "sha256:result" })), false)
 })
 
-test("eval corpus import preflights bytes and the minimum v1 envelope", async () => {
+test("eval cancellation notices follow the returned durable status", () => {
+  const returned = (status) => ({ status, spec: { run_id: "eval-1234567890abcdef" } })
+
+  assert.equal(
+    evalCancellationNotice(returned("cancelling")),
+    "Cancellation requested for eval-1234567….",
+  )
+  assert.equal(
+    evalCancellationNotice(returned("cancelled")),
+    "Eval run eval-1234567… is cancelled.",
+  )
+  assert.equal(
+    evalCancellationNotice(returned("completed")),
+    "Eval run eval-1234567… completed before cancellation took effect.",
+  )
+  assert.equal(
+    evalCancellationNotice(returned("failed")),
+    "Eval run eval-1234567… failed before cancellation took effect.",
+  )
+})
+
+test("eval launch notices describe the returned durable run instead of fabricating admission", () => {
+  const returned = (status) => ({ status, spec: { run_id: "eval-1234567890abcdef" } })
+
+  assert.equal(evalLaunchNotice(returned("queued")), "Opened eval run eval-1234567… (queued).")
+  assert.equal(
+    evalLaunchNotice(returned("completed")),
+    "Opened eval run eval-1234567… (completed).",
+  )
+  assert.equal(evalLaunchNotice(returned("failed")), "Opened eval run eval-1234567… (failed).")
+  assert.equal(
+    evalLaunchNotice(returned("cancelled")),
+    "Opened eval run eval-1234567… (cancelled).",
+  )
+})
+
+test("inactive complete eval results are released from the browser cache immediately", async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const queryKey = ["evals", "result", "eval-complete"]
+  const observer = new QueryObserver(client, {
+    queryKey,
+    queryFn: async () => ({ payload: "bounded-result" }),
+    ...EVAL_RESULT_QUERY_RETENTION,
+  })
+  const unsubscribe = observer.subscribe(() => {})
+  let subscribed = true
+
+  try {
+    await observer.refetch()
+    assert.deepEqual(client.getQueryData(queryKey), { payload: "bounded-result" })
+    unsubscribe()
+    subscribed = false
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    assert.equal(client.getQueryData(queryKey), undefined)
+  } finally {
+    if (subscribed) unsubscribe()
+    client.clear()
+  }
+})
+
+test("eval corpus import preflight bounds work without authorizing normalized content", async () => {
   const corpus = {
     schema_version: 1,
     revision: "sha256:corpus",
@@ -38,15 +126,15 @@ test("eval corpus import preflights bytes and the minimum v1 envelope", async ()
     suites: [],
     cases: [],
   }
-  assert.deepEqual(await parseEvalCorpusFile(new Blob([JSON.stringify(corpus)])), corpus)
+  await preflightEvalCorpusFile(new Blob([JSON.stringify(corpus)]))
 
-  await assert.rejects(parseEvalCorpusFile(new Blob(["not json"])), /not valid JSON/)
+  await assert.rejects(preflightEvalCorpusFile(new Blob(["not json"])), /not valid JSON/)
   await assert.rejects(
-    parseEvalCorpusFile(new Blob([JSON.stringify({ ...corpus, schema_version: 2 })])),
+    preflightEvalCorpusFile(new Blob([JSON.stringify({ ...corpus, schema_version: 2 })])),
     /corpus v1/,
   )
   await assert.rejects(
-    parseEvalCorpusFile(new Blob([new Uint8Array(MAX_EVAL_CORPUS_FILE_BYTES + 1)])),
+    preflightEvalCorpusFile(new Blob([new Uint8Array(MAX_EVAL_CORPUS_FILE_BYTES + 1)])),
     /larger than the supported 8 MiB/,
   )
 })
@@ -61,6 +149,122 @@ test("eval launch idempotency keys use secure browser UUIDs", () => {
     createEvalIdempotencyKey(),
     /^cayu-dashboard-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
   )
+})
+
+test("eval launch retries reuse their key across page reloads until reconciled", () => {
+  const storage = new MemoryStorage()
+  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4)
+  const originalKey = new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity)
+
+  assert.equal(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
+
+  new EvalLaunchIdempotencyRegistry(storage, "/api").resolve(identity)
+  assert.notEqual(new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor(identity), originalKey)
+})
+
+test("eval launch retries are isolated between API mounts on one origin", () => {
+  const storage = new MemoryStorage()
+  const identity = evalLaunchRequestIdentity("sha256:corpus", "suite-1", 4)
+  const first = new EvalLaunchIdempotencyRegistry(storage, "/app-a/api")
+  const second = new EvalLaunchIdempotencyRegistry(storage, "/app-b/api")
+  const firstKey = first.keyFor(identity)
+  const secondKey = second.keyFor(identity)
+
+  assert.notEqual(firstKey, secondKey)
+  second.resolve(identity)
+  assert.equal(first.keyFor(identity), firstKey)
+  assert.notEqual(second.keyFor(identity), secondKey)
+})
+
+test("eval launch retry keys clear only after definitive API responses", () => {
+  for (const status of [400, 401, 403, 404, 405, 409, 410, 413, 415, 422, 451, 501]) {
+    assert.equal(evalLaunchFailureIsDefinitive(status), true)
+  }
+  for (const status of [408, 425, 429, 499, 500, 502, 503, 504]) {
+    assert.equal(evalLaunchFailureIsDefinitive(status), false)
+  }
+})
+
+test("permanent launch rejections release their retry-state capacity", () => {
+  const storage = new MemoryStorage()
+  const registry = new EvalLaunchIdempotencyRegistry(storage, "/api")
+
+  for (let index = 0; index < 64; index += 1) {
+    const identity = `permanently-rejected-request-${index}`
+    registry.keyFor(identity)
+    assert.equal(evalLaunchFailureIsDefinitive(index % 2 === 0 ? 405 : 501), true)
+    registry.resolve(identity)
+  }
+
+  assert.equal(storage.getItem(evalLaunchRegistryKey("/api")), null)
+  assert.doesNotThrow(() => registry.keyFor("subsequent-valid-request"))
+})
+
+test("eval launch retry state rejects corrupt and unavailable storage", () => {
+  const storage = new MemoryStorage()
+  const storageKey = evalLaunchRegistryKey("/api")
+  assert.throws(
+    () => new EvalLaunchIdempotencyRegistry(storage, ""),
+    /API scope is outside the browser retry-state limit/,
+  )
+  storage.setItem(storageKey, "not-json")
+  assert.throws(
+    () => new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor("request"),
+    /retry state is invalid/,
+  )
+
+  const unavailableStorage = {
+    getItem() {
+      throw new Error("denied")
+    },
+    setItem() {},
+    removeItem() {},
+  }
+  assert.throws(
+    () => new EvalLaunchIdempotencyRegistry(unavailableStorage, "/api").keyFor("request"),
+    /retry state is unavailable/,
+  )
+
+  const unwritableStorage = {
+    getItem() {
+      return null
+    },
+    setItem() {
+      throw new Error("denied")
+    },
+    removeItem() {},
+  }
+  assert.throws(
+    () => new EvalLaunchIdempotencyRegistry(unwritableStorage, "/api").keyFor("request"),
+    /could not be persisted/,
+  )
+
+  const duplicateKey = createEvalIdempotencyKey()
+  storage.setItem(
+    storageKey,
+    JSON.stringify({
+      version: 1,
+      entries: [
+        ["request-1", duplicateKey],
+        ["request-2", duplicateKey],
+      ],
+    }),
+  )
+  assert.throws(
+    () => new EvalLaunchIdempotencyRegistry(storage, "/api").keyFor("request-3"),
+    /retry state is invalid/,
+  )
+})
+
+test("eval launch retry state never silently evicts an unresolved request", () => {
+  const storage = new MemoryStorage()
+  const registry = new EvalLaunchIdempotencyRegistry(storage, "/api")
+  for (let index = 0; index < 32; index += 1) {
+    registry.keyFor(`request-${index}`)
+  }
+
+  assert.throws(() => registry.keyFor("request-32"), /Too many eval launches/)
+  assert.equal(JSON.parse(storage.getItem(evalLaunchRegistryKey("/api"))).entries.length, 32)
 })
 
 test("eval trial cost summary distinguishes observed, unavailable, and absent pricing", () => {

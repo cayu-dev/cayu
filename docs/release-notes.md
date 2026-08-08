@@ -40,6 +40,11 @@ deployments must use one consistent public-authority alias keyring.
   store. Bounded catalog, run, cancellation, result, comparison, and report APIs
   dispatch only persisted target-scoped work through the existing execution
   core; ownership loss and shutdown cannot publish partial success.
+- The capability-gated dashboard now completes that workflow: operators can
+  save promoted sessions or import corpora, browse suites and cases, launch and
+  cancel durable runs, inspect every trial/assertion with output, usage, cost,
+  duration, completeness, and safe diagnostics, compare compatible results,
+  and download canonical corpus plus JSON/HTML reports.
 - `cayu serve` and `cayu worker` provide stable entrypoints for configured
   projects, while bounded topology, workflow, usage, and event projections
   support control-plane inspection without exposing private authority.

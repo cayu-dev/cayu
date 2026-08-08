@@ -290,6 +290,15 @@ def test_evals_authenticates_and_bounds_before_parsing(tmp_path) -> None:
             assert duplicate.json() == {"detail": "Invalid Evals request."}
             assert calls == 3
 
+            invalid_utf8 = client.post(
+                "/api/evals/corpora",
+                content=b'{"description":"\xff"}',
+                headers={**_AUTH_HEADERS, "Content-Type": "application/json"},
+            )
+            assert invalid_utf8.status_code == 422
+            assert invalid_utf8.json() == {"detail": "Invalid Evals request."}
+            assert calls == 4
+
             wrong_media_type = client.post(
                 "/api/evals/corpora",
                 content=json.dumps(_corpus().model_dump(mode="json")),
@@ -297,7 +306,7 @@ def test_evals_authenticates_and_bounds_before_parsing(tmp_path) -> None:
             )
             assert wrong_media_type.status_code == 422
             assert wrong_media_type.json() == {"detail": "Invalid Evals request."}
-            assert calls == 4
+            assert calls == 5
 
             oversized = client.post(
                 "/api/evals/corpora",
@@ -305,7 +314,7 @@ def test_evals_authenticates_and_bounds_before_parsing(tmp_path) -> None:
                 headers={**_AUTH_HEADERS, "Content-Type": "application/json"},
             )
             assert oversized.status_code == 413
-            assert calls == 5
+            assert calls == 6
     finally:
         asyncio.run(store.close())
 

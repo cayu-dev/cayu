@@ -23,38 +23,55 @@ const EVAL_STATUSES = new Set<EvalStatus>([
   "failed",
   "cancelled",
 ])
+const EVAL_CURSOR_MAX_BYTES = 1_024
+const EVAL_CURSOR_RE = /^[A-Za-z0-9_-]+$/
+const EVAL_CORPUS_REVISION_RE = /^sha256:[0-9a-f]{64}$/
+const EVAL_PORTABLE_ID_RE = /^[a-z][a-z0-9._-]{0,127}$/
+const EVAL_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
 
-function boundedSearchValue(value: unknown): string | undefined {
+function matchingSearchValue(value: unknown, pattern: RegExp): string | undefined {
   if (typeof value !== "string") return undefined
   const normalized = value.trim()
-  return normalized.length > 0 && normalized.length <= 512 ? normalized : undefined
+  return pattern.test(normalized) ? normalized : undefined
+}
+
+function boundedCursorValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const normalized = value.trim()
+  return normalized.length > 0 &&
+    normalized.length <= EVAL_CURSOR_MAX_BYTES &&
+    EVAL_CURSOR_RE.test(normalized)
+    ? normalized
+    : undefined
 }
 
 export function validateEvalsSearch(search: Record<string, unknown>): EvalsSearch {
   const tab = search.tab === "runs" ? "runs" : search.tab === "catalog" ? "catalog" : undefined
-  const status = boundedSearchValue(search.status)
+  const status = typeof search.status === "string" ? search.status.trim() : undefined
+  const corpus = matchingSearchValue(search.corpus, EVAL_CORPUS_REVISION_RE)
+  const suite = matchingSearchValue(search.suite, EVAL_PORTABLE_ID_RE)
+  const run = matchingSearchValue(search.run, EVAL_RUN_ID_RE)
+  const baseline = matchingSearchValue(search.baseline, EVAL_RUN_ID_RE)
+  const corporaCursor = boundedCursorValue(search.corpora_cursor)
+  const suitesCursor = boundedCursorValue(search.suites_cursor)
+  const casesCursor = boundedCursorValue(search.cases_cursor)
+  const runsCursor = boundedCursorValue(search.runs_cursor)
   return {
     ...(tab ? { tab } : {}),
-    ...(boundedSearchValue(search.corpus) ? { corpus: boundedSearchValue(search.corpus) } : {}),
-    ...(boundedSearchValue(search.suite) ? { suite: boundedSearchValue(search.suite) } : {}),
-    ...(boundedSearchValue(search.run) ? { run: boundedSearchValue(search.run) } : {}),
-    ...(boundedSearchValue(search.baseline)
-      ? { baseline: boundedSearchValue(search.baseline) }
-      : {}),
+    ...(corpus ? { corpus } : {}),
+    ...(suite ? { suite } : {}),
+    ...(run ? { run } : {}),
+    ...(baseline ? { baseline } : {}),
     ...(status && EVAL_STATUSES.has(status as EvalStatus) ? { status: status as EvalStatus } : {}),
-    ...(boundedSearchValue(search.corpora_cursor)
-      ? { corpora_cursor: boundedSearchValue(search.corpora_cursor) }
-      : {}),
-    ...(boundedSearchValue(search.suites_cursor)
-      ? { suites_cursor: boundedSearchValue(search.suites_cursor) }
-      : {}),
-    ...(boundedSearchValue(search.cases_cursor)
-      ? { cases_cursor: boundedSearchValue(search.cases_cursor) }
-      : {}),
-    ...(boundedSearchValue(search.runs_cursor)
-      ? { runs_cursor: boundedSearchValue(search.runs_cursor) }
-      : {}),
+    ...(corporaCursor ? { corpora_cursor: corporaCursor } : {}),
+    ...(suitesCursor ? { suites_cursor: suitesCursor } : {}),
+    ...(casesCursor ? { cases_cursor: casesCursor } : {}),
+    ...(runsCursor ? { runs_cursor: runsCursor } : {}),
   }
+}
+
+export function evalRunIdIsValid(value: string): boolean {
+  return EVAL_RUN_ID_RE.test(value)
 }
 
 export function evalsSearchWithout(

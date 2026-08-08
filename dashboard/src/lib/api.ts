@@ -435,21 +435,15 @@ export async function fetchEvalCorpora(
 }
 
 export async function importEvalCorpus(
-  corpus: EvalCorpus,
+  corpus: Blob,
   signal?: AbortSignal,
 ): Promise<EvalCorpusEntry> {
   return requestJson<EvalCorpusEntry>("/evals/corpora", {
     method: "POST",
-    body: JSON.stringify(corpus),
+    headers: { "Content-Type": "application/json" },
+    body: corpus,
     signal,
   })
-}
-
-export async function fetchEvalCorpus(
-  corpusRevision: string,
-  signal?: AbortSignal,
-): Promise<EvalCorpus> {
-  return requestJson<EvalCorpus>(`/evals/corpora/${encodeURIComponent(corpusRevision)}`, { signal })
 }
 
 export async function downloadEvalCorpus(

@@ -16,6 +16,12 @@ npm run dev
 The Vite development server proxies `/api` to `http://localhost:8000`. Run a compatible Cayu
 server there, or update `vite.config.ts` for your local server.
 
+The stock dashboard follows the server's capability contract. A completely configured
+authenticated Evals surface adds corpus import/browsing, promoted-session save, durable
+launch/status/cancellation, complete result inspection, compatible comparison, and corpus plus
+JSON/HTML downloads. The browser never receives executable target wiring or provider
+credentials; it uses the attached server target and generated API contract.
+
 Create production assets with:
 
 ```bash

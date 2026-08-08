@@ -35,7 +35,7 @@ import {
   previewEvaluationPromotion,
 } from "@/lib/api"
 import { dashboardCapabilityUnavailableText } from "@/lib/dashboard-capabilities"
-import { parseEvalCorpusFile, shortEvalIdentity } from "@/lib/evals-dashboard"
+import { preflightEvalCorpusFile, shortEvalIdentity } from "@/lib/evals-dashboard"
 import {
   createPromotionAssertion,
   PROMOTION_ASSERTION_KINDS,
@@ -229,8 +229,8 @@ export function EvaluationPromotionAction({
       const exported = await exportPreviewedCandidate(controller.signal)
       if (exported === null || controller.signal.aborted) return
       exportCompleted = true
-      const corpus = await parseEvalCorpusFile(exported.blob)
-      const imported = await importEvalCorpus(corpus, controller.signal)
+      await preflightEvalCorpusFile(exported.blob)
+      const imported = await importEvalCorpus(exported.blob, controller.signal)
       if (controller.signal.aborted) return
       setSavedRevision(imported.revision)
       await queryClient.invalidateQueries({ queryKey: ["evals", "corpora"] })
