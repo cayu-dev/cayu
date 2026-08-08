@@ -244,6 +244,7 @@ from cayu.runtime.sessions import (
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
     copy_interrupt_session_request,
+    copy_resume_request,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -1758,7 +1759,7 @@ class CayuApp:
         session_id, store_resolved_session_id = await self._resolve_public_session_authority(
             request.session_id
         )
-        request = request.model_copy(update={"session_id": session_id}, deep=True)
+        request = copy_resume_request(request).model_copy(update={"session_id": session_id})
         stream = self._resume_private(
             request,
             store_resolved_session_id=store_resolved_session_id,
@@ -2643,7 +2644,7 @@ class CayuApp:
         if type(response) is not UserInputResponse:
             raise TypeError("Runtime user input resolution requires a UserInputResponse.")
         session_id = await self._resolve_public_session_id(response.session_id)
-        response = response.model_copy(
+        response = copy_user_input_response(response).model_copy(
             update={
                 "session_id": session_id,
                 "input_id": await self._resolve_public_action_linkage(
@@ -2652,7 +2653,6 @@ class CayuApp:
                     field_name="input_id",
                 ),
             },
-            deep=True,
         )
         stream = self._resolve_user_input_private(response)
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -2683,7 +2683,7 @@ class CayuApp:
         if type(request) is not UserInputRecoveryRequest:
             raise TypeError("Runtime user input recovery requires a UserInputRecoveryRequest.")
         session_id = await self._resolve_public_session_id(request.session_id)
-        request = request.model_copy(
+        request = copy_user_input_recovery_request(request).model_copy(
             update={
                 "session_id": session_id,
                 "input_id": await self._resolve_public_action_linkage(
@@ -2697,7 +2697,6 @@ class CayuApp:
                     field_name="tool_call_id",
                 ),
             },
-            deep=True,
         )
         stream = self._recover_user_input_private(request)
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -2731,7 +2730,7 @@ class CayuApp:
         if type(request) is not ToolApprovalRequest:
             raise TypeError("Runtime approval resolution requires a ToolApprovalRequest.")
         session_id = await self._resolve_public_session_id(request.session_id)
-        request = request.model_copy(
+        request = copy_tool_approval_request(request).model_copy(
             update={
                 "session_id": session_id,
                 "approval_id": await self._resolve_public_action_linkage(
@@ -2750,7 +2749,6 @@ class CayuApp:
                     field_name="tool_call_id",
                 ),
             },
-            deep=True,
         )
         stream = self._resolve_tool_approval_private(request)
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -2776,7 +2774,7 @@ class CayuApp:
         if type(request) is not ToolApprovalRecoveryRequest:
             raise TypeError("Runtime approval recovery requires a ToolApprovalRecoveryRequest.")
         session_id = await self._resolve_public_session_id(request.session_id)
-        request = request.model_copy(
+        request = copy_tool_approval_recovery_request(request).model_copy(
             update={
                 "session_id": session_id,
                 "approval_id": await self._resolve_public_action_linkage(
@@ -2795,7 +2793,6 @@ class CayuApp:
                     field_name="tool_call_id",
                 ),
             },
-            deep=True,
         )
         stream = self._recover_tool_approval_private(request)
         async with _close_delegated_event_stream(stream) as owned_stream:
@@ -2821,7 +2818,7 @@ class CayuApp:
         if type(request) is not ToolRoundRecoveryRequest:
             raise TypeError("Runtime tool round recovery requires a ToolRoundRecoveryRequest.")
         session_id = await self._resolve_public_session_id(request.session_id)
-        request = request.model_copy(
+        request = copy_tool_round_recovery_request(request).model_copy(
             update={
                 "session_id": session_id,
                 "round_id": await self._resolve_public_action_linkage(
@@ -2835,7 +2832,6 @@ class CayuApp:
                     field_name="tool_call_id",
                 ),
             },
-            deep=True,
         )
         stream = self._recover_tool_round_private(request)
         async with _close_delegated_event_stream(stream) as owned_stream:
