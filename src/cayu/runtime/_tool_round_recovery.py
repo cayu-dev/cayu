@@ -102,6 +102,11 @@ class PendingToolRound(BaseModel):
         ge=1,
         le=MAX_DURABLE_JSON_INTEGER,
     )
+    structured_output_retries: StrictInt = Field(
+        default=0,
+        ge=0,
+        le=MAX_DURABLE_JSON_INTEGER,
+    )
     structured_output_validation: StructuredOutputValidation | None = None
 
     @field_validator("agent_name")
@@ -262,6 +267,8 @@ class PendingToolRound(BaseModel):
             raise ValueError(
                 "A structured-output finalizer attempt requires authoritative validation."
             )
+        if self.structured_output_retries and self.structured_output is None:
+            raise ValueError("Structured-output retry state requires a structured-output contract.")
         if self.policy_state == "planned" and self.policy_context_version != 1:
             raise ValueError("A planned pending tool round requires policy context version 1.")
         if self.policy_state == "unplanned":
@@ -724,6 +731,7 @@ def checkpoint_with_pending_tool_round(
     source_transcript_cursor: int | None = None,
     model_step: int | None = None,
     structured_output_attempt: int | None = None,
+    structured_output_retries: int = 0,
     structured_output_validation: StructuredOutputValidation | None = None,
 ) -> tuple[dict[str, Any], PendingToolRound]:
     copied_checkpoint = (
@@ -802,6 +810,7 @@ def checkpoint_with_pending_tool_round(
         source_transcript_cursor=source_transcript_cursor,
         model_step=model_step,
         structured_output_attempt=structured_output_attempt,
+        structured_output_retries=structured_output_retries,
         structured_output_validation=structured_output_validation,
     )
     _require_executable_pending_tool_round(pending_round)

@@ -149,6 +149,7 @@ from cayu.runtime.checkpoints import (
 from cayu.runtime.costs import ModelPrice, PriceBook
 from cayu.runtime.event_sinks import EventSink, InMemoryEventSink
 from cayu.runtime.sessions import (
+    MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     PERSISTED_EVENT_SIDE_EFFECT_ERROR_MAX_BYTES,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     BudgetReservationIdentityConflict,
@@ -7658,6 +7659,61 @@ def test_session_store_conformance_model_completion_stage_reopens_and_promotes_e
             assert await store.load_events(session_id) == list(publication.events)
             assert await store.load_model_completion_stage(session_id, stage_id) == completed.stage
             assert await store.load_active_model_completion_stage(session_id) == later_active
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_bounds_model_completion_recovery_context(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        try:
+            session_id = "sess_model_completion_recovery_context_bound"
+            stage_id = "model-step:recovery-context-bound"
+            await store.create(
+                RunRequest(agent_name="assistant", session_id=session_id, messages=[]),
+                identity=_identity(),
+            )
+            running = await store.transition_status(
+                session_id,
+                from_statuses={SessionStatus.PENDING},
+                to_status=SessionStatus.RUNNING,
+            )
+            recovery_context = {
+                "schema_version": 1,
+                "request_metadata": {"payload": "x" * 1024},
+            }
+            prepared = await store.prepare_model_completion_stage(
+                session_id,
+                request=ModelCompletionStageRequest(
+                    stage_id=stage_id,
+                    logical_step_id=stage_id,
+                    dispatch_ordinal=0,
+                    intent={"recovery_context": recovery_context},
+                ),
+                expected_statuses={SessionStatus.RUNNING},
+                expected_run_epoch=running.run_epoch,
+                expected_transcript_cursor=0,
+            )
+            assert prepared.stage.intent["recovery_context"] == recovery_context
+            assert (await store.load_model_completion_stage(session_id, stage_id)) == (
+                prepared.stage
+            )
+
+            with pytest.raises(ValidationError, match="exceeds the durable byte limit"):
+                ModelCompletionStageRequest(
+                    stage_id="model-step:oversized-recovery-context",
+                    logical_step_id="model-step:oversized-recovery-context",
+                    dispatch_ordinal=1,
+                    intent={
+                        "recovery_context": {
+                            "payload": "x" * MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
+                        }
+                    },
+                )
         finally:
             await _close_store(store)
 

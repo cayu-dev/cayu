@@ -91,7 +91,14 @@ from cayu.evals import (
 )
 from cayu.evals.models import WorkspaceFileProbe
 from cayu.evals.runner import _blocked_assertion_results, _build_child_trajectories
-from cayu.providers import ModelProvider, ModelStreamEvent
+from cayu.providers import (
+    ModelProvider,
+    ModelRequest,
+    ModelStreamEvent,
+    ProviderOperationMode,
+    ProviderOperationStartRequest,
+    ProviderOperationStatus,
+)
 from cayu.runtime import InMemorySessionStore, SessionIdentity
 from cayu.runtime.sessions import Session, SessionStatus
 from cayu.runtime.usage import SessionUsageSummary, build_aggregate_usage_metrics
@@ -1279,6 +1286,42 @@ def build():
 def test_scripted_provider_requires_completed_event():
     with pytest.raises(ValueError, match="COMPLETED"):
         ScriptedModelProvider([ModelStreamEvent.text_delta("no completion")])
+
+
+def test_scripted_provider_retrieves_the_same_completed_background_operation():
+    async def scenario() -> None:
+        provider = ScriptedModelProvider(
+            [
+                ModelStreamEvent.text_delta("completed offline"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            background=True,
+        )
+        adapter = provider.provider_operations
+        assert adapter is not None
+        connection = await adapter.start(
+            ProviderOperationStartRequest(
+                request=ModelRequest(
+                    model="fake-model",
+                    messages=[Message.text("user", "hello")],
+                ),
+                idempotency_key="provider-operation:test",
+            )
+        )
+        assert provider.provider_operation_mode is ProviderOperationMode.BACKGROUND
+        assert provider.background_operation_ids == (connection.state.operation_id,)
+
+        assert provider.complete_background_operation() == connection.state.operation_id
+        first = await adapter.retrieve(connection.state)
+        replay = await adapter.retrieve(connection.state)
+
+        assert first == replay
+        assert first.state.operation_id == connection.state.operation_id
+        assert first.status is ProviderOperationStatus.COMPLETED
+        assert len(provider.requests) == 1
+        assert provider.background_operation_ids == (connection.state.operation_id,)
+
+    asyncio.run(scenario())
 
 
 def test_event_not_occurred_pass_message_reads_naturally():

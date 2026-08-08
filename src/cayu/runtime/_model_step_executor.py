@@ -17,8 +17,10 @@ from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Any, Never, cast
+from typing import Any, Literal, Never, cast
 from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from cayu._exception_groups import (
     add_exception_note_safely,
@@ -56,6 +58,7 @@ from cayu.artifacts import (
 from cayu.core.agents import AgentSpec
 from cayu.core.billing import (
     BillingIdentity,
+    copy_billing_identity,
     resolved_billing_identity,
 )
 from cayu.core.events import Event, EventType, copy_event, event_with_runtime_payload_authority
@@ -191,6 +194,12 @@ from cayu.runtime.model_steps import (
     provider_state_count,
     thinking_count,
 )
+from cayu.runtime.provider_operations import (
+    ProviderOperationEvidenceError,
+    ProviderOperationRecoveryResult,
+    ProviderOperationRecoveryStatus,
+    RecoverableProviderOperation,
+)
 from cayu.runtime.retry_policy import (
     RetryDecision,
     RetryPolicy,
@@ -199,6 +208,7 @@ from cayu.runtime.retry_policy import (
     retry_event_payload,
 )
 from cayu.runtime.sessions import (
+    MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES,
     CheckpointTransform,
     EventOrder,
     EventQuery,
@@ -213,6 +223,7 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
     SessionStore,
 )
+from cayu.runtime.stop_policy import RunLimits
 from cayu.runtime.structured_output import (
     STRUCTURED_OUTPUT_TOOL_NAME,
     StructuredOutputSpec,
@@ -237,6 +248,123 @@ from cayu.vaults import SecretRedactor
 logger = logging.getLogger(__name__)
 _PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS = 5.0
 _PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS = 5.0
+MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES = MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
+MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES = 256
+MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS = 32
+_MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES = 512
+_MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS = 128
+_MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES = 256
+
+
+class ModelCompletionRecoveryContext(BaseModel):
+    """Secret-free run semantics required to publish an offline completion."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    schema_version: Literal[1] = 1
+    task_id: str | None = None
+    request_metadata: dict[str, Any] = Field(default_factory=dict)
+    structured_output: StructuredOutputSpec | None = None
+    thinking: ThinkingConfig | None = None
+    max_steps: StrictInt = Field(default=16, ge=1, le=256)
+    limits: RunLimits = Field(default_factory=RunLimits)
+    budget_limits: tuple[BudgetLimit, ...] = ()
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    structured_output_attempt: StrictInt | None = Field(default=None, ge=1)
+    billing_identity: BillingIdentity | None = None
+
+    @field_validator("task_id")
+    @classmethod
+    def validate_task_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return require_durable_clean_nonblank(value, "task_id")
+
+    @field_validator("request_metadata", mode="before")
+    @classmethod
+    def copy_request_metadata(cls, value: object) -> dict[str, Any]:
+        copied = copy_durable_json_object(value, "request_metadata")
+        if len(copied) > MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES:
+            raise ValueError(
+                "request_metadata cannot contain more than "
+                f"{MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES} entries."
+            )
+        return copied
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value: Any) -> tuple[BudgetLimit, ...]:
+        if (
+            type(value) in (list, tuple)
+            and len(value) > MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS
+        ):
+            raise ValueError(
+                "budget_limits cannot contain more than "
+                f"{MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS} limits."
+            )
+        return copy_request_budget_limits(value)
+
+    @field_validator("billing_identity", mode="after")
+    @classmethod
+    def copy_context_billing_identity(
+        cls,
+        value: BillingIdentity | None,
+    ) -> BillingIdentity | None:
+        return copy_billing_identity(value)
+
+    @model_validator(mode="after")
+    def validate_durable_bounds(self) -> ModelCompletionRecoveryContext:
+        for limit in self.budget_limits:
+            price_book = limit.pricing
+            if (
+                len(price_book.prices) > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
+                or len(price_book.resource_mappings) > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
+                or len(price_book.contextual_pricing_requirements)
+                > _MAX_MODEL_COMPLETION_RECOVERY_PRICE_ENTRIES
+            ):
+                raise ValueError("budget limit pricing collections exceed recovery bounds.")
+        if self.billing_identity is not None:
+            identity = self.billing_identity
+            if (
+                len(identity.request_evidence) > _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES
+                or len(identity.completion_evidence)
+                > _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES
+                or len(identity.pricing_contexts) > _MAX_MODEL_COMPLETION_RECOVERY_PRICING_CONTEXTS
+                or any(
+                    len(context.dimensions) > _MAX_MODEL_COMPLETION_RECOVERY_EVIDENCE_ENTRIES
+                    for context in identity.pricing_contexts
+                )
+            ):
+                raise ValueError("billing identity collections exceed recovery bounds.")
+        encoded = canonical_durable_json_bytes(
+            self.model_dump(mode="json"),
+            "model_completion_recovery_context",
+        )
+        if len(encoded) > MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES:
+            raise ValueError(
+                "model completion recovery context exceeds the durable byte limit of "
+                f"{MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES}."
+            )
+        return self
+
+
+ModelCompletionRecoveryContextFactory = Callable[
+    [BillingIdentity | None],
+    ModelCompletionRecoveryContext | None,
+]
+
+
+def model_completion_recovery_context_from_stage(
+    stage: ModelCompletionStage,
+) -> ModelCompletionRecoveryContext | None:
+    """Reconstruct the typed, secret-free continuation context from one stage."""
+
+    raw_context = stage.intent.get("recovery_context")
+    if raw_context is None:
+        return None
+    return ModelCompletionRecoveryContext.model_validate(
+        copy_durable_json_object(raw_context, "recovery_context")
+    )
 
 
 def _ambiguous_provider_operation_start_error(
@@ -692,9 +820,17 @@ def _model_completion_stage_intent(
     requested_model: str,
     source_transcript_cursor: int,
     request_fingerprint: str,
+    recovery_context: ModelCompletionRecoveryContext | None,
 ) -> dict[str, Any]:
     model_attempt_identity = copy_model_attempt_identity(model_attempt_identity)
-    return {
+    if (
+        recovery_context is not None
+        and type(recovery_context) is not ModelCompletionRecoveryContext
+    ):
+        raise TypeError(
+            "Model completion recovery context must be a ModelCompletionRecoveryContext."
+        )
+    intent = {
         "schema_version": 1,
         "purpose": "assistant-turn",
         **model_attempt_identity.payload(),
@@ -704,6 +840,9 @@ def _model_completion_stage_intent(
         "source_transcript_cursor": source_transcript_cursor,
         "request_fingerprint": request_fingerprint,
     }
+    if recovery_context is not None:
+        intent["recovery_context"] = recovery_context.model_dump(mode="json")
+    return intent
 
 
 def _non_turn_model_completion_event(
@@ -1259,6 +1398,303 @@ class ModelStepExecutor:
 
         task.add_done_callback(settled)
 
+    async def recover_provider_operation(
+        self,
+        *,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        environment_name: str | None,
+        recovery_context: ModelCompletionRecoveryContext | None,
+        model_completion_publisher: ModelCompletionPublisher,
+    ) -> ProviderOperationRecoveryResult:
+        """Retrieve and atomically publish one exact offline provider operation."""
+
+        provider = registered_provider.provider
+        adapter = provider.provider_operations
+        if (
+            provider.provider_operation_mode is not ProviderOperationMode.BACKGROUND
+            or not isinstance(
+                adapter,
+                ProviderOperationAdapter,
+            )
+        ):
+            raise RuntimeError(
+                "The registered provider no longer supports its durable background operation."
+            )
+        if operation.provider != registered_provider.name:
+            raise RuntimeError("Provider-operation recovery resolved a different provider.")
+        if operation.model_attempt_identity.model_step_id != stage.logical_step_id:
+            raise RuntimeError("Provider-operation recovery belongs to a different model stage.")
+        if (
+            recovery_context is not None
+            and type(recovery_context) is not ModelCompletionRecoveryContext
+        ):
+            raise TypeError("Provider-operation recovery context is invalid.")
+        if (
+            recovery_context is not None
+            and recovery_context.structured_output is not None
+            and recovery_context.structured_output.strategy is StructuredOutputStrategy.NATIVE
+        ):
+            raise ProviderOperationEvidenceError(
+                "Offline recovery of native structured output requires manual reconciliation."
+            )
+
+        async def require_recovery_owner() -> None:
+            current = await self._session_store.load(session.id)
+            if current is None:
+                raise KeyError(f"Session not found: {session.id}")
+            if current.run_epoch != session.run_epoch:
+                raise SessionRunFenced(
+                    "Provider-operation recovery run epoch is stale: expected "
+                    f"{session.run_epoch}, current {current.run_epoch}."
+                )
+            if current.status is SessionStatus.INTERRUPTING:
+                raise SessionInterruptedByRequest(session.id)
+
+        def recovery_event(event_type: EventType, *, status: str) -> Event:
+            event = _event_with_model_identity_authority(
+                Event(
+                    type=event_type,
+                    session_id=session.id,
+                    interaction_id=operation.interaction_id,
+                    agent_name=registered_agent.spec.name,
+                    environment_name=environment_name,
+                    payload={
+                        "provider": registered_provider.name,
+                        "model": session.model,
+                        "step": operation.step,
+                        "attempt": operation.attempt,
+                        "max_attempts": operation.max_attempts,
+                        **operation.model_attempt_identity.payload(),
+                        "source_run_epoch": operation.source_run_epoch,
+                        "run_epoch": session.run_epoch,
+                        "operation_id": operation.state.operation_id,
+                        "stream_protocol": operation.state.stream_protocol,
+                        "status": status,
+                    },
+                ),
+                operation.model_attempt_identity,
+            )
+            return event_with_runtime_payload_authority(
+                event,
+                "operation_id",
+                "stream_protocol",
+            )
+
+        await require_recovery_owner()
+        scheduled = await self._event_writer.emit(
+            recovery_event(
+                EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+                status=operation.status.value,
+            )
+        )
+        await require_recovery_owner()
+        started = await self._event_writer.emit(
+            recovery_event(
+                EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
+                status=operation.status.value,
+            )
+        )
+        await require_recovery_owner()
+        snapshot = copy_provider_operation_snapshot(await adapter.retrieve(operation.state))
+        if snapshot.state != operation.state:
+            raise RuntimeError("Provider operation retrieval returned a different identity.")
+        await require_recovery_owner()
+        if snapshot.status in {
+            ProviderOperationStatus.QUEUED,
+            ProviderOperationStatus.IN_PROGRESS,
+        }:
+            rescheduled = await self._event_writer.emit(
+                recovery_event(
+                    EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+                    status=snapshot.status.value,
+                )
+            )
+            return ProviderOperationRecoveryResult(
+                status=ProviderOperationRecoveryStatus.PENDING,
+                events=(scheduled, started, rescheduled),
+            )
+        if snapshot.status is not ProviderOperationStatus.COMPLETED:
+            raise RuntimeError(
+                "Provider operation cannot be recovered automatically from terminal status: "
+                f"{snapshot.status.value}."
+            )
+
+        assistant_parts: list[
+            transcript_helpers.AssistantTextPart
+            | transcript_helpers.AssistantThinkingPart
+            | ToolCallPart
+        ] = []
+        tool_calls: list[runtime_records.ToolCallRequest] = []
+        completed_boundary = None
+        completed_event: ModelStreamEvent | None = None
+        for raw_event in snapshot.events:
+            if completed_event is not None:
+                raise RuntimeError("Recovered provider operation emitted output after completion.")
+            boundary = _validate_stream_event(
+                raw_event,
+                provider_name=registered_provider.name,
+                requested_model=session.model,
+                usage_dialect=registered_provider.usage_dialect,
+            )
+            stream_event = boundary.event
+            if stream_event.type is ModelStreamEventType.TEXT_DELTA:
+                transcript_helpers.append_assistant_text_delta(
+                    assistant_parts,
+                    stream_event.delta,
+                )
+            elif stream_event.type is ModelStreamEventType.THINKING:
+                if recovery_context is None:
+                    raise ProviderOperationEvidenceError(
+                        "Legacy provider-operation evidence cannot safely reconstruct thinking "
+                        "transcript policy."
+                    )
+                transcript_helpers.append_assistant_thinking_delta(
+                    assistant_parts,
+                    stream_event.delta,
+                    provider_state=stream_event.payload.get("provider_state"),
+                    include=(
+                        recovery_context.thinking.include_in_transcript
+                        if recovery_context.thinking is not None
+                        else True
+                    ),
+                )
+            elif stream_event.type is ModelStreamEventType.TOOL_CALL:
+                if recovery_context is None:
+                    raise ProviderOperationEvidenceError(
+                        "Legacy provider-operation evidence cannot safely reconstruct a tool "
+                        "continuation."
+                    )
+                tool_call = transcript_helpers.parse_tool_call(stream_event.payload)
+                tool_calls.append(tool_call)
+                assistant_parts.append(transcript_helpers.tool_call_part(tool_call))
+            elif stream_event.type is ModelStreamEventType.ERROR:
+                provider_error = model_provider_error_from_payload(
+                    stream_event.payload,
+                    fallback_provider=registered_provider.name,
+                )
+                raise provider_error or RuntimeError("Recovered provider operation failed.")
+            elif stream_event.type is ModelStreamEventType.COMPLETED:
+                if boundary.completion_error is not None:
+                    raise ModelProviderError(
+                        "Recovered provider operation returned invalid completion metadata.",
+                        provider=registered_provider.name,
+                        error_type="DurableValueError",
+                        error_code="invalid_model_completion_value",
+                        retryable=False,
+                    )
+                completed_boundary = boundary
+                completed_event = stream_event
+            else:  # pragma: no cover - boundary validation owns the closed event vocabulary
+                raise RuntimeError("Recovered provider operation returned an unsupported event.")
+        if completed_event is None or completed_boundary is None:
+            raise RuntimeError("Completed provider operation returned no completed event.")
+
+        _require_unique_tool_call_ids(tool_calls)
+        provider_state_parts = transcript_helpers.provider_state_parts(completed_event.payload)
+        assistant_message = transcript_helpers.assistant_message(
+            content_parts=assistant_parts,
+            provider_state_parts=provider_state_parts,
+        )
+        step_result = _assistant_step_result(
+            session_id=session.id,
+            step=operation.step,
+            model_attempt_identity=operation.model_attempt_identity,
+            assistant_message=assistant_message,
+            tool_calls=tool_calls,
+            completion=_stream_event_completion(completed_event),
+        )
+        classification = classify_assistant_step(step_result)
+        billing_identity = resolve_completion_billing_identity(
+            provider,
+            (None if recovery_context is None else recovery_context.billing_identity),
+            copy_durable_json_object(completed_event.payload, "completed_payload"),
+            provider_name=registered_provider.name,
+        )
+        completion_event = _model_stream_event_to_runtime_event(
+            completed_event,
+            session=session,
+            registered_agent=registered_agent,
+            environment_name=environment_name,
+            provider_name=registered_provider.name,
+            step=operation.step,
+            attempt=operation.attempt,
+            max_attempts=operation.max_attempts,
+            model_attempt_identity=operation.model_attempt_identity,
+            tool_round_identity=step_result.tool_round_identity,
+            classification=classification.payload(),
+            transcript_cursor_after_completion=(
+                stage.source_transcript_cursor
+                + int(assistant_message is not None and not tool_calls)
+            ),
+            usage_dialect=registered_provider.usage_dialect,
+            billing_identity=billing_identity,
+            accounting_usage_metrics=completed_boundary.accounting_usage_metrics,
+            accounting_usage_rejected=completed_boundary.accounting_usage_rejected,
+            usage_normalization_failed=completed_boundary.usage_normalization_failed,
+        )
+        completion_event = self._event_writer.prepare(completion_event)
+        durable_step_result = _durable_assistant_step_result(
+            step_result,
+            redactor=self._secret_redactor,
+        )
+        structured_output_validation = None
+        if (
+            recovery_context is not None
+            and recovery_context.structured_output is not None
+            and recovery_context.structured_output.strategy is StructuredOutputStrategy.TOOL
+            and any(call.name == STRUCTURED_OUTPUT_TOOL_NAME for call in tool_calls)
+        ):
+            structured_output_validation = _redact_structured_output_validation(
+                _validate_structured_output_tool_round(
+                    tool_calls=tool_calls,
+                    spec=recovery_context.structured_output,
+                ),
+                self._secret_redactor,
+            )
+        request_fingerprint = stage.intent.get("request_fingerprint")
+        if type(request_fingerprint) is not str:
+            raise RuntimeError("Provider-operation stage lost its request fingerprint.")
+        publication = ModelCompletionPublicationRequest(
+            dispatch=ModelCompletionDispatch(
+                stage=stage,
+                request_fingerprint=request_fingerprint,
+            ),
+            assistant_step_result=durable_step_result,
+            completion_event=completion_event,
+            authoritative_assistant_message=durable_step_result.assistant_message,
+            defer_assistant_message=bool(tool_calls),
+            structured_output_validation=structured_output_validation,
+        )
+        await _publish_model_completion(
+            model_completion_publisher,
+            publication,
+            terminal_failure=None,
+            publication_cancellation=None,
+        )
+        reconciled = recovery_event(
+            EventType.PROVIDER_OPERATION_RECONCILED,
+            status=snapshot.status.value,
+        )
+        try:
+            reconciled = await self._event_writer.emit(reconciled)
+        except Exception as delivery_error:
+            logger.warning(
+                "Provider operation completed durably but reconciliation telemetry failed: "
+                "session_id=%s operation_id=%s error_type=%s",
+                session.id,
+                operation.state.operation_id,
+                type(delivery_error).__name__,
+            )
+        return ProviderOperationRecoveryResult(
+            status=ProviderOperationRecoveryStatus.RECONCILED,
+            events=(scheduled, started, reconciled),
+            completion_event=completion_event,
+        )
+
     def create_run(
         self,
         *,
@@ -1279,6 +1715,9 @@ class ModelStepExecutor:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        model_completion_recovery_context_factory: (
+            ModelCompletionRecoveryContextFactory | None
+        ) = None,
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> ModelStepRun:
         return ModelStepRun(
@@ -1300,6 +1739,14 @@ class ModelStepExecutor:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            model_completion_recovery_context_factory=(
+                model_completion_recovery_context_factory
+                or (
+                    lambda billing_identity: ModelCompletionRecoveryContext(
+                        billing_identity=billing_identity
+                    )
+                )
+            ),
             model_completion_publisher=model_completion_publisher,
         )
 
@@ -2877,6 +3324,7 @@ class ModelStepRun:
         run_started_at: float,
         turn_usage_tracker: SessionUsageTracker | None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None,
+        model_completion_recovery_context_factory: ModelCompletionRecoveryContextFactory,
         model_completion_publisher: ModelCompletionPublisher | None = None,
     ) -> None:
         self._executor = executor
@@ -2897,6 +3345,7 @@ class ModelStepRun:
         self._run_started_at = run_started_at
         self._turn_usage_tracker = turn_usage_tracker
         self._active_run = active_run
+        self._model_completion_recovery_context_factory = model_completion_recovery_context_factory
         self._reservation_identity_guard = (
             self._executor._run_limit_controller.reservation_identity_guard()
         )
@@ -3462,12 +3911,21 @@ class ModelStepRun:
                     raise RuntimeError(
                         "Model completion stage attempt belongs to a different model step."
                     )
+                recovery_context = self._model_completion_recovery_context_factory(billing_identity)
+                if (
+                    recovery_context is not None
+                    and type(recovery_context) is not ModelCompletionRecoveryContext
+                ):
+                    raise TypeError(
+                        "Model completion recovery context factory returned an invalid value."
+                    )
                 intent = _model_completion_stage_intent(
                     model_attempt_identity=pending_model_attempt_identity,
                     provider_name=self._registered_provider.name,
                     requested_model=attempt_model_request.model,
                     source_transcript_cursor=source_transcript_cursor,
                     request_fingerprint=request_fingerprint,
+                    recovery_context=recovery_context,
                 )
                 prepared = await self._executor._session_store.prepare_model_completion_stage(
                     self._session.id,

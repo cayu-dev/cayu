@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,11 +12,16 @@ from cayu.providers.operations import (
     PROVIDER_OPERATION_ID_MAX_CHARS,
     PROVIDER_OPERATION_STREAM_PROTOCOL_MAX_CHARS,
 )
-from cayu.runtime.sessions import EventOrder, EventQuery, SessionStore
+from cayu.runtime.execution_units import ModelAttemptIdentity
+from cayu.runtime.sessions import (
+    EventOrder,
+    EventQuery,
+    ModelCompletionStage,
+    SessionStore,
+)
 from cayu.runtime.usage import is_conversational_model_completion_payload
 
-_INSPECTION_EVENT_TYPES = (
-    EventType.MODEL_STARTED,
+_INSPECTION_ATTEMPT_EVENT_TYPES = (
     EventType.PROVIDER_OPERATION_STARTING,
     EventType.PROVIDER_OPERATION_STARTED,
     EventType.MODEL_COMPLETED,
@@ -23,6 +29,7 @@ _INSPECTION_EVENT_TYPES = (
     EventType.MODEL_ATTEMPT_DISCARDED,
 )
 _INSPECTION_EVENT_LIMIT = 8
+_RECOVERY_EVIDENCE_LIMIT = 2
 _MODEL_IDENTITY_PAYLOAD_FIELDS = (
     "step",
     "attempt",
@@ -30,11 +37,28 @@ _MODEL_IDENTITY_PAYLOAD_FIELDS = (
     "model_step_id",
     "model_attempt_id",
 )
+_RECOVERY_EVENT_TYPES = frozenset(
+    {
+        EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+        EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
+        EventType.PROVIDER_OPERATION_RECONCILED,
+    }
+)
+_RECOVERY_OUTPUT_EVENT_TYPES = (
+    EventType.MODEL_TEXT_DELTA,
+    EventType.MODEL_THINKING_DELTA,
+    EventType.MODEL_ERROR,
+    EventType.MODEL_COMPLETED,
+    EventType.MODEL_ATTEMPT_DISCARDED,
+)
 
 
 class ProviderOperationInspectionStatus(StrEnum):
     SYNCHRONOUS = "synchronous"
     PROVIDER_OPERATION_IN_PROGRESS = "provider_operation_in_progress"
+    RECONNECT_SCHEDULED = "reconnect_scheduled"
+    RECONNECT_IN_PROGRESS = "reconnect_in_progress"
+    PROVIDER_OPERATION_RECONCILED = "provider_operation_reconciled"
 
 
 class ProviderOperationInspection(BaseModel):
@@ -56,6 +80,38 @@ class ProviderOperationInspection(BaseModel):
 
 class ProviderOperationEvidenceError(RuntimeError):
     """Durable provider-operation evidence is malformed or contradictory."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecoverableProviderOperation:
+    """Exact durable operation identity bound to one active completion stage."""
+
+    interaction_id: str
+    provider: str
+    model: str
+    model_attempt_identity: ModelAttemptIdentity
+    state: ProviderOperationState
+    status: ProviderOperationStatus
+    step: int
+    attempt: int
+    max_attempts: int
+    source_run_epoch: int
+
+
+class ProviderOperationRecoveryStatus(StrEnum):
+    """Outcome of one fenced provider-operation retrieval attempt."""
+
+    PENDING = "pending"
+    RECONCILED = "reconciled"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderOperationRecoveryResult:
+    """Events and state produced by one exact-operation recovery attempt."""
+
+    status: ProviderOperationRecoveryStatus
+    events: tuple[Event, ...]
+    completion_event: Event | None = None
 
 
 def _model_identity(event: Event, *, label: str) -> tuple[object, ...]:
@@ -111,41 +167,172 @@ def _completion_scope(event: Event, *, label: str) -> tuple[str, str]:
     return provider, model
 
 
+def _parse_operation_event(event: Event) -> RecoverableProviderOperation:
+    try:
+        _model_identity(event, label="Provider-operation recovery evidence")
+        provider, model = _provider_scope(
+            event,
+            label="Provider-operation recovery evidence",
+        )
+        source_run_epoch = _provider_operation_epoch(
+            event,
+            label="Provider-operation recovery evidence",
+        )
+        identity = ModelAttemptIdentity.model_validate(
+            {
+                "model_step_id": event.payload.get("model_step_id"),
+                "model_attempt_id": event.payload.get("model_attempt_id"),
+            }
+        )
+        state = ProviderOperationState.model_validate(
+            {
+                "version": event.payload.get("state_version"),
+                "operation_id": event.payload.get("operation_id"),
+                "stream_protocol": event.payload.get("stream_protocol"),
+                "recovery_metadata": event.payload.get("recovery_metadata", {}),
+            }
+        )
+        status = ProviderOperationStatus(event.payload.get("status"))
+        step = event.payload.get("step")
+        attempt = event.payload.get("attempt")
+        max_attempts = event.payload.get("max_attempts")
+        start_id = event.payload.get("start_id")
+        if (
+            event.interaction_id is None
+            or type(step) is not int
+            or type(attempt) is not int
+            or type(max_attempts) is not int
+            or type(start_id) is not str
+        ):
+            raise ValueError
+        start_id = require_durable_clean_nonblank(start_id, "start_id")
+        if len(start_id) > 1024:
+            raise ValueError
+    except (ProviderOperationEvidenceError, TypeError, ValueError):
+        raise ProviderOperationEvidenceError(
+            "Provider-operation recovery evidence is malformed."
+        ) from None
+    return RecoverableProviderOperation(
+        interaction_id=event.interaction_id,
+        provider=provider,
+        model=model,
+        model_attempt_identity=identity,
+        state=state,
+        status=status,
+        step=step,
+        attempt=attempt,
+        max_attempts=max_attempts,
+        source_run_epoch=source_run_epoch,
+    )
+
+
+async def load_recoverable_provider_operation(
+    session_store: SessionStore,
+    stage: ModelCompletionStage,
+) -> RecoverableProviderOperation | None:
+    """Load one bounded operation identity that exactly matches an active stage."""
+
+    records = await session_store.query_events(
+        EventQuery(
+            session_id=stage.session_id,
+            event_type=EventType.PROVIDER_OPERATION_STARTED,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=_RECOVERY_EVIDENCE_LIMIT,
+        )
+    )
+    if not records:
+        return None
+    latest = _parse_operation_event(records[0].event)
+    raw_attempt_id = stage.intent.get("model_attempt_id")
+    raw_provider = stage.intent.get("provider_name")
+    raw_model = stage.intent.get("requested_model")
+    if (
+        latest.model_attempt_identity.model_step_id != stage.logical_step_id
+        or latest.model_attempt_identity.model_attempt_id != raw_attempt_id
+        or latest.provider != raw_provider
+        or latest.model != raw_model
+        or latest.source_run_epoch != stage.source_run_epoch
+    ):
+        return None
+    if len(records) > 1:
+        prior = _parse_operation_event(records[1].event)
+        if prior.model_attempt_identity == latest.model_attempt_identity:
+            raise ProviderOperationEvidenceError(
+                "Active model attempt has more than one durable provider-operation identity."
+            )
+    for event_type in _RECOVERY_OUTPUT_EVENT_TYPES:
+        accepted = await session_store.query_events(
+            EventQuery(
+                session_id=stage.session_id,
+                event_type=event_type,
+                after_sequence=records[0].sequence,
+                order_by=EventOrder.SEQUENCE_ASC,
+                limit=1,
+            )
+        )
+        if accepted:
+            raise ProviderOperationEvidenceError(
+                "Provider-operation recovery is unsafe after provider output crossed "
+                "Cayu's durable event boundary."
+            )
+    return latest
+
+
 async def inspect_provider_operation(
     session_store: SessionStore,
     session_id: str,
 ) -> ProviderOperationInspection:
     """Inspect at most one latest model attempt without hydrating stream deltas."""
 
-    records = await session_store.query_events(
+    started_records = await session_store.query_events(
         EventQuery(
             session_id=session_id,
-            event_types=_INSPECTION_EVENT_TYPES,
+            event_type=EventType.MODEL_STARTED,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    if not started_records:
+        return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
+    started_record = started_records[0]
+    current_identity = _model_identity(
+        started_record.event,
+        label="Latest model-attempt evidence",
+    )
+    current_provider_scope = _provider_scope(
+        started_record.event,
+        label="Latest model-attempt evidence",
+    )
+    attempt_records = await session_store.query_events(
+        EventQuery(
+            session_id=session_id,
+            event_types=_INSPECTION_ATTEMPT_EVENT_TYPES,
+            after_sequence=started_record.sequence,
             order_by=EventOrder.SEQUENCE_DESC,
             limit=_INSPECTION_EVENT_LIMIT,
         )
     )
-    current_identity: tuple[object, ...] | None = None
-    current_provider_scope: tuple[str, str] | None = None
-    later_events: list[Event] = []
-    for record in records:
-        event = record.event
-        if event.type == EventType.MODEL_STARTED:
-            current_identity = _model_identity(event, label="Latest model-attempt evidence")
-            current_provider_scope = _provider_scope(
-                event,
-                label="Latest model-attempt evidence",
-            )
-            break
-        later_events.append(event)
-    if current_identity is None:
-        if len(records) == _INSPECTION_EVENT_LIMIT:
-            raise ProviderOperationEvidenceError(
-                "Latest model-attempt evidence exceeds the bounded inspection window."
-            )
-        return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
-    if current_provider_scope is None:  # pragma: no cover - assigned with current_identity
-        raise ProviderOperationEvidenceError("Latest model-attempt provider scope is unavailable.")
+    if len(attempt_records) == _INSPECTION_EVENT_LIMIT:
+        raise ProviderOperationEvidenceError(
+            "Latest model-attempt evidence exceeds the bounded inspection window."
+        )
+    recovery_records = await session_store.query_events(
+        EventQuery(
+            session_id=session_id,
+            event_types=tuple(_RECOVERY_EVENT_TYPES),
+            after_sequence=started_record.sequence,
+            order_by=EventOrder.SEQUENCE_DESC,
+            limit=1,
+        )
+    )
+    later_events = [
+        record.event
+        for record in sorted(
+            [*attempt_records, *recovery_records],
+            key=lambda record: record.sequence,
+            reverse=True,
+        )
+    ]
 
     starting_events = [
         event for event in later_events if event.type == EventType.PROVIDER_OPERATION_STARTING
@@ -153,6 +340,7 @@ async def inspect_provider_operation(
     operation_events = [
         event for event in later_events if event.type == EventType.PROVIDER_OPERATION_STARTED
     ]
+    recovery_events = [event for event in later_events if event.type in _RECOVERY_EVENT_TYPES]
     owning_events = [
         event
         for event in later_events
@@ -160,6 +348,7 @@ async def inspect_provider_operation(
         in {
             EventType.PROVIDER_OPERATION_STARTING,
             EventType.PROVIDER_OPERATION_STARTED,
+            *_RECOVERY_EVENT_TYPES,
             EventType.MODEL_ERROR,
             EventType.MODEL_ATTEMPT_DISCARDED,
         }
@@ -181,7 +370,7 @@ async def inspect_provider_operation(
             raise ProviderOperationEvidenceError(
                 "Model completion evidence is bound to a different provider or model."
             )
-    provider_evidence = [*starting_events, *operation_events]
+    provider_evidence = [*starting_events, *operation_events, *recovery_events]
     for evidence in provider_evidence:
         if _provider_scope(evidence, label="Provider-operation evidence") != current_provider_scope:
             raise ProviderOperationEvidenceError(
@@ -201,6 +390,10 @@ async def inspect_provider_operation(
         and _model_identity(event, label="Model completion evidence") == current_identity
         for event in owning_events
     )
+    if recovery_events and not operation_events:
+        raise ProviderOperationEvidenceError(
+            "Provider-operation recovery evidence has no durable operation identity."
+        )
     if not operation_events and not starting_events:
         return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
     parsed_starting: list[tuple[str, str]] = []
@@ -273,7 +466,37 @@ async def inspect_provider_operation(
             "Provider-operation starting and started evidence is contradictory for the latest "
             "model attempt."
         )
-    if terminal_seen or status.terminal:
+    for recovery_event in recovery_events:
+        if (
+            recovery_event.payload.get("operation_id") != state.operation_id
+            or recovery_event.payload.get("stream_protocol") != state.stream_protocol
+        ):
+            raise ProviderOperationEvidenceError(
+                "Provider-operation recovery evidence is bound to a different operation."
+            )
+    latest_recovery_type = recovery_events[0].type if recovery_events else None
+    if terminal_seen or latest_recovery_type == EventType.PROVIDER_OPERATION_RECONCILED:
+        return ProviderOperationInspection(
+            status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED,
+            provider=provider,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+        )
+    if latest_recovery_type == EventType.PROVIDER_OPERATION_RECONNECT_STARTED:
+        return ProviderOperationInspection(
+            status=ProviderOperationInspectionStatus.RECONNECT_IN_PROGRESS,
+            provider=provider,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+        )
+    if latest_recovery_type == EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED:
+        return ProviderOperationInspection(
+            status=ProviderOperationInspectionStatus.RECONNECT_SCHEDULED,
+            provider=provider,
+            operation_id=state.operation_id,
+            stream_protocol=state.stream_protocol,
+        )
+    if status.terminal:
         return ProviderOperationInspection(status=ProviderOperationInspectionStatus.SYNCHRONOUS)
     return ProviderOperationInspection(
         status=ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS,
@@ -287,5 +510,9 @@ __all__ = [
     "ProviderOperationEvidenceError",
     "ProviderOperationInspection",
     "ProviderOperationInspectionStatus",
+    "ProviderOperationRecoveryResult",
+    "ProviderOperationRecoveryStatus",
+    "RecoverableProviderOperation",
     "inspect_provider_operation",
+    "load_recoverable_provider_operation",
 ]

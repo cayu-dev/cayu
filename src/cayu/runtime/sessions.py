@@ -2212,6 +2212,7 @@ MODEL_COMPLETION_WINNER_RECORD_TYPE = "cayu.model-completion-stage.winner"
 MODEL_COMPLETION_STAGE_ABANDONMENT_RECORD_TYPE = "cayu.model-completion-stage.abandoned"
 MODEL_COMPLETION_STAGE_SCHEMA_VERSION = 1
 MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY = MODEL_COMPLETION_STAGE_OPERATION_KEY_PREFIX + "active"
+MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES = 256 * 1024
 _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS = frozenset({"failed", "filtered", "invalid", "length"})
 _MESSAGELESS_MODEL_COMPLETION_CLASSIFICATIONS = _NON_TURN_MODEL_COMPLETION_CLASSIFICATIONS | {
     "continue"
@@ -2239,7 +2240,25 @@ class ModelCompletionStageRequest(BaseModel):
     @field_validator("intent", mode="before")
     @classmethod
     def copy_intent(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "intent")
+        copied = copy_durable_json_object(value, "intent")
+        recovery_context = copied.get("recovery_context")
+        if recovery_context is not None:
+            if type(recovery_context) is not dict:
+                raise ValueError("intent.recovery_context must be an object.")
+            if (
+                len(
+                    canonical_durable_json_bytes(
+                        recovery_context,
+                        "intent.recovery_context",
+                    )
+                )
+                > MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES
+            ):
+                raise ValueError(
+                    "intent.recovery_context exceeds the durable byte limit of "
+                    f"{MODEL_COMPLETION_RECOVERY_CONTEXT_MAX_BYTES}."
+                )
+        return copied
 
     @field_validator("reservation_ids", mode="before")
     @classmethod
@@ -12798,6 +12817,7 @@ def _validate_assistant_model_completion_publication(
         "source_transcript_cursor",
         "model_step",
         "structured_output_attempt",
+        "structured_output_retries",
         "structured_output_validation",
     }
     marker_keys = set(marker)

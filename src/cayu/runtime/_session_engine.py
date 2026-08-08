@@ -62,6 +62,7 @@ from cayu.environments import (
     EnvironmentFactoryOperation,
 )
 from cayu.providers import (
+    ProviderOperationMode,
     UsageDialect,
     copy_usage_dialect,
 )
@@ -116,6 +117,7 @@ from cayu.runtime._model_errors import (
 from cayu.runtime._model_step_executor import (
     ModelCompletionPublicationRequest,
     ModelCompletionPublicationResult,
+    ModelCompletionRecoveryContext,
     ModelStepBudgetEvaluationRequest,
     ModelStepBudgetReservationFailureRequest,
     ModelStepExecutor,
@@ -7147,6 +7149,25 @@ class SessionEngine:
                 session
             )
             session = model_boundary.session
+            for recovery_event in model_boundary.recovery_events:
+                yield copy_event(recovery_event)
+            if (
+                model_boundary.state == "provider_operation_reconciled"
+                and model_boundary.completion_event is not None
+            ):
+                yield copy_event(model_boundary.completion_event)
+            if model_boundary.state == "provider_operation_pending":
+                await self._clear_session_run_operation(
+                    session_id=session.id,
+                    operation_id=run_operation_id,
+                )
+                await self.session_store.update_status(
+                    session.id,
+                    SessionStatus.INTERRUPTED,
+                )
+                await self.session_store.release_run_fence(session.id)
+                _deactivate_session_interaction(session.id)
+                return
             if request.model is not None:
                 session = await self.session_store.update_model(session.id, request.model)
             transcript = await self.session_store.load_transcript(session.id)
@@ -7691,6 +7712,7 @@ class SessionEngine:
         budget_limits: tuple[BudgetLimit, ...],
         retry_policy: RetryPolicy,
         structured_output_attempt: int | None,
+        structured_output_retries: int,
     ) -> ModelCompletionPublicationResult:
         """Commit one staged model completion and its next durable action atomically."""
 
@@ -7753,6 +7775,7 @@ class SessionEngine:
                     source_transcript_cursor=(publication.dispatch.stage.source_transcript_cursor),
                     model_step=assistant_step_result.step,
                     structured_output_attempt=structured_output_attempt,
+                    structured_output_retries=structured_output_retries,
                     structured_output_validation=(publication.structured_output_validation),
                 )
             )
@@ -8147,6 +8170,11 @@ class SessionEngine:
                 entrance_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
                     checkpoint
                 )
+                if entrance_pending_round is not None:
+                    structured_output_retries = max(
+                        structured_output_retries,
+                        entrance_pending_round.structured_output_retries,
+                    )
                 pending_result_cursor = pending_tool_round_source_transcript_cursor + int(
                     entrance_pending_round is None
                     or entrance_pending_round.assistant_message_state == "published"
@@ -8286,6 +8314,42 @@ class SessionEngine:
                 active_run=active_run,
             )
 
+            def model_completion_recovery_context(
+                billing_identity: BillingIdentity | None,
+            ) -> ModelCompletionRecoveryContext | None:
+                if (
+                    registered_provider.provider.provider_operation_mode
+                    is not ProviderOperationMode.BACKGROUND
+                ):
+                    return None
+                context = ModelCompletionRecoveryContext(
+                    task_id=task_id,
+                    request_metadata=request_metadata,
+                    structured_output=structured_output,
+                    thinking=effective_thinking,
+                    max_steps=max_steps,
+                    limits=limits,
+                    budget_limits=budget_limits,
+                    retry_policy=retry_policy,
+                    structured_output_attempt=(
+                        structured_output_retries + 1
+                        if (
+                            structured_output is not None
+                            and structured_output.strategy == StructuredOutputStrategy.TOOL
+                        )
+                        else None
+                    ),
+                    billing_identity=billing_identity,
+                )
+                payload = context.model_dump(mode="json")
+                if self._secret_redactor.redact_json(payload) != payload:
+                    raise ValueError(
+                        "Background provider-operation recovery semantics contain a workload "
+                        "secret and cannot be persisted exactly; the provider operation was "
+                        "not started."
+                    )
+                return context
+
             async def publish_model_completion(
                 publication: ModelCompletionPublicationRequest,
             ) -> ModelCompletionPublicationResult:
@@ -8314,6 +8378,7 @@ class SessionEngine:
                         )
                         else None
                     ),
+                    structured_output_retries=structured_output_retries,
                 )
 
             model_step_run = self._model_step_executor.create_run(
@@ -8334,6 +8399,7 @@ class SessionEngine:
                 run_started_at=run_started_at,
                 turn_usage_tracker=turn_usage_tracker,
                 active_run=active_run,
+                model_completion_recovery_context_factory=(model_completion_recovery_context),
                 model_completion_publisher=publish_model_completion,
             )
             model_steps = () if skip_model_steps else range(1, max_steps + 1)

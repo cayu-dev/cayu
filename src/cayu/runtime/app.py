@@ -87,10 +87,14 @@ from cayu.runtime._interruption_coordinator import (
     BackgroundInterruptionCoordinator,
 )
 from cayu.runtime._model_step_executor import (
+    ModelCompletionPublicationRequest,
+    ModelCompletionPublicationResult,
+    ModelCompletionRecoveryContext,
     ModelStepBudgetEvaluationRequest,
     ModelStepBudgetReservationFailureRequest,
     ModelStepExecutor,
     ModelStepLimitEvaluationRequest,
+    model_completion_recovery_context_from_stage,
 )
 from cayu.runtime._recovery_coordinator import (
     RecoveryAbandonedTurnRequest,
@@ -119,6 +123,7 @@ from cayu.runtime._session_engine import (
     _validate_run_request,
 )
 from cayu.runtime._session_queries import query_all_event_records, query_all_sessions
+from cayu.runtime._structured_output_tool_round import _has_structured_output_tool_call
 from cayu.runtime._tool_round_executor import (
     InterruptedToolRoundRequest,
     ToolRoundExecutor,
@@ -192,6 +197,10 @@ from cayu.runtime.mcp_manifest_policy import (
     McpManifestPolicy,
     copy_mcp_manifest_policy,
 )
+from cayu.runtime.provider_operations import (
+    ProviderOperationRecoveryResult,
+    RecoverableProviderOperation,
+)
 from cayu.runtime.public_authority import (
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
@@ -216,6 +225,7 @@ from cayu.runtime.sessions import (
     IncompleteSessionsRecoveryRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
+    ModelCompletionStage,
     PendingActionQuery,
     PendingActionResultTooLarge,
     ResumeRequest,
@@ -673,6 +683,7 @@ class CayuApp:
             ),
             abandoned_turn_completed=self._complete_abandoned_recovery_turn,
             resume_interaction=self._resume_recovery_interaction,
+            recover_provider_operation=self._recover_provider_operation,
         )
         self._background_interruption_coordinator = BackgroundInterruptionCoordinator(
             session_store=self._runtime_session_store,
@@ -1586,6 +1597,62 @@ class CayuApp:
                 size_bytes=artifact.size_bytes,
                 metadata=artifact.metadata,
             )
+        )
+
+    async def _recover_provider_operation(
+        self,
+        session: Session,
+        stage: ModelCompletionStage,
+        operation: RecoverableProviderOperation,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_provider: runtime_records.RegisteredProvider,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+    ) -> ProviderOperationRecoveryResult:
+        recovery_context = model_completion_recovery_context_from_stage(stage)
+        publication_context = recovery_context or ModelCompletionRecoveryContext()
+
+        async def publish(
+            publication: ModelCompletionPublicationRequest,
+        ) -> ModelCompletionPublicationResult:
+            return await self._session_engine._publish_assistant_model_completion(
+                publication,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                task_id=publication_context.task_id,
+                request_metadata=publication_context.request_metadata,
+                structured_output=publication_context.structured_output,
+                thinking=publication_context.thinking,
+                max_steps=publication_context.max_steps,
+                limits=publication_context.limits,
+                budget_limits=publication_context.budget_limits,
+                retry_policy=publication_context.retry_policy,
+                structured_output_attempt=(
+                    publication_context.structured_output_attempt
+                    if (
+                        publication.assistant_step_result is not None
+                        and _has_structured_output_tool_call(
+                            publication.assistant_step_result.tool_calls
+                        )
+                    )
+                    else None
+                ),
+                structured_output_retries=(
+                    max(publication_context.structured_output_attempt - 1, 0)
+                    if publication_context.structured_output_attempt is not None
+                    else 0
+                ),
+            )
+
+        return await self._model_step_executor.recover_provider_operation(
+            session=session,
+            stage=stage,
+            operation=operation,
+            registered_agent=registered_agent,
+            registered_provider=registered_provider,
+            environment_name=_environment_name(registered_environment),
+            recovery_context=recovery_context,
+            model_completion_publisher=publish,
         )
 
     def _get_registered_provider(

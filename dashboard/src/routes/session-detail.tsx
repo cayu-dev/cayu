@@ -2656,6 +2656,12 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             {session.model && <Badge variant="outline">{session.model}</Badge>}
             {state?.provider_operation.status === "provider_operation_in_progress" ? (
               <Badge variant="secondary">Provider operation in progress</Badge>
+            ) : state?.provider_operation.status === "reconnect_scheduled" ? (
+              <Badge variant="secondary">Provider reconnect scheduled</Badge>
+            ) : state?.provider_operation.status === "reconnect_in_progress" ? (
+              <Badge variant="secondary">Provider reconnect in progress</Badge>
+            ) : state?.provider_operation.status === "provider_operation_reconciled" ? (
+              <Badge variant="outline">Provider operation reconciled</Badge>
             ) : state?.provider_operation.status === "synchronous" ? (
               <Badge variant="outline">Synchronous provider</Badge>
             ) : null}

@@ -55,10 +55,12 @@ JSONL row also carries the schema version so independently consumed
 `model_call`, `unmatched_ledger`, and `aggregate` records cannot be mistaken for
 the version 1 representation.
 
-Session-inspection CLI schema version `4` adds the bounded
-`provider_operation` object to `session show`; its status is either
-`synchronous` or `provider_operation_in_progress`, and the latter includes only
-the provider, operation id, and stream protocol. Version `4` retains version
+Session-inspection CLI schema version `5` extends the bounded
+`provider_operation` object with `reconnect_scheduled`,
+`reconnect_in_progress`, and `provider_operation_reconciled` states. These and
+`provider_operation_in_progress` include only the provider, operation id, and
+stream protocol; private recovery metadata is never exposed. Version `5`
+retains version `4`'s `synchronous` state and provider-operation object, version
 `3`'s durable `interaction_id` correlation to event and transcript records, an
 `interactions` collection, and response-scoped filters. It retains version
 `2`'s identity-free aggregate usage

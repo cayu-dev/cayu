@@ -6,9 +6,11 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from cayu._exception_groups import exception_cause, set_exception_cause
-from cayu.core import AgentSpec, EventType, Message
+from cayu.core import AgentSpec, EventType, Message, ThinkingConfig
+from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event
 from cayu.providers import (
     ModelContextOverflowError,
@@ -32,13 +34,18 @@ from cayu.runtime import (
     PersistedEventSideEffectClaim,
     RecentTurnsContextPolicy,
     RetryPolicy,
+    RunLimits,
     RunRequest,
     SessionIdentity,
     SessionRunFenced,
     SessionStatus,
 )
 from cayu.runtime._model_step_executor import (
+    MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS,
+    MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES,
+    MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES,
     ModelAttemptFailed,
+    ModelCompletionRecoveryContext,
     _raise_terminal_model_attempt_failure,
 )
 from cayu.runtime.provider_operations import (
@@ -46,6 +53,7 @@ from cayu.runtime.provider_operations import (
     ProviderOperationInspectionStatus,
     inspect_provider_operation,
 )
+from cayu.runtime.sessions import ModelCompletionStageRequest, ModelCompletionStageResult
 from cayu.vaults import SecretRedactor
 
 
@@ -346,6 +354,52 @@ class _ReconnectableProvider(ModelProvider):
         return events()
 
 
+class _ContextualReconnectableProvider(_ReconnectableProvider):
+    def __init__(self, identity: BillingIdentity) -> None:
+        super().__init__(background=True)
+        self.identity = identity
+
+    async def billing_identity_for_request(
+        self,
+        request: ModelRequest,
+    ) -> BillingIdentity | None:
+        del request
+        return self.identity
+
+    def billing_identity_for_completion(
+        self,
+        identity: BillingIdentity | None,
+        payload: dict,
+    ) -> BillingIdentity | None:
+        del payload
+        assert identity == self.identity
+        return identity
+
+
+class _CaptureStageStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stage_requests: list[ModelCompletionStageRequest] = []
+
+    async def prepare_model_completion_stage(
+        self,
+        session_id: str,
+        *,
+        request: ModelCompletionStageRequest,
+        expected_statuses: set[SessionStatus],
+        expected_run_epoch: int,
+        expected_transcript_cursor: int,
+    ) -> ModelCompletionStageResult:
+        self.stage_requests.append(request.model_copy(deep=True))
+        return await super().prepare_model_completion_stage(
+            session_id,
+            request=request,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_transcript_cursor=expected_transcript_cursor,
+        )
+
+
 class _SynchronousProvider(ModelProvider):
     name = "synchronous"
 
@@ -521,9 +575,108 @@ def test_reconnectable_dispatch_persists_identity_before_model_output() -> None:
     assert provider.adapter.start_requests[0].idempotency_key == stored_start.payload["start_id"]
 
 
+def test_model_stage_persists_secret_free_offline_recovery_context() -> None:
+    identity = BillingIdentity(
+        provider_name="reconnectable",
+        resource_id="model-in-us-test-1",
+        request_evidence={"region": "us-test-1"},
+    )
+    store = _CaptureStageStore()
+    provider = _ContextualReconnectableProvider(identity)
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    metadata = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
+
+    asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="provider_operation_recovery_context",
+                messages=[Message.text("user", "hello")],
+                metadata=metadata,
+                max_steps=3,
+                limits=RunLimits(max_tool_calls=2),
+                retry_policy=RetryPolicy(max_attempts=2),
+                thinking=ThinkingConfig(include_in_transcript=False),
+            ),
+        )
+    )
+
+    assert len(store.stage_requests) == 1
+    context = ModelCompletionRecoveryContext.model_validate(
+        store.stage_requests[0].intent["recovery_context"]
+    )
+    assert context.request_metadata == metadata
+    assert context.max_steps == 3
+    assert context.limits == RunLimits(max_tool_calls=2)
+    assert context.retry_policy.max_attempts == 2
+    assert context.thinking == ThinkingConfig(include_in_transcript=False)
+    assert context.billing_identity == identity
+
+
+@pytest.mark.parametrize("secret_location", ["value", "object_key"])
+def test_background_dispatch_rejects_unrecoverable_secret_semantics_before_start(
+    secret_location: str,
+) -> None:
+    secret = "provider-recovery-workload-secret"
+    identity = BillingIdentity(
+        provider_name="reconnectable",
+        resource_id="model-in-us-test-1",
+        request_evidence=({"opaque": secret} if secret_location == "value" else {secret: "safe"}),
+    )
+    store = _CaptureStageStore()
+    provider = _ContextualReconnectableProvider(identity)
+    app = CayuApp(
+        session_store=store,
+        secret_redactor=SecretRedactor(secret),
+        enable_logging=False,
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=f"provider_operation_secret_{secret_location}",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert events[-1].type is EventType.SESSION_FAILED
+    assert provider.adapter.start_calls == 0
+    assert store.stage_requests == []
+    assert secret not in "".join(event.model_dump_json() for event in events)
+
+
+def test_offline_recovery_context_is_bounded_before_stage_storage() -> None:
+    with pytest.raises(ValidationError, match="less than or equal to 256"):
+        ModelCompletionRecoveryContext(max_steps=257)
+    with pytest.raises(ValidationError, match="request_metadata cannot contain more than"):
+        ModelCompletionRecoveryContext(
+            request_metadata={
+                f"key-{index}": index
+                for index in range(MAX_MODEL_COMPLETION_RECOVERY_METADATA_ENTRIES + 1)
+            }
+        )
+    with pytest.raises(ValidationError, match="budget_limits cannot contain more than"):
+        ModelCompletionRecoveryContext.model_validate(
+            {"budget_limits": [None] * (MAX_MODEL_COMPLETION_RECOVERY_BUDGET_LIMITS + 1)}
+        )
+    with pytest.raises(ValidationError, match="exceeds the durable byte limit"):
+        ModelCompletionRecoveryContext(
+            request_metadata={"payload": "x" * MAX_MODEL_COMPLETION_RECOVERY_CONTEXT_BYTES}
+        )
+
+
 def test_synchronous_dispatch_is_unchanged() -> None:
     provider = _SynchronousProvider()
-    app = CayuApp(enable_logging=False)
+    store = _CaptureStageStore()
+    app = CayuApp(session_store=store, enable_logging=False)
     app.register_provider(provider, default=True)
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
@@ -540,6 +693,7 @@ def test_synchronous_dispatch_is_unchanged() -> None:
 
     assert provider.stream_calls == 1
     assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in events}
+    assert "recovery_context" not in store.stage_requests[0].intent
 
 
 def test_operator_inspection_distinguishes_sync_and_in_progress() -> None:
@@ -1673,7 +1827,11 @@ def test_operator_inspection_rejects_conflicting_completion_scope(order: str) ->
             EventType.MODEL_ERROR,
             ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS,
         ),
-        (True, EventType.MODEL_COMPLETED, ProviderOperationInspectionStatus.SYNCHRONOUS),
+        (
+            True,
+            EventType.MODEL_COMPLETED,
+            ProviderOperationInspectionStatus.PROVIDER_OPERATION_RECONCILED,
+        ),
     ],
 )
 def test_operator_inspection_classifies_ambiguous_start_and_terminal_error(
@@ -1731,6 +1889,60 @@ def test_operator_inspection_classifies_ambiguous_start_and_terminal_error(
         assert inspection.provider == "reconnectable"
         assert inspection.operation_id == ("response_a" if include_started else None)
         assert inspection.stream_protocol == ("responses-v1" if include_started else None)
+
+
+def test_operator_inspection_uses_latest_reconnect_transition() -> None:
+    async def scenario():
+        session_id = "inspection_latest_reconnect_transition"
+        app = CayuApp(enable_logging=False)
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        recovery_payload = {
+            "operation_id": "response_a",
+            "stream_protocol": "responses-v1",
+            "status": "in_progress",
+        }
+        await app.session_store.append_events(
+            session_id,
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                ),
+                _operation_event(operation_id="response_a", session_id=session_id),
+                _model_event(
+                    EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                    payload=recovery_payload,
+                ),
+                _model_event(
+                    EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                    payload=recovery_payload,
+                ),
+                _model_event(
+                    EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                    payload=recovery_payload,
+                ),
+            ],
+        )
+        return await inspect_provider_operation(app.session_store, session_id)
+
+    inspection = asyncio.run(scenario())
+
+    assert inspection.status is ProviderOperationInspectionStatus.RECONNECT_SCHEDULED
+    assert inspection.operation_id == "response_a"
 
 
 class _FenceOnEventStore(InMemorySessionStore):

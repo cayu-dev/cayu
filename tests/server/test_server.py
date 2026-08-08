@@ -5888,7 +5888,7 @@ def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
     }
 
 
-def test_server_session_state_exposes_in_progress_provider_operation() -> None:
+def test_server_session_state_exposes_provider_reconnect_in_progress() -> None:
     app = CayuApp()
 
     async def seed() -> None:
@@ -5934,6 +5934,18 @@ def test_server_session_state_exposes_in_progress_provider_operation() -> None:
                         "recovery_metadata": {"cursor": 0},
                     },
                 ),
+                Event(
+                    type=EventType.PROVIDER_OPERATION_RECONNECT_STARTED,
+                    session_id="state_provider_operation",
+                    interaction_id="interaction-a",
+                    payload={
+                        **model_identity,
+                        "provider": "reconnectable",
+                        "operation_id": "response_123",
+                        "stream_protocol": "responses-v1",
+                        "status": "in_progress",
+                    },
+                ),
             ],
         )
 
@@ -5944,7 +5956,7 @@ def test_server_session_state_exposes_in_progress_provider_operation() -> None:
 
     assert response.status_code == 200
     assert response.json()["provider_operation"] == {
-        "status": "provider_operation_in_progress",
+        "status": "reconnect_in_progress",
         "provider": "reconnectable",
         "operation_id": "response_123",
         "stream_protocol": "responses-v1",

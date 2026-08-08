@@ -52,6 +52,7 @@ from cayu.core.messages import Message, MessageRole, ToolCallPart, ToolResultPar
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.tools import _TOOL_POLICY_DENIAL_SOURCE, ToolResult
 from cayu.environments import EnvironmentFactoryOperation
+from cayu.providers import ProviderOperationAdapter, ProviderOperationMode
 from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
@@ -136,6 +137,13 @@ from cayu.runtime.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
 )
 from cayu.runtime.loop_policies import LoopPolicy
+from cayu.runtime.provider_operations import (
+    ProviderOperationEvidenceError,
+    ProviderOperationRecoveryResult,
+    ProviderOperationRecoveryStatus,
+    RecoverableProviderOperation,
+    load_recoverable_provider_operation,
+)
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
@@ -152,6 +160,7 @@ from cayu.runtime.sessions import (
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
+    ModelCompletionStage,
     RuntimePublicationReceipt,
     Session,
     SessionOrder,
@@ -848,12 +857,19 @@ class ModelCompletionManualRecoveryRequired(RuntimeError):
 class ModelCompletionBoundaryReconciliation:
     """Verified state at the durable model-completion publication boundary."""
 
-    state: Literal["none", "promoted", "already_promoted"]
+    state: Literal[
+        "none",
+        "promoted",
+        "already_promoted",
+        "provider_operation_pending",
+        "provider_operation_reconciled",
+    ]
     session: Session
     pointer: model_completion_publication.ModelStepPublicationCheckpoint | None = None
     completion_event: Event | None = None
     pending_tool_round: tool_round_recovery.PendingToolRound | None = None
     transcript_cursor: int = 0
+    recovery_events: tuple[Event, ...] = ()
 
     @property
     def blocks_provider_dispatch(self) -> bool:
@@ -927,6 +943,17 @@ ResumeInteraction = Callable[
     ],
     Awaitable[Event | None],
 ]
+RecoverProviderOperation = Callable[
+    [
+        Session,
+        ModelCompletionStage,
+        RecoverableProviderOperation,
+        runtime_records.RegisteredAgentState,
+        runtime_records.RegisteredProvider,
+        runtime_records.RegisteredEnvironment | None,
+    ],
+    Awaitable[ProviderOperationRecoveryResult],
+]
 
 
 class RecoveryCoordinator:
@@ -957,6 +984,7 @@ class RecoveryCoordinator:
         pending_session_interrupt_checkpoint: PendingSessionInterruptCheckpoint,
         abandoned_turn_completed: AbandonedTurnCompleted,
         resume_interaction: ResumeInteraction,
+        recover_provider_operation: RecoverProviderOperation,
     ) -> None:
         self._session_store = session_store
         self._task_store = task_store
@@ -980,6 +1008,35 @@ class RecoveryCoordinator:
         self._pending_session_interrupt_checkpoint = pending_session_interrupt_checkpoint
         self._abandoned_turn_completed = abandoned_turn_completed
         self._resume_interaction = resume_interaction
+        self._recover_provider_operation = recover_provider_operation
+
+    async def _recoverable_provider_operation(
+        self,
+        stage: ModelCompletionStage,
+    ) -> tuple[RecoverableProviderOperation, runtime_records.RegisteredProvider] | None:
+        try:
+            operation = await load_recoverable_provider_operation(self._session_store, stage)
+        except ProviderOperationEvidenceError as evidence_error:
+            raise ModelCompletionManualRecoveryRequired(
+                "Provider-operation recovery cannot continue because provider output already "
+                "crossed Cayu's durable acceptance boundary."
+            ) from evidence_error
+        if operation is None:
+            return None
+        try:
+            registered_provider = self._resolve_registered_provider(operation.provider)
+        except KeyError:
+            return None
+        provider = registered_provider.provider
+        if (
+            provider.provider_operation_mode is not ProviderOperationMode.BACKGROUND
+            or not isinstance(
+                provider.provider_operations,
+                ProviderOperationAdapter,
+            )
+        ):
+            return None
+        return operation, registered_provider
 
     async def preflight_model_completion_boundary(self, session: Session) -> bool:
         """Reject a non-terminal dispatch and report terminal work to promote."""
@@ -990,6 +1047,8 @@ class RecoveryCoordinator:
         stage = active.stage
         self._validate_active_model_completion_stage(session, stage)
         if stage.state == "in_flight":
+            if await self._recoverable_provider_operation(stage) is not None:
+                return True
             raise ModelCompletionManualRecoveryRequired(
                 "The active model-completion dispatch has no durable terminal response. "
                 "Its provider outcome and linked budget reservations require manual "
@@ -1009,17 +1068,66 @@ class RecoveryCoordinator:
         await self._run_limit_controller.recover_pending_budget_settlements(session_id=session.id)
         await self._run_limit_controller.recover_pending_budget_settlements()
         active = await self._session_store.load_active_model_completion_stage(session.id)
-        state: Literal["none", "promoted", "already_promoted"] = "none"
+        state: Literal[
+            "none",
+            "promoted",
+            "already_promoted",
+            "provider_operation_pending",
+            "provider_operation_reconciled",
+        ] = "none"
+        recovery_events: tuple[Event, ...] = ()
         if active is not None:
             stage = active.stage
             self._validate_active_model_completion_stage(session, stage)
             if stage.state == "in_flight":
-                raise ModelCompletionManualRecoveryRequired(
-                    "The active model-completion dispatch has no durable terminal response. "
-                    "Its provider outcome and linked budget reservations require manual "
-                    f"reconciliation before retrying: {stage.stage_id}"
+                recoverable = await self._recoverable_provider_operation(stage)
+                if recoverable is None:
+                    raise ModelCompletionManualRecoveryRequired(
+                        "The active model-completion dispatch has no durable terminal response. "
+                        "Its provider outcome and linked budget reservations require manual "
+                        f"reconciliation before retrying: {stage.stage_id}"
+                    )
+                operation, registered_provider = recoverable
+                try:
+                    registered_agent = self._resolve_registered_agent(session.agent_name)
+                    registered_environment = self._resolve_registered_environment(
+                        session.environment_name
+                    )
+                except KeyError as registration_error:
+                    raise ModelCompletionManualRecoveryRequired(
+                        "Provider-operation recovery requires the original agent, provider, "
+                        "and environment registrations."
+                    ) from registration_error
+                recovered = await self._recover_provider_operation(
+                    session,
+                    stage,
+                    operation,
+                    registered_agent,
+                    registered_provider,
+                    registered_environment,
                 )
-            if session.status not in {
+                recovery_events = recovered.events
+                if recovered.status is ProviderOperationRecoveryStatus.PENDING:
+                    transcript = await self._session_store.load_transcript(session.id)
+                    return ModelCompletionBoundaryReconciliation(
+                        state="provider_operation_pending",
+                        session=session,
+                        transcript_cursor=len(transcript),
+                        recovery_events=recovery_events,
+                    )
+                if recovered.status is not ProviderOperationRecoveryStatus.RECONCILED:
+                    raise RuntimeError("Provider-operation recovery returned an unknown state.")
+                active = await self._session_store.load_active_model_completion_stage(session.id)
+                if active is not None:
+                    raise RuntimeError(
+                        "Reconciled provider operation retained an active model-completion stage."
+                    )
+                loaded_session = await self._session_store.load(session.id)
+                if loaded_session is None:
+                    raise KeyError(f"Session not found: {stage.session_id}")
+                session = loaded_session
+                state = "provider_operation_reconciled"
+            elif session.status not in {
                 stage.source_status,
                 SessionStatus.INTERRUPTING,
                 SessionStatus.FAILED,
@@ -1028,11 +1136,12 @@ class RecoveryCoordinator:
                     "The completed model stage cannot be promoted from the current session "
                     f"status ({session.status.value}); expected {stage.source_status.value}."
                 )
-            session = await self._promote_completed_model_stage(
-                session=session,
-                stage_id=stage.stage_id,
-            )
-            state = "promoted"
+            else:
+                session = await self._promote_completed_model_stage(
+                    session=session,
+                    stage_id=stage.stage_id,
+                )
+                state = "promoted"
 
         checkpoint = await self._session_store.load_checkpoint(session.id)
         pointer = model_completion_publication.model_step_publication_from_checkpoint(checkpoint)
@@ -1067,6 +1176,7 @@ class RecoveryCoordinator:
             return ModelCompletionBoundaryReconciliation(
                 state=state,
                 session=session,
+                recovery_events=recovery_events,
             )
 
         receipt = await self._session_store.load_runtime_publication_receipt(
@@ -1327,6 +1437,7 @@ class RecoveryCoordinator:
             completion_event=copy_event(completion_event),
             pending_tool_round=pending_round,
             transcript_cursor=transcript_page.total_records,
+            recovery_events=recovery_events,
         )
 
     async def _tool_result_tail_has_durable_lifecycle_provenance(
@@ -8331,6 +8442,15 @@ class RecoveryCoordinator:
             consume_on_rejection=True,
         )
         deferred_input = await self._session_store.load_deferred_interaction_input(session.id)
+        active_model_completion = await self._session_store.load_active_model_completion_stage(
+            session.id
+        )
+        recoverable_provider_operation_pending = bool(
+            active_model_completion is not None
+            and active_model_completion.stage.state == "in_flight"
+            and await self._recoverable_provider_operation(active_model_completion.stage)
+            is not None
+        )
         terminal_repair_required = False
         if session.status in _RECOVERY_RESUMABLE_SESSION_STATUSES:
             terminal_repair = await self._terminal_evidence_repair_required(
@@ -8343,6 +8463,7 @@ class RecoveryCoordinator:
                 or pending_user_input is not None
                 or pending_tool_round is not None
                 or deferred_input is not None
+                or recoverable_provider_operation_pending
             )
             if not terminal_repair and not has_pending_work:
                 return IncompleteSessionRecoveryResult(
@@ -9585,7 +9706,27 @@ class RecoveryCoordinator:
 
         model_boundary = await self.reconcile_model_completion_boundary(session)
         session = model_boundary.session
-        if model_boundary.state == "promoted" and model_boundary.completion_event is not None:
+        events.extend(copy_event(event) for event in model_boundary.recovery_events)
+        if model_boundary.state == "provider_operation_pending":
+            return IncompleteSessionRecoveryResult(
+                session_id=session.id,
+                previous_status=previous_status,
+                status=session.status,
+                actions=(IncompleteSessionRecoveryAction.SKIPPED_ACTIVE,),
+                events=tuple(events),
+                message=(
+                    "Provider operation is still pending; its exact durable dispatch remains "
+                    "eligible for later recovery."
+                ),
+            )
+        if (
+            model_boundary.state
+            in {
+                "promoted",
+                "provider_operation_reconciled",
+            }
+            and model_boundary.completion_event is not None
+        ):
             events.append(copy_event(model_boundary.completion_event))
         checkpoint = await self._session_store.load_checkpoint(session.id)
         pending_approval = approval_support.pending_approval_from_checkpoint(checkpoint)

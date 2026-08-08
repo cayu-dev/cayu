@@ -1255,6 +1255,35 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         internal_keys={"recovery_metadata"},
         exact_internal_keys={"recovery_metadata"},
     )
+    provider_operation_recovery_keys = (
+        "attempt",
+        "max_attempts",
+        "model",
+        "model_attempt_id",
+        "model_step_id",
+        "operation_id",
+        "provider",
+        "run_epoch",
+        "source_run_epoch",
+        "status",
+        "step",
+        "stream_protocol",
+    )
+    policies[EventType.PROVIDER_OPERATION_RECONNECT_SCHEDULED] = _policy(
+        *provider_operation_recovery_keys,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+    )
+    policies[EventType.PROVIDER_OPERATION_RECONNECT_STARTED] = _policy(
+        *provider_operation_recovery_keys,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+    )
+    policies[EventType.PROVIDER_OPERATION_RECONCILED] = _policy(
+        *provider_operation_recovery_keys,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"operation_id", "stream_protocol"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+    )
 
     tool_common = {
         "approval",

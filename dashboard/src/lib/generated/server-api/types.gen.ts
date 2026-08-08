@@ -766,7 +766,7 @@ export type ApiProviderOperationInspection = {
     /**
      * Status
      */
-    status: 'synchronous' | 'provider_operation_in_progress';
+    status: 'synchronous' | 'provider_operation_in_progress' | 'reconnect_scheduled' | 'reconnect_in_progress' | 'provider_operation_reconciled';
     /**
      * Stream Protocol
      */

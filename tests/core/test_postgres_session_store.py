@@ -26,6 +26,10 @@ from tests.core.pending_action_conformance import assert_pending_action_store_co
 from tests.core.session_topology_conformance import (
     assert_session_topology_store_conformance,
 )
+from tests.core.test_provider_operation_offline_recovery import (
+    assert_offline_provider_operation_recovery,
+    assert_pending_provider_operation_later_completes,
+)
 from tests.core.tool_result_projection_conformance import (
     assert_tool_result_projection_recovery_conformance,
     assert_tool_result_projection_session_store_conformance,
@@ -33,6 +37,7 @@ from tests.core.tool_result_projection_conformance import (
 
 from cayu import LocalArtifactStore
 from cayu.core import Event, EventType, Message
+from cayu.providers import ProviderOperationStatus
 from cayu.runtime import (
     EventOrder,
     EventQuery,
@@ -169,6 +174,27 @@ def test_postgres_session_store_preserves_projected_tool_results(
 
 def test_postgres_pending_action_store_conformance(postgres_dsn: str) -> None:
     _run(postgres_dsn, assert_pending_action_store_conformance)
+
+
+def test_postgres_offline_provider_operation_recovery(postgres_dsn: str) -> None:
+    _run(postgres_dsn, assert_offline_provider_operation_recovery)
+
+
+@pytest.mark.parametrize(
+    "initial_status",
+    [ProviderOperationStatus.QUEUED, ProviderOperationStatus.IN_PROGRESS],
+)
+def test_postgres_pending_provider_operation_later_completes(
+    postgres_dsn: str,
+    initial_status: ProviderOperationStatus,
+) -> None:
+    async def ops(store) -> None:
+        await assert_pending_provider_operation_later_completes(
+            store,
+            initial_status=initial_status,
+        )
+
+    _run(postgres_dsn, ops)
 
 
 def test_postgres_session_topology_store_conformance(postgres_dsn: str) -> None:

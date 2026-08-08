@@ -1439,7 +1439,13 @@ class SessionSummaryResponse(ApiBaseModel):
 
 
 class ApiProviderOperationInspection(ApiBaseModel):
-    status: Literal["synchronous", "provider_operation_in_progress"]
+    status: Literal[
+        "synchronous",
+        "provider_operation_in_progress",
+        "reconnect_scheduled",
+        "reconnect_in_progress",
+        "provider_operation_reconciled",
+    ]
     provider: str | None = Field(default=None, max_length=256)
     operation_id: str | None = Field(default=None, max_length=512)
     stream_protocol: str | None = Field(default=None, max_length=128)

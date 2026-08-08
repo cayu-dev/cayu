@@ -2512,8 +2512,12 @@ version 4 adds the required `surfaces.usage` capability so usage aggregation and
 the dashboard's configured pricing catalog are represented independently. Server
 contract version 5 adds required interaction identity to mutation SSE envelopes,
 event records, and transcript records, and exposes interaction-scoped control-plane
-reads. Clients generated against contract version 1, 2, 3, or 4 must regenerate from the
-current OpenAPI document. Version 1 and 2 clients must also treat all aggregate
+reads. Server contract version 6 changes public SSE event identities to opaque,
+sequence-backed replay markers and applies schema-aware public event projection.
+Server contract version 7 adds explicit provider-operation reconnect and
+reconciliation states to session-state inspection. Clients generated against
+contract version 1 through 6 must regenerate from the current OpenAPI document.
+Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.
 The exported aggregate models—including the aggregate usage fields on session
@@ -3084,20 +3088,50 @@ Provider adapters translate that cursor into API-specific continuation fields.
 Cayu rejects extra fields and all string content, so credentials, raw requests,
 response bodies, and hidden reasoning cannot be stored there.
 
+When a worker disappears after `provider.operation.started` but before any
+provider output crosses a durable Cayu boundary, the next run-epoch owner may
+retrieve that exact operation. Cayu binds the operation evidence to the active
+model-completion stage and original model attempt before invoking the adapter.
+Text, thinking, error, completion, or discarded-attempt evidence after the
+operation identity makes this path ineligible and requires manual
+reconciliation; retrieval is never used to overwrite or infer an already
+accepted partial stream.
+Queued and in-progress results remain attached to that stage and never authorize
+a replacement request. They retain their publication-eligible session state
+after a recovery poll, so a later poll can commit the same operation's terminal
+result. Before dispatch, the active stage also retains the secret-free
+continuation inputs needed to normalize and publish offline output: redacted
+request metadata, task linkage, thinking transcript policy, structured-output
+tool contract, run and budget limits, retry policy, and resolved billing
+identity. A completed retrieval is normalized through the ordinary model
+completion contract and atomically publishes one assistant step, terminal
+completion event, transcript update, and usage record. Native structured-output
+decoding cannot yet resume at this boundary and fails closed to manual
+reconciliation; the provider-neutral structured-output tool path retains and
+validates its original contract. Repeated or competing recovery converges
+through the stage publication and run-epoch fences. This offline-completion path
+intentionally covers only the no-accepted-output boundary; durable partial-stream
+cursor advancement and replay deduplication are separate contracts.
+
 Provider-operation reconnection is distinct from Cayu boundary replay. Boundary
 replay redelivers already durable Cayu events and never proves that provider
 work is still running. Reconnection asks the provider about work identified by
 the durable operation record. It is also distinct from provider-internal
 process restoration: Cayu does not restore an SDK client, socket, task, or
-worker process. Operator inspection reports only `synchronous` or
-`provider_operation_in_progress` plus bounded identity fields; it never exposes
-the original request or private recovery metadata. Run-epoch fencing on the
-event append prevents a stale invocation from creating authoritative operation
-evidence after ownership has moved. Inspection validates the complete owning
-interaction, provider, model, step, attempt, and run-epoch evidence. Local
-`model.error` and `model.attempt_discarded` records do not prove that provider-
-owned work stopped; only durable model completion or a provider-terminal status
-ends the in-progress inspection state.
+worker process. Operator inspection reports `synchronous`,
+`provider_operation_in_progress`, `reconnect_scheduled`,
+`reconnect_in_progress`, or `provider_operation_reconciled` plus bounded
+identity fields; it never exposes the original request or private recovery
+metadata. Repeated polls do not expand inspection work: Cayu reads the stable
+attempt and operation identity plus only the latest reconnect transition.
+Run-epoch fencing on both event append and stage promotion prevents a
+stale invocation from creating authoritative operation evidence or publishing
+recovered output after ownership has moved. Inspection validates the complete
+owning interaction, provider, model, step, attempt, operation, and run-epoch
+evidence. Local `model.error` and `model.attempt_discarded` records do not prove
+that provider-owned work stopped; only durable model completion, explicit
+reconciliation, or a provider-terminal status ends the in-progress inspection
+state.
 
 The deterministic provider conformance suite lives in
 `tests/providers/test_provider_conformance.py`. It runs every built-in adapter

@@ -49,7 +49,7 @@ from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
 FORMAT_CHOICES = ("json", "table", "jsonl")
-CLI_SCHEMA_VERSION = "4"
+CLI_SCHEMA_VERSION = "5"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576

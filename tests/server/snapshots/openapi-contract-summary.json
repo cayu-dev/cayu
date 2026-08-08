@@ -1446,7 +1446,10 @@
         "status": {
           "enum": [
             "synchronous",
-            "provider_operation_in_progress"
+            "provider_operation_in_progress",
+            "reconnect_scheduled",
+            "reconnect_in_progress",
+            "provider_operation_reconciled"
           ],
           "title": "Status",
           "type": "string"
@@ -5604,7 +5607,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "6",
+          "default": "7",
           "title": "Contract Version",
           "type": "string"
         },
@@ -8877,7 +8880,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "6",
+          "default": "7",
           "title": "Contract Version",
           "type": "string"
         }

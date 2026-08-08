@@ -89,6 +89,9 @@ class EventType(StrEnum):
     MODEL_ATTEMPT_DISCARDED = "model.attempt_discarded"
     PROVIDER_OPERATION_STARTING = "provider.operation.starting"
     PROVIDER_OPERATION_STARTED = "provider.operation.started"
+    PROVIDER_OPERATION_RECONNECT_SCHEDULED = "provider.operation.reconnect_scheduled"
+    PROVIDER_OPERATION_RECONNECT_STARTED = "provider.operation.reconnect_started"
+    PROVIDER_OPERATION_RECONCILED = "provider.operation.reconciled"
 
     STRUCTURED_OUTPUT_VALIDATED = "structured_output.validated"
     STRUCTURED_OUTPUT_VALIDATING = "structured_output.validating"
