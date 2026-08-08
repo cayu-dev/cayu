@@ -5747,8 +5747,10 @@ export type TaskStatusCounts = {
  * no-ops (disabling isn't portable — pass a raw ``reasoning_effort`` via
  * ``provider_options`` to target a backend like Gemini that accepts ``"none"``).
  *
- * Choose the field appropriate to your model; a mismatch surfaces as a clear
- * provider 400 rather than being silently corrected.
+ * ``effort`` and ``max_tokens`` select mutually exclusive modes. Disabling thinking
+ * cannot be combined with either enabled-mode control. Provider-specific support is
+ * still validated by the provider; contradictory neutral controls fail here before a
+ * provider request can be built.
  */
 export type ThinkingConfig = {
     /**

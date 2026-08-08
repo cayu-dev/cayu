@@ -3355,6 +3355,9 @@ Application Default Credentials.
 `effort` maps to adaptive Anthropic thinking, OpenAI reasoning effort, and the
 compatible Chat Completions `reasoning_effort` field. When `effort` is omitted,
 `max_tokens` (at least 1024) selects Anthropic's legacy budgeted-thinking form.
+`effort` and `max_tokens` are mutually exclusive. `enabled=False` cannot be
+combined with either enabled-mode control; contradictory configurations fail at
+`ThinkingConfig` construction before the runtime can build a provider request.
 `enabled=False` is best effort: Anthropic can disable thinking, while providers
 without a portable disable control may ignore it. Typed thinking settings win
 over conflicting raw provider options.

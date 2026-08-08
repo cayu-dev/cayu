@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictInt, field_validator, model_validator
 
 ThinkingEffort = Literal["low", "medium", "high"]
 
@@ -29,8 +29,10 @@ class ThinkingConfig(BaseModel):
       no-ops (disabling isn't portable — pass a raw ``reasoning_effort`` via
       ``provider_options`` to target a backend like Gemini that accepts ``"none"``).
 
-    Choose the field appropriate to your model; a mismatch surfaces as a clear
-    provider 400 rather than being silently corrected.
+    ``effort`` and ``max_tokens`` select mutually exclusive modes. Disabling thinking
+    cannot be combined with either enabled-mode control. Provider-specific support is
+    still validated by the provider; contradictory neutral controls fail here before a
+    provider request can be built.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -52,6 +54,14 @@ class ThinkingConfig(BaseModel):
         if value < MIN_THINKING_BUDGET_TOKENS:
             raise ValueError(f"thinking max_tokens must be at least {MIN_THINKING_BUDGET_TOKENS}.")
         return value
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> ThinkingConfig:
+        if not self.enabled and (self.effort is not None or self.max_tokens is not None):
+            raise ValueError("thinking enabled=False cannot be combined with effort or max_tokens.")
+        if self.effort is not None and self.max_tokens is not None:
+            raise ValueError("thinking effort and max_tokens are mutually exclusive.")
+        return self
 
 
 def thinking_config_payload(config: ThinkingConfig) -> dict[str, Any]:

@@ -16,7 +16,7 @@ from cayu import (
 )
 from cayu.core.events import Event, EventType
 from cayu.core.messages import MessageRole, ProviderStatePart, TextPart, copy_message_part
-from cayu.core.thinking import thinking_config_payload
+from cayu.core.thinking import MIN_THINKING_BUDGET_TOKENS, thinking_config_payload
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from cayu.providers.anthropic import (
     _anthropic_message,
@@ -63,6 +63,53 @@ def test_thinking_config_rejects_budget_below_minimum() -> None:
 def test_thinking_config_rejects_unknown_effort() -> None:
     with pytest.raises(ValidationError):
         ThinkingConfig(effort="extreme")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"enabled": False},
+        {"effort": "medium"},
+        {"max_tokens": MIN_THINKING_BUDGET_TOKENS},
+    ],
+    ids=["provider-default", "disabled", "adaptive-effort", "legacy-budget"],
+)
+def test_thinking_config_accepts_each_supported_mode(kwargs: dict[str, object]) -> None:
+    ThinkingConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_message"),
+    [
+        (
+            {"effort": "high", "max_tokens": MIN_THINKING_BUDGET_TOKENS},
+            "thinking effort and max_tokens are mutually exclusive",
+        ),
+        (
+            {"enabled": False, "effort": "low"},
+            "thinking enabled=False cannot be combined with effort or max_tokens",
+        ),
+        (
+            {"enabled": False, "max_tokens": MIN_THINKING_BUDGET_TOKENS},
+            "thinking enabled=False cannot be combined with effort or max_tokens",
+        ),
+        (
+            {
+                "enabled": False,
+                "effort": "medium",
+                "max_tokens": MIN_THINKING_BUDGET_TOKENS,
+            },
+            "thinking enabled=False cannot be combined with effort or max_tokens",
+        ),
+    ],
+    ids=["effort-and-budget", "disabled-effort", "disabled-budget", "disabled-both"],
+)
+def test_thinking_config_rejects_contradictory_modes(
+    kwargs: dict[str, object], expected_message: str
+) -> None:
+    with pytest.raises(ValidationError, match=expected_message):
+        ThinkingConfig(**kwargs)
 
 
 def _anthropic_payload(config: ThinkingConfig) -> dict:
