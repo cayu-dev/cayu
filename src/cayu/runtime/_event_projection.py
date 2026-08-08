@@ -61,6 +61,8 @@ class EventPayloadPolicy:
     owned_nested_paths: frozenset[tuple[str, ...]] = frozenset()
     authority_keys: frozenset[str] = frozenset()
     internal_authority_keys: frozenset[str] = frozenset()
+    internal_keys: frozenset[str] = frozenset()
+    exact_internal_keys: frozenset[str] = frozenset()
     public_authority_keys: frozenset[str] = frozenset()
     aliased_authority_keys: frozenset[str] = frozenset()
     nested_authority_paths: frozenset[tuple[str, ...]] = frozenset()
@@ -76,6 +78,12 @@ class EventPayloadPolicy:
             raise ValueError("Public event authority keys must also be authority keys.")
         if not self.internal_authority_keys <= self.authority_keys:
             raise ValueError("Internal event authority keys must also be authority keys.")
+        if not self.internal_keys <= self.owned_keys:
+            raise ValueError("Internal event keys must also be owned keys.")
+        if not self.exact_internal_keys <= self.internal_keys:
+            raise ValueError("Exact internal event keys must also be internal keys.")
+        if self.internal_keys & self.authority_keys:
+            raise ValueError("Internal event keys and authority keys must be disjoint.")
         if self.internal_authority_keys & (
             self.public_authority_keys | self.aliased_authority_keys
         ):
@@ -404,6 +412,8 @@ def _policy(
     owned_nested_paths: Collection[tuple[str, ...]] = (),
     authority_keys: Collection[str] = (),
     internal_authority_keys: Collection[str] = (),
+    internal_keys: Collection[str] = (),
+    exact_internal_keys: Collection[str] = (),
     public_authority_keys: Collection[str] = (),
     aliased_authority_keys: Collection[str] = (),
     nested_authority_paths: Collection[tuple[str, ...]] = (),
@@ -425,6 +435,8 @@ def _policy(
         owned_nested_paths=(frozenset(owned_nested_paths) | nested_authority | nested_untrusted),
         authority_keys=authority,
         internal_authority_keys=frozenset(internal_authority_keys),
+        internal_keys=frozenset(internal_keys),
+        exact_internal_keys=frozenset(exact_internal_keys),
         public_authority_keys=frozenset(public_authority_keys),
         aliased_authority_keys=frozenset(aliased_authority_keys),
         nested_authority_paths=nested_authority,
@@ -1205,6 +1217,44 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         "step",
         authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS,
     )
+    provider_operation_starting_keys = (
+        "attempt",
+        "max_attempts",
+        "model",
+        "model_attempt_id",
+        "model_step_id",
+        "provider",
+        "source_run_epoch",
+        "start_id",
+        "step",
+    )
+    policies[EventType.PROVIDER_OPERATION_STARTING] = _policy(
+        *provider_operation_starting_keys,
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS | {"start_id"},
+        internal_authority_keys={"start_id"},
+    )
+    policies[EventType.PROVIDER_OPERATION_STARTED] = _policy(
+        "attempt",
+        "max_attempts",
+        "model",
+        "model_attempt_id",
+        "model_step_id",
+        "operation_id",
+        "provider",
+        "recovery_metadata",
+        "source_run_epoch",
+        "start_id",
+        "state_version",
+        "status",
+        "step",
+        "stream_protocol",
+        authority_keys=_MODEL_EXECUTION_AUTHORITY_KEYS
+        | {"operation_id", "start_id", "stream_protocol"},
+        internal_authority_keys={"start_id"},
+        public_authority_keys={"operation_id", "stream_protocol"},
+        internal_keys={"recovery_metadata"},
+        exact_internal_keys={"recovery_metadata"},
+    )
 
     tool_common = {
         "approval",
@@ -1907,6 +1957,12 @@ def _prepare_runtime_event(
         redactor=redactor,
         projection_references=projection_references,
     )
+    for key in policy.exact_internal_keys:
+        if key in event.payload and redacted_payload.get(key) != event.payload[key]:
+            raise ValueError(
+                f"event.payload.{key} contains a workload secret and cannot be "
+                "used as exact private recovery state."
+            )
     _restore_runtime_payload_authority(
         event,
         policy=policy,
@@ -2151,6 +2207,8 @@ def _project_runtime_event(
         envelope_alias_session_id=event.session_id,
         projection_references=projection_references,
     )
+    for key in policy.internal_keys:
+        redacted_payload.pop(key, None)
     _restore_policy_denial_truncation_markers(
         event,
         redacted_payload=redacted_payload,

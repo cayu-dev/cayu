@@ -1438,12 +1438,20 @@ class SessionSummaryResponse(ApiBaseModel):
     usage: SessionUsageSummary
 
 
+class ApiProviderOperationInspection(ApiBaseModel):
+    status: Literal["synchronous", "provider_operation_in_progress"]
+    provider: str | None = Field(default=None, max_length=256)
+    operation_id: str | None = Field(default=None, max_length=512)
+    stream_protocol: str | None = Field(default=None, max_length=128)
+
+
 class SessionStateResponse(ApiBaseModel):
     session_id: str
     status: Literal["pending", "running", "interrupting", "completed", "failed", "interrupted"]
     updated_at: str
     last_activity_at: str
     interruption_cascade: Literal["none", "pending", "failed"]
+    provider_operation: ApiProviderOperationInspection
 
 
 class CausalBudgetSummaryResponse(ApiBaseModel):

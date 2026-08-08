@@ -18,6 +18,7 @@ from cayu._validation import (
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.messages import Message, detach_message
+from cayu.providers.operations import ProviderOperationAdapter, ProviderOperationMode
 
 
 class ModelStreamEventType(StrEnum):
@@ -644,6 +645,22 @@ class ModelProvider(ABC):
     ``json_schema`` response format). The runtime rejects ``NATIVE`` specs
     before running when the resolved provider does not set this.
     """
+
+    @property
+    def provider_operation_mode(self) -> ProviderOperationMode:
+        """Explicit dispatch mode; capability support alone never enables it."""
+
+        return ProviderOperationMode.SYNCHRONOUS
+
+    @property
+    def provider_operations(self) -> ProviderOperationAdapter | None:
+        """Optional reconnectable-operation adapter.
+
+        Returning ``None`` preserves the ordinary synchronous ``stream`` path.
+        Providers opt in explicitly by returning a composed adapter.
+        """
+
+        return None
 
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:

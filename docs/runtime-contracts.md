@@ -3043,6 +3043,62 @@ Provider adapters must:
 - stop emitting after `completed`
 - keep provider-specific API payload formatting isolated inside the adapter
 
+Reconnectable provider-owned work is an explicit optional capability, not a
+different interpretation of `ModelProvider.stream(...)`. Merely implementing a
+`provider_operations` adapter does not enable it: the provider must also return
+the explicit `ProviderOperationMode.BACKGROUND` mode, normally because its
+caller selected a provider-specific background option. The default mode stays
+synchronous and does not consult or start the optional adapter. An enabled
+adapter exposes separate start, retrieve, reconnect, and cancel operations and
+normalizes provider lifecycle values into bounded `ProviderOperationStatus`
+values.
+
+Before external dispatch, Cayu durably commits
+`provider.operation.starting` with a stable, model-attempt-scoped idempotency
+key. The adapter receives that key when it starts the provider operation. Start
+then returns a versioned operation identity and a normalized model-event stream;
+Cayu commits `provider.operation.started` for the current session, interaction,
+model step, model attempt, and run epoch before forwarding subsequent model
+output. Any failure after invoking start is treated as an ambiguous external
+outcome and disables automatic model retry. If the second commit fails or is
+cancelled, Cayu makes one bounded cancellation attempt and preserves the
+original publication failure or cancellation, but only after exact readback
+proves the started identity absent. Once the identity is durable, later event
+fan-out failure leaves the provider operation intact for side-effect delivery
+and provider-operation recovery. A durable starting event without a started
+event is therefore explicit ambiguous-dispatch evidence, not permission to
+submit a second non-idempotent request. Cayu bounds local start and cancellation
+settlement before releasing run ownership; a timeout remains durable ambiguous
+or uncertain-cleanup evidence, not proof that opaque remote work stopped. Once start has been
+invoked, provider stream errors, transport loss, context overflow, and local
+attempt-discard signals cannot authorize another automatic provider dispatch.
+An eventual start acknowledgement may publish cleanup evidence only under the
+dispatching run epoch or its exact single successor recovery claim. It never
+borrows authority from a later resumed or replacement run epoch.
+
+The provider-issued operation id and stream protocol are publicly inspectable;
+the bounded durable recovery metadata is retained only in the internal event
+record. Recovery metadata is a typed provider-neutral cursor (a strict
+nonnegative signed-64-bit integer), not an arbitrary dictionary or text field.
+Provider adapters translate that cursor into API-specific continuation fields.
+Cayu rejects extra fields and all string content, so credentials, raw requests,
+response bodies, and hidden reasoning cannot be stored there.
+
+Provider-operation reconnection is distinct from Cayu boundary replay. Boundary
+replay redelivers already durable Cayu events and never proves that provider
+work is still running. Reconnection asks the provider about work identified by
+the durable operation record. It is also distinct from provider-internal
+process restoration: Cayu does not restore an SDK client, socket, task, or
+worker process. Operator inspection reports only `synchronous` or
+`provider_operation_in_progress` plus bounded identity fields; it never exposes
+the original request or private recovery metadata. Run-epoch fencing on the
+event append prevents a stale invocation from creating authoritative operation
+evidence after ownership has moved. Inspection validates the complete owning
+interaction, provider, model, step, attempt, and run-epoch evidence. Local
+`model.error` and `model.attempt_discarded` records do not prove that provider-
+owned work stopped; only durable model completion or a provider-terminal status
+ends the in-progress inspection state.
+
 The deterministic provider conformance suite lives in
 `tests/providers/test_provider_conformance.py`. It runs every built-in adapter
 against scripted transports through the public `ModelProvider.stream(...)`,

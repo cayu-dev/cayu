@@ -319,6 +319,31 @@ def test_shielded_task_outcome_allows_already_completed_task_at_zero_timeout() -
     assert outcome.result == "done"
 
 
+def test_shielded_task_outcome_starts_bounded_settlement_after_cancellation() -> None:
+    async def run() -> task_wait.ShieldedTaskOutcome[None]:
+        child = asyncio.create_task(asyncio.Event().wait())
+        waiter = asyncio.create_task(
+            await_shielded_task_outcome(
+                child,
+                timeout_after_cancellation_s=0,
+            )
+        )
+        await asyncio.sleep(0)
+        waiter.cancel("bound settlement")
+        try:
+            return await waiter
+        finally:
+            child.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await child
+
+    outcome = asyncio.run(run())
+
+    assert outcome.timed_out is True
+    assert isinstance(outcome.cancellation, asyncio.CancelledError)
+    assert outcome.cancellation.args == ("bound settlement",)
+
+
 def test_shielded_task_outcome_counts_checkpoint_time_toward_positive_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

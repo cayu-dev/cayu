@@ -138,7 +138,7 @@ def test_session_list_uses_project_target_and_emits_stable_json(
     assert payload == {
         "has_more": False,
         "next_cursor": None,
-        "schema_version": "3",
+        "schema_version": "4",
         "sessions": [
             {
                 "agent": "writer",
@@ -496,6 +496,95 @@ def test_session_show_summarizes_oversized_state_without_printing_content(
     assert payload["usage"]["cached_input_tokens"] == "80"
     assert payload["budget"]["cost_state"] == "unknown"
     assert payload["budget"]["amount"] is None
+    assert payload["provider_operation"] == {
+        "status": "synchronous",
+        "provider": None,
+        "operation_id": None,
+        "stream_protocol": None,
+    }
+
+
+def test_session_show_reports_in_progress_provider_operation(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    database = _write_project(tmp_path)
+
+    async def seed() -> None:
+        store = SQLiteSessionStore(database)
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="operator",
+                    session_id="sess_provider_operation",
+                    messages=[Message.text("user", "inspect")],
+                ),
+                identity=SessionIdentity(
+                    provider_name="reconnectable",
+                    model="model-large",
+                ),
+            )
+            model_identity = {
+                "provider": "reconnectable",
+                "model": "model-large",
+                "step": 1,
+                "attempt": 1,
+                "max_attempts": 1,
+                "model_step_id": "mstep_" + "a" * 32,
+                "model_attempt_id": "matt_" + "b" * 32,
+                "source_run_epoch": 1,
+            }
+            await store.append_events(
+                "sess_provider_operation",
+                [
+                    Event(
+                        type=EventType.MODEL_STARTED,
+                        session_id="sess_provider_operation",
+                        interaction_id="interaction-a",
+                        payload=model_identity,
+                    ),
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_STARTED,
+                        session_id="sess_provider_operation",
+                        interaction_id="interaction-a",
+                        payload={
+                            **model_identity,
+                            "provider": "reconnectable",
+                            "start_id": "provider-operation:" + model_identity["model_attempt_id"],
+                            "state_version": 1,
+                            "operation_id": "response_123",
+                            "stream_protocol": "responses-v1",
+                            "status": "in_progress",
+                            "recovery_metadata": {"cursor": 0},
+                        },
+                    ),
+                ],
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(seed())
+
+    assert (
+        main(
+            [
+                "session",
+                "show",
+                "sess_provider_operation",
+                "--sqlite",
+                str(database),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["provider_operation"] == {
+        "status": "provider_operation_in_progress",
+        "provider": "reconnectable",
+        "operation_id": "response_123",
+        "stream_protocol": "responses-v1",
+    }
 
 
 def test_session_show_distinguishes_partial_and_mixed_currency_ledgers(
@@ -1235,7 +1324,7 @@ def test_session_usage_reports_per_call_cache_and_honest_pricing_state(
         "model_call",
         "unmatched_ledger",
     }
-    assert {row["schema_version"] for row in jsonl_rows} == {"3"}
+    assert {row["schema_version"] for row in jsonl_rows} == {"4"}
     aggregate_row = next(row for row in jsonl_rows if row["record_type"] == "aggregate")
     assert aggregate_row["total_tokens"] == "12"
 
@@ -1294,7 +1383,7 @@ def test_session_usage_json_serializes_aggregate_counters_losslessly(
         == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["schema_version"] == "3"
+    assert payload["schema_version"] == "4"
     assert payload["aggregate"]["input_tokens"] == expected
     assert payload["aggregate"]["total_tokens"] == expected
 
@@ -2774,7 +2863,7 @@ def test_session_cli_lists_and_filters_response_scoped_interactions(
         == 0
     )
     listed = json.loads(capsys.readouterr().out)
-    assert listed["schema_version"] == "3"
+    assert listed["schema_version"] == "4"
     assert [item["interaction_id"] for item in listed["interactions"]] == [
         "interaction-b",
         "interaction-a",

@@ -2654,6 +2654,11 @@ function SessionDetail({ sessionId }: { sessionId: string }) {
             <span>Created {formatDateTime(session.created_at)}</span>
             {session.provider_name && <Badge variant="outline">{session.provider_name}</Badge>}
             {session.model && <Badge variant="outline">{session.model}</Badge>}
+            {state?.provider_operation.status === "provider_operation_in_progress" ? (
+              <Badge variant="secondary">Provider operation in progress</Badge>
+            ) : state?.provider_operation.status === "synchronous" ? (
+              <Badge variant="outline">Synchronous provider</Badge>
+            ) : null}
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
             {workflowCapability.enabled && (

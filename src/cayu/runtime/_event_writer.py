@@ -156,12 +156,27 @@ class RuntimeEventWriter:
         return prepared.model_copy(deep=True)
 
     async def is_persisted(self, event: Event) -> bool:
-        """Return whether this exact event reached the durable event handoff."""
+        """Return whether this event identity reached the durable event handoff."""
 
         records = await self._session_store.query_events(
             EventQuery(session_id=event.session_id, event_id=event.id, limit=1)
         )
         return any(record.event.id == event.id for record in records)
+
+    async def is_exact_persisted(self, event: Event) -> bool:
+        """Return whether one exact prepared event reached the durable handoff."""
+
+        records = await self._session_store.query_events(
+            EventQuery(session_id=event.session_id, event_id=event.id, limit=2)
+        )
+        return (
+            _reconcile_exact_persisted_event(
+                event,
+                records,
+                conflict_message="Persisted event identity conflicts with exact readback.",
+            )
+            is not None
+        )
 
     async def emit_many(self, session_id: str, events: list[Event]) -> list[Event]:
         """Persist and fan out a defensive copy of one event batch.

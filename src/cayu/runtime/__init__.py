@@ -252,6 +252,12 @@ from cayu.runtime.mcp_manifest_policy import (
     copy_mcp_manifest_policy,
 )
 from cayu.runtime.outcomes import RunOutcome, StructuredOutputResult, run_to_completion
+from cayu.runtime.provider_operations import (
+    ProviderOperationEvidenceError,
+    ProviderOperationInspection,
+    ProviderOperationInspectionStatus,
+    inspect_provider_operation,
+)
 from cayu.runtime.public_authority import (
     PUBLIC_AUTHORITY_ALIAS_ACTIVE_KEY_ID_ENV,
     PUBLIC_AUTHORITY_ALIAS_KEYS_ENV,
@@ -722,6 +728,9 @@ __all__ = [
     "PromptCacheCompactor",
     "Provenance",
     "ProviderManifest",
+    "ProviderOperationEvidenceError",
+    "ProviderOperationInspection",
+    "ProviderOperationInspectionStatus",
     "PublicAuthorityAliasCodec",
     "PublicAuthorityAliasKeyring",
     "RecentTurnsContextPolicy",
@@ -920,6 +929,7 @@ __all__ = [
     "estimate_usage_session_cost_breakdown",
     "first_reached_limit",
     "has_run_limits",
+    "inspect_provider_operation",
     "is_runtime_owned_session_metadata_key",
     "load_model_catalog",
     "load_price_book",

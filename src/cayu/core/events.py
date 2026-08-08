@@ -87,6 +87,8 @@ class EventType(StrEnum):
     MODEL_ERROR = "model.error"
     MODEL_RETRY = "model.retry"
     MODEL_ATTEMPT_DISCARDED = "model.attempt_discarded"
+    PROVIDER_OPERATION_STARTING = "provider.operation.starting"
+    PROVIDER_OPERATION_STARTED = "provider.operation.started"
 
     STRUCTURED_OUTPUT_VALIDATED = "structured_output.validated"
     STRUCTURED_OUTPUT_VALIDATING = "structured_output.validating"

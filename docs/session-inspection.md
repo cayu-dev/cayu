@@ -55,9 +55,13 @@ JSONL row also carries the schema version so independently consumed
 `model_call`, `unmatched_ledger`, and `aggregate` records cannot be mistaken for
 the version 1 representation.
 
-Session-inspection CLI schema version `3` adds durable `interaction_id`
-correlation to event and transcript records, an `interactions` collection, and
-response-scoped filters. It retains version `2`'s identity-free aggregate usage
+Session-inspection CLI schema version `4` adds the bounded
+`provider_operation` object to `session show`; its status is either
+`synchronous` or `provider_operation_in_progress`, and the latter includes only
+the provider, operation id, and stream protocol. Version `4` retains version
+`3`'s durable `interaction_id` correlation to event and transcript records, an
+`interactions` collection, and response-scoped filters. It retains version
+`2`'s identity-free aggregate usage
 counters as canonical nonnegative decimal strings in `show.usage`,
 `usage.aggregate`, and the JSONL aggregate record. Per-model-call counters
 remain signed-64-bit JSON integers. Consumers must branch on `schema_version`

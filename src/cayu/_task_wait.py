@@ -62,6 +62,7 @@ async def await_shielded_task_outcome(
     *,
     cancellation: asyncio.CancelledError | None = None,
     timeout_s: float | None = None,
+    timeout_after_cancellation_s: float | None = None,
 ) -> ShieldedTaskOutcome[_ResultT]:
     """Await a child while retaining caller cancellation and fatal signals."""
 
@@ -69,6 +70,11 @@ async def await_shielded_task_outcome(
     historical_requests = 0 if current_task is None else current_task.cancelling()
     loop = asyncio.get_running_loop()
     deadline = None if timeout_s is None else loop.time() + timeout_s
+    if cancellation is not None and timeout_after_cancellation_s is not None:
+        cancellation_deadline = loop.time() + timeout_after_cancellation_s
+        deadline = (
+            cancellation_deadline if deadline is None else min(deadline, cancellation_deadline)
+        )
 
     def completed_task_outcome() -> ShieldedTaskOutcome[_ResultT]:
         try:
@@ -87,7 +93,7 @@ async def await_shielded_task_outcome(
         *,
         preserve_requests: int,
     ) -> bool:
-        nonlocal cancellation
+        nonlocal cancellation, deadline
         if current_task is None or current_task.cancelling() <= preserve_requests:
             return False
         # This helper deliberately suppresses cancellation only long enough to
@@ -98,6 +104,11 @@ async def await_shielded_task_outcome(
             cancellation or observed,
             preserve_requests=preserve_requests,
         )
+        if timeout_after_cancellation_s is not None:
+            cancellation_deadline = loop.time() + timeout_after_cancellation_s
+            deadline = (
+                cancellation_deadline if deadline is None else min(deadline, cancellation_deadline)
+            )
         return True
 
     if cancellation is not None:

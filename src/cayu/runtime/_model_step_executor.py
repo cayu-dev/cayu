@@ -13,16 +13,19 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextvars import Context
 from copy import deepcopy
 from dataclasses import dataclass, field
 from hashlib import sha256
-from typing import Any, cast
+from typing import Any, Never, cast
 from uuid import uuid4
 
 from cayu._exception_groups import (
     add_exception_note_safely,
+    exception_cause,
     exception_tree_contains,
     iter_exception_tree,
+    set_exception_cause,
 )
 from cayu._task_wait import (
     await_shielded_task_outcome,
@@ -78,10 +81,19 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
     ModelStreamEventType,
+    ProviderOperationAdapter,
+    ProviderOperationConnection,
+    ProviderOperationMode,
+    ProviderOperationSnapshot,
+    ProviderOperationStartRequest,
+    ProviderOperationState,
+    ProviderOperationStatus,
     UsageDialect,
     copy_input_token_count_result,
     copy_model_context_pressure_profile,
     copy_model_stream_event,
+    copy_provider_operation_connection,
+    copy_provider_operation_snapshot,
     normalize_model_completion,
 )
 from cayu.providers.base import copy_model_completion
@@ -196,7 +208,9 @@ from cayu.runtime.sessions import (
     ModelCompletionStageResult,
     RuntimePublicationResult,
     Session,
+    SessionRunFenced,
     SessionStatus,
+    SessionStatusConflict,
     SessionStore,
 )
 from cayu.runtime.structured_output import (
@@ -221,6 +235,110 @@ from cayu.runtime.usage import (
 from cayu.vaults import SecretRedactor
 
 logger = logging.getLogger(__name__)
+_PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS = 5.0
+_PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS = 5.0
+
+
+def _ambiguous_provider_operation_start_error(
+    *,
+    provider_name: str,
+    cause: BaseException,
+) -> ModelProviderError:
+    return ModelProviderError(
+        "Provider operation start outcome is ambiguous; automatic retry is disabled.",
+        provider=provider_name,
+        error_type=type(cause).__name__,
+        error_code="provider_operation_start_ambiguous",
+        retryable=False,
+    )
+
+
+def _attach_provider_operation_cleanup_failure(
+    failure: BaseException,
+    cleanup_error: BaseException,
+) -> None:
+    prior_cause = exception_cause(failure)
+    combined = BaseExceptionGroup(
+        "Provider operation publication and cancellation both failed.",
+        [prior_cause, cleanup_error] if prior_cause is not None else [cleanup_error],
+    )
+    if not set_exception_cause(failure, combined):
+        add_exception_note_safely(
+            failure,
+            "Provider operation cancellation also failed with "
+            f"{type(cleanup_error).__name__}; its exception could not be attached.",
+        )
+
+
+async def _cancel_provider_operation_after_definite_absence(
+    *,
+    adapter: ProviderOperationAdapter,
+    state: ProviderOperationState,
+    failure: BaseException,
+    cancellation: asyncio.CancelledError | None = None,
+) -> tuple[asyncio.CancelledError | None, ProviderOperationSnapshot | None]:
+    async def cancel():
+        return await adapter.cancel(state)
+
+    cleanup_task = asyncio.create_task(cancel())
+    outcome = await await_shielded_task_outcome(
+        cleanup_task,
+        cancellation=cancellation,
+        timeout_s=_PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS,
+    )
+    if outcome.timed_out:
+        cleanup_task.cancel()
+        drain_outcome = await await_shielded_task_outcome(
+            cleanup_task,
+            cancellation=outcome.cancellation,
+            timeout_s=_PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS,
+        )
+        if drain_outcome.timed_out:
+            cleanup_task.add_done_callback(_consume_detached_task_outcome)
+            failure.add_note(
+                "Provider operation cancellation remained in flight after local task "
+                "cancellation; ownership was released with uncertain cleanup evidence."
+            )
+            return drain_outcome.cancellation, None
+        cleanup_error = drain_outcome.error
+        if isinstance(cleanup_error, asyncio.CancelledError):
+            cleanup_error = None
+        failure.add_note(
+            "Provider operation cancellation exceeded its bounded timeout; "
+            "the local cancellation task was drained before ownership was released."
+        )
+        if cleanup_error is not None:
+            _attach_provider_operation_cleanup_failure(failure, cleanup_error)
+        return drain_outcome.cancellation, None
+    cleanup_error = outcome.error
+    if isinstance(cleanup_error, asyncio.CancelledError) and outcome.cancellation is None:
+        cleanup_error = unexpected_child_cancellation_error(
+            cleanup_error,
+            operation="Provider operation cancellation",
+        )
+    if cleanup_error is not None:
+        _attach_provider_operation_cleanup_failure(failure, cleanup_error)
+        failure.add_note(
+            "Provider operation cleanup after start-evidence failure also failed: "
+            f"{type(cleanup_error).__name__}."
+        )
+        return outcome.cancellation, None
+    try:
+        if outcome.result is None:
+            raise RuntimeError("Provider operation cancellation returned no snapshot.")
+        cancellation_snapshot = copy_provider_operation_snapshot(outcome.result)
+        if cancellation_snapshot.state != state:
+            raise RuntimeError("Provider operation cancellation returned a different identity.")
+        if not cancellation_snapshot.status.terminal:
+            failure.add_note("Provider operation cancellation did not reach a terminal state.")
+    except BaseException as cleanup_error:
+        _attach_provider_operation_cleanup_failure(failure, cleanup_error)
+        failure.add_note(
+            "Provider operation cleanup after start-evidence failure also failed: "
+            f"{type(cleanup_error).__name__}."
+        )
+        return outcome.cancellation, None
+    return outcome.cancellation, cancellation_snapshot
 
 
 class ModelAttemptFailed(Exception):
@@ -239,13 +357,24 @@ class ModelAttemptFailed(Exception):
         emitted_error_event: bool,
         cause: Exception | None = None,
         completion_observed: bool = False,
+        automatic_retry_disabled: bool = False,
     ) -> None:
         self.message = require_nonblank(message, "message")
         self.payload = copy_json_value(payload, "payload")
         self.emitted_error_event = emitted_error_event
         self.cause = cause
         self.completion_observed = completion_observed
+        self.automatic_retry_disabled = automatic_retry_disabled
         super().__init__(self.message)
+
+
+def _raise_terminal_model_attempt_failure(exc: ModelAttemptFailed) -> Never:
+    if exc.cause is None:
+        raise RuntimeError(exc.message) from exc
+    authoritative_cause = exception_cause(exc.cause)
+    if exc.automatic_retry_disabled and authoritative_cause is not None:
+        raise exc.cause from authoritative_cause
+    raise exc.cause from exc
 
 
 def _copy_model_completion_stage(stage: ModelCompletionStage) -> ModelCompletionStage:
@@ -1119,6 +1248,16 @@ class ModelStepExecutor:
         self._apply_budget_evaluation = apply_budget_evaluation
         self._apply_limit_evaluation = apply_limit_evaluation
         self._stop_for_budget_reservation_failure = stop_for_budget_reservation_failure
+        self._provider_operation_reconciliation_tasks: set[asyncio.Task[None]] = set()
+
+    def _retain_provider_operation_reconciliation(self, task: asyncio.Task[None]) -> None:
+        self._provider_operation_reconciliation_tasks.add(task)
+
+        def settled(completed: asyncio.Task[None]) -> None:
+            self._provider_operation_reconciliation_tasks.discard(completed)
+            _consume_detached_task_outcome(completed)
+
+        task.add_done_callback(settled)
 
     def create_run(
         self,
@@ -1585,9 +1724,7 @@ class ModelStepExecutor:
                         None,
                     )
                 if not decision.retry:
-                    if exc.cause is not None:
-                        raise exc.cause from exc
-                    raise RuntimeError(exc.message) from exc
+                    _raise_terminal_model_attempt_failure(exc)
                 yield (
                     await self._event_writer.emit(
                         _model_retry_event(
@@ -1849,11 +1986,346 @@ class ModelStepExecutor:
             completion_dispatch = await prepare_model_completion_dispatch(model_request)
         provider_events: AsyncIterator[ModelStreamEvent] | None = None
         provider_exhausted = False
+        background_dispatch_invoked = False
         durable_stream_failure: ModelAttemptFailed | None = None
         provider_control_failure: ModelProviderError | None = None
         post_completion_failure: BaseException | None = None
         try:
-            provider_events = provider.stream(model_request)
+            provider_operation_mode = provider.provider_operation_mode
+            if type(provider_operation_mode) is not ProviderOperationMode:
+                raise TypeError(
+                    "ModelProvider.provider_operation_mode must return a ProviderOperationMode."
+                )
+            if provider_operation_mode is ProviderOperationMode.SYNCHRONOUS:
+                provider_events = provider.stream(model_request)
+            else:
+                provider_operation_adapter = provider.provider_operations
+                if not isinstance(provider_operation_adapter, ProviderOperationAdapter):
+                    raise RuntimeError(
+                        "Background provider-operation mode requires a ProviderOperationAdapter."
+                    )
+                start_id = f"provider-operation:{model_attempt_identity.model_attempt_id}"
+                starting_event = _event_with_model_identity_authority(
+                    Event(
+                        type=EventType.PROVIDER_OPERATION_STARTING,
+                        session_id=session.id,
+                        agent_name=registered_agent.spec.name,
+                        environment_name=environment_name,
+                        payload={
+                            "provider": registered_provider.name,
+                            "model": session.model,
+                            "step": step,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            **model_attempt_identity.payload(),
+                            "source_run_epoch": session.run_epoch,
+                            "start_id": start_id,
+                        },
+                    ),
+                    model_attempt_identity,
+                )
+                starting_event = event_with_runtime_payload_authority(
+                    starting_event,
+                    "start_id",
+                )
+                emitted_starting_event = await self._event_writer.emit(starting_event)
+                yield emitted_starting_event, None
+
+                async def start_provider_operation() -> ProviderOperationConnection:
+                    return await provider_operation_adapter.start(
+                        ProviderOperationStartRequest(
+                            request=model_request,
+                            idempotency_key=start_id,
+                        )
+                    )
+
+                start_task = asyncio.create_task(start_provider_operation())
+                background_dispatch_invoked = True
+
+                def operation_event_for(
+                    operation_state: ProviderOperationState,
+                    operation_status: ProviderOperationStatus,
+                ) -> Event:
+                    event = _event_with_model_identity_authority(
+                        Event(
+                            type=EventType.PROVIDER_OPERATION_STARTED,
+                            session_id=session.id,
+                            interaction_id=emitted_starting_event.interaction_id,
+                            agent_name=registered_agent.spec.name,
+                            environment_name=environment_name,
+                            payload={
+                                "provider": registered_provider.name,
+                                "model": session.model,
+                                "step": step,
+                                "attempt": attempt,
+                                "max_attempts": max_attempts,
+                                **model_attempt_identity.payload(),
+                                "source_run_epoch": session.run_epoch,
+                                "start_id": start_id,
+                                "state_version": operation_state.version,
+                                "operation_id": operation_state.operation_id,
+                                "stream_protocol": operation_state.stream_protocol,
+                                "status": operation_status.value,
+                                "recovery_metadata": operation_state.recovery_metadata.model_dump(
+                                    mode="json",
+                                    exclude_none=True,
+                                ),
+                            },
+                        ),
+                        model_attempt_identity,
+                    )
+                    return event_with_runtime_payload_authority(event, "start_id")
+
+                start_outcome = await await_shielded_task_outcome(
+                    start_task,
+                    timeout_after_cancellation_s=(
+                        _PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS
+                    ),
+                )
+                if start_outcome.timed_out:
+                    start_task.cancel()
+                    if (
+                        start_outcome.cancellation is None
+                    ):  # pragma: no cover - timeout is armed by cancellation
+                        raise RuntimeError("Provider operation start settlement timed out.")
+
+                    async def reconcile_late_start() -> None:
+                        late_outcome = await await_shielded_task_outcome(start_task)
+                        if late_outcome.error is not None or late_outcome.result is None:
+                            return
+                        late_operation = copy_provider_operation_connection(late_outcome.result)
+                        try:
+                            (
+                                _,
+                                cancellation_snapshot,
+                            ) = await _cancel_provider_operation_after_definite_absence(
+                                adapter=provider_operation_adapter,
+                                state=late_operation.state,
+                                failure=RuntimeError(
+                                    "Caller cancellation preceded provider start acknowledgement."
+                                ),
+                            )
+                            reconciled_status = (
+                                late_operation.status
+                                if cancellation_snapshot is None
+                                else cancellation_snapshot.status
+                            )
+                            reconciliation_event = self._event_writer.prepare(
+                                operation_event_for(
+                                    late_operation.state,
+                                    reconciled_status,
+                                )
+                            )
+
+                            def preserve_checkpoint(
+                                _current: Session,
+                                checkpoint: dict[str, Any] | None,
+                            ) -> dict[str, Any]:
+                                if checkpoint is None:
+                                    raise RuntimeError(
+                                        "Late provider-operation reconciliation requires an "
+                                        "existing session checkpoint."
+                                    )
+                                copied = copy_json_value(checkpoint, "checkpoint")
+                                if type(copied) is not dict:
+                                    raise TypeError("Session checkpoint must be an object.")
+                                return copied
+
+                            for publication_attempt in range(2):
+                                reconciliation_session = await self._session_store.load(session.id)
+                                if reconciliation_session is None:
+                                    return
+                                if reconciliation_session.run_epoch == session.run_epoch:
+                                    eligible_statuses = {
+                                        SessionStatus.RUNNING,
+                                        SessionStatus.INTERRUPTING,
+                                    }
+                                elif reconciliation_session.run_epoch == session.run_epoch + 1:
+                                    eligible_statuses = {
+                                        SessionStatus.INTERRUPTED,
+                                        SessionStatus.FAILED,
+                                    }
+                                else:
+                                    return
+                                try:
+                                    await self._session_store.publish_checkpoint_and_events(
+                                        session.id,
+                                        checkpoint_transform=preserve_checkpoint,
+                                        events=[reconciliation_event],
+                                        expected_statuses=eligible_statuses,
+                                        expected_run_epoch=reconciliation_session.run_epoch,
+                                    )
+                                    break
+                                except (SessionRunFenced, SessionStatusConflict):
+                                    if publication_attempt == 1:
+                                        raise
+                            persisted = await self._session_store.query_events(
+                                EventQuery(
+                                    session_id=session.id,
+                                    event_id=reconciliation_event.id,
+                                    limit=1,
+                                )
+                            )
+                            if len(persisted) != 1 or persisted[0].event != reconciliation_event:
+                                raise RuntimeError(
+                                    "Late provider-operation reconciliation readback did not "
+                                    "match its durable event."
+                                )
+                            await self._event_writer.fan_out_persisted([persisted[0].event])
+                        finally:
+                            await _close_async_iterator(late_outcome.result.events)
+
+                    reconciliation_task = asyncio.create_task(
+                        reconcile_late_start(),
+                        context=Context(),
+                    )
+                    self._retain_provider_operation_reconciliation(reconciliation_task)
+                    start_outcome.cancellation.add_note(
+                        "Provider operation start remained in flight after bounded cancellation "
+                        "settlement; durable starting evidence prevents automatic retry."
+                    )
+                    raise start_outcome.cancellation
+                start_error = start_outcome.error
+                if (
+                    isinstance(start_error, asyncio.CancelledError)
+                    and start_outcome.cancellation is None
+                ):
+                    start_error = unexpected_child_cancellation_error(
+                        start_error,
+                        operation="Provider operation start",
+                    )
+                if start_error is not None:
+                    if start_outcome.cancellation is not None:
+                        raise start_outcome.cancellation from start_error
+                    if not isinstance(start_error, Exception):
+                        raise start_error
+                    raise _ambiguous_provider_operation_start_error(
+                        provider_name=registered_provider.name,
+                        cause=start_error,
+                    ) from start_error
+                try:
+                    if start_outcome.result is None:
+                        raise RuntimeError("Provider operation start returned no connection.")
+                    provider_operation = copy_provider_operation_connection(start_outcome.result)
+                except Exception as start_validation_error:
+                    if start_outcome.cancellation is not None:
+                        raise start_outcome.cancellation from start_validation_error
+                    raise _ambiguous_provider_operation_start_error(
+                        provider_name=registered_provider.name,
+                        cause=start_validation_error,
+                    ) from start_validation_error
+                operation_state = provider_operation.state
+                operation_event = operation_event_for(
+                    provider_operation.state,
+                    provider_operation.status,
+                )
+                provider_events = provider_operation.events
+                try:
+                    operation_event = self._event_writer.prepare(operation_event)
+                except BaseException as preparation_error:
+                    (
+                        cleanup_cancellation,
+                        _,
+                    ) = await _cancel_provider_operation_after_definite_absence(
+                        adapter=provider_operation_adapter,
+                        state=operation_state,
+                        failure=preparation_error,
+                        cancellation=start_outcome.cancellation,
+                    )
+                    if cleanup_cancellation is not None:
+                        raise cleanup_cancellation from preparation_error
+                    if isinstance(
+                        preparation_error,
+                        SessionInterruptedByRequest | SessionRunFenced,
+                    ):
+                        raise
+                    if isinstance(preparation_error, Exception):
+                        raise _ambiguous_provider_operation_start_error(
+                            provider_name=registered_provider.name,
+                            cause=preparation_error,
+                        ) from preparation_error
+                    raise
+                try:
+                    persisted_operation_event = await self._event_writer.persist_exact_replay(
+                        operation_event
+                    )
+                except BaseException as persistence_error:
+                    try:
+                        exact_identity_is_durable = await self._event_writer.is_exact_persisted(
+                            operation_event
+                        )
+                    except BaseException as verification_error:
+                        persistence_error.add_note(
+                            "Provider operation start-evidence readback also failed: "
+                            f"{type(verification_error).__name__}."
+                        )
+                        if start_outcome.cancellation is not None:
+                            raise start_outcome.cancellation from BaseExceptionGroup(
+                                "Provider operation publication and readback both failed.",
+                                [persistence_error, verification_error],
+                            )
+                        if isinstance(
+                            verification_error,
+                            SessionInterruptedByRequest | SessionRunFenced,
+                        ) or not isinstance(verification_error, Exception):
+                            raise
+                        if isinstance(
+                            persistence_error,
+                            SessionInterruptedByRequest | SessionRunFenced,
+                        ):
+                            raise persistence_error from verification_error
+                        if isinstance(persistence_error, Exception):
+                            raise _ambiguous_provider_operation_start_error(
+                                provider_name=registered_provider.name,
+                                cause=persistence_error,
+                            ) from verification_error
+                        raise persistence_error from verification_error
+                    if not exact_identity_is_durable:
+                        (
+                            cleanup_cancellation,
+                            _,
+                        ) = await _cancel_provider_operation_after_definite_absence(
+                            adapter=provider_operation_adapter,
+                            state=operation_state,
+                            failure=persistence_error,
+                            cancellation=start_outcome.cancellation,
+                        )
+                        if cleanup_cancellation is not None:
+                            raise cleanup_cancellation from persistence_error
+                    if start_outcome.cancellation is not None:
+                        raise start_outcome.cancellation from persistence_error
+                    if isinstance(
+                        persistence_error,
+                        SessionInterruptedByRequest | SessionRunFenced,
+                    ):
+                        raise
+                    if isinstance(persistence_error, Exception):
+                        raise _ambiguous_provider_operation_start_error(
+                            provider_name=registered_provider.name,
+                            cause=persistence_error,
+                        ) from persistence_error
+                    raise
+                try:
+                    [emitted_operation_event] = await self._event_writer.fan_out_persisted(
+                        [persisted_operation_event]
+                    )
+                except BaseException as delivery_error:
+                    if start_outcome.cancellation is not None:
+                        raise start_outcome.cancellation from delivery_error
+                    if isinstance(
+                        delivery_error,
+                        SessionInterruptedByRequest | SessionRunFenced,
+                    ):
+                        raise
+                    if isinstance(delivery_error, Exception):
+                        raise _ambiguous_provider_operation_start_error(
+                            provider_name=registered_provider.name,
+                            cause=delivery_error,
+                        ) from delivery_error
+                    raise
+                if start_outcome.cancellation is not None:
+                    raise start_outcome.cancellation
+                yield emitted_operation_event, None
             async for raw_stream_event in provider_events:
                 boundary_value = _validate_stream_event(
                     raw_stream_event,
@@ -2082,6 +2554,15 @@ class ModelStepExecutor:
             post_completion_failure = exc
         except ModelAttemptFailed as exc:
             if model_completion_publisher is None or not model_completed:
+                if background_dispatch_invoked and not exc.automatic_retry_disabled:
+                    raise ModelAttemptFailed(
+                        message=exc.message,
+                        payload=exc.payload,
+                        emitted_error_event=exc.emitted_error_event,
+                        cause=exc.cause,
+                        completion_observed=exc.completion_observed,
+                        automatic_retry_disabled=True,
+                    ) from exc
                 raise
             durable_stream_failure = exc
         except Exception as exc:
@@ -2297,6 +2778,27 @@ class ModelStepExecutor:
             if terminal_failure is not None:
                 raise terminal_failure
 
+        if provider_control_failure is not None and background_dispatch_invoked:
+            post_dispatch_failure = ModelProviderError(
+                "A background provider operation failed after dispatch; automatic retry and "
+                "context-overflow recovery are disabled while the original operation may "
+                "remain active.",
+                provider=registered_provider.name,
+                error_type=type(provider_control_failure).__name__,
+                error_code="provider_operation_failed_after_dispatch",
+                retryable=False,
+            )
+            set_exception_cause(post_dispatch_failure, provider_control_failure)
+            raise ModelAttemptFailed(
+                message=str(post_dispatch_failure),
+                payload={
+                    "error": str(post_dispatch_failure),
+                    "error_type": type(provider_control_failure).__name__,
+                },
+                emitted_error_event=False,
+                cause=post_dispatch_failure,
+                automatic_retry_disabled=True,
+            ) from post_dispatch_failure
         if type(provider_control_failure) is ModelContextOverflowError:
             yield (
                 await self._event_writer.emit(
@@ -2316,6 +2818,15 @@ class ModelStepExecutor:
         if provider_control_failure is not None:
             raise provider_control_failure from None
         if durable_stream_failure is not None:
+            if background_dispatch_invoked and not durable_stream_failure.automatic_retry_disabled:
+                durable_stream_failure = ModelAttemptFailed(
+                    message=durable_stream_failure.message,
+                    payload=durable_stream_failure.payload,
+                    emitted_error_event=durable_stream_failure.emitted_error_event,
+                    cause=durable_stream_failure.cause,
+                    completion_observed=durable_stream_failure.completion_observed,
+                    automatic_retry_disabled=True,
+                )
             raise durable_stream_failure from None
         if post_completion_failure is not None:
             raise post_completion_failure
@@ -2326,6 +2837,7 @@ class ModelStepExecutor:
                 payload={"error": message, "error_type": "RuntimeError"},
                 emitted_error_event=False,
                 cause=RuntimeError(message),
+                automatic_retry_disabled=background_dispatch_invoked,
             )
         await self._session_control.raise_if_interrupted(session.id)
         if completed_stream_event is None:
@@ -5925,7 +6437,7 @@ def _typed_retry_fields(
     exc: ModelAttemptFailed,
 ) -> tuple[int | None, bool | None, float | None]:
     cause = exc.cause
-    if exc.completion_observed:
+    if exc.completion_observed or exc.automatic_retry_disabled:
         # A valid completed frame is the authoritative terminal attempt. A
         # later transport/control failure cannot authorize another provider
         # charge for the same logical step.

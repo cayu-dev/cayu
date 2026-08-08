@@ -5870,6 +5870,12 @@ def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
     assert body["session_id"] == "state_1"
     assert body["status"] == "running"
     assert body["interruption_cascade"] == "none"
+    assert body["provider_operation"] == {
+        "status": "synchronous",
+        "provider": None,
+        "operation_id": None,
+        "stream_protocol": None,
+    }
     assert body["updated_at"]
     assert body["last_activity_at"]
     assert set(body) == {
@@ -5878,6 +5884,166 @@ def test_server_exposes_bounded_session_state_without_heavy_loaders() -> None:
         "updated_at",
         "last_activity_at",
         "interruption_cascade",
+        "provider_operation",
+    }
+
+
+def test_server_session_state_exposes_in_progress_provider_operation() -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="state_provider_operation",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        model_identity = {
+            "provider": "reconnectable",
+            "model": "fake-model",
+            "step": 1,
+            "attempt": 1,
+            "max_attempts": 1,
+            "model_step_id": "mstep_" + "a" * 32,
+            "model_attempt_id": "matt_" + "b" * 32,
+            "source_run_epoch": 1,
+        }
+        await app.session_store.append_events(
+            "state_provider_operation",
+            [
+                Event(
+                    type=EventType.MODEL_STARTED,
+                    session_id="state_provider_operation",
+                    interaction_id="interaction-a",
+                    payload=model_identity,
+                ),
+                Event(
+                    type=EventType.PROVIDER_OPERATION_STARTED,
+                    session_id="state_provider_operation",
+                    interaction_id="interaction-a",
+                    payload={
+                        **model_identity,
+                        "provider": "reconnectable",
+                        "start_id": "provider-operation:" + model_identity["model_attempt_id"],
+                        "state_version": 1,
+                        "operation_id": "response_123",
+                        "stream_protocol": "responses-v1",
+                        "status": "in_progress",
+                        "recovery_metadata": {"cursor": 0},
+                    },
+                ),
+            ],
+        )
+
+    asyncio.run(seed())
+
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    response = client.get("/api/sessions/state_provider_operation/state")
+
+    assert response.status_code == 200
+    assert response.json()["provider_operation"] == {
+        "status": "provider_operation_in_progress",
+        "provider": "reconnectable",
+        "operation_id": "response_123",
+        "stream_protocol": "responses-v1",
+    }
+
+
+def test_server_session_state_keeps_ambiguous_start_and_model_error_visible() -> None:
+    app = CayuApp()
+
+    async def seed() -> None:
+        for session_id, include_started in (
+            ("state_provider_start_ambiguous", False),
+            ("state_provider_error", True),
+        ):
+            await app.session_store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+                identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+            )
+            model_identity = {
+                "provider": "reconnectable",
+                "model": "fake-model",
+                "step": 1,
+                "attempt": 1,
+                "max_attempts": 1,
+                "model_step_id": "mstep_" + "a" * 32,
+                "model_attempt_id": "matt_" + "b" * 32,
+                "source_run_epoch": 1,
+            }
+            events = [
+                Event(
+                    type=EventType.MODEL_STARTED,
+                    session_id=session_id,
+                    interaction_id="interaction-a",
+                    payload=model_identity,
+                ),
+                Event(
+                    type=EventType.PROVIDER_OPERATION_STARTING,
+                    session_id=session_id,
+                    interaction_id="interaction-a",
+                    payload={
+                        **model_identity,
+                        "provider": "reconnectable",
+                        "start_id": "provider-operation:" + model_identity["model_attempt_id"],
+                    },
+                ),
+            ]
+            if include_started:
+                events.extend(
+                    [
+                        Event(
+                            type=EventType.PROVIDER_OPERATION_STARTED,
+                            session_id=session_id,
+                            interaction_id="interaction-a",
+                            payload={
+                                **model_identity,
+                                "provider": "reconnectable",
+                                "start_id": (
+                                    "provider-operation:" + model_identity["model_attempt_id"]
+                                ),
+                                "state_version": 1,
+                                "operation_id": "response_123",
+                                "stream_protocol": "responses-v1",
+                                "status": "in_progress",
+                                "recovery_metadata": {"cursor": 0},
+                            },
+                        ),
+                        Event(
+                            type=EventType.MODEL_ERROR,
+                            session_id=session_id,
+                            interaction_id="interaction-a",
+                            payload=model_identity,
+                        ),
+                    ]
+                )
+            await app.session_store.append_events(session_id, events)
+
+    asyncio.run(seed())
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+
+    ambiguous = client.get("/api/sessions/state_provider_start_ambiguous/state")
+    model_error = client.get("/api/sessions/state_provider_error/state")
+
+    assert ambiguous.status_code == 200
+    assert ambiguous.json()["provider_operation"] == {
+        "status": "provider_operation_in_progress",
+        "provider": "reconnectable",
+        "operation_id": None,
+        "stream_protocol": None,
+    }
+    assert model_error.status_code == 200
+    assert model_error.json()["provider_operation"] == {
+        "status": "provider_operation_in_progress",
+        "provider": "reconnectable",
+        "operation_id": "response_123",
+        "stream_protocol": "responses-v1",
     }
 
 

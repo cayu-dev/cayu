@@ -752,6 +752,28 @@ export type ApiPendingActionIssue = {
 };
 
 /**
+ * ApiProviderOperationInspection
+ */
+export type ApiProviderOperationInspection = {
+    /**
+     * Operation Id
+     */
+    operation_id?: string | null;
+    /**
+     * Provider
+     */
+    provider?: string | null;
+    /**
+     * Status
+     */
+    status: 'synchronous' | 'provider_operation_in_progress';
+    /**
+     * Stream Protocol
+     */
+    stream_protocol?: string | null;
+};
+
+/**
  * ApiReviewedKnowledgeEntry
  */
 export type ApiReviewedKnowledgeEntry = {
@@ -4035,6 +4057,7 @@ export type SessionStateResponse = {
      * Last Activity At
      */
     last_activity_at: string;
+    provider_operation: ApiProviderOperationInspection;
     /**
      * Session Id
      */

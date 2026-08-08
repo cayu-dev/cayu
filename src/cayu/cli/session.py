@@ -43,12 +43,13 @@ from cayu.runtime._checkpoint_store import runtime_checkpoint_session_store
 from cayu.runtime.aggregates import summary_usage_metrics_from_event_payload
 from cayu.runtime.budgets import is_complete_budget_reconciliation_pricing
 from cayu.runtime.interactions import INTERACTION_TERMINAL_EVENT_TYPES
+from cayu.runtime.provider_operations import inspect_provider_operation
 from cayu.runtime.usage import count_model_steps_with_usage
 from cayu.storage import SQLiteSessionStore
 from cayu.storage import migrations as schema
 
 FORMAT_CHOICES = ("json", "table", "jsonl")
-CLI_SCHEMA_VERSION = "3"
+CLI_SCHEMA_VERSION = "4"
 _MAX_COLLECTED_EVENT_BYTES = 64 * 1024 * 1024
 _MAX_COLLECTED_EVENT_RECORDS = 100_000
 _MAX_TRANSCRIPT_CONTENT_BYTES = 1_048_576
@@ -373,6 +374,7 @@ async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
     except KeyError as exc:
         raise ValueError(f"Session not found: {args.session_id}") from exc
     identity = summary.session
+    provider_operation = await inspect_provider_operation(store, args.session_id)
     usage = _aggregate_usage_cli_payload(summary.usage.usage)
     payload = {
         "schema_version": CLI_SCHEMA_VERSION,
@@ -425,6 +427,7 @@ async def _show_session(args: argparse.Namespace, store: SessionStore) -> int:
             "accepted_event_count": summary.operation_event_count,
             "state": "present" if summary.operation_event_count else "none",
         },
+        "provider_operation": provider_operation.model_dump(mode="json"),
         "terminal_failure": {"state": summary.terminal_failure_state},
         "budget": summary.budget.model_dump(mode="json"),
     }

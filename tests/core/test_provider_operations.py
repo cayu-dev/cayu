@@ -1,0 +1,1928 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+
+from cayu._exception_groups import exception_cause, set_exception_cause
+from cayu.core import AgentSpec, EventType, Message
+from cayu.core.events import Event
+from cayu.providers import (
+    ModelContextOverflowError,
+    ModelProvider,
+    ModelProviderError,
+    ModelRequest,
+    ModelStreamEvent,
+    ProviderOperationAdapter,
+    ProviderOperationConnection,
+    ProviderOperationMode,
+    ProviderOperationSnapshot,
+    ProviderOperationStartRequest,
+    ProviderOperationState,
+    ProviderOperationStatus,
+)
+from cayu.runtime import (
+    CayuApp,
+    EventQuery,
+    EventRecord,
+    InMemorySessionStore,
+    PersistedEventSideEffectClaim,
+    RecentTurnsContextPolicy,
+    RetryPolicy,
+    RunRequest,
+    SessionIdentity,
+    SessionRunFenced,
+    SessionStatus,
+)
+from cayu.runtime._model_step_executor import (
+    ModelAttemptFailed,
+    _raise_terminal_model_attempt_failure,
+)
+from cayu.runtime.provider_operations import (
+    ProviderOperationEvidenceError,
+    ProviderOperationInspectionStatus,
+    inspect_provider_operation,
+)
+from cayu.vaults import SecretRedactor
+
+
+class _ReconnectableAdapter(ProviderOperationAdapter):
+    def __init__(self, *, cursor: int = 0, start_error: Exception | None = None) -> None:
+        self.cursor = cursor
+        self.start_error = start_error
+        self.start_calls = 0
+        self.start_requests: list[ProviderOperationStartRequest] = []
+        self.cancel_calls = 0
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        self.start_calls += 1
+        self.start_requests.append(request)
+        if self.start_error is not None:
+            raise self.start_error
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+        return ProviderOperationConnection(
+            state=ProviderOperationState(
+                operation_id="response_123",
+                stream_protocol="responses-v1",
+                recovery_metadata={"cursor": self.cursor},
+            ),
+            status=ProviderOperationStatus.IN_PROGRESS,
+            events=events(),
+        )
+
+    async def retrieve(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        raise AssertionError("retrieve is not used for an initial dispatch")
+
+    async def reconnect(self, state: ProviderOperationState) -> ProviderOperationConnection:
+        raise AssertionError("reconnect is not used for an initial dispatch")
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        return ProviderOperationSnapshot(
+            state=state,
+            status=ProviderOperationStatus.CANCELLED,
+        )
+
+
+class _BlockingCancelAdapter(_ReconnectableAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_entered = asyncio.Event()
+        self.cancel_release = asyncio.Event()
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        self.cancel_entered.set()
+        await self.cancel_release.wait()
+        return ProviderOperationSnapshot(
+            state=state,
+            status=ProviderOperationStatus.CANCELLED,
+        )
+
+
+class _CancellationResistantCancelAdapter(_ReconnectableAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_entered = asyncio.Event()
+        self.local_cancellation_observed = asyncio.Event()
+        self.cancel_release = asyncio.Event()
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        self.cancel_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.local_cancellation_observed.set()
+            await self.cancel_release.wait()
+            raise
+
+
+class _FailingOperationStreamAdapter(_ReconnectableAdapter):
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        connection = await super().start(request)
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            raise ModelProviderError(
+                "provider stream disconnected",
+                provider="reconnectable",
+                retryable=True,
+            )
+            yield  # pragma: no cover - keeps this an async generator
+
+        return ProviderOperationConnection(
+            state=connection.state,
+            status=connection.status,
+            events=events(),
+        )
+
+
+class _ErrorEventOperationStreamAdapter(_ReconnectableAdapter):
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        connection = await super().start(request)
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.error(
+                "provider stream disconnected",
+                cause=ModelProviderError(
+                    "provider stream disconnected",
+                    provider="reconnectable",
+                    retryable=True,
+                ),
+            )
+
+        return ProviderOperationConnection(
+            state=connection.state,
+            status=connection.status,
+            events=events(),
+        )
+
+
+class _EmptyOperationStreamAdapter(_ReconnectableAdapter):
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        connection = await super().start(request)
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            return
+            yield  # pragma: no cover - keeps this an async generator
+
+        return ProviderOperationConnection(
+            state=connection.state,
+            status=connection.status,
+            events=events(),
+        )
+
+
+class _OverflowingOperationStreamAdapter(_ReconnectableAdapter):
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        connection = await super().start(request)
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            raise ModelContextOverflowError(
+                "provider context limit exceeded",
+                provider="reconnectable",
+                status_code=400,
+                error_code="context_length_exceeded",
+            )
+            yield  # pragma: no cover - keeps this an async generator
+
+        return ProviderOperationConnection(
+            state=connection.state,
+            status=connection.status,
+            events=events(),
+        )
+
+
+class _ProviderIdentityAdapter(_ReconnectableAdapter):
+    def __init__(self, *, operation_id: str, stream_protocol: str = "responses-v1") -> None:
+        super().__init__()
+        self.operation_id = operation_id
+        self.stream_protocol = stream_protocol
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        connection = await super().start(request)
+        return ProviderOperationConnection(
+            state=ProviderOperationState(
+                operation_id=self.operation_id,
+                stream_protocol=self.stream_protocol,
+                recovery_metadata=connection.state.recovery_metadata,
+            ),
+            status=connection.status,
+            events=connection.events,
+        )
+
+
+class _BlockingStartAdapter(_ReconnectableAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_entered = asyncio.Event()
+        self.start_release = asyncio.Event()
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        self.start_calls += 1
+        self.start_requests.append(request)
+        self.start_entered.set()
+        await self.start_release.wait()
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+        return ProviderOperationConnection(
+            state=ProviderOperationState(
+                operation_id="response_123",
+                stream_protocol="responses-v1",
+            ),
+            status=ProviderOperationStatus.IN_PROGRESS,
+            events=events(),
+        )
+
+
+class _CancellationResistantStartAdapter(_BlockingStartAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.local_cancellation_observed = asyncio.Event()
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        try:
+            return await super().start(request)
+        except asyncio.CancelledError:
+            self.local_cancellation_observed.set()
+            await self.start_release.wait()
+            raise
+
+
+class _LateSuccessfulStartAdapter(_BlockingStartAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.local_cancellation_observed = asyncio.Event()
+        self.late_cancel_observed = asyncio.Event()
+        self.cancelled_states: list[ProviderOperationState] = []
+
+    async def start(self, request: ProviderOperationStartRequest) -> ProviderOperationConnection:
+        self.start_calls += 1
+        self.start_requests.append(request)
+        self.start_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.local_cancellation_observed.set()
+            await self.start_release.wait()
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.text_delta("late")
+
+        return ProviderOperationConnection(
+            state=ProviderOperationState(
+                operation_id="response_late",
+                stream_protocol="responses-v1",
+            ),
+            status=ProviderOperationStatus.IN_PROGRESS,
+            events=events(),
+        )
+
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        self.cancelled_states.append(state)
+        self.late_cancel_observed.set()
+        return ProviderOperationSnapshot(state=state, status=ProviderOperationStatus.CANCELLED)
+
+
+class _LateFailingCancelAdapter(_LateSuccessfulStartAdapter):
+    async def cancel(self, state: ProviderOperationState) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        self.cancelled_states.append(state)
+        self.late_cancel_observed.set()
+        raise TimeoutError("late provider cancellation failed")
+
+
+class _SynchronousFailingCancelAdapter(_ReconnectableAdapter):
+    def cancel(  # ty: ignore[invalid-method-override]
+        self,
+        state: ProviderOperationState,
+    ) -> ProviderOperationSnapshot:
+        self.cancel_calls += 1
+        raise TimeoutError("cancel failed before returning an awaitable")
+
+
+class _ReconnectableProvider(ModelProvider):
+    name = "reconnectable"
+
+    def __init__(
+        self,
+        *,
+        background: bool = False,
+        cursor: int = 0,
+        start_error: Exception | None = None,
+    ) -> None:
+        self.background = background
+        self.adapter = _ReconnectableAdapter(cursor=cursor, start_error=start_error)
+        self.stream_calls = 0
+
+    @property
+    def provider_operation_mode(self) -> ProviderOperationMode:
+        if self.background:
+            return ProviderOperationMode.BACKGROUND
+        return ProviderOperationMode.SYNCHRONOUS
+
+    @property
+    def provider_operations(self) -> ProviderOperationAdapter:
+        return self.adapter
+
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.stream_calls += 1
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+        return events()
+
+
+class _SynchronousProvider(ModelProvider):
+    name = "synchronous"
+
+    def __init__(self) -> None:
+        self.stream_calls = 0
+
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.stream_calls += 1
+
+        async def events() -> AsyncIterator[ModelStreamEvent]:
+            yield ModelStreamEvent.text_delta("done")
+            yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+        return events()
+
+
+def test_provider_operation_state_is_versioned_portable_and_bounded() -> None:
+    state = ProviderOperationState(
+        operation_id="response_123",
+        stream_protocol="responses-v1",
+        recovery_metadata={"cursor": 7},
+    )
+
+    assert state.version == 1
+    assert state.model_dump(mode="json") == {
+        "version": 1,
+        "operation_id": "response_123",
+        "stream_protocol": "responses-v1",
+        "recovery_metadata": {"cursor": 7},
+    }
+
+    with pytest.raises(ValueError, match="operation_id"):
+        ProviderOperationState(operation_id="x" * 513, stream_protocol="responses-v1")
+    with pytest.raises(ValueError, match="recovery_metadata"):
+        ProviderOperationState(
+            operation_id="response_123",
+            stream_protocol="responses-v1",
+            recovery_metadata={"cursor": 2**63},
+        )
+    with pytest.raises(ValueError, match="recovery_metadata"):
+        ProviderOperationState(
+            operation_id="response_123",
+            stream_protocol="responses-v1",
+            recovery_metadata={"cursor": object()},
+        )
+
+
+@pytest.mark.parametrize(
+    "recovery_metadata",
+    [
+        {"bearer_token": "credential"},
+        {"private_key": "credential"},
+        {"request": {"messages": []}},
+        {"analysis": "private chain of thought"},
+        {"response_body": "unbounded provider response"},
+        {"cursor": "Bearer sk-test-secret"},
+        {"cursor": "raw request: user private message"},
+        {"cursor": "hidden reasoning: chain of thought"},
+        {"cursor": -1},
+        {"cursor": True},
+        {"cursor": 1.0},
+    ],
+)
+def test_provider_operation_state_rejects_unsafe_recovery_content(
+    recovery_metadata: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="must not contain"):
+        ProviderOperationState(
+            operation_id="response_123",
+            stream_protocol="responses-v1",
+            recovery_metadata=recovery_metadata,
+        )
+
+
+def test_provider_operation_status_interprets_terminal_states() -> None:
+    assert ProviderOperationStatus.IN_PROGRESS.terminal is False
+    assert ProviderOperationStatus.QUEUED.terminal is False
+    assert ProviderOperationStatus.COMPLETED.terminal is True
+    assert ProviderOperationStatus.FAILED.terminal is True
+
+
+def test_model_provider_defaults_to_no_provider_operation_capability() -> None:
+    provider = _SynchronousProvider()
+
+    assert provider.provider_operations is None
+    assert provider.provider_operation_mode is ProviderOperationMode.SYNCHRONOUS
+
+
+def test_capability_support_does_not_enable_background_dispatch() -> None:
+    provider = _ReconnectableProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="supported_but_synchronous",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.stream_calls == 1
+    assert provider.adapter.start_calls == 0
+    assert not {
+        EventType.PROVIDER_OPERATION_STARTING,
+        EventType.PROVIDER_OPERATION_STARTED,
+    }.intersection(event.type for event in events)
+
+
+def test_reconnectable_dispatch_persists_identity_before_model_output() -> None:
+    provider = _ReconnectableProvider(background=True)
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def run():
+        public_events = [
+            event
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="provider_operation_start",
+                    messages=[Message.text("user", "hello")],
+                )
+            )
+        ]
+        stored_events = await app.session_store.load_events("provider_operation_start")
+        return public_events, stored_events
+
+    public_events, stored_events = asyncio.run(run())
+
+    assert provider.adapter.start_calls == 1
+    assert provider.stream_calls == 0
+    public_types = [event.type for event in public_events]
+    assert (
+        public_types.index(EventType.MODEL_STARTED)
+        < public_types.index(EventType.PROVIDER_OPERATION_STARTING)
+        < public_types.index(EventType.PROVIDER_OPERATION_STARTED)
+        < public_types.index(EventType.MODEL_TEXT_DELTA)
+    )
+    public_starting = next(
+        event for event in public_events if event.type == EventType.PROVIDER_OPERATION_STARTING
+    )
+    assert "start_id" not in public_starting.payload
+    public_start = next(
+        event for event in public_events if event.type == EventType.PROVIDER_OPERATION_STARTED
+    )
+    assert public_start.payload["operation_id"] == "response_123"
+    assert public_start.payload["stream_protocol"] == "responses-v1"
+    assert public_start.payload["status"] == "in_progress"
+    assert public_start.payload["state_version"] == 1
+    assert "start_id" not in public_start.payload
+    assert "recovery_metadata" not in public_start.payload
+
+    stored_starting = next(
+        event for event in stored_events if event.type == EventType.PROVIDER_OPERATION_STARTING
+    )
+    stored_start = next(
+        event for event in stored_events if event.type == EventType.PROVIDER_OPERATION_STARTED
+    )
+    assert stored_start.payload["state_version"] == 1
+    assert stored_start.payload["recovery_metadata"] == {"cursor": 0}
+    assert stored_start.payload["provider"] == "reconnectable"
+    assert stored_start.payload["source_run_epoch"] == 1
+    assert stored_start.payload["model_step_id"]
+    assert stored_start.payload["model_attempt_id"]
+    assert stored_start.interaction_id
+    assert stored_starting.payload["start_id"] == stored_start.payload["start_id"]
+    assert provider.adapter.start_requests[0].idempotency_key == stored_start.payload["start_id"]
+
+
+def test_synchronous_dispatch_is_unchanged() -> None:
+    provider = _SynchronousProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="synchronous_provider",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.stream_calls == 1
+    assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in events}
+
+
+def test_operator_inspection_distinguishes_sync_and_in_progress() -> None:
+    provider = _SynchronousProvider()
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def scenario():
+        await _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="inspection_sync",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+        sync = await inspect_provider_operation(app.session_store, "inspection_sync")
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="inspection_in_progress",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "inspection_in_progress",
+            [
+                _model_event(EventType.MODEL_STARTED, sequence_identity="attempt-a"),
+                _model_event(
+                    EventType.PROVIDER_OPERATION_STARTED,
+                    sequence_identity="attempt-a",
+                    payload={
+                        "provider": "reconnectable",
+                        "start_id": "provider-operation:attempt-a",
+                        "state_version": 1,
+                        "operation_id": "response_123",
+                        "stream_protocol": "responses-v1",
+                        "status": "in_progress",
+                        "recovery_metadata": {"cursor": 0},
+                    },
+                ),
+            ],
+        )
+        in_progress = await inspect_provider_operation(app.session_store, "inspection_in_progress")
+        return sync, in_progress
+
+    sync, in_progress = asyncio.run(scenario())
+
+    assert sync.status is ProviderOperationInspectionStatus.SYNCHRONOUS
+    assert sync.operation_id is None
+    assert in_progress.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+    assert in_progress.operation_id == "response_123"
+    assert in_progress.provider == "reconnectable"
+    assert in_progress.stream_protocol == "responses-v1"
+
+
+def test_operator_inspection_ignores_independently_scoped_compaction_completion() -> None:
+    app = CayuApp(enable_logging=False)
+
+    async def scenario():
+        session_id = "inspection_after_compaction"
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                ),
+                _operation_event(operation_id="response_a", session_id=session_id),
+                Event(
+                    type=EventType.MODEL_COMPLETED,
+                    session_id=session_id,
+                    payload={
+                        "purpose": "context_compaction",
+                        "provider_name": "compactor",
+                        "requested_model": "summary-model",
+                        "model": "summary-model",
+                        "model_step_id": "mstep_" + "b" * 32,
+                        "model_attempt_id": "matt_" + "c" * 32,
+                    },
+                ),
+            ],
+        )
+        return await inspect_provider_operation(app.session_store, session_id)
+
+    inspection = asyncio.run(scenario())
+
+    assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+    assert inspection.operation_id == "response_a"
+
+
+@pytest.mark.parametrize(
+    ("fence_on", "expected_start_calls", "expected_cancel_calls"),
+    [
+        (EventType.PROVIDER_OPERATION_STARTING, 0, 0),
+        (EventType.PROVIDER_OPERATION_STARTED, 1, 1),
+    ],
+)
+def test_stale_run_owner_cannot_start_or_publish_provider_operation_identity(
+    fence_on: EventType,
+    expected_start_calls: int,
+    expected_cancel_calls: int,
+) -> None:
+    store = _FenceOnEventStore(fence_on)
+    provider = _ReconnectableProvider(background=True)
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(SessionRunFenced):
+        asyncio.run(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=f"stale_{fence_on.value}",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    events = asyncio.run(store.load_events(f"stale_{fence_on.value}"))
+    assert store.fenced
+    assert provider.adapter.start_calls == expected_start_calls
+    assert provider.adapter.cancel_calls == expected_cancel_calls
+    assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in events}
+
+
+def test_ambiguous_provider_operation_start_is_never_retried() -> None:
+    provider = _ReconnectableProvider(
+        background=True,
+        start_error=TimeoutError("provider submission timed out"),
+    )
+    app = CayuApp(
+        enable_logging=False,
+        retry_policy=_two_attempt_retry_policy(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="ambiguous_provider_start",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.adapter.start_calls == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    failed = next(event for event in events if event.type == EventType.SESSION_FAILED)
+    assert failed.payload["error_type"] == "ModelProviderError"
+    stored = asyncio.run(app.session_store.load_events("ambiguous_provider_start"))
+    assert sum(event.type == EventType.PROVIDER_OPERATION_STARTING for event in stored) == 1
+
+
+@pytest.mark.parametrize(
+    "adapter_type",
+    [
+        _FailingOperationStreamAdapter,
+        _ErrorEventOperationStreamAdapter,
+        _EmptyOperationStreamAdapter,
+    ],
+)
+def test_started_provider_operation_stream_failure_is_never_retried(adapter_type) -> None:
+    provider = _ReconnectableProvider(background=True)
+    adapter = adapter_type()
+    provider.adapter = adapter
+    app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="failed_background_stream",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert adapter.start_calls == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    assert EventType.MODEL_ATTEMPT_DISCARDED not in {event.type for event in events}
+    inspection = asyncio.run(
+        inspect_provider_operation(app.session_store, "failed_background_stream")
+    )
+    assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+
+
+def test_started_provider_operation_overflow_does_not_dispatch_recovery_attempt() -> None:
+    provider = _ReconnectableProvider(background=True)
+    adapter = _OverflowingOperationStreamAdapter()
+    provider.adapter = adapter
+    app = CayuApp(enable_logging=False, retry_policy=_two_attempt_retry_policy())
+    app.register_provider(provider, default=True)
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        context_overflow_policy=RecentTurnsContextPolicy(max_user_turns=1),
+    )
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="background_context_overflow",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert adapter.start_calls == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    assert EventType.CONTEXT_OVERFLOW_RECOVERING not in {event.type for event in events}
+
+
+def test_disabled_retry_preserves_authoritative_provider_failure_cause() -> None:
+    overflow = ModelContextOverflowError(
+        "provider context limit exceeded",
+        provider="reconnectable",
+        status_code=400,
+        error_code="context_length_exceeded",
+    )
+    public_failure = ModelProviderError(
+        "background operation failed after dispatch",
+        provider="reconnectable",
+        retryable=False,
+    )
+    assert set_exception_cause(public_failure, overflow)
+    attempt_failure = ModelAttemptFailed(
+        message=str(public_failure),
+        payload={"error": str(public_failure)},
+        emitted_error_event=False,
+        cause=public_failure,
+        automatic_retry_disabled=True,
+    )
+
+    with pytest.raises(ModelProviderError) as captured:
+        _raise_terminal_model_attempt_failure(attempt_failure)
+
+    assert captured.value is public_failure
+    assert exception_cause(captured.value) is overflow
+
+
+def test_provider_owned_operation_identity_cannot_embed_a_workload_secret() -> None:
+    secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"
+    provider = _ReconnectableProvider(background=True)
+    adapter = _ProviderIdentityAdapter(operation_id=f"op-{secret}-tail")
+    provider.adapter = adapter
+    app = CayuApp(enable_logging=False, secret_redactor=SecretRedactor(secret))
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="secret_provider_identity",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert adapter.start_calls == 1
+    assert adapter.cancel_calls == 1
+    stored = asyncio.run(app.session_store.load_events("secret_provider_identity"))
+    assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in stored}
+    assert secret not in repr(events) + repr(stored)
+
+
+def test_cancellation_during_provider_start_waits_for_identity_before_releasing_run() -> None:
+    async def scenario() -> tuple[bool, int, int, ProviderOperationInspectionStatus]:
+        provider = _ReconnectableProvider(background=True)
+        adapter = _BlockingStartAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancelled_provider_start",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        task.cancel("cancel after provider dispatch")
+        assert task.cancelling() == 1
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not task.done()
+        adapter.start_release.set()
+        with pytest.raises(asyncio.CancelledError, match="cancel after provider dispatch"):
+            await task
+        inspection = await inspect_provider_operation(
+            app.session_store,
+            "cancelled_provider_start",
+        )
+        return task.cancelled(), task.cancelling(), adapter.start_calls, inspection.status
+
+    cancelled, cancelling, start_calls, status = asyncio.run(scenario())
+
+    assert cancelled
+    assert cancelling == 0
+    assert start_calls == 1
+    assert status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+
+
+def test_cancellation_during_provider_start_is_raised_before_started_event_yield() -> None:
+    async def scenario() -> tuple[bool, list[EventType]]:
+        provider = _ReconnectableProvider(background=True)
+        adapter = _BlockingStartAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        seen: list[EventType] = []
+
+        async def collect_until_started() -> None:
+            async for event in app.run(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancel_before_started_yield",
+                    messages=[Message.text("user", "hello")],
+                )
+            ):
+                seen.append(event.type)
+                if event.type == EventType.PROVIDER_OPERATION_STARTED:
+                    return
+
+        task = asyncio.create_task(collect_until_started())
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        task.cancel("cancel before started event delivery")
+        adapter.start_release.set()
+        with pytest.raises(asyncio.CancelledError, match="cancel before started event delivery"):
+            await task
+        return task.cancelled(), seen
+
+    cancelled, seen = asyncio.run(scenario())
+
+    assert cancelled
+    assert EventType.PROVIDER_OPERATION_STARTED not in seen
+
+
+def test_cancellation_during_unsettled_provider_start_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[bool, int, ProviderOperationInspectionStatus]:
+        monkeypatch.setattr(
+            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            0.0,
+        )
+        provider = _ReconnectableProvider(background=True)
+        adapter = _CancellationResistantStartAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancel_unsettled_provider_start",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        task.cancel("cancel unsettled provider start")
+        with pytest.raises(asyncio.CancelledError, match="cancel unsettled provider start"):
+            await asyncio.wait_for(task, timeout=1)
+        await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=1)
+        inspection = await inspect_provider_operation(
+            app.session_store,
+            "cancel_unsettled_provider_start",
+        )
+        adapter.start_release.set()
+        await asyncio.sleep(0)
+        return task.cancelled(), adapter.start_calls, inspection.status
+
+    cancelled, start_calls, status = asyncio.run(scenario())
+
+    assert cancelled
+    assert start_calls == 1
+    assert status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+
+
+def test_late_successful_start_acknowledgement_cancels_exact_returned_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[
+        int,
+        list[ProviderOperationState],
+        ProviderOperationInspectionStatus,
+        list[Event],
+    ]:
+        monkeypatch.setattr(
+            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            0.0,
+        )
+        provider = _ReconnectableProvider(background=True)
+        adapter = _LateSuccessfulStartAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="late_successful_provider_start",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        task.cancel("cancel before late start acknowledgement")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=1)
+        adapter.start_release.set()
+        await asyncio.wait_for(adapter.late_cancel_observed.wait(), timeout=1)
+        inspection = await inspect_provider_operation(
+            app.session_store,
+            "late_successful_provider_start",
+        )
+        stored = await app.session_store.load_events("late_successful_provider_start")
+        return (
+            adapter.cancel_calls,
+            adapter.cancelled_states,
+            inspection.status,
+            stored,
+        )
+
+    cancel_calls, cancelled_states, status, stored = asyncio.run(scenario())
+
+    assert cancel_calls == 1
+    assert cancelled_states == [
+        ProviderOperationState(
+            operation_id="response_late",
+            stream_protocol="responses-v1",
+        )
+    ]
+    assert status is ProviderOperationInspectionStatus.SYNCHRONOUS
+    reconciled = [event for event in stored if event.type == EventType.PROVIDER_OPERATION_STARTED]
+    assert len(reconciled) == 1
+    assert reconciled[0].payload["operation_id"] == "response_late"
+    assert reconciled[0].payload["status"] == ProviderOperationStatus.CANCELLED.value
+
+
+def test_late_start_acknowledgement_cannot_publish_after_run_epoch_moves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[ProviderOperationInspectionStatus, list[Event]]:
+        monkeypatch.setattr(
+            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            0.0,
+        )
+        provider = _ReconnectableProvider(background=True)
+        adapter = _LateSuccessfulStartAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        session_id = "late_start_after_newer_epoch"
+        task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        task.cancel("cancel before late start acknowledgement")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=1)
+
+        prior = await app.session_store.load(session_id)
+        assert prior is not None
+        newer = await app.session_store.transition_status(
+            session_id,
+            from_statuses={prior.status},
+            to_status=SessionStatus.RUNNING,
+        )
+        assert newer.run_epoch == prior.run_epoch + 1
+        stored = await app.session_store.load_events(session_id)
+        earlier_started = next(event for event in stored if event.type == EventType.MODEL_STARTED)
+        await app.session_store.append_event(
+            session_id,
+            Event(
+                type=EventType.MODEL_STARTED,
+                session_id=session_id,
+                interaction_id=earlier_started.interaction_id,
+                agent_name=earlier_started.agent_name,
+                environment_name=earlier_started.environment_name,
+                payload={
+                    **earlier_started.payload,
+                    "model_step_id": "mstep_" + ("c" * 32),
+                    "model_attempt_id": "matt_" + ("d" * 32),
+                },
+            ),
+        )
+        await app.session_store.transition_status(
+            session_id,
+            from_statuses={SessionStatus.RUNNING},
+            to_status=SessionStatus.FAILED,
+        )
+
+        adapter.start_release.set()
+        await asyncio.wait_for(adapter.late_cancel_observed.wait(), timeout=1)
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        inspection = await inspect_provider_operation(app.session_store, session_id)
+        return inspection.status, await app.session_store.load_events(session_id)
+
+    status, stored = asyncio.run(scenario())
+
+    assert status is ProviderOperationInspectionStatus.SYNCHRONOUS
+    assert not any(
+        event.type == EventType.PROVIDER_OPERATION_STARTED
+        and event.payload.get("operation_id") == "response_late"
+        for event in stored
+    )
+
+
+def test_late_start_cancellation_failure_preserves_exact_in_progress_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[ProviderOperationInspectionStatus, str | None]:
+        monkeypatch.setattr(
+            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_SETTLEMENT_TIMEOUT_SECONDS",
+            0.0,
+        )
+        provider = _ReconnectableProvider(background=True)
+        adapter = _LateFailingCancelAdapter()
+        provider.adapter = adapter
+        app = CayuApp(enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="late_failed_provider_cancellation",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(adapter.start_entered.wait(), timeout=1)
+        task.cancel("cancel before late failed cancellation")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        adapter.start_release.set()
+        await asyncio.wait_for(adapter.late_cancel_observed.wait(), timeout=1)
+        for _ in range(10):
+            inspection = await inspect_provider_operation(
+                app.session_store,
+                "late_failed_provider_cancellation",
+            )
+            if inspection.operation_id is not None:
+                return inspection.status, inspection.operation_id
+            await asyncio.sleep(0)
+        return inspection.status, inspection.operation_id
+
+    status, operation_id = asyncio.run(scenario())
+
+    assert status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+    assert operation_id == "response_late"
+
+
+def test_cancellation_during_started_identity_publication_still_attempts_cleanup() -> None:
+    store = _CancelOnEventStore(EventType.PROVIDER_OPERATION_STARTED)
+    provider = _ReconnectableProvider(background=True)
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancelled_started_publication",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    assert provider.adapter.start_calls == 1
+    assert provider.adapter.cancel_calls == 1
+
+
+def test_started_identity_timeout_without_commit_cleans_up_and_never_retries() -> None:
+    store = _FailBeforeCommitOnEventStore(
+        EventType.PROVIDER_OPERATION_STARTED,
+        TimeoutError("started identity append timed out"),
+    )
+    provider = _ReconnectableProvider(background=True)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        retry_policy=_two_attempt_retry_policy(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="started_identity_timeout",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.adapter.start_calls == 1
+    assert provider.adapter.cancel_calls == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    stored = asyncio.run(app.session_store.load_events("started_identity_timeout"))
+    assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in stored}
+
+
+def test_synchronous_cleanup_failure_never_retries_provider_start() -> None:
+    store = _FailBeforeCommitOnEventStore(
+        EventType.PROVIDER_OPERATION_STARTED,
+        TimeoutError("started identity append timed out"),
+    )
+    provider = _ReconnectableProvider(background=True)
+    adapter = _SynchronousFailingCancelAdapter()
+    provider.adapter = adapter
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        retry_policy=_two_attempt_retry_policy(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="synchronous_cleanup_failure",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert adapter.start_calls == 1
+    assert adapter.cancel_calls == 1
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+
+
+def test_cleanup_failure_does_not_invoke_extension_exception_cause_accessors() -> None:
+    store = _FailBeforeCommitOnEventStore(
+        EventType.PROVIDER_OPERATION_STARTED,
+        _HostileCauseError("started identity append failed"),
+    )
+    provider = _ReconnectableProvider(background=True)
+    adapter = _SynchronousFailingCancelAdapter()
+    provider.adapter = adapter
+    app = CayuApp(session_store=store, enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="hostile_cleanup_failure_cause",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert adapter.start_calls == 1
+    assert adapter.cancel_calls == 1
+    failed = next(event for event in events if event.type == EventType.SESSION_FAILED)
+    assert failed.payload["error_type"] == "ModelProviderError"
+    assert failed.payload["error_type"] != "RuntimeError"
+
+
+def test_post_commit_delivery_failure_leaves_operation_recoverable_without_retry() -> None:
+    store = _FailClaimAfterStartedCommitStore()
+    provider = _ReconnectableProvider(background=True)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        retry_policy=_two_attempt_retry_policy(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="post_commit_delivery_failure",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.adapter.start_calls == 1
+    assert provider.adapter.cancel_calls == 0
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+    assert EventType.PROVIDER_OPERATION_STARTED not in {event.type for event in events}
+    stored = asyncio.run(app.session_store.load_events("post_commit_delivery_failure"))
+    assert EventType.PROVIDER_OPERATION_STARTED in {event.type for event in stored}
+    inspection = asyncio.run(
+        inspect_provider_operation(app.session_store, "post_commit_delivery_failure")
+    )
+    assert inspection.status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS
+
+
+def test_unavailable_started_identity_readback_never_cancels_or_retries() -> None:
+    store = _UnverifiableStartedCommitStore()
+    provider = _ReconnectableProvider(background=True)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        retry_policy=_two_attempt_retry_policy(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    events = asyncio.run(
+        _collect_run_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="unverifiable_started_identity",
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+    )
+
+    assert provider.adapter.start_calls == 1
+    assert provider.adapter.cancel_calls == 0
+    assert EventType.MODEL_RETRY not in {event.type for event in events}
+
+
+def test_cancellation_during_started_identity_readback_propagates() -> None:
+    store = _CancelOuterStartedReadbackStore()
+    provider = _ReconnectableProvider(background=True)
+    app = CayuApp(
+        session_store=store,
+        enable_logging=False,
+        retry_policy=_two_attempt_retry_policy(),
+    )
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancelled_started_readback",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+
+    assert provider.adapter.start_calls == 1
+    assert provider.adapter.cancel_calls == 0
+
+
+def test_cancellation_during_definite_absence_cleanup_propagates() -> None:
+    async def scenario() -> tuple[int, int]:
+        store = _FailBeforeCommitOnEventStore(
+            EventType.PROVIDER_OPERATION_STARTED,
+            TimeoutError("started identity append timed out"),
+        )
+        provider = _ReconnectableProvider(background=True)
+        blocking_adapter = _BlockingCancelAdapter()
+        provider.adapter = blocking_adapter
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+        run_task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="cancelled_started_cleanup",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(blocking_adapter.cancel_entered.wait(), timeout=1)
+        run_task.cancel("caller cancelled during provider cleanup")
+        blocking_adapter.cancel_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+        return blocking_adapter.start_calls, blocking_adapter.cancel_calls
+
+    start_calls, cancel_calls = asyncio.run(scenario())
+
+    assert start_calls == 1
+    assert cancel_calls == 1
+
+
+def test_timed_out_provider_cancellation_releases_with_uncertain_cleanup_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> tuple[bool, int]:
+        monkeypatch.setattr(
+            "cayu.runtime._model_step_executor._PROVIDER_OPERATION_START_CLEANUP_TIMEOUT_SECONDS",
+            0.0,
+        )
+        store = _FailBeforeCommitOnEventStore(
+            EventType.PROVIDER_OPERATION_STARTED,
+            TimeoutError("started identity append timed out"),
+        )
+        provider = _ReconnectableProvider(background=True)
+        adapter = _CancellationResistantCancelAdapter()
+        provider.adapter = adapter
+        app = CayuApp(session_store=store, enable_logging=False)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+        task = asyncio.create_task(
+            _collect_run_events(
+                app,
+                RunRequest(
+                    agent_name="assistant",
+                    session_id="timed_out_provider_cancellation",
+                    messages=[Message.text("user", "hello")],
+                ),
+            )
+        )
+        await asyncio.wait_for(adapter.local_cancellation_observed.wait(), timeout=1)
+        await asyncio.wait_for(task, timeout=1)
+        assert task.done()
+        adapter.cancel_release.set()
+        await asyncio.sleep(0)
+        return task.done(), adapter.cancel_calls
+
+    done, cancel_calls = asyncio.run(scenario())
+
+    assert done
+    assert cancel_calls == 1
+
+
+def test_operator_inspection_rejects_contradictory_operation_identity() -> None:
+    app = CayuApp(enable_logging=False)
+
+    async def scenario() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="contradictory_operation",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            "contradictory_operation",
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id="contradictory_operation",
+                ),
+                _operation_event(
+                    operation_id="response_a",
+                    session_id="contradictory_operation",
+                ),
+                _operation_event(
+                    operation_id="response_b",
+                    session_id="contradictory_operation",
+                ),
+            ],
+        )
+        with pytest.raises(ProviderOperationEvidenceError, match="contradictory"):
+            await inspect_provider_operation(app.session_store, "contradictory_operation")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "order", ["valid_then_mismatched", "mismatched_then_valid", "mismatched_only"]
+)
+def test_operator_inspection_rejects_mismatched_complete_owning_identity(order: str) -> None:
+    async def scenario() -> None:
+        session_id = f"mismatched_scope_{order}"
+        app = CayuApp(enable_logging=False)
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        valid = _operation_event(operation_id="response_a", session_id=session_id)
+        mismatched = valid.model_copy(
+            update={
+                "id": str(uuid4()),
+                "payload": {
+                    **valid.payload,
+                    "model_step_id": "mstep_" + "b" * 32,
+                    "source_run_epoch": 2,
+                },
+            },
+            deep=True,
+        )
+        operation_events = {
+            "valid_then_mismatched": [valid, mismatched],
+            "mismatched_then_valid": [mismatched, valid],
+            "mismatched_only": [mismatched],
+        }[order]
+        await app.session_store.append_events(
+            session_id,
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                ),
+                *operation_events,
+            ],
+        )
+        with pytest.raises(ProviderOperationEvidenceError, match="mismatched identity"):
+            await inspect_provider_operation(app.session_store, session_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("interaction_id", "interaction-b"),
+        ("provider", "other-provider"),
+        ("model", "other-model"),
+        ("step", 2),
+        ("attempt", 2),
+        ("max_attempts", 3),
+        ("model_step_id", "mstep_" + "b" * 32),
+        ("model_attempt_id", "attempt-b"),
+    ],
+)
+def test_operator_inspection_validates_each_owning_identity_field(
+    field: str,
+    value: object,
+) -> None:
+    async def scenario() -> None:
+        session_id = f"mismatched_{field}"
+        app = CayuApp(enable_logging=False)
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        operation = _operation_event(operation_id="response_a", session_id=session_id)
+        update = {"id": str(uuid4())}
+        if field == "interaction_id":
+            update["interaction_id"] = value
+        else:
+            update["payload"] = {**operation.payload, field: value}
+        mismatched = operation.model_copy(update=update, deep=True)
+        await app.session_store.append_events(
+            session_id,
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                ),
+                mismatched,
+            ],
+        )
+        with pytest.raises(ProviderOperationEvidenceError):
+            await inspect_provider_operation(app.session_store, session_id)
+
+    asyncio.run(scenario())
+
+
+def test_operator_inspection_rejects_contradictory_provider_operation_epochs() -> None:
+    async def scenario() -> None:
+        session_id = "contradictory_provider_epochs"
+        app = CayuApp(enable_logging=False)
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        await app.session_store.append_events(
+            session_id,
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                ),
+                _model_event(
+                    EventType.PROVIDER_OPERATION_STARTING,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                    payload={"start_id": "provider-operation:attempt-a"},
+                ),
+                _operation_event(operation_id="response_a", session_id=session_id).model_copy(
+                    update={
+                        "payload": {
+                            **_operation_event(
+                                operation_id="response_a",
+                                session_id=session_id,
+                            ).payload,
+                            "source_run_epoch": 2,
+                        }
+                    },
+                    deep=True,
+                ),
+            ],
+        )
+        with pytest.raises(ProviderOperationEvidenceError, match="run epochs"):
+            await inspect_provider_operation(app.session_store, session_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["valid_then_conflicting", "conflicting_then_valid", "conflicting_only"],
+)
+def test_operator_inspection_rejects_conflicting_completion_scope(order: str) -> None:
+    async def scenario() -> None:
+        session_id = f"conflicting_completion_scope_{order}"
+        app = CayuApp(enable_logging=False)
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        valid = _model_event(
+            EventType.MODEL_COMPLETED,
+            sequence_identity="attempt-a",
+            session_id=session_id,
+        )
+        conflicting = valid.model_copy(
+            update={
+                "id": str(uuid4()),
+                "payload": {
+                    **valid.payload,
+                    "provider_name": "other-provider",
+                    "requested_model": "other-model",
+                },
+            },
+            deep=True,
+        )
+        completions = {
+            "valid_then_conflicting": [valid, conflicting],
+            "conflicting_then_valid": [conflicting, valid],
+            "conflicting_only": [conflicting],
+        }[order]
+        await app.session_store.append_events(
+            session_id,
+            [
+                _model_event(
+                    EventType.MODEL_STARTED,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                ),
+                _operation_event(operation_id="response_a", session_id=session_id),
+                *completions,
+            ],
+        )
+        with pytest.raises(ProviderOperationEvidenceError, match="different provider or model"):
+            await inspect_provider_operation(app.session_store, session_id)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("include_started", "terminal_type", "expected_status"),
+    [
+        (False, None, ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS),
+        (
+            False,
+            EventType.MODEL_ERROR,
+            ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS,
+        ),
+        (
+            True,
+            EventType.MODEL_ERROR,
+            ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS,
+        ),
+        (True, EventType.MODEL_COMPLETED, ProviderOperationInspectionStatus.SYNCHRONOUS),
+    ],
+)
+def test_operator_inspection_classifies_ambiguous_start_and_terminal_error(
+    include_started: bool,
+    terminal_type: EventType | None,
+    expected_status: ProviderOperationInspectionStatus,
+) -> None:
+    async def scenario():
+        session_id = (
+            "inspection_ambiguous_start" if terminal_type is None else "inspection_terminal_error"
+        )
+        app = CayuApp(enable_logging=False)
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="reconnectable", model="fake-model"),
+        )
+        events = [
+            _model_event(
+                EventType.MODEL_STARTED,
+                sequence_identity="attempt-a",
+                session_id=session_id,
+            ),
+            _model_event(
+                EventType.PROVIDER_OPERATION_STARTING,
+                sequence_identity="attempt-a",
+                session_id=session_id,
+                payload={
+                    "provider": "reconnectable",
+                    "source_run_epoch": 1,
+                    "start_id": "provider-operation:attempt-a",
+                },
+            ),
+        ]
+        if include_started:
+            events.append(_operation_event(operation_id="response_a", session_id=session_id))
+        if terminal_type is not None:
+            events.append(
+                _model_event(
+                    terminal_type,
+                    sequence_identity="attempt-a",
+                    session_id=session_id,
+                )
+            )
+        await app.session_store.append_events(session_id, events)
+        return await inspect_provider_operation(app.session_store, session_id)
+
+    inspection = asyncio.run(scenario())
+
+    assert inspection.status is expected_status
+    if expected_status is ProviderOperationInspectionStatus.PROVIDER_OPERATION_IN_PROGRESS:
+        assert inspection.provider == "reconnectable"
+        assert inspection.operation_id == ("response_a" if include_started else None)
+        assert inspection.stream_protocol == ("responses-v1" if include_started else None)
+
+
+class _FenceOnEventStore(InMemorySessionStore):
+    def __init__(self, fence_on: EventType) -> None:
+        super().__init__()
+        self.fence_on = fence_on
+        self.fenced = False
+
+    async def append_event(self, session_id: str, event: Event) -> None:
+        if event.type == self.fence_on and not self.fenced:
+            self.fenced = True
+            fenced = await asyncio.create_task(
+                self.fence_stalled_run(
+                    session_id,
+                    statuses={SessionStatus.RUNNING},
+                    inactive_before=datetime.now(UTC) + timedelta(seconds=1),
+                )
+            )
+            assert fenced is not None
+        await super().append_event(session_id, event)
+
+
+class _CancelOnEventStore(InMemorySessionStore):
+    def __init__(self, cancel_on: EventType) -> None:
+        super().__init__()
+        self.cancel_on = cancel_on
+
+    async def append_event(self, session_id: str, event: Event) -> None:
+        if event.type == self.cancel_on:
+            raise asyncio.CancelledError("publication cancelled")
+        await super().append_event(session_id, event)
+
+
+class _FailBeforeCommitOnEventStore(InMemorySessionStore):
+    def __init__(self, fail_on: EventType, failure: Exception) -> None:
+        super().__init__()
+        self.fail_on = fail_on
+        self.failure = failure
+        self.failed = False
+
+    async def append_event(self, session_id: str, event: Event) -> None:
+        if event.type == self.fail_on and not self.failed:
+            self.failed = True
+            raise self.failure
+        await super().append_event(session_id, event)
+
+
+class _HostileCauseError(Exception):
+    @property
+    def __cause__(self):
+        raise RuntimeError("extension cause getter must not run")
+
+    @__cause__.setter
+    def __cause__(self, value):
+        raise RuntimeError("extension cause setter must not run")
+
+
+class _FailClaimAfterStartedCommitStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started_event_id: str | None = None
+        self.failed_claim = False
+
+    async def append_event(self, session_id: str, event: Event) -> None:
+        await super().append_event(session_id, event)
+        if event.type == EventType.PROVIDER_OPERATION_STARTED:
+            self.started_event_id = event.id
+
+    async def claim_persisted_event_side_effect(
+        self,
+        *,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        lease_seconds: float = 300.0,
+    ) -> PersistedEventSideEffectClaim | None:
+        if event_id == self.started_event_id and not self.failed_claim:
+            self.failed_claim = True
+            raise TimeoutError("post-commit side-effect claim timed out")
+        return await super().claim_persisted_event_side_effect(
+            session_id=session_id,
+            event_id=event_id,
+            lease_seconds=lease_seconds,
+        )
+
+
+class _UnverifiableStartedCommitStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started_event_id: str | None = None
+
+    async def append_event(self, session_id: str, event: Event) -> None:
+        if event.type == EventType.PROVIDER_OPERATION_STARTED:
+            self.started_event_id = event.id
+            raise TimeoutError("started identity commit is unknown")
+        await super().append_event(session_id, event)
+
+    async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
+        if (
+            self.started_event_id is not None
+            and query is not None
+            and query.event_id == self.started_event_id
+        ):
+            raise TimeoutError("started identity readback is unavailable")
+        return await super().query_events(query)
+
+
+class _CancelOuterStartedReadbackStore(InMemorySessionStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started_event_id: str | None = None
+        self.readbacks = 0
+
+    async def append_event(self, session_id: str, event: Event) -> None:
+        if event.type == EventType.PROVIDER_OPERATION_STARTED:
+            self.started_event_id = event.id
+            raise TimeoutError("started identity commit is unknown")
+        await super().append_event(session_id, event)
+
+    async def query_events(self, query: EventQuery | None = None) -> list[EventRecord]:
+        if (
+            self.started_event_id is not None
+            and query is not None
+            and query.event_id == self.started_event_id
+        ):
+            self.readbacks += 1
+            if self.readbacks == 2:
+                raise asyncio.CancelledError("caller cancelled during exact readback")
+        return await super().query_events(query)
+
+
+async def _collect_run_events(app: CayuApp, request: RunRequest):
+    return [event async for event in app.run(request)]
+
+
+def _two_attempt_retry_policy() -> RetryPolicy:
+    return RetryPolicy(
+        max_attempts=2,
+        initial_delay_s=0.0,
+        max_delay_s=0.0,
+        backoff_multiplier=1.0,
+        jitter_s=0.0,
+    )
+
+
+def _model_event(
+    event_type: EventType,
+    *,
+    sequence_identity: str,
+    payload=None,
+    session_id: str = "inspection_in_progress",
+):
+    completion_payload = (
+        {
+            "transcript_cursor": 1,
+            "provider_name": "reconnectable",
+            "requested_model": "fake-model",
+        }
+        if event_type == EventType.MODEL_COMPLETED
+        else {}
+    )
+    return Event(
+        type=event_type,
+        session_id=session_id,
+        interaction_id="interaction-a",
+        payload={
+            "provider": "reconnectable",
+            "model": "fake-model",
+            "step": 1,
+            "attempt": 1,
+            "max_attempts": 2,
+            "model_step_id": "mstep_" + "a" * 32,
+            "model_attempt_id": sequence_identity,
+            "source_run_epoch": 1,
+            **completion_payload,
+            **(payload or {}),
+        },
+    )
+
+
+def _operation_event(*, operation_id: str, session_id: str) -> Event:
+    return _model_event(
+        EventType.PROVIDER_OPERATION_STARTED,
+        sequence_identity="attempt-a",
+        session_id=session_id,
+        payload={
+            "provider": "reconnectable",
+            "source_run_epoch": 1,
+            "start_id": "provider-operation:attempt-a",
+            "state_version": 1,
+            "operation_id": operation_id,
+            "stream_protocol": "responses-v1",
+            "status": "in_progress",
+            "recovery_metadata": {"cursor": 0},
+        },
+    )

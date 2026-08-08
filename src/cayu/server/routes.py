@@ -120,6 +120,7 @@ from cayu.runtime.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
     InteractionSummaryEvidence,
 )
+from cayu.runtime.provider_operations import inspect_provider_operation
 from cayu.runtime.retry_policy import RetryPolicy
 from cayu.runtime.sessions import (
     SESSION_MESSAGE_CONTENT_MAX_BYTES,
@@ -5776,12 +5777,14 @@ def create_router(
         if state is None:
             raise HTTPException(status_code=404, detail="Session not found")
         interruption_cascade = await cayu_app.interruption_cascade_status(session_id)
+        provider_operation = await inspect_provider_operation(session_store, session_id)
         return {
             "session_id": cayu_app.project_session_id_for_exposure(state.id),
             "status": state.status,
             "updated_at": state.updated_at.isoformat(),
             "last_activity_at": state.last_activity_at.isoformat(),
             "interruption_cascade": interruption_cascade,
+            "provider_operation": provider_operation.model_dump(mode="json"),
         }
 
     @router.get(

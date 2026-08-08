@@ -1417,6 +1417,60 @@
         "title": "ApiPendingActionIssue",
         "type": "object"
       },
+      "ApiProviderOperationInspection": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_id": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "status": {
+            "enum": [
+              "synchronous",
+              "provider_operation_in_progress"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "stream_protocol": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stream Protocol"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ApiProviderOperationInspection",
+        "type": "object"
+      },
       "ApiReviewedKnowledgeEntry": {
         "additionalProperties": false,
         "properties": {
@@ -7758,6 +7812,9 @@
             "title": "Last Activity At",
             "type": "string"
           },
+          "provider_operation": {
+            "$ref": "#/components/schemas/ApiProviderOperationInspection"
+          },
           "session_id": {
             "title": "Session Id",
             "type": "string"
@@ -7784,7 +7841,8 @@
           "status",
           "updated_at",
           "last_activity_at",
-          "interruption_cascade"
+          "interruption_cascade",
+          "provider_operation"
         ],
         "title": "SessionStateResponse",
         "type": "object"
