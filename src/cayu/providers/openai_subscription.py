@@ -21,7 +21,6 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -29,6 +28,7 @@ from urllib.parse import urlencode
 import httpx
 
 from cayu._validation import require_clean_nonblank, require_finite
+from cayu._version import package_version
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     aclosing_provider_stream,
@@ -1145,10 +1145,7 @@ def _subscription_credential_values(
 
 
 def _cayu_version() -> str:
-    try:
-        return version("cayu")
-    except PackageNotFoundError:
-        return "0.1.0a3"
+    return package_version()
 
 
 def _default_auth_path() -> Path:

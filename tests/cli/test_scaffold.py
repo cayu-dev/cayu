@@ -25,6 +25,7 @@ from cayu import (
     load_eval_run,
     run_to_completion,
 )
+from cayu import __version__ as cayu_version
 from cayu.cli import main
 from cayu.cli.project import project_context
 
@@ -96,9 +97,9 @@ def test_cayu_new_creates_a_valid_importable_project(tmp_path: Path, capsys) -> 
     assert "_SCAFFOLDED_PROVIDER = None" in configuration_source
     assert 'os.environ.get("CAYU_PROVIDER", _SCAFFOLDED_PROVIDER)' in configuration_source
     pyproject = (proj / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'dependencies = ["cayu>=0.1.0"]' in pyproject
+    assert f'dependencies = ["cayu>={cayu_version}"]' in pyproject
     assert 'console = ["cayu[console]"]' not in pyproject
-    assert 'dev = ["cayu[server]>=0.1.0", "pytest"]' in pyproject
+    assert f'dev = ["cayu[server]>={cayu_version}", "pytest"]' in pyproject
     assert '[tool.cayu]\nfactory = "app:build_app"' in pyproject
     assert 'eval_target = "evals.agent:build_eval"' in pyproject
     assert '[tool.cayu.session_store]\nbackend = "sqlite"\npath = "data/cayu.db"' in pyproject
@@ -155,7 +156,7 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
     ):
         assert (project / filename).is_file()
     pyproject = (project / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'dependencies = ["cayu[server]>=0.1.0"]' in pyproject
+    assert f'dependencies = ["cayu[server]>={cayu_version}"]' in pyproject
     assert 'dev = ["pytest", "ruff>=0.15.15,<0.16"]' in pyproject
     assert 'service_factory = "service:build_service"' in pyproject
     assert 'factory = "app:build_app"' in pyproject

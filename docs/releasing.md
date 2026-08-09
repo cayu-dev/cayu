@@ -43,15 +43,37 @@ environment, tag ruleset, and `PYPI_PUBLISH_ENABLED` switch are all active.
 Referencing an absent environment from a workflow causes GitHub to create it
 without protection rules.
 
+## Between releases
+
+Once a `v*` tag has been published, its matching `## vX.Y.Z` release-note
+section is part of the immutable release record. Main must not edit that tagged
+section; publish corrections or follow-up guidance under `## Unreleased` and in
+the next release instead.
+
+Post-release code and migration guidance belongs under exactly one
+`## Unreleased` heading. Main must also use an explicit development version
+that differs from the latest published artifact. Keep `pyproject.toml`, the
+source-tree fallback in `src/cayu/_version.py`, and `uv.lock` synchronized.
+Using a prospective `.dev0` identity does not commit the project to that final
+release number; release preparation may select and coordinate a different
+version.
+
+The release-artifact CI lane runs `scripts/verify_release_state.py` against the
+tags already fetched into the checkout. It fails when a tagged section changes
+or post-release source reuses a published package version, permits
+`## Unreleased` and new untagged sections to evolve, and requires no GitHub or
+PyPI access.
+
 ## Publish a release
 
-1. Land the version bump on `main`, confirm the version in `pyproject.toml`, and
-   add one exact, non-empty `## vX.Y.Z` section to `docs/release-notes.md` for
-   the matching tag. The workflow publishes that curated section verbatim and
-   does not generate release notes; a missing, duplicate, or empty section
-   fails before GitHub release creation. Regenerate dashboard API metadata,
-   compiled assets, and the version-matched editable source bundle after the
-   version change:
+1. Land the coordinated version bump on `main`, confirm the version in
+   `pyproject.toml`, and curate the applicable `## Unreleased` material into one
+   exact, non-empty `## vX.Y.Z` section in `docs/release-notes.md` for the
+   matching tag. The workflow does not generate release notes; it publishes
+   that curated section verbatim. A missing, duplicate, or empty section fails
+   before GitHub release creation. Regenerate dashboard API metadata, compiled
+   assets, and the version-matched editable source bundle after the version
+   change:
 
    ```bash
    cd dashboard

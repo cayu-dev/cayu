@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import tomllib
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -8,6 +10,7 @@ from typing import Any
 import pytest
 
 import cayu
+import cayu._version as cayu_version_module
 from cayu import CayuApp
 from cayu.cli import _version, main
 
@@ -324,9 +327,21 @@ def test_other_cli_commands_work_without_ipython(monkeypatch, capsys) -> None:
 
 def test_package_version_attribute_and_root_version_flag(capsys) -> None:
     assert cayu.__version__ == _version()
+    assert cayu.__version__ == cayu.DEFAULT_MCP_CLIENT_VERSION
 
     with pytest.raises(SystemExit) as excinfo:
         main(["--version"])
 
     assert excinfo.value.code == 0
     assert capsys.readouterr().out == f"cayu {_version()}\n"
+
+
+def test_source_tree_version_fallback_matches_project_metadata(monkeypatch) -> None:
+    def missing_distribution(_distribution: str) -> str:
+        raise PackageNotFoundError("cayu")
+
+    monkeypatch.setattr(cayu_version_module, "version", missing_distribution)
+    with (Path(__file__).parents[2] / "pyproject.toml").open("rb") as pyproject:
+        expected = tomllib.load(pyproject)["project"]["version"]
+
+    assert cayu_version_module.package_version() == expected

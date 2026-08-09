@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
-from cayu import Message
+from cayu import Message, __version__
 from cayu.providers import ModelContextOverflowError, ModelRequest, ModelStreamEventType
 from cayu.providers.openai_subscription import (
     OpenAISubscriptionAuthError,
@@ -129,7 +129,7 @@ def test_subscription_provider_uses_codex_endpoint_with_honest_cayu_identity() -
     assert call["headers"]["authorization"] == "Bearer subscription-access"
     assert call["headers"]["ChatGPT-Account-ID"] == "acct-cayu"
     assert call["headers"]["originator"] == "cayu"
-    assert call["headers"]["user-agent"].startswith("cayu/")
+    assert call["headers"]["user-agent"] == f"cayu/{__version__}"
     assert call["payload"]["store"] is False
     assert call["payload"]["stream"] is True
 

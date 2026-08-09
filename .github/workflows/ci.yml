@@ -220,6 +220,8 @@ jobs:
       prerelease: ${{ steps.release-version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -227,6 +229,11 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: uv python install 3.11
+      - name: Verify immutable release state
+        run: >-
+          uv run --no-project --offline --no-python-downloads --python 3.11
+          python scripts/verify_release_state.py
+          --notes docs/release-notes.md
       # PR and main CI must be deterministic. Freshness is wall-clock policy enforced by
       # scheduled maintenance and release-tag validation; this check validates the committed
       # artifact without making an unchanged branch fail as time passes.

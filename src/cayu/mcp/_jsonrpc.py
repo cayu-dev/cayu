@@ -14,6 +14,7 @@ from typing import Any, TypeVar, cast
 
 from cayu._exception_groups import rebuild_exception_group
 from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
+from cayu._version import __version__
 from cayu.mcp.base import (
     McpInitializeResult,
     McpResourceDefinition,
@@ -38,7 +39,7 @@ SUPPORTED_MCP_PROTOCOL_VERSIONS = frozenset(
 )
 DEFAULT_MCP_REQUEST_TIMEOUT_S = 30.0
 DEFAULT_MCP_CLIENT_NAME = "cayu"
-DEFAULT_MCP_CLIENT_VERSION = "0.1.0"
+DEFAULT_MCP_CLIENT_VERSION = __version__
 DEFAULT_MCP_MAX_LIST_PAGES = 100
 DEFAULT_MCP_MAX_LIST_ITEMS = 10_000
 JSONRPC_METHOD_NOT_FOUND = -32601

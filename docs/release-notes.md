@@ -10,18 +10,18 @@ the final release should differ only in version and release metadata.
 Pin the complete application to `cayu==0.1.0rc5`, refresh its lockfile, and run
 its own tests. Upgrade independently deployed Cayu servers, dashboards, and
 generated clients together: the server contract advances from version 4 to
-version 9, and the public application manifest and generator plan advance to
+version 6, and the public application manifest and generator plan advance to
 schema version 7.
 
-The storage schema advances from revision 23 to revision 33. Revision 26 is a
+The storage schema advances from revision 23 to revision 29. Revision 26 is a
 deliberate prerelease boundary: migration rejects a populated pre-26 Cayu
 session database instead of attempting to rewrite its durable interaction
 history. Stop all older workers, take an application-consistent backup, and
 recreate populated prerelease Cayu session databases before starting rc5.
 Empty stores migrate normally. Run `cayu storage status` and
 `cayu storage migrate` against every explicitly configured SQLite or PostgreSQL
-session store, budget ledger, and eval store, then confirm revision 33 with no
-pending migrations. Do not run mixed rc4/rc5 workers.
+session store and budget ledger, then confirm revision 29 with no pending
+migrations. Do not run mixed rc4/rc5 workers.
 
 After deployment, verify `cayu version`, run `cayu check --json`, execute the
 application's test suite, and exercise a durable session through process
@@ -33,25 +33,6 @@ deployments must use one consistent public-authority alias keyring.
 - Durable interaction admission, replay, approval, model-budget settlement,
   and terminal recovery now retain bounded, attributable evidence across
   crashes and retries.
-- The eval-store contract retains immutable corpus revisions, fenced run
-  lifecycle state, cancellation intent, and safe published results. SQLite and
-  PostgreSQL are durable; the memory implementation is explicitly transient.
-- Authenticated servers can attach one trusted corpus target to a durable eval
-  store. Bounded catalog, run, cancellation, result, comparison, and report APIs
-  dispatch only persisted target-scoped work through the existing execution
-  core; ownership loss and shutdown cannot publish partial success.
-- The capability-gated dashboard now completes that workflow: operators can
-  save promoted sessions or import corpora, browse suites and cases, launch and
-  cancel durable runs, inspect every trial/assertion with output, usage, cost,
-  duration, completeness, and safe diagnostics, compare compatible results,
-  and download canonical corpus plus JSON/HTML reports.
-- Portable-result comparison now produces one typed regression projection for
-  the SDK, authenticated API, dashboard, CLI, JSON, and HTML. Different target
-  releases and AppManifest fingerprints remain comparable when the corpus,
-  cases, assertions, evidence policy, and applicable pricing contract are
-  unchanged. CLI exits are frozen as `0` for pass/no regression, `1` for an
-  evaluated failure/regression, and `2` for invalid, unavailable, incomparable,
-  configuration, or execution outcomes.
 - `cayu serve` and `cayu worker` provide stable entrypoints for configured
   projects, while bounded topology, workflow, usage, and event projections
   support control-plane inspection without exposing private authority.
@@ -106,7 +87,23 @@ process restart. Coding agents should treat failed storage status, migration,
 contract, or project tests as a blocked upgrade rather than editing around the
 guard.
 
-## v0.1.0
+## Unreleased
+
+### Upgrade from v0.1.0
+
+The storage schema advances from revision 29 to revision 33. Revision 30 is an
+additive PostgreSQL index rebuild that keeps direct-child session traversal in
+the same bytewise identifier order as SQLite, memory, and Python validation.
+Revision 31 records runtime ownership of fresh-input markers and raises the
+compatibility floor so older workers cannot expose that private marker as
+ordinary event payload. Revisions 32 and 33 add the durable eval catalog, run
+lifecycle tables, and their target-leading query indexes.
+Stop all `v0.1.0` workers, take an application-consistent backup, and run
+`cayu storage status` followed by `cayu storage migrate` against every
+explicitly configured SQLite or PostgreSQL session store, budget ledger, and
+eval store. Confirm revision 33 with no pending migrations before starting
+post-release workers, and do not run mixed `v0.1.0` and development-version
+workers.
 
 ### Completed production sessions can become eval trajectories
 
@@ -290,6 +287,8 @@ later oversized graph can be constructed.
 Standalone trajectory documents advance from version 1 to version 2 for the same provenance
 contract. Older prerelease documents must be regenerated; Cayu does not migrate
 or guess at their meaning.
+
+## v0.1.0
 
 ### Remote environment allocation fails closed without exact recovery
 

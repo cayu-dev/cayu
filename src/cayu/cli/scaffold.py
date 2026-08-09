@@ -6,8 +6,9 @@ import argparse
 import json
 import re
 import sys
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+from cayu._version import package_version
 
 _NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*")
 _TEMPLATE_TOKEN_RE = re.compile(
@@ -1995,10 +1996,7 @@ def add_new_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _installed_cayu_version() -> str:
-    try:
-        return version("cayu")
-    except PackageNotFoundError:
-        return "0.1.0"
+    return package_version()
 
 
 def project_files(

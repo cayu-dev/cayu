@@ -134,6 +134,10 @@ def test_release_runbook_records_external_security_prerequisites() -> None:
     assert "PYPI_PUBLISH_ENABLED" in runbook
     assert "exact, non-empty `## vX.Y.Z` section" in runbook
     assert "does not generate release notes" in runbook
+    assert "`## Unreleased`" in runbook
+    assert "must not edit that tagged section" in runbook_words
+    assert "development version" in runbook_words
+    assert "scripts/verify_release_state.py" in runbook
     assert "0.1.0a1" not in runbook
     assert 'version="$(python -c' in runbook
 
@@ -182,6 +186,20 @@ def test_github_release_uses_curated_notes_for_the_exact_tag() -> None:
     assert '--output "$RUNNER_TEMP/release-notes.md"' in github_release
     assert '--notes-file "$RUNNER_TEMP/release-notes.md"' in github_release
     assert "--generate-notes" not in github_release
+
+
+def test_release_artifact_job_enforces_tagged_note_immutability() -> None:
+    package = _job_block(_CI_WORKFLOW.read_text(), "package")
+
+    checkout = package.index("uses: actions/checkout@")
+    setup = package.index("uses: astral-sh/setup-uv@")
+    assert "fetch-depth: 0" in package[checkout:setup]
+    assert "uv run --no-project" in package
+    assert "--offline" in package
+    assert "--no-python-downloads" in package
+    assert "--python 3.11" in package
+    assert "python scripts/verify_release_state.py" in package
+    assert "--notes docs/release-notes.md" in package
 
 
 def test_pull_request_scopes_expensive_verification_jobs() -> None:
