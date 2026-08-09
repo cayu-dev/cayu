@@ -23,6 +23,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._clock import normalize_utc_datetime, utc_clock
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     copy_durable_json_object,
@@ -78,6 +79,7 @@ class Task(BaseModel):
     session_id: str | None = None
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
+    available_at: datetime | None = None
     worker_id: str | None = None
     lease_expires_at: datetime | None = None
     status_reason: str | None = None
@@ -133,6 +135,13 @@ class Task(BaseModel):
             return require_nonblank(value, info.field_name)
         return require_clean_nonblank(value, info.field_name)
 
+    @field_validator("available_at")
+    @classmethod
+    def normalize_available_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "available_at")
+
 
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
@@ -144,6 +153,7 @@ class TaskCreate(BaseModel):
     session_id: str | None = None
     parent_task_id: str | None = None
     assigned_agent_name: str | None = None
+    available_at: datetime | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -176,6 +186,13 @@ class TaskCreate(BaseModel):
         if info.field_name in {"title", "description"}:
             return require_nonblank(value, info.field_name)
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("available_at")
+    @classmethod
+    def normalize_available_at(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return normalize_utc_datetime(value, "available_at")
 
 
 class TaskQuery(BaseModel):
@@ -249,6 +266,8 @@ class TaskOperationalSnapshot(BaseModel):
     as_of: datetime
     total_count: AggregateCount = Field(ge=0)
     counts_by_status: TaskStatusCounts
+    claimable_pending_count: AggregateCount = Field(ge=0)
+    scheduled_pending_count: AggregateCount = Field(ge=0)
     accuracy: AggregateAccuracy
 
     @field_validator("as_of")
@@ -262,6 +281,11 @@ class TaskOperationalSnapshot(BaseModel):
     def validate_total(self) -> TaskOperationalSnapshot:
         if sum(self.counts_by_status.model_dump().values()) != self.total_count:
             raise ValueError("Task status counts must sum to total_count.")
+        if (
+            self.claimable_pending_count + self.scheduled_pending_count
+            > self.counts_by_status.pending
+        ):
+            raise ValueError("Claimable and scheduled pending counts cannot exceed pending count.")
         return self
 
 
@@ -805,6 +829,7 @@ class TaskTopologyStoreResult(BaseModel):
 class TaskStore(ABC):
     """Persistent store for durable work items."""
 
+    supports_delayed_availability: ClassVar[bool] = False
     supports_task_topology: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
@@ -988,11 +1013,13 @@ class TaskStore(ABC):
 class InMemoryTaskStore(TaskStore):
     """In-process task store for tests, local development, and examples."""
 
+    supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], datetime] | None = None) -> None:
         self._lock = asyncio.Lock()
+        self._clock = utc_clock(clock)
         self._tasks: dict[str, Task] = {}
         self._task_keys_by_session: dict[str, list[tuple[datetime, str]]] = {}
         self._task_keys_by_parent: dict[str, list[tuple[datetime, str]]] = {}
@@ -1124,17 +1151,26 @@ class InMemoryTaskStore(TaskStore):
         filters = copy_task_aggregate_filter(filters)
         task_query = task_query_from_aggregate_filter(filters)
         async with self._lock:
-            as_of = datetime.now(UTC)
+            as_of = self._clock()
             counts = {status: 0 for status in TaskStatus}
             total_count = 0
+            claimable_pending_count = 0
+            scheduled_pending_count = 0
             for task in self._tasks.values():
                 if _task_matches(task, task_query):
                     counts[task.status] += 1
                     total_count += 1
+                    if task.status == TaskStatus.PENDING:
+                        if task.available_at is not None and task.available_at > as_of:
+                            scheduled_pending_count += 1
+                        elif task.session_id is None:
+                            claimable_pending_count += 1
             return TaskOperationalSnapshot(
                 as_of=as_of,
                 total_count=total_count,
                 counts_by_status=TaskStatusCounts.model_validate(counts),
+                claimable_pending_count=claimable_pending_count,
+                scheduled_pending_count=scheduled_pending_count,
                 accuracy=EXACT_AGGREGATE.model_copy(),
             )
 
@@ -1306,11 +1342,14 @@ class InMemoryTaskStore(TaskStore):
         if query.status is not None and query.status is not TaskStatus.PENDING:
             return None
         async with self._lock:
+            availability_now = self._clock()
+            now = datetime.now(UTC)
             candidates = [
                 task
                 for task in self._tasks.values()
                 if task.status is TaskStatus.PENDING
                 and task.session_id is None
+                and (task.available_at is None or task.available_at <= availability_now)
                 and _task_matches_claim_filter(task, query)
             ]
             if not candidates:
@@ -1318,7 +1357,6 @@ class InMemoryTaskStore(TaskStore):
             # Claiming is always FIFO by creation time, independent of the query's
             # display ordering, so the oldest pending task is dispatched first.
             task = _sort_tasks(candidates, TaskOrder.CREATED_AT_ASC)[0]
-            now = datetime.now(UTC)
             updated = task.model_copy(
                 update={
                     "status": TaskStatus.CLAIMED,
@@ -2002,6 +2040,7 @@ def copy_task(task: Task) -> Task:
         session_id=task.session_id,
         parent_task_id=task.parent_task_id,
         assigned_agent_name=task.assigned_agent_name,
+        available_at=task.available_at,
         worker_id=task.worker_id,
         lease_expires_at=task.lease_expires_at,
         status_reason=task.status_reason,
@@ -2032,6 +2071,7 @@ def copy_task_create(request: TaskCreate) -> TaskCreate:
         session_id=request.session_id,
         parent_task_id=request.parent_task_id,
         assigned_agent_name=request.assigned_agent_name,
+        available_at=request.available_at,
         input=copy_durable_json_object(request.input, "input"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
     )
@@ -2086,6 +2126,7 @@ def _task_from_create(request: TaskCreate) -> Task:
         session_id=request.session_id,
         parent_task_id=request.parent_task_id,
         assigned_agent_name=request.assigned_agent_name,
+        available_at=request.available_at,
         input=copy_durable_json_object(request.input, "input"),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
         created_at=now,

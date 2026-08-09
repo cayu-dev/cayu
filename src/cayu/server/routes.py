@@ -3065,6 +3065,7 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
             "session_id": task.session_id,
             "parent_task_id": task.parent_task_id,
             "assigned_agent_name": task.assigned_agent_name,
+            "available_at": task.available_at.isoformat() if task.available_at else None,
             "worker_id": task.worker_id,
             "lease_expires_at": (
                 task.lease_expires_at.isoformat() if task.lease_expires_at else None
@@ -3075,6 +3076,7 @@ def _serialize_task_list_item(cayu_app: Any, task: Task) -> dict[str, Any]:
         },
         "task",
         preserve_string_fields={
+            "available_at",
             "completed_at",
             "created_at",
             "lease_expires_at",

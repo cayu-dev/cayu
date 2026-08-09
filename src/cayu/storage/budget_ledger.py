@@ -9,6 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal
 
+from cayu._clock import utc_clock
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
 )
@@ -30,7 +31,6 @@ from cayu.runtime.budgets import (
     BudgetSettlementRecord,
     _budget_reservation_amount,
     _budget_settlement_record,
-    _clock_or_utc_now,
     _copy_budget_settlement_cursor,
     _EffectiveBudgetLimit,
     _ensure_effective_budget_limit,
@@ -85,7 +85,7 @@ class SQLiteBudgetLedger(BudgetLedger):
 
         self.path = db_path
         self._lock = asyncio.Lock()
-        self._clock = _clock_or_utc_now(clock)
+        self._clock = utc_clock(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
         self._connection = sqlite_support.connect(db_path)
         self._connection.row_factory = sqlite3.Row

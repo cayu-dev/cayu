@@ -7,6 +7,7 @@ Dockerized Postgres. They skip automatically when Docker is unavailable.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import pytest
@@ -66,12 +67,26 @@ async def _truncate(dsn: str) -> None:
         await conn.commit()
 
 
-def _new_store(dsn: str):
+class _MutableClock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
+
+
+def _new_store(dsn: str, *, clock=None):
     from cayu import PostgresTaskStore
     from cayu.storage.migrations import SchemaMode
 
     # Tests own a throwaway database and (re)create the schema each run.
-    return PostgresTaskStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
+    return PostgresTaskStore(
+        dsn,
+        min_size=1,
+        max_size=4,
+        clock=clock,
+        schema_mode=SchemaMode.CREATE,
+    )
 
 
 def _run(dsn: str, coro_factory) -> object:
@@ -91,6 +106,125 @@ def test_postgres_task_store_task_claim_lost_conformance(postgres_dsn):
         await assert_task_claim_lost_conformance(store)
 
     _run(postgres_dsn, ops)
+
+
+def test_postgres_persists_availability_and_claims_once_at_exact_boundary(
+    postgres_dsn,
+):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        boundary = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+        clock = _MutableClock(boundary - timedelta(microseconds=1))
+        creator = _new_store(postgres_dsn, clock=clock)
+        try:
+            await creator.create_task(
+                TaskCreate(
+                    task_id="durable-future",
+                    type="scheduled",
+                    available_at=boundary,
+                )
+            )
+            await creator.create_task(
+                TaskCreate(
+                    task_id="after-boundary",
+                    type="scheduled",
+                    available_at=boundary + timedelta(microseconds=1),
+                )
+            )
+            before = await creator.aggregate_operational_snapshot()
+            assert before.claimable_pending_count == 0
+            assert before.scheduled_pending_count == 2
+            assert await creator.claim_task("worker-before") is None
+        finally:
+            await creator.close()
+
+        reconstructed = _new_store(postgres_dsn, clock=clock)
+        try:
+            loaded = await reconstructed.load_task("durable-future")
+            assert loaded is not None
+            assert loaded.available_at == boundary
+
+            clock.value = boundary
+            at_boundary = await reconstructed.aggregate_operational_snapshot()
+            assert at_boundary.claimable_pending_count == 1
+            assert at_boundary.scheduled_pending_count == 1
+            claims = await asyncio.gather(
+                *(reconstructed.claim_task(f"worker-{index}") for index in range(8))
+            )
+            winners = [claim for claim in claims if claim is not None]
+            assert len(winners) == 1
+            assert winners[0].id == "durable-future"
+            assert winners[0].available_at == boundary
+
+            clock.value = boundary + timedelta(microseconds=1)
+            after = await reconstructed.claim_task("worker-after")
+            assert after is not None
+            assert after.id == "after-boundary"
+        finally:
+            await reconstructed.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_injected_availability_clock_does_not_expire_new_task_lease(
+    postgres_dsn,
+):
+    async def run() -> None:
+        await _truncate(postgres_dsn)
+        boundary = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+        store = _new_store(postgres_dsn, clock=_MutableClock(boundary))
+        try:
+            await store.create_task(
+                TaskCreate(
+                    task_id="lease-clock",
+                    type="scheduled",
+                    available_at=boundary,
+                )
+            )
+            claimed = await store.claim_task("worker")
+            assert claimed is not None
+            released = await store.release_task("lease-clock", "worker")
+            assert released.status is TaskStatus.PENDING
+        finally:
+            await store.close()
+
+    asyncio.run(run())
+
+
+def test_postgres_production_claim_uses_database_clock(postgres_dsn):
+    async def run() -> None:
+        import psycopg
+
+        await _truncate(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await store.ensure_schema()
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute("SELECT transaction_timestamp()")
+                row = await cur.fetchone()
+                assert row is not None
+                database_now = row[0]
+
+            available_at = database_now + timedelta(minutes=5)
+            await store.create_task(
+                TaskCreate(
+                    task_id="database-clock-authority",
+                    type="scheduled",
+                    available_at=available_at,
+                )
+            )
+
+            # Simulate a worker process whose wall clock is far ahead. The
+            # production claim path must not consult it for eligibility.
+            store._clock = lambda: available_at + timedelta(hours=1)
+            assert await store.claim_task("clock-skewed-worker") is None
+        finally:
+            await store.close()
+
+    asyncio.run(run())
 
 
 def test_postgres_task_store_task_topology_conformance(postgres_dsn):

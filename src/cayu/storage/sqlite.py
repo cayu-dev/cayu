@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, TypeVar, cast
 from uuid import uuid4
 
+from cayu._clock import utc_clock
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     JsonUtf8SizeCounter,
@@ -285,7 +286,7 @@ from cayu.storage import migrations as schema
 _EVENT_QUERY_SESSION_IDS_BATCH_SIZE = 500
 _SQLITE_NON_SESSION_MIN_REQUIRED_REVISION = 18
 _SQLITE_SESSION_MIN_REQUIRED_REVISION = 31
-_SQLITE_TASK_TOPOLOGY_MIN_REQUIRED_REVISION = 27
+_SQLITE_TASK_MIN_REQUIRED_REVISION = 34
 _SQL_DIALECT = session_store_sql.SessionStoreSqlDialect(
     placeholder="?",
     contains_style="sqlite_nocase_like",
@@ -8499,12 +8500,14 @@ class SQLiteSessionStore(SessionStore):
 class SQLiteTaskStore(TaskStore):
     """SQLite-backed task store for durable local work items."""
 
+    supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
 
     def __init__(
         self,
         path: str | Path,
         *,
+        clock: Callable[[], datetime] | None = None,
         schema_mode: schema.SchemaMode = schema.SchemaMode.CREATE,
     ) -> None:
         if isinstance(path, Path):
@@ -8523,6 +8526,7 @@ class SQLiteTaskStore(TaskStore):
 
         self.path = db_path
         self._schema_mode = schema_mode
+        self._clock = utc_clock(clock)
         self._lock = asyncio.Lock()
         self._connection = self._connect(db_path)
         self._initialize_schema()
@@ -8555,6 +8559,7 @@ class SQLiteTaskStore(TaskStore):
                         session_id,
                         parent_task_id,
                         assigned_agent_name,
+                        available_at,
                         worker_id,
                         lease_expires_at,
                         status_reason,
@@ -8568,7 +8573,7 @@ class SQLiteTaskStore(TaskStore):
                         started_at,
                         completed_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     sqlite_support.task_to_row_values(task),
                 )
@@ -8827,23 +8832,54 @@ class SQLiteTaskStore(TaskStore):
         clauses, params = self._task_filter_clauses(task_query_from_aggregate_filter(filters))
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         async with self._lock:
+            as_of = sqlite_support.format_datetime(self._clock())
             rows = self._connection.execute(
                 f"""
                 WITH
                 snapshot(as_of) AS (
-                    SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    SELECT ?
+                ),
+                matching_tasks AS (
+                    SELECT status, session_id, available_at
+                    FROM cayu_tasks
+                    {where_sql}
                 ),
                 status_counts AS (
                     SELECT status, COUNT(*) AS status_count
-                    FROM cayu_tasks
-                    {where_sql}
+                    FROM matching_tasks
                     GROUP BY status
+                ),
+                pending_counts AS (
+                    SELECT
+                        COALESCE(SUM(
+                            CASE
+                                WHEN status = 'pending'
+                                 AND session_id IS NULL
+                                 AND (available_at IS NULL OR available_at <= snapshot.as_of)
+                                THEN 1 ELSE 0
+                            END
+                        ), 0) AS claimable_pending_count,
+                        COALESCE(SUM(
+                            CASE
+                                WHEN status = 'pending'
+                                 AND available_at > snapshot.as_of
+                                THEN 1 ELSE 0
+                            END
+                        ), 0) AS scheduled_pending_count
+                    FROM matching_tasks
+                    CROSS JOIN snapshot
                 )
-                SELECT snapshot.as_of, status_counts.status, status_counts.status_count
+                SELECT
+                    snapshot.as_of,
+                    status_counts.status,
+                    status_counts.status_count,
+                    pending_counts.claimable_pending_count,
+                    pending_counts.scheduled_pending_count
                 FROM snapshot
+                CROSS JOIN pending_counts
                 LEFT JOIN status_counts ON TRUE
                 """,
-                params,
+                (as_of, *params),
             ).fetchall()
             counts = {status: 0 for status in TaskStatus}
             for row in rows:
@@ -8854,6 +8890,8 @@ class SQLiteTaskStore(TaskStore):
                 as_of=sqlite_support.parse_datetime(rows[0]["as_of"]),
                 total_count=sum(counts.values()),
                 counts_by_status=TaskStatusCounts.model_validate(counts),
+                claimable_pending_count=rows[0]["claimable_pending_count"],
+                scheduled_pending_count=rows[0]["scheduled_pending_count"],
                 accuracy=EXACT_AGGREGATE.model_copy(),
             )
 
@@ -9069,14 +9107,21 @@ class SQLiteTaskStore(TaskStore):
         if query.status is not None and query.status is not TaskStatus.PENDING:
             return None
         clauses, params = self._task_filter_clauses(query)
-        where_sql = " AND ".join(["status = ?", "session_id IS NULL", *clauses])
+        where_sql = " AND ".join(
+            [
+                "status = ?",
+                "session_id IS NULL",
+                "(available_at IS NULL OR available_at <= ?)",
+                *clauses,
+            ]
+        )
         # Claiming is always FIFO by creation time, independent of the query's
         # display ordering, so the oldest pending task is dispatched first.
         order_sql = sqlite_support.task_order_sql(TaskOrder.CREATED_AT_ASC)
-        now = datetime.now(UTC)
-        lease_expires_at = now + timedelta(seconds=lease_seconds)
-
         async with self._lock:
+            availability_now = self._clock()
+            now = datetime.now(UTC)
+            lease_expires_at = now + timedelta(seconds=lease_seconds)
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 row = self._connection.execute(
@@ -9087,7 +9132,11 @@ class SQLiteTaskStore(TaskStore):
                     ORDER BY {order_sql}, id ASC
                     LIMIT 1
                     """,
-                    [str(TaskStatus.PENDING), *params],
+                    [
+                        str(TaskStatus.PENDING),
+                        sqlite_support.format_datetime(availability_now),
+                        *params,
+                    ],
                 ).fetchone()
                 if row is None:
                     self._connection.commit()
@@ -9297,7 +9346,7 @@ class SQLiteTaskStore(TaskStore):
         sqlite_support.reconcile_schema(
             self._connection,
             self._schema_mode,
-            app_min_supported=_SQLITE_TASK_TOPOLOGY_MIN_REQUIRED_REVISION,
+            app_min_supported=_SQLITE_TASK_MIN_REQUIRED_REVISION,
         )
 
     def _load_task_unlocked(self, task_id: str) -> Task | None:

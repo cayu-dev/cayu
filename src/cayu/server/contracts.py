@@ -1654,6 +1654,7 @@ class ApiTaskListItem(ApiBaseModel):
     session_id: str | None
     parent_task_id: str | None
     assigned_agent_name: str | None
+    available_at: str | None
     worker_id: str | None
     lease_expires_at: str | None
     created_at: str

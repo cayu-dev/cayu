@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -106,6 +107,18 @@ def test_revision_thirty_rebuilds_session_lineage_index_with_c_collation() -> No
         if candidate.index_name == "idx_cayu_sessions_parent_created_id"
     ]
     assert matching == [index]
+
+
+def test_revision_thirty_four_builds_task_availability_index_concurrently() -> None:
+    indexes = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[34]
+
+    assert len(indexes) == 1
+    index = indexes[0]
+    assert index.index_name == "idx_cayu_tasks_claim_availability"
+    assert index.key_definitions == ("created_at", "id", "available_at")
+    assert index.predicate_definition == "status = 'pending' AND session_id IS NULL"
+    assert "CREATE INDEX CONCURRENTLY" in index.create_statement
+    assert postgres_storage._required_concurrent_indexes(34)[-1] == index
 
 
 def test_postgres_workflow_replay_is_fenced_atomic_and_indexed(postgres_dsn: str) -> None:
@@ -370,6 +383,47 @@ def test_create_mode_initializes_and_records_baseline(postgres_dsn: str) -> None
     asyncio.run(runner())
 
 
+def test_create_mode_rolls_back_schema_when_transactional_index_creation_fails(
+    postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def runner() -> None:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        availability_index = postgres_storage._CONCURRENT_INDEX_MIGRATIONS[34][0]
+        broken_index = replace(
+            availability_index,
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY idx_cayu_tasks_claim_availability "
+                "ON cayu_tasks(column_that_does_not_exist)"
+            ),
+        )
+        monkeypatch.setitem(
+            postgres_storage._CONCURRENT_INDEX_MIGRATIONS,
+            34,
+            (broken_index,),
+        )
+
+        store = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.CREATE)
+        try:
+            with pytest.raises(psycopg.errors.UndefinedColumn):
+                await store.ensure_schema()
+        finally:
+            await store.close()
+
+        async with (
+            await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+            conn.cursor() as cur,
+        ):
+            await cur.execute(
+                "SELECT to_regclass('cayu_schema_migrations'), to_regclass('cayu_tasks')"
+            )
+            assert await cur.fetchone() == (None, None)
+
+    asyncio.run(runner())
+
+
 def test_validate_mode_succeeds_after_create(postgres_dsn: str) -> None:
     async def runner() -> None:
         await _drop_all(postgres_dsn)
@@ -502,7 +556,7 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
 
         task_validator = PostgresTaskStore(postgres_dsn, schema_mode=SchemaMode.VALIDATE)
         try:
-            with pytest.raises(schema.SchemaTooOld, match="requires >= 27"):
+            with pytest.raises(schema.SchemaTooOld, match="requires >= 34"):
                 await task_validator.ensure_schema()
         finally:
             await task_validator.close()
@@ -604,6 +658,18 @@ def test_latest_migrates_queue_and_event_side_effect_handoff(
             proof_column = await cur.fetchone()
             assert proof_column[:2] == ("boolean", "NO")
             assert proof_column[2] in {"false", "false::boolean"}
+            await cur.execute(
+                "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 34"
+            )
+            assert await cur.fetchone() == ("breaking", 34)
+            await cur.execute(
+                "SELECT data_type, is_nullable FROM information_schema.columns "
+                "WHERE table_schema = current_schema() "
+                "AND table_name = 'cayu_tasks' AND column_name = 'available_at'"
+            )
+            assert await cur.fetchone() == ("timestamp with time zone", "YES")
+            await cur.execute("SELECT to_regclass('idx_cayu_tasks_claim_availability')")
+            assert (await cur.fetchone())[0] == "idx_cayu_tasks_claim_availability"
             await cur.execute(
                 """
                 SELECT pg_get_indexdef(index_class.oid)

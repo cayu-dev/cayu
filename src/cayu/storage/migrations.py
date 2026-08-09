@@ -202,6 +202,10 @@ REVISIONS: tuple[Revision, ...] = (
     # Add target-leading eval run catalog and claim indexes. Existing writers
     # already maintain target_key and every lifecycle column in these indexes.
     Revision(revision=33, kind=RevisionKind.ADDITIVE, compatible_from=31),
+    # Persist the optional task availability gate and index eligible queue
+    # selection. Pre-34 task workers ignore the gate and could claim future work
+    # early, so they must not share a revision-34 database.
+    Revision(revision=34, kind=RevisionKind.BREAKING, compatible_from=34),
 )
 
 #: The revision an empty database is initialized to.

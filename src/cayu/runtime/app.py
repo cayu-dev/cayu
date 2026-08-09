@@ -2048,7 +2048,12 @@ class CayuApp:
             raise TypeError("Task creation requires a TaskCreate request.")
         if self.task_store is None:
             raise RuntimeError("task_store is required to create tasks.")
-        return await self.task_store.create_task(copy_task_create(request))
+        request = copy_task_create(request)
+        if request.available_at is not None and not self.task_store.supports_delayed_availability:
+            raise NotImplementedError(
+                f"{type(self.task_store).__name__} does not support delayed task availability."
+            )
+        return await self.task_store.create_task(request)
 
     async def pause_task(
         self,

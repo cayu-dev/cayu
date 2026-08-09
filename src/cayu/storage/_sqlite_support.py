@@ -1437,6 +1437,10 @@ _MIGRATION_STEPS: dict[int, str] = {
                 target_key, status, lease_expires_at, created_at ASC, run_id ASC
             );
     """,
+    34: """
+        CREATE INDEX IF NOT EXISTS idx_cayu_tasks_claim_availability
+            ON cayu_tasks(status, session_id, created_at, id, available_at);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no
@@ -1492,6 +1496,7 @@ _MIGRATION_ADD_COLUMNS: dict[int, tuple[tuple[str, str, str], ...]] = {
             "INTEGER NOT NULL DEFAULT 0 CHECK (input_contract_runtime_owned IN (0, 1))",
         ),
     ),
+    34: (("cayu_tasks", "available_at", "TEXT"),),
 }
 
 # Per-revision ``ALTER TABLE DROP COLUMN`` steps, keyed by revision. Like the ADD
@@ -2475,6 +2480,7 @@ def task_to_row_values(task: Task) -> tuple[object, ...]:
         task.session_id,
         task.parent_task_id,
         task.assigned_agent_name,
+        format_optional_datetime(task.available_at),
         task.worker_id,
         format_optional_datetime(task.lease_expires_at),
         task.status_reason,
@@ -2503,6 +2509,7 @@ def task_from_row(row: sqlite3.Row) -> Task:
         session_id=row["session_id"],
         parent_task_id=row["parent_task_id"],
         assigned_agent_name=row["assigned_agent_name"],
+        available_at=parse_optional_datetime(row["available_at"]),
         worker_id=row["worker_id"],
         lease_expires_at=parse_optional_datetime(row["lease_expires_at"]),
         status_reason=row["status_reason"],

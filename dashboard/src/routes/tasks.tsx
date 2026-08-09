@@ -36,6 +36,7 @@ import {
 import { dashboardCapabilityUnavailableText } from "../lib/dashboard-capabilities"
 import { formatDateTime } from "../lib/format"
 import { currentQueryParam, dashboardPath, replaceDashboardLocation } from "../lib/links"
+import { taskAvailabilityDescriptor } from "../lib/task-availability"
 import { cn } from "../lib/utils"
 
 type TaskStatusFilter = "all" | NonNullable<TaskListQuery["status"]>
@@ -198,6 +199,7 @@ export function TasksPage() {
   })
   const selectedTask =
     taskDetail.data ?? (selectedListTask?.id === taskDetailId ? selectedListTask : null)
+  const selectedAvailabilityLabel = selectedTask ? taskAvailabilityDescriptor(selectedTask) : null
   const hasNextPage = taskList.length === PAGE_LIMIT
   const hasPreviousPage = offset > 0
   const hasFilters =
@@ -386,6 +388,7 @@ export function TasksPage() {
                 <TableHead>Agent</TableHead>
                 <TableHead>Worker</TableHead>
                 <TableHead>Lease</TableHead>
+                <TableHead>Availability</TableHead>
                 <TableHead>Session</TableHead>
                 <TableHead>Updated</TableHead>
               </TableRow>
@@ -393,7 +396,7 @@ export function TasksPage() {
             <TableBody>
               {tasks.isError ? (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={8}>
                     <StateMessage tone="danger">
                       {tasks.error instanceof Error ? tasks.error.message : "Failed to load tasks."}
                     </StateMessage>
@@ -401,62 +404,81 @@ export function TasksPage() {
                 </TableRow>
               ) : tasks.isLoading ? (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={8}>
                     <StateMessage>Loading tasks...</StateMessage>
                   </TableCell>
                 </TableRow>
               ) : taskList.length ? (
-                taskList.map((task) => (
-                  <TableRow
-                    key={task.id}
-                    className={cn(
-                      "cursor-pointer",
-                      selectedTask?.id === task.id && "bg-muted/70 hover:bg-muted/70",
-                    )}
-                    onClick={() => selectTask(task.id)}
-                  >
-                    <TableCell>
-                      <div className="min-w-56">
-                        <div className="truncate font-medium">{taskTitle(task)}</div>
-                        <div className="truncate font-mono text-xs text-muted-foreground">
-                          {task.id}
-                        </div>
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={statusBadgeVariant(task.status)}>{task.status}</Badge>
-                    </TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">
-                      {task.assigned_agent_name ?? "-"}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">
-                      {task.worker_id ?? "-"}
-                    </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      {formatDateTime(task.lease_expires_at)}
-                    </TableCell>
-                    <TableCell>
-                      {task.session_id ? (
-                        <Link
-                          to="/sessions/$sessionId"
-                          params={{ sessionId: task.session_id }}
-                          className="font-mono text-xs text-primary hover:underline"
-                          onClick={(event) => event.stopPropagation()}
-                        >
-                          {task.session_id}
-                        </Link>
-                      ) : (
-                        <span className="text-muted-foreground">-</span>
+                taskList.map((task) => {
+                  const availabilityLabel = taskAvailabilityDescriptor(task)
+                  return (
+                    <TableRow
+                      key={task.id}
+                      className={cn(
+                        "cursor-pointer",
+                        selectedTask?.id === task.id && "bg-muted/70 hover:bg-muted/70",
                       )}
-                    </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
-                      {formatDateTime(task.updated_at)}
-                    </TableCell>
-                  </TableRow>
-                ))
+                      onClick={() => selectTask(task.id)}
+                    >
+                      <TableCell>
+                        <div className="min-w-56">
+                          <div className="truncate font-medium">{taskTitle(task)}</div>
+                          <div className="truncate font-mono text-xs text-muted-foreground">
+                            {task.id}
+                          </div>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={statusBadgeVariant(task.status)}>{task.status}</Badge>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        {task.assigned_agent_name ?? "-"}
+                      </TableCell>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        {task.worker_id ?? "-"}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        {formatDateTime(task.lease_expires_at)}
+                      </TableCell>
+                      <TableCell>
+                        {availabilityLabel ? (
+                          <div className="space-y-1">
+                            <Badge variant="outline">{availabilityLabel}</Badge>
+                            {task.available_at && (
+                              <div className="text-xs text-muted-foreground">
+                                {formatDateTime(task.available_at)}
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">
+                            {task.available_at ? formatDateTime(task.available_at) : "-"}
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {task.session_id ? (
+                          <Link
+                            to="/sessions/$sessionId"
+                            params={{ sessionId: task.session_id }}
+                            className="font-mono text-xs text-primary hover:underline"
+                            onClick={(event) => event.stopPropagation()}
+                          >
+                            {task.session_id}
+                          </Link>
+                        ) : (
+                          <span className="text-muted-foreground">-</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        {formatDateTime(task.updated_at)}
+                      </TableCell>
+                    </TableRow>
+                  )
+                })
               ) : (
                 <TableRow>
-                  <TableCell colSpan={7}>
+                  <TableCell colSpan={8}>
                     <StateMessage>
                       {hasFilters ? "No tasks match the current filters." : "No tasks yet."}
                     </StateMessage>
@@ -518,6 +540,19 @@ export function TasksPage() {
                   <span className="text-right text-xs">
                     {formatDateTime(selectedTask.lease_expires_at)}
                   </span>
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <span className="text-muted-foreground">Availability</span>
+                  <div className="text-right">
+                    {selectedAvailabilityLabel && (
+                      <Badge variant="outline">{selectedAvailabilityLabel}</Badge>
+                    )}
+                    <div className="mt-1 text-xs">
+                      {selectedTask.available_at
+                        ? formatDateTime(selectedTask.available_at)
+                        : "Immediate"}
+                    </div>
+                  </div>
                 </div>
                 <div className="flex items-start justify-between gap-3">
                   <span className="text-muted-foreground">Created</span>

@@ -22,6 +22,7 @@ from pydantic import (
     model_validator,
 )
 
+from cayu._clock import utc_clock
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     MIN_DURABLE_JSON_INTEGER,
@@ -1990,7 +1991,7 @@ class InMemoryBudgetLedger(BudgetLedger):
         self._records: dict[str, BudgetReservationRecord] = {}
         self._settlements: dict[str, BudgetSettlementRecord] = {}
         self._lock = asyncio.Lock()
-        self._clock = _clock_or_utc_now(clock)
+        self._clock = utc_clock(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
 
     @property
@@ -3754,18 +3755,6 @@ def _utc_datetime(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware.")
     return value.astimezone(UTC)
-
-
-def _clock_or_utc_now(clock: Callable[[], datetime] | None) -> Callable[[], datetime]:
-    if clock is None:
-        return lambda: datetime.now(UTC)
-    if not callable(clock):
-        raise TypeError("clock must be callable.")
-
-    def _checked_clock() -> datetime:
-        return _utc_datetime(clock(), "clock()")
-
-    return _checked_clock
 
 
 def _event_in_window(

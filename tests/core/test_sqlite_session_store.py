@@ -1929,7 +1929,7 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
     with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 31"):
         SQLiteSessionStore(db_path, schema_mode=schema_migrations.SchemaMode.VALIDATE)
 
-    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 27"):
+    with pytest.raises(schema_migrations.SchemaTooOld, match="requires >= 34"):
         SQLiteTaskStore(
             db_path,
             schema_mode=schema_migrations.SchemaMode.VALIDATE,
@@ -1996,6 +1996,17 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
             "FROM pragma_table_info('cayu_events') "
             "WHERE name = 'input_contract_runtime_owned'"
         ).fetchone()
+        delayed_task_revision = connection.execute(
+            "SELECT kind, compatible_from FROM cayu_schema_migrations WHERE revision = 34"
+        ).fetchone()
+        delayed_task_column = connection.execute(
+            'SELECT name, type, "notnull", dflt_value '
+            "FROM pragma_table_info('cayu_tasks') WHERE name = 'available_at'"
+        ).fetchone()
+        delayed_task_index = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_cayu_tasks_claim_availability'"
+        ).fetchone()
         task_session_topology_index = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'index' "
             "AND name = 'idx_cayu_tasks_session_created_id'"
@@ -2034,6 +2045,9 @@ def test_sqlite_latest_migrates_queue_and_event_side_effect_handoff(tmp_path):
         1,
         "0",
     )
+    assert delayed_task_revision == ("breaking", 34)
+    assert delayed_task_column == ("available_at", "TEXT", 0, None)
+    assert delayed_task_index == ("idx_cayu_tasks_claim_availability",)
     assert task_session_topology_index == ("idx_cayu_tasks_session_created_id",)
     assert task_parent_topology_index == ("idx_cayu_tasks_parent_created_id",)
     assert legacy_writer_trigger is None
@@ -2612,6 +2626,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (31, 31),
         (32, 31),
         (33, 31),
+        (34, 34),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

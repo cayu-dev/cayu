@@ -550,6 +550,7 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
         task.session_id,
         task.parent_task_id,
         task.assigned_agent_name,
+        to_utc_optional(task.available_at),
         task.worker_id,
         to_utc_optional(task.lease_expires_at),
         task.status_reason,
@@ -567,8 +568,9 @@ def task_insert_values(task: Task) -> tuple[object, ...]:
 
 TASK_COLUMNS = (
     "id, type, title, description, status, session_id, parent_task_id, "
-    "assigned_agent_name, worker_id, lease_expires_at, status_reason, status_payload, input, "
-    "result, error, metadata, created_at, updated_at, started_at, completed_at"
+    "assigned_agent_name, available_at, worker_id, lease_expires_at, status_reason, "
+    "status_payload, input, result, error, metadata, created_at, updated_at, started_at, "
+    "completed_at"
 )
 
 
@@ -582,18 +584,19 @@ def task_from_row(row: tuple[Any, ...]) -> Task:
         session_id=row[5],
         parent_task_id=row[6],
         assigned_agent_name=row[7],
-        worker_id=row[8],
-        lease_expires_at=to_utc_optional(row[9]),
-        status_reason=row[10],
-        status_payload=None if row[11] is None else _loads(row[11]),
-        input=_loads(row[12]),
-        result=None if row[13] is None else _loads(row[13]),
-        error=None if row[14] is None else _loads(row[14]),
-        metadata=_loads(row[15]),
-        created_at=to_utc(row[16]),
-        updated_at=to_utc(row[17]),
-        started_at=to_utc_optional(row[18]),
-        completed_at=to_utc_optional(row[19]),
+        available_at=to_utc_optional(row[8]),
+        worker_id=row[9],
+        lease_expires_at=to_utc_optional(row[10]),
+        status_reason=row[11],
+        status_payload=None if row[12] is None else _loads(row[12]),
+        input=_loads(row[13]),
+        result=None if row[14] is None else _loads(row[14]),
+        error=None if row[15] is None else _loads(row[15]),
+        metadata=_loads(row[16]),
+        created_at=to_utc(row[17]),
+        updated_at=to_utc(row[18]),
+        started_at=to_utc_optional(row[19]),
+        completed_at=to_utc_optional(row[20]),
     )
 
 

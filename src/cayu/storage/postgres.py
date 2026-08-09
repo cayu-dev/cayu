@@ -29,6 +29,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - exercised only without 
         'Install them with `pip install "cayu[postgres]"`.'
     ) from exc
 
+from cayu._clock import utc_clock
 from cayu._validation import (
     EXECUTION_UNIT_ID_MAX_CHARS,
     MAX_DURABLE_JSON_INTEGER,
@@ -66,7 +67,6 @@ from cayu.runtime.budgets import (
     BudgetSettlementRecord,
     _budget_reservation_amount,
     _budget_settlement_record,
-    _clock_or_utc_now,
     _copy_budget_settlement_cursor,
     _EffectiveBudgetLimit,
     _ensure_effective_budget_limit,
@@ -428,9 +428,10 @@ logger = logging.getLogger(__name__)
 _PGVECTOR_SCHEMA_ADVISORY_LOCK_KEY = 0x6361_7975_7665_6374 & 0x7FFF_FFFF_FFFF_FFFF
 _TASK_RETURNING_COLUMNS = (
     "task.id, task.type, task.title, task.description, task.status, task.session_id, "
-    "task.parent_task_id, task.assigned_agent_name, task.worker_id, task.lease_expires_at, "
-    "task.status_reason, task.status_payload, task.input, task.result, task.error, task.metadata, "
-    "task.created_at, task.updated_at, task.started_at, task.completed_at"
+    "task.parent_task_id, task.assigned_agent_name, task.available_at, task.worker_id, "
+    "task.lease_expires_at, task.status_reason, task.status_payload, task.input, task.result, "
+    "task.error, task.metadata, task.created_at, task.updated_at, task.started_at, "
+    "task.completed_at"
 )
 _SESSION_MESSAGE_QUEUE_COLUMNS = (
     "ordering_key, queue_id, session_id, idempotency_key, content, delivery_mode, status, "
@@ -1222,6 +1223,7 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "ON cayu_eval_runs("
         "target_key, status, lease_expires_at, created_at ASC, run_id ASC)",
     ),
+    34: ("ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ",),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -1638,6 +1640,16 @@ class _ConcurrentIndexMigration:
     unique: bool = False
     replace_existing: bool = False
 
+    def transactional_create_statement(self) -> str:
+        """Return the equivalent index DDL for an empty, locked schema."""
+
+        parts = self.create_statement.split("CONCURRENTLY")
+        if len(parts) != 2:
+            raise RuntimeError(
+                f"Concurrent index {self.index_name} must have exactly one CONCURRENTLY clause."
+            )
+        return "".join(parts)
+
 
 _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] = {
     16: (
@@ -2045,6 +2057,21 @@ _CONCURRENT_INDEX_MIGRATIONS: dict[int, tuple[_ConcurrentIndexMigration, ...]] =
             ),
             required_key_collations=(None, None, "C"),
             replace_existing=True,
+        ),
+    ),
+    34: (
+        _ConcurrentIndexMigration(
+            index_name="idx_cayu_tasks_claim_availability",
+            table_name="cayu_tasks",
+            key_definitions=("created_at", "id", "available_at"),
+            predicate_definition=("status = 'pending' AND session_id IS NULL"),
+            create_statement=(
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                "idx_cayu_tasks_claim_availability "
+                "ON cayu_tasks(created_at, id, available_at) "
+                "WHERE status = 'pending' AND session_id IS NULL"
+            ),
+            drop_statement=("DROP INDEX CONCURRENTLY IF EXISTS idx_cayu_tasks_claim_availability"),
         ),
     ),
 }
@@ -2700,6 +2727,11 @@ class _PostgresStoreBase:
         for rev in schema.pending(current):
             for statement in _MIGRATION_STEPS.get(rev.revision, ()):
                 await cur.execute(statement)
+            # Fresh CREATE owns empty tables under the schema lock, so hot-table
+            # indexes can be built transactionally. Existing databases still use
+            # the non-transactional CONCURRENTLY path in ``_migrate_schema``.
+            for index in _CONCURRENT_INDEX_MIGRATIONS.get(rev.revision, ()):
+                await cur.execute(index.transactional_create_statement())
             await self._record_revision(cur, rev)
 
     async def _ensure_concurrent_index(
@@ -3354,7 +3386,7 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
             max_size=max_size,
             schema_mode=schema_mode,
         )
-        self._clock = _clock_or_utc_now(clock)
+        self._clock = utc_clock(clock)
         self._reservation_ttl_seconds = _validate_reservation_ttl(reservation_ttl_seconds)
 
     @property
@@ -13464,9 +13496,32 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
 class PostgresTaskStore(_PostgresStoreBase, TaskStore):
     """Postgres-backed task store for durable multi-tenant work items."""
 
+    supports_delayed_availability: ClassVar[bool] = True
     supports_task_topology: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
-    _min_required_revision = 27
+    _min_required_revision = 34
+
+    def __init__(
+        self,
+        conninfo: str | None = None,
+        *,
+        pool: AsyncConnectionPool | None = None,
+        min_size: int = 1,
+        max_size: int = 8,
+        clock: Callable[[], datetime] | None = None,
+        schema_mode: schema.SchemaMode = schema.SchemaMode.VALIDATE,
+        read_only: bool = False,
+    ) -> None:
+        super().__init__(
+            conninfo,
+            pool=pool,
+            min_size=min_size,
+            max_size=max_size,
+            schema_mode=schema_mode,
+            read_only=read_only,
+        )
+        self._clock = utc_clock(clock)
+        self._clock_is_injected = clock is not None
 
     async def create_task(self, request: TaskCreate) -> Task:
         request = copy_task_create(request)
@@ -13492,7 +13547,7 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s
+                            %s, %s, %s
                         )
                         """,
                         pg_support.task_insert_values(task),
@@ -13802,17 +13857,45 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     as_of_row = await cur.fetchone()
                     if as_of_row is None:
                         raise RuntimeError("Postgres did not return a snapshot timestamp.")
+                    as_of = self._clock() if self._clock_is_injected else as_of_row[0]
                     await cur.execute(
                         cast(
                             "LiteralString",
                             f"""
-                            SELECT status, COUNT(*)
-                            FROM cayu_tasks
-                            {where_sql}
-                            GROUP BY status
+                            WITH
+                            matching_tasks AS (
+                                SELECT status, session_id, available_at
+                                FROM cayu_tasks
+                                {where_sql}
+                            ),
+                            status_counts AS (
+                                SELECT status, COUNT(*) AS status_count
+                                FROM matching_tasks
+                                GROUP BY status
+                            ),
+                            pending_counts AS (
+                                SELECT
+                                    COUNT(*) FILTER (
+                                        WHERE status = 'pending'
+                                          AND session_id IS NULL
+                                          AND (available_at IS NULL OR available_at <= %s)
+                                    ) AS claimable_pending_count,
+                                    COUNT(*) FILTER (
+                                        WHERE status = 'pending'
+                                          AND available_at > %s
+                                    ) AS scheduled_pending_count
+                                FROM matching_tasks
+                            )
+                            SELECT
+                                status_counts.status,
+                                status_counts.status_count,
+                                pending_counts.claimable_pending_count,
+                                pending_counts.scheduled_pending_count
+                            FROM pending_counts
+                            LEFT JOIN status_counts ON TRUE
                             """,
                         ),
-                        params,
+                        [*params, as_of, as_of],
                     )
                     rows = await cur.fetchall()
                 await conn.commit()
@@ -13822,11 +13905,14 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
 
         counts = {status: 0 for status in TaskStatus}
         for row in rows:
-            counts[TaskStatus(row[0])] = row[1]
+            if row[0] is not None:
+                counts[TaskStatus(row[0])] = row[1]
         return TaskOperationalSnapshot(
-            as_of=as_of_row[0],
+            as_of=as_of,
             total_count=sum(counts.values()),
             counts_by_status=TaskStatusCounts.model_validate(counts),
+            claimable_pending_count=rows[0][2],
+            scheduled_pending_count=rows[0][3],
             accuracy=EXACT_AGGREGATE.model_copy(),
         )
 
@@ -14037,13 +14123,31 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
         if query.status is not None and query.status is not TaskStatus.PENDING:
             return None
         clauses, params = self._task_filter_clauses(query)
-        where_sql = " AND ".join(["status = %s", "session_id IS NULL", *clauses])
+        if self._clock_is_injected:
+            availability_clause = "(available_at IS NULL OR available_at <= %s)"
+            availability_params: list[Any] = [self._clock()]
+        else:
+            # Production eligibility and lease timestamps share PostgreSQL's
+            # transaction clock. A skewed worker clock must never make a
+            # future task claimable before the authoritative store says so.
+            availability_clause = (
+                "(available_at IS NULL OR available_at <= transaction_timestamp())"
+            )
+            availability_params = []
+        lease_expires_sql = "transaction_timestamp() + (%s * INTERVAL '1 second')"
+        updated_at_sql = "transaction_timestamp()"
+        mutation_params = [lease_seconds]
+        where_sql = " AND ".join(
+            [
+                "status = %s",
+                "session_id IS NULL",
+                availability_clause,
+                *clauses,
+            ]
+        )
         # Claiming is always FIFO by creation time, independent of the query's
         # display ordering, so the oldest pending task is dispatched first.
         order_sql = pg_support.task_order_sql(TaskOrder.CREATED_AT_ASC)
-        now = datetime.now(UTC)
-        lease_expires_at = now + timedelta(seconds=lease_seconds)
-
         await self._ensure_ready()
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -14062,8 +14166,8 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                         UPDATE cayu_tasks AS task
                         SET status = %s,
                             worker_id = %s,
-                            lease_expires_at = %s,
-                            updated_at = %s
+                            lease_expires_at = {lease_expires_sql},
+                            updated_at = {updated_at_sql}
                         FROM candidate
                         WHERE task.id = candidate.id
                         RETURNING {_TASK_RETURNING_COLUMNS}
@@ -14071,11 +14175,11 @@ class PostgresTaskStore(_PostgresStoreBase, TaskStore):
                     ),
                     [
                         str(TaskStatus.PENDING),
+                        *availability_params,
                         *params,
                         str(TaskStatus.CLAIMED),
                         worker_id,
-                        lease_expires_at,
-                        now,
+                        *mutation_params,
                     ],
                 )
                 row = await cur.fetchone()

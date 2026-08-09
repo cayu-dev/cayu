@@ -109,6 +109,26 @@ def test_revision_thirty_three_adds_target_scoped_eval_indexes() -> None:
         )
 
 
+def test_revision_thirty_four_adds_delayed_task_availability() -> None:
+    revision = m.revision(34)
+    state = m.SchemaState(
+        revision=revision.revision,
+        compatible_from=revision.compatible_from,
+    )
+
+    # An older TaskStore would ignore available_at and could claim future work
+    # early, so no pre-34 binary may start against the migrated database.
+    with pytest.raises(m.SchemaTooNew, match="understands revision >= 34"):
+        m.validate(state, app_latest=33, app_min_supported=31)
+    m.validate(state, app_latest=34, app_min_supported=34)
+    with pytest.raises(m.SchemaTooOld, match="requires >= 34"):
+        m.validate(
+            m.SchemaState(revision=33, compatible_from=31),
+            app_latest=34,
+            app_min_supported=34,
+        )
+
+
 def test_revision_fourteen_remains_compatible_with_older_binaries() -> None:
     m.validate(
         m.SchemaState(revision=14, compatible_from=10),

@@ -2145,6 +2145,17 @@
           ],
           "title": "Assigned Agent Name"
         },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Available At"
+        },
         "completed_at": {
           "anyOf": [
             {
@@ -2322,6 +2333,7 @@
         "session_id",
         "parent_task_id",
         "assigned_agent_name",
+        "available_at",
         "worker_id",
         "lease_expires_at",
         "created_at",
@@ -2349,6 +2361,17 @@
             }
           ],
           "title": "Assigned Agent Name"
+        },
+        "available_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Available At"
         },
         "completed_at": {
           "anyOf": [
@@ -2482,6 +2505,7 @@
         "session_id",
         "parent_task_id",
         "assigned_agent_name",
+        "available_at",
         "worker_id",
         "lease_expires_at",
         "created_at",
@@ -6918,8 +6942,18 @@
           "title": "As Of",
           "type": "string"
         },
+        "claimable_pending_count": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Claimable Pending Count",
+          "type": "string"
+        },
         "counts_by_status": {
           "$ref": "#/components/schemas/TaskStatusCounts"
+        },
+        "scheduled_pending_count": {
+          "pattern": "^(0|[1-9]\\d*)$",
+          "title": "Scheduled Pending Count",
+          "type": "string"
         },
         "total_count": {
           "pattern": "^(0|[1-9]\\d*)$",
@@ -6931,6 +6965,8 @@
         "as_of",
         "total_count",
         "counts_by_status",
+        "claimable_pending_count",
+        "scheduled_pending_count",
         "accuracy"
       ],
       "title": "TaskOperationalSnapshot",

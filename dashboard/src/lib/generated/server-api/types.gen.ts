@@ -1190,6 +1190,10 @@ export type ApiTaskDetail = {
      */
     assigned_agent_name: string | null;
     /**
+     * Available At
+     */
+    available_at: string | null;
+    /**
      * Completed At
      */
     completed_at: string | null;
@@ -1285,6 +1289,10 @@ export type ApiTaskListItem = {
      * Assigned Agent Name
      */
     assigned_agent_name: string | null;
+    /**
+     * Available At
+     */
+    available_at: string | null;
     /**
      * Completed At
      */
@@ -5791,7 +5799,15 @@ export type TaskOperationalSnapshot = {
      * As Of
      */
     as_of: string;
+    /**
+     * Claimable Pending Count
+     */
+    claimable_pending_count: string;
     counts_by_status: TaskStatusCounts;
+    /**
+     * Scheduled Pending Count
+     */
+    scheduled_pending_count: string;
     /**
      * Total Count
      */

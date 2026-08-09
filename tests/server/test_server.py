@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -1838,6 +1838,36 @@ def test_server_task_list_exposes_worker_lease_state() -> None:
     assert isinstance(tasks[0]["updated_at"], str)
 
 
+def test_server_task_endpoints_serialize_availability_in_canonical_utc() -> None:
+    task_store = InMemoryTaskStore()
+    local_time = datetime(
+        2026,
+        8,
+        8,
+        9,
+        30,
+        tzinfo=timezone(timedelta(hours=5, minutes=30)),
+    )
+    asyncio.run(
+        task_store.create_task(
+            TaskCreate(
+                task_id="scheduled_task",
+                type="review",
+                available_at=local_time,
+            )
+        )
+    )
+
+    client = TestClient(create_server(CayuApp(task_store=task_store), config=_LOCAL_SERVER_CONFIG))
+    task_list = client.get("/api/tasks")
+    task_detail = client.get("/api/tasks/scheduled_task")
+
+    assert task_list.status_code == 200
+    assert task_detail.status_code == 200
+    assert task_list.json()[0]["available_at"] == "2026-08-08T04:00:00+00:00"
+    assert task_detail.json()["available_at"] == "2026-08-08T04:00:00+00:00"
+
+
 def test_server_task_list_filters_lifecycle_states() -> None:
     task_store = InMemoryTaskStore()
 
@@ -2681,6 +2711,8 @@ def test_server_exposes_separate_store_local_operational_snapshots() -> None:
     }
     assert body["task_snapshot_status"] == "available"
     assert body["tasks"]["counts_by_status"]["pending"] == "1"
+    assert body["tasks"]["claimable_pending_count"] == "1"
+    assert body["tasks"]["scheduled_pending_count"] == "0"
 
     without_tasks = client.post(
         "/api/operations/snapshot",

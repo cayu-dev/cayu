@@ -204,6 +204,9 @@ export function DashboardPage() {
     ? sumCounts(sessionCounts.pending, sessionCounts.running, sessionCounts.interrupting)
     : null
   const taskCounts = operationalSnapshot?.tasks?.counts_by_status
+  const pendingTaskAvailabilityDetail = operationalSnapshot?.tasks
+    ? `${formatCount(operationalSnapshot.tasks.claimable_pending_count)} claimable pending; ${formatCount(operationalSnapshot.tasks.scheduled_pending_count)} scheduled pending.`
+    : null
   const attentionTaskCount = taskCounts
     ? sumCounts(taskCounts.blocked, taskCounts.needs_attention, taskCounts.failed)
     : null
@@ -327,7 +330,7 @@ export function DashboardPage() {
             icon: ListTodo,
             label: "Tasks Needing Attention",
             value: attentionTaskCount === null ? "—" : formatCount(attentionTaskCount),
-            detail: `${taskMetricDetail} Blocked, needs attention, and failed tasks are included.`,
+            detail: `${taskMetricDetail}${pendingTaskAvailabilityDetail ? ` ${pendingTaskAvailabilityDetail}` : ""} Blocked, needs attention, and failed tasks are included.`,
           },
         ].map(({ icon: Icon, label, value, detail }) => (
           <Card key={label}>

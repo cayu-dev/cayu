@@ -1801,7 +1801,7 @@ Creates and updates optional durable units of work.
 
 A task is not a PM-specific object. It is a generic work item that can represent a webhook job, background agent run, workflow step, orchestrator assignment, coding task, invoice-processing job, report generation job, or external automation. Simple one-off agent calls do not need tasks; they can use only sessions and events.
 
-`Task` values have type, status, optional session/parent-task/assigned-agent identity, JSON-object input, optional JSON-object result/error, JSON-object metadata, and lifecycle timestamps. `TaskStore` exposes:
+`Task` values have type, status, optional session/parent-task/assigned-agent identity, an optional `available_at` UTC availability gate, JSON-object input, optional JSON-object result/error, JSON-object metadata, and lifecycle timestamps. `TaskStore` exposes:
 
 - `create_task(TaskCreate(...))`
 - `create_running_task(TaskCreate(session_id=...))`
@@ -1826,6 +1826,41 @@ A task is not a PM-specific object. It is a generic work item that can represent
 the required session attachment, and `started_at`. It is intended for control-plane
 commands that have already durably claimed their session and must not expose a
 crash window containing an attached, unclaimable pending task.
+
+`TaskCreate.available_at` and `Task.available_at` accept only timezone-aware
+datetimes and normalize them to UTC. Omitting the field means immediate
+availability. A pending task whose timestamp is in the future remains durable
+and visible to ordinary loads, filtered lists, ordering, and pagination, but
+`claim_task(...)` excludes it in the same store transaction or lock that owns
+the claim transition. It becomes an ordinary claim candidate when
+`available_at <=` the store's authoritative UTC clock; equality is eligible and
+no resume or lifecycle transition is required. PostgreSQL production claims use
+the database transaction timestamp, not a worker-process wall clock; injected
+clocks exist only as a deterministic test seam. Availability adds no lifecycle
+status. Holding and resuming a task preserves the timestamp, so a task resumed
+before its boundary returns to `pending` without becoming prematurely
+claimable. Trusted direct lifecycle calls such as `start_task(...)` remain
+explicit application decisions rather than queue claims and do not wait for the
+gate.
+
+The durable store predicate is the correctness boundary. An application may
+use a process timer, sleep, or a future `next_available_at` optimization to
+avoid polling, but losing that process-local wakeup cannot lose or prematurely
+release the task. A later worker claim observes the persisted timestamp and
+decides eligibility again.
+
+`TaskStore.supports_delayed_availability` defaults to `False`, and `CayuApp`
+rejects delayed creation before calling a store that has not opted in. A custom
+store may set it to `True` only when it preserves `available_at` and applies the
+same predicate atomically inside `claim_task(...)`. Direct custom-store callers
+must honor the capability too; they must not discard the field or claim the
+task immediately.
+
+Breaking schema revision 34 stores the nullable task timestamp and its claim
+index. Pre-34 task workers do not enforce the gate and could claim future work
+early, so they must not share a revision-34 database. Stop older workers and
+migrate SQLite and PostgreSQL task databases before starting this build; an
+application-only rollback across the boundary is rejected.
 
 Valid task lifecycle is intentionally small for the foundation:
 
@@ -2594,9 +2629,18 @@ Session counts always include `pending`, `running`, `interrupting`, `completed`,
 SQLite uses one read statement, and PostgreSQL uses a repeatable-read,
 read-only transaction. A concurrent write belongs either before or after that
 store-local snapshot; it cannot produce internally mixed status totals.
-SQLite captures `as_of` inside the aggregate statement, while PostgreSQL uses
-the transaction timestamp; the in-memory stores capture it while holding their
-store lock.
+Task snapshots additionally report `claimable_pending_count` and
+`scheduled_pending_count`. Claimable pending means an unattached pending task
+whose availability is absent or due at `as_of`; scheduled pending means any
+pending task whose availability is strictly later than `as_of`. The counts are
+disjoint and their sum may be smaller than the total pending count because a
+due task already linked to a session is neither fresh queue work nor scheduled
+future work. SQLite and the in-memory store capture the store clock while
+holding their lock; PostgreSQL uses the transaction timestamp. Tests may inject
+a timezone-aware clock to prove exact-boundary behavior without sleeping.
+Clients may display the persisted timestamp, but must not derive authoritative
+"claimable" or "scheduled" state from a browser or other client clock. Use the
+snapshot counts and their `as_of` timestamp for those current-state claims.
 
 `POST /api/usage/rollup` returns exact usage totals for the UTC-normalized,
 half-open event-time window `start_at <= event.timestamp < end_at`. Its optional
