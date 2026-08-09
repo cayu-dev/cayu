@@ -89,6 +89,40 @@ guard.
 
 ## Unreleased
 
+## v0.2.0rc1
+
+This is the first release candidate for `v0.2.0`. It freezes the current
+runtime, evaluation, and delayed-task contracts for clean-install and
+fresh-store validation. Bug fixes discovered during candidate testing may ship
+in `v0.2.0rc2`; otherwise the final release should change only version and
+release metadata.
+
+### What this candidate validates
+
+- Completed production sessions can become bounded, reviewable eval
+  trajectories and portable corpora, then run through the same trusted local
+  execution core used by runtime-native evals.
+- The packaged dashboard supports the complete authenticated eval workflow:
+  corpus management, durable run control, result inspection, compatible
+  comparisons, and dashboard-to-CI export.
+- Provider cursor recovery, interruption handling, lossless trial outcomes,
+  evidence provenance, and cost-aware comparisons remain explicit across
+  retries, restarts, and unavailable evidence.
+- Durable tasks can be scheduled with an optional UTC availability time. The
+  store remains authoritative for eligibility, concurrent claimers cannot take
+  future work early, and the dashboard reports durable configuration without
+  trusting the browser clock.
+
+### Candidate verification
+
+Install `cayu==0.2.0rc1` into a clean Python 3.11-or-newer environment and use
+fresh SQLite and PostgreSQL stores. Fresh stores initialize at schema revision
+34, which includes durable eval state and delayed task availability. Verify
+`cayu version`, run `cayu check --json`, execute the current-contract test suite,
+and exercise a representative durable session, eval run, and delayed task. This
+candidate does not claim mixed-version operation or compatibility with durable
+stores created by earlier prereleases.
+
 ## v0.2.0.dev0
 
 ### Upgrade from v0.1.0
