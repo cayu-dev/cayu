@@ -2694,8 +2694,11 @@ sequence-backed replay markers and applies schema-aware public event projection.
 Server contract version 7 adds explicit provider-operation reconnect and
 reconciliation states to session-state inspection. Server contract version 8
 adds the required Evals capability surface and authenticated corpus, run,
-result, cancellation, and comparison endpoints. Clients generated against
-contract version 1 through 7 must regenerate from the current OpenAPI document.
+result, cancellation, and comparison endpoints. Server contract version 9
+replaces the compatibility-only comparison response with the complete typed
+compatible-result regression projection used by the dashboard and local CI.
+Clients generated against contract version 1 through 8 must regenerate from the
+current OpenAPI document.
 Version 1 and 2 clients must also treat all aggregate
 counter fields as strings. Independently hosted dashboards must not render
 control-plane routes against a server reporting a different contract version.

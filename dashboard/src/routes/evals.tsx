@@ -1416,7 +1416,9 @@ function ComparisonPanel({
 }
 
 function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
-  const { compatibility, baseline, current } = comparison
+  const { comparison: resultComparison, baseline, current } = comparison
+  const { compatibility } = resultComparison
+  const regressions = resultComparison.regressions ?? []
   const reasons = compatibility.reasons ?? []
   return (
     <div className="space-y-4 p-4">
@@ -1443,9 +1445,37 @@ function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
       </div>
 
       <div className="grid gap-4 md:grid-cols-2">
-        <ComparisonRunSummary label="Baseline" run={baseline} />
-        <ComparisonRunSummary label="Current" run={current} />
+        <ComparisonRunSummary label="Baseline" run={baseline} result={resultComparison.baseline} />
+        <ComparisonRunSummary label="Current" run={current} result={resultComparison.current} />
       </div>
+      {compatibility.comparable && (
+        <div
+          className={
+            regressions.length === 0
+              ? "rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3 text-sm"
+              : "rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm"
+          }
+          data-testid="eval-comparison-regressions"
+        >
+          <div className="font-medium">
+            {regressions.length === 0
+              ? "No compatible-result regressions."
+              : `${regressions.length} compatible-result regression${regressions.length === 1 ? "" : "s"}.`}
+          </div>
+          {regressions.length > 0 && (
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              {regressions.map((regression) => (
+                <li key={`${regression.scope}:${regression.case_id ?? "run"}:${regression.kind}`}>
+                  {regression.scope === "case" ? `Case ${regression.case_id}: ` : "Run: "}
+                  {regression.kind === "status"
+                    ? `status ${regression.baseline_status} → ${regression.current_status}`
+                    : `score ${formatScore(regression.baseline_score)} → ${formatScore(regression.current_score)}`}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       <div className="grid gap-4 rounded-lg border border-border bg-muted/20 p-3 text-xs sm:grid-cols-2">
         <RunFact
           label="Baseline result revision"
@@ -1460,17 +1490,27 @@ function ComparisonSummary({ comparison }: { comparison: EvalComparison }) {
   )
 }
 
-function ComparisonRunSummary({ label, run }: { label: string; run: EvalRun }) {
+function ComparisonRunSummary({
+  label,
+  run,
+  result,
+}: {
+  label: string
+  run: EvalRun
+  result: EvalComparison["comparison"]["baseline"]
+}) {
   return (
     <div className="rounded-lg border border-border p-3">
       <div className="mb-3 flex items-center justify-between gap-2">
         <div className="font-medium">{label}</div>
-        <OutcomeBadge outcome={run.result?.status ?? run.status} />
+        <OutcomeBadge outcome={result.status} />
       </div>
       <div className="grid gap-3 text-sm sm:grid-cols-2">
         <RunFact label="Run" value={shortEvalIdentity(run.spec.run_id)} />
         <RunFact label="Suite" value={run.spec.suite_id} />
-        <RunFact label="Score" value={formatScore(run.result?.score)} />
+        <RunFact label="Release" value={result.application_release_id} />
+        <RunFact label="App manifest" value={shortEvalIdentity(result.app_manifest_fingerprint)} />
+        <RunFact label="Score" value={formatScore(result.score)} />
         <RunFact
           label="Duration"
           value={run.result ? formatDuration(run.result.duration_ms) : "unavailable"}

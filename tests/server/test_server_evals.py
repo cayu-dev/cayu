@@ -420,7 +420,8 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
                 json={"baseline_run_id": run_id, "current_run_id": run_id},
             )
             assert comparison.status_code == 200
-            assert comparison.json()["compatibility"]["comparable"] is True
+            assert comparison.json()["comparison"]["compatibility"]["comparable"] is True
+            assert comparison.json()["comparison"]["regressions"] == []
 
             json_report = client.get(
                 f"/api/evals/runs/{run_id}/report.json",
@@ -461,6 +462,83 @@ def test_evals_api_imports_executes_compares_and_exports_deterministically(tmp_p
             }
     finally:
         asyncio.run(store.close())
+
+
+def test_evals_api_compares_compatible_releases_and_returns_typed_regressions(tmp_path) -> None:
+    corpus = _corpus(trials=1)
+    database = tmp_path / "evals.db"
+    request = {
+        "corpus_revision": corpus.revision,
+        "suite_id": corpus.suites[0].id,
+        "max_concurrency": 1,
+    }
+    baseline_store = SQLiteEvalStore(database)
+    try:
+        baseline_target = _target(
+            _provider(trials=1),
+            application_release_id="baseline-release",
+        )
+        with TestClient(_server(baseline_target, baseline_store)) as client:
+            assert (
+                client.post(
+                    "/api/evals/corpora",
+                    headers=_AUTH_HEADERS,
+                    json=corpus.model_dump(mode="json"),
+                ).status_code
+                == 201
+            )
+            baseline_admission = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "baseline-run"},
+                json=request,
+            )
+            assert baseline_admission.status_code == 202
+            baseline_run_id = baseline_admission.json()["spec"]["run_id"]
+            assert _wait_for_terminal(client, baseline_run_id)["result"]["status"] == "passed"
+
+    finally:
+        asyncio.run(baseline_store.close())
+
+    current_store = SQLiteEvalStore(database)
+    try:
+        current_target = _target(
+            _provider(trials=1, output="Denied"),
+            application_release_id="current-release",
+        )
+        with TestClient(_server(current_target, current_store)) as client:
+            current_admission = client.post(
+                "/api/evals/runs",
+                headers={**_AUTH_HEADERS, "Idempotency-Key": "current-run"},
+                json=request,
+            )
+            assert current_admission.status_code == 202
+            current_run_id = current_admission.json()["spec"]["run_id"]
+            assert _wait_for_terminal(client, current_run_id)["result"]["status"] == "failed"
+
+            response = client.post(
+                "/api/evals/comparisons",
+                headers=_AUTH_HEADERS,
+                json={
+                    "baseline_run_id": baseline_run_id,
+                    "current_run_id": current_run_id,
+                },
+            )
+            assert response.status_code == 200
+            comparison = response.json()["comparison"]
+            assert comparison["compatibility"]["comparable"] is True
+            assert comparison["baseline"]["application_release_id"] == "baseline-release"
+            assert comparison["current"]["application_release_id"] == "current-release"
+            assert [
+                (regression["scope"], regression["kind"], regression["case_id"])
+                for regression in comparison["regressions"]
+            ] == [
+                ("run", "status", None),
+                ("run", "score", None),
+                ("case", "status", "refund-approval"),
+                ("case", "score", "refund-approval"),
+            ]
+    finally:
+        asyncio.run(current_store.close())
 
 
 def test_eval_result_refreshes_run_after_concurrent_publication(tmp_path, monkeypatch) -> None:

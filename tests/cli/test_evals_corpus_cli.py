@@ -59,12 +59,12 @@ def _corpus(*, suite_id: str = "refunds", case_id: str = "refund-approved"):
     )
 
 
-def build_corpus_eval_plan() -> EvalPlan:
+def _corpus_eval_plan(*, output: str = "Approved") -> EvalPlan:
     app = CayuApp(enable_logging=False)
     app.register_provider(
         ScriptedModelProvider(
             [
-                ModelStreamEvent.text_delta("Approved"),
+                ModelStreamEvent.text_delta(output),
                 ModelStreamEvent.completed(
                     {
                         "finish_reason": "stop",
@@ -89,6 +89,14 @@ def build_corpus_eval_plan() -> EvalPlan:
             application_release_id="release-2026-08-06",
         )
     )
+
+
+def build_corpus_eval_plan() -> EvalPlan:
+    return _corpus_eval_plan()
+
+
+def build_failing_corpus_eval_plan() -> EvalPlan:
+    return _corpus_eval_plan(output="Denied")
 
 
 def test_eval_run_executes_downloaded_corpus_and_writes_safe_json_and_html(
@@ -125,6 +133,142 @@ def test_eval_run_executes_downloaded_corpus_and_writes_safe_json_and_html(
     assert "session_id" not in serialized
     assert '"final_output":' not in serialized
     assert '"text": "Approved"' in serialized
+
+
+def test_eval_report_and_compare_accept_dashboard_corpus_results_with_stable_exits(
+    tmp_path: Path,
+) -> None:
+    corpus_path = tmp_path / "corpus.json"
+    baseline_path = tmp_path / "baseline.json"
+    current_path = tmp_path / "current.json"
+    report_path = tmp_path / "report.html"
+    comparison_path = tmp_path / "comparison.json"
+    corpus_path.write_text(eval_corpus_to_json(_corpus()), encoding="utf-8")
+
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_corpus_eval_plan",
+                "--corpus",
+                str(corpus_path),
+                "--output",
+                str(baseline_path),
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "eval",
+                "run",
+                f"{__name__}:build_failing_corpus_eval_plan",
+                "--corpus",
+                str(corpus_path),
+                "--output",
+                str(current_path),
+            ]
+        )
+        == 1
+    )
+    assert (
+        main(
+            [
+                "eval",
+                "report",
+                str(current_path),
+                "--output",
+                str(report_path),
+            ]
+        )
+        == 0
+    )
+    assert (
+        main(
+            [
+                "eval",
+                "compare",
+                str(baseline_path),
+                str(current_path),
+                "--json",
+                "--output",
+                str(comparison_path),
+            ]
+        )
+        == 1
+    )
+
+    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    assert comparison["compatibility"]["comparable"] is True
+    assert [item["kind"] for item in comparison["regressions"]] == [
+        "status",
+        "score",
+        "status",
+        "score",
+    ]
+    assert "Cayu Eval Comparison" not in report_path.read_text(encoding="utf-8")
+    assert "Cayu Eval Report" in report_path.read_text(encoding="utf-8")
+
+
+def test_eval_compare_returns_two_and_typed_reasons_for_incomparable_corpora(
+    tmp_path: Path,
+) -> None:
+    baseline_corpus = tmp_path / "baseline-corpus.json"
+    current_corpus = tmp_path / "current-corpus.json"
+    baseline_result = tmp_path / "baseline-result.json"
+    current_result = tmp_path / "current-result.json"
+    comparison_path = tmp_path / "comparison.json"
+    baseline_corpus.write_text(eval_corpus_to_json(_corpus()), encoding="utf-8")
+    current_corpus.write_text(
+        eval_corpus_to_json(_corpus(case_id="refund-changed")),
+        encoding="utf-8",
+    )
+    target = f"{__name__}:build_corpus_eval_plan"
+
+    for corpus_path, result_path in (
+        (baseline_corpus, baseline_result),
+        (current_corpus, current_result),
+    ):
+        assert (
+            main(
+                [
+                    "eval",
+                    "run",
+                    target,
+                    "--corpus",
+                    str(corpus_path),
+                    "--output",
+                    str(result_path),
+                ]
+            )
+            == 0
+        )
+
+    assert (
+        main(
+            [
+                "eval",
+                "compare",
+                str(baseline_result),
+                str(current_result),
+                "--json",
+                "--output",
+                str(comparison_path),
+            ]
+        )
+        == 2
+    )
+    comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+    assert comparison["compatibility"]["comparable"] is False
+    assert comparison["compatibility"]["reasons"] == [
+        "corpus_revision_mismatch",
+        "case_contract_mismatch",
+        "assertion_contract_mismatch",
+    ]
+    assert comparison["cases"] == []
+    assert comparison["regressions"] == []
 
 
 def test_eval_corpus_validate_inspect_and_atomic_merge_commands(
@@ -191,7 +335,7 @@ def test_eval_run_requires_explicit_suite_for_multi_suite_corpus(
     )
 
     payload = json.loads(capsys.readouterr().out)
-    assert exit_code == 1
+    assert exit_code == 2
     assert payload["error"]["code"] == "EVAL_COMMAND_FAILED"
     assert "--suite is required" in payload["error"]["message"]
 
@@ -211,7 +355,7 @@ def test_corpus_commands_reject_output_paths_that_would_overwrite_inputs(tmp_pat
                 str(corpus_path),
             ]
         )
-        == 1
+        == 2
     )
     assert "must not overwrite corpus input" in capsys.readouterr().err
     assert corpus_path.read_text(encoding="utf-8") == original
@@ -228,7 +372,7 @@ def test_corpus_commands_reject_output_paths_that_would_overwrite_inputs(tmp_pat
                 str(corpus_path),
             ]
         )
-        == 1
+        == 2
     )
     captured = capsys.readouterr()
     assert "must not overwrite --corpus" in captured.out + captured.err
@@ -246,7 +390,7 @@ def test_corpus_commands_reject_output_paths_that_would_overwrite_inputs(tmp_pat
                 str(destination),
             ]
         )
-        == 1
+        == 2
     )
     assert "must not overwrite merge destination" in capsys.readouterr().err
     assert not destination.exists()
@@ -274,7 +418,7 @@ def test_eval_run_rejects_colliding_json_and_html_outputs_before_execution(
                 str(output_path),
             ]
         )
-        == 1
+        == 2
     )
 
     captured = capsys.readouterr()

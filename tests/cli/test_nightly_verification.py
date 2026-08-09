@@ -982,6 +982,22 @@ def test_dashboard_behavior_check_skips_when_playwright_chromium_is_missing(
     assert result.reason == "Playwright Chromium is unavailable"
 
 
+def test_evals_release_acceptance_is_real_provider_and_browser_gated() -> None:
+    check = next(check for check in nightly.CHECKS if check.id == "evals-release-acceptance-live")
+
+    assert check.lane == "dashboard-live"
+    assert check.command == (
+        "uv",
+        "run",
+        "python",
+        "examples/evals_release_acceptance_live.py",
+    )
+    assert check.required_any_env == (("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),)
+    assert check.requires_provider_api_key is True
+    assert check.requires_playwright_chromium is True
+    assert check.requires_structured_evidence is True
+
+
 def test_internal_evals_hermetic_success_is_reported_without_live_credentials() -> None:
     check = next(check for check in nightly.CHECKS if check.id == "internal-evals-hermetic")
     environ = {

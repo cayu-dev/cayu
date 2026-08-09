@@ -68,8 +68,8 @@ deployments.
 | Reviewed knowledge | Durable entries, approval state, keyword/vector retrieval, recall tools |
 | Provider flexibility | OpenAI API, experimental OpenAI subscription login, Anthropic, Bedrock, Vertex, OpenAI-compatible APIs |
 | Agent operations | Tasks, dispatchers, event watchers, subagents, runtime hooks |
-| Behavioral proof | Runtime tests, trajectory assertions, replay, eval reports |
-| Operations | FastAPI control plane and a packaged inspection dashboard |
+| Behavioral proof | Runtime tests, production-session promotion, durable evals, comparison, and CI reports |
+| Operations | FastAPI control plane and a packaged dashboard for sessions, workflows, usage, and evals |
 
 ## Quickstart
 

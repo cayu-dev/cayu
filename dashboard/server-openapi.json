@@ -4474,6 +4474,71 @@
         "title": "ControlPlaneSurfaceCapabilities",
         "type": "object"
       },
+      "CorpusCaseComparison": {
+        "additionalProperties": false,
+        "description": "Aggregate outcomes for one case in two contract-compatible results.",
+        "properties": {
+          "baseline_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Score"
+          },
+          "baseline_status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Baseline Status",
+            "type": "string"
+          },
+          "case_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Case Id",
+            "type": "string"
+          },
+          "current_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Score"
+          },
+          "current_status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Current Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "case_id",
+          "baseline_status",
+          "current_status"
+        ],
+        "title": "CorpusCaseComparison",
+        "type": "object"
+      },
       "CorpusComparisonCompatibility": {
         "additionalProperties": false,
         "description": "Typed precondition result for later regression comparison and UI adapters.",
@@ -4528,6 +4593,201 @@
         "title": "CorpusComparisonReason",
         "type": "string"
       },
+      "CorpusComparisonResultSummary": {
+        "additionalProperties": false,
+        "description": "Bounded public identity and aggregate outcome for one compared result.",
+        "properties": {
+          "app_manifest_fingerprint": {
+            "maxLength": 64,
+            "minLength": 64,
+            "title": "App Manifest Fingerprint",
+            "type": "string"
+          },
+          "application_release_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Application Release Id",
+            "type": "string"
+          },
+          "result_revision": {
+            "title": "Result Revision",
+            "type": "string"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "status": {
+            "enum": [
+              "passed",
+              "failed",
+              "unavailable",
+              "error"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result_revision",
+          "application_release_id",
+          "app_manifest_fingerprint",
+          "status"
+        ],
+        "title": "CorpusComparisonResultSummary",
+        "type": "object"
+      },
+      "CorpusExecutionComparison": {
+        "additionalProperties": false,
+        "description": "Deterministic contract-aware comparison of two published corpus executions.",
+        "properties": {
+          "baseline": {
+            "$ref": "#/components/schemas/CorpusComparisonResultSummary"
+          },
+          "cases": {
+            "items": {
+              "$ref": "#/components/schemas/CorpusCaseComparison"
+            },
+            "maxItems": 1000,
+            "title": "Cases",
+            "type": "array"
+          },
+          "compatibility": {
+            "$ref": "#/components/schemas/CorpusComparisonCompatibility"
+          },
+          "current": {
+            "$ref": "#/components/schemas/CorpusComparisonResultSummary"
+          },
+          "regressions": {
+            "items": {
+              "$ref": "#/components/schemas/CorpusExecutionRegression"
+            },
+            "maxItems": 2002,
+            "title": "Regressions",
+            "type": "array"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "score_tolerance": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Score Tolerance",
+            "type": "number"
+          }
+        },
+        "required": [
+          "compatibility",
+          "baseline",
+          "current"
+        ],
+        "title": "CorpusExecutionComparison",
+        "type": "object"
+      },
+      "CorpusExecutionRegression": {
+        "additionalProperties": false,
+        "description": "One typed regression derived from compatible published aggregates.",
+        "properties": {
+          "baseline_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Score"
+          },
+          "baseline_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "unavailable",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Baseline Status"
+          },
+          "case_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Case Id"
+          },
+          "current_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Score"
+          },
+          "current_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passed",
+                  "failed",
+                  "unavailable",
+                  "error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Status"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CorpusRegressionKind"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/CorpusRegressionScope"
+          }
+        },
+        "required": [
+          "scope",
+          "kind"
+        ],
+        "title": "CorpusExecutionRegression",
+        "type": "object"
+      },
       "CorpusExecutionResult": {
         "additionalProperties": false,
         "description": "Safe published run plus the fresh target identity used to produce it.",
@@ -4556,6 +4816,24 @@
         ],
         "title": "CorpusExecutionResult",
         "type": "object"
+      },
+      "CorpusRegressionKind": {
+        "description": "Stable dimension on which one compatible result regressed.",
+        "enum": [
+          "status",
+          "score"
+        ],
+        "title": "CorpusRegressionKind",
+        "type": "string"
+      },
+      "CorpusRegressionScope": {
+        "description": "Stable location of one compatible-result regression.",
+        "enum": [
+          "run",
+          "case"
+        ],
+        "title": "CorpusRegressionScope",
+        "type": "string"
       },
       "CorpusUserMessageSpec": {
         "additionalProperties": false,
@@ -5211,8 +5489,8 @@
           "baseline": {
             "$ref": "#/components/schemas/EvalRunRecord"
           },
-          "compatibility": {
-            "$ref": "#/components/schemas/CorpusComparisonCompatibility"
+          "comparison": {
+            "$ref": "#/components/schemas/CorpusExecutionComparison"
           },
           "current": {
             "$ref": "#/components/schemas/EvalRunRecord"
@@ -5221,7 +5499,7 @@
         "required": [
           "baseline",
           "current",
-          "compatibility"
+          "comparison"
         ],
         "title": "EvalComparisonResponse",
         "type": "object"
@@ -9491,7 +9769,7 @@
             "$ref": "#/components/schemas/ClientGenerationContract"
           },
           "contract_version": {
-            "default": "8",
+            "default": "9",
             "title": "Contract Version",
             "type": "string"
           },
@@ -13096,7 +13374,7 @@
             "type": "string"
           },
           "contract_version": {
-            "default": "8",
+            "default": "9",
             "title": "Contract Version",
             "type": "string"
           }

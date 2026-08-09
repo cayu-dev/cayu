@@ -29,7 +29,10 @@ test("eval API adapters encode identities, forward cancellation, and preserve la
     }
     return new Response(
       JSON.stringify({
-        compatibility: { comparable: true },
+        comparison: {
+          compatibility: { comparable: true },
+          regressions: [],
+        },
         baseline: { spec: { run_id: "eval/base" } },
         current: { spec: { run_id: "eval/current" } },
       }),

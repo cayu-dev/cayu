@@ -45,12 +45,18 @@ from cayu.evals.execution import (
 )
 from cayu.evals.execution_comparison import (
     CorpusComparisonReason,
+    CorpusExecutionRegression,
+    CorpusRegressionKind,
+    CorpusRegressionScope,
+    compare_corpus_execution_results,
     corpus_execution_compatibility,
 )
 from cayu.evals.execution_reporting import (
+    corpus_execution_comparison_to_json,
     corpus_execution_result_from_json,
     corpus_execution_result_to_json,
     load_corpus_execution_result,
+    render_corpus_execution_comparison_html,
     render_corpus_execution_html,
     write_corpus_execution_result,
 )
@@ -582,11 +588,17 @@ def test_comparison_compatibility_permits_a_different_release_and_manifest():
     )
 
     compatibility = corpus_execution_compatibility(baseline, current)
+    comparison = compare_corpus_execution_results(baseline, current)
 
     assert compatibility.comparable is True
     assert compatibility.reasons == ()
+    assert comparison.compatibility == compatibility
+    assert comparison.regressions == ()
     assert baseline.target.application_release_id != current.target.application_release_id
     assert baseline.target.app_manifest_fingerprint != current.target.app_manifest_fingerprint
+    assert (
+        comparison.baseline.app_manifest_fingerprint != comparison.current.app_manifest_fingerprint
+    )
 
 
 def test_comparison_compatibility_reports_changed_corpus_and_case_contracts():
@@ -606,6 +618,95 @@ def test_comparison_compatibility_reports_changed_corpus_and_case_contracts():
         CorpusComparisonReason.CORPUS_REVISION_MISMATCH,
         CorpusComparisonReason.CASE_CONTRACT_MISMATCH,
     )
+
+
+def test_contract_aware_comparison_reports_typed_regressions_across_releases():
+    corpus = _corpus()
+    baseline = asyncio.run(run_corpus_suite(_target(_provider()), corpus, "refund-regressions"))
+    current = asyncio.run(
+        run_corpus_suite(
+            _target(
+                _provider(output="Denied"),
+                application_release_id="release-2026-08-07",
+            ),
+            corpus,
+            "refund-regressions",
+        )
+    )
+
+    comparison = compare_corpus_execution_results(baseline, current)
+
+    assert comparison.compatibility.comparable is True
+    assert comparison.baseline.application_release_id == "release-2026-08-06"
+    assert comparison.current.application_release_id == "release-2026-08-07"
+    assert [(item.scope, item.kind, item.case_id) for item in comparison.regressions] == [
+        (CorpusRegressionScope.RUN, CorpusRegressionKind.STATUS, None),
+        (CorpusRegressionScope.RUN, CorpusRegressionKind.SCORE, None),
+        (CorpusRegressionScope.CASE, CorpusRegressionKind.STATUS, "refund-approval"),
+        (CorpusRegressionScope.CASE, CorpusRegressionKind.SCORE, "refund-approval"),
+    ]
+    serialized = corpus_execution_comparison_to_json(comparison)
+    assert serialized == corpus_execution_comparison_to_json(comparison)
+    assert '"application_release_id": "release-2026-08-07"' in serialized
+    rendered = render_corpus_execution_comparison_html(comparison)
+    assert "Compatible evaluation contracts" in rendered
+    assert "release-2026-08-07" in rendered
+    assert comparison.current.app_manifest_fingerprint in rendered
+    assert "Score regression tolerance <code>0</code>" in rendered
+    assert "passed → failed" in rendered
+
+    tolerant = compare_corpus_execution_results(baseline, current, score_tolerance=1.0)
+    assert [item.kind for item in tolerant.regressions] == [
+        CorpusRegressionKind.STATUS,
+        CorpusRegressionKind.STATUS,
+    ]
+
+
+def test_contract_aware_comparison_never_diffs_incomparable_results():
+    baseline = asyncio.run(run_corpus_suite(_target(_provider()), _corpus(), "refund-regressions"))
+    current = asyncio.run(
+        run_corpus_suite(
+            _target(_provider()),
+            _corpus(input_text="Refund order 43."),
+            "refund-regressions",
+        )
+    )
+
+    comparison = compare_corpus_execution_results(baseline, current)
+
+    assert comparison.compatibility.comparable is False
+    assert comparison.cases == ()
+    assert comparison.regressions == ()
+    rendered = render_corpus_execution_comparison_html(comparison)
+    assert "Incomparable evaluation contracts" in rendered
+    assert "Regressions are not evaluated for incomparable results." in rendered
+    assert "No compatible-result regressions." not in rendered
+
+
+def test_regression_projection_rejects_improvements_labeled_as_regressions():
+    with pytest.raises(ValueError, match="worse status"):
+        CorpusExecutionRegression(
+            scope=CorpusRegressionScope.RUN,
+            kind=CorpusRegressionKind.STATUS,
+            baseline_status="failed",
+            current_status="passed",
+        )
+    with pytest.raises(ValueError, match="lower the score"):
+        CorpusExecutionRegression(
+            scope=CorpusRegressionScope.CASE,
+            kind=CorpusRegressionKind.SCORE,
+            case_id="case-a",
+            baseline_score=0.5,
+            current_score=0.5,
+        )
+
+
+def test_contract_aware_comparison_revalidates_potentially_forged_results():
+    result = asyncio.run(run_corpus_suite(_target(_provider()), _corpus(), "refund-regressions"))
+    forged = result.model_copy(update={"revision": "sha256:" + "0" * 64})
+
+    with pytest.raises(ValidationError, match="revision does not match"):
+        compare_corpus_execution_results(result, forged)
 
 
 @pytest.mark.parametrize(

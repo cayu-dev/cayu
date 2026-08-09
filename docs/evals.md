@@ -123,10 +123,15 @@ revision conflict by default, validates the complete result, and atomically
 replaces the destination. `--replace-conflicts` deliberately selects the last
 conflicting definition in command-line order.
 
-The command exits with `0` when all cases pass and `1` when the run fails,
-errors, or a comparison detects regressions. `eval report` and `eval compare`
-operate only on the paths supplied to them and do not perform project
-discovery.
+`eval run` and `eval compare` have stable CI exits: `0` means the selected suite
+passed, or a compatible comparison found no regression; `1` means execution
+completed and produced a failed result or a compatible regression; `2` means
+the command could not make a conclusive pass/fail decision. Exit `2` covers
+invalid corpus or result input, unavailable/error/skipped evidence, incomparable
+contracts, target/configuration errors, and execution errors. Direct-suite runs
+use the same `0`/`1`/`2` status mapping. `eval report` and `eval compare` auto-detect
+direct `EvalRun` and portable `CorpusExecutionResult` documents, operate only on
+the supplied paths, and do not perform project discovery.
 
 ## Portable corpus documents
 
@@ -861,8 +866,52 @@ completed baseline run ID; the dashboard displays the server's typed
 compatibility verdict and immutable summaries side by side. Different
 application releases are allowed, while changed corpus, suite, case, assertion,
 evidence-policy, target-key, or applicable-pricing contracts are explicitly
-incomparable. The browser does not choose a baseline automatically or invent a
-universal regression score.
+incomparable. For compatible runs, status regressions and score drops beyond the
+selected tolerance are reported at run and case scope. The browser does not
+choose a baseline automatically or invent a universal regression score.
+
+The SDK, server, dashboard, JSON, HTML, and CLI share that same comparison
+projection. `compare_corpus_execution_results(...)` returns the immutable typed
+`CorpusExecutionComparison`; `corpus_execution_comparison_to_json(...)` and
+`render_corpus_execution_comparison_html(...)` render it without reading an
+application or recomputing eval assertions. An incompatible comparison contains
+only typed mismatch reasons and result summaries—never fabricated regressions.
+
+### Release acceptance: dashboard to local CI
+
+The repository's credential-free browser contract proves the complete
+promotion, save/download, durable launch/cancellation, result inspection,
+comparison, report, local rerun, and CI-exit journey against an installed Cayu
+package:
+
+```bash
+python examples/dashboard_behavior_live.py
+```
+
+Release-artifact CI runs that script with the built wheel's Python executable,
+with `PYTHONPATH` and provider credentials removed. Its local rerun deliberately
+uses a different application release ID and must still compare cleanly against
+the downloaded dashboard result.
+
+The focused real-application check exercises the same user journey with an
+actual OpenAI or Anthropic model. It promotes one completed session, adds an
+output-content assertion in the dashboard, saves the corpus, executes two
+durable dashboard runs, inspects and downloads the result, compares the runs,
+and runs the exported corpus once more through the local CLI as a CI gate:
+
+```bash
+# Four agent executions: source capture, two dashboard runs, and one local rerun.
+CAYU_PROVIDER=openai OPENAI_API_KEY=... \
+  uv run python examples/evals_release_acceptance_live.py
+
+CAYU_PROVIDER=anthropic ANTHROPIC_API_KEY=... \
+  uv run python examples/evals_release_acceptance_live.py
+```
+
+Model overrides use `CAYU_OPENAI_MODEL` or `CAYU_ANTHROPIC_MODEL`. The check is
+credential-gated and never falls back to a scripted provider; a missing or
+mismatched selected credential exits before application execution. Nightly
+verification exposes it as `evals-release-acceptance-live`.
 
 `ToolsCalledInOrder([...])` requires an exact sequence: reordered, missing, or
 additional calls fail. It reads model-requested `ToolCallPart` values in durable

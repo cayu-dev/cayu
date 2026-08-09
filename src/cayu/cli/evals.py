@@ -13,6 +13,7 @@ from cayu.cli._output import add_output_options
 from cayu.cli._targets import TargetResolutionError, load_target
 from cayu.cli.project import project_context, resolve_eval_project
 from cayu.evals import (
+    CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES,
     CorpusExecutionResult,
     CorpusTarget,
     EvalCorpusDocument,
@@ -20,16 +21,20 @@ from cayu.evals import (
     EvalRun,
     EvalStatus,
     EvalSuite,
+    compare_corpus_execution_results,
     compare_eval_runs,
     comparison_to_json,
+    corpus_execution_comparison_to_json,
     corpus_execution_result_to_json,
     eval_corpus_inspection_to_json,
     eval_run_to_json,
     inspect_eval_corpus,
+    load_corpus_execution_result,
     load_eval_corpus,
     load_eval_run,
     merge_eval_corpus_files,
     render_comparison_html,
+    render_corpus_execution_comparison_html,
     render_corpus_execution_html,
     render_html_report,
     run_eval_plan,
@@ -186,8 +191,8 @@ def run_eval_command(args: argparse.Namespace) -> int:
             )
         else:
             print(f"error: {exc}", file=sys.stderr)
-        return 1
-    return 1
+        return 2
+    return 2
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -224,7 +229,7 @@ async def _run(args: argparse.Namespace) -> int:
             _write_or_print(output, args.output)
             if args.html_output is not None:
                 Path(args.html_output).write_text(render_html_report(run), encoding="utf-8")
-            return 0 if run.status == EvalStatus.PASSED else 1
+            return _status_exit_code(run.status)
 
         if plan.corpus_target is None:
             raise ValueError("--corpus requires an EvalPlan configured with corpus_target.")
@@ -246,7 +251,7 @@ async def _run(args: argparse.Namespace) -> int:
                 render_corpus_execution_html(result),
                 encoding="utf-8",
             )
-        return 0 if result.run.status == "passed" else 1
+        return _status_exit_code(result.run.status)
 
 
 async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:
@@ -272,24 +277,101 @@ async def _load_eval_plan(target: str, *, label: str) -> EvalPlan:
 
 
 def _report(args: argparse.Namespace) -> int:
-    run = load_eval_run(args.input)
-    output = eval_run_to_json(run) if args.output_format == "json" else render_html_report(run)
+    result = _load_saved_eval_result(args.input)
+    if type(result) is CorpusExecutionResult:
+        output = (
+            corpus_execution_result_to_json(result)
+            if args.output_format == "json"
+            else render_corpus_execution_html(result)
+        )
+        _write_or_print(output, args.output)
+        return 0
+    if type(result) is not EvalRun:
+        raise TypeError("Unsupported eval result document type.")
+    output = (
+        eval_run_to_json(result) if args.output_format == "json" else render_html_report(result)
+    )
     _write_or_print(output, args.output)
     return 0
 
 
 def _compare(args: argparse.Namespace) -> int:
-    baseline = load_eval_run(args.baseline)
-    current = load_eval_run(args.current)
-    comparison = compare_eval_runs(baseline, current, score_tolerance=args.score_tolerance)
-    if args.output_format == "json":
-        output = comparison_to_json(comparison)
-    else:
-        output = render_comparison_html(comparison)
+    baseline = _load_saved_eval_result(args.baseline)
+    current = _load_saved_eval_result(args.current)
+    if type(baseline) is not type(current):
+        raise ValueError("Cannot compare direct EvalRun and corpus execution result documents.")
+    if type(baseline) is CorpusExecutionResult and type(current) is CorpusExecutionResult:
+        comparison = compare_corpus_execution_results(
+            baseline,
+            current,
+            score_tolerance=args.score_tolerance,
+        )
+        output = (
+            corpus_execution_comparison_to_json(comparison)
+            if args.output_format == "json"
+            else render_corpus_execution_comparison_html(comparison)
+        )
+        _write_or_print(output, args.output)
+        if not comparison.compatibility.comparable:
+            return 2
+        if _status_exit_code(comparison.baseline.status) == 2:
+            return 2
+        current_exit = _status_exit_code(comparison.current.status)
+        if current_exit == 2:
+            return 2
+        if current_exit == 1 or comparison.regressions:
+            return 1
+        return 0
+
+    if type(baseline) is not EvalRun or type(current) is not EvalRun:
+        raise TypeError("Unsupported eval result document type.")
+    comparison = compare_eval_runs(
+        baseline,
+        current,
+        score_tolerance=args.score_tolerance,
+    )
+    output = (
+        comparison_to_json(comparison)
+        if args.output_format == "json"
+        else render_comparison_html(comparison)
+    )
     _write_or_print(output, args.output)
-    if comparison.regressions or current.status != EvalStatus.PASSED:
+    if _status_exit_code(baseline.status) == 2:
+        return 2
+    current_exit = _status_exit_code(current.status)
+    if current_exit == 2:
+        return 2
+    if current_exit == 1 or comparison.regressions:
         return 1
     return 0
+
+
+def _status_exit_code(status: EvalStatus | str) -> int:
+    value = status.value if isinstance(status, EvalStatus) else status
+    if value == "passed":
+        return 0
+    if value == "failed":
+        return 1
+    return 2
+
+
+def _load_saved_eval_result(path: str) -> EvalRun | CorpusExecutionResult:
+    result_path = Path(path)
+    with result_path.open("rb") as handle:
+        raw = handle.read(CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES + 1)
+    if len(raw) > CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES:
+        raise ValueError(
+            f"Eval result JSON exceeds {CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES} bytes."
+        )
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("Eval result JSON must be UTF-8.") from exc
+    if not isinstance(document, dict):
+        raise ValueError("Eval result JSON must be an object.")
+    if document.get("schema_version") == 1 or {"target", "run"} <= set(document):
+        return load_corpus_execution_result(result_path)
+    return load_eval_run(result_path)
 
 
 def _validate_corpus(args: argparse.Namespace) -> int:

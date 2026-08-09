@@ -70,7 +70,7 @@ from cayu.evals.execution import (
     compile_corpus_suite,
     evaluation_target_identity,
 )
-from cayu.evals.execution_comparison import corpus_execution_compatibility
+from cayu.evals.execution_comparison import compare_corpus_execution_results
 from cayu.evals.execution_reporting import (
     corpus_execution_result_to_json,
     render_corpus_execution_html,
@@ -4379,15 +4379,15 @@ def create_router(
                 current_run, current = baseline_run, baseline
             else:
                 current_run, current = await _load_eval_result(body.current_run_id)
-            compatibility = await asyncio.to_thread(
-                corpus_execution_compatibility,
+            comparison = await asyncio.to_thread(
+                compare_corpus_execution_results,
                 baseline,
                 current,
             )
             response = EvalComparisonResponse(
                 baseline=baseline_run,
                 current=current_run,
-                compatibility=compatibility,
+                comparison=comparison,
             )
             return await _model_json_response(response, EvalComparisonResponse)
 

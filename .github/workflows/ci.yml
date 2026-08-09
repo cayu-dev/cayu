@@ -276,6 +276,11 @@ jobs:
       - run: .release-server-venv/bin/playwright install --with-deps chromium
       - name: Smoke-test protected cayu serve from the built wheel
         run: .release-server-venv/bin/python scripts/smoke_built_wheel_serve.py
+      - name: Verify the installed-wheel dashboard-to-local eval journey
+        run: |
+          unset PYTHONPATH CAYU_PROVIDER OPENAI_API_KEY ANTHROPIC_API_KEY GEMINI_API_KEY
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+          .release-server-venv/bin/python examples/dashboard_behavior_live.py
       - name: Verify editable dashboard source from installed release artifacts
         run: |
           uv venv --python 3.11 .release-sdist-venv

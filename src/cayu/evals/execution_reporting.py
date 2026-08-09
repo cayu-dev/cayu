@@ -17,9 +17,16 @@ from cayu.evals.execution import (
     CORPUS_EXECUTION_RESULT_SCHEMA_VERSION,
     CorpusExecutionResult,
 )
+from cayu.evals.execution_comparison import (
+    CorpusExecutionComparison,
+    CorpusExecutionRegression,
+    CorpusRegressionKind,
+)
 
 CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES = 48 << 20
 CORPUS_EXECUTION_RESULT_MAX_HTML_BYTES = 48 << 20
+CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES = 4 << 20
+CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES = 4 << 20
 
 
 def _validated_result(result: CorpusExecutionResult) -> CorpusExecutionResult:
@@ -47,6 +54,32 @@ def corpus_execution_result_to_json(result: CorpusExecutionResult) -> str:
             raise ValueError(
                 "Corpus execution result JSON exceeds "
                 f"{CORPUS_EXECUTION_RESULT_MAX_JSON_BYTES} bytes."
+            )
+        chunks.append(chunk)
+    return "".join(chunks) + "\n"
+
+
+def corpus_execution_comparison_to_json(comparison: CorpusExecutionComparison) -> str:
+    """Return bounded deterministic JSON for one contract-aware comparison."""
+
+    if type(comparison) is not CorpusExecutionComparison:
+        raise TypeError("comparison must be an exact CorpusExecutionComparison.")
+    validated = CorpusExecutionComparison.model_validate(
+        comparison.model_dump(mode="python", round_trip=True, warnings="none")
+    )
+    document = copy_durable_json_object(
+        validated.model_dump(mode="json"),
+        "corpus execution comparison",
+    )
+    encoder = json.JSONEncoder(ensure_ascii=False, indent=2, sort_keys=True)
+    chunks: list[str] = []
+    total_bytes = 1
+    for chunk in encoder.iterencode(document):
+        total_bytes += len(chunk.encode("utf-8"))
+        if total_bytes > CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES:
+            raise ValueError(
+                "Corpus execution comparison JSON exceeds "
+                f"{CORPUS_EXECUTION_COMPARISON_MAX_JSON_BYTES} bytes."
             )
         chunks.append(chunk)
     return "".join(chunks) + "\n"
@@ -214,6 +247,109 @@ def render_corpus_execution_html(result: CorpusExecutionResult) -> str:
     return rendered
 
 
+def render_corpus_execution_comparison_html(
+    comparison: CorpusExecutionComparison,
+) -> str:
+    """Render a standalone comparison exclusively from its bounded public graph."""
+
+    if type(comparison) is not CorpusExecutionComparison:
+        raise TypeError("comparison must be an exact CorpusExecutionComparison.")
+    comparison = CorpusExecutionComparison.model_validate(
+        comparison.model_dump(mode="python", round_trip=True, warnings="none")
+    )
+    compatibility = comparison.compatibility
+    if compatibility.comparable:
+        compatibility_text = "Compatible evaluation contracts"
+        compatibility_details = ""
+    else:
+        compatibility_text = "Incomparable evaluation contracts"
+        compatibility_details = (
+            "<ul>"
+            + "".join(
+                f"<li><code>{_escape(reason.value)}</code></li>" for reason in compatibility.reasons
+            )
+            + "</ul>"
+        )
+    regression_rows = "\n".join(
+        "<tr>"
+        f"<td>{_escape(regression.scope.value)}</td>"
+        f"<td>{_escape(regression.case_id or 'run')}</td>"
+        f"<td>{_escape(regression.kind.value)}</td>"
+        f"<td>{_escape(_regression_change(regression))}</td>"
+        "</tr>"
+        for regression in comparison.regressions
+    )
+    if not regression_rows:
+        message = (
+            "No compatible-result regressions."
+            if compatibility.comparable
+            else "Regressions are not evaluated for incomparable results."
+        )
+        regression_rows = f'<tr><td colspan="4">{message}</td></tr>'
+    case_rows = "\n".join(
+        "<tr>"
+        f"<td><code>{_escape(case.case_id)}</code></td>"
+        f"<td>{_badge(case.baseline_status)}</td>"
+        f"<td>{_badge(case.current_status)}</td>"
+        f"<td>{_score(case.baseline_score)} → {_score(case.current_score)}</td>"
+        "</tr>"
+        for case in comparison.cases
+    )
+    if not case_rows:
+        case_rows = (
+            '<tr><td colspan="4">Case outcomes are omitted for incomparable results.</td></tr>'
+        )
+    rendered = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cayu Eval Comparison</title>
+  <style>
+    :root {{ color-scheme:light; --ink:#18211d; --muted:#5d6864; --line:#d9dfdc; --paper:#fff; --canvas:#f7f7f4; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:var(--ink); background:var(--canvas); }}
+    .page {{ max-width:1120px; margin:auto; padding:32px 24px 56px; }}
+    h1 {{ margin:0 0 6px; font-size:2rem; }} h2 {{ margin:30px 0 12px; }} p {{ color:var(--muted); }} code {{ overflow-wrap:anywhere; }}
+    .notice,table {{ background:var(--paper); border:1px solid var(--line); border-radius:9px; }} .notice {{ padding:14px; }}
+    table {{ width:100%; border-collapse:collapse; overflow:hidden; }} th,td {{ padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
+    th {{ background:#f0f4f3; font-size:.78rem; text-transform:uppercase; letter-spacing:.04em; }} tr:last-child td {{ border-bottom:0; }}
+    .badge {{ display:inline-block; padding:3px 8px; border-radius:999px; font-size:.78rem; font-weight:700; }}
+    .passed {{ color:#0f5132; background:#d9f2e3; }} .failed {{ color:#842029; background:#f8d7da; }}
+    .unavailable {{ color:#553c00; background:#fff0b3; }} .error {{ color:#664d03; background:#fff3cd; }}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <h1>Cayu Eval Comparison</h1>
+    <p>Baseline <code>{_escape(comparison.baseline.result_revision)}</code> vs current <code>{_escape(comparison.current.result_revision)}</code></p>
+    <p>Score regression tolerance <code>{_escape(format(comparison.score_tolerance, ".15g"))}</code></p>
+    <section class="notice"><strong>{_escape(compatibility_text)}</strong>{compatibility_details}</section>
+    <h2>Outcome</h2>
+    <table>
+      <thead><tr><th>Result</th><th>Release</th><th>App manifest</th><th>Status</th><th>Score</th></tr></thead>
+      <tbody>
+        <tr><td>Baseline</td><td><code>{_escape(comparison.baseline.application_release_id)}</code></td><td><code>{_escape(comparison.baseline.app_manifest_fingerprint)}</code></td><td>{_badge(comparison.baseline.status)}</td><td>{_score(comparison.baseline.score)}</td></tr>
+        <tr><td>Current</td><td><code>{_escape(comparison.current.application_release_id)}</code></td><td><code>{_escape(comparison.current.app_manifest_fingerprint)}</code></td><td>{_badge(comparison.current.status)}</td><td>{_score(comparison.current.score)}</td></tr>
+      </tbody>
+    </table>
+    <h2>Regressions</h2>
+    <table><thead><tr><th>Scope</th><th>Case</th><th>Kind</th><th>Change</th></tr></thead><tbody>{regression_rows}</tbody></table>
+    <h2>Cases</h2>
+    <table><thead><tr><th>Case</th><th>Baseline</th><th>Current</th><th>Score</th></tr></thead><tbody>{case_rows}</tbody></table>
+  </main>
+</body>
+</html>
+"""
+    rendered = require_durable_text(rendered, "corpus execution comparison HTML report")
+    if len(rendered.encode("utf-8")) > CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES:
+        raise ValueError(
+            "Corpus execution comparison HTML exceeds "
+            f"{CORPUS_EXECUTION_COMPARISON_MAX_HTML_BYTES} bytes."
+        )
+    return rendered
+
+
 def write_corpus_execution_html(
     result: CorpusExecutionResult,
     path: str | Path,
@@ -286,6 +422,22 @@ def _badge(status: str) -> str:
 
 def _score(score: float | None) -> str:
     return "unavailable" if score is None else f"{score:.2f}"
+
+
+def _regression_change(regression: CorpusExecutionRegression) -> str:
+    if regression.kind is CorpusRegressionKind.STATUS:
+        baseline_status = regression.baseline_status
+        current_status = regression.current_status
+        if baseline_status is None or current_status is None:
+            raise ValueError("Status regression is missing its status pair.")
+        return f"{baseline_status} → {current_status}"
+    if regression.kind is CorpusRegressionKind.SCORE:
+        baseline_score = regression.baseline_score
+        current_score = regression.current_score
+        if baseline_score is None or current_score is None:
+            raise ValueError("Score regression is missing its score pair.")
+        return f"{baseline_score:.2f} → {current_score:.2f}"
+    raise ValueError(f"Unsupported regression kind {regression.kind!r}.")
 
 
 def _escape(value: Any) -> str:

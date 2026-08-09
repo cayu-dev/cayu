@@ -7,6 +7,8 @@ import json
 import os
 import re
 import socket
+import subprocess
+import sys
 import tempfile
 from collections.abc import AsyncIterator
 from decimal import Decimal
@@ -29,6 +31,7 @@ from cayu import (
     AlwaysRequireApprovalToolPolicy,
     CayuApp,
     CorpusTarget,
+    EvalPlan,
     Event,
     EventType,
     InMemoryTaskStore,
@@ -111,6 +114,14 @@ WORKFLOW_LINKED_TASK_COUNT = 26
 WORKFLOW_CHILD_TASK_PREFIX = "dashboard-workflow-child-task"
 WORKFLOW_CHILD_TASK_COUNT = 26
 EVIDENCE_PREFIX = "CAYU_NIGHTLY_EVIDENCE="
+_LIVE_CREDENTIAL_ENV = (
+    "ANTHROPIC_API_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+)
 
 ObserverAbort = tuple[str, str | None, str]
 
@@ -901,6 +912,27 @@ def _dashboard_price_book() -> PriceBook:
     )
 
 
+def build_release_acceptance_eval_plan() -> EvalPlan:
+    """Build the local side of the dashboard-to-CI installed-package proof."""
+
+    app = CayuApp(enable_logging=False)
+    app.register_provider(DashboardContractProvider(), default=True)
+    app.register_agent(
+        AgentSpec(name=AGENT_NAME, model=MODEL_NAME),
+        tools=[DashboardContractTool()],
+        tool_policy=AlwaysRequireApprovalToolPolicy(tools=["dashboard_contract_tool"]),
+    )
+    return EvalPlan(
+        corpus_target=CorpusTarget(
+            key="dashboard.regressions",
+            app=app,
+            request_base=RunRequest(agent_name=AGENT_NAME, messages=[]),
+            application_release_id="dashboard-local-ci-contract",
+            price_book=_dashboard_price_book(),
+        )
+    )
+
+
 async def _run_browser_contract(
     base_url: str,
     provider: DashboardContractProvider,
@@ -925,6 +957,7 @@ async def _run_browser_contract(
         "/api/resume",
         "/api/tool-approvals/resolve",
         f"/api/sessions/{INTERRUPT_SESSION_ID}/interrupt",
+        f"/api/sessions/{INTERRUPT_FAILURE_SESSION_ID}/interrupt",
         f"/api/sessions/{RESUME_INTERRUPT_SESSION_ID}/interrupt",
     }
     diagnostics_dir = Path(
@@ -1060,6 +1093,7 @@ async def _run_browser_contract(
             "eval_durable_launch_and_cancellation",
             "eval_result_inspection_and_reports",
             "eval_compatible_comparison",
+            "eval_local_rerun_and_ci",
             "session_annotation_editing",
             "event_detail",
             "event_filters",
@@ -1415,6 +1449,11 @@ async def _exercise_evaluation_promotion(
         f"{baseline_run_id}.eval-result.json",
         "the dashboard must preserve the server-owned eval JSON filename",
     )
+    json_result_path = await json_download.path()
+    require(
+        json_result_path is not None,
+        "the dashboard eval JSON download must produce a readable local file",
+    )
     async with page.expect_download() as html_download_info:
         await page.get_by_role("button", name="HTML", exact=True).click()
     html_download = await html_download_info.value
@@ -1434,6 +1473,11 @@ async def _exercise_evaluation_promotion(
     await page.get_by_label("Baseline run ID").fill(baseline_run_id)
     await page.get_by_role("button", name="Compare", exact=True).click()
     await expect(page.get_by_text("These runs are comparable.", exact=True)).to_be_visible()
+    await expect(page.get_by_text("No compatible-result regressions.", exact=True)).to_be_visible()
+    await _exercise_local_eval_acceptance(
+        corpus_path=Path(download_path),
+        dashboard_result_path=Path(json_result_path),
+    )
 
     await reopen_catalog()
     await page.get_by_role("button", name=suite_name, exact=True).click()
@@ -1517,6 +1561,111 @@ async def _exercise_evaluation_promotion(
     await expect(page).to_have_url(re.compile(r"/cayu/sessions$"))
 
 
+async def _exercise_local_eval_acceptance(
+    *,
+    corpus_path: Path,
+    dashboard_result_path: Path,
+) -> None:
+    """Prove that dashboard exports are the exact local reporting and CI inputs."""
+
+    application_root = Path(__file__).resolve().parent
+    environment = os.environ.copy()
+    environment.pop("CAYU_PROVIDER", None)
+    for name in _LIVE_CREDENTIAL_ENV:
+        environment.pop(name, None)
+
+    def run_command(arguments: list[str]) -> None:
+        completed = subprocess.run(
+            [sys.executable, "-m", "cayu", "eval", *arguments],
+            cwd=application_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise AssertionError(
+                "installed-package eval command failed "
+                f"with exit {completed.returncode}: {completed.stdout}{completed.stderr}"
+            )
+
+    with tempfile.TemporaryDirectory(prefix="cayu-evals-local-acceptance-") as temporary:
+        output_root = Path(temporary)
+        inspection_path = output_root / "corpus-inspection.json"
+        local_result_path = output_root / "local-result.json"
+        local_report_path = output_root / "local-report.html"
+        dashboard_report_path = output_root / "dashboard-report.html"
+        comparison_path = output_root / "comparison.json"
+        target = "dashboard_behavior_live:build_release_acceptance_eval_plan"
+
+        await asyncio.to_thread(run_command, ["validate", str(corpus_path)])
+        await asyncio.to_thread(
+            run_command,
+            ["inspect", str(corpus_path), "--json", "--output", str(inspection_path)],
+        )
+        await asyncio.to_thread(
+            run_command,
+            [
+                "run",
+                target,
+                "--corpus",
+                str(corpus_path),
+                "--output",
+                str(local_result_path),
+                "--html-output",
+                str(local_report_path),
+            ],
+        )
+        await asyncio.to_thread(
+            run_command,
+            [
+                "report",
+                str(dashboard_result_path),
+                "--output",
+                str(dashboard_report_path),
+            ],
+        )
+        await asyncio.to_thread(
+            run_command,
+            [
+                "compare",
+                str(dashboard_result_path),
+                str(local_result_path),
+                "--json",
+                "--output",
+                str(comparison_path),
+            ],
+        )
+
+        inspection = json.loads(inspection_path.read_text(encoding="utf-8"))
+        comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+        require_equal(
+            inspection["target_key"],
+            "dashboard.regressions",
+            "local corpus inspection must preserve the dashboard target contract",
+        )
+        require_equal(
+            comparison["compatibility"]["comparable"],
+            True,
+            "dashboard and local results must share one comparison contract",
+        )
+        require_equal(
+            comparison["regressions"],
+            [],
+            "the deterministic local rerun must pass its dashboard CI baseline",
+        )
+        require(
+            comparison["baseline"]["application_release_id"]
+            != comparison["current"]["application_release_id"],
+            "comparison acceptance must prove that release changes remain comparable",
+        )
+        require(
+            "Cayu Eval Report" in dashboard_report_path.read_text(encoding="utf-8"),
+            "the local CLI must render a downloaded dashboard result",
+        )
+
+
 async def _exercise_workflow(
     page: Page,
     base_url: str,
@@ -1558,6 +1707,31 @@ async def _exercise_workflow(
                     f"observed={observed_requests!r}"
                 )
             await asyncio.sleep(0.05)
+
+    async def wait_for_request_quiescence(
+        method: str,
+        path: str,
+        *,
+        quiet_seconds: float = 1.0,
+    ) -> int:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10
+        observed_count = request_count(method, path)
+        quiet_since = loop.time()
+        while True:
+            await asyncio.sleep(0.05)
+            current_count = request_count(method, path)
+            now = loop.time()
+            if current_count != observed_count:
+                observed_count = current_count
+                quiet_since = now
+            elif now - quiet_since >= quiet_seconds:
+                return current_count
+            if now >= deadline:
+                raise AssertionError(
+                    f"Timed out waiting for {method} {path} request quiescence; "
+                    f"observed={observed_requests!r}"
+                )
 
     page.on("request", record_workflow_request)
     try:
@@ -1832,6 +2006,7 @@ async def _exercise_workflow(
         )
         await wait_for_request_count("POST", topology_path, hidden_topology_count + 1)
         await wait_for_request_count("POST", "/api/usage/rollup", hidden_usage_count + 1)
+        pre_terminal_usage_count = request_count("POST", "/api/usage/rollup")
 
         await session_store.append_events(
             WORKFLOW_ACTIVE_SESSION_ID,
@@ -1854,9 +2029,15 @@ async def _exercise_workflow(
                 "Every loaded node is terminal, so routine refresh is stopped.",
             )
         ).to_be_visible(timeout=12_000)
-        await page.wait_for_load_state("networkidle")
         terminal_topology_count = request_count("POST", topology_path)
-        terminal_usage_count = request_count("POST", "/api/usage/rollup")
+        terminal_usage_count = await wait_for_request_quiescence(
+            "POST",
+            "/api/usage/rollup",
+        )
+        require(
+            terminal_usage_count > pre_terminal_usage_count,
+            "an active-to-terminal Workflow transition must reconcile usage once",
+        )
         await page.wait_for_timeout(5_500)
         require_equal(
             request_count("POST", topology_path),

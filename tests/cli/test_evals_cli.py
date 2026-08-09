@@ -246,7 +246,7 @@ def test_eval_run_does_not_climb_past_nearest_project_missing_default(
     )
     monkeypatch.chdir(nested)
 
-    assert main(["eval", "run"]) == 1
+    assert main(["eval", "run"]) == 2
 
     error = _captured_eval_error(capsys)
     assert str(project_pyproject) in error
@@ -281,7 +281,7 @@ def test_eval_run_does_not_climb_past_eval_target_only_project(
     )
     monkeypatch.chdir(nested)
 
-    assert main(["eval", "run"]) == 1
+    assert main(["eval", "run"]) == 2
 
     error = _captured_eval_error(capsys)
     assert str(project_pyproject) in error
@@ -299,7 +299,7 @@ def test_eval_run_reports_non_utf8_pyproject_path(
     pyproject.write_bytes(b"[tool.cayu]\nfactory = \xff\n")
     monkeypatch.chdir(tmp_path)
 
-    assert main(["eval", "run"]) == 1
+    assert main(["eval", "run"]) == 2
 
     error = _captured_eval_error(capsys)
     assert f"Could not read {pyproject}" in error
@@ -314,7 +314,7 @@ def test_eval_run_reports_missing_or_malformed_configured_target(
     pyproject = tmp_path / "pyproject.toml"
     monkeypatch.chdir(tmp_path)
 
-    assert main(["eval", "run"]) == 1
+    assert main(["eval", "run"]) == 2
     missing_project_error = _captured_eval_error(capsys)
     assert "No Cayu project found" in missing_project_error
     assert '[tool.cayu] factory = "module:build_app"' in missing_project_error
@@ -327,7 +327,7 @@ def test_eval_run_reports_missing_or_malformed_configured_target(
             eval_declaration=declaration,
         )
 
-        assert main(["eval", "run"]) == 1
+        assert main(["eval", "run"]) == 2
         error = _captured_eval_error(capsys)
         assert str(pyproject) in error
         assert "[tool.cayu].eval_target must be a non-empty string" in error
@@ -349,7 +349,7 @@ def test_eval_run_timeout_returns_nonzero_and_saves_actionable_error(tmp_path: P
     )
 
     report = load_eval_run(output)
-    assert exit_code == 1
+    assert exit_code == 2
     assert report.status == EvalStatus.ERROR
     assert report.cases[0].status == EvalStatus.ERROR
     assert report.cases[0].error == "Eval case timed out after 0.01 seconds."
@@ -385,7 +385,7 @@ def build():
     monkeypatch.chdir(first_project)
     sys.modules.pop(module_name, None)
 
-    assert main(["eval", "run", f"{module_name}:build"]) == 1
+    assert main(["eval", "run", f"{module_name}:build"]) == 2
     assert "Eval target must return EvalPlan" in _captured_eval_error(capsys)
     assert (first_project / "build-count.txt").read_text(encoding="utf-8") == "1"
     assert module_name not in sys.modules
@@ -393,7 +393,7 @@ def build():
 
     sys.modules.pop(module_name, None)
     monkeypatch.chdir(second_project)
-    assert main(["eval", "run", f"{module_name}:build"]) == 1
+    assert main(["eval", "run", f"{module_name}:build"]) == 2
     error = _captured_eval_error(capsys)
     assert "Command-line eval target could not be loaded" in error
     assert f"No module named '{module_name}'" in error
@@ -443,7 +443,7 @@ def build():
     monkeypatch.chdir(project)
     sys.modules.pop(module_name, None)
 
-    assert main(["eval", "run", f"{module_name}:build"]) == 1
+    assert main(["eval", "run", f"{module_name}:build"]) == 2
     assert "Eval target must return EvalPlan" in _captured_eval_error(capsys)
     loaded = json.loads((project / "import-state.json").read_text(encoding="utf-8"))
     assert loaded["source"] == "local"
@@ -463,16 +463,16 @@ def test_eval_run_reports_clear_target_resolution_errors(
     monkeypatch.chdir(tmp_path)
     sys.modules.pop(module_name, None)
 
-    assert main(["eval", "run", "not-a-target"]) == 1
+    assert main(["eval", "run", "not-a-target"]) == 2
     syntax_error = _captured_eval_error(capsys)
     assert "Command-line eval target must use module:attribute syntax" in syntax_error
 
-    assert main(["eval", "run", "missing_repo_local_eval:build"]) == 1
+    assert main(["eval", "run", "missing_repo_local_eval:build"]) == 2
     missing_error = _captured_eval_error(capsys)
     assert "Command-line eval target could not be loaded" in missing_error
     assert "No module named 'missing_repo_local_eval'" in missing_error
 
-    assert main(["eval", "run", f"{module_name}:missing"]) == 1
+    assert main(["eval", "run", f"{module_name}:missing"]) == 2
     attribute_error = _captured_eval_error(capsys)
     assert "Command-line eval target could not be loaded" in attribute_error
     assert "has no attribute 'missing'" in attribute_error
@@ -489,7 +489,7 @@ def test_eval_run_configured_target_errors_identify_pyproject_source(
     )
     monkeypatch.chdir(tmp_path)
 
-    assert main(["eval", "run"]) == 1
+    assert main(["eval", "run"]) == 2
 
     syntax_error = _captured_eval_error(capsys)
     assert f"Configured eval target from {pyproject}" in syntax_error
@@ -499,7 +499,7 @@ def test_eval_run_configured_target_errors_identify_pyproject_source(
         tmp_path,
         eval_declaration='eval_target = "missing_configured_eval:build"',
     )
-    assert main(["eval", "run"]) == 1
+    assert main(["eval", "run"]) == 2
 
     error = _captured_eval_error(capsys)
     assert f"Configured eval target from {pyproject}" in error
@@ -515,7 +515,7 @@ def test_eval_run_configured_target_errors_identify_pyproject_source(
     )
     sys.modules.pop("invalid_configured_eval", None)
 
-    assert main(["eval", "run"]) == 1
+    assert main(["eval", "run"]) == 2
 
     invalid_error = _captured_eval_error(capsys)
     assert f"Configured eval target from {pyproject}" in invalid_error

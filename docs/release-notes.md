@@ -10,7 +10,7 @@ the final release should differ only in version and release metadata.
 Pin the complete application to `cayu==0.1.0rc5`, refresh its lockfile, and run
 its own tests. Upgrade independently deployed Cayu servers, dashboards, and
 generated clients together: the server contract advances from version 4 to
-version 8, and the public application manifest and generator plan advance to
+version 9, and the public application manifest and generator plan advance to
 schema version 7.
 
 The storage schema advances from revision 23 to revision 33. Revision 26 is a
@@ -45,6 +45,13 @@ deployments must use one consistent public-authority alias keyring.
   cancel durable runs, inspect every trial/assertion with output, usage, cost,
   duration, completeness, and safe diagnostics, compare compatible results,
   and download canonical corpus plus JSON/HTML reports.
+- Portable-result comparison now produces one typed regression projection for
+  the SDK, authenticated API, dashboard, CLI, JSON, and HTML. Different target
+  releases and AppManifest fingerprints remain comparable when the corpus,
+  cases, assertions, evidence policy, and applicable pricing contract are
+  unchanged. CLI exits are frozen as `0` for pass/no regression, `1` for an
+  evaluated failure/regression, and `2` for invalid, unavailable, incomparable,
+  configuration, or execution outcomes.
 - `cayu serve` and `cayu worker` provide stable entrypoints for configured
   projects, while bounded topology, workflow, usage, and event projections
   support control-plane inspection without exposing private authority.
@@ -215,6 +222,17 @@ session ID, provider payload, exception text, credential, or executable target
 state. AppManifest changes during execution reject publication. Typed
 compatibility checks require an equal evaluation contract while intentionally
 allowing different target releases and manifests.
+
+`compare_corpus_execution_results(...)` now returns the complete immutable
+comparison graph: typed compatibility reasons, bounded baseline/current
+summaries, per-case deltas, and canonical status/score regressions. Deterministic
+JSON and standalone HTML render that same graph. Incomparable results never
+manufacture regression rows. `cayu eval report` and `cayu eval compare`
+auto-detect direct and corpus result documents, and corpus-mode CI distinguishes
+evaluated failure (`1`) from an unavailable decision (`2`). Release CI executes
+the complete hermetic dashboard-to-local journey from the built wheel, while
+`examples/evals_release_acceptance_live.py` provides the credential-gated
+OpenAI/Anthropic application proof.
 
 The CLI also provides `cayu eval validate`, `cayu eval inspect`, and atomic
 `cayu eval merge`. Equal definitions deduplicate; a same-ID content conflict

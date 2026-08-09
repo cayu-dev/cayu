@@ -875,6 +875,23 @@ CHECKS: tuple[VerificationCheck, ...] = (
         requires_structured_evidence=True,
     ),
     VerificationCheck(
+        id="evals-release-acceptance-live",
+        capability="real-provider dashboard-to-local eval release acceptance",
+        lane="dashboard-live",
+        command=("uv", "run", "python", "examples/evals_release_acceptance_live.py"),
+        status_on_success=STATUS_VERIFIED,
+        prerequisites=(
+            "OPENAI_API_KEY or ANTHROPIC_API_KEY",
+            "Playwright Chromium",
+            "Cayu server and browser extras",
+        ),
+        required_any_env=(("OPENAI_API_KEY", "ANTHROPIC_API_KEY"),),
+        required_modules=("playwright", "fastapi", "uvicorn"),
+        requires_provider_api_key=True,
+        requires_playwright_chromium=True,
+        requires_structured_evidence=True,
+    ),
+    VerificationCheck(
         id="sigkill-recovery",
         capability="crash recovery across a real process boundary",
         lane="recovery",
@@ -1126,7 +1143,7 @@ def _run_check(
         outcome = _run_subprocess(check.command, effective_env, timeout_s=check.timeout_s)
     else:
         outcome = runner(check.command, effective_env)
-    evidence = {
+    evidence: dict[str, Any] = {
         "returncode": outcome.returncode,
         **_pytest_counts(outcome.stdout + "\n" + outcome.stderr),
     }

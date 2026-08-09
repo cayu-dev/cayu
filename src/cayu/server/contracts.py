@@ -34,7 +34,7 @@ from cayu.evals.execution import (
     CORPUS_EXECUTION_MAX_CONCURRENCY,
     CorpusExecutionResult,
 )
-from cayu.evals.execution_comparison import CorpusComparisonCompatibility
+from cayu.evals.execution_comparison import CorpusExecutionComparison
 from cayu.evals.promotion import (
     PROMOTION_CANDIDATE_MAX_BYTES,
     CapturedRunScoreV1,
@@ -866,7 +866,7 @@ class EvalComparisonRequest(ApiBaseModel):
 class EvalComparisonResponse(ApiBaseModel):
     baseline: EvalRunRecord
     current: EvalRunRecord
-    compatibility: CorpusComparisonCompatibility
+    comparison: CorpusExecutionComparison
 
     @model_validator(mode="after")
     def validate_terminal_runs(self) -> EvalComparisonResponse:
@@ -874,6 +874,22 @@ class EvalComparisonResponse(ApiBaseModel):
             raise ValueError("Eval comparison baseline must have a completed result.")
         if self.current.status is not EvalRunStatus.COMPLETED:
             raise ValueError("Eval comparison current run must have a completed result.")
+        baseline_summary = self.baseline.result
+        current_summary = self.current.result
+        if baseline_summary is None or current_summary is None:
+            raise ValueError("Eval comparison runs must retain result summaries.")
+        if (
+            self.comparison.baseline.result_revision != baseline_summary.revision
+            or self.comparison.baseline.status != baseline_summary.status
+            or self.comparison.baseline.score != baseline_summary.score
+        ):
+            raise ValueError("Eval comparison baseline does not match its run record.")
+        if (
+            self.comparison.current.result_revision != current_summary.revision
+            or self.comparison.current.status != current_summary.status
+            or self.comparison.current.score != current_summary.score
+        ):
+            raise ValueError("Eval comparison current result does not match its run record.")
         return self
 
 

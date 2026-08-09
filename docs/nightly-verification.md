@@ -44,6 +44,7 @@ list the check IDs:
 uv run python scripts/nightly_verification.py --list
 uv run python scripts/nightly_verification.py --check core-pytest --strict
 uv run python scripts/nightly_verification.py --check internal-evals-hermetic --strict
+uv run python scripts/nightly_verification.py --check evals-release-acceptance-live --strict
 uv run python scripts/nightly_verification.py --check console-pty --strict
 uv run python scripts/nightly_verification.py --check sigkill-recovery --strict
 uv run python scripts/nightly_verification.py --check docker-runner --strict
@@ -108,6 +109,7 @@ or in CI.
 | OpenAI embeddings | `OPENAI_API_KEY` | provider-dependent | `knowledge-embedding-live` |
 | Advanced runtime examples | `ANTHROPIC_API_KEY` for prompt-cache compaction; `GEMINI_API_KEY` for the other primary checks; `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for portability checks | provider-dependent | `advanced-prompt-cache-compaction`, `advanced-research-council`, `advanced-counterfactual-approval`, `advanced-repo-tournament`, `advanced-tainted-incident`, plus provider-suffixed portability checks |
 | Dashboard browser | `cayu[browser]` and installed Chromium | $0 | `dashboard-behavior` |
+| Real-provider eval release acceptance | `cayu[server,browser]`, installed Chromium, and the selected OpenAI or Anthropic key | four agent executions, plus provider-level retries | `evals-release-acceptance-live` |
 
 The CI workflow requires the disposable Postgres tier, Docker runner checks, and
 Docker virtual-egress checks as part of its Python 3.14 suite. It also runs

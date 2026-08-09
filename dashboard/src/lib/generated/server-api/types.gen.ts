@@ -2291,6 +2291,34 @@ export type ControlPlaneSurfaceCapabilities = {
 };
 
 /**
+ * CorpusCaseComparison
+ *
+ * Aggregate outcomes for one case in two contract-compatible results.
+ */
+export type CorpusCaseComparison = {
+    /**
+     * Baseline Score
+     */
+    baseline_score?: number | null;
+    /**
+     * Baseline Status
+     */
+    baseline_status: 'passed' | 'failed' | 'unavailable' | 'error';
+    /**
+     * Case Id
+     */
+    case_id: string;
+    /**
+     * Current Score
+     */
+    current_score?: number | null;
+    /**
+     * Current Status
+     */
+    current_status: 'passed' | 'failed' | 'unavailable' | 'error';
+};
+
+/**
  * CorpusComparisonCompatibility
  *
  * Typed precondition result for later regression comparison and UI adapters.
@@ -2326,6 +2354,91 @@ export type CorpusComparisonCompatibility = {
 export type CorpusComparisonReason = 'target_key_mismatch' | 'corpus_revision_mismatch' | 'suite_id_mismatch' | 'suite_revision_mismatch' | 'evidence_policy_revision_mismatch' | 'pricing_profile_fingerprint_mismatch' | 'case_contract_mismatch' | 'assertion_contract_mismatch';
 
 /**
+ * CorpusComparisonResultSummary
+ *
+ * Bounded public identity and aggregate outcome for one compared result.
+ */
+export type CorpusComparisonResultSummary = {
+    /**
+     * App Manifest Fingerprint
+     */
+    app_manifest_fingerprint: string;
+    /**
+     * Application Release Id
+     */
+    application_release_id: string;
+    /**
+     * Result Revision
+     */
+    result_revision: string;
+    /**
+     * Score
+     */
+    score?: number | null;
+    /**
+     * Status
+     */
+    status: 'passed' | 'failed' | 'unavailable' | 'error';
+};
+
+/**
+ * CorpusExecutionComparison
+ *
+ * Deterministic contract-aware comparison of two published corpus executions.
+ */
+export type CorpusExecutionComparison = {
+    baseline: CorpusComparisonResultSummary;
+    /**
+     * Cases
+     */
+    cases?: Array<CorpusCaseComparison>;
+    compatibility: CorpusComparisonCompatibility;
+    current: CorpusComparisonResultSummary;
+    /**
+     * Regressions
+     */
+    regressions?: Array<CorpusExecutionRegression>;
+    /**
+     * Schema Version
+     */
+    schema_version?: 1;
+    /**
+     * Score Tolerance
+     */
+    score_tolerance?: number;
+};
+
+/**
+ * CorpusExecutionRegression
+ *
+ * One typed regression derived from compatible published aggregates.
+ */
+export type CorpusExecutionRegression = {
+    /**
+     * Baseline Score
+     */
+    baseline_score?: number | null;
+    /**
+     * Baseline Status
+     */
+    baseline_status?: 'passed' | 'failed' | 'unavailable' | 'error' | null;
+    /**
+     * Case Id
+     */
+    case_id?: string | null;
+    /**
+     * Current Score
+     */
+    current_score?: number | null;
+    /**
+     * Current Status
+     */
+    current_status?: 'passed' | 'failed' | 'unavailable' | 'error' | null;
+    kind: CorpusRegressionKind;
+    scope: CorpusRegressionScope;
+};
+
+/**
  * CorpusExecutionResult
  *
  * Safe published run plus the fresh target identity used to produce it.
@@ -2342,6 +2455,20 @@ export type CorpusExecutionResult = {
     schema_version?: 1;
     target: EvaluationTargetIdentity;
 };
+
+/**
+ * CorpusRegressionKind
+ *
+ * Stable dimension on which one compatible result regressed.
+ */
+export type CorpusRegressionKind = 'status' | 'score';
+
+/**
+ * CorpusRegressionScope
+ *
+ * Stable location of one compatible-result regression.
+ */
+export type CorpusRegressionScope = 'run' | 'case';
 
 /**
  * CorpusUserMessageSpec
@@ -2650,7 +2777,7 @@ export type EvalCaseSpec = {
  */
 export type EvalComparisonResponse = {
     baseline: EvalRunRecord;
-    compatibility: CorpusComparisonCompatibility;
+    comparison: CorpusExecutionComparison;
     current: EvalRunRecord;
 };
 
