@@ -89,6 +89,8 @@ guard.
 
 ## Unreleased
 
+## v0.2.0.dev0
+
 ### Upgrade from v0.1.0
 
 The storage schema advances from revision 29 to revision 33. Revision 30 is an
