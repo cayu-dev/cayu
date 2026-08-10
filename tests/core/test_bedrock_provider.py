@@ -728,6 +728,33 @@ def test_bedrock_provider_preserves_typed_aws_error_fields() -> None:
     assert events[0].payload["retry_after_s"] == 2.5
 
 
+@pytest.mark.parametrize("retry_after", ["NaN", "Infinity", "-Infinity"])
+def test_bedrock_provider_drops_non_finite_retry_after(retry_after: str) -> None:
+    provider = BedrockProvider(
+        client=FailingBedrockClient(
+            FakeClientError(
+                code="ThrottlingException",
+                message="slow down",
+                status=429,
+                request_id="123e4567-e89b-42d3-a456-426614174001",
+                retry_after=retry_after,
+            )
+        )
+    )
+
+    events = collect(
+        provider,
+        ModelRequest(model="anthropic.claude-test", messages=[Message.text("user", "Hello")]),
+    )
+
+    assert len(events) == 1
+    assert events[0].type == ModelStreamEventType.ERROR
+    assert events[0].payload["provider"] == "bedrock"
+    assert events[0].payload["status_code"] == 429
+    assert events[0].payload["retryable"] is True
+    assert "retry_after_s" not in events[0].payload
+
+
 def test_bedrock_provider_propagates_context_overflow_for_runtime_recovery() -> None:
     provider = BedrockProvider(
         client=FailingBedrockClient(

@@ -5,6 +5,7 @@ import base64
 import contextlib
 import importlib
 import json
+import math
 import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -1182,7 +1183,7 @@ def _bedrock_error_from_exception(exc: Exception) -> Exception:
         if isinstance(raw_retry_after, str):
             with contextlib.suppress(ValueError):
                 parsed_retry_after = float(raw_retry_after)
-                if parsed_retry_after >= 0:
+                if math.isfinite(parsed_retry_after) and parsed_retry_after >= 0:
                     retry_after_s = parsed_retry_after
     if type(status) is not int:
         status = None

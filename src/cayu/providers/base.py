@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from enum import StrEnum
@@ -192,9 +193,14 @@ class ModelProviderError(RuntimeError):
             raise ValueError("retryable must be a boolean.")
         self.retryable = retryable
         if retry_after_s is not None:
-            if type(retry_after_s) not in {int, float} or retry_after_s < 0:
-                raise ValueError("retry_after_s must be a non-negative number.")
-            retry_after_s = float(retry_after_s)
+            if type(retry_after_s) not in {int, float}:
+                raise ValueError("retry_after_s must be a finite non-negative number.")
+            try:
+                retry_after_s = float(retry_after_s)
+            except OverflowError:
+                raise ValueError("retry_after_s must be a finite non-negative number.") from None
+            if not math.isfinite(retry_after_s) or retry_after_s < 0:
+                raise ValueError("retry_after_s must be a finite non-negative number.")
         self.retry_after_s = retry_after_s
         self.response_body = response_body
 

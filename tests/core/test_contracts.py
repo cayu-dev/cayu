@@ -1592,15 +1592,40 @@ def test_model_provider_error_carries_typed_classification_fields():
     assert unclassified.error_payload_fields() == {"provider": "anthropic"}
 
 
-def test_model_provider_error_rejects_invalid_classification_fields():
+def test_model_provider_error_rejects_invalid_retryable() -> None:
     with pytest.raises(ValueError, match="retryable must be a boolean"):
         ModelProviderError("boom", provider="p", retryable="yes")  # type: ignore[arg-type]
 
-    with pytest.raises(ValueError, match="retry_after_s must be a non-negative number"):
-        ModelProviderError("boom", provider="p", retry_after_s=-1.0)
 
-    with pytest.raises(ValueError, match="retry_after_s must be a non-negative number"):
-        ModelProviderError("boom", provider="p", retry_after_s=True)  # type: ignore[arg-type]
+@pytest.mark.parametrize(
+    ("retry_after_s", "expected"),
+    [(0, 0.0), (2, 2.0), (2.5, 2.5)],
+)
+def test_model_provider_error_accepts_finite_nonnegative_retry_after(
+    retry_after_s: int | float,
+    expected: float,
+) -> None:
+    error = ModelProviderError("boom", provider="p", retry_after_s=retry_after_s)
+
+    assert error.retry_after_s == expected
+    assert type(error.retry_after_s) is float
+    assert error.error_payload_fields()["retry_after_s"] == expected
+
+
+@pytest.mark.parametrize(
+    "retry_after_s",
+    [True, -1, -1.0, math.nan, math.inf, -math.inf, 10**1000, "1"],
+)
+def test_model_provider_error_rejects_invalid_retry_after(retry_after_s: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^retry_after_s must be a finite non-negative number\.$",
+    ):
+        ModelProviderError(
+            "boom",
+            provider="p",
+            retry_after_s=retry_after_s,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.parametrize("status_code", [None, 100, 599])
@@ -1647,6 +1672,25 @@ def test_model_provider_error_reconstruction_drops_invalid_http_status_code() ->
 
     assert isinstance(error, ModelProviderError)
     assert error.status_code is None
+    assert error.error_payload_fields() == {"provider": "p"}
+
+
+@pytest.mark.parametrize("retry_after_s", [math.nan, math.inf, -math.inf, 10**1000])
+def test_model_provider_error_reconstruction_drops_invalid_retry_after(
+    retry_after_s: int | float,
+) -> None:
+    error = model_provider_error_from_payload(
+        {
+            "error": "provider failed",
+            "error_type": "ModelProviderError",
+            "provider": "p",
+            "retry_after_s": retry_after_s,
+        },
+        fallback_provider="fallback",
+    )
+
+    assert isinstance(error, ModelProviderError)
+    assert error.retry_after_s is None
     assert error.error_payload_fields() == {"provider": "p"}
 
 
@@ -1985,14 +2029,33 @@ def test_retry_policy_uses_retry_after_below_max_delay_verbatim():
     assert decision.delay_seconds == 7.0
 
 
-def test_retry_policy_rejects_negative_retry_after():
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize(
+    "retry_after_s",
+    [True, -1, -1.0, math.nan, math.inf, -math.inf, 10**1000, "1"],
+)
+def test_retry_policy_rejects_invalid_retry_after(retry_after_s: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^retry_after_s must be a finite non-negative number\.$",
+    ):
         retry_decision(
             policy=RetryPolicy(max_attempts=2),
             attempt=1,
             error="HTTP 503",
-            retry_after_s=-1.0,
+            retry_after_s=retry_after_s,  # type: ignore[arg-type]
         )
+
+
+def test_retry_policy_accepts_integer_zero_retry_after() -> None:
+    decision = retry_decision(
+        policy=RetryPolicy(max_attempts=2),
+        attempt=1,
+        error="HTTP 503",
+        retry_after_s=0,
+    )
+
+    assert decision.retry is True
+    assert decision.delay_seconds == 0.0
 
 
 def test_retry_policy_jitter_does_not_exceed_max_delay():

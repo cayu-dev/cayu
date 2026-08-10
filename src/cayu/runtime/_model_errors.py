@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -618,4 +619,10 @@ def _payload_retryable(value: Any) -> bool | None:
 
 
 def _payload_retry_after_s(value: Any) -> float | None:
-    return float(value) if type(value) in {int, float} and value >= 0 else None
+    if type(value) not in {int, float}:
+        return None
+    try:
+        normalized = float(value)
+    except OverflowError:
+        return None
+    return normalized if math.isfinite(normalized) and normalized >= 0 else None
