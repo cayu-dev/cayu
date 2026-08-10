@@ -13,7 +13,7 @@ from cayu._validation import (
     durable_json_object_from_pairs,
     parse_durable_json_integer_literal,
     reject_nonportable_json_constant,
-    require_clean_nonblank,
+    require_durable_clean_nonblank,
     require_durable_text,
 )
 from cayu.evals.models import (
@@ -64,7 +64,14 @@ class EvalCaseComparison(BaseModel):
     @field_validator("case_id")
     @classmethod
     def validate_case_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("regressions")
+    @classmethod
+    def validate_regressions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            require_durable_text(item, f"regressions[{index}]") for index, item in enumerate(value)
+        )
 
 
 class EvalRunComparison(BaseModel):
@@ -84,7 +91,14 @@ class EvalRunComparison(BaseModel):
     @field_validator("baseline_run_id", "current_run_id", "baseline_suite_id", "current_suite_id")
     @classmethod
     def validate_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("regressions")
+    @classmethod
+    def validate_regressions(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(
+            require_durable_text(item, f"regressions[{index}]") for index, item in enumerate(value)
+        )
 
     @field_validator("cases", mode="before")
     @classmethod

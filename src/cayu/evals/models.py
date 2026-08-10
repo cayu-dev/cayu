@@ -220,7 +220,7 @@ class EvalAssertionResult(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("assertion_revision")
     @classmethod

@@ -650,6 +650,93 @@ class TinyWorkflow(WorkflowBase):
         yield await ctx.completed()
 
 
+@pytest.mark.parametrize("invalid_name", ["bad\x00name", "bad\ud800name"])
+@pytest.mark.parametrize("bypass", ["model_copy", "mutation"])
+def test_workflow_base_revalidates_spec_before_journal_factory(
+    invalid_name: str,
+    bypass: str,
+):
+    spec = WorkflowSpec(name="valid")
+    if bypass == "model_copy":
+        spec = spec.model_copy(update={"name": invalid_name})
+    else:
+        spec.name = invalid_name
+    factory_calls: list[WorkflowJournalContext] = []
+
+    def journal_factory(context: WorkflowJournalContext) -> WorkflowJournal:
+        factory_calls.append(context)
+        return MemoryJournal()
+
+    with pytest.raises(ValueError):
+        workflow = TinyWorkflow(
+            CayuApp(enable_logging=False),
+            spec=spec,
+            journal_factory=journal_factory,
+        )
+        workflow.context("wf-invalid-spec")
+
+    assert factory_calls == []
+
+
+@pytest.mark.parametrize("invalid_name", ["bad\x00name", "bad\ud800name"])
+def test_workflow_context_revalidates_direct_spec(invalid_name: str):
+    spec = WorkflowSpec(name="valid").model_copy(update={"name": invalid_name})
+
+    with pytest.raises(ValueError):
+        WorkflowContext(
+            app=CayuApp(enable_logging=False),
+            spec=spec,
+            session_id="wf-invalid-context",
+            journal=MemoryJournal(),
+        )
+
+
+@pytest.mark.parametrize("invalid_name", ["bad\x00name", "bad\ud800name"])
+def test_workflow_context_revalidates_owned_spec_before_journal_factory(
+    invalid_name: str,
+):
+    factory_calls: list[WorkflowJournalContext] = []
+
+    def journal_factory(context: WorkflowJournalContext) -> WorkflowJournal:
+        factory_calls.append(context)
+        return MemoryJournal()
+
+    workflow = TinyWorkflow(
+        CayuApp(enable_logging=False),
+        spec=WorkflowSpec(name="valid"),
+        journal_factory=journal_factory,
+    )
+    workflow.spec.name = invalid_name
+
+    with pytest.raises(ValueError):
+        workflow.context("wf-mutated-owned-spec")
+
+    assert factory_calls == []
+
+
+def test_workflow_context_uses_detached_stable_unicode_name_snapshot():
+    workflow_name = "Zażółć_日本語_😀"
+    source_spec = WorkflowSpec(name=workflow_name)
+    factory_contexts: list[WorkflowJournalContext] = []
+
+    def journal_factory(context: WorkflowJournalContext) -> WorkflowJournal:
+        factory_contexts.append(context)
+        return MemoryJournal()
+
+    workflow = TinyWorkflow(
+        CayuApp(enable_logging=False),
+        spec=source_spec,
+        journal_factory=journal_factory,
+    )
+    source_spec.name = "caller\x00mutation"
+    context = workflow.context("wf-unicode-spec")
+    context.spec.name = "context\x00mutation"
+
+    assert factory_contexts[0].workflow_name == workflow_name
+    assert context.workflow_name == workflow_name
+    assert context.event(EventType.WORKFLOW_STARTED).workflow_name == workflow_name
+
+
 def test_workflow_anchor_is_recovery_safe():
     app = CayuApp(enable_logging=False)
     asyncio.run(_drain(TinyWorkflow(app), "wf-anchor"))

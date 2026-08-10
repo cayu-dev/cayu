@@ -7,7 +7,11 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from cayu._validation import copy_durable_json_object, require_clean_nonblank
+from cayu._validation import (
+    copy_durable_json_object,
+    require_durable_clean_nonblank,
+    require_durable_text,
+)
 from cayu.core.events import Event
 from cayu.core.messages import Message
 from cayu.core.thinking import ThinkingConfig
@@ -64,20 +68,27 @@ class AgentSpec(BaseModel):
     @field_validator("name", "model")
     @classmethod
     def validate_nonblank_fields(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("provider_name")
     @classmethod
     def validate_optional_provider_name(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("system_prompt")
+    @classmethod
+    def validate_optional_system_prompt(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        return require_durable_text(value, info.field_name)
 
     @field_validator("workflow_tool_names")
     @classmethod
     def validate_workflow_tool_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         validated = tuple(
-            require_clean_nonblank(name, f"workflow_tool_names[{index}]")
+            require_durable_clean_nonblank(name, f"workflow_tool_names[{index}]")
             for index, name in enumerate(value)
         )
         if len(validated) != len(set(validated)):

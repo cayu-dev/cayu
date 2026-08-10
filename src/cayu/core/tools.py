@@ -578,7 +578,7 @@ class ToolContext(BaseModel):
     @field_validator("session_id")
     @classmethod
     def validate_nonblank_session_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator(
         "agent_name",
@@ -596,7 +596,7 @@ class ToolContext(BaseModel):
     ) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("mcp_servers", mode="before")
     @classmethod

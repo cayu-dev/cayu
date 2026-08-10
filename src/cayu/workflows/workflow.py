@@ -24,7 +24,7 @@ from cayu._validation import (
 from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
 from cayu.core.messages import Message, MessageRole, TextPart, ToolCallPart
 from cayu.core.thinking import ThinkingConfig
-from cayu.core.workflows import Workflow, WorkflowSpec
+from cayu.core.workflows import Workflow, WorkflowSpec, copy_workflow_spec
 from cayu.runtime import (
     BudgetLimit,
     CayuApp,
@@ -223,7 +223,8 @@ class WorkflowContext:
         journal: WorkflowJournal,
     ) -> None:
         self.app = app
-        self.spec = spec
+        self.spec = copy_workflow_spec(spec)
+        self._workflow_name = self.spec.name
         self.session_id = require_clean_nonblank(session_id, "session_id")
         self.journal = journal
         self.attempt_id = uuid4().hex
@@ -238,7 +239,7 @@ class WorkflowContext:
 
     @property
     def workflow_name(self) -> str:
-        return self.spec.name
+        return self._workflow_name
 
     def next_gated_loop_name(self) -> str:
         """Return the one safe automatic loop namespace.
@@ -412,26 +413,27 @@ class WorkflowBase(Workflow):
                 "or pass `spec=` to the constructor."
             )
         self.app = app
-        self.spec = resolved_spec
+        self.spec = copy_workflow_spec(resolved_spec)
         self._journal_factory = journal_factory or _default_journal_factory
 
     def context(self, session_id: str) -> WorkflowContext:
         """Build the per-run context (and its journal) for one workflow run."""
         session_id = require_clean_nonblank(session_id, "session_id")
+        context_spec = copy_workflow_spec(self.spec)
         journal_context = WorkflowJournalContext(
             session_store=self.app.session_store,
             session_id=session_id,
-            workflow_name=self.spec.name,
+            workflow_name=context_spec.name,
             emit_events=self.app._workflow_event_emitter(session_id),
             reserve_step_started=self.app._workflow_step_reserver(
                 session_id,
-                self.spec.name,
+                context_spec.name,
             ),
         )
         journal = self._journal_factory(journal_context)
         return WorkflowContext(
             app=self.app,
-            spec=self.spec,
+            spec=context_spec,
             session_id=session_id,
             journal=journal,
         )

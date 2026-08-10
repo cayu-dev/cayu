@@ -10,7 +10,8 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
-    require_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
     require_unicode_scalar_text,
 )
 from cayu.artifacts import ArtifactStore
@@ -71,7 +72,7 @@ class EnvironmentSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class WorkspaceInstructions(BaseModel):
@@ -83,7 +84,7 @@ class WorkspaceInstructions(BaseModel):
     @field_validator("content")
     @classmethod
     def validate_content(cls, value: str) -> str:
-        return require_nonblank(value, "content")
+        return require_durable_nonblank(value, "content")
 
     @field_validator("sources", mode="before")
     @classmethod
@@ -97,7 +98,10 @@ class WorkspaceInstructions(BaseModel):
                 raise TypeError("sources must be an iterable of strings.") from exc
         if not sources:
             raise ValueError("sources must contain at least one entry.")
-        return tuple(require_nonblank(source, "source") for source in sources)
+        return tuple(
+            require_durable_nonblank(source, f"sources[{index}]")
+            for index, source in enumerate(sources)
+        )
 
 
 class WorkspaceInstructionsConfig(BaseModel):
@@ -119,7 +123,10 @@ class WorkspaceInstructionsConfig(BaseModel):
                 raise TypeError("paths must be an iterable of strings.") from exc
         if not paths:
             raise ValueError("paths must contain at least one entry.")
-        return tuple(_validate_workspace_instruction_path(path) for path in paths)
+        return tuple(
+            _validate_workspace_instruction_path(path, field_name=f"paths[{index}]")
+            for index, path in enumerate(paths)
+        )
 
     @field_validator("max_bytes")
     @classmethod
@@ -246,7 +253,7 @@ def copy_environment_spec(spec: EnvironmentSpec) -> EnvironmentSpec:
         raise TypeError("Environment specs must be EnvironmentSpec instances.")
     if type(spec.name) is not str:
         # Exact-type on purpose: str subclasses can override strip()/__eq__
-        # and defeat validation (see require_nonblank).
+        # and defeat validation (see require_durable_clean_nonblank).
         raise ValueError("`name` must be a string.")
     return type(spec)(
         name=spec.name,
@@ -274,13 +281,11 @@ def copy_workspace_instructions_input(
 async def load_workspace_instructions(environment: Environment) -> WorkspaceInstructions | None:
     if not isinstance(environment, Environment):
         raise TypeError("Environment instructions require an Environment.")
-    instructions = environment.workspace_instructions
+    instructions = copy_workspace_instructions_input(environment.workspace_instructions)
     if instructions is None:
         return None
     if isinstance(instructions, WorkspaceInstructions):
-        return type(instructions).model_validate(instructions.model_dump())
-    if isinstance(instructions, str):
-        return WorkspaceInstructions(content=str(instructions))
+        return instructions
     if not isinstance(instructions, WorkspaceInstructionsConfig):
         raise TypeError("Invalid workspace_instructions configuration.")
     if environment.workspace is None:
@@ -323,8 +328,8 @@ async def load_workspace_instructions(environment: Environment) -> WorkspaceInst
     )
 
 
-def _validate_workspace_instruction_path(path: str) -> str:
-    path = require_nonblank(path, "path")
+def _validate_workspace_instruction_path(path: str, *, field_name: str) -> str:
+    path = require_durable_nonblank(path, field_name)
     candidate = PurePosixPath(path)
     if candidate.is_absolute():
         raise ValueError("workspace instruction paths must be relative.")

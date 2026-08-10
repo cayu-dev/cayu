@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_durable_json_object, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_durable_clean_nonblank
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType, event_durable_sequence
 from cayu.core.messages import Message
@@ -115,7 +115,7 @@ class EvalCase(BaseModel):
     @field_validator("id")
     @classmethod
     def validate_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("request")
     @classmethod
@@ -175,7 +175,7 @@ class EvalSuite(BaseModel):
     @field_validator("id")
     @classmethod
     def validate_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("cases", mode="before")
     @classmethod
@@ -328,6 +328,7 @@ async def _run_eval_suite(
         raise TypeError("run_eval_suite requires a CayuApp.")
     if type(suite) is not EvalSuite:
         raise TypeError("run_eval_suite requires an EvalSuite.")
+    suite = _detach_eval_suite(suite)
     if type(max_concurrency) is not int:
         raise TypeError("run_eval_suite max_concurrency must be an int.")
     if max_concurrency < 1:
@@ -513,6 +514,9 @@ async def run_eval_case(
     Aggregate fields are deterministic projections of the ordered ``result.trials`` tuple.
     No trial is selected as a representative and no trial evidence is overwritten.
     """
+    if type(case) is not EvalCase:
+        raise TypeError("run_eval_case requires an EvalCase.")
+    case = _detach_eval_case(case)
     result, _ = await _run_eval_case(
         app,
         case,

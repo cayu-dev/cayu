@@ -70,6 +70,7 @@ from cayu import (
     compare_eval_runs,
     comparison_to_json,
     eval_run_to_json,
+    extract_durable_value_error,
     load_eval_run,
     render_comparison_html,
     render_html_report,
@@ -338,6 +339,78 @@ def test_eval_suite_runs_assertions_over_runtime_state(tmp_path):
     trial = result.cases[0].trials[0]
     assert trial.session_id is not None
     assert trial.usage_summary["usage"]["total_tokens"] == 7
+
+
+@pytest.mark.parametrize("identity", ["suite", "case"])
+@pytest.mark.parametrize(
+    ("invalid_text", "expected_code"),
+    [
+        ("invalid\x00identity", "nul_character"),
+        ("invalid\ud800identity", "unicode_surrogate"),
+    ],
+)
+def test_eval_suite_revalidates_portable_identity_before_provider_dispatch(
+    identity: str,
+    invalid_text: str,
+    expected_code: str,
+) -> None:
+    provider = ScriptedModelProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    case = EvalCase(
+        id="case",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "test")],
+        ),
+    )
+    suite = EvalSuite(id="suite", cases=[case])
+    if identity == "suite":
+        suite = suite.model_copy(update={"id": invalid_text})
+    else:
+        forged_case = case.model_copy(update={"id": invalid_text})
+        suite = suite.model_copy(update={"cases": [forged_case]})
+
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(run_eval_suite(app, suite))
+
+    durable_error = extract_durable_value_error(raised.value)
+    assert durable_error is not None
+    assert durable_error.code == expected_code
+    assert provider.requests == []
+
+
+@pytest.mark.parametrize(
+    ("invalid_text", "expected_code"),
+    [
+        ("invalid\x00identity", "nul_character"),
+        ("invalid\ud800identity", "unicode_surrogate"),
+    ],
+)
+def test_run_eval_case_revalidates_portable_identity_before_provider_dispatch(
+    invalid_text: str,
+    expected_code: str,
+) -> None:
+    provider = ScriptedModelProvider([ModelStreamEvent.completed({"finish_reason": "stop"})])
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_agent(AgentSpec(name="agent", model="fake-model"))
+    case = EvalCase(
+        id="case",
+        request=RunRequest(
+            agent_name="agent",
+            messages=[Message.text("user", "test")],
+        ),
+    ).model_copy(update={"id": invalid_text})
+
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(run_eval_case(app, case, suite_id="suite"))
+
+    durable_error = extract_durable_value_error(raised.value)
+    assert durable_error is not None
+    assert durable_error.code == expected_code
+    assert provider.requests == []
 
 
 def test_eval_suite_asserts_tool_trajectory():
@@ -1152,7 +1225,7 @@ def test_compare_detects_failed_to_unavailable_status_regression():
 
 
 @pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
-def test_comparison_exports_reject_nonportable_identity(invalid_text):
+def test_compare_eval_runs_rejects_nonportable_source_identity(invalid_text):
     baseline = _run(
         EvalStatus.PASSED,
         1.0,
@@ -1163,7 +1236,26 @@ def test_comparison_exports_reject_nonportable_identity(invalid_text):
         1.0,
         [_case_result("a", EvalStatus.PASSED, 1.0)],
     )
-    comparison = compare_eval_runs(baseline, current)
+
+    with pytest.raises(ValueError):
+        compare_eval_runs(baseline, current)
+
+
+@pytest.mark.parametrize("invalid_text", ["contains\x00nul", "\ud800"], ids=["nul", "surrogate"])
+def test_comparison_exports_reject_nonportable_identity(invalid_text):
+    baseline = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
+    )
+    current = _run(
+        EvalStatus.PASSED,
+        1.0,
+        [_case_result("a", EvalStatus.PASSED, 1.0)],
+    )
+    comparison = compare_eval_runs(baseline, current).model_copy(
+        update={"baseline_run_id": invalid_text}
+    )
 
     with pytest.raises(ValueError):
         comparison_to_json(comparison)

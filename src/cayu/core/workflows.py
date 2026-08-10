@@ -6,7 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from cayu._validation import copy_durable_json_object, require_clean_nonblank
+from cayu._validation import copy_durable_json_object, require_durable_clean_nonblank
 from cayu.core.events import Event
 
 # Journaled once per workflow context to fence superseded attempts. The event
@@ -28,7 +28,15 @@ class WorkflowSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+
+def copy_workflow_spec(spec: WorkflowSpec) -> WorkflowSpec:
+    """Validate and detach one already-constructed workflow specification."""
+
+    if not isinstance(spec, WorkflowSpec):
+        raise TypeError("Workflow specification copies require a WorkflowSpec.")
+    return type(spec).model_validate(spec.model_dump(mode="python", warnings=False))
 
 
 class Workflow(ABC):
