@@ -24,6 +24,7 @@ from cayu.evals.models import (
     EvalStatus,
     Trajectory,
     _model_instance_python_input,
+    _revalidate_model_iterable,
     _validate_trajectory_record_contract,
 )
 from cayu.runtime.usage import aggregate_usage_metrics_from_json_payload
@@ -84,6 +85,11 @@ class EvalRunComparison(BaseModel):
     @classmethod
     def validate_ids(cls, value: str, info) -> str:
         return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("cases", mode="before")
+    @classmethod
+    def detach_cases(cls, value):
+        return _revalidate_model_iterable(value, EvalCaseComparison)
 
 
 def _validated_durable_model_document(

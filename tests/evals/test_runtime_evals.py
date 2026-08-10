@@ -571,10 +571,14 @@ def test_write_html_report_rejects_nonportable_text_before_overwrite(
         [
             EvalCaseResult.from_trials(
                 case_id="c",
-                trials=(_trial_result(EvalStatus.ERROR, None, error=invalid_text),),
+                trials=(_trial_result(EvalStatus.ERROR, None, error="trial error"),),
             ),
         ],
     )
+    # Public construction rejects this text. Forge an already-created model to
+    # retain coverage for the dedicated export boundary's defensive revalidation.
+    run.cases[0].trials[0].error = invalid_text
+    run.cases[0].trials[0].assertions[0].message = invalid_text
     path = tmp_path / "report.html"
     path.write_text("existing report", encoding="utf-8")
 

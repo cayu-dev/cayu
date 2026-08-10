@@ -951,6 +951,18 @@ returning, and reports a typed `SessionTrajectoryError` if the evidence changed
 or cannot be proved complete. The operation does not run or recover sessions and
 does not inspect the current environment for probes.
 
+Evaluation boundaries follow the same ownership rule. Assertion messages and
+revisions; trial diagnostics, output, and session identity; case and run
+identities; trajectory output; and workspace-probe paths reject NUL and lone
+UTF-16 surrogates when their public value is constructed. Eval case and suite
+timeouts must be finite positive numbers. `EvalSuite`, `EvalRunComparison`,
+`EvalPlan`, `StructuredOutputValidation`, and `EvalContext` rebuild supplied
+nested contract values into detached snapshots, including already-validated
+Pydantic instances; later mutation of caller-owned requests, transcripts,
+metadata, comparisons, structured-output errors, or trajectories cannot rewrite
+retained evaluation evidence. `EvalPlan.app` is intentionally the exception: it
+remains the same live `CayuApp` reference and is never deep-copied.
+
 Checkpoint field updates that can race with runtime finalization use `transform_checkpoint(...)`; transcript repair uses `append_transcript_messages_and_transform_checkpoint(...)` when it must update both atomically. Built-in stores execute those transforms while holding their session/checkpoint write boundary (a process-local lock for the in-memory store, an immediate write transaction for SQLite, and a row lock for PostgreSQL). Interruption-aware checkpoint replacements explicitly take the current `pending_session_interrupt` and `pending_interruption_cascade` values—including their absence—from that transactional snapshot, so an older runtime snapshot can neither erase active interruption state nor resurrect cleared state.
 
 ### Durable session steering

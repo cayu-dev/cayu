@@ -218,6 +218,18 @@ class StructuredOutputValidation(BaseModel):
             return None
         return copy_durable_json_value(value, "output")
 
+    @field_validator("errors", mode="before")
+    @classmethod
+    def detach_errors(cls, value):
+        if not isinstance(value, list | tuple):
+            return value
+        return [
+            StructuredOutputError.model_validate(error.model_dump(mode="python", warnings=False))
+            if isinstance(error, StructuredOutputError)
+            else error
+            for error in value
+        ]
+
 
 def _require_native_structured_output_support(
     structured_output: StructuredOutputSpec | None,

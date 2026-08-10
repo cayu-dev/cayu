@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import math
 import traceback
 from collections import Counter
 from collections.abc import Iterable, Sequence
@@ -151,6 +152,17 @@ class EvalCase(BaseModel):
         return copy_durable_json_object(value, "metadata")
 
 
+def _detach_eval_case(case: EvalCase) -> EvalCase:
+    """Rebuild one case while preserving request-private runtime provenance."""
+
+    return EvalCase(
+        id=case.id,
+        request=case.request,
+        assertions=case.assertions,
+        metadata=case.metadata,
+    )
+
+
 class EvalSuite(BaseModel):
     model_config = ConfigDict(
         extra="forbid", arbitrary_types_allowed=True, hide_input_in_errors=True
@@ -169,7 +181,7 @@ class EvalSuite(BaseModel):
     @classmethod
     def validate_cases(cls, value) -> list[EvalCase]:
         if isinstance(value, EvalCase):
-            return [value]
+            return [_detach_eval_case(value)]
         if isinstance(value, str | bytes):
             raise TypeError("EvalSuite cases must be EvalCase instances.")
         try:
@@ -179,7 +191,8 @@ class EvalSuite(BaseModel):
         if not cases:
             raise ValueError("EvalSuite requires at least one case.")
         normalized = [
-            case if type(case) is EvalCase else EvalCase.model_validate(case) for case in cases
+            _detach_eval_case(case) if isinstance(case, EvalCase) else EvalCase.model_validate(case)
+            for case in cases
         ]
         # Reject duplicate IDs at the root: compare_eval_runs indexes cases by id, so a
         # duplicate would run but be silently dropped from every baseline comparison.
@@ -195,6 +208,10 @@ class EvalSuite(BaseModel):
     @classmethod
     def copy_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         return copy_durable_json_object(value, "metadata")
+
+
+def _detach_eval_suite(suite: EvalSuite) -> EvalSuite:
+    return EvalSuite(id=suite.id, cases=suite.cases, metadata=suite.metadata)
 
 
 @dataclass(frozen=True)
@@ -219,6 +236,11 @@ class EvalPlan:
                 raise TypeError("EvalPlan app must be a CayuApp.")
             if type(self.suite) is not EvalSuite:
                 raise TypeError("EvalPlan suite must be an exact EvalSuite.")
+            object.__setattr__(
+                self,
+                "suite",
+                _detach_eval_suite(self.suite),
+            )
             return
         if type(self.corpus_target) is not CorpusTarget:
             raise TypeError("EvalPlan corpus_target must be an exact CorpusTarget.")
@@ -1304,7 +1326,9 @@ def _validate_timeout_seconds(value: float | None, field_name: str) -> None:
         return
     if type(value) not in (int, float):
         raise TypeError(f"{field_name} must be a number or None.")
-    if value != value or value <= 0:  # rejects NaN and non-positive values
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError(f"{field_name} must be a finite positive number.")
+    if value <= 0:
         raise ValueError(f"{field_name} must be a positive number.")
 
 

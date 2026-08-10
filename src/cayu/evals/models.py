@@ -28,6 +28,8 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_text,
 )
 from cayu.artifacts import ArtifactMetadata, ArtifactScope
 from cayu.core.events import Event, EventType
@@ -215,12 +217,22 @@ class EvalAssertionResult(BaseModel):
 
         return self.outcome == EvalOutcome.PASSED
 
-    @field_validator("name", "assertion_revision")
+    @field_validator("name")
     @classmethod
-    def validate_identity(cls, value: str | None, info) -> str | None:
+    def validate_name(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+    @field_validator("assertion_revision")
+    @classmethod
+    def validate_assertion_revision(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str, info) -> str:
+        return require_durable_text(value, info.field_name)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -243,7 +255,9 @@ class EvalAssertionResult(BaseModel):
 class EvalTrialResult(BaseModel):
     """Lossless result for one concrete, independently executed case trial."""
 
-    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
+    model_config = ConfigDict(
+        extra="forbid", revalidate_instances="always", hide_input_in_errors=True
+    )
 
     trial_number: StrictInt = Field(ge=1)
     status: EvalStatus
@@ -269,7 +283,12 @@ class EvalTrialResult(BaseModel):
     def validate_session_id(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("final_output")
+    @classmethod
+    def validate_final_output(cls, value: str, info) -> str:
+        return require_durable_text(value, info.field_name)
 
     @field_validator("trajectory", mode="before")
     @classmethod
@@ -278,11 +297,11 @@ class EvalTrialResult(BaseModel):
 
     @field_validator("error", "unavailable_reason", mode="before")
     @classmethod
-    def normalize_diagnostic(cls, value: object) -> str | None:
+    def normalize_diagnostic(cls, value: object, info) -> str | None:
         if value is None:
             return None
         text = str(value).strip()
-        return text or None
+        return None if not text else require_durable_text(text, info.field_name)
 
     @field_validator("usage_summary", mode="before")
     @classmethod
@@ -456,14 +475,14 @@ class EvalCaseResult(BaseModel):
     @field_validator("case_id")
     @classmethod
     def validate_case_id(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("authored_session_id")
     @classmethod
     def validate_session_id(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("error", "unavailable_reason", mode="before")
     @classmethod
@@ -631,7 +650,7 @@ class EvalRun(BaseModel):
     @field_validator("run_id", "suite_id")
     @classmethod
     def validate_ids(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -930,7 +949,12 @@ class TrajectoryProbes(BaseModel):
     artifact is absent", which the workspace and artifact assertions report differently.
     """
 
-    model_config = ConfigDict(extra="forbid", ser_json_bytes="base64", val_json_bytes="base64")
+    model_config = ConfigDict(
+        extra="forbid",
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+        hide_input_in_errors=True,
+    )
 
     workspace_available: StrictBool = False
     # path -> file bytes (capped at WORKSPACE_PROBE_MAX_BYTES), or None only when absence was
@@ -959,10 +983,25 @@ class TrajectoryProbes(BaseModel):
         for index, path in enumerate(value):
             if type(path) is not str:
                 raise ValueError("workspace_unavailable_paths must contain only strings.")
-            paths.append(require_clean_nonblank(path, f"workspace_unavailable_paths[{index}]"))
+            paths.append(
+                require_durable_clean_nonblank(
+                    path,
+                    f"workspace_unavailable_paths[{index}]",
+                )
+            )
         if len(paths) != len(set(paths)):
             raise ValueError("workspace_unavailable_paths must not contain duplicates.")
         return tuple(sorted(paths))
+
+    @field_validator("workspace_files", mode="before")
+    @classmethod
+    def validate_workspace_file_paths(cls, value):
+        if not isinstance(value, Mapping):
+            return value
+        return {
+            require_durable_text(path, "workspace_files path"): content
+            for path, content in value.items()
+        }
 
     @field_validator(
         "artifact_scopes_captured",
@@ -1140,6 +1179,11 @@ class Trajectory(BaseModel):
     @classmethod
     def revalidate_children(cls, value):
         return _revalidate_model_iterable(value, Trajectory)
+
+    @field_validator("final_output")
+    @classmethod
+    def validate_final_output(cls, value: str, info) -> str:
+        return require_durable_text(value, info.field_name)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -1414,6 +1458,16 @@ class EvalContext:
     # this false when the root record is absent so an empty observation is never
     # confused with conclusive negative evidence.
     root_evidence_available: bool = True
+
+    def __post_init__(self) -> None:
+        detached_trajectory = Trajectory.model_validate(
+            _model_instance_python_input(self.trajectory)
+        )
+        detached_metadata = copy_json_value(self.metadata, "metadata")
+        if type(detached_metadata) is not dict:
+            raise ValueError("EvalContext metadata must be an object.")
+        object.__setattr__(self, "trajectory", detached_trajectory)
+        object.__setattr__(self, "metadata", detached_metadata)
 
     @property
     def session(self) -> Session | None:
