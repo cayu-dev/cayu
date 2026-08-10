@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from cayu._validation import require_clean_nonblank
-from cayu.vaults.base import ResolvedSecret, SecretNotFound, SecretRef, Vault
+from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
+from cayu.vaults.base import ResolvedSecret, SecretNotFound, SecretRef, Vault, copy_secret_ref
 
 
 class ChainVault(Vault):
@@ -46,9 +46,10 @@ class ChainVault(Vault):
     ) -> ResolvedSecret:
         if type(ref) is not SecretRef:
             raise TypeError("Vault refs must be SecretRef instances.")
+        validated_ref = copy_secret_ref(ref)
         for vault in self._vaults:
             try:
-                return await vault.resolve(ref, scope=scope)
+                return await vault.resolve(validated_ref, scope=scope)
             except SecretNotFound:
                 continue
         raise SecretNotFound(f"No vault could resolve secret: {ref.name}")
@@ -75,7 +76,7 @@ class RoutedVault(Vault):
             raise TypeError("RoutedVault fallback must be a Vault or None.")
         self._routes: dict[str, Vault] = {}
         for name, vault in routes.items():
-            secret_name = require_clean_nonblank(name, "route name")
+            secret_name = require_durable_clean_nonblank(name, "route name")
             if not isinstance(vault, Vault):
                 raise TypeError("RoutedVault route values must be Vault instances.")
             self._routes[secret_name] = vault
@@ -92,7 +93,7 @@ class RoutedVault(Vault):
         return vault
 
     async def get(self, name: str, *, scope: dict[str, Any] | None = None) -> SecretRef:
-        secret_name = require_clean_nonblank(name, "name")
+        secret_name = require_durable_clean_nonblank(name, "name")
         return await self._vault_for(secret_name).get(secret_name, scope=scope)
 
     async def resolve(
@@ -103,5 +104,6 @@ class RoutedVault(Vault):
     ) -> ResolvedSecret:
         if type(ref) is not SecretRef:
             raise TypeError("Vault refs must be SecretRef instances.")
-        secret_name = require_clean_nonblank(ref.name, "name")
-        return await self._vault_for(secret_name).resolve(ref, scope=scope)
+        validated_ref = copy_secret_ref(ref)
+        secret_name = require_durable_clean_nonblank(validated_ref.name, "name")
+        return await self._vault_for(secret_name).resolve(validated_ref, scope=scope)

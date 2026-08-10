@@ -5,8 +5,12 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
-from cayu.vaults.base import ResolvedSecret, SecretNotFound, SecretRef, Vault
+from cayu._validation import (
+    copy_durable_json_object,
+    require_durable_clean_nonblank,
+    require_nonblank,
+)
+from cayu.vaults.base import ResolvedSecret, SecretNotFound, SecretRef, Vault, copy_secret_ref
 
 
 class StaticVault(Vault):
@@ -22,7 +26,7 @@ class StaticVault(Vault):
             raise TypeError("StaticVault secrets must be a mapping.")
         self._secrets: dict[str, SecretStr] = {}
         for name, value in secrets.items():
-            secret_name = require_clean_nonblank(name, "secret name")
+            secret_name = require_durable_clean_nonblank(name, "secret name")
             if type(value) is SecretStr:
                 require_nonblank(value.get_secret_value(), "secret value")
                 secret_value = value
@@ -38,15 +42,18 @@ class StaticVault(Vault):
             if not isinstance(metadata, Mapping):
                 raise TypeError("StaticVault metadata must be a mapping.")
             for name, value in metadata.items():
-                secret_name = require_clean_nonblank(name, "metadata secret name")
+                secret_name = require_durable_clean_nonblank(name, "metadata secret name")
                 if secret_name not in self._secrets:
                     raise ValueError(f"Metadata provided for unknown secret: {secret_name}")
                 if not isinstance(value, Mapping):
                     raise TypeError("StaticVault metadata values must be mappings.")
-                self._metadata[secret_name] = copy_json_value(value, "metadata")
+                self._metadata[secret_name] = copy_durable_json_object(
+                    dict(value),
+                    "metadata",
+                )
 
     async def get(self, name: str, *, scope: dict[str, Any] | None = None) -> SecretRef:
-        secret_name = require_clean_nonblank(name, "name")
+        secret_name = require_durable_clean_nonblank(name, "name")
         if secret_name not in self._secrets:
             raise SecretNotFound(f"Secret not found: {secret_name}")
         return SecretRef(
@@ -63,7 +70,8 @@ class StaticVault(Vault):
     ) -> ResolvedSecret:
         if type(ref) is not SecretRef:
             raise TypeError("Vault refs must be SecretRef instances.")
-        secret_name = require_clean_nonblank(ref.name, "name")
+        validated_ref = copy_secret_ref(ref)
+        secret_name = require_durable_clean_nonblank(validated_ref.name, "name")
         value = self._secrets.get(secret_name)
         if value is None:
             raise SecretNotFound(f"Secret not found: {secret_name}")
@@ -78,7 +86,7 @@ class StaticVault(Vault):
         name: str,
         scope: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        metadata = copy_json_value(self._metadata.get(name, {}), "metadata")
+        metadata = copy_durable_json_object(self._metadata.get(name, {}), "metadata")
         if scope:
-            metadata["scope"] = copy_json_value(scope, "scope")
+            metadata["scope"] = copy_durable_json_object(scope, "scope")
         return metadata

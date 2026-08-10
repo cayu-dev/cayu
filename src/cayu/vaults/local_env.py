@@ -6,8 +6,12 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
-from cayu.vaults.base import ResolvedSecret, SecretNotFound, SecretRef, Vault
+from cayu._validation import (
+    copy_durable_json_object,
+    require_durable_clean_nonblank,
+    require_nonblank,
+)
+from cayu.vaults.base import ResolvedSecret, SecretNotFound, SecretRef, Vault, copy_secret_ref
 
 
 class LocalEnvVault(Vault):
@@ -23,8 +27,11 @@ class LocalEnvVault(Vault):
             raise TypeError("LocalEnvVault mapping must be a mapping.")
         self._mapping: dict[str, str] = {}
         for name, env_name in mapping.items():
-            secret_name = require_clean_nonblank(name, "secret name")
-            environment_name = require_clean_nonblank(env_name, "environment variable name")
+            secret_name = require_durable_clean_nonblank(name, "secret name")
+            environment_name = require_durable_clean_nonblank(
+                env_name,
+                "environment variable name",
+            )
             self._mapping[secret_name] = environment_name
 
         self._metadata: dict[str, dict[str, Any]] = {}
@@ -32,15 +39,18 @@ class LocalEnvVault(Vault):
             if not isinstance(metadata, Mapping):
                 raise TypeError("LocalEnvVault metadata must be a mapping.")
             for name, value in metadata.items():
-                secret_name = require_clean_nonblank(name, "metadata secret name")
+                secret_name = require_durable_clean_nonblank(name, "metadata secret name")
                 if secret_name not in self._mapping:
                     raise ValueError(f"Metadata provided for unknown secret: {secret_name}")
                 if not isinstance(value, Mapping):
                     raise TypeError("LocalEnvVault metadata values must be mappings.")
-                self._metadata[secret_name] = copy_json_value(value, "metadata")
+                self._metadata[secret_name] = copy_durable_json_object(
+                    dict(value),
+                    "metadata",
+                )
 
     async def get(self, name: str, *, scope: dict[str, Any] | None = None) -> SecretRef:
-        secret_name = require_clean_nonblank(name, "name")
+        secret_name = require_durable_clean_nonblank(name, "name")
         if secret_name not in self._mapping:
             raise SecretNotFound(f"Secret not found: {secret_name}")
         return SecretRef(
@@ -57,7 +67,8 @@ class LocalEnvVault(Vault):
     ) -> ResolvedSecret:
         if type(ref) is not SecretRef:
             raise TypeError("Vault refs must be SecretRef instances.")
-        secret_name = require_clean_nonblank(ref.name, "name")
+        validated_ref = copy_secret_ref(ref)
+        secret_name = require_durable_clean_nonblank(validated_ref.name, "name")
         env_name = self._mapping.get(secret_name)
         if env_name is None:
             raise SecretNotFound(f"Secret not found: {secret_name}")
@@ -81,7 +92,7 @@ class LocalEnvVault(Vault):
         name: str,
         scope: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        metadata = copy_json_value(self._metadata.get(name, {}), "metadata")
+        metadata = copy_durable_json_object(self._metadata.get(name, {}), "metadata")
         if scope:
-            metadata["scope"] = copy_json_value(scope, "scope")
+            metadata["scope"] = copy_durable_json_object(scope, "scope")
         return metadata

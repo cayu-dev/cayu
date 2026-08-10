@@ -7,8 +7,20 @@ from typing import Any
 
 from pydantic import SecretStr
 
-from cayu._validation import copy_json_value, require_clean_nonblank, require_nonblank
-from cayu.vaults.base import ResolvedSecret, SecretNotFound, SecretRef, Vault, VaultError
+from cayu._validation import (
+    copy_durable_json_object,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_nonblank,
+)
+from cayu.vaults.base import (
+    ResolvedSecret,
+    SecretNotFound,
+    SecretRef,
+    Vault,
+    VaultError,
+    copy_secret_ref,
+)
 
 _HANDLE_PREFIX = "aws-secretsmanager:"
 
@@ -36,8 +48,11 @@ class SecretsManagerVault(Vault):
             raise TypeError("SecretsManagerVault mapping must be a mapping.")
         self._mapping: dict[str, str] = {}
         for name, secret_id in mapping.items():
-            logical_name = require_clean_nonblank(name, "secret name")
-            self._mapping[logical_name] = require_clean_nonblank(secret_id, "secret id")
+            logical_name = require_durable_clean_nonblank(name, "secret name")
+            self._mapping[logical_name] = require_durable_clean_nonblank(
+                secret_id,
+                "secret id",
+            )
         self._version_stage = require_clean_nonblank(version_stage, "version_stage")
         self._region_name = _optional_clean_string(region_name, "region_name")
         self._profile_name = _optional_clean_string(profile_name, "profile_name")
@@ -56,12 +71,15 @@ class SecretsManagerVault(Vault):
             if not isinstance(metadata, Mapping):
                 raise TypeError("SecretsManagerVault metadata must be a mapping.")
             for name, value in metadata.items():
-                logical_name = require_clean_nonblank(name, "metadata secret name")
+                logical_name = require_durable_clean_nonblank(name, "metadata secret name")
                 if logical_name not in self._mapping:
                     raise ValueError(f"Metadata provided for unknown secret: {logical_name}")
                 if not isinstance(value, Mapping):
                     raise TypeError("SecretsManagerVault metadata values must be mappings.")
-                self._metadata[logical_name] = copy_json_value(dict(value), "metadata")
+                self._metadata[logical_name] = copy_durable_json_object(
+                    dict(value),
+                    "metadata",
+                )
 
     async def get(self, name: str, *, scope: dict[str, Any] | None = None) -> SecretRef:
         logical_name, secret_id = self._target(name)
@@ -79,9 +97,10 @@ class SecretsManagerVault(Vault):
     ) -> ResolvedSecret:
         if type(ref) is not SecretRef:
             raise TypeError("Vault refs must be SecretRef instances.")
-        logical_name, secret_id = self._target(ref.name)
+        validated_ref = copy_secret_ref(ref)
+        logical_name, secret_id = self._target(validated_ref.name)
         expected_handle = f"{_HANDLE_PREFIX}{secret_id}"
-        if ref.handle is not None and ref.handle != expected_handle:
+        if validated_ref.handle is not None and validated_ref.handle != expected_handle:
             raise VaultError(
                 f"Secret reference handle does not match configured target: {logical_name}"
             )
@@ -125,7 +144,7 @@ class SecretsManagerVault(Vault):
         )
 
     def _target(self, name: str) -> tuple[str, str]:
-        logical_name = require_clean_nonblank(name, "name")
+        logical_name = require_durable_clean_nonblank(name, "name")
         secret_id = self._mapping.get(logical_name)
         if secret_id is None:
             raise SecretNotFound(f"Secret not found: {logical_name}")
@@ -136,10 +155,10 @@ class SecretsManagerVault(Vault):
         name: str,
         scope: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        metadata = copy_json_value(self._metadata.get(name, {}), "metadata")
+        metadata = copy_durable_json_object(self._metadata.get(name, {}), "metadata")
         metadata["provider"] = "aws-secrets-manager"
         if scope:
-            metadata["scope"] = copy_json_value(scope, "scope")
+            metadata["scope"] = copy_durable_json_object(scope, "scope")
         return metadata
 
     async def _get_client(self) -> Any:

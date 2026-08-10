@@ -4925,6 +4925,13 @@ values are resolved only by trusted application/runtime code and should not be
 placed in model prompts, tool schemas, transcripts, durable events, or ordinary
 logs.
 
+Secret names, optional handles, environment-variable names, provider secret
+identifiers, and routed-vault names are clean portable durable text. Built-in
+vault metadata is normalized and defensively copied through the portable
+durable JSON contract at construction, before lookup, routing, environment
+access, or provider access. Validation diagnostics never include raw secret
+values.
+
 An `Environment` can attach a vault resolver:
 
 ```python

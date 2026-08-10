@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
-    require_clean_nonblank,
+    require_durable_clean_nonblank,
     require_nonblank,
 )
 
@@ -36,14 +36,14 @@ class SecretRef(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("handle")
     @classmethod
     def validate_nonblank_handle(cls, value: str | None, info) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
 
 class SecretEnv(BaseModel):
@@ -63,7 +63,7 @@ class SecretEnv(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("ref")
     @classmethod
@@ -77,7 +77,7 @@ def copy_secret_ref(ref: SecretRef) -> SecretRef:
     return SecretRef(
         name=ref.name,
         handle=ref.handle,
-        metadata=copy_json_value(ref.metadata, "metadata"),
+        metadata=copy_durable_json_object(ref.metadata, "metadata"),
     )
 
 
@@ -113,7 +113,7 @@ class ResolvedSecret(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_nonblank_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("value")
     @classmethod
@@ -197,7 +197,7 @@ def secret_env_refs(
     refs: dict[str, SecretRef] = {}
     if isinstance(secret_env, Mapping):
         for name, ref in cast("Mapping[str, SecretRef]", secret_env).items():
-            env_name = require_clean_nonblank(name, "secret_env name")
+            env_name = require_durable_clean_nonblank(name, "secret_env name")
             refs[env_name] = copy_secret_ref(ref)
         return refs
     if not isinstance(secret_env, Sequence) or isinstance(secret_env, str | bytes):
@@ -205,9 +205,10 @@ def secret_env_refs(
     for entry in secret_env:
         if type(entry) is not SecretEnv:
             raise TypeError("secret_env entries must be SecretEnv instances.")
-        if entry.name in refs:
-            raise ValueError(f"secret_env declares duplicate environment variable: {entry.name}")
-        refs[entry.name] = copy_secret_ref(entry.ref)
+        env_name = require_durable_clean_nonblank(entry.name, "secret_env name")
+        if env_name in refs:
+            raise ValueError(f"secret_env declares duplicate environment variable: {env_name}")
+        refs[env_name] = copy_secret_ref(entry.ref)
     return refs
 
 
