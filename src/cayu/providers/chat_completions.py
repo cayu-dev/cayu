@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote_plus, urlencode, urlsplit, urlunsplit
 
 from cayu._validation import copy_json_value, require_clean_nonblank, require_finite
 from cayu.artifacts import (
@@ -44,7 +45,6 @@ from cayu.providers._http import (
     safe_error_response_text,
     sanitize_provider_cancellation,
     stream_sse_json_events,
-    validate_base_url,
     validate_url,
 )
 from cayu.providers.base import (
@@ -202,6 +202,7 @@ class HttpxChatCompletionsTransport:
         timeout_s: float,
         stream_idle_timeout_s: float,
     ) -> AsyncIterator[Mapping[str, Any]]:
+        timeout_s = _validate_timeout_s(timeout_s)
         url = _validate_url(url, "url", allow_http=self.allow_http)
         events = stream_sse_json_events(
             client=self._client.get(),
@@ -302,11 +303,7 @@ class ChatCompletionsProvider(ModelProvider):
                     declared_usage_dialect,
                     f"{type(self).__name__}.usage_dialect",
                 )
-        if type(timeout_s) not in {int, float}:
-            raise TypeError("timeout_s must be a number.")
-        if timeout_s <= 0:
-            raise ValueError("timeout_s must be greater than zero.")
-        self.timeout_s = float(timeout_s)
+        self.timeout_s = _validate_timeout_s(timeout_s)
         if type(stream_idle_timeout_s) not in {int, float}:
             raise TypeError("stream_idle_timeout_s must be a number.")
         stream_idle_timeout_s = require_finite(
@@ -461,16 +458,28 @@ class ChatCompletionsProvider(ModelProvider):
     def _endpoint(self) -> str:
         # OpenAI-SDK convention: base_url already carries the version path, so
         # append only "/chat/completions". `endpoint_url` is a full override.
-        url = (
-            self.endpoint_url
-            if self.endpoint_url is not None
-            else f"{self.base_url}/chat/completions"
-        )
+        if self.endpoint_url is not None and self.api_version is None:
+            return self.endpoint_url
+        endpoint_override = self.endpoint_url is not None
+        url = self.endpoint_url if self.endpoint_url is not None else self.base_url
+        parts = urlsplit(url)
+        path = parts.path
+        if not endpoint_override:
+            path = f"{path.rstrip('/')}/chat/completions"
+        query = parts.query
         if self.api_version is not None:
-            # endpoint_url may already carry a query string, so pick the separator.
-            separator = "&" if "?" in url else "?"
-            url = f"{url}{separator}{urlencode({'api-version': self.api_version})}"
-        return url
+            query_parts = (
+                []
+                if not query
+                else [
+                    part
+                    for part in query.split("&")
+                    if unquote_plus(part.partition("=")[0]) != "api-version"
+                ]
+            )
+            query_parts.append(urlencode({"api-version": self.api_version}))
+            query = "&".join(query_parts)
+        return urlunsplit(parts._replace(path=path, query=query))
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -494,6 +503,8 @@ def build_chat_completions_payload(
         raise TypeError("request must be a ModelRequest.")
     if type(clean_schemas) is not bool:
         raise TypeError("clean_schemas must be a bool.")
+    if type(include_usage) is not bool:
+        raise TypeError("include_usage must be a bool.")
     document_encoding = _validate_document_encoding(document_encoding)
 
     options = _effective_chat_completions_request_options(
@@ -1220,7 +1231,7 @@ def _effective_chat_completions_request_options(
     effective = _chat_completions_options(options, options_key)
     # Cayu models one provider response as one assistant step; n>1 would return
     # multiple `choices` that the stream loop cannot represent. Reject it.
-    if "n" in effective and effective["n"] != 1:
+    if "n" in effective and (type(effective["n"]) is not int or effective["n"] != 1):
         raise ValueError(
             "Chat Completions n must be 1 (multi-candidate responses are unsupported)."
         )
@@ -1244,10 +1255,22 @@ def _optional_string(value: Mapping[str, Any], key: str) -> str | None:
     return raw_value
 
 
-def _validate_document_encoding(value: str) -> str:
-    if value not in _VALID_DOCUMENT_ENCODINGS:
+def _validate_document_encoding(value: object) -> str:
+    if type(value) is not str or value not in _VALID_DOCUMENT_ENCODINGS:
         raise ValueError(f"document_encoding must be one of {sorted(_VALID_DOCUMENT_ENCODINGS)}.")
     return value
+
+
+def _validate_timeout_s(value: float) -> float:
+    if type(value) not in {int, float}:
+        raise TypeError("timeout_s must be a number.")
+    try:
+        normalized = float(value)
+    except OverflowError:
+        raise ValueError("timeout_s must be finite and greater than zero.") from None
+    if not math.isfinite(normalized) or normalized <= 0:
+        raise ValueError("timeout_s must be finite and greater than zero.")
+    return normalized
 
 
 def _declared_subclass_usage_dialect(
@@ -1262,12 +1285,15 @@ def _declared_subclass_usage_dialect(
 
 
 def _validate_base_url(base_url: str, *, allow_http: bool = False) -> str:
-    return validate_base_url(
+    validated = validate_url(
         base_url,
+        "base_url",
         provider_label="Chat Completions",
         allow_http=allow_http,
         allow_http_hint=True,
     )
+    parts = urlsplit(validated)
+    return urlunsplit(parts._replace(path=parts.path.rstrip("/")))
 
 
 def _validate_url(url: str, field_name: str, *, allow_http: bool = False) -> str:

@@ -3519,7 +3519,9 @@ wire-level limits.
 
 `ChatCompletionsProvider` targets OpenAI-compatible
 `/v1/chat/completions` services rather than the Responses API. Its `base_url`
-includes the version path and the adapter appends `/chat/completions`.
+includes the version path and the adapter appends `/chat/completions` without
+disturbing query parameters or fragments. When `api_version` is configured, it
+replaces any URL-provided `api-version` values and is emitted exactly once.
 `document_encoding="file"` uses the OpenAI/Azure file content part, while
 `document_encoding="image_url"` supports compatible services such as Gemini
 that carry PDFs through an image URL part. Vendor-specific authentication,

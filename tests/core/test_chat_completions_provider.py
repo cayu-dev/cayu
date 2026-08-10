@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
@@ -594,15 +595,77 @@ def test_build_chat_completions_payload_requires_resolved_user_file_parts() -> N
         build_chat_completions_payload(request)
 
 
-def test_provider_rejects_invalid_document_encoding() -> None:
-    with pytest.raises(ValueError, match="document_encoding"):
-        ChatCompletionsProvider(api_key="test-key", name="gemini", document_encoding="bogus")
+@pytest.mark.parametrize("document_encoding", ["bogus", [], {}, 1, True, None])
+def test_provider_rejects_invalid_document_encoding(document_encoding: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^document_encoding must be one of \['file', 'image_url'\]\.$",
+    ):
+        ChatCompletionsProvider(
+            api_key="test-key",
+            name="gemini",
+            document_encoding=document_encoding,  # type: ignore[arg-type]
+        )
 
 
-def test_build_chat_completions_payload_rejects_invalid_document_encoding() -> None:
+@pytest.mark.parametrize("document_encoding", ["bogus", [], {}, 1, True, None])
+def test_build_chat_completions_payload_rejects_invalid_document_encoding(
+    document_encoding: object,
+) -> None:
     request = ModelRequest(model="gemini-test", messages=[Message.text("user", "Hi.")])
-    with pytest.raises(ValueError, match="document_encoding"):
-        build_chat_completions_payload(request, document_encoding="bogus")
+    with pytest.raises(
+        ValueError,
+        match=r"^document_encoding must be one of \['file', 'image_url'\]\.$",
+    ):
+        build_chat_completions_payload(
+            request,
+            document_encoding=document_encoding,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, math.nan, math.inf, -math.inf, 10**1000])
+def test_provider_rejects_non_positive_or_non_finite_timeout(timeout_s: int | float) -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"^timeout_s must be finite and greater than zero\.$",
+    ):
+        ChatCompletionsProvider(api_key="test-key", timeout_s=timeout_s)
+
+
+@pytest.mark.parametrize("timeout_s", [True, "1", None])
+def test_provider_rejects_non_numeric_timeout(timeout_s: object) -> None:
+    with pytest.raises(TypeError, match=r"^timeout_s must be a number\.$"):
+        ChatCompletionsProvider(
+            api_key="test-key",
+            timeout_s=timeout_s,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("timeout_s", [math.nan, math.inf, -math.inf])
+async def test_http_transport_rejects_non_finite_timeout_before_client_use(
+    timeout_s: float,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = HttpxChatCompletionsTransport()
+
+    def fail_client_use() -> None:
+        pytest.fail("HTTP client must not be acquired for an invalid timeout")
+
+    monkeypatch.setattr(transport._client, "get", fail_client_use)
+    events = transport.stream_chat_completions(
+        url="https://example.test/v1/chat/completions",
+        headers={},
+        payload={},
+        timeout_s=timeout_s,
+        stream_idle_timeout_s=1.0,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"^timeout_s must be finite and greater than zero\.$",
+    ):
+        await anext(events)
 
 
 @pytest.mark.anyio
@@ -1608,14 +1671,69 @@ def test_provider_endpoint_appends_chat_completions_to_base_url() -> None:
     assert trailing._endpoint() == "https://api.together.xyz/v1/chat/completions"
 
 
-def test_provider_endpoint_url_override_is_used_verbatim() -> None:
+def test_provider_endpoint_preserves_base_query_and_fragment() -> None:
+    provider = ChatCompletionsProvider(
+        api_key="k",
+        name="gateway",
+        base_url="https://gateway.example/v1/?tenant=probe&return=%2F#route/",
+        api_version="2024-10-21",
+    )
+
+    assert provider._endpoint() == (
+        "https://gateway.example/v1/chat/completions?tenant=probe&return=%2F&"
+        "api-version=2024-10-21#route/"
+    )
+
+
+@pytest.mark.parametrize(
+    "endpoint_url",
+    [
+        "https://gateway.internal/proxy/chat",
+        "https://gateway.internal/proxy/chat?",
+        "https://gateway.internal/proxy/chat#",
+    ],
+)
+def test_provider_endpoint_url_override_is_used_verbatim(endpoint_url: str) -> None:
     provider = ChatCompletionsProvider(
         api_key="k",
         name="custom",
-        endpoint_url="https://gateway.internal/proxy/chat",
+        endpoint_url=endpoint_url,
     )
-    assert provider._endpoint() == "https://gateway.internal/proxy/chat"
+    assert provider._endpoint() == endpoint_url
 
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "endpoint_url",
+    [
+        "https://gateway.internal/proxy/chat?",
+        "https://gateway.internal/proxy/chat#",
+    ],
+)
+async def test_provider_passes_endpoint_override_to_transport_verbatim(
+    endpoint_url: str,
+) -> None:
+    transport = RecordingTransport(stream_events=[[_finish_chunk("stop")]])
+    provider = ChatCompletionsProvider(
+        api_key="k",
+        name="custom",
+        endpoint_url=endpoint_url,
+        transport=transport,
+        stream_include_usage=False,
+    )
+    request = ModelRequest(
+        model="m",
+        messages=[Message.text("user", "Hi.")],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert len(transport.calls) == 1
+    assert transport.calls[0]["url"] == endpoint_url
+
+
+def test_provider_endpoint_url_override_accepts_api_version() -> None:
     versioned = ChatCompletionsProvider(
         api_key="k",
         name="custom",
@@ -1636,6 +1754,35 @@ def test_provider_endpoint_url_with_query_uses_ampersand_for_api_version() -> No
     )
     assert provider._endpoint() == (
         "https://gateway.internal/proxy/chat?tenant=acme&api-version=2024-10-21"
+    )
+
+
+def test_provider_endpoint_api_version_replaces_existing_values_once() -> None:
+    provider = ChatCompletionsProvider(
+        api_key="k",
+        name="custom",
+        endpoint_url=(
+            "https://gateway.internal/proxy/chat?api%2Dversion=old&tenant=&route=a&"
+            "signature=a%20b&api-version=older&route=b#regional"
+        ),
+        api_version="2024-10-21",
+    )
+
+    assert provider._endpoint() == (
+        "https://gateway.internal/proxy/chat?tenant=&route=a&signature=a%20b&route=b&"
+        "api-version=2024-10-21#regional"
+    )
+
+
+def test_provider_endpoint_preserves_url_api_version_without_override() -> None:
+    provider = ChatCompletionsProvider(
+        api_key="k",
+        name="gateway",
+        base_url="https://gateway.internal/v1?tenant=acme&api-version=url-version#regional",
+    )
+
+    assert provider._endpoint() == (
+        "https://gateway.internal/v1/chat/completions?tenant=acme&api-version=url-version#regional"
     )
 
 
@@ -1951,22 +2098,40 @@ async def test_stream_completes_without_usage_chunk() -> None:
     assert "stream_options" not in transport.calls[0]["payload"]
 
 
-def test_payload_rejects_multi_candidate_n() -> None:
+@pytest.mark.parametrize("n", [2, True, False, 1.5, "1", None, [], {}])
+def test_payload_rejects_noncanonical_candidate_count(n: object) -> None:
     request = ModelRequest(
         model="m",
         messages=[Message.text("user", "Hi.")],
-        options={"openai": {"n": 2}},
+        options={"openai": {"n": n}},
     )
     with pytest.raises(ValueError, match="n must be 1"):
         build_chat_completions_payload(request, options_key="openai")
 
-    ok = ModelRequest(
+
+@pytest.mark.parametrize("n", [1, 1.0])
+def test_payload_accepts_durable_canonical_single_candidate_count(n: object) -> None:
+    request = ModelRequest(
         model="m",
         messages=[Message.text("user", "Hi.")],
-        options={"openai": {"n": 1}},
+        options={"openai": {"n": n}},
     )
-    payload = build_chat_completions_payload(ok, options_key="openai")
+
+    assert type(request.options["openai"]["n"]) is int
+    payload = build_chat_completions_payload(request, options_key="openai")
+    assert type(payload["n"]) is int
     assert payload["n"] == 1
+
+
+@pytest.mark.parametrize("include_usage", [1, 0, "true", None, [], {}])
+def test_payload_rejects_non_boolean_include_usage(include_usage: object) -> None:
+    request = ModelRequest(model="m", messages=[Message.text("user", "Hi.")])
+
+    with pytest.raises(TypeError, match=r"^include_usage must be a bool\.$"):
+        build_chat_completions_payload(
+            request,
+            include_usage=include_usage,  # type: ignore[arg-type]
+        )
 
 
 @pytest.mark.anyio
