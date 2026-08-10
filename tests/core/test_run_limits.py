@@ -405,8 +405,7 @@ def test_app_revalidates_run_limits_before_provider_or_durable_mutation() -> Non
         agent_name="assistant",
         session_id="sess_nonportable_run_limit",
         messages=[Message.text("user", "call the tool")],
-        limits=invalid_limits,
-    )
+    ).model_copy(update={"limits": invalid_limits})
 
     async def scenario():
         with pytest.raises(ValidationError):

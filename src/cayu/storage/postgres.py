@@ -47,7 +47,11 @@ from cayu.core.billing import BillingIdentity, copy_billing_identity
 from cayu.core.events import EVENT_ID_MAX_CHARS, Event, EventType
 from cayu.core.messages import Message, MessageRole
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
-from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
+from cayu.embeddings import (
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    copy_text_embedding_result,
+)
 from cayu.runtime.aggregates import EXACT_AGGREGATE, UsageRollupStoreResult
 from cayu.runtime.approvals import (
     _PENDING_TOOL_APPROVAL_EVENT_PROJECTION_KEYS,
@@ -5775,11 +5779,13 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         missing = list(chunks) if refresh_existing else await self._missing_embedding_chunks(chunks)
         if not missing:
             return 0
-        result = await self.embedding_provider.embed_texts(
-            TextEmbeddingRequest(
-                model=self.embedding_model,
-                texts=[chunk.text for chunk in missing],
-                dimensions=self.embedding_dimensions,
+        result = copy_text_embedding_result(
+            await self.embedding_provider.embed_texts(
+                TextEmbeddingRequest(
+                    model=self.embedding_model,
+                    texts=[chunk.text for chunk in missing],
+                    dimensions=self.embedding_dimensions,
+                )
             )
         )
         if len(result.embeddings) != len(missing):
@@ -5864,11 +5870,13 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         return missing
 
     async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
-        result = await self.embedding_provider.embed_texts(
-            TextEmbeddingRequest(
-                model=self.embedding_model,
-                texts=[text],
-                dimensions=self.embedding_dimensions,
+        result = copy_text_embedding_result(
+            await self.embedding_provider.embed_texts(
+                TextEmbeddingRequest(
+                    model=self.embedding_model,
+                    texts=[text],
+                    dimensions=self.embedding_dimensions,
+                )
             )
         )
         embedding = next((item for item in result.embeddings if item.index == 0), None)

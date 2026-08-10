@@ -58,6 +58,13 @@ class CommandRequest(BaseModel):
     timeout_s: int
     stdin: str | None = None
 
+    @field_validator("command")
+    @classmethod
+    def copy_command(cls, value: ExecCommand) -> ExecCommand:
+        if type(value) is not ExecCommand:
+            raise TypeError("CommandRequest.command must be an ExecCommand.")
+        return ExecCommand.model_validate(value.model_dump(mode="python"))
+
 
 class CommandPolicyResult(BaseModel):
     """Authorization decision for one exec_command invocation."""

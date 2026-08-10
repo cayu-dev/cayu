@@ -93,7 +93,7 @@ class ScriptedModelProvider(ModelProvider):
         return self._operation_adapter.complete(operation_id)
 
     def _consume_batch(self, request: ModelRequest) -> tuple[ModelStreamEvent, ...]:
-        self.requests.append(request)
+        self.requests.append(_copy_model_request(request))
         index = len(self.requests) - 1
         if index >= len(self._batches):
             raise AssertionError(f"No scripted model event batch for request {index}.")
@@ -252,7 +252,13 @@ def _normalize_batches(
 def _require_model_event(value: object) -> ModelStreamEvent:
     if type(value) is not ModelStreamEvent:
         raise TypeError("ScriptedModelProvider batches must contain ModelStreamEvent values.")
-    return value
+    return ModelStreamEvent.model_validate(value.model_dump(mode="python"))
+
+
+def _copy_model_request(request: ModelRequest) -> ModelRequest:
+    if type(request) is not ModelRequest:
+        raise TypeError("ScriptedModelProvider requests must be ModelRequest values.")
+    return ModelRequest.model_validate(request.model_dump(mode="python"))
 
 
 def _require_complete_batch(batch: tuple[ModelStreamEvent, ...]) -> tuple[ModelStreamEvent, ...]:

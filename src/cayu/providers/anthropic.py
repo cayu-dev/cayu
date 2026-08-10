@@ -70,7 +70,7 @@ from cayu.providers.cache import (
     resolve_cache_policy,
 )
 from cayu.proxies import CredentialProxy
-from cayu.vaults import SecretRef
+from cayu.vaults import SecretRef, copy_secret_ref
 
 if TYPE_CHECKING:
     import httpx
@@ -435,7 +435,7 @@ class AnthropicProvider(ModelProvider):
                     "deferred resolution."
                 ),
             )
-        self.api_key_ref = api_key_ref
+        self.api_key_ref = None if api_key_ref is None else copy_secret_ref(api_key_ref)
         self.credential_proxy = credential_proxy
         self.base_url = _validate_base_url(base_url)
         self.anthropic_version = require_clean_nonblank(
@@ -464,7 +464,11 @@ class AnthropicProvider(ModelProvider):
         self.extra_headers = _copy_headers(extra_headers)
         if cache_policy is not None and type(cache_policy) is not CachePolicy:
             raise TypeError("cache_policy must be a CachePolicy.")
-        self.cache_policy = cache_policy
+        self.cache_policy = (
+            None
+            if cache_policy is None
+            else CachePolicy.model_validate(cache_policy.model_dump(mode="python"))
+        )
 
     async def aclose(self) -> None:
         """Close the transport's shared HTTP client, if it owns one."""

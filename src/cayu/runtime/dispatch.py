@@ -103,6 +103,11 @@ class DispatchRequest(BaseModel):
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
         return copy_request_budget_limits(value)
 
+    @field_validator("limits")
+    @classmethod
+    def copy_limits(cls, value: RunLimits) -> RunLimits:
+        return copy_run_limits(value)
+
     @field_validator("loop_policies", mode="before")
     @classmethod
     def copy_loop_policies(cls, value) -> tuple[LoopPolicy, ...]:

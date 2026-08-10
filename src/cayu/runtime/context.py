@@ -45,7 +45,7 @@ from cayu.artifacts import (
     FileAttachmentKind,
     file_attachment_from_payload,
 )
-from cayu.core.agents import AgentSpec
+from cayu.core.agents import AgentSpec, copy_agent_spec
 from cayu.core.billing import (
     BillingIdentity,
 )
@@ -92,7 +92,7 @@ from cayu.runtime.execution_units import (
     strip_runtime_owned_execution_identity,
 )
 from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy, retry_decision
-from cayu.runtime.sessions import Session
+from cayu.runtime.sessions import Session, copy_session
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 from cayu.runtime.usage import (
     ModelCompletionPurpose,
@@ -748,6 +748,16 @@ class ContextRequest(BaseModel):
     @classmethod
     def copy_messages(cls, value):
         return [copy_message(message) for message in value]
+
+    @field_validator("session")
+    @classmethod
+    def copy_session_contract(cls, value: Session) -> Session:
+        return copy_session(value)
+
+    @field_validator("agent")
+    @classmethod
+    def copy_agent_contract(cls, value: AgentSpec) -> AgentSpec:
+        return copy_agent_spec(value)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -2176,6 +2186,16 @@ class CompactionRequest(BaseModel):
     @classmethod
     def copy_messages(cls, value):
         return [copy_message(message) for message in value]
+
+    @field_validator("session")
+    @classmethod
+    def copy_session_contract(cls, value: Session) -> Session:
+        return copy_session(value)
+
+    @field_validator("agent")
+    @classmethod
+    def copy_agent_contract(cls, value: AgentSpec) -> AgentSpec:
+        return copy_agent_spec(value)
 
     @field_validator("context_messages")
     @classmethod

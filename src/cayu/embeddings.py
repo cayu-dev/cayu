@@ -9,8 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
-    require_clean_nonblank,
-    require_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
 )
 
 
@@ -27,7 +27,7 @@ class TextEmbeddingRequest(BaseModel):
     @field_validator("model")
     @classmethod
     def validate_model(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("texts")
     @classmethod
@@ -35,7 +35,7 @@ class TextEmbeddingRequest(BaseModel):
         if not value:
             raise ValueError(f"`{info.field_name}` cannot be empty.")
         return [
-            require_nonblank(text, f"{info.field_name}[{index}]")
+            require_durable_nonblank(text, f"{info.field_name}[{index}]")
             for index, text in enumerate(value)
         ]
 
@@ -128,7 +128,20 @@ class TextEmbeddingResult(BaseModel):
     @field_validator("model")
     @classmethod
     def validate_model(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("embeddings")
+    @classmethod
+    def copy_embeddings(cls, value: list[TextEmbedding]) -> list[TextEmbedding]:
+        return [copy_text_embedding(embedding) for embedding in value]
+
+    @field_validator("usage")
+    @classmethod
+    def copy_usage(
+        cls,
+        value: TextEmbeddingUsage | None,
+    ) -> TextEmbeddingUsage | None:
+        return copy_text_embedding_usage(value)
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -158,6 +171,26 @@ class TextEmbeddingProvider(ABC):
         """Embed text inputs and return one vector for each input."""
 
 
+def copy_text_embedding(embedding: TextEmbedding) -> TextEmbedding:
+    if type(embedding) is not TextEmbedding:
+        raise TypeError("Embedding copies require TextEmbedding instances.")
+    return TextEmbedding(index=embedding.index, vector=list(embedding.vector))
+
+
+def copy_text_embedding_usage(
+    usage: TextEmbeddingUsage | None,
+) -> TextEmbeddingUsage | None:
+    if usage is None:
+        return None
+    if type(usage) is not TextEmbeddingUsage:
+        raise TypeError("Embedding usage copies require TextEmbeddingUsage instances.")
+    return TextEmbeddingUsage(
+        input_tokens=usage.input_tokens,
+        total_tokens=usage.total_tokens,
+        metadata=copy_json_value(usage.metadata, "usage.metadata"),
+    )
+
+
 def copy_text_embedding_request(request: TextEmbeddingRequest) -> TextEmbeddingRequest:
     if type(request) is not TextEmbeddingRequest:
         raise TypeError("TextEmbeddingRequest instances must not be subclasses.")
@@ -172,19 +205,9 @@ def copy_text_embedding_request(request: TextEmbeddingRequest) -> TextEmbeddingR
 def copy_text_embedding_result(result: TextEmbeddingResult) -> TextEmbeddingResult:
     if type(result) is not TextEmbeddingResult:
         raise TypeError("TextEmbeddingResult instances must not be subclasses.")
-    usage = None
-    if result.usage is not None:
-        usage = TextEmbeddingUsage(
-            input_tokens=result.usage.input_tokens,
-            total_tokens=result.usage.total_tokens,
-            metadata=copy_json_value(result.usage.metadata, "usage.metadata"),
-        )
     return TextEmbeddingResult(
         model=result.model,
-        embeddings=[
-            TextEmbedding(index=embedding.index, vector=list(embedding.vector))
-            for embedding in result.embeddings
-        ],
-        usage=usage,
+        embeddings=[copy_text_embedding(embedding) for embedding in result.embeddings],
+        usage=copy_text_embedding_usage(result.usage),
         metadata=copy_json_value(result.metadata, "metadata"),
     )

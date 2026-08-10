@@ -24,7 +24,11 @@ from cayu._validation import (
 from cayu._validation import (
     require_durable_nonblank as require_nonblank,
 )
-from cayu.embeddings import TextEmbeddingProvider, TextEmbeddingRequest
+from cayu.embeddings import (
+    TextEmbeddingProvider,
+    TextEmbeddingRequest,
+    copy_text_embedding_result,
+)
 
 DEFAULT_KNOWLEDGE_NAMESPACE = "default"
 DEFAULT_KNOWLEDGE_KIND = "fact"
@@ -1285,11 +1289,13 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         missing = [chunk for chunk in chunks if not self._has_current_embedding(chunk)]
         if not missing:
             return
-        result = await self.embedding_provider.embed_texts(
-            TextEmbeddingRequest(
-                model=self.embedding_model,
-                texts=[chunk.text for chunk in missing],
-                dimensions=self.embedding_dimensions,
+        result = copy_text_embedding_result(
+            await self.embedding_provider.embed_texts(
+                TextEmbeddingRequest(
+                    model=self.embedding_model,
+                    texts=[chunk.text for chunk in missing],
+                    dimensions=self.embedding_dimensions,
+                )
             )
         )
         if len(result.embeddings) != len(missing):
@@ -1309,11 +1315,13 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             }
 
     async def _embed_query(self, query: KnowledgeQuery, text: str) -> list[float]:
-        result = await self.embedding_provider.embed_texts(
-            TextEmbeddingRequest(
-                model=self.embedding_model,
-                texts=[text],
-                dimensions=self.embedding_dimensions,
+        result = copy_text_embedding_result(
+            await self.embedding_provider.embed_texts(
+                TextEmbeddingRequest(
+                    model=self.embedding_model,
+                    texts=[text],
+                    dimensions=self.embedding_dimensions,
+                )
             )
         )
         embedding = next((item for item in result.embeddings if item.index == 0), None)

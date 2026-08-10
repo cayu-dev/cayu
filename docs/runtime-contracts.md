@@ -14,6 +14,16 @@ Public specifications, runtime decisions and contexts, workspace bindings, envir
 
 Runtime APIs copy contract objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state. Session stores return isolated transcript copies: messages loaded from a store share no mutable payload state with the stored transcript, and messages passed to append cannot rewrite stored history after the fact.
 
+Invocation admission applies the same ownership rule to nested contract models, not
+only JSON containers. `CommandRequest` owns its `ExecCommand`; dispatch, run, and
+resume requests own their `RunLimits`; and context/compaction requests own detached
+session and agent snapshots. Live infrastructure handles on a `ContextRequest`, such
+as a knowledge store or callback, remain handles and are deliberately not deep-copied.
+Provider configuration follows that split: `AnthropicProvider` snapshots its cache
+policy and unresolved `SecretRef`, while retaining the explicitly supplied transport
+and credential-proxy handles. `ScriptedModelProvider` snapshots configured events and
+records detached request history so tests can inspect stable request-aware evidence.
+
 ## Root checkpoint schema compatibility
 
 The runtime-owned root checkpoint object carries
@@ -5274,6 +5284,13 @@ endpoint. The returned `TextEmbeddingResult` contains copied float vectors and
 provider-reported usage when the provider returns it. Embedding calls are normal
 provider API calls: apps should treat their latency, rate limits, retention, and
 billing as provider-specific behavior.
+
+Embedding model identities and every input text must be portable durable text: NUL
+and lone surrogate code points fail at request/result construction. A
+`TextEmbeddingResult` owns detached copies of every embedding vector and usage record,
+so later provider or caller mutation cannot rewrite completed evidence. Embedding-backed
+stores revalidate the provider result at the consumption boundary; a provider cannot
+bypass vector, index, dimension, or finite-number validation with an unvalidated model.
 
 `KnowledgeIndexer` is the deterministic local indexing helper for app-owned text.
 It is not an agent and does not connect to remote memory systems. It converts one

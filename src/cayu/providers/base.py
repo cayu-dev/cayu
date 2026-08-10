@@ -452,6 +452,14 @@ class ModelStreamEvent(BaseModel):
         # validate strictly before any transcript, event, or checkpoint write.
         return copy_json_value(value, "payload")
 
+    @field_validator("completion")
+    @classmethod
+    def copy_completion(
+        cls,
+        value: ModelCompletion | None,
+    ) -> ModelCompletion | None:
+        return copy_model_completion(value)
+
     @field_validator("type", mode="before")
     @classmethod
     def validate_type(cls, value: object) -> ModelStreamEventType:

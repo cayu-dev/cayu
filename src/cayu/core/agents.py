@@ -106,3 +106,11 @@ class Agent(ABC):
         ``async for event in agent.run(messages)`` — instead of some callers
         needing ``await agent.run(...)`` first.
         """
+
+
+def copy_agent_spec(spec: AgentSpec) -> AgentSpec:
+    """Validate and detach one already-constructed agent specification."""
+
+    if type(spec) is not AgentSpec:
+        raise TypeError("Agent specification copy requires an AgentSpec.")
+    return AgentSpec.model_validate(spec.model_dump(mode="python"))
