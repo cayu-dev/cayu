@@ -705,7 +705,7 @@ def _normalized_finish_reason(
         return ModelFinishReason.UNKNOWN
     if raw_finish_reason in {"stop", "end_turn", "stop_sequence"}:
         return ModelFinishReason.STOP
-    if raw_finish_reason in {"tool_calls", "tool_use"}:
+    if raw_finish_reason in {"function_call", "tool_calls", "tool_use"}:
         return ModelFinishReason.TOOL_CALLS
     if raw_finish_reason in {
         "length",

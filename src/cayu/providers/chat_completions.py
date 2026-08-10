@@ -576,6 +576,7 @@ async def chat_completions_stream_events(
     tool_calls = _ToolCallAccumulator()
     response_id: str | None = None
     model: str | None = None
+    choice_index: int | None = None
     finish_reason: str | None = None
     usage: Any = None
     post_terminal_failure: BaseException | None = None
@@ -638,41 +639,61 @@ async def chat_completions_stream_events(
             continue
         if not isinstance(choices, list):
             raise ChatCompletionsProtocolError("Chat Completions choices must be a list.")
-        for choice in choices:
-            if not isinstance(choice, Mapping):
-                raise ChatCompletionsProtocolError("Chat Completions choice must be an object.")
-            delta = choice.get("delta")
-            if delta is not None:
-                if not isinstance(delta, Mapping):
-                    raise ChatCompletionsProtocolError("Chat Completions delta must be an object.")
-                reasoning = delta.get("reasoning_content")
-                if not (isinstance(reasoning, str) and reasoning):
-                    # Fall back to `reasoning` unless reasoning_content is a non-empty
-                    # string, so an empty/absent reasoning_content can't shadow it.
-                    reasoning = delta.get("reasoning")
-                if isinstance(reasoning, str) and reasoning:
-                    # Display-only reasoning surfaced by OpenAI-compatible reasoning
-                    # providers (DeepSeek/OpenRouter); no round-trip state.
-                    yield ModelStreamEvent.thinking(reasoning)
-                content = delta.get("content")
-                if content is not None:
-                    if not isinstance(content, str):
-                        raise ChatCompletionsProtocolError(
-                            "Chat Completions delta content must be a string."
-                        )
-                    if content:
-                        yield ModelStreamEvent.text_delta(content)
-                tool_calls.record(delta.get("tool_calls"))
-            choice_finish = choice.get("finish_reason")
-            if choice_finish is not None:
-                if not isinstance(choice_finish, str):
+        if len(choices) > 1:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions stream emitted multiple choices in one chunk."
+            )
+        if not choices:
+            continue
+        choice = choices[0]
+        if not isinstance(choice, Mapping):
+            raise ChatCompletionsProtocolError("Chat Completions choice must be an object.")
+        chunk_choice_index = choice.get("index")
+        if chunk_choice_index is not None:
+            if type(chunk_choice_index) is not int or chunk_choice_index < 0:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions choice index must be a non-negative integer."
+                )
+            if choice_index is not None and chunk_choice_index != choice_index:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions stream emitted conflicting choice indexes."
+                )
+            choice_index = chunk_choice_index
+        delta = choice.get("delta")
+        if delta is not None:
+            if not isinstance(delta, Mapping):
+                raise ChatCompletionsProtocolError("Chat Completions delta must be an object.")
+            reasoning = delta.get("reasoning_content")
+            if not (isinstance(reasoning, str) and reasoning):
+                # Fall back to `reasoning` unless reasoning_content is a non-empty
+                # string, so an empty/absent reasoning_content can't shadow it.
+                reasoning = delta.get("reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                # Display-only reasoning surfaced by OpenAI-compatible reasoning
+                # providers (DeepSeek/OpenRouter); no round-trip state.
+                yield ModelStreamEvent.thinking(reasoning)
+            content = delta.get("content")
+            if content is not None:
+                if not isinstance(content, str):
                     raise ChatCompletionsProtocolError(
-                        "Chat Completions finish_reason must be a string."
+                        "Chat Completions delta content must be a string."
                     )
-                if finish_reason is not None and choice_finish != finish_reason:
-                    raise ChatCompletionsProtocolError(
-                        "Chat Completions stream emitted conflicting finish_reason values."
-                    )
+                if content:
+                    yield ModelStreamEvent.text_delta(content)
+            tool_calls.record(delta.get("tool_calls"))
+        choice_finish = choice.get("finish_reason")
+        if choice_finish is not None:
+            if not isinstance(choice_finish, str):
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions finish_reason must be a string."
+                )
+            if finish_reason is not None and _canonical_chat_finish_reason(
+                choice_finish
+            ) != _canonical_chat_finish_reason(finish_reason):
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions stream emitted conflicting finish_reason values."
+                )
+            if finish_reason is None:
                 finish_reason = choice_finish
 
     # Tool calls are emitted once, after the upstream stream, before Cayu's terminal
@@ -806,8 +827,13 @@ def _tool_call_names_function(tool_call: Mapping[str, Any]) -> bool:
     return _optional_string(function, "name") is not None
 
 
+def _canonical_chat_finish_reason(value: str) -> str:
+    return "tool_calls" if value == "function_call" else value
+
+
 class _PendingToolCall:
     def __init__(self) -> None:
+        self.index: int | None = None
         self.call_id: str | None = None
         self.name: str | None = None
         self.arguments_parts: list[str] = []
@@ -823,15 +849,16 @@ class _ToolCallAccumulator:
 
     Providers correlate fragments differently. OpenAI puts an ``index`` on each
     ``tool_calls[]`` entry; Gemini's OpenAI-compatible endpoint omits it and
-    sends the complete call (with an ``id``) in a single delta. We key by the
-    per-call ``index`` when present, else by ``id``, else fall back to the most
-    recent slot (a continuation fragment), preserving first-seen order.
+    sends the complete call (with an ``id``) in a single delta. Index and ID are
+    aliases only after one fragment proves that they identify the same call.
+    Keyless argument-only fragments retain the compatible most-recent fallback.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[Any, _PendingToolCall] = {}
-        self._next_sequence = 0
-        self._last_key: Any = None
+        self._pending: list[_PendingToolCall] = []
+        self._by_index: dict[int, _PendingToolCall] = {}
+        self._by_id: dict[str, _PendingToolCall] = {}
+        self._last_pending: _PendingToolCall | None = None
 
     def record(self, tool_calls: Any) -> None:
         if tool_calls is None:
@@ -842,10 +869,7 @@ class _ToolCallAccumulator:
             if not isinstance(tool_call, Mapping):
                 raise ChatCompletionsProtocolError("Chat Completions tool_call must be an object.")
             call_id = _optional_string(tool_call, "id")
-            key = self._key_for(tool_call, call_id)
-            pending = self._pending.setdefault(key, _PendingToolCall())
-            if call_id is not None:
-                pending.call_id = call_id
+            pending = self._pending_for(tool_call, call_id)
             extra_content = tool_call.get("extra_content")
             if extra_content is not None:
                 if not isinstance(extra_content, Mapping):
@@ -862,6 +886,10 @@ class _ToolCallAccumulator:
                 )
             name = _optional_string(function, "name")
             if name is not None:
+                if pending.name is not None:
+                    raise ChatCompletionsProtocolError(
+                        "Chat Completions tool_call emitted more than one function name."
+                    )
                 pending.name = name
             arguments = function.get("arguments")
             if arguments is not None:
@@ -871,35 +899,67 @@ class _ToolCallAccumulator:
                     )
                 pending.arguments_parts.append(arguments)
 
-    def _key_for(self, tool_call: Mapping[str, Any], call_id: str | None) -> Any:
+    def _pending_for(
+        self,
+        tool_call: Mapping[str, Any],
+        call_id: str | None,
+    ) -> _PendingToolCall:
         index = tool_call.get("index")
-        if index is not None:
-            if type(index) is not int or index < 0:
-                raise ChatCompletionsProtocolError(
-                    "Chat Completions tool_call index must be a non-negative integer."
-                )
-            key: Any = ("index", index)
-        elif call_id is not None:
-            key = ("id", call_id)
-        elif self._last_key is not None and not _tool_call_names_function(tool_call):
+        if index is not None and (type(index) is not int or index < 0):
+            raise ChatCompletionsProtocolError(
+                "Chat Completions tool_call index must be a non-negative integer."
+            )
+        indexed = self._by_index.get(index) if index is not None else None
+        identified = self._by_id.get(call_id) if call_id is not None else None
+        if indexed is not None and identified is not None and indexed is not identified:
+            raise ChatCompletionsProtocolError(
+                "Chat Completions tool_call index and id identify different calls."
+            )
+        pending = indexed or identified
+        if pending is None and (
+            index is None
+            and call_id is None
+            and self._last_pending is not None
+            and not _tool_call_names_function(tool_call)
+        ):
             # A keyless fragment that names no function continues the most recent
             # call (providers stream arguments across chunks that carry only the
             # index-less function.arguments). One that *does* name a function is a
             # distinct call, so fall through to a fresh slot instead of merging it
             # into the previous call's arguments.
-            return self._last_key
-        else:
-            key = ("sequence", self._next_sequence)
-            self._next_sequence += 1
-        self._last_key = key
-        return key
+            pending = self._last_pending
+        if pending is None:
+            pending = _PendingToolCall()
+            self._pending.append(pending)
+        if index is not None:
+            if pending.index is not None and pending.index != index:
+                raise ChatCompletionsProtocolError("Chat Completions tool_call id changed indexes.")
+            existing = self._by_index.get(index)
+            if existing is not None and existing is not pending:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions tool_call index identifies multiple calls."
+                )
+            pending.index = index
+            self._by_index[index] = pending
+        if call_id is not None:
+            if pending.call_id is not None and pending.call_id != call_id:
+                raise ChatCompletionsProtocolError("Chat Completions tool_call index changed ids.")
+            existing = self._by_id.get(call_id)
+            if existing is not None and existing is not pending:
+                raise ChatCompletionsProtocolError(
+                    "Chat Completions tool_call id identifies multiple calls."
+                )
+            pending.call_id = call_id
+            self._by_id[call_id] = pending
+        self._last_pending = pending
+        return pending
 
     def has_pending(self) -> bool:
         return bool(self._pending)
 
     def events(self) -> list[ModelStreamEvent]:
         tool_call_events: list[ModelStreamEvent] = []
-        for position, pending in enumerate(self._pending.values()):
+        for position, pending in enumerate(self._pending):
             if pending.call_id is None or not pending.call_id.strip():
                 raise ChatCompletionsProtocolError(
                     f"Chat Completions tool_call {position} is missing an id."
@@ -930,7 +990,7 @@ class _ToolCallAccumulator:
 
     def provider_state_items(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        for pending in self._pending.values():
+        for pending in self._pending:
             if pending.extra_content is None:
                 continue
             if pending.call_id is None or not pending.call_id.strip():

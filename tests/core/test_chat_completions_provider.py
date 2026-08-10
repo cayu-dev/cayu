@@ -35,6 +35,7 @@ from cayu.providers import (
     ModelContextOverflowError,
     ModelFinishReason,
     ModelRequest,
+    ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
     build_chat_completions_payload,
@@ -138,6 +139,50 @@ def _usage_chunk(usage: dict[str, Any]) -> dict[str, Any]:
         "choices": [],
         "usage": usage,
     }
+
+
+def _tool_call_chunk(
+    tool_calls: list[dict[str, Any]],
+    *,
+    finish_reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"tool_calls": tool_calls},
+                "finish_reason": finish_reason,
+            }
+        ]
+    }
+
+
+def _interleaved_correlated_tool_call_chunks() -> list[Mapping[str, Any]]:
+    return [
+        _tool_call_chunk(
+            [
+                {
+                    "index": 0,
+                    "function": {"name": "alpha", "arguments": '{"value":'},
+                }
+            ]
+        ),
+        _tool_call_chunk(
+            [
+                {
+                    "id": "call_b",
+                    "function": {"name": "beta", "arguments": '{"value":'},
+                }
+            ]
+        ),
+        _tool_call_chunk([{"index": 0, "id": "call_a", "function": {"arguments": "1"}}]),
+        _tool_call_chunk([{"index": 1, "id": "call_b", "function": {"arguments": "2"}}]),
+        _tool_call_chunk([{"id": "call_a", "function": {"arguments": "}"}}]),
+        _tool_call_chunk(
+            [{"index": 1, "function": {"arguments": "}"}}],
+            finish_reason="tool_calls",
+        ),
+    ]
 
 
 def test_build_chat_completions_payload_translates_cayu_messages() -> None:
@@ -778,6 +823,92 @@ async def test_provider_emits_tool_call_events() -> None:
 
 
 @pytest.mark.anyio
+async def test_provider_correlates_interleaved_tool_call_identity_transitions() -> None:
+    transport = RecordingTransport(stream_events=[_interleaved_correlated_tool_call_chunks()])
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="openai_chat",
+        transport=transport,
+    )
+    request = ModelRequest(
+        model="compatible-model",
+        messages=[Message.text("user", "Use both tools.")],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert events[0].payload == {
+        "id": "call_a",
+        "name": "alpha",
+        "arguments": {"value": 1},
+    }
+    assert events[1].payload == {
+        "id": "call_b",
+        "name": "beta",
+        "arguments": {"value": 2},
+    }
+
+
+@pytest.mark.anyio
+async def test_provider_rejects_multiple_choices_before_tool_call_emission() -> None:
+    transport = RecordingTransport(
+        stream_events=[
+            [
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_a",
+                                        "function": {"name": "alpha", "arguments": "{}"},
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        },
+                        {
+                            "index": 1,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_b",
+                                        "function": {"name": "beta", "arguments": "{}"},
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        },
+                    ]
+                }
+            ]
+        ]
+    )
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        name="openai_chat",
+        transport=transport,
+    )
+    request = ModelRequest(
+        model="compatible-model",
+        messages=[Message.text("user", "Use a tool.")],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.ERROR]
+    assert events[0].payload["error_type"] == "ChatCompletionsProtocolError"
+
+
+@pytest.mark.anyio
 async def test_provider_round_trips_runtime_tool_results() -> None:
     transport = RecordingTransport(
         stream_events=[
@@ -905,6 +1036,204 @@ async def test_chat_completions_stream_events_accumulates_tool_call_fragments() 
 
 
 @pytest.mark.anyio
+async def test_chat_completions_stream_events_correlates_interleaved_aliases() -> None:
+    async def raw_events():
+        for chunk in _interleaved_correlated_tool_call_chunks():
+            yield chunk
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.TOOL_CALL,
+        ModelStreamEventType.COMPLETED,
+    ]
+    assert [event.payload for event in events[:2]] == [
+        {"id": "call_a", "name": "alpha", "arguments": {"value": 1}},
+        {"id": "call_b", "name": "beta", "arguments": {"value": 2}},
+    ]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_rejects_multiple_choices_before_deltas() -> None:
+    observed: list[ModelStreamEvent] = []
+
+    async def raw_events():
+        yield {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": "candidate zero"},
+                    "finish_reason": "stop",
+                },
+                {
+                    "index": 1,
+                    "delta": {"content": "candidate one"},
+                    "finish_reason": "stop",
+                },
+            ]
+        }
+
+    with pytest.raises(ChatCompletionsProtocolError, match="multiple choices"):
+        async for event in chat_completions_stream_events(raw_events()):
+            observed.append(event)
+
+    assert observed == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("choice_index", [True, -1, 0.0, "0", [], {}])
+async def test_chat_completions_stream_events_rejects_invalid_choice_index(
+    choice_index: object,
+) -> None:
+    async def raw_events():
+        yield {
+            "choices": [
+                {
+                    "index": choice_index,
+                    "delta": {},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    with pytest.raises(ChatCompletionsProtocolError, match="choice index"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_rejects_changed_choice_index() -> None:
+    observed: list[ModelStreamEvent] = []
+
+    async def raw_events():
+        yield _text_chunk("candidate zero")
+        yield {
+            "choices": [
+                {
+                    "index": 1,
+                    "delta": {"content": "candidate one"},
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+    with pytest.raises(ChatCompletionsProtocolError, match="conflicting choice indexes"):
+        async for event in chat_completions_stream_events(raw_events()):
+            observed.append(event)
+
+    assert [event.delta for event in observed] == ["candidate zero"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool_call_chunks", "message"),
+    [
+        (
+            [
+                [
+                    {
+                        "index": 0,
+                        "id": "call_a",
+                        "function": {"name": "alpha", "arguments": "{}"},
+                    }
+                ],
+                [{"index": 0, "id": "call_b"}],
+            ],
+            "changed ids",
+        ),
+        (
+            [
+                [
+                    {
+                        "index": 0,
+                        "id": "call_a",
+                        "function": {"name": "alpha", "arguments": "{}"},
+                    }
+                ],
+                [{"index": 1, "id": "call_a"}],
+            ],
+            "changed indexes",
+        ),
+        (
+            [
+                [
+                    {
+                        "index": 0,
+                        "id": "call_a",
+                        "function": {"name": "alpha", "arguments": "{}"},
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_b",
+                        "function": {"name": "beta", "arguments": "{}"},
+                    },
+                ],
+                [{"index": 0, "id": "call_b"}],
+            ],
+            "identify different calls",
+        ),
+    ],
+)
+async def test_chat_completions_stream_events_rejects_tool_call_alias_conflicts(
+    tool_call_chunks: list[list[dict[str, Any]]],
+    message: str,
+) -> None:
+    async def raw_events():
+        for tool_calls in tool_call_chunks:
+            yield _tool_call_chunk(tool_calls)
+
+    with pytest.raises(ChatCompletionsProtocolError, match=message):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_rejects_duplicate_function_names() -> None:
+    async def raw_events():
+        yield _tool_call_chunk(
+            [
+                {
+                    "index": 0,
+                    "id": "call_a",
+                    "function": {"name": "alpha", "arguments": ""},
+                }
+            ]
+        )
+        yield _tool_call_chunk([{"index": 0, "function": {"name": "alpha", "arguments": "{}"}}])
+
+    with pytest.raises(ChatCompletionsProtocolError, match="more than one function name"):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool_call", "message"),
+    [
+        (
+            {"index": 0, "function": {"name": "alpha", "arguments": "{}"}},
+            "missing an id",
+        ),
+        (
+            {
+                "index": 0,
+                "id": "call_a",
+                "function": {"name": "alpha", "arguments": "{"},
+            },
+            "not valid JSON",
+        ),
+    ],
+)
+async def test_chat_completions_stream_events_preserves_terminal_tool_call_validation(
+    tool_call: dict[str, Any],
+    message: str,
+) -> None:
+    async def raw_events():
+        yield _tool_call_chunk([tool_call], finish_reason="tool_calls")
+
+    with pytest.raises(ChatCompletionsProtocolError, match=message):
+        [event async for event in chat_completions_stream_events(raw_events())]
+
+
+@pytest.mark.anyio
 async def test_chat_completions_stream_events_handles_gemini_tool_call_without_index() -> None:
     # Gemini's OpenAI-compatible endpoint omits the per-tool-call ``index`` and
     # delivers the complete call (with an ``id``) in a single delta. The index
@@ -1009,6 +1338,20 @@ async def test_chat_completions_stream_events_preserves_gemini_tool_call_extra_c
             },
         }
     ]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_stream_events_normalizes_legacy_function_call_finish() -> None:
+    async def raw_events():
+        yield _finish_chunk("function_call")
+        yield _finish_chunk("tool_calls")
+
+    events = [event async for event in chat_completions_stream_events(raw_events())]
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    assert events[0].completion is not None
+    assert events[0].completion.finish_reason == ModelFinishReason.TOOL_CALLS
+    assert events[0].completion.raw_finish_reason == "function_call"
 
 
 @pytest.mark.anyio

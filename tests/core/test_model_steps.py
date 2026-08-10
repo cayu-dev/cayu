@@ -60,6 +60,9 @@ def test_normalize_model_completion_maps_common_provider_reasons() -> None:
         normalize_model_completion({"stop_reason": "tool_use"}).finish_reason
         == ModelFinishReason.TOOL_CALLS
     )
+    legacy = normalize_model_completion({"finish_reason": "function_call"})
+    assert legacy.finish_reason == ModelFinishReason.TOOL_CALLS
+    assert legacy.raw_finish_reason == "function_call"
     assert (
         normalize_model_completion(
             {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}

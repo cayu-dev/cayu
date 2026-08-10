@@ -3536,6 +3536,14 @@ provider-neutral tool strategy.
 Ollama or vLLM. `clean_schemas=True` removes schema keywords commonly rejected
 by compatible services.
 
+Each streamed Chat Completions chunk may carry at most one choice, and a choice
+index cannot change across chunks. Streamed tool-call indexes and IDs become
+aliases only when one fragment supplies both consistently; a changed or
+cross-linked identity fails the model attempt before any tool call is emitted.
+Compatible keyless argument continuations still attach to the most recently
+accumulated call. The legacy `function_call` finish reason normalizes to
+provider-neutral `tool_calls` while remaining available as the raw reason.
+
 `VertexProvider` adapts Anthropic Messages through Google Cloud Vertex AI's
 regional raw-predict endpoint. Install `cayu[vertex]`, pass the GCP project and
 region, and provide explicit Google credentials or use Application Default
