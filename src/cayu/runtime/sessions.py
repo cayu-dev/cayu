@@ -3211,6 +3211,16 @@ class SessionOperationalSnapshot(BaseModel):
     counts_by_status: SessionStatusCounts
     accuracy: AggregateAccuracy
 
+    @field_validator("counts_by_status")
+    @classmethod
+    def copy_counts_by_status(cls, value: SessionStatusCounts) -> SessionStatusCounts:
+        return SessionStatusCounts.model_validate(value.model_dump(mode="python", warnings=False))
+
+    @field_validator("accuracy")
+    @classmethod
+    def copy_accuracy(cls, value: AggregateAccuracy) -> AggregateAccuracy:
+        return AggregateAccuracy.model_validate(value.model_dump(mode="python", warnings=False))
+
     @field_validator("as_of")
     @classmethod
     def normalize_as_of(cls, value: datetime) -> datetime:

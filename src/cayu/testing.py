@@ -20,6 +20,9 @@ from cayu._validation import (
     copy_durable_json_object,
     copy_json_value,
     require_clean_nonblank,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+    require_durable_text,
     require_nonblank,
 )
 from cayu.core.tools import ToolContext, ToolEffect, ToolResult
@@ -136,12 +139,12 @@ class ProviderCredentialIsolationVerification(BaseModel):
     @field_validator("adapter")
     @classmethod
     def validate_adapter(cls, value: str) -> str:
-        return require_clean_nonblank(value, "adapter")
+        return require_durable_clean_nonblank(value, "adapter")
 
     @field_validator("canary_labels", "positive_controls")
     @classmethod
     def normalize_names(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
-        names = tuple(require_clean_nonblank(item, info.field_name) for item in value)
+        names = tuple(require_durable_clean_nonblank(item, info.field_name) for item in value)
         if not names:
             raise ValueError(f"{info.field_name} must not be empty")
         if len(names) != len(set(names)):
@@ -151,7 +154,7 @@ class ProviderCredentialIsolationVerification(BaseModel):
     @field_validator("auth_search_labels")
     @classmethod
     def normalize_optional_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        names = tuple(require_clean_nonblank(item, "auth_search_labels") for item in value)
+        names = tuple(require_durable_clean_nonblank(item, "auth_search_labels") for item in value)
         if len(names) != len(set(names)):
             raise ValueError("auth_search_labels entries must be unique")
         return tuple(sorted(names))
@@ -750,12 +753,12 @@ class ToolEffectVerification(BaseModel):
     @field_validator("agent_name", "tool_name")
     @classmethod
     def validate_name(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name)
+        return require_durable_clean_nonblank(value, info.field_name)
 
     @field_validator("created_paths", "updated_paths", "deleted_paths")
     @classmethod
     def normalize_paths(cls, value: tuple[str, ...], info) -> tuple[str, ...]:
-        paths = tuple(require_nonblank(path, info.field_name) for path in value)
+        paths = tuple(require_durable_nonblank(path, info.field_name) for path in value)
         if len(paths) != len(set(paths)):
             raise ValueError(f"{info.field_name} entries must be unique")
         return tuple(sorted(paths))
@@ -763,7 +766,9 @@ class ToolEffectVerification(BaseModel):
     @field_validator("unobserved_systems")
     @classmethod
     def normalize_unobserved_systems(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        systems = tuple(require_clean_nonblank(item, "unobserved_systems") for item in value)
+        systems = tuple(
+            require_durable_clean_nonblank(item, "unobserved_systems") for item in value
+        )
         if len(systems) != len(set(systems)):
             raise ValueError("unobserved_systems entries must be unique")
         return tuple(sorted(systems))
@@ -773,7 +778,12 @@ class ToolEffectVerification(BaseModel):
     def validate_exception_type(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return require_clean_nonblank(value, "exception_type")
+        return require_durable_clean_nonblank(value, "exception_type")
+
+    @field_validator("limitations")
+    @classmethod
+    def validate_limitations(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(require_durable_text(item, "limitations") for item in value)
 
     @model_validator(mode="after")
     def validate_evidence(self) -> ToolEffectVerification:

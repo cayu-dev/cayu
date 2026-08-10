@@ -547,6 +547,18 @@ class PendingToolCallApprovalEventView(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     active_taint_labels: list[str] = Field(default_factory=list)
 
+    @field_validator("arguments", "metadata", mode="before")
+    @classmethod
+    def copy_json_fields(cls, value: dict[str, Any] | None, info):
+        if value is None:
+            return None
+        return copy_durable_json_value(value, info.field_name)
+
+    @field_validator("active_taint_labels", mode="before")
+    @classmethod
+    def copy_active_taint_labels(cls, value: list[str]) -> list[str]:
+        return list(value)
+
     @model_validator(mode="after")
     def validate_argument_projection(self) -> PendingToolCallApprovalEventView:
         if (self.arguments_state == "quarantined") != (self.arguments is None):
@@ -584,6 +596,64 @@ class PendingToolApprovalEventView(BaseModel):
     budget_limits: tuple[BudgetLimit, ...] | None = None
     retry_policy: RetryPolicy | None = None
     expires_at: datetime | None = None
+
+    @field_validator("arguments", "metadata", mode="before")
+    @classmethod
+    def copy_json_fields(cls, value: dict[str, Any] | None, info):
+        if value is None:
+            return None
+        return copy_durable_json_value(value, info.field_name)
+
+    @field_validator("tool_calls")
+    @classmethod
+    def copy_tool_calls(
+        cls,
+        value: list[PendingToolCallApprovalEventView],
+    ) -> list[PendingToolCallApprovalEventView]:
+        return [
+            PendingToolCallApprovalEventView.model_validate(
+                call.model_dump(mode="python", warnings=False)
+            )
+            for call in value
+        ]
+
+    @field_validator("structured_output")
+    @classmethod
+    def copy_structured_output(
+        cls,
+        value: StructuredOutputSpec | None,
+    ) -> StructuredOutputSpec | None:
+        return copy_structured_output_spec(value)
+
+    @field_validator("limits")
+    @classmethod
+    def copy_limits(cls, value: RunLimits | None) -> RunLimits | None:
+        if value is None:
+            return None
+        return copy_run_limits(value)
+
+    @field_validator("budget_limits", mode="before")
+    @classmethod
+    def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...] | None:
+        if value is None:
+            return None
+        return copy_budget_limits(value, field_name="budget_limits")
+
+    @field_validator("thinking")
+    @classmethod
+    def copy_thinking(cls, value: ThinkingConfig | None) -> ThinkingConfig | None:
+        if value is None:
+            return None
+        if type(value) is not ThinkingConfig:
+            raise TypeError("Thinking config must be a ThinkingConfig instance.")
+        return ThinkingConfig.model_validate(value.model_dump(mode="python"))
+
+    @field_validator("retry_policy")
+    @classmethod
+    def copy_retry(cls, value: RetryPolicy | None) -> RetryPolicy | None:
+        if value is None:
+            return None
+        return copy_retry_policy(value)
 
     @model_validator(mode="after")
     def validate_argument_projection(self) -> PendingToolApprovalEventView:

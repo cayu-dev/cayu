@@ -51,6 +51,7 @@ from cayu.runtime.approvals import (
     ToolApprovalDecision,
     ToolApprovalRequest,
     ToolPolicyEvidence,
+    copy_resolution_actor,
     pending_tool_call_for_approval_event,
 )
 from cayu.runtime.budgets import BudgetLimit
@@ -447,6 +448,17 @@ class BusinessApprovalRecord:
     expired: bool
     requested_at: datetime | None
     resolved_at: datetime | None
+
+    def __post_init__(self) -> None:
+        if self.routing is not None:
+            object.__setattr__(
+                self,
+                "routing",
+                BusinessApprovalRouting.model_validate(
+                    self.routing.model_dump(mode="python", warnings=False)
+                ),
+            )
+        object.__setattr__(self, "resolved_by", copy_resolution_actor(self.resolved_by))
 
     @property
     def pending(self) -> bool:

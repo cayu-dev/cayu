@@ -12,6 +12,16 @@ Core message parts, tool results, events, model requests, session/task stores, c
 
 Public specifications, runtime decisions and contexts, workspace bindings, environment factory inputs and results, eval and embedding records, secret references, proxy decisions, and virtual credential grants apply the same portable-value contract to their metadata and options at construction. These constructors normalize integral floats and take an owned copy immediately, so invalid or subsequently mutated extension data cannot enter runtime state through an otherwise valid public value object.
 
+Verification evidence follows that boundary too. `ToolEffectVerification` and
+`ProviderCredentialIsolationVerification` reject NUL and lone surrogate code
+points in every public text field and in each text collection item, while
+preserving ordinary Unicode. Public operational projections are owned
+snapshots: `RunOutcome` copies its events, payloads, and validated structured
+output; task/session operational snapshots copy their status counts and
+accuracy; and business-approval records copy their routing evidence and
+resolver actor, including nested claims. Mutating an accepted source model
+therefore cannot rewrite evidence already returned to a caller.
+
 Runtime APIs copy contract objects at boundaries. User code should not mutate registered specs, request objects, message parts, event payloads, tool results, or provider events and expect those mutations to change already-registered or already-emitted runtime state. Session stores return isolated transcript copies: messages loaded from a store share no mutable payload state with the stored transcript, and messages passed to append cannot rewrite stored history after the fact.
 
 Invocation admission applies the same ownership rule to nested contract models, not
@@ -680,6 +690,15 @@ those aliases directly to the resolution or recovery request: the public
 `CayuApp` method resolves each one against the exact durable event and session
 before any coordination decision. Non-actionable execution identities remain
 private markers.
+
+The two approval-event view models detach their JSON arguments and metadata at
+construction. A `PendingToolApprovalEventView` also detaches each supplied
+`PendingToolCallApprovalEventView`, so later mutation of a previously validated
+call view cannot rewrite the round-level approval projection. Its mutable
+continuation contracts (`structured_output`, `limits`, and `budget_limits`) are
+likewise rebuilt as validated owned snapshots. `ThinkingConfig` is revalidated
+into the exact frozen base contract, while `RetryPolicy` uses its canonical
+exact-type immutable boundary; mutable subclasses of either are rejected.
 
 `ToolApprovalRequest.decision` uses `ToolApprovalDecision`; manual recovery uses
 `ToolApprovalRecoveryOutcome`. These enums are the public typed values for the
@@ -2234,6 +2253,11 @@ validated JSON `null` from no validated output. Tests can use
 `scripted_structured_output(value)` with `ScriptedModelProvider` to exercise the
 tool strategy without importing or reproducing Cayu's reserved submission-tool
 wire protocol.
+
+The returned event tuple and structured-output result are detached snapshots,
+including nested event payloads and structured JSON values. Callers may retain
+them as evidence without subsequent mutation of their source objects changing
+the recorded outcome.
 
 When a caller already has a loaded transcript, `final_output_text(transcript)`
 returns the concatenated text from the most recent assistant message that

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from cayu._validation import copy_json_value
-from cayu.core.events import Event, EventType
+from cayu.core.events import Event, EventType, copy_event
 from cayu.runtime.sessions import SessionStatus
 
 if TYPE_CHECKING:
@@ -59,6 +59,25 @@ class RunOutcome:
     events: tuple[Event, ...]
     structured_output: StructuredOutputResult | None = None
     interaction_id: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "events", tuple(copy_event(event) for event in self.events))
+        if self.structured_output is not None:
+            if type(self.structured_output) is not StructuredOutputResult:
+                raise TypeError("structured_output must be a StructuredOutputResult.")
+            object.__setattr__(
+                self,
+                "structured_output",
+                StructuredOutputResult(
+                    output=copy_json_value(
+                        self.structured_output.output,
+                        "structured_output.output",
+                    ),
+                    name=self.structured_output.name,
+                    attempt=self.structured_output.attempt,
+                    max_retries=self.structured_output.max_retries,
+                ),
+            )
 
     @property
     def ok(self) -> bool:
