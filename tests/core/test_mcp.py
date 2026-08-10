@@ -289,7 +289,7 @@ def test_mcp_tool_adapter_redacts_injected_secrets_echoed_by_server() -> None:
     assert secret not in result.content
     assert REDACTED_SECRET in result.content
     # The raw content/structured echoes are scrubbed recursively too.
-    assert secret not in json.dumps(result.structured)
+    assert secret not in json.dumps(result.model_dump(mode="json")["structured"])
     assert result.structured["mcp_content"][0]["text"] == f"here is your token: {REDACTED_SECRET}"
     assert result.structured["mcp_structured_content"]["token"] == REDACTED_SECRET
     assert result.structured["mcp_structured_content"]["nested"]["also"] == REDACTED_SECRET
@@ -365,7 +365,10 @@ def test_mcp_tool_adapter_redacts_structured_secret_before_byte_truncation(
     )
 
     assert secret not in result.content
-    assert secret not in json.dumps(result.structured, ensure_ascii=False)
+    assert secret not in json.dumps(
+        result.model_dump(mode="json")["structured"],
+        ensure_ascii=False,
+    )
     assert result.structured["mcp_structured_content"]["token"].endswith(
         f"{REDACTED_SECRET}-suffix"
     )

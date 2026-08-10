@@ -340,11 +340,11 @@ def _runner_failure_result(
         }
     )
     return (
-        result.model_copy(
-            update={
-                "structured": structured,
-                "artifacts": [diagnostic],
-            }
+        ToolResult(
+            content=result.content,
+            structured=structured,
+            artifacts=[diagnostic],
+            is_error=result.is_error,
         ),
         controls,
     )

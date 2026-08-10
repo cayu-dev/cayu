@@ -638,13 +638,15 @@ def test_artifact_reference_is_bounded_for_an_extreme_session_identity(tmp_path)
     )
 
     reference = projection.result.artifacts[-1]
+    serialized_reference = projection.result.model_dump(mode="json")["artifacts"][-1]
     assert projection.record.status == "externalized"
     assert "session_id" not in reference
     assert reference["session_id_sha256"] == hashlib.sha256(session_id.encode()).hexdigest()
+    assert serialized_reference == reference
     assert (
         len(
             json.dumps(
-                reference,
+                serialized_reference,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode()

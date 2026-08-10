@@ -247,6 +247,9 @@ async def run_scenario(
     if crashed_events[-1].type != EventType.SESSION_INTERRUPTED or state.mutation_count != 1:
         raise RuntimeError("Approval did not stop at the injected post-mutation crash boundary.")
     receipt_key, receipt = next(iter(state.receipts.items()))
+    receipt_payload = receipt.model_dump(mode="json")["structured"]
+    if type(receipt_payload) is not dict:
+        raise RuntimeError("Deployment receipt did not contain structured evidence.")
     tool_call_id = approval_events[0].payload["approval"]["tool_call_id"]
 
     # Rebuild the application around the same durable store, then reconcile the
@@ -261,7 +264,7 @@ async def run_scenario(
                 tool_call_id=tool_call_id,
                 outcome=ToolApprovalRecoveryOutcome.COMPLETED,
                 message=receipt.content,
-                structured=receipt.structured,
+                structured=receipt_payload,
                 metadata={"receipt_id": receipt_key, "source": "external-reconciliation"},
                 limits=advanced_run_limits(),
             )
@@ -318,7 +321,7 @@ async def run_scenario(
                         "user",
                         json.dumps(
                             {
-                                "deployment_receipt": receipt.structured,
+                                "deployment_receipt": receipt_payload,
                                 "observed_state": {
                                     "version": state.version,
                                     "mutations": state.mutation_count,
@@ -419,7 +422,7 @@ async def run_scenario(
         outputs={
             "approval_snapshot": snapshot,
             "decision_brief": brief,
-            "deployment_receipt": receipt.structured,
+            "deployment_receipt": receipt_payload,
             "verification": verification,
         },
     )

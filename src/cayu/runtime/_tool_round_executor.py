@@ -5580,12 +5580,11 @@ def _prepare_tool_result_event(
         )
         payload_without_argument_projection.pop("effective_arguments", None)
         event = event.model_copy(update={"payload": payload_without_argument_projection})
-    result = result.model_copy(
-        update={
-            "artifacts": tool_results.strip_runtime_tool_result_projection_authority(
-                result.artifacts
-            )
-        }
+    result = ToolResult(
+        content=result.content,
+        structured=result.structured,
+        artifacts=tool_results.strip_runtime_tool_result_projection_authority(result.artifacts),
+        is_error=result.is_error,
     )
     event, result = _validate_and_synchronize_tool_result_event(
         event=event,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal, TypeGuard, cast
@@ -809,7 +809,7 @@ def _require_bounded_artifact_reference(reference: dict[str, Any]) -> None:
 
 
 def _validate_builtin_tool_result_artifact_reference(
-    reference: dict[str, Any],
+    reference: Mapping[str, Any],
 ) -> dict[str, Any]:
     copied = copy_durable_json_value(reference, "tool_result_artifact_reference")
     if type(copied) is not dict or set(copied) != _BUILTIN_TOOL_RESULT_ARTIFACT_REFERENCE_FIELDS:

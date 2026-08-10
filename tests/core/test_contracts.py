@@ -507,8 +507,8 @@ def test_core_value_objects_own_mutable_constructor_inputs():
     workflow_metadata = {"nested": {"value": "original"}}
     workflow = WorkflowSpec(name="workflow", metadata=workflow_metadata)
 
-    tool_result_structured = {"nested": {"value": "original"}}
-    tool_result_artifacts = [{"nested": {"value": "original"}}]
+    tool_result_structured = {"nested": {"values": [{"value": "original"}]}}
+    tool_result_artifacts = [{"nested": {"values": [{"value": "original"}]}}]
     tool_result = ToolResult(
         content="ok",
         structured=tool_result_structured,
@@ -518,15 +518,109 @@ def test_core_value_objects_own_mutable_constructor_inputs():
     payload["nested"]["value"] = "mutated"
     agent_metadata["nested"]["value"] = "mutated"
     workflow_metadata["nested"]["value"] = "mutated"
-    tool_result_structured["nested"]["value"] = "mutated"
-    tool_result_artifacts[0]["nested"]["value"] = "mutated"
+    tool_result_structured["nested"]["values"][0]["value"] = "mutated"
+    tool_result_structured["nested"]["values"].append({"value": "added"})
+    tool_result_artifacts[0]["nested"]["values"][0]["value"] = "mutated"
+    tool_result_artifacts.append({"value": "added"})
 
     assert event.payload == {"nested": {"value": "original"}}
     assert event.environment_name == "local"
     assert agent.metadata == {"nested": {"value": "original"}}
     assert workflow.metadata == {"nested": {"value": "original"}}
-    assert tool_result.structured == {"nested": {"value": "original"}}
-    assert tool_result.artifacts == [{"nested": {"value": "original"}}]
+    assert tool_result.structured == {"nested": {"values": [{"value": "original"}]}}
+    assert tool_result.artifacts == [{"nested": {"values": [{"value": "original"}]}}]
+
+
+def test_tool_result_nested_payloads_are_read_only_and_serialize_as_plain_json() -> None:
+    result = ToolResult(
+        content="ok",
+        structured={"nested": {"items": [{"value": "original"}]}},
+        artifacts=[{"nested": {"items": [{"value": "original"}]}}],
+    )
+    expected = {
+        "content": "ok",
+        "structured": {"nested": {"items": [{"value": "original"}]}},
+        "artifacts": [{"nested": {"items": [{"value": "original"}]}}],
+        "is_error": False,
+    }
+    assert result.structured is not None
+    structured_nested = result.structured["nested"]
+    artifact = result.artifacts[0]
+    artifact_nested = artifact["nested"]
+
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        result.structured["added"] = True  # type: ignore[index]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        structured_nested["added"] = True  # type: ignore[index]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        structured_nested["items"].append({"value": "mutated"})  # type: ignore[union-attr]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        result.artifacts.append({"added": True})  # type: ignore[union-attr]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        artifact["added"] = True  # type: ignore[index]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        artifact_nested["added"] = True  # type: ignore[index]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        artifact_nested["items"].append({"value": "mutated"})  # type: ignore[union-attr]
+
+    empty = ToolResult()
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        empty.artifacts.append({"added": True})  # type: ignore[union-attr]
+
+    python_dump = result.model_dump(mode="python")
+    json_dump = result.model_dump(mode="json")
+    assert python_dump == expected
+    assert json_dump == expected
+    assert type(python_dump["structured"]) is dict
+    assert type(python_dump["structured"]["nested"]["items"]) is list
+    assert type(python_dump["artifacts"]) is list
+    assert type(python_dump["artifacts"][0]) is dict
+    assert ToolResult(**python_dump) == result
+    assert result.model_dump(exclude={"structured": {"nested"}})["structured"] == {}
+    assert result.model_dump(include={"artifacts": {0: {"nested": {"items": {0: {"value"}}}}}}) == {
+        "artifacts": [{"nested": {"items": [{"value": "original"}]}}]
+    }
+
+
+def test_tool_result_model_copy_revalidates_and_owns_updated_payloads() -> None:
+    structured = {"nested": {"items": ["original"]}}
+    artifacts = [{"nested": {"items": ["original"]}}]
+
+    copied = ToolResult(content="before").model_copy(
+        update={
+            "content": "after",
+            "structured": structured,
+            "artifacts": artifacts,
+        }
+    )
+
+    structured["nested"]["items"].append("source mutation")
+    artifacts[0]["nested"]["items"].append("source mutation")
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        copied.structured["nested"]["items"].append("result mutation")  # type: ignore[union-attr]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        copied.artifacts[0]["nested"]["items"].append("result mutation")  # type: ignore[union-attr]
+
+    assert copied.model_dump(mode="json") == {
+        "content": "after",
+        "structured": {"nested": {"items": ["original"]}},
+        "artifacts": [{"nested": {"items": ["original"]}}],
+        "is_error": False,
+    }
+    with pytest.raises(ValidationError, match="JSON-compatible"):
+        copied.model_copy(update={"structured": {"invalid": object()}})
+
+    sparse = ToolResult(content="sparse")
+    sparse_copy = sparse.model_copy()
+    assert sparse_copy.model_fields_set == sparse.model_fields_set == {"content"}
+    assert sparse_copy.model_dump(mode="json", exclude_unset=True) == {"content": "sparse"}
+
+    updated_sparse_copy = sparse.model_copy(update={"is_error": True})
+    assert updated_sparse_copy.model_fields_set == {"content", "is_error"}
+    assert updated_sparse_copy.model_dump(mode="json", exclude_unset=True) == {
+        "content": "sparse",
+        "is_error": True,
+    }
 
 
 def test_message_parts_own_mutable_constructor_inputs():

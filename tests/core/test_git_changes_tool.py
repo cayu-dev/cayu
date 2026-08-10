@@ -177,7 +177,8 @@ def test_git_changes_bounds_structured_status_entries(tmp_path: Path) -> None:
         )
     )
 
-    assert len(json.dumps(result.structured, separators=(",", ":")).encode()) <= 1024
+    serialized_structured = result.model_dump(mode="json")["structured"]
+    assert len(json.dumps(serialized_structured, separators=(",", ":")).encode()) <= 1024
     assert "structured_result_bytes" in result.structured["truncation_reasons"]
     assert result.structured["next_offset"] == result.structured["returned"]
 

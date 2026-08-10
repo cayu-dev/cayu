@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
+from typing import Any
 
 from cayu import (
     InMemoryKnowledgeStore,
@@ -107,7 +109,7 @@ def print_json(label: str, value) -> None:
     print(label, json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
-def _write_summary(structured: dict | None) -> dict:
+def _write_summary(structured: Mapping[str, Any] | None) -> dict[str, Any]:
     if structured is None:
         return {}
     entry = structured["entry"]
@@ -120,7 +122,7 @@ def _write_summary(structured: dict | None) -> dict:
     }
 
 
-def _tool_hit_ids(structured: dict | None) -> list[str]:
+def _tool_hit_ids(structured: Mapping[str, Any] | None) -> list[str]:
     if structured is None:
         return []
     return [hit["entry_id"] for hit in structured["hits"]]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import islice
@@ -141,7 +141,7 @@ def redact_tool_result(result: ToolResult, redactor: SecretRedactor) -> ToolResu
 
 
 def strip_runtime_tool_result_projection_authority(
-    artifacts: list[dict[str, Any]],
+    artifacts: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Remove runtime-only ownership evidence from application-authored artifacts."""
 

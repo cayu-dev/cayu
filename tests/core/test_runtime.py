@@ -20817,6 +20817,7 @@ def test_cayu_app_after_tool_call_hook_observes_tool_result_and_emits_events():
             self.result: ToolResult | None = None
             self.task_id: str | None = None
             self.tool_event_type: EventType | str | None = None
+            self.result_mutation_rejected = False
 
         async def after_tool_call(self, context: ToolCallHookContext) -> None:
             self.tool_name = context.tool_name
@@ -20827,7 +20828,10 @@ def test_cayu_app_after_tool_call_hook_observes_tool_result_and_emits_events():
             self.tool_event_type = context.tool_event.type
             self.arguments["text"] = "mutated"
             if self.result.structured is not None:
-                self.result.structured["echoed"] = "mutated"
+                try:
+                    self.result.structured["echoed"] = "mutated"  # type: ignore[index]
+                except TypeError:
+                    self.result_mutation_rejected = True
             await context.emit_custom_event(
                 "custom.tool.observed",
                 payload={
@@ -20881,7 +20885,8 @@ def test_cayu_app_after_tool_call_hook_observes_tool_result_and_emits_events():
     assert hook.tool_call_id == "call_echo"
     assert hook.arguments == {"text": "mutated"}
     assert hook.result is not None
-    assert hook.result.structured == {"agent": "assistant", "echoed": "mutated"}
+    assert hook.result.structured == {"agent": "assistant", "echoed": "from tool"}
+    assert hook.result_mutation_rejected is True
     assert hook.task_id == "task_tool_hook"
     assert hook.tool_event_type == EventType.TOOL_CALL_COMPLETED
     assert [
@@ -21977,18 +21982,22 @@ def test_after_tool_call_modify_applies_on_short_circuit_result():
 
 
 def test_before_tool_call_decision_copies_synthetic_result_payload() -> None:
+    structured = {"nested": {"status": "original"}}
+    artifacts = [{"id": "artifact-1", "metadata": {"source": "original"}}]
     original = ToolResult(
         content="cached",
-        structured={"nested": {"status": "original"}},
-        artifacts=[{"id": "artifact-1", "metadata": {"source": "original"}}],
+        structured=structured,
+        artifacts=artifacts,
         is_error=True,
     )
 
     decision = BeforeToolCallDecision(action="short_circuit", synthetic_result=original)
 
     assert decision.synthetic_result is not original
-    original.structured["nested"]["status"] = "mutated"  # type: ignore[index]
-    original.artifacts[0]["metadata"]["source"] = "mutated"  # type: ignore[index]
+    structured["nested"]["status"] = "mutated"
+    artifacts[0]["metadata"]["source"] = "mutated"
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        original.structured["nested"]["status"] = "mutated"  # type: ignore[index]
     assert decision.synthetic_result == ToolResult(
         content="cached",
         structured={"nested": {"status": "original"}},
@@ -21998,18 +22007,22 @@ def test_before_tool_call_decision_copies_synthetic_result_payload() -> None:
 
 
 def test_after_tool_call_decision_copies_modified_result_payload() -> None:
+    structured = {"nested": {"status": "original"}}
+    artifacts = [{"id": "artifact-1", "metadata": {"source": "original"}}]
     original = ToolResult(
         content="rewritten",
-        structured={"nested": {"status": "original"}},
-        artifacts=[{"id": "artifact-1", "metadata": {"source": "original"}}],
+        structured=structured,
+        artifacts=artifacts,
         is_error=False,
     )
 
     decision = AfterToolCallDecision(action="modify", modified_result=original)
 
     assert decision.modified_result is not original
-    original.structured["nested"]["status"] = "mutated"  # type: ignore[index]
-    original.artifacts[0]["metadata"]["source"] = "mutated"  # type: ignore[index]
+    structured["nested"]["status"] = "mutated"
+    artifacts[0]["metadata"]["source"] = "mutated"
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        original.artifacts[0]["metadata"]["source"] = "mutated"  # type: ignore[index]
     assert decision.modified_result == ToolResult(
         content="rewritten",
         structured={"nested": {"status": "original"}},
@@ -49962,8 +49975,23 @@ def test_cayu_app_protects_tool_call_arguments_from_tool_mutation():
     assert tool_call_part.arguments == {"nested": {"value": "original"}}
 
 
-def test_cayu_app_protects_tool_result_messages_from_result_mutation():
-    store = InMemorySessionStore()
+@pytest.fixture(params=("memory", "sqlite"), ids=("memory", "sqlite"))
+def tool_result_session_store(request, tmp_path):
+    store = (
+        InMemorySessionStore()
+        if request.param == "memory"
+        else SQLiteSessionStore(tmp_path / "tool-result-read-only.sqlite")
+    )
+    yield store
+    close = getattr(store, "close", None)
+    if close is not None:
+        asyncio.run(close())
+
+
+def test_cayu_app_protects_tool_result_messages_from_result_mutation(
+    tool_result_session_store,
+):
+    store = tool_result_session_store
     tool = ResultHoldingTool()
     provider = FakeProvider(
         [
@@ -50001,13 +50029,26 @@ def test_cayu_app_protects_tool_result_messages_from_result_mutation():
     assert events[-1].type == EventType.SESSION_COMPLETED
     assert tool.result is not None
 
-    tool.result.structured["nested"]["value"] = "mutated"
-    tool.result.artifacts[0]["nested"]["value"] = "mutated"
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        tool.result.structured["nested"]["value"] = "mutated"  # type: ignore[index]
+    with pytest.raises(TypeError, match="Frozen JSON values cannot be mutated"):
+        tool.result.artifacts[0]["nested"]["value"] = "mutated"  # type: ignore[index]
 
     tool_result_part = provider.requests[1].messages[-1].content[0]
     assert tool_result_part.type == "tool_result"
     assert tool_result_part.structured == {"nested": {"value": "original"}}
     assert tool_result_part.artifacts == [{"nested": {"value": "original"}}]
+
+    completed = next(event for event in events if event.type == EventType.TOOL_CALL_COMPLETED)
+    assert type(completed.payload["result"]["structured"]) is dict
+    assert type(completed.payload["result"]["artifacts"]) is list
+    assert completed.payload["result"]["structured"] == {"nested": {"value": "original"}}
+    assert completed.payload["result"]["artifacts"] == [{"nested": {"value": "original"}}]
+
+    transcript = asyncio.run(store.load_transcript("sess_mutating_tool_result"))
+    stored_result = transcript[2].content[0]
+    assert stored_result.structured == {"nested": {"value": "original"}}
+    assert stored_result.artifacts == [{"nested": {"value": "original"}}]
 
 
 def test_cayu_app_protects_runtime_history_from_provider_mutation():

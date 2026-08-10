@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isfinite
@@ -12,6 +12,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SerializerFunctionWrapHandler,
     StrictBool,
     computed_field,
     field_serializer,
@@ -21,10 +22,12 @@ from pydantic import (
 from cayu._validation import (
     copy_durable_json_object,
     copy_durable_json_value,
+    freeze_json_value,
     require_clean_nonblank,
     require_durable_clean_nonblank,
     require_durable_text,
     require_nonblank,
+    thaw_json_value,
 )
 
 if TYPE_CHECKING:
@@ -231,11 +234,16 @@ class ToolResult(BaseModel):
     treated as read-only once returned from a tool.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        validate_default=True,
+    )
 
     content: str = ""
-    structured: dict[str, Any] | None = None
-    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    structured: Mapping[str, Any] | None = None
+    artifacts: Sequence[Mapping[str, Any]] = Field(default_factory=list)
     is_error: StrictBool = False
 
     @field_validator("structured", "artifacts", mode="before")
@@ -243,10 +251,55 @@ class ToolResult(BaseModel):
     def copy_result_data(cls, value, info):
         return copy_durable_json_value(value, info.field_name)
 
+    @field_validator("structured", "artifacts")
+    @classmethod
+    def freeze_result_data(cls, value: Any) -> Any:
+        return freeze_json_value(value)
+
+    @field_serializer("structured", mode="wrap")
+    def serialize_structured(
+        self,
+        value: Mapping[str, Any] | None,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, Any] | None:
+        serialized = handler(thaw_json_value(value))
+        if serialized is not None and type(serialized) is not dict:
+            raise AssertionError("ToolResult structured data must serialize as an object.")
+        return serialized
+
+    @field_serializer("artifacts", mode="wrap")
+    def serialize_artifacts(
+        self,
+        value: Sequence[Mapping[str, Any]],
+        handler: SerializerFunctionWrapHandler,
+    ) -> list[dict[str, Any]]:
+        serialized = handler(thaw_json_value(value))
+        if type(serialized) is not list or any(
+            type(artifact) is not dict for artifact in serialized
+        ):
+            raise AssertionError("ToolResult artifacts must serialize as an array of objects.")
+        return serialized
+
     @field_validator("content")
     @classmethod
     def validate_content(cls, value: str) -> str:
         return require_durable_text(value, "content")
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> ToolResult:
+        data = self.model_dump(mode="python", round_trip=True)
+        if update is not None:
+            data.update(update)
+        copied = type(self).model_validate(data)
+        fields_set = set(self.model_fields_set)
+        if update is not None:
+            fields_set.update(update)
+        object.__setattr__(copied, "__pydantic_fields_set__", fields_set)
+        return copied
 
 
 _TOOL_POLICY_DENIAL_SOURCE = "tool_policy"

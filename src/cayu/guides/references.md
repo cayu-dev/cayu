@@ -50,6 +50,11 @@ configuration.
 - `artifacts`: JSON object descriptors for durable outputs; defaults to `[]`.
 - `is_error`: whether the tool reports a failed result; defaults to `False`.
 
+`structured` and `artifacts` are recursively read-only after construction. Use
+`result.model_dump(mode="json")` when a serializer or transformation needs
+ordinary JSON dictionaries and lists, and construct a replacement `ToolResult`
+when changing a result.
+
 Construct a bare unit-test context with
 `ToolContext(session_id="test-session")`. This direct implementation unit test
 needs no application graph:
