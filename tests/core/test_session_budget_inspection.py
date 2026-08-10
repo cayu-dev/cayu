@@ -160,6 +160,198 @@ def test_budget_inspection_distinguishes_all_settlement_states() -> None:
     assert inspection.cost_state == "partial"
 
 
+def test_budget_inspection_requires_reservation_before_terminal_evidence() -> None:
+    reservation = _reservation_event(value=1)
+    reconciliation = Event(
+        type=EventType.BUDGET_RECONCILED,
+        session_id=reservation.session_id,
+        payload={
+            **budget_reconciliation_payload(_reconciliation(value=1, kind="completed")),
+            "pricing": _pricing_evidence(),
+        },
+    )
+    release = Event(
+        type=EventType.BUDGET_RESERVATION_RELEASED,
+        session_id=reservation.session_id,
+        payload={
+            "reservation_id": "reservation-state-1",
+            "settlement_kind": "released",
+            "budget_limit_id": _budget_limit_id(1),
+            **_model_attempt_identity(1),
+        },
+    )
+
+    for terminal, expected_amount in ((reconciliation, "0.25"), (release, "0")):
+        ordered = session_budget_inspection(
+            [
+                project_budget_inspection_event(reservation),
+                project_budget_inspection_event(terminal),
+            ]
+        )
+        reordered = session_budget_inspection(
+            [
+                project_budget_inspection_event(terminal),
+                project_budget_inspection_event(reservation),
+            ]
+        )
+
+        assert ordered.cost_state == "priced"
+        assert ordered.amount == expected_amount
+        assert ordered.currency == "USD"
+        assert reordered.cost_state == "partial"
+        assert reordered.amount is None
+        assert reordered.currency is None
+
+
+def test_budget_inspection_matches_terminal_order_by_reservation_identity() -> None:
+    reservation_one = _reservation_event(value=1)
+    reservation_two = _reservation_event(value=2)
+
+    def reconciliation(value: int) -> Event:
+        return Event(
+            type=EventType.BUDGET_RECONCILED,
+            session_id=reservation_one.session_id,
+            payload={
+                **budget_reconciliation_payload(_reconciliation(value=value, kind="completed")),
+                "pricing": _pricing_evidence(),
+            },
+        )
+
+    inspection = session_budget_inspection(
+        [
+            project_budget_inspection_event(reservation_one),
+            project_budget_inspection_event(reconciliation(2)),
+            project_budget_inspection_event(reservation_two),
+            project_budget_inspection_event(reconciliation(1)),
+        ]
+    )
+
+    assert inspection.cost_state == "partial"
+    assert inspection.amount is None
+    assert inspection.currency is None
+
+
+def test_budget_inspection_rejects_decimal_strings_with_surrounding_whitespace() -> None:
+    identity = _model_attempt_identity(1)
+    budget_limit_id = _budget_limit_id(1)
+    reservation_id = "reservation-dirty-decimal"
+    reservation_payload = {
+        "reservation_id": reservation_id,
+        "budget_limit_id": budget_limit_id,
+        **identity,
+        "scope": "session",
+        "key": None,
+        "window": "all_time",
+        "currency": "USD",
+        "maximum": "1",
+        "action": "interrupt",
+    }
+    reconciliation_payload = {
+        "reservation_id": reservation_id,
+        "settlement_kind": "completed",
+        "budget_limit_id": budget_limit_id,
+        **identity,
+        "actual_amount": "0.25",
+        "pricing": _pricing_evidence(),
+    }
+    malformed_cases = (
+        [
+            Event(
+                type=EventType.BUDGET_CHECKED,
+                session_id="sess_dirty_decimal",
+                payload={
+                    "budget_limit_id": budget_limit_id,
+                    "scope": "session",
+                    "key": None,
+                    "window": "all_time",
+                    "currency": "USD",
+                    "maximum": "1",
+                    "action": "interrupt",
+                    "actual": "0.25 ",
+                    "unpriced_model_steps": 0,
+                    "cost_summary": {},
+                },
+            )
+        ],
+        [
+            Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id="sess_dirty_decimal",
+                payload={**reservation_payload, "maximum": "\t1"},
+            ),
+            Event(
+                type=EventType.BUDGET_RECONCILED,
+                session_id="sess_dirty_decimal",
+                payload=reconciliation_payload,
+            ),
+        ],
+        [
+            Event(
+                type=EventType.BUDGET_RESERVED,
+                session_id="sess_dirty_decimal",
+                payload=reservation_payload,
+            ),
+            Event(
+                type=EventType.BUDGET_RECONCILED,
+                session_id="sess_dirty_decimal",
+                payload={**reconciliation_payload, "actual_amount": " 0.25"},
+            ),
+        ],
+    )
+
+    for events in malformed_cases:
+        inspection = session_budget_inspection(
+            [project_budget_inspection_event(event) for event in events]
+        )
+
+        assert inspection.cost_state == "partial"
+        assert inspection.amount is None
+        assert inspection.currency is None
+
+
+def test_budget_inspection_accepts_clean_exponent_decimals() -> None:
+    identity = _model_attempt_identity(1)
+    budget_limit_id = _budget_limit_id(1)
+    reservation_id = "reservation-exponent-decimal"
+    events = [
+        Event(
+            type=EventType.BUDGET_RESERVED,
+            session_id="sess_exponent_decimal",
+            payload={
+                "reservation_id": reservation_id,
+                "budget_limit_id": budget_limit_id,
+                **identity,
+                "scope": "session",
+                "key": None,
+                "window": "all_time",
+                "currency": "USD",
+                "maximum": "1E+1",
+                "action": "interrupt",
+            },
+        ),
+        Event(
+            type=EventType.BUDGET_RECONCILED,
+            session_id="sess_exponent_decimal",
+            payload={
+                "reservation_id": reservation_id,
+                "settlement_kind": "completed",
+                "budget_limit_id": budget_limit_id,
+                **identity,
+                "actual_amount": "2.5E-1",
+                "pricing": _pricing_evidence(),
+            },
+        ),
+    ]
+
+    inspection = session_budget_inspection(
+        [project_budget_inspection_event(event) for event in events]
+    )
+
+    assert inspection.cost_state == "priced"
+    assert inspection.amount == "0.25"
+    assert inspection.currency == "USD"
+
+
 def test_budget_inspection_uses_latest_fully_priced_checks_without_reservations() -> None:
     def checked_event(actual: str) -> Event:
         amount = Decimal(actual)

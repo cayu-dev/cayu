@@ -3804,6 +3804,114 @@ def test_session_store_conformance_inspection_fails_closed_for_malformed_budget_
     asyncio.run(run())
 
 
+def test_session_store_conformance_inspection_preserves_budget_event_order(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        store_kind = session_store_case[0]
+        pricing = {
+            "provider_name": "fake",
+            "model": "model",
+            "match": "exact",
+            "provenance": {
+                "source": "application",
+                "url": "application://test-price-book",
+                "as_of": "2026-08-10",
+            },
+            "effective_from": None,
+            "effective_through": None,
+            "tier_max_input_tokens": None,
+        }
+        try:
+            case_index = 0
+            for terminal_kind in ("reconciled", "released"):
+                for reordered in (False, True):
+                    case_index += 1
+                    order_name = "reordered" if reordered else "ordered"
+                    session_id = f"inspection-budget-{terminal_kind}-{order_name}-{store_kind}"
+                    budget_limit_id = f"blim_{case_index:064x}"
+                    reservation_id = f"reservation-{terminal_kind}-{case_index}"
+                    identity = {
+                        "model_step_id": f"mstep_{case_index:032x}",
+                        "model_attempt_id": f"matt_{case_index:032x}",
+                    }
+                    await store.create(
+                        RunRequest(
+                            session_id=session_id,
+                            agent_name="assistant",
+                            messages=[Message.text("user", "inspect")],
+                        ),
+                        identity=_identity(),
+                    )
+                    reservation = Event(
+                        type=EventType.BUDGET_RESERVED,
+                        session_id=session_id,
+                        payload={
+                            "reservation_id": reservation_id,
+                            "budget_limit_id": budget_limit_id,
+                            **identity,
+                            "scope": "session",
+                            "key": None,
+                            "window": "all_time",
+                            "currency": "USD",
+                            "maximum": "1",
+                            "action": "interrupt",
+                        },
+                    )
+                    if terminal_kind == "reconciled":
+                        terminal = Event(
+                            type=EventType.BUDGET_RECONCILED,
+                            session_id=session_id,
+                            payload={
+                                "reservation_id": reservation_id,
+                                "settlement_kind": "completed",
+                                "budget_limit_id": budget_limit_id,
+                                **identity,
+                                "actual_amount": "0.25",
+                                "pricing": pricing,
+                            },
+                        )
+                        model_terminal = Event(
+                            type=EventType.MODEL_COMPLETED,
+                            session_id=session_id,
+                            payload=identity,
+                        )
+                        expected_amount = "0.25"
+                    else:
+                        terminal = Event(
+                            type=EventType.BUDGET_RESERVATION_RELEASED,
+                            session_id=session_id,
+                            payload={
+                                "reservation_id": reservation_id,
+                                "settlement_kind": "released",
+                                "budget_limit_id": budget_limit_id,
+                                **identity,
+                            },
+                        )
+                        model_terminal = None
+                        expected_amount = "0"
+                    events = [terminal, reservation] if reordered else [reservation, terminal]
+                    if model_terminal is not None:
+                        events.append(model_terminal)
+                    await store.append_events(session_id, events)
+
+                    inspection = await store.inspect_summary(session_id)
+
+                    if reordered:
+                        assert inspection.budget.cost_state == "partial"
+                        assert inspection.budget.amount is None
+                        assert inspection.budget.currency is None
+                    else:
+                        assert inspection.budget.cost_state == "priced"
+                        assert inspection.budget.amount == expected_amount
+                        assert inspection.budget.currency == "USD"
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
 def test_session_store_conformance_inspection_requires_exact_model_budget_join(
     session_store_case,
 ) -> None:

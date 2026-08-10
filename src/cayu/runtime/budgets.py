@@ -189,6 +189,7 @@ def session_budget_inspection(
     validation contract.
     """
     budget_events = [event for event in events if event.type in _BUDGET_INSPECTION_EVENT_TYPES]
+    invalid_reservation_sequence = _has_out_of_order_reservation_terminal(budget_events)
     terminal_step_ids_by_attempt_id: dict[str, list[str]] = {}
     invalid_terminal_attempt_ids: set[str] = set()
     terminal_events_by_identity: dict[ModelAttemptIdentity, list[Event]] = {}
@@ -468,6 +469,7 @@ def session_budget_inspection(
     currency: str | None = None
     if (
         contradictory_limit_identity
+        or invalid_reservation_sequence
         or invalid_reservation_limit_identity
         or invalid_reservation_evidence
         or invalid_failure_identity
@@ -649,8 +651,8 @@ def _inspection_decimal(value: Any, *, positive: bool = False) -> Decimal | None
     if type(value) is not str:
         return None
     try:
-        parsed = Decimal(value)
-    except ArithmeticError:
+        parsed = Decimal(require_clean_nonblank(value, "budget decimal"))
+    except (ArithmeticError, ValueError):
         return None
     if not parsed.is_finite() or parsed < 0 or (positive and parsed == 0):
         return None
@@ -690,6 +692,26 @@ def _inspection_reservation_id(value: Any) -> str | None:
         return require_clean_nonblank(value, "reservation_id")
     except ValueError:
         return None
+
+
+def _has_out_of_order_reservation_terminal(events: Iterable[Event]) -> bool:
+    """Whether a settlement appears before its matching reservation."""
+
+    seen_reservation_ids: set[str] = set()
+    invalid_sequence = False
+    for event in events:
+        reservation_id = _inspection_reservation_id(event.payload.get("reservation_id"))
+        if event.type == EventType.BUDGET_RESERVED:
+            if reservation_id is not None:
+                seen_reservation_ids.add(reservation_id)
+            continue
+        if (
+            event.type in {EventType.BUDGET_RECONCILED, EventType.BUDGET_RESERVATION_RELEASED}
+            and reservation_id is not None
+            and reservation_id not in seen_reservation_ids
+        ):
+            invalid_sequence = True
+    return invalid_sequence
 
 
 def is_complete_budget_reconciliation_pricing(value: Any) -> bool:
