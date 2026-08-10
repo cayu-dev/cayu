@@ -784,6 +784,12 @@ _TOOL_TERMINAL_TYPES = frozenset(
         EventType.TOOL_CALL_BLOCKED,
     }
 )
+_TOOL_EXECUTION_TERMINAL_TYPES = frozenset(
+    {
+        EventType.TOOL_CALL_COMPLETED,
+        EventType.TOOL_CALL_FAILED,
+    }
+)
 
 
 async def _session_tools(args: argparse.Namespace, store: SessionStore) -> int:
@@ -865,6 +871,7 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
     approval_gated_calls: set[_ToolCallKey] = set()
     evidence_conflicts: set[_ToolCallKey] = set()
     approval_decision_conflicts: set[_ToolCallKey] = set()
+    execution_terminal_keys: set[_ToolCallKey] = set()
     tool_names: dict[_ToolCallKey, set[str]] = {}
     lifecycle_records: dict[_ToolCallKey, list[EventRecord]] = {}
     approval_scoped_keys: set[_ToolCallKey] = set()
@@ -1011,6 +1018,8 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
                 evidence_conflicts.add(call_key)
             starts.setdefault(call_key, record)
         elif event.type in _TOOL_TERMINAL_TYPES:
+            if event.type in _TOOL_EXECUTION_TERMINAL_TYPES:
+                execution_terminal_keys.add(call_key)
             if call_key in terminals:
                 evidence_conflicts.add(call_key)
             terminals.setdefault(call_key, record)
@@ -1145,6 +1154,10 @@ def _tool_call_rows(records: list[EventRecord]) -> list[dict[str, Any]]:
         ):
             evidence_conflicts.add(call_key)
             approval_decision_conflicts.add(call_key)
+
+    for call_key in approval_outcomes.keys() & execution_terminal_keys:
+        evidence_conflicts.add(call_key)
+        approval_decision_conflicts.add(call_key)
 
     for call_key, names in tool_names.items():
         if len(names) != 1:

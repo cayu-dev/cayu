@@ -314,6 +314,221 @@ def test_session_commands_have_sqlite_postgres_semantic_parity(
         asyncio.run(_drop_postgres_schema(postgres_dsn))
 
 
+@pytest.mark.parametrize("backend", ["sqlite", "postgres"])
+def test_session_tools_conflicting_approval_and_execution_is_unavailable_across_backends(
+    backend: str,
+    tmp_path: Path,
+    request,
+    monkeypatch,
+    capsys,
+) -> None:
+    from cayu.cli import session as session_cli
+
+    sqlite_path = tmp_path / "conflicting-tool-evidence.db"
+    postgres_dsn = request.getfixturevalue("postgres_dsn") if backend == "postgres" else None
+    session_id = "sess_conflicting_tool_evidence"
+    observed_at = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    normal_identity = {
+        "model_step_id": f"mstep_{'1' * 32}",
+        "model_attempt_id": f"matt_{'2' * 32}",
+        "tool_round_id": f"tround_{'3' * 32}",
+    }
+    conflicting_identity = {
+        "model_step_id": f"mstep_{'4' * 32}",
+        "model_attempt_id": f"matt_{'5' * 32}",
+        "tool_round_id": f"tround_{'6' * 32}",
+    }
+    shared_call_id = "provider-reused-call-id"
+    approval_id = "approval-conflict"
+
+    async def seed(store: SessionStore) -> None:
+        await store.create(
+            RunRequest(
+                agent_name="inspector",
+                session_id=session_id,
+                messages=[Message.text("user", "inspect conflicting tool evidence")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="model"),
+        )
+        await store.append_events(
+            session_id,
+            [
+                Event(type="custom.before", session_id=session_id),
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session_id,
+                    tool_name="read_file",
+                    timestamp=observed_at,
+                    payload={
+                        **normal_identity,
+                        "tool_call_id": shared_call_id,
+                        "arguments": {"path": "README.md"},
+                    },
+                ),
+                Event(
+                    type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
+                    session_id=session_id,
+                    tool_name="deploy",
+                    timestamp=observed_at + timedelta(seconds=1),
+                    payload={
+                        **conflicting_identity,
+                        "approval_id": approval_id,
+                        "tool_call_id": shared_call_id,
+                        "approval": {
+                            **conflicting_identity,
+                            "approval_id": approval_id,
+                            "tool_call_id": shared_call_id,
+                            "tool_name": "deploy",
+                            "arguments": {"environment": "production"},
+                            "tool_calls": [
+                                {
+                                    "tool_call_id": shared_call_id,
+                                    "tool_name": "deploy",
+                                    "arguments": {"environment": "production"},
+                                    "policy_evidence": "authoritative",
+                                    "policy_decision": "require_approval",
+                                }
+                            ],
+                        },
+                    },
+                ),
+                Event(
+                    type=EventType.TOOL_CALL_STARTED,
+                    session_id=session_id,
+                    tool_name="deploy",
+                    timestamp=observed_at + timedelta(seconds=2),
+                    payload={
+                        **conflicting_identity,
+                        "approval_id": approval_id,
+                        "tool_call_id": shared_call_id,
+                        "arguments": {"environment": "production"},
+                    },
+                ),
+                Event(
+                    type=EventType.TOOL_CALL_APPROVAL_DENIED,
+                    session_id=session_id,
+                    tool_name="deploy",
+                    timestamp=observed_at + timedelta(seconds=3),
+                    payload={
+                        **conflicting_identity,
+                        "approval_id": approval_id,
+                        "tool_call_id": shared_call_id,
+                        "approval_required": True,
+                    },
+                ),
+                Event(
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id=session_id,
+                    tool_name="read_file",
+                    timestamp=observed_at + timedelta(seconds=4),
+                    payload={
+                        **normal_identity,
+                        "tool_call_id": shared_call_id,
+                        "result": {
+                            "content": "ordinary result",
+                            "structured": {"returned": 1},
+                            "artifacts": [],
+                            "is_error": False,
+                        },
+                    },
+                ),
+                Event(
+                    type=EventType.TOOL_CALL_COMPLETED,
+                    session_id=session_id,
+                    tool_name="deploy",
+                    timestamp=observed_at + timedelta(seconds=5),
+                    payload={
+                        **conflicting_identity,
+                        "approval_id": approval_id,
+                        "tool_call_id": shared_call_id,
+                        "result": {
+                            "content": "must not be exposed",
+                            "structured": {"returned": 9, "truncated": True},
+                            "artifacts": [{"size_bytes": 17}],
+                            "is_error": False,
+                        },
+                    },
+                ),
+                Event(type="custom.after", session_id=session_id),
+            ],
+        )
+
+    async def prepare() -> None:
+        if postgres_dsn is None:
+            store: SessionStore = SQLiteSessionStore(sqlite_path)
+        else:
+            await _drop_postgres_schema(postgres_dsn)
+            store = PostgresSessionStore(
+                postgres_dsn,
+                min_size=1,
+                max_size=4,
+                schema_mode=SchemaMode.CREATE,
+            )
+        try:
+            await seed(store)
+        finally:
+            await store.close()
+
+    asyncio.run(prepare())
+    monkeypatch.setattr(session_cli, "_EVENT_QUERY_PAGE_SIZE", 2)
+    target = (
+        ["--sqlite", str(sqlite_path)] if postgres_dsn is None else ["--postgres", postgres_dsn]
+    )
+
+    try:
+        base_command = [
+            "session",
+            "tools",
+            session_id,
+            *target,
+            "--after-sequence",
+            "1",
+            "--before-sequence",
+            "8",
+            "--limit",
+            "1",
+            "--json",
+        ]
+        assert main(base_command) == 0
+        first_page = json.loads(capsys.readouterr().out)
+        assert first_page["event_window"] == {
+            "after_sequence": 1,
+            "before_sequence": 8,
+        }
+        assert first_page["total_calls"] == 2
+        assert first_page["has_more"] is True
+        assert first_page["next_offset"] == 1
+        assert first_page["calls"][0]["model_step_id"] == normal_identity["model_step_id"]
+        assert first_page["calls"][0]["status"] == "success"
+
+        assert main([*base_command, "--offset", "1"]) == 0
+        output = capsys.readouterr().out
+        second_page = json.loads(output)
+        assert "must not be exposed" not in output
+        assert second_page["total_calls"] == 2
+        assert second_page["has_more"] is False
+        assert second_page["next_offset"] is None
+        assert len(second_page["calls"]) == 1
+        conflicting = second_page["calls"][0]
+        assert conflicting["model_step_id"] == conflicting_identity["model_step_id"]
+        assert conflicting["tool_call_id"] == shared_call_id
+        assert conflicting["status"] == "unavailable"
+        assert conflicting["approval_state"] == "unavailable"
+        for field in (
+            "completed_at",
+            "duration_ms",
+            "rendered_content_bytes",
+            "structured_result_bytes",
+            "artifact_bytes",
+            "returned",
+            "truncated",
+        ):
+            assert conflicting[field] is None
+    finally:
+        if postgres_dsn is not None:
+            asyncio.run(_drop_postgres_schema(postgres_dsn))
+
+
 def test_postgres_read_only_store_uses_transaction_scoped_protection(
     postgres_dsn: str,
 ) -> None:

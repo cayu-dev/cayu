@@ -305,6 +305,218 @@ def test_tool_inspection_marks_conflicting_approval_decisions_unavailable() -> N
     assert rows[0]["approval_state"] == "unavailable"
 
 
+@pytest.mark.parametrize(
+    "terminal_type",
+    [EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED],
+    ids=["completed", "failed"],
+)
+@pytest.mark.parametrize("expired", [False, True], ids=["denied", "expired"])
+def test_tool_inspection_marks_denied_or_expired_execution_unavailable(
+    terminal_type: EventType,
+    expired: bool,
+) -> None:
+    result = ToolResult(
+        content="must not be exposed",
+        structured={"returned": 3, "truncated": True},
+        artifacts=[{"size_bytes": 17}],
+        is_error=terminal_type is EventType.TOOL_CALL_FAILED,
+    )
+    decision_records = (
+        [
+            _record(
+                3,
+                EventType.TOOL_CALL_APPROVAL_EXPIRED,
+                payload_extra={"approval_id": "approval-1"},
+            ),
+            _record(
+                4,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+                payload_extra={
+                    "approval_id": "approval-1",
+                    "approval_required": True,
+                    "expired": True,
+                },
+                result=ToolResult(content="expired", is_error=True),
+            ),
+        ]
+        if expired
+        else [
+            _record(
+                3,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+                payload_extra={
+                    "approval_id": "approval-1",
+                    "approval_required": True,
+                },
+                result=ToolResult(content="denied", is_error=True),
+            )
+        ]
+    )
+    terminal_sequence = decision_records[-1].sequence + 1
+
+    rows = _tool_call_rows(
+        [
+            _approval_request(),
+            _record(
+                2,
+                EventType.TOOL_CALL_STARTED,
+                payload_extra={"approval_id": "approval-1"},
+            ),
+            *decision_records,
+            _record(
+                terminal_sequence,
+                terminal_type,
+                payload_extra={"approval_id": "approval-1"},
+                result=result,
+            ),
+        ]
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "unavailable"
+    assert row["approval_state"] == "unavailable"
+    assert row["started_at"] is not None
+    for field in (
+        "completed_at",
+        "duration_ms",
+        "rendered_content_bytes",
+        "structured_result_bytes",
+        "artifact_bytes",
+        "returned",
+        "truncated",
+    ):
+        assert row[field] is None
+
+
+@pytest.mark.parametrize(
+    "execution_terminal_type",
+    [EventType.TOOL_CALL_COMPLETED, EventType.TOOL_CALL_FAILED],
+    ids=["completed", "failed"],
+)
+@pytest.mark.parametrize("expired", [False, True], ids=["denied", "expired"])
+@pytest.mark.parametrize(
+    "execution_terminal_first",
+    [False, True],
+    ids=["blocked-first", "execution-first"],
+)
+def test_tool_inspection_conflicting_approval_state_is_independent_of_retained_terminal(
+    execution_terminal_type: EventType,
+    expired: bool,
+    execution_terminal_first: bool,
+) -> None:
+    decision_records = (
+        [
+            _record(
+                2,
+                EventType.TOOL_CALL_APPROVAL_EXPIRED,
+                payload_extra={"approval_id": "approval-1"},
+            ),
+            _record(
+                3,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+                payload_extra={
+                    "approval_id": "approval-1",
+                    "approval_required": True,
+                    "expired": True,
+                },
+                result=ToolResult(content="expired", is_error=True),
+            ),
+        ]
+        if expired
+        else [
+            _record(
+                2,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+                payload_extra={
+                    "approval_id": "approval-1",
+                    "approval_required": True,
+                },
+                result=ToolResult(content="denied", is_error=True),
+            )
+        ]
+    )
+    first_terminal_sequence = decision_records[-1].sequence + 1
+    terminal_types = [EventType.TOOL_CALL_BLOCKED, execution_terminal_type]
+    if execution_terminal_first:
+        terminal_types.reverse()
+    terminals = [
+        _record(
+            first_terminal_sequence + offset,
+            terminal_type,
+            payload_extra={"approval_id": "approval-1"},
+            result=ToolResult(
+                content="blocked" if terminal_type is EventType.TOOL_CALL_BLOCKED else "executed",
+                is_error=terminal_type is not EventType.TOOL_CALL_COMPLETED,
+            ),
+        )
+        for offset, terminal_type in enumerate(terminal_types)
+    ]
+
+    rows = _tool_call_rows([_approval_request(), *decision_records, *terminals])
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "unavailable"
+    assert row["approval_state"] == "unavailable"
+    for field in (
+        "completed_at",
+        "duration_ms",
+        "rendered_content_bytes",
+        "structured_result_bytes",
+        "artifact_bytes",
+        "returned",
+        "truncated",
+    ):
+        assert row[field] is None
+
+
+def test_tool_inspection_scopes_denied_execution_conflict_to_exact_call_identity() -> None:
+    unrelated_identity = {
+        "model_step_id": f"mstep_{'4' * 32}",
+        "model_attempt_id": f"matt_{'5' * 32}",
+        "tool_round_id": f"tround_{'6' * 32}",
+    }
+    rows = _tool_call_rows(
+        [
+            _approval_request(),
+            _record(
+                2,
+                EventType.TOOL_CALL_APPROVAL_DENIED,
+                payload_extra={
+                    "approval_id": "approval-1",
+                    "approval_required": True,
+                },
+                result=ToolResult(content="denied", is_error=True),
+            ),
+            _record(
+                3,
+                EventType.TOOL_CALL_COMPLETED,
+                payload_extra={"approval_id": "approval-1"},
+                result=ToolResult(content="contradictory"),
+            ),
+            _record(
+                4,
+                EventType.TOOL_CALL_STARTED,
+                payload_extra=unrelated_identity,
+            ),
+            _record(
+                5,
+                EventType.TOOL_CALL_COMPLETED,
+                payload_extra=unrelated_identity,
+                result=ToolResult(content="valid"),
+            ),
+        ]
+    )
+
+    rows_by_step = {row["model_step_id"]: row for row in rows}
+    assert rows_by_step[_identity()["model_step_id"]]["status"] == "unavailable"
+    unrelated = rows_by_step[unrelated_identity["model_step_id"]]
+    assert unrelated["tool_call_id"] == "call-1"
+    assert unrelated["status"] == "success"
+    assert unrelated["approval_state"] == "none"
+
+
 def test_tool_inspection_rejects_decision_for_different_approval_identity() -> None:
     rows = _tool_call_rows(
         [

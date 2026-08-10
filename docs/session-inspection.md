@@ -109,7 +109,10 @@ structurally rather than relying on provider-specific secret key names. Commands
 that aggregate event histories retain only purpose-specific projections and stop
 at 64 MiB or 100,000 retained event records. Large raw tool results remain
 inspectable through exact size metadata because their content is not retained by
-the `tools` projection. For longer histories, `usage` and `tools` accept
+the `tools` projection. When denial or expiry evidence conflicts with completed
+or failed execution for the same exact approval-scoped call, `tools` reports both
+the status and approval state as unavailable and omits terminal result metrics.
+For longer histories, `usage` and `tools` accept
 `--after-sequence` and `--before-sequence` event windows so every portion remains
 inspectable without disabling the safety ceiling. Totals in those outputs apply
 to the selected window. Content flags are still an operator trust
