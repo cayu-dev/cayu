@@ -2544,6 +2544,15 @@ integers, while exact session totals may exceed that range. Python-mode dumps
 retain exact integers and JSON-mode dumps encode aggregate counters as canonical
 nonnegative decimal strings.
 
+Public usage evidence owns a transitively detached snapshot at construction.
+This includes step and aggregate cache counters, session and causal summaries,
+provider/model/session groups and remainders, accuracy evidence, and both shared
+and session-scoped pricing inputs in `UsageRollupStoreResult`. Passing an
+already-validated nested model does not transfer a mutable reference into the
+accepted result: later caller or store-layer mutation cannot rewrite totals,
+attribution, ordering, accuracy, pricing inputs, or the result's public dump.
+Built-in aggregate stores return values under the same ownership contract.
+
 `CayuApp.get_causal_budget_usage(causal_budget_id)` derives the same normalized
 usage totals across every session whose stored `causal_budget_id` matches. The
 summary includes `session_ids`, `session_count`, and per-session
@@ -2573,6 +2582,16 @@ The optional FastAPI server exposes the same estimator at
 `PriceBook` and optional `currency`; the response is the JSON form of
 `SessionCostSummary`, with decimal cost values serialized as strings for stable
 API output.
+
+Cost, billing, and budget records use the same detached-snapshot boundary.
+`SessionCostSummary` and causal summaries own their line items and per-session
+summaries; aggregate cost rollups own currencies, unpriced reasons, billing
+identities, breakdowns, and accuracy evidence. `BudgetLimit` owns its supplied
+price book, `BudgetCheck` owns its cost summary, and
+`BudgetSettlementRecord` owns both its reconciliation and audit event. Caller
+mutation after construction therefore cannot change the Decimal amounts,
+currency separation, line/group ordering, authorization decision, or
+historical settlement evidence that Cayu accepted.
 
 `CayuApp.get_causal_budget_cost(causal_budget_id, pricing)` uses the same
 pricing contract and line-item estimator across all sessions in that causal

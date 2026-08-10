@@ -29,6 +29,7 @@ from cayu._validation import (
     canonical_durable_json_bytes,
     copy_durable_json_object,
     require_execution_unit_id,
+    revalidate_model_input,
 )
 from cayu._validation import (
     require_durable_clean_nonblank as require_clean_nonblank,
@@ -1100,6 +1101,11 @@ class BudgetLimit(BaseModel):
     def copy_window(cls, value) -> BudgetWindow:
         return copy_budget_window(value)
 
+    @field_validator("pricing", mode="before")
+    @classmethod
+    def copy_pricing(cls, value: object) -> object:
+        return revalidate_model_input(value, PriceBook)
+
     @field_validator("max_estimated_cost")
     @classmethod
     def validate_cost(cls, value: Decimal, info) -> Decimal:
@@ -1259,6 +1265,11 @@ class BudgetCheck(BaseModel):
         if not value.is_finite():
             raise ValueError(f"{info.field_name} must be finite.")
         return value
+
+    @field_validator("cost_summary", mode="before")
+    @classmethod
+    def copy_cost_summary(cls, value: object) -> object:
+        return revalidate_model_input(value, SessionCostSummary)
 
 
 class BudgetSettlementFallback(BaseModel):
@@ -1483,6 +1494,11 @@ class BudgetReconciliationPricing(BaseModel):
     tier_max_input_tokens: StrictInt | None = Field(default=None, gt=0, le=MAX_DURABLE_JSON_INTEGER)
     billing_identity: BillingIdentity | None = Field(default=None, exclude=True)
 
+    @field_validator("provenance", "billing_identity", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, Provenance, BillingIdentity)
+
     @field_validator("provider_name", "model")
     @classmethod
     def validate_strings(cls, value: str, info) -> str:
@@ -1526,6 +1542,11 @@ class BudgetReconciliation(BaseModel):
     pricing_tier_max_input_tokens: StrictInt | None = Field(
         default=None, gt=0, le=MAX_DURABLE_JSON_INTEGER
     )
+
+    @field_validator("billing_identity", "pricing_provenance", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, BillingIdentity, Provenance)
 
     @field_validator("reservation_id", "settlement_id")
     @classmethod
@@ -1626,6 +1647,18 @@ class BudgetSettlementRecord(BaseModel):
     reconciliation: BudgetReconciliation
     event: Event
     event_published: StrictBool = False
+
+    @field_validator("reconciliation", mode="before")
+    @classmethod
+    def copy_reconciliation(cls, value: object) -> object:
+        return revalidate_model_input(value, BudgetReconciliation)
+
+    @field_validator("event", mode="before")
+    @classmethod
+    def copy_audit_event(cls, value: object) -> object:
+        if isinstance(value, Event):
+            return copy_event(value)
+        return value
 
     @field_validator("settlement_id", "reservation_id", "session_id", "agent_name")
     @classmethod

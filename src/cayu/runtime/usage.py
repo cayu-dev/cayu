@@ -21,6 +21,8 @@ from cayu._validation import (
     copy_durable_json_value,
     copy_json_value,
     require_durable_clean_nonblank,
+    revalidate_model_input,
+    revalidate_model_inputs,
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
@@ -102,6 +104,11 @@ class UsageMetrics(BaseModel):
             return None
         return require_durable_clean_nonblank(value, info.field_name)
 
+    @field_validator("billing_identity", "cache", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, BillingIdentity, CacheUsageMetrics)
+
 
 def _serialize_aggregate_count(value: int) -> str:
     """Serialize exact aggregate counters without crossing JSON's safe-integer boundary."""
@@ -177,6 +184,11 @@ class AggregateUsageMetrics(BaseModel):
     total_tokens: AggregateCount = Field(ge=0)
     reasoning_output_tokens: AggregateCount = Field(ge=0)
     cache: AggregateCacheUsageMetrics
+
+    @field_validator("cache", mode="before")
+    @classmethod
+    def copy_cache(cls, value: object) -> object:
+        return revalidate_model_input(value, AggregateCacheUsageMetrics)
 
 
 def build_aggregate_usage_metrics(
@@ -352,7 +364,7 @@ class SessionUsageSummary(BaseModel):
     def project_step_usage(cls, value: object) -> object:
         if type(value) is UsageMetrics:
             return add_aggregate_usage(build_aggregate_usage_metrics(), value)
-        return value
+        return revalidate_model_input(value, AggregateUsageMetrics)
 
     @field_validator("session_id")
     @classmethod
@@ -393,7 +405,12 @@ class CausalBudgetUsageSummary(BaseModel):
     def project_step_usage(cls, value: object) -> object:
         if type(value) is UsageMetrics:
             return add_aggregate_usage(build_aggregate_usage_metrics(), value)
-        return value
+        return revalidate_model_input(value, AggregateUsageMetrics)
+
+    @field_validator("session_summaries", mode="before")
+    @classmethod
+    def copy_session_summaries(cls, value: object) -> object:
+        return revalidate_model_inputs(value, SessionUsageSummary)
 
     @field_validator("causal_budget_id")
     @classmethod

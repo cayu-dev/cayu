@@ -26,6 +26,8 @@ from cayu._validation import (
     json_utf8_size_within_limit,
     require_clean_nonblank,
     require_durable_clean_nonblank,
+    revalidate_model_input,
+    revalidate_model_inputs,
 )
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.events import Event, EventType
@@ -866,6 +868,11 @@ class CostLineItem(BaseModel):
     total_cost: Decimal = Field(ge=0)
     missing_pricing_reason: str | None = None
 
+    @field_validator("billing_identity", "pricing_provenance", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, BillingIdentity, Provenance)
+
     @field_validator(
         "provider_name",
         "requested_model",
@@ -942,6 +949,11 @@ class SessionCostSummary(BaseModel):
     total_cost: Decimal = Field(ge=0)
     line_items: tuple[CostLineItem, ...] = Field(default_factory=tuple)
 
+    @field_validator("line_items", mode="before")
+    @classmethod
+    def copy_line_items(cls, value: object) -> object:
+        return revalidate_model_inputs(value, CostLineItem)
+
     @field_validator("session_id", "currency")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
@@ -963,6 +975,11 @@ class CausalBudgetCostSummary(BaseModel):
     total_cost: Decimal = Field(ge=0)
     line_items: tuple[CostLineItem, ...] = Field(default_factory=tuple)
     session_costs: tuple[SessionCostSummary, ...] = Field(default_factory=tuple)
+
+    @field_validator("line_items", "session_costs", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_inputs(value, CostLineItem, SessionCostSummary)
 
     @field_validator("causal_budget_id", "currency")
     @classmethod

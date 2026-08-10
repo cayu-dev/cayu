@@ -27,6 +27,8 @@ from cayu._validation import (
     JsonUtf8SizeCounter,
     json_utf8_size_within_limit,
     require_clean_nonblank,
+    revalidate_model_input,
+    revalidate_model_inputs,
 )
 from cayu.core.billing import BillingIdentity
 from cayu.core.events import Event, EventType
@@ -140,6 +142,11 @@ class UsageAggregateTotals(BaseModel):
     model_steps_with_usage: AggregateCount = Field(ge=0)
     tool_calls: AggregateCount = Field(ge=0)
     usage: AggregateUsageMetrics
+
+    @field_validator("usage", mode="before")
+    @classmethod
+    def copy_usage(cls, value: object) -> object:
+        return revalidate_model_input(value, AggregateUsageMetrics)
 
     @model_validator(mode="after")
     def validate_reported_steps(self) -> UsageAggregateTotals:
@@ -418,6 +425,11 @@ class UsageAggregateGroup(BaseModel):
     model: str | None
     totals: UsageAggregateTotals
 
+    @field_validator("totals", mode="before")
+    @classmethod
+    def copy_totals(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageAggregateTotals)
+
     @field_validator("provider_name", "model")
     @classmethod
     def validate_optional_identity(cls, value: str | None, info) -> str | None:
@@ -434,6 +446,11 @@ class UsageAggregateRemainder(BaseModel):
     group_count: PositiveAggregateCount = Field(ge=1)
     totals: UsageAggregateTotals
 
+    @field_validator("totals", mode="before")
+    @classmethod
+    def copy_totals(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageAggregateTotals)
+
 
 class UsageAggregateBreakdown(BaseModel):
     """Deterministic top groups plus an exact remainder when detail is bounded."""
@@ -443,6 +460,16 @@ class UsageAggregateBreakdown(BaseModel):
     groups: tuple[UsageAggregateGroup, ...] = Field(max_length=100)
     remainder: UsageAggregateRemainder | None
     accuracy: AggregateAccuracy
+
+    @field_validator("groups", mode="before")
+    @classmethod
+    def copy_groups(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsageAggregateGroup)
+
+    @field_validator("remainder", "accuracy", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageAggregateRemainder, AggregateAccuracy)
 
     @model_validator(mode="after")
     def validate_accuracy(self) -> UsageAggregateBreakdown:
@@ -474,6 +501,11 @@ class UsageSessionAggregateGroup(BaseModel):
     active: StrictBool
     totals: UsageAggregateTotals
 
+    @field_validator("totals", mode="before")
+    @classmethod
+    def copy_totals(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageAggregateTotals)
+
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, value: str) -> str:
@@ -500,6 +532,11 @@ class UsageSessionAggregateRemainder(BaseModel):
     active_session_count: AggregateCount = Field(ge=0)
     totals: UsageAggregateTotals
 
+    @field_validator("totals", mode="before")
+    @classmethod
+    def copy_totals(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageAggregateTotals)
+
     @model_validator(mode="after")
     def validate_counts(self) -> UsageSessionAggregateRemainder:
         if self.active_session_count > self.group_count:
@@ -517,6 +554,20 @@ class UsageSessionAggregateBreakdown(BaseModel):
     groups: tuple[UsageSessionAggregateGroup, ...] = Field(max_length=100)
     remainder: UsageSessionAggregateRemainder | None
     accuracy: AggregateAccuracy
+
+    @field_validator("groups", mode="before")
+    @classmethod
+    def copy_groups(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsageSessionAggregateGroup)
+
+    @field_validator("remainder", "accuracy", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(
+            value,
+            UsageSessionAggregateRemainder,
+            AggregateAccuracy,
+        )
 
     @model_validator(mode="after")
     def validate_breakdown(self) -> UsageSessionAggregateBreakdown:
@@ -561,10 +612,10 @@ class UsagePricingInput(BaseModel):
             return None
         return require_bounded_usage_session_id(value)
 
-    @field_validator("metrics")
+    @field_validator("metrics", mode="before")
     @classmethod
-    def copy_metrics(cls, value: UsageMetrics | None) -> UsageMetrics | None:
-        return None if value is None else value.model_copy(deep=True)
+    def copy_metrics(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageMetrics)
 
 
 def coalesce_usage_pricing_inputs(
@@ -931,6 +982,31 @@ class UsageRollupStoreResult(BaseModel):
     matching_session_count: StrictInt = Field(default=0, ge=0)
     includes_active_sessions: StrictBool = True
     _session_pricing_attribution: tuple[tuple[str, str], ...] = PrivateAttr(default=())
+
+    @field_validator(
+        "totals",
+        "totals_accuracy",
+        "provider_breakdown",
+        "model_breakdown",
+        "session_breakdown",
+        "pricing_inputs_accuracy",
+        "session_pricing_inputs_accuracy",
+        mode="before",
+    )
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(
+            value,
+            UsageAggregateTotals,
+            AggregateAccuracy,
+            UsageAggregateBreakdown,
+            UsageSessionAggregateBreakdown,
+        )
+
+    @field_validator("pricing_inputs", "session_pricing_inputs", mode="before")
+    @classmethod
+    def copy_pricing_inputs(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsagePricingInput)
 
     @field_validator("as_of", "start_at", "end_at")
     @classmethod
@@ -1384,6 +1460,11 @@ class UsageBillingCostGroup(BaseModel):
     total_cost: Decimal = Field(ge=0)
     missing_pricing_reason: str | None = None
 
+    @field_validator("billing_identity", mode="before")
+    @classmethod
+    def copy_billing_identity(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageBillingIdentity)
+
     @field_validator(
         "pricing_provider_name",
         "pricing_model",
@@ -1451,6 +1532,16 @@ class UsageBillingCostBreakdown(BaseModel):
     remainder: UsageBillingCostRemainder | None
     accuracy: AggregateAccuracy
 
+    @field_validator("groups", mode="before")
+    @classmethod
+    def copy_groups(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsageBillingCostGroup)
+
+    @field_validator("remainder", "accuracy", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageBillingCostRemainder, AggregateAccuracy)
+
     @model_validator(mode="after")
     def validate_scope(self) -> UsageBillingCostBreakdown:
         represented_steps = sum(group.model_steps for group in self.groups)
@@ -1482,6 +1573,16 @@ class UsageCostRollup(BaseModel):
     currencies: tuple[UsageCurrencyCost, ...] = Field(max_length=5000)
     unpriced_reasons: tuple[UsageUnpricedReason, ...] = Field(max_length=5000)
     billing_breakdown: UsageBillingCostBreakdown
+
+    @field_validator("currencies", "unpriced_reasons", mode="before")
+    @classmethod
+    def copy_detail(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsageCurrencyCost, UsageUnpricedReason)
+
+    @field_validator("accuracy", "billing_breakdown", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, AggregateAccuracy, UsageBillingCostBreakdown)
 
     @field_validator("price_book_version", "price_book_generated_at")
     @classmethod
@@ -1528,6 +1629,16 @@ class UsageSessionCostSummary(BaseModel):
     currencies: tuple[UsageCurrencyCost, ...] = Field(max_length=5000)
     unpriced_reasons: tuple[UsageUnpricedReason, ...] = Field(max_length=5000)
 
+    @field_validator("currencies", "unpriced_reasons", mode="before")
+    @classmethod
+    def copy_detail(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsageCurrencyCost, UsageUnpricedReason)
+
+    @field_validator("accuracy", mode="before")
+    @classmethod
+    def copy_accuracy(cls, value: object) -> object:
+        return revalidate_model_input(value, AggregateAccuracy)
+
     @model_validator(mode="after")
     def validate_step_accounting(self) -> UsageSessionCostSummary:
         if self.priced_model_steps + self.unpriced_model_steps != self.evaluated_model_steps:
@@ -1551,6 +1662,11 @@ class UsageSessionCostGroup(BaseModel):
     session_id: str
     cost: UsageSessionCostSummary
 
+    @field_validator("cost", mode="before")
+    @classmethod
+    def copy_cost(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageSessionCostSummary)
+
     @field_validator("session_id")
     @classmethod
     def validate_session_id(cls, value: str) -> str:
@@ -1565,6 +1681,11 @@ class UsageSessionCostRemainder(BaseModel):
     group_count: PositiveAggregateCount = Field(ge=1)
     cost: UsageSessionCostSummary
 
+    @field_validator("cost", mode="before")
+    @classmethod
+    def copy_cost(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageSessionCostSummary)
+
 
 class UsageSessionCostBreakdown(BaseModel):
     """Bounded per-session costs plus an aggregate remainder."""
@@ -1576,6 +1697,16 @@ class UsageSessionCostBreakdown(BaseModel):
     groups: tuple[UsageSessionCostGroup, ...] = Field(max_length=100)
     remainder: UsageSessionCostRemainder | None
     accuracy: AggregateAccuracy
+
+    @field_validator("groups", mode="before")
+    @classmethod
+    def copy_groups(cls, value: object) -> object:
+        return revalidate_model_inputs(value, UsageSessionCostGroup)
+
+    @field_validator("remainder", "accuracy", mode="before")
+    @classmethod
+    def copy_nested_contracts(cls, value: object) -> object:
+        return revalidate_model_input(value, UsageSessionCostRemainder, AggregateAccuracy)
 
     @field_validator("price_book_version", "price_book_generated_at")
     @classmethod

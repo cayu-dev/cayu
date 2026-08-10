@@ -27,6 +27,67 @@ MIN_DURABLE_JSON_INTEGER = -(2**63)
 MAX_DURABLE_JSON_INTEGER = 2**63 - 1
 MAX_DURABLE_JSON_NESTING = 128
 
+
+def revalidate_model_input(value: Any, *model_types: type[BaseModel]) -> Any:
+    """Reconstruct an already-validated model while leaving raw input unchanged.
+
+    Pydantic normally accepts a model instance for a nested field by reference.
+    Public snapshot contracts use this helper in ``mode="before"`` validators
+    so caller-owned instances are detached and revalidated just like raw
+    mappings. Private model attributes are intentionally not preserved; values
+    whose runtime provenance is part of their contract need a dedicated copier.
+    """
+
+    for model_type in model_types:
+        if isinstance(value, model_type):
+            return model_type.model_validate(_model_instance_python_input(value))
+    return value
+
+
+def revalidate_model_inputs(value: Any, *model_types: type[BaseModel]) -> Any:
+    """Reconstruct validated models inside one iterable field input."""
+
+    if (
+        value is None
+        or isinstance(value, (str, bytes, bytearray, Mapping, BaseModel))
+        or not isinstance(value, Iterable)
+    ):
+        return value
+    return tuple(revalidate_model_input(item, *model_types) for item in value)
+
+
+def _model_instance_python_input(value: BaseModel) -> dict[str, Any]:
+    """Dump a model for validation without dropping excluded nested fields."""
+
+    nested_fields: dict[str, Any] = {}
+    for field_name, field_info in type(value).model_fields.items():
+        field_value = getattr(value, field_name)
+        if field_info.exclude or isinstance(field_value, (BaseModel, Mapping, list, tuple)):
+            nested_fields[field_name] = field_value
+    document = value.model_dump(
+        mode="python",
+        warnings=False,
+        exclude=set(nested_fields),
+    )
+    for field_name, field_value in nested_fields.items():
+        document[field_name] = (
+            dict(field_value)
+            if isinstance(field_value, Mapping)
+            else _nested_model_python_input(field_value)
+        )
+    return document
+
+
+def _nested_model_python_input(value: Any) -> Any:
+    if isinstance(value, BaseModel):
+        return _model_instance_python_input(value)
+    if isinstance(value, list):
+        return [_nested_model_python_input(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_nested_model_python_input(item) for item in value)
+    return value
+
+
 _MAX_DURABLE_ERROR_FIELD_CHARS = 128
 _MAX_DURABLE_ERROR_PATH_CHARS = 512
 _DURABLE_ERROR_MESSAGES = {
