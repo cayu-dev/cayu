@@ -12,7 +12,8 @@ import asyncio
 import hashlib
 import inspect
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from contextlib import aclosing
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -120,6 +121,10 @@ _OVERSIZED_PRODUCT_REQUEST_DETAIL = "Product request exceeds the server byte lim
 
 class _ProductWorkReconciliationRequired(RuntimeError):
     """Durable Cayu work may exist and must not be terminalized or redispatched."""
+
+
+class _ProductRuntimeObservationUncertain(RuntimeError):
+    """The product observer cannot prove the durable runtime outcome."""
 
 
 def _product_request_fingerprint(*, agent_name: str, request_text: str) -> str:
@@ -624,9 +629,8 @@ def _validated_product_store_operation(
     *,
     source: str,
     expected: Mapping[str, object],
-    validate_complete: bool,
 ) -> ProductOperation:
-    """Snapshot declared fields and validate only what the caller will consume."""
+    """Snapshot and fully validate one store-supplied product operation."""
 
     if not isinstance(value, ProductOperation):
         raise TypeError(f"Product store must return ProductOperation from {source}().")
@@ -634,11 +638,7 @@ def _validated_product_store_operation(
         fields = {
             field_name: getattr(value, field_name) for field_name in ProductOperation.model_fields
         }
-        operation = (
-            ProductOperation.model_validate(fields)
-            if validate_complete
-            else ProductOperation.model_construct(**fields)
-        )
+        operation = ProductOperation.model_validate(fields)
     except (AttributeError, TypeError, ValueError):
         raise TypeError(f"Product store returned an invalid operation from {source}().") from None
     if any(
@@ -905,7 +905,6 @@ class CayuService:
             operation,
             source="find_by_session_id",
             expected={"session_id": session_id},
-            validate_complete=True,
         )
         if operation.status != "pending":
             return ()
@@ -945,7 +944,6 @@ class CayuService:
             claim.operation,
             source="claim_execution",
             expected={"work_id": work_id},
-            validate_complete=True,
         )
         if not claim.acquired:
             return operation
@@ -1034,6 +1032,13 @@ class CayuService:
                     ),
                     receipt_policy=receipt_policy,
                 )
+            except _ProductRuntimeObservationUncertain as observation_failure:
+                return await _reconcile_uncertain_product_stream(
+                    service=self,
+                    operation=operation,
+                    claim_id=claim_id,
+                    observation_failure=observation_failure,
+                )
             except (BaseExceptionGroup, Exception, asyncio.CancelledError) as execution_error:
                 await _terminalize_failed_product_operation(
                     self.product_store,
@@ -1098,6 +1103,63 @@ async def _settle_product_run_outcome(
     )
 
 
+async def _reconcile_uncertain_product_stream(
+    *,
+    service: CayuService,
+    operation: ProductOperation,
+    claim_id: str,
+    observation_failure: _ProductRuntimeObservationUncertain,
+) -> ProductOperation:
+    """Settle only exact terminal evidence after the runtime stream becomes uncertain."""
+
+    try:
+        reconciled = await _reconcile_terminal_product_work(
+            service=service,
+            operation=operation,
+            claim_id=claim_id,
+        )
+        if reconciled is not None:
+            return reconciled
+        await _record_product_recovery_status(
+            service=service,
+            operation=operation,
+            claim_id=claim_id,
+            recovery_status="manual_reconciliation_required",
+        )
+        return await _release_and_reload_pending_product_operation(
+            service=service,
+            operation=operation,
+            claim_id=claim_id,
+        )
+    except BaseException as reconciliation_failure:
+        if isinstance(reconciliation_failure, asyncio.CancelledError):
+            reconciliation_failure.add_note(
+                "Product runtime observation also failed before cancellation."
+            )
+            prior_cause = reconciliation_failure.__cause__
+            reconciliation_failure.__cause__ = (
+                observation_failure
+                if prior_cause is None
+                else BaseExceptionGroup(
+                    "Product stream reconciliation retained multiple failure causes.",
+                    [prior_cause, observation_failure],
+                )
+            )
+            combined_failure: BaseException = reconciliation_failure
+        else:
+            combined_failure = BaseExceptionGroup(
+                "Product runtime observation and durable reconciliation both failed.",
+                [observation_failure, reconciliation_failure],
+            )
+        await _release_product_claim_after_failure(
+            product_store=service.product_store,
+            operation=operation,
+            claim_id=claim_id,
+            failure=combined_failure,
+            action="product runtime observation reconciliation",
+        )
+
+
 async def _release_and_reload_pending_product_operation(
     *,
     service: CayuService,
@@ -1128,7 +1190,6 @@ async def _release_and_reload_pending_product_operation(
             "task_id": operation.task_id,
             "request_text": operation.request_text,
         },
-        validate_complete=True,
     )
 
 
@@ -1162,7 +1223,6 @@ async def _record_product_recovery_status(
             "status": "pending",
             "recovery_status": recovery_status,
         },
-        validate_complete=True,
     )
 
 
@@ -1178,43 +1238,45 @@ async def _run_product_operation_bounded(
 ]:
     """Consume one run without retaining its complete event or delta history."""
 
-    status = SessionStatus.INTERRUPTED
+    status: SessionStatus | None = None
     recovery_status: ProductRecoveryStatus | None = None
-    terminal_observed = False
     if type(request) is RunRequest:
-        stream = app.run(request)
+        stream = cast("AsyncGenerator[Event, None]", app.run(request))
     elif type(request) is ResumeRequest:
-        stream = app.resume(request)
+        stream = cast("AsyncGenerator[Event, None]", app.resume(request))
     else:
         raise TypeError("Product execution requires an exact run or resume request.")
     try:
-        async for event in stream:
-            receipt_policy.observe(event)
-            if event.type == EventType.SESSION_COMPLETED:
-                status = SessionStatus.COMPLETED
-                terminal_observed = True
-            elif event.type == EventType.SESSION_FAILED:
-                status = SessionStatus.FAILED
-                terminal_observed = True
-            elif event.type == EventType.SESSION_INTERRUPTED:
-                status = SessionStatus.INTERRUPTED
-                interruption_type = (event.payload or {}).get("interruption_type")
-                if interruption_type == "tool_approval_required":
-                    recovery_status = "waiting_for_approval"
-                elif interruption_type == "user_input_required":
-                    recovery_status = "waiting_for_user_input"
-                else:
-                    recovery_status = "interrupted"
-                terminal_observed = True
-    except Exception:
-        if not terminal_observed:
-            status = SessionStatus.FAILED
+        async with aclosing(stream):
+            async for event in stream:
+                receipt_policy.observe(event)
+                if event.type == EventType.SESSION_COMPLETED:
+                    status = SessionStatus.COMPLETED
+                elif event.type == EventType.SESSION_FAILED:
+                    status = SessionStatus.FAILED
+                elif event.type == EventType.SESSION_INTERRUPTED:
+                    status = SessionStatus.INTERRUPTED
+                    interruption_type = (event.payload or {}).get("interruption_type")
+                    if interruption_type == "tool_approval_required":
+                        recovery_status = "waiting_for_approval"
+                    elif interruption_type == "user_input_required":
+                        recovery_status = "waiting_for_user_input"
+                    else:
+                        recovery_status = "interrupted"
+    except Exception as observation_failure:
+        raise _ProductRuntimeObservationUncertain(
+            "Product runtime stream ended without an authoritative observed outcome."
+        ) from observation_failure
     finally:
         receipt_policy.close()
-    if receipt_policy.capture_failed and status is SessionStatus.COMPLETED:
-        status = SessionStatus.FAILED
+    if status is None:
+        raise _ProductRuntimeObservationUncertain(
+            "Product runtime stream ended without an authoritative terminal event."
+        )
     if status is SessionStatus.COMPLETED and receipt_policy.receipt is None:
-        status = SessionStatus.FAILED
+        raise _ProductRuntimeObservationUncertain(
+            "Completed product runtime work has no durable publication receipt."
+        )
     return status, receipt_policy.receipt, recovery_status
 
 
@@ -1325,10 +1387,6 @@ class _ProductResultReceiptPolicy(LoopPolicy):
         return "product-result-publication"
 
     @property
-    def capture_failed(self) -> bool:
-        return self._capture.failed
-
-    @property
     def receipt(self) -> ProductResultReceipt | None:
         return self._receipt
 
@@ -1423,7 +1481,6 @@ class _ProductContinuationReceiptPolicy(LoopPolicy):
                 "task_id": self._operation.task_id,
                 "request_text": self._operation.request_text,
             },
-            validate_complete=True,
         )
         if claimed_operation.status != "pending":
             return BeforeStopDecision.complete(reason="product operation already terminal")
@@ -1723,15 +1780,23 @@ async def _recover_progressed_product_work(
         operation=operation,
         claim_id=claim_id,
     )
-    outcome_status, result_receipt, recovery_status = await _run_product_operation_bounded(
-        service.cayu_app,
-        ResumeRequest(
-            session_id=operation.session_id,
-            messages=[Message.text("user", _PRODUCT_RECOVERY_MESSAGE)],
-            loop_policies=(receipt_policy,),
-        ),
-        receipt_policy=receipt_policy,
-    )
+    try:
+        outcome_status, result_receipt, recovery_status = await _run_product_operation_bounded(
+            service.cayu_app,
+            ResumeRequest(
+                session_id=operation.session_id,
+                messages=[Message.text("user", _PRODUCT_RECOVERY_MESSAGE)],
+                loop_policies=(receipt_policy,),
+            ),
+            receipt_policy=receipt_policy,
+        )
+    except _ProductRuntimeObservationUncertain as observation_failure:
+        return await _reconcile_uncertain_product_stream(
+            service=service,
+            operation=operation,
+            claim_id=claim_id,
+            observation_failure=observation_failure,
+        )
     return await _settle_product_run_outcome(
         service=service,
         operation=operation,
@@ -2129,7 +2194,6 @@ async def _finish_product_operation_resisting_cancellation(
             operation,
             source="finish",
             expected={"work_id": work_id, "status": status, "result": result},
-            validate_complete=True,
         )
 
     finalization_task = asyncio.create_task(
@@ -2492,7 +2556,6 @@ def create_agent_service(
             reservation.operation,
             source="reserve",
             expected=expected_authority,
-            validate_complete=reservation.created,
         )
         if operation.status == "pending":
             completed = await service.execute_work(operation.work_id)
@@ -2510,7 +2573,6 @@ def create_agent_service(
                     "session_id": operation.session_id,
                     "task_id": operation.task_id,
                 },
-                validate_complete=False,
             )
         if not reservation.created:
             response.status_code = 200
@@ -2540,7 +2602,6 @@ def create_agent_service(
             operation,
             source="find",
             expected={"tenant_id": principal.tenant_id, "public_id": public_id},
-            validate_complete=False,
         )
         return _public_operation(operation, app=app)
 

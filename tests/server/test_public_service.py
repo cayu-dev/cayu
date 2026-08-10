@@ -16,6 +16,7 @@ from cayu import (
     REDACTED_SECRET,
     AgentSpec,
     CayuApp,
+    Event,
     EventOrder,
     EventQuery,
     EventType,
@@ -68,6 +69,7 @@ from cayu.server.service import (
     MAX_PUBLIC_RESULT_CHARS,
     _is_maintained_service,
     _product_auth_dependency,
+    _ProductResultReceiptPolicy,
 )
 
 
@@ -1864,6 +1866,53 @@ def test_completed_idempotency_replay_allows_request_data_minimization() -> None
     assert len(provider.requests) == 1
 
 
+def test_public_projection_rejects_unreceipted_completed_store_state() -> None:
+    result = "unreceipted-success-sentinel"
+    operation = ProductOperation.model_construct(
+        tenant_id="tenant-a",
+        public_id="op_unreceipted_projection",
+        work_id="work_unreceipted_projection",
+        idempotency_key="unreceipted-projection",
+        request_fingerprint=_product_request_fingerprint("work"),
+        session_id="session_unreceipted_projection",
+        task_id="task_unreceipted_projection",
+        request_text="work",
+        status="completed",
+        result=result,
+        result_receipt=None,
+        recovery_status=None,
+    )
+
+    class UnreceiptedStore(MemoryProductStore):
+        async def find(self, **_kwargs) -> ProductOperation | None:
+            return operation
+
+        async def reserve(self, **_kwargs) -> ProductOperationReservation:
+            return ProductOperationReservation(operation=operation, created=False)
+
+    service, _store, provider = _build_service(product_store=UnreceiptedStore())
+    client = TestClient(service.asgi_app, raise_server_exceptions=False)
+
+    read = client.get(
+        f"/api/operations/{operation.public_id}",
+        headers={"Authorization": "Bearer tenant-a"},
+    )
+    replay = client.post(
+        "/api/operations",
+        headers={
+            "Authorization": "Bearer tenant-a",
+            "Idempotency-Key": operation.idempotency_key,
+        },
+        json={"request": operation.request_text},
+    )
+
+    for response in (read, replay):
+        assert response.status_code == 500
+        assert response.json() == {"detail": "Internal server error."}
+        assert result not in response.text
+    assert provider.requests == []
+
+
 def test_product_lookup_must_preserve_authenticated_tenant_authority() -> None:
     class CrossTenantLookupStore(MemoryProductStore):
         async def find(self, *, tenant_id: str, public_id: str) -> ProductOperation | None:
@@ -2363,6 +2412,60 @@ def test_product_result_capture_is_bounded_without_losing_terminal_status() -> N
     assert response.json()["status"] == "completed"
     assert response.json()["result"] == oversized_result[:MAX_PUBLIC_RESULT_CHARS]
     assert len(provider.requests) == 1
+
+
+def test_stream_observation_failure_keeps_ambiguous_product_work_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_observe = _ProductResultReceiptPolicy.observe
+
+    def fail_after_provider_completion(
+        self: _ProductResultReceiptPolicy,
+        event: Event,
+    ) -> None:
+        original_observe(self, event)
+        if event.type == EventType.MODEL_COMPLETED:
+            raise RuntimeError("post-provider projection failed")
+
+    monkeypatch.setattr(
+        _ProductResultReceiptPolicy,
+        "observe",
+        fail_after_provider_completion,
+    )
+
+    async def scenario() -> None:
+        store = MemoryProductStore()
+        service, _store, provider = _build_service(product_store=store)
+        reservation = await store.reserve(
+            tenant_id="tenant-a",
+            idempotency_key="ambiguous-stream-observation",
+            request_fingerprint=_product_request_fingerprint("work once"),
+            public_id="op_ambiguous_stream_observation",
+            work_id="work_ambiguous_stream_observation",
+            session_id="session_ambiguous_stream_observation",
+            task_id="task_ambiguous_stream_observation",
+            request_text="work once",
+        )
+
+        pending = await service.execute_work(reservation.operation.work_id)
+
+        assert pending is not None
+        assert pending.status == "pending"
+        assert pending.result is None
+        assert pending.result_receipt is None
+        assert pending.recovery_status == "manual_reconciliation_required"
+        state = await service.cayu_app.session_store.load_state(reservation.operation.session_id)
+        assert state is not None
+        assert state.status == SessionStatus.INTERRUPTED
+        task_store = service.cayu_app.task_store
+        assert task_store is not None
+        task = await task_store.load_task(reservation.operation.task_id)
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+        assert len(provider.requests) == 1
+        assert reservation.operation.work_id not in store.execution_claims
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("request_text", ["   ", "contains-\x00-nul"])
