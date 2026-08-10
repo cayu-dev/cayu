@@ -31,6 +31,7 @@ from cayu.runtime import (
     RunRequest,
     TieredPricing,
 )
+from cayu.storage import SQLiteSessionStore
 
 
 class FakeProvider(ModelProvider):
@@ -330,11 +331,23 @@ def test_bedrock_cached_usage_with_provider_total_remains_priced() -> None:
     assert cost.total_cost == Decimal("0.0000153")
 
 
-def test_openai_explicit_zero_usage_reconciles_and_releases_the_reservation() -> None:
-    class OpenAIZeroUsageProvider(FakeProvider):
-        usage_dialect = UsageDialect.OPENAI
+@pytest.mark.parametrize(
+    ("usage_dialect", "session_suffix"),
+    [
+        (UsageDialect.OPENAI, "openai"),
+        (UsageDialect.ANTHROPIC, "anthropic"),
+        (UsageDialect.GEMINI, "gemini"),
+        (UsageDialect.GENERIC, "generic"),
+    ],
+)
+def test_authoritative_explicit_zero_usage_releases_the_reservation(
+    usage_dialect: UsageDialect,
+    session_suffix: str,
+) -> None:
+    class ZeroUsageProvider(FakeProvider):
+        pass
 
-    provider = OpenAIZeroUsageProvider(
+    provider = ZeroUsageProvider(
         [
             ModelStreamEvent.completed(
                 {
@@ -348,6 +361,7 @@ def test_openai_explicit_zero_usage_reconciles_and_releases_the_reservation() ->
             )
         ]
     )
+    provider.usage_dialect = usage_dialect
     pricing = fake_budget_limit("10").pricing
     app = CayuApp(
         budget_policy=BudgetPolicy(
@@ -373,12 +387,12 @@ def test_openai_explicit_zero_usage_reconciles_and_releases_the_reservation() ->
             app,
             RunRequest(
                 agent_name="assistant",
-                session_id="sess_openai_zero_usage",
+                session_id=f"sess_{session_suffix}_zero_usage",
                 messages=[Message.text("user", "hello")],
             ),
         )
     )
-    cost = asyncio.run(app.get_session_cost("sess_openai_zero_usage", pricing))
+    cost = asyncio.run(app.get_session_cost(f"sess_{session_suffix}_zero_usage", pricing))
 
     reserved = next(event for event in events if event.type == EventType.BUDGET_RESERVED)
     completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
@@ -479,6 +493,24 @@ def test_openai_explicit_zero_usage_reconciles_and_releases_the_reservation() ->
             },
             UsageDialect.AUTO,
         ),
+        (
+            {
+                "input_tokens": 500_000,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 100_000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 200_000},
+            },
+            UsageDialect.ANTHROPIC,
+        ),
+        (
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "output_tokens_details": {"thinking_tokens": 1},
+            },
+            UsageDialect.GENERIC,
+        ),
     ],
     ids=(
         "contradictory-cache-read",
@@ -491,6 +523,8 @@ def test_openai_explicit_zero_usage_reconciles_and_releases_the_reservation() ->
         "auto-malformed-input-without-details",
         "auto-ambiguous-matching-cache-counters",
         "auto-malformed-inferred-cache-read",
+        "anthropic-cache-write-conflict",
+        "generic-thinking-conflict",
     ),
 )
 def test_malformed_cached_usage_charges_the_reserved_amount(
@@ -616,6 +650,24 @@ def test_malformed_cached_usage_charges_the_reserved_amount(
             },
             UsageDialect.AUTO,
         ),
+        (
+            {
+                "input_tokens": 500_000,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 100_000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 200_000},
+            },
+            UsageDialect.ANTHROPIC,
+        ),
+        (
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "output_tokens_details": {"thinking_tokens": 1},
+            },
+            UsageDialect.GENERIC,
+        ),
     ],
     ids=(
         "generic-alias-conflict",
@@ -624,6 +676,8 @@ def test_malformed_cached_usage_charges_the_reserved_amount(
         "auto-malformed-input-without-details",
         "auto-ambiguous-matching-cache-counters",
         "auto-malformed-inferred-cache-read",
+        "anthropic-cache-write-conflict",
+        "generic-thinking-conflict",
     ),
 )
 def test_malformed_usage_is_unpriced_and_blocks_later_dispatch(
@@ -702,6 +756,114 @@ def test_malformed_usage_is_unpriced_and_blocks_later_dispatch(
     assert any(event.type == EventType.BUDGET_LIMIT_REACHED for event in first_events)
     assert any(event.type == EventType.BUDGET_LIMIT_REACHED for event in second_events)
     assert len(provider.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("registered_name", "declared_dialect", "raw_usage", "case_name"),
+    [
+        (
+            "anthropic-gateway",
+            UsageDialect.ANTHROPIC,
+            {
+                "input_tokens": 500_000,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 100_000,
+                "cache_details": [{"ttl": "5m", "input_tokens": 200_000}],
+            },
+            "cache_write",
+        ),
+        (
+            "generic-gateway",
+            UsageDialect.GENERIC,
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "output_tokens_details": {"thinking_tokens": 1},
+            },
+            "thinking",
+        ),
+    ],
+    ids=("cache-write-conflict", "generic-thinking-conflict"),
+)
+def test_conflicting_usage_remains_unpriced_after_sqlite_reopen(
+    tmp_path,
+    registered_name: str,
+    declared_dialect: UsageDialect,
+    raw_usage: dict[str, object],
+    case_name: str,
+) -> None:
+    class GatewayProvider(FakeProvider):
+        name = registered_name
+        usage_dialect = declared_dialect
+
+    provider = GatewayProvider(
+        [
+            ModelStreamEvent.completed(
+                {
+                    "model": "test-model",
+                    "usage": raw_usage,
+                    "usage_metrics": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                }
+            )
+        ]
+    )
+    pricing = PriceBook(
+        prices=(
+            ModelPrice.fixed(
+                provider_name=registered_name,
+                model="test-model",
+                input_per_million=Decimal("10"),
+                output_per_million=Decimal("10"),
+            ),
+        )
+    )
+    path = tmp_path / f"contradictory-{case_name}-usage.sqlite"
+    session_id = f"sess_contradictory_{case_name}_usage_sqlite"
+
+    async def run():
+        store = SQLiteSessionStore(path)
+        app = CayuApp(session_store=store)
+        app.register_provider(provider, default=True)
+        app.register_agent(AgentSpec(name="assistant", model="test-model"))
+        events = await collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=session_id,
+                messages=[Message.text("user", "hello")],
+            ),
+        )
+        await store.close()
+
+        reopened = SQLiteSessionStore(path)
+        try:
+            durable_events = await reopened.load_events(session_id)
+            reopened_app = CayuApp(session_store=reopened)
+            cost = await reopened_app.get_session_cost(session_id, pricing)
+            return events, durable_events, cost
+        finally:
+            await reopened.close()
+
+    events, durable_events, cost = asyncio.run(run())
+
+    completed = next(event for event in events if event.type == EventType.MODEL_COMPLETED)
+    durable_completed = next(
+        event for event in durable_events if event.type == EventType.MODEL_COMPLETED
+    )
+    assert completed.payload["usage"] == raw_usage
+    assert "usage_metrics" not in completed.payload
+    assert completed.payload["usage_normalization_failed"] is True
+    assert durable_completed.payload["usage"] == raw_usage
+    assert "usage_metrics" not in durable_completed.payload
+    assert durable_completed.payload["usage_normalization_failed"] is True
+    assert cost.priced_model_steps == 0
+    assert cost.unpriced_model_steps == 1
+    assert cost.total_cost == Decimal("0")
 
 
 def test_cayu_app_strips_nested_provider_supplied_billing_identity_without_raw_usage() -> None:

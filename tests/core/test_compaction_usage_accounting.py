@@ -421,3 +421,35 @@ def test_compaction_rejects_incomplete_or_mixed_usage_before_pricing(
     assert sanitized.payload["usage_normalization_failed"] is True
     assert "usage_metrics" not in sanitized.payload
     assert sanitized.payload["usage_unavailable_reason"] == ("invalid compaction usage telemetry")
+
+
+def test_compaction_preserves_conflicting_cache_write_usage_as_bounded_evidence() -> None:
+    raw_usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_creation_input_tokens": 5,
+        "cache_creation": {"ephemeral_5m_input_tokens": 6},
+    }
+    payload = runtime_context_module._compaction_model_completed_payload(
+        completed_payload={"usage": raw_usage},
+        provider_name="gateway",
+        fallback_model="summary-model",
+        compactor="ModelCompactor",
+        usage_dialect=UsageDialect.ANTHROPIC,
+    )
+    sanitized = runtime_context_module.sanitize_context_compaction_telemetry(
+        runtime_context_module.ContextCompactionTelemetry(
+            event_type=EventType.MODEL_COMPLETED,
+            payload=payload,
+        )
+    )
+
+    assert sanitized.payload["usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_creation_input_tokens": 5,
+        "cache_creation": {"bounded_total": 6},
+    }
+    assert sanitized.payload["usage_normalization_failed"] is True
+    assert "usage_metrics" not in sanitized.payload
+    assert sanitized.payload["usage_unavailable_reason"] == ("invalid compaction usage telemetry")

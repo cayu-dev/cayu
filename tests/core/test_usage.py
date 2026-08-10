@@ -694,16 +694,47 @@ def test_declared_openai_usage_accepts_explicit_zero_cache_counters_without_deta
     assert metrics.cache.uncached_input_tokens == 100
 
 
-def test_declared_openai_usage_accepts_explicit_zero_primary_counters() -> None:
+@pytest.mark.parametrize(
+    ("provider_name", "usage_dialect", "raw_usage"),
+    [
+        (
+            "renamed-openai",
+            UsageDialect.OPENAI,
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+        (
+            "anthropic",
+            UsageDialect.AUTO,
+            {"input_tokens": 0, "output_tokens": 0},
+        ),
+        (
+            "renamed-anthropic",
+            UsageDialect.ANTHROPIC,
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+        (
+            "gemini-gateway",
+            UsageDialect.GEMINI,
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        ),
+        (
+            "generic-gateway",
+            UsageDialect.GENERIC,
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+    ],
+    ids=("openai", "anthropic-name", "anthropic-declared", "gemini", "generic"),
+)
+def test_authoritative_usage_accepts_explicit_zero_primary_counters(
+    provider_name: str,
+    usage_dialect: UsageDialect,
+    raw_usage: dict[str, int],
+) -> None:
     metrics = normalize_usage_metrics(
-        provider_name="renamed-gateway",
-        model="gpt",
-        raw_usage={
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-        },
-        usage_dialect=UsageDialect.OPENAI,
+        provider_name=provider_name,
+        model="test-model",
+        raw_usage=raw_usage,
+        usage_dialect=usage_dialect,
     )
 
     assert metrics is not None
@@ -712,6 +743,94 @@ def test_declared_openai_usage_accepts_explicit_zero_primary_counters() -> None:
     assert metrics.total_tokens == 0
     assert metrics.cache.read_tokens == 0
     assert metrics.cache.uncached_input_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "usage_dialect", "raw_usage"),
+    [
+        ("anthropic", UsageDialect.ANTHROPIC, {}),
+        ("anthropic", UsageDialect.ANTHROPIC, {"input_tokens": 0}),
+        (
+            "unknown-gateway",
+            UsageDialect.AUTO,
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        ),
+    ],
+    ids=("empty", "incomplete", "unknown-auto-dialect"),
+)
+def test_zero_usage_requires_complete_authoritative_primary_counters(
+    provider_name: str,
+    usage_dialect: UsageDialect,
+    raw_usage: dict[str, int],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name=provider_name,
+            model="test-model",
+            raw_usage=raw_usage,
+            usage_dialect=usage_dialect,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "output_details",
+    [
+        {"thinking_tokens": 1},
+        {"thinking_tokens": "1"},
+        {"thinking_tokens": True},
+        {"thinking_tokens": -1},
+        {"reasoning_tokens": 1, "thinking_tokens": 2},
+    ],
+    ids=("exceeds-output", "string", "boolean", "negative", "conflicting-aliases"),
+)
+@pytest.mark.parametrize(
+    ("provider_name", "usage_dialect"),
+    [
+        ("anthropic", UsageDialect.ANTHROPIC),
+        ("generic-gateway", UsageDialect.GENERIC),
+    ],
+    ids=("anthropic", "generic"),
+)
+def test_authoritative_zero_usage_rejects_contradictory_thinking_evidence(
+    provider_name: str,
+    usage_dialect: UsageDialect,
+    output_details: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name=provider_name,
+            model="test-model",
+            raw_usage={
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "output_tokens_details": output_details,
+            },
+            usage_dialect=usage_dialect,
+        )
+        is None
+    )
+
+
+def test_declared_generic_usage_accepts_coherent_thinking_evidence() -> None:
+    metrics = normalize_usage_metrics(
+        provider_name="generic-gateway",
+        model="test-model",
+        raw_usage={
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "total_tokens": 3,
+            "output_tokens_details": {"thinking_tokens": 1},
+        },
+        usage_dialect=UsageDialect.GENERIC,
+    )
+
+    assert metrics is not None
+    assert metrics.output_tokens == 2
+    assert metrics.total_tokens == 3
+    assert metrics.reasoning_output_tokens == 1
 
 
 @pytest.mark.parametrize("nullable_details_key", ["input_tokens_details", "prompt_tokens_details"])
@@ -3385,7 +3504,7 @@ def test_normalize_anthropic_usage_metrics() -> None:
             "input_tokens": 100,
             "output_tokens": 20,
             "cache_read_input_tokens": 70,
-            "cache_creation_input_tokens": 0,
+            "cache_creation_input_tokens": 5,
             "cache_creation": {
                 "ephemeral_5m_input_tokens": 2,
                 "ephemeral_1h_input_tokens": 3,
@@ -3415,7 +3534,7 @@ def test_normalize_vertex_usage_metrics_matches_anthropic() -> None:
         "input_tokens": 100,
         "output_tokens": 20,
         "cache_read_input_tokens": 70,
-        "cache_creation_input_tokens": 0,
+        "cache_creation_input_tokens": 5,
         "cache_creation": {
             "ephemeral_5m_input_tokens": 2,
             "ephemeral_1h_input_tokens": 3,
@@ -3458,6 +3577,48 @@ def test_normalize_cache_details_take_precedence_over_anthropic_cache_creation()
     assert metrics.cache.write_5m_tokens == 7
     assert metrics.cache.write_1h_tokens == 0
     assert metrics.cache.write_unknown_ttl_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "cache_evidence",
+    [
+        {
+            "cache_creation_input_tokens": 5,
+            "cache_creation": {"ephemeral_5m_input_tokens": 6},
+        },
+        {
+            "cache_creation_input_tokens": 5,
+            "cache_details": [{"ttl": "5m", "input_tokens": 6}],
+        },
+        {
+            "cache_creation": {"ephemeral_5m_input_tokens": 5},
+            "cache_details": [{"ttl": "1h", "input_tokens": 6}],
+        },
+        {
+            "cache_creation_input_tokens": 0,
+            "cache_creation": {"ephemeral_5m_input_tokens": 1},
+            "cache_details": [{"ttl": "5m", "input_tokens": 1}],
+        },
+    ],
+    ids=(
+        "top-level-vs-creation",
+        "top-level-vs-details",
+        "creation-vs-details",
+        "zero-vs-positive-details",
+    ),
+)
+def test_normalize_anthropic_usage_rejects_conflicting_cache_write_totals(
+    cache_evidence: dict[str, object],
+) -> None:
+    assert (
+        normalize_usage_metrics(
+            provider_name="anthropic",
+            model="claude-test",
+            raw_usage={"input_tokens": 1, "output_tokens": 0, **cache_evidence},
+            usage_dialect=UsageDialect.ANTHROPIC,
+        )
+        is None
+    )
 
 
 def test_normalize_bedrock_anthropic_shape_by_payload() -> None:

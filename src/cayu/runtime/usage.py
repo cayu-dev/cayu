@@ -530,10 +530,13 @@ def normalize_usage_metrics(
     ):
         return None
 
-    if not _has_usage_counter(raw_usage) and dialect not in {
-        _DIALECT_GEMINI,
-        _DIALECT_OPENAI,
-    }:
+    has_complete_authoritative_primary_counters = (
+        authoritative_dialect is not None and has_input_tokens and has_output_tokens
+    )
+    if (
+        not _has_positive_usage_counter(raw_usage)
+        and not has_complete_authoritative_primary_counters
+    ):
         return None
     nested_cached_input = _nested_cached_input_tokens(raw_usage)
     has_nested_cached_container = _has_nested_cached_input_container(raw_usage)
@@ -577,47 +580,31 @@ def normalize_usage_metrics(
         and cached_input_tokens > input_tokens
     ):
         return None
-    strict_reasoning_output = (
-        _nested_reasoning_output_tokens(raw_usage)
-        if dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI}
-        else None
-    )
-    if dialect in {_DIALECT_GEMINI, _DIALECT_OPENAI} and strict_reasoning_output is None:
+    strict_reasoning_output = _nested_reasoning_output_tokens(raw_usage)
+    if strict_reasoning_output is None:
         return None
-    reasoning_output_tokens = 0
     input_details = raw_usage.get("input_tokens_details")
     if type(input_details) is not dict:
         input_details = raw_usage.get("prompt_tokens_details")
     if dialect == _DIALECT_ANTHROPIC and type(input_details) is dict:
         cached_input_tokens = _nonnegative_int(input_details.get("cached_tokens"))
 
-    if strict_reasoning_output is not None:
-        reasoning_output_tokens, has_reasoning_output = strict_reasoning_output
-        if dialect == _DIALECT_GEMINI:
-            hidden_output_tokens = total_tokens - computed_primary_total
-            if has_reasoning_output:
-                if hidden_output_tokens == 0:
-                    if reasoning_output_tokens > output_tokens:
-                        return None
-                elif reasoning_output_tokens == hidden_output_tokens:
-                    output_tokens += hidden_output_tokens
-                else:
+    reasoning_output_tokens, has_reasoning_output = strict_reasoning_output
+    if dialect == _DIALECT_GEMINI:
+        hidden_output_tokens = total_tokens - computed_primary_total
+        if has_reasoning_output:
+            if hidden_output_tokens == 0:
+                if reasoning_output_tokens > output_tokens:
                     return None
-            else:
-                reasoning_output_tokens = hidden_output_tokens
+            elif reasoning_output_tokens == hidden_output_tokens:
                 output_tokens += hidden_output_tokens
-        elif reasoning_output_tokens > output_tokens:
-            return None
-    else:
-        output_details = raw_usage.get("output_tokens_details")
-        if type(output_details) is not dict:
-            output_details = raw_usage.get("completion_tokens_details")
-        if type(output_details) is dict:
-            reasoning_output_tokens = _nonnegative_int(output_details.get("reasoning_tokens"))
-            if reasoning_output_tokens == 0:
-                # Anthropic reports extended-thinking tokens as `thinking_tokens` (already
-                # billed inside output_tokens); surface them in the same neutral field.
-                reasoning_output_tokens = _nonnegative_int(output_details.get("thinking_tokens"))
+            else:
+                return None
+        else:
+            reasoning_output_tokens = hidden_output_tokens
+            output_tokens += hidden_output_tokens
+    elif reasoning_output_tokens > output_tokens:
+        return None
 
     cache_write_5m_tokens = 0
     cache_write_1h_tokens = 0
@@ -637,33 +624,26 @@ def normalize_usage_metrics(
             else:
                 cache_write_unknown_ttl_tokens += tokens
     cache_creation = raw_usage.get("cache_creation")
-    if type(cache_creation) is dict:
-        cache_creation_tokens = sum(_nonnegative_int(value) for value in cache_creation.values())
-        if cache_creation_tokens > 0:
-            cache_write_tokens = max(cache_write_tokens, cache_creation_tokens)
-        if not has_cache_details:
-            cache_write_5m_tokens += _nonnegative_int(
-                cache_creation.get("ephemeral_5m_input_tokens")
-            )
-            cache_write_1h_tokens += _nonnegative_int(
-                cache_creation.get("ephemeral_1h_input_tokens")
-            )
-            cache_write_unknown_ttl_tokens += sum(
-                _nonnegative_int(value)
-                for key, value in cache_creation.items()
-                if key
-                not in {
-                    "ephemeral_5m_input_tokens",
-                    "ephemeral_1h_input_tokens",
-                }
-            )
+    if type(cache_creation) is dict and not has_cache_details:
+        cache_write_5m_tokens += _nonnegative_int(cache_creation.get("ephemeral_5m_input_tokens"))
+        cache_write_1h_tokens += _nonnegative_int(cache_creation.get("ephemeral_1h_input_tokens"))
+        cache_write_unknown_ttl_tokens += sum(
+            _nonnegative_int(value)
+            for key, value in cache_creation.items()
+            if key
+            not in {
+                "ephemeral_5m_input_tokens",
+                "ephemeral_1h_input_tokens",
+            }
+        )
 
     detailed_cache_writes = (
         cache_write_5m_tokens + cache_write_1h_tokens + cache_write_unknown_ttl_tokens
     )
-    if detailed_cache_writes > cache_write_tokens:
-        cache_write_tokens = detailed_cache_writes
-    elif cache_write_tokens > detailed_cache_writes:
+    has_detailed_cache_writes = has_cache_details or type(cache_creation) is dict
+    if has_detailed_cache_writes and detailed_cache_writes != cache_write_tokens:
+        return None
+    if not has_detailed_cache_writes and cache_write_tokens > 0:
         cache_write_unknown_ttl_tokens += cache_write_tokens - detailed_cache_writes
 
     anthropic_shaped = dialect == _DIALECT_ANTHROPIC
@@ -1159,12 +1139,15 @@ def _nested_reasoning_output_tokens(
 
 
 def _strict_cache_write_tokens(raw_usage: dict[str, Any]) -> int | None:
-    """Validate cache-write evidence before an OpenAI-dialect payload can be priced."""
+    """Return one cache-write total only when every supplied source agrees."""
 
+    observed: list[int] = []
     counter = _optional_nonnegative_int_field(raw_usage, "cache_creation_input_tokens")
     if counter is None:
         return None
-    total, _ = counter
+    total, present = counter
+    if present:
+        observed.append(total)
 
     cache_creation = raw_usage.get("cache_creation")
     if "cache_creation" in raw_usage and cache_creation is not None:
@@ -1175,7 +1158,7 @@ def _strict_cache_write_tokens(raw_usage: dict[str, Any]) -> int | None:
             if type(value) is not int or value < 0:
                 return None
             creation_total += value
-        total = max(total, creation_total)
+        observed.append(creation_total)
 
     cache_details = raw_usage.get("cache_details")
     if "cache_details" in raw_usage and cache_details is not None:
@@ -1192,11 +1175,17 @@ def _strict_cache_write_tokens(raw_usage: dict[str, Any]) -> int | None:
             if not present:
                 return None
             details_total += value
-        total = max(total, details_total)
-    return total
+        observed.append(details_total)
+    if not observed:
+        return 0
+    if any(value != observed[0] for value in observed[1:]):
+        return None
+    return observed[0]
 
 
-def _has_usage_counter(values: dict[str, Any]) -> bool:
+def _has_positive_usage_counter(values: dict[str, Any]) -> bool:
+    """Return whether recognized provider evidence contains a positive counter."""
+
     keys = (
         "input_tokens",
         "prompt_tokens",
