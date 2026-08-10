@@ -121,7 +121,10 @@ from cayu.runtime import (
     copy_dispatch_request,
     retry_decision,
 )
-from cayu.runtime._model_errors import copy_provider_hook_error_control
+from cayu.runtime._model_errors import (
+    copy_provider_hook_error_control,
+    model_provider_error_from_payload,
+)
 from cayu.runtime.approvals import copy_resolution_actor
 from cayu.runtime.structured_output import validate_structured_output_text
 from cayu.storage import KnowledgeEntry, KnowledgeHit
@@ -1599,8 +1602,52 @@ def test_model_provider_error_rejects_invalid_classification_fields():
     with pytest.raises(ValueError, match="retry_after_s must be a non-negative number"):
         ModelProviderError("boom", provider="p", retry_after_s=True)  # type: ignore[arg-type]
 
+
+@pytest.mark.parametrize("status_code", [None, 100, 599])
+def test_model_provider_error_accepts_http_status_code_boundaries(
+    status_code: int | None,
+) -> None:
+    error = ModelProviderError("boom", provider="p", status_code=status_code)
+
+    assert error.status_code == status_code
+    assert error.error_payload_fields() == (
+        {"provider": "p"} if status_code is None else {"provider": "p", "status_code": status_code}
+    )
+
+
+@pytest.mark.parametrize("status_code", [99, 600, True, 100.0, "500", object()])
+def test_model_provider_error_rejects_invalid_http_status_codes(status_code: object) -> None:
     with pytest.raises(ValueError, match="status_code must be a valid HTTP status code"):
-        ModelProviderError("boom", provider="p", status_code=42)
+        ModelProviderError(
+            "boom",
+            provider="p",
+            status_code=status_code,  # type: ignore[arg-type]
+        )
+
+
+def test_model_provider_error_subclasses_inherit_http_status_code_validation() -> None:
+    error = ModelContextOverflowError("context too large", provider="p", status_code=599)
+
+    assert error.status_code == 599
+    assert error.error_payload_fields()["status_code"] == 599
+    with pytest.raises(ValueError, match="status_code must be a valid HTTP status code"):
+        ModelContextOverflowError("context too large", provider="p", status_code=600)
+
+
+def test_model_provider_error_reconstruction_drops_invalid_http_status_code() -> None:
+    error = model_provider_error_from_payload(
+        {
+            "error": "provider failed",
+            "error_type": "ModelProviderError",
+            "provider": "p",
+            "status_code": 600,
+        },
+        fallback_provider="fallback",
+    )
+
+    assert isinstance(error, ModelProviderError)
+    assert error.status_code is None
+    assert error.error_payload_fields() == {"provider": "p"}
 
 
 def test_model_context_overflow_error_is_typed_and_never_retryable():

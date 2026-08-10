@@ -180,7 +180,9 @@ class ModelProviderError(RuntimeError):
     ) -> None:
         super().__init__(require_nonblank(message, "message"))
         self.provider = require_clean_nonblank(provider, "provider")
-        if status_code is not None and (type(status_code) is not int or status_code < 100):
+        if status_code is not None and (
+            type(status_code) is not int or status_code < 100 or status_code > 599
+        ):
             raise ValueError("status_code must be a valid HTTP status code.")
         self.status_code = status_code
         self.error_type = _optional_clean_error_field(error_type, "error_type")

@@ -608,7 +608,7 @@ def _clean_payload_string(value: Any) -> str | None:
 
 
 def _payload_status_code(value: Any) -> int | None:
-    if type(value) is not int or value < 100:
+    if type(value) is not int or value < 100 or value > 599:
         return None
     return value
 
