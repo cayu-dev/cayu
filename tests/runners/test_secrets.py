@@ -7,7 +7,7 @@ import stat
 
 import pytest
 
-from cayu.runners._secrets import runner_env_file
+from cayu.runners._secrets import DOCKER_ENV_FILE_MAX_LINE_BYTES, runner_env_file
 
 
 def test_runner_env_file_writes_key_value_lines_and_cleans_up() -> None:
@@ -31,13 +31,36 @@ def test_runner_env_file_yields_none_for_empty_env() -> None:
         assert path is None
 
 
-def test_runner_env_file_rejects_newline_and_equals_in_name() -> None:
-    with pytest.raises(ValueError, match="env-file"), runner_env_file({"BAD\nNAME": "v"}):
+@pytest.mark.parametrize(
+    "environment",
+    (
+        {"BAD\nNAME": "v"},
+        {"BAD=NAME": "v"},
+        {"INNER SPACE": "v"},
+        {"INNER\tTAB": "v"},
+        {"#COMMENT": "v"},
+        {"\ufeffBOM": "v"},
+        {"OK": "value\nwith-newline"},
+        {"OK": "value\rwith-carriage-return"},
+    ),
+)
+def test_runner_env_file_rejects_unrepresentable_environment(
+    environment: dict[str, str],
+) -> None:
+    with pytest.raises(ValueError, match="env-file"), runner_env_file(environment):
         pass
-    with pytest.raises(ValueError, match="env-file"), runner_env_file({"BAD=NAME": "v"}):
-        pass
+
+
+def test_runner_env_file_enforces_docker_line_size_boundary() -> None:
+    key = "VALUE"
+    value_at_limit = "x" * (DOCKER_ENV_FILE_MAX_LINE_BYTES - len(f"{key}="))
+
+    with runner_env_file({key: value_at_limit}) as path:
+        assert path is not None
+        assert os.path.getsize(path) == DOCKER_ENV_FILE_MAX_LINE_BYTES + 1
+
     with (
-        pytest.raises(ValueError, match="env-file"),
-        runner_env_file({"OK": "value\nwith-newline"}),
+        pytest.raises(ValueError, match="supported size"),
+        runner_env_file({key: f"{value_at_limit}x"}),
     ):
         pass

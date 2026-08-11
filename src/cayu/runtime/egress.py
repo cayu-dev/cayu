@@ -92,12 +92,22 @@ from cayu.environments.factory import (
     environment_factory_cleanup_settlement_task,
     environment_factory_cleanup_settlement_tasks,
 )
+from cayu.runners._subprocess import (
+    copy_runner_env,
+    validate_output_limit,
+    validate_runner_env_remove,
+    validate_stdin,
+    validate_timeout,
+)
 from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
     ExecResult,
     Runner,
     RunnerWorkspaceCapabilityT,
+    _clean_runner_preflight,
+    _clear_preflight_traceback_frames,
+    copy_exec_command,
 )
 from cayu.runtime._binding_cleanup import (
     BindingFinalizeFailure,
@@ -1139,6 +1149,32 @@ def _workspace_dispatch_settlement_kind(
     return "uncertain"
 
 
+def _validated_runner_dispatch_kwargs(
+    runner: Runner,
+    cwd: str | None,
+    env: dict[str, str] | None,
+    env_remove: tuple[str, ...],
+    timeout_s: int | None,
+    stdin: str | None,
+    output_limit_bytes: int | None,
+) -> dict[str, Any]:
+    """Own validated command inputs before managed dispatch admission."""
+
+    validated_cwd = runner.resolve_cwd(cwd)
+    validated_env = None if env is None else copy_runner_env(env, inherit_env=False)
+    validated_env_remove = validate_runner_env_remove(env_remove)
+    kwargs: dict[str, Any] = {
+        "cwd": validated_cwd,
+        "env": validated_env,
+        "timeout_s": validate_timeout(timeout_s),
+        "stdin": validate_stdin(stdin),
+        "output_limit_bytes": validate_output_limit(output_limit_bytes),
+    }
+    if validated_env_remove:
+        kwargs["env_remove"] = validated_env_remove
+    return kwargs
+
+
 class _EgressManagedRunner(Runner):
     """Runner wrapper that also owns pre-bind egress resources.
 
@@ -1239,6 +1275,39 @@ class _EgressManagedRunner(Runner):
 
         return self._runner.workspace_capability(capability_type)
 
+    @_clean_runner_preflight
+    def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate the selected backend before managed dispatch admission."""
+
+        self._ensure_exec_open()
+        try:
+            owned_command = copy_exec_command(command)
+            kwargs = _validated_runner_dispatch_kwargs(
+                self._runner,
+                cwd,
+                env,
+                env_remove,
+                timeout_s,
+                stdin,
+                output_limit_bytes,
+            )
+            self._runner.preflight_exec(owned_command, **kwargs)
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            raise
+        finally:
+            del command
+
     async def exec(
         self,
         command: ExecCommand,
@@ -1250,18 +1319,33 @@ class _EgressManagedRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
-        kwargs: dict[str, Any] = {
-            "cwd": cwd,
-            "env": env,
-            "timeout_s": timeout_s,
-            "stdin": stdin,
-            "output_limit_bytes": output_limit_bytes,
-        }
-        if env_remove:
-            kwargs["env_remove"] = env_remove
+        self._ensure_exec_open()
+        try:
+            owned_command = copy_exec_command(command)
+            kwargs = _validated_runner_dispatch_kwargs(
+                self._runner,
+                cwd,
+                env,
+                env_remove,
+                timeout_s,
+                stdin,
+                output_limit_bytes,
+            )
+            self._runner.preflight_exec(owned_command, **kwargs)
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            kwargs = {}
+            cwd = None
+            env = None
+            env_remove = ()
+            stdin = None
+            raise
+        finally:
+            del command
         dispatch_id = self._begin_workspace_dispatch()
         try:
-            result = await self._runner.exec(command, **kwargs)
+            result = await self._runner.exec(owned_command, **kwargs)
         except BaseException as exc:
             self._finish_workspace_dispatch(dispatch_id=dispatch_id, error=exc)
             raise
@@ -1281,19 +1365,34 @@ class _EgressManagedRunner(Runner):
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         self._ensure_exec_open()
-        kwargs: dict[str, Any] = {
-            "redactor": self._output_redactor.merged_with(redactor),
-            "cwd": cwd,
-            "env": env,
-            "timeout_s": timeout_s,
-            "stdin": stdin,
-            "output_limit_bytes": output_limit_bytes,
-        }
-        if env_remove:
-            kwargs["env_remove"] = env_remove
+        try:
+            owned_command = copy_exec_command(command)
+            kwargs = _validated_runner_dispatch_kwargs(
+                self._runner,
+                cwd,
+                env,
+                env_remove,
+                timeout_s,
+                stdin,
+                output_limit_bytes,
+            )
+            self._runner.preflight_exec(owned_command, **kwargs)
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            kwargs = {}
+            cwd = None
+            env = None
+            env_remove = ()
+            stdin = None
+            del redactor
+            raise
+        finally:
+            del command
+        kwargs["redactor"] = self._output_redactor.merged_with(redactor)
         dispatch_id = self._begin_workspace_dispatch()
         try:
-            result = await self._runner.exec_redacted(command, **kwargs)
+            result = await self._runner.exec_redacted(owned_command, **kwargs)
         except BaseException as exc:
             self._finish_workspace_dispatch(dispatch_id=dispatch_id, error=exc)
             raise
@@ -1311,18 +1410,33 @@ class _EgressManagedRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
-        kwargs: dict[str, Any] = {
-            "cwd": cwd,
-            "env": env,
-            "timeout_s": timeout_s,
-            "stdin": stdin,
-            "output_limit_bytes": output_limit_bytes,
-        }
-        if env_remove:
-            kwargs["env_remove"] = env_remove
+        self._ensure_exec_open()
+        try:
+            owned_command = copy_exec_command(command)
+            kwargs = _validated_runner_dispatch_kwargs(
+                self._runner,
+                cwd,
+                env,
+                env_remove,
+                timeout_s,
+                stdin,
+                output_limit_bytes,
+            )
+            self._runner.preflight_exec(owned_command, **kwargs)
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            kwargs = {}
+            cwd = None
+            env = None
+            env_remove = ()
+            stdin = None
+            raise
+        finally:
+            del command
         dispatch_id = self._begin_workspace_dispatch()
         try:
-            result = await self._runner.exec_system(command, **kwargs)
+            result = await self._runner.exec_system(owned_command, **kwargs)
         except BaseException as exc:
             self._finish_workspace_dispatch(dispatch_id=dispatch_id, error=exc)
             raise

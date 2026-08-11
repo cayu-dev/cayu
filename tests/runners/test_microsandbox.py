@@ -429,6 +429,17 @@ def test_microsandbox_runner_create_passes_lifecycle_options() -> None:
     assert FakeSandboxApi.created[0]["network"] is network
 
 
+@pytest.mark.parametrize("invalid_text", ("/workspace\x00bad", "/workspace\ud800bad"))
+def test_microsandbox_runner_rejects_nonportable_default_cwd(invalid_text: str) -> None:
+    with pytest.raises(ValueError, match="default_cwd"):
+        MicrosandboxRunner(object(), name="sandbox", default_cwd=invalid_text)
+
+    runner = MicrosandboxRunner(object(), name="sandbox")
+    runner.default_cwd = invalid_text
+    with pytest.raises(ValueError, match="default_cwd"):
+        runner.resolve_cwd()
+
+
 def test_microsandbox_runner_create_denies_network_by_default() -> None:
     async def run() -> MicrosandboxRunner:
         reset_fake_module()
@@ -539,6 +550,119 @@ def test_microsandbox_runner_executes_process_with_explicit_env_and_bounds_outpu
         }
     ]
     assert "CAYU_SECRET_HOST_ENV" not in sandbox.exec_calls[0]["env"]
+
+
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+def test_microsandbox_owns_environment_before_waiting_for_exec_lock(
+    public_method: str,
+) -> None:
+    sandbox = FakeSandbox("runner")
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+    environment = {"ORIGINAL": "value"}
+
+    async def run() -> None:
+        await runner._exec_lock.acquire()
+        kwargs: dict[str, Any] = {"env": environment}
+        if public_method == "exec_redacted":
+            kwargs["redactor"] = SecretRedactor()
+        task = asyncio.create_task(
+            getattr(runner, public_method)(
+                ExecCommand.process("python", "-c", "pass"),
+                **kwargs,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            assert not task.done()
+            environment.clear()
+            environment["INVALID\x00NAME"] = "changed"
+        finally:
+            runner._exec_lock.release()
+        await task
+
+    asyncio.run(run())
+
+    assert sandbox.exec_calls[0]["env"] == {"ORIGINAL": "value"}
+    assert environment == {"INVALID\x00NAME": "changed"}
+
+
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+def test_microsandbox_owns_command_before_waiting_for_exec_lock(
+    public_method: str,
+) -> None:
+    sandbox = FakeSandbox("runner")
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        sandbox_module=FakeMicrosandboxModule,
+    )
+    command = ExecCommand.process("python", "-c", "print('owned-command')")
+
+    async def run() -> None:
+        await runner._exec_lock.acquire()
+        kwargs: dict[str, Any] = {}
+        if public_method == "exec_redacted":
+            kwargs["redactor"] = SecretRedactor()
+        task = asyncio.create_task(getattr(runner, public_method)(command, **kwargs))
+        try:
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert command.argv is not None
+            command.argv[:] = ["mutated-command"]
+        finally:
+            runner._exec_lock.release()
+        await task
+
+    asyncio.run(run())
+
+    assert sandbox.exec_calls[0]["cmd"] == "python"
+    assert sandbox.exec_calls[0]["args"] == ["-c", "print('owned-command')"]
+
+
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+def test_microsandbox_owns_overlay_before_waiting_for_exec_lock(
+    public_method: str,
+) -> None:
+    sandbox = FakeSandbox("runner")
+    runner = MicrosandboxRunner(
+        sandbox,
+        name="runner",
+        env_overlay={"OVERLAY": "owned"},
+        sandbox_module=FakeMicrosandboxModule,
+    )
+
+    async def run() -> None:
+        await runner._exec_lock.acquire()
+        kwargs: dict[str, Any] = {}
+        if public_method == "exec_redacted":
+            kwargs["redactor"] = SecretRedactor()
+        task = asyncio.create_task(
+            getattr(runner, public_method)(
+                ExecCommand.process("python", "-c", "pass"),
+                **kwargs,
+            )
+        )
+        try:
+            await asyncio.sleep(0)
+            assert not task.done()
+            runner.env_overlay.clear()
+            runner.env_overlay["OVERLAY"] = "mutated"
+            runner.env_overlay["INVALID\x00NAME"] = "changed"
+        finally:
+            runner._exec_lock.release()
+        await task
+
+    asyncio.run(run())
+
+    assert sandbox.exec_calls[0]["env"] == {"OVERLAY": "owned"}
+    assert runner.env_overlay == {
+        "OVERLAY": "mutated",
+        "INVALID\x00NAME": "changed",
+    }
 
 
 def test_microsandbox_runner_redacts_stream_events_before_bounding() -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from inspect import isawaitable
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -22,7 +24,18 @@ from cayu.core.tools import (
     _bound_policy_denial_result,
 )
 from cayu.runners import ExecCommand, ExecResult, RunnerUnavailableError
+from cayu.runners._cleanup import runner_cancellation_failure
+from cayu.runners.base import (
+    _clear_preflight_traceback_frames,
+    _CommandValidationModel,
+    runner_execution_error,
+)
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._operation_boundary import (
+    await_invocation_cancellation_checkpoint,
+    await_invocation_operation,
+)
+from cayu.tools._runner import InvocationRunnerHandle
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 50_000
 MAX_OUTPUT_LIMIT_BYTES = 200_000
@@ -39,7 +52,7 @@ class CommandPolicyDecision(StrEnum):
     REQUIRE_COMMAND_APPROVAL = "require_command_approval"
 
 
-class CommandRequest(BaseModel):
+class CommandRequest(_CommandValidationModel):
     """Exec request evaluated by a :class:`CommandPolicy`.
 
     ``cwd`` preserves the original requested value for audit and backward
@@ -49,7 +62,7 @@ class CommandRequest(BaseModel):
     still be loaded; :class:`ExecCommandTool` always supplies it.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     command: ExecCommand
     cwd: str | None = None
@@ -86,11 +99,12 @@ class CommandPolicy(ABC):
     """Authorizes exec_command requests before they reach the runner.
 
     With a policy, ``ExecCommandTool`` resolves the requested ``cwd`` through
-    the active runner before evaluation and supplies both the requested and
-    canonical forms. An allowed command executes with that same canonical
-    value. Without a policy the model-controlled command, ``cwd``, and ``env``
-    pass straight to the runner. Hosts that need an allow/deny/approval seam
-    attach a policy via ``ExecCommandTool(policy=...)``.
+    the active runner and runs the selected backend's side-effect-free preflight
+    before evaluation, then supplies both the requested and canonical forms. An
+    allowed command executes with that same canonical value. Without a policy
+    the model-controlled command, ``cwd``, and ``env`` pass straight to the
+    runner. Hosts that need an allow/deny/approval seam attach a policy via
+    ``ExecCommandTool(policy=...)``.
     """
 
     @abstractmethod
@@ -201,6 +215,27 @@ class ExecCommandTool(Tool):
                 require_unicode_scalar_text(stdin, "stdin")
             canonical_cwd = runner.resolve_cwd(cwd)
         if self._policy is not None:
+            preflight_runner = _require_runner_preflight(runner)
+            preflight_failure: Exception | None = None
+            try:
+                await _run_command_preflight(
+                    preflight_runner,
+                    command,
+                    cwd=canonical_cwd,
+                    env=env,
+                    timeout_s=timeout_s,
+                    stdin=stdin,
+                    output_limit_bytes=max_output_bytes,
+                )
+            except Exception as exc:
+                preflight_failure = exc
+            if preflight_failure is not None:
+                caller_cancellation = await await_invocation_cancellation_checkpoint()
+                if caller_cancellation is not None:
+                    raise caller_cancellation from preflight_failure
+                if isinstance(preflight_failure, RunnerUnavailableError):
+                    return _runner_unavailable_result(preflight_failure)
+                raise preflight_failure from None
             verdict = await self._policy.evaluate(
                 ctx,
                 CommandRequest(
@@ -227,15 +262,7 @@ class ExecCommandTool(Tool):
                 output_limit_bytes=max_output_bytes,
             )
         except RunnerUnavailableError as exc:
-            return ToolResult(
-                content=str(exc),
-                structured={
-                    "error": "runner_unavailable",
-                    "diagnostic": copy_json_value(exc.diagnostic, "diagnostic"),
-                },
-                artifacts=exc.artifacts,
-                is_error=True,
-            )
+            return _runner_unavailable_result(exc)
         result = _require_exec_result(result)
         content = _command_content(
             stdout=result.stdout,
@@ -408,12 +435,148 @@ class _CommandRunnerHandle(Protocol):
     def resolve_cwd(self, cwd: str | None = None) -> str: ...
 
 
+@runtime_checkable
+class _CommandPreflightHandle(Protocol):
+    def preflight_exec(self, command: ExecCommand, **kwargs) -> object: ...
+
+
 def _require_runner(ctx: ToolContext) -> _CommandRunnerHandle | None:
     if ctx.runner is None:
         return None
     if not isinstance(ctx.runner, _CommandRunnerHandle):
         raise TypeError("Tool context runner must support command execution and cwd resolution.")
     return ctx.runner
+
+
+def _require_runner_preflight(runner: _CommandRunnerHandle) -> _CommandPreflightHandle:
+    if not isinstance(runner, _CommandPreflightHandle):
+        raise TypeError("Policy-enabled command runners must support command preflight.")
+    return runner
+
+
+async def _run_command_preflight(
+    runner: _CommandPreflightHandle,
+    command: ExecCommand,
+    *,
+    cwd: str | None,
+    env: dict[str, str] | None,
+    timeout_s: int | None,
+    stdin: str | None,
+    output_limit_bytes: int | None,
+) -> None:
+    """Run one policy preflight without surrendering caller cancellation."""
+
+    if type(runner) is InvocationRunnerHandle:
+        await _run_invocation_command_preflight(
+            runner,
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        return
+
+    async def operation(
+        preflight_runner: _CommandPreflightHandle = runner,
+        owned_command: ExecCommand = command,
+        owned_cwd: str | None = cwd,
+        owned_env: dict[str, str] | None = env,
+        owned_timeout_s: int | None = timeout_s,
+        owned_stdin: str | None = stdin,
+        owned_output_limit_bytes: int | None = output_limit_bytes,
+    ) -> object:
+        result = preflight_runner.preflight_exec(
+            owned_command,
+            cwd=owned_cwd,
+            env=owned_env,
+            timeout_s=owned_timeout_s,
+            stdin=owned_stdin,
+            output_limit_bytes=owned_output_limit_bytes,
+        )
+        if isawaitable(result):
+            result = await result
+        if result is not None:
+            raise TypeError("Command runner preflight must return None.")
+        return None
+
+    pending = await_invocation_operation(operation)
+    del operation
+    outcome = await pending
+    del pending
+    failure = outcome.error
+    caller_cancellation = outcome.cancellation
+    del outcome
+    if failure is not None:
+        _clear_preflight_traceback_frames(failure)
+        failure.__traceback__ = None
+    del runner, command, cwd, env, timeout_s, stdin, output_limit_bytes
+    if caller_cancellation is not None:
+        secondary_failure = (
+            runner_cancellation_failure(failure)
+            if isinstance(failure, asyncio.CancelledError)
+            else failure
+        )
+        del failure
+        raise caller_cancellation from secondary_failure
+    if isinstance(failure, asyncio.CancelledError):
+        safe_failure = runner_execution_error(failure, adapter="unknown")
+        del failure
+        raise safe_failure from None
+    if failure is not None:
+        raise failure from None
+
+
+async def _run_invocation_command_preflight(
+    runner: InvocationRunnerHandle,
+    command: ExecCommand,
+    *,
+    cwd: str | None,
+    env: dict[str, str] | None,
+    timeout_s: int | None,
+    stdin: str | None,
+    output_limit_bytes: int | None,
+) -> None:
+    """Preserve the invocation handle's redaction-aware cancellation boundary."""
+
+    invocation_failure: BaseException | None = None
+    result: object | None = None
+    try:
+        result = runner.preflight_exec(
+            command,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        if isawaitable(result):
+            result = await result
+        if result is not None:
+            raise TypeError("Command runner preflight must return None.")
+    except BaseException as error:
+        invocation_failure = error
+    if invocation_failure is None:
+        return
+    _clear_preflight_traceback_frames(invocation_failure)
+    invocation_failure.__traceback__ = None
+    published_failure = invocation_failure
+    del runner, command, cwd, env, timeout_s, stdin, output_limit_bytes
+    del invocation_failure, result
+    raise published_failure
+
+
+def _runner_unavailable_result(exc: RunnerUnavailableError) -> ToolResult:
+    return ToolResult(
+        content=str(exc),
+        structured={
+            "error": "runner_unavailable",
+            "diagnostic": copy_json_value(exc.diagnostic, "diagnostic"),
+        },
+        artifacts=exc.artifacts,
+        is_error=True,
+    )
 
 
 def _require_exec_result(result: object) -> ExecResult:

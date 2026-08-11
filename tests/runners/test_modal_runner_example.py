@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import ExecCommand, RunnerCancelledError
 
@@ -22,6 +25,7 @@ def _load_example():
     spec = importlib.util.spec_from_file_location("modal_runner_example", _EXAMPLE_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -195,6 +199,147 @@ def test_exec_translates_argv_env_cwd_and_passes_native_timeout(
     assert "HOSTSECRET" not in call["env"]  # host env is not inherited
     assert call["timeout"] == 7  # native exec timeout is passed through
     assert result.stdout == "abc" and result.stdout_truncated is True
+
+
+def test_exec_applies_valid_environment_removals_before_dispatch() -> None:
+    sandbox = FakeSandbox()
+
+    async def run():
+        await mod.ModalRunner(sandbox).exec(
+            ExecCommand.process("true"),
+            env={"KEEP": "value", "DROP": "removed"},
+            env_remove=("DROP",),
+        )
+
+    asyncio.run(run())
+
+    assert sandbox.exec_calls[0]["env"] == {"KEEP": "value"}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"env": {"BAD=NAME": "value"}},
+        {"env": {"VALID": "bad\x00value"}},
+        {"env_remove": ["VALID"]},
+        {"env_remove": (" PADDED ",)},
+        {"timeout_s": True},
+        {"stdin": "bad\ud800stdin"},
+    ),
+)
+def test_exec_rejects_invalid_request_before_modal_dispatch(kwargs: dict[str, Any]) -> None:
+    sandbox = FakeSandbox()
+
+    async def run():
+        await mod.ModalRunner(sandbox).exec(ExecCommand.process("true"), **kwargs)
+
+    with pytest.raises((TypeError, ValueError)):
+        asyncio.run(run())
+
+    assert sandbox.exec_calls == []
+
+
+def test_preflight_rejects_invalid_request_without_modal_dispatch() -> None:
+    sandbox = FakeSandbox()
+    runner = mod.ModalRunner(sandbox)
+
+    with pytest.raises(ValueError):
+        runner.preflight_exec(
+            ExecCommand.process("true"),
+            env={"VALID": "bad\x00value"},
+        )
+
+    assert sandbox.exec_calls == []
+
+
+def test_preflight_failure_does_not_retain_secret_bearing_sibling_inputs() -> None:
+    secret = "MODAL_PREFLIGHT_SECRET_CANARY_ABCDEFGHIJKLMNOP"
+    sandbox = FakeSandbox()
+    command = ExecCommand.process("true", f"Authorization: Bearer {secret}")
+    assert command.argv is not None
+    command.argv[0] = "invalid\x00argument"
+
+    with pytest.raises(ValueError) as raised:
+        mod.ModalRunner(sandbox).preflight_exec(
+            command,
+            env={"TOKEN": secret},
+        )
+
+    current = raised.value.__traceback__
+    while current is not None:
+        if Path(current.tb_frame.f_code.co_filename) == _EXAMPLE_PATH:
+            assert all(secret not in repr(value) for value in current.tb_frame.f_locals.values())
+        current = current.tb_next
+    assert sandbox.exec_calls == []
+
+
+def test_preflight_rejects_closed_runner_without_modal_dispatch() -> None:
+    sandbox = FakeSandbox()
+    runner = mod.ModalRunner(sandbox)
+    asyncio.run(runner.close())
+
+    with pytest.raises(RuntimeError, match="ModalRunner is closed"):
+        runner.preflight_exec(ExecCommand.process("true"))
+
+    assert sandbox.exec_calls == []
+
+
+def test_exec_revalidates_mutated_command_without_serializer_diagnostics() -> None:
+    secret = "modal-mutated-command-secret-canary-ABCDEFGHIJKLMNOP"
+
+    class SecretBearingValue:
+        def __repr__(self) -> str:
+            return secret
+
+    sandbox = FakeSandbox()
+    command = ExecCommand.process("true")
+    assert command.argv is not None
+    command.argv[0] = SecretBearingValue()  # type: ignore[list-item]
+
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        with pytest.raises(ValidationError) as raised:
+            asyncio.run(mod.ModalRunner(sandbox).exec(command))
+
+    assert emitted == []
+    assert secret not in f"{raised.value!s} {raised.value!r}"
+    assert sandbox.exec_calls == []
+
+
+def test_exec_owns_request_before_modal_dispatch_suspends() -> None:
+    async def run() -> tuple[dict[str, Any], dict[str, str], ExecCommand]:
+        dispatch_started = asyncio.Event()
+        release_dispatch = asyncio.Event()
+        sandbox = FakeSandbox()
+
+        async def blocking_exec(*argv, workdir=None, env=None, timeout=None):
+            sandbox.exec_calls.append(
+                {"argv": list(argv), "workdir": workdir, "env": env, "timeout": timeout}
+            )
+            dispatch_started.set()
+            await release_dispatch.wait()
+            sandbox.last_process = _Process()
+            return sandbox.last_process
+
+        sandbox.exec = _Aio(blocking_exec)
+        command = ExecCommand.process("original-command")
+        environment = {"ORIGINAL": "value"}
+        task = asyncio.create_task(mod.ModalRunner(sandbox).exec(command, env=environment))
+        await dispatch_started.wait()
+        assert command.argv is not None
+        command.argv[0] = "mutated-command"
+        environment.clear()
+        environment["MUTATED"] = "value"
+        release_dispatch.set()
+        await task
+        return sandbox.exec_calls[0], environment, command
+
+    call, environment, command = asyncio.run(run())
+
+    assert call["argv"] == ["original-command"]
+    assert call["env"] == {"ORIGINAL": "value"}
+    assert environment == {"MUTATED": "value"}
+    assert command.argv == ["mutated-command"]
 
 
 def test_exec_shell_runs_under_bash() -> None:

@@ -15,7 +15,11 @@ from typing import Any, Literal, cast
 from cayu._exception_groups import exception_group_children
 from cayu._exception_state import exception_state, set_exception_state
 from cayu._task_wait import await_shielded_task_outcome
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -42,7 +46,10 @@ from cayu.runners.base import (
     RunnerUnavailableError,
     RunnerWorkspaceCapability,
     RunnerWorkspaceCapabilityT,
+    _clean_runner_preflight,
+    _clear_preflight_traceback_frames,
     attach_cancellation_artifacts,
+    copy_exec_command,
     runner_execution_error,
 )
 from cayu.vaults import SecretRedactor
@@ -817,6 +824,35 @@ class MicrosandboxRunner(Runner):
         if client is not None:
             await _close_quietly(client)
 
+    @_clean_runner_preflight
+    def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate the complete Microsandbox request without provider activity."""
+
+        if type(command) is not ExecCommand:
+            raise TypeError("MicrosandboxRunner command must be an ExecCommand.")
+        self._ensure_agent_available()
+        self._ensure_exec_open()
+        prepared = self._prepare_exec_request(
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        del prepared
+
     async def exec(
         self,
         command: ExecCommand,
@@ -828,16 +864,57 @@ class MicrosandboxRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
-        async with self._exec_lock:
-            return await self._exec_serialized(
+        if type(command) is not ExecCommand:
+            raise TypeError("MicrosandboxRunner command must be an ExecCommand.")
+        self._ensure_agent_available()
+        self._ensure_exec_open()
+        try:
+            (
+                owned_command,
+                working_dir,
+                environment,
+                timeout,
+                sdk_stdin,
+                output_limit,
+            ) = self._prepare_exec_request(
                 command,
-                output_redactor=SecretRedactor(),
                 cwd=cwd,
                 env=env,
                 env_remove=env_remove,
                 timeout_s=timeout_s,
                 stdin=stdin,
                 output_limit_bytes=output_limit_bytes,
+            )
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            working_dir = ""
+            environment = {}
+            sdk_stdin = None
+            cwd = None
+            env = None
+            env_remove = ()
+            timeout_s = None
+            stdin = None
+            output_limit_bytes = None
+            raise
+        finally:
+            del command
+        cwd = None
+        env = None
+        env_remove = ()
+        timeout_s = None
+        stdin = None
+        output_limit_bytes = None
+        async with self._exec_lock:
+            return await self._exec_serialized(
+                owned_command,
+                output_redactor=SecretRedactor(),
+                working_dir=working_dir,
+                environment=environment,
+                timeout=timeout,
+                sdk_stdin=sdk_stdin,
+                output_limit=output_limit,
             )
 
     async def exec_redacted(
@@ -854,10 +931,20 @@ class MicrosandboxRunner(Runner):
     ) -> ExecResult:
         if not isinstance(redactor, SecretRedactor):
             raise TypeError("MicrosandboxRunner redactor must be a SecretRedactor.")
-        async with self._exec_lock:
-            return await self._exec_serialized(
+        if type(command) is not ExecCommand:
+            raise TypeError("MicrosandboxRunner command must be an ExecCommand.")
+        self._ensure_agent_available()
+        self._ensure_exec_open()
+        try:
+            (
+                owned_command,
+                working_dir,
+                environment,
+                timeout,
+                sdk_stdin,
+                output_limit,
+            ) = self._prepare_exec_request(
                 command,
-                output_redactor=redactor,
                 cwd=cwd,
                 env=env,
                 env_remove=env_remove,
@@ -865,33 +952,80 @@ class MicrosandboxRunner(Runner):
                 stdin=stdin,
                 output_limit_bytes=output_limit_bytes,
             )
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            working_dir = ""
+            environment = {}
+            sdk_stdin = None
+            cwd = None
+            env = None
+            env_remove = ()
+            timeout_s = None
+            stdin = None
+            output_limit_bytes = None
+            del redactor
+            raise
+        finally:
+            del command
+        cwd = None
+        env = None
+        env_remove = ()
+        timeout_s = None
+        stdin = None
+        output_limit_bytes = None
+        async with self._exec_lock:
+            return await self._exec_serialized(
+                owned_command,
+                output_redactor=redactor,
+                working_dir=working_dir,
+                environment=environment,
+                timeout=timeout,
+                sdk_stdin=sdk_stdin,
+                output_limit=output_limit,
+            )
+
+    def _prepare_exec_request(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> tuple[ExecCommand, str, dict[str, str], int | None, bytes | None, int | None]:
+        """Own and validate one complete request before the execution lock can suspend."""
+
+        owned_command = copy_exec_command(command)
+        working_dir = self.resolve_cwd(cwd)
+        environment = copy_runner_env(env, inherit_env=False)
+        env_overlay = copy_runner_env(self.env_overlay, inherit_env=False)
+        environment = remove_runner_env(environment, env_remove)
+        if env_overlay:
+            environment.update(env_overlay)
+        timeout = validate_timeout(timeout_s)
+        standard_input = validate_stdin(stdin)
+        sdk_stdin = standard_input.encode("utf-8") if standard_input is not None else None
+        output_limit = validate_output_limit(output_limit_bytes)
+        return owned_command, working_dir, environment, timeout, sdk_stdin, output_limit
 
     async def _exec_serialized(
         self,
         command: ExecCommand,
         *,
         output_redactor: SecretRedactor,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        env_remove: tuple[str, ...] = (),
-        timeout_s: int | None = None,
-        stdin: str | None = None,
-        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+        working_dir: str,
+        environment: dict[str, str],
+        timeout: int | None,
+        sdk_stdin: bytes | None,
+        output_limit: int | None,
     ) -> ExecResult:
         if type(command) is not ExecCommand:
             raise TypeError("MicrosandboxRunner command must be an ExecCommand.")
         self._ensure_agent_available()
         self._ensure_exec_open()
-
-        working_dir = self.resolve_cwd(cwd)
-        environment = copy_runner_env(env, inherit_env=False)
-        environment = remove_runner_env(environment, env_remove)
-        if self.env_overlay:
-            environment.update(self.env_overlay)
-        timeout = validate_timeout(timeout_s)
-        standard_input = validate_stdin(stdin)
-        sdk_stdin = standard_input.encode("utf-8") if standard_input is not None else None
-        output_limit = validate_output_limit(output_limit_bytes)
 
         stdout = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
         stderr = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
@@ -1151,7 +1285,7 @@ def _validate_sandbox_name(name: str) -> str:
 
 
 def _validate_guest_root(path: str) -> str:
-    root = require_clean_nonblank(path, "default_cwd")
+    root = require_durable_clean_nonblank(path, "default_cwd")
     if not posixpath.isabs(root):
         raise ValueError("MicrosandboxRunner default_cwd must be an absolute guest path.")
     return posixpath.normpath(root)

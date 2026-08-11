@@ -33,6 +33,30 @@ SUPERVISOR_SPEC = importlib.util.spec_from_file_location(
     "cayu_lambda_microvm_runner_supervisor", SUPERVISOR_PATH
 )
 assert SUPERVISOR_SPEC is not None and SUPERVISOR_SPEC.loader is not None
+
+
+@pytest.mark.parametrize("invalid_text", ("/workspace\x00bad", "/workspace\ud800bad"))
+def test_lambda_microvm_runner_rejects_nonportable_default_cwd(invalid_text: str) -> None:
+    with pytest.raises(ValueError, match="default_cwd"):
+        LambdaMicroVMRunner(
+            object(),
+            microvm_id="mvm-test",
+            endpoint="local.test",
+            default_cwd=invalid_text,
+            endpoint_transport=object(),  # type: ignore[arg-type]
+        )
+
+    runner = LambdaMicroVMRunner(
+        object(),
+        microvm_id="mvm-test",
+        endpoint="local.test",
+        endpoint_transport=object(),  # type: ignore[arg-type]
+    )
+    runner.default_cwd = invalid_text
+    with pytest.raises(ValueError, match="default_cwd"):
+        runner.resolve_cwd()
+
+
 SUPERVISOR_MODULE = importlib.util.module_from_spec(SUPERVISOR_SPEC)
 sys.modules[SUPERVISOR_SPEC.name] = SUPERVISOR_MODULE
 SUPERVISOR_SPEC.loader.exec_module(SUPERVISOR_MODULE)
@@ -88,6 +112,34 @@ class FakeLambdaMicroVMClient:
     def terminate_microvm(self, **kwargs: Any) -> dict[str, Any]:
         self.terminate_calls.append(kwargs)
         return {}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("factory", ("create", "from_existing"))
+@pytest.mark.parametrize("invalid_text", ("/workspace\x00bad", "/workspace\ud800bad"))
+async def test_lambda_microvm_factory_rejects_nonportable_default_cwd_before_provider_call(
+    factory: str,
+    invalid_text: str,
+) -> None:
+    client = FakeLambdaMicroVMClient()
+
+    with pytest.raises(ValueError, match="default_cwd"):
+        if factory == "create":
+            await LambdaMicroVMRunner.create(
+                "arn:aws:lambda:us-west-2:123:microvm-image:cayu",
+                client=client,
+                default_cwd=invalid_text,
+            )
+        else:
+            await LambdaMicroVMRunner.from_existing(
+                "mvm-123",
+                client=client,
+                default_cwd=invalid_text,
+            )
+
+    assert client.run_calls == []
+    assert client.get_calls == []
+    assert client.token_calls == []
 
 
 class SuspendingLambdaMicroVMClient(FakeLambdaMicroVMClient):

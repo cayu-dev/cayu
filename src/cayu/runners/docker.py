@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from typing import Literal
 from uuid import uuid4
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
 from cayu.credentials import CredentialMode, CredentialModeInput, normalize_credential_mode
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -28,19 +28,28 @@ from cayu.runners._secrets import (
     redact_exec_result,
     resolved_secret_redactor,
     runner_env_file,
+    validate_runner_env_file_environment,
+    validate_secret_env_collisions,
 )
 from cayu.runners._subprocess import (
     SubprocessCommand,
     copy_runner_env,
     remove_runner_env,
     run_subprocess,
+    validate_output_limit,
+    validate_runner_env_remove,
+    validate_stdin,
+    validate_timeout,
 )
 from cayu.runners.base import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
     ExecResult,
     Runner,
+    _clean_runner_preflight,
+    _clear_preflight_traceback_frames,
     attach_cancellation_artifacts,
+    copy_exec_command,
 )
 from cayu.vaults import (
     SecretEnv,
@@ -98,7 +107,7 @@ def _docker_lifecycle_detail(value: str, redactor: SecretRedactor) -> str:
 
 
 def _validate_guest_cwd(cwd: str) -> str:
-    value = require_clean_nonblank(cwd, "default_cwd")
+    value = require_durable_clean_nonblank(cwd, "default_cwd")
     if not posixpath.isabs(value):
         raise ValueError("DockerRunner default_cwd must be an absolute guest path.")
     return posixpath.normpath(value)
@@ -333,6 +342,7 @@ class DockerRunner(Runner):
         self.close_action = _validate_close_action(close_action)
         self.docker_path = _require_docker(docker_path)
         self.credential_mode = normalize_credential_mode(credential_mode)
+        self._allow_raw_secret_env = allow_raw_secret_env
         self.secret_env, self.secret_resolver = normalize_runner_secret_env(
             secret_env,
             secret_resolver,
@@ -411,7 +421,7 @@ class DockerRunner(Runner):
             default_cwd = mount_path if mount_path is not None else DEFAULT_DOCKER_CWD
         default_cwd = _validate_guest_cwd(default_cwd)
         mode = normalize_credential_mode(credential_mode)
-        normalize_runner_secret_env(
+        validated_secret_env, validated_secret_resolver = normalize_runner_secret_env(
             secret_env,
             secret_resolver,
             credential_mode=mode,
@@ -513,8 +523,8 @@ class DockerRunner(Runner):
             cancel_timeout_s=cancel_timeout,
             cancellation_cleanup=cancellation_policy,
             timeout_cleanup=timeout_policy,
-            secret_env=secret_env,
-            secret_resolver=secret_resolver,
+            secret_env=validated_secret_env,
+            secret_resolver=validated_secret_resolver,
             credential_mode=mode,
             allow_raw_secret_env=allow_raw_secret_env,
             env_overlay=env_overlay,
@@ -542,8 +552,7 @@ class DockerRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
-        env = None
-        stdin = None
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
         return await operation
 
     async def exec_redacted(
@@ -570,9 +579,91 @@ class DockerRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
-        env = None
-        stdin = None
+        del command, redactor, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
         return await operation
+
+    @_clean_runner_preflight
+    def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate Docker's exact transport contract without side effects."""
+
+        prepared = self._prepare_exec_request(
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        del prepared
+
+    def _prepare_exec_request(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> tuple[
+        ExecCommand,
+        str,
+        dict[str, str],
+        dict[str, str],
+        tuple[str, ...],
+        dict[str, SecretRef],
+        SecretResolver | None,
+        int | None,
+        str | None,
+        int | None,
+    ]:
+        """Own one complete Docker request before lookup or dispatch."""
+
+        if type(command) is not ExecCommand:
+            raise TypeError("DockerRunner command must be an ExecCommand.")
+        self._ensure_exec_open()
+        owned_command = copy_exec_command(command)
+        environment = copy_runner_env(env, inherit_env=False)
+        env_overlay = copy_runner_env(self.env_overlay, inherit_env=False)
+        validated_env_remove = validate_runner_env_remove(env_remove)
+        working_dir = self.resolve_cwd(cwd)
+        timeout = validate_timeout(timeout_s)
+        standard_input = validate_stdin(stdin)
+        output_limit = validate_output_limit(output_limit_bytes)
+        validate_runner_env_file_environment(environment)
+        validate_runner_env_file_environment(env_overlay)
+        declared_secret_env, secret_resolver = normalize_runner_secret_env(
+            self.secret_env,
+            self.secret_resolver,
+            credential_mode=self.credential_mode,
+            allow_raw_secret_env=self._allow_raw_secret_env,
+        )
+        validate_runner_env_file_environment(dict.fromkeys(declared_secret_env, ""))
+        validate_secret_env_collisions(environment, declared_secret_env)
+        return (
+            owned_command,
+            working_dir,
+            environment,
+            env_overlay,
+            validated_env_remove,
+            declared_secret_env,
+            secret_resolver,
+            timeout,
+            standard_input,
+            output_limit,
+        )
 
     async def _exec(
         self,
@@ -586,24 +677,60 @@ class DockerRunner(Runner):
         stdin: str | None,
         output_limit_bytes: int | None,
     ) -> ExecResult:
-        if type(command) is not ExecCommand:
-            raise TypeError("DockerRunner command must be an ExecCommand.")
-        self._ensure_exec_open()
-        environment = copy_runner_env(env, inherit_env=False)
+        try:
+            (
+                owned_command,
+                working_dir,
+                environment,
+                env_overlay,
+                validated_env_remove,
+                declared_secret_env,
+                secret_resolver,
+                timeout,
+                standard_input,
+                output_limit,
+            ) = self._prepare_exec_request(
+                command,
+                cwd=cwd,
+                env=env,
+                env_remove=env_remove,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                output_limit_bytes=output_limit_bytes,
+            )
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            working_dir = ""
+            environment = {}
+            env_overlay = {}
+            validated_env_remove = ()
+            declared_secret_env = {}
+            secret_resolver = None
+            standard_input = None
+            cwd = None
+            env = None
+            env_remove = ()
+            stdin = None
+            del output_redactor
+            raise
+        finally:
+            del command
         env = None
+        stdin = None
         resolved_secrets = (
-            await resolve_secret_env(self.secret_env, self.secret_resolver)
-            if self.secret_env and self.secret_resolver is not None
+            await resolve_secret_env(declared_secret_env, secret_resolver)
+            if declared_secret_env and secret_resolver is not None
             else {}
         )
         environment = merge_secret_env_values(environment, resolved_secrets)
-        environment = remove_runner_env(environment, env_remove)
+        environment = remove_runner_env(environment, validated_env_remove)
         invocation_redactor = resolved_secret_redactor(resolved_secrets).merged_with(
             output_redactor
         )
-        if self.env_overlay:
+        if env_overlay:
             # Applied last: the enforced egress overlay must win over model env.
-            environment.update(self.env_overlay)
+            environment.update(env_overlay)
         command_id = uuid4().hex
         pid_file = f"{DOCKER_COMMAND_STATE_DIR}/{command_id}.pid"
         handle = _DockerCommandHandle(
@@ -617,10 +744,10 @@ class DockerRunner(Runner):
             argv = _build_docker_exec_argv(
                 self.docker_path,
                 self.name,
-                command,
-                cwd=self.resolve_cwd(cwd),
+                owned_command,
+                cwd=working_dir,
                 env_file=env_file,
-                has_stdin=stdin is not None,
+                has_stdin=standard_input is not None,
                 pid_file=pid_file,
             )
             # The trusted host docker process receives only the bounded operational
@@ -632,9 +759,9 @@ class DockerRunner(Runner):
                 result = await run_subprocess(
                     SubprocessCommand(argv=argv),
                     env=host_env,
-                    timeout_s=timeout_s,
-                    stdin=stdin,
-                    output_limit_bytes=output_limit_bytes,
+                    timeout_s=timeout,
+                    stdin=standard_input,
+                    output_limit_bytes=output_limit,
                     output_redactor=invocation_redactor,
                 )
             except asyncio.CancelledError as exc:

@@ -37,10 +37,26 @@ class Runner(ABC):
 - `command` is positional; everything else is keyword-only. Match the signature
   and defaults exactly — `ExecCommandTool` calls `exec(...)` with these keywords.
 - Set `isolation` to a short label for your backend (`"modal"`, `"docker"`, …).
-- Apply `env_remove` after ordinary/injected environment construction and before
-  enforced backend overlays. This lets trusted built-ins remove ambient variables
-  that would redirect a supposedly read-only process while preserving mandatory
-  sandbox networking configuration.
+- Validate each execution request's command text, `cwd`, and `env` / `env_remove`
+  structure before resolving secrets or starting external command preparation for that
+  request. Command argv/shell and `cwd` text reject NUL and Unicode surrogate code points,
+  as do caller-provided environment values; stdin permits NUL but rejects surrogates.
+  Snapshot and revalidate enforced backend overlays at the same execution boundary.
+  Reject any additional backend-specific transport limitations before dispatch (for
+  example, Docker env-file keys use Docker's whitespace/comment grammar, values cannot
+  contain line breaks, and complete lines are size-bounded). Override
+  `Runner.preflight_exec(...)` with those stricter checks so invocation and managed-runner
+  wrappers can reject the request before consulting secret state or admitting workspace
+  dispatch; the override must not perform lookup, dispatch, or mutation, and `exec(...)`
+  must still revalidate at its own execution boundary. If authentic caller cancellation
+  is already pending when preflight rejects, cancellation remains authoritative and the
+  invocation wrapper may consult its secret snapshot only to redact the cancellation
+  reason; runner `SecretRef` resolution and dispatch remain skipped. Apply validated
+  `env_remove` entries after ordinary/injected
+  environment construction and before enforced backend overlays.
+  This lets trusted built-ins remove ambient variables that would redirect a
+  supposedly read-only process while preserving mandatory sandbox networking
+  configuration.
 - Implement `resolve_cwd()` as an idempotent containment boundary. Relative
   requests resolve beneath `default_cwd`; an absolute input is accepted only
   when it is the runner's own canonical root/child path. In particular,
@@ -49,6 +65,8 @@ class Runner(ABC):
   the same value to `exec(...)`, including the canonical default when the model
   omitted `cwd`. Therefore attaching a command policy requires a runner whose
   resolver accepts its own canonical output on every invocation.
+  Revalidate the stored effective default on every call so post-construction mutation
+  cannot carry non-portable text into secret lookup or backend preparation.
 - **`Runner` is exported from `cayu.runners`, not the top-level `cayu`** (only the
   concrete runners are re-exported at the top level):
 

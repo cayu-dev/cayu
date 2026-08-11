@@ -14,13 +14,16 @@ import os
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from typing import cast
 
+from cayu._validation import require_durable_text
 from cayu.credentials import (
     CredentialMode,
     CredentialModeInput,
     is_agent_readable,
     normalize_credential_mode,
 )
+from cayu.runners._subprocess import runner_env_name_identity, validate_runner_env_name
 from cayu.runners.base import ExecResult
 from cayu.vaults import (
     ResolvedSecret,
@@ -32,6 +35,8 @@ from cayu.vaults import (
     validate_secret_resolver,
 )
 
+DOCKER_ENV_FILE_MAX_LINE_BYTES = 64 * 1024 - 1
+
 
 def normalize_runner_secret_env(
     secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef],
@@ -39,6 +44,7 @@ def normalize_runner_secret_env(
     *,
     credential_mode: CredentialModeInput = CredentialMode.RAW_ENV,
     allow_raw_secret_env: bool = True,
+    case_sensitive_env_names: bool = True,
 ) -> tuple[dict[str, SecretRef], SecretResolver | None]:
     """Validate a runner's declared secret env, resolver, and credential mode.
 
@@ -49,7 +55,28 @@ def normalize_runner_secret_env(
     """
 
     mode = normalize_credential_mode(credential_mode)
-    refs = secret_env_refs(secret_env)
+    owned_secret_env: Sequence[SecretEnv] | Mapping[str, SecretRef]
+    if isinstance(secret_env, Sequence) and not isinstance(secret_env, str | bytes):
+        owned_entries = tuple(secret_env)
+        for entry in owned_entries:
+            if type(entry) is SecretEnv:
+                validate_runner_env_name(entry.name, "Runner secret_env name")
+        owned_secret_env = cast("Sequence[SecretEnv]", owned_entries)
+    else:
+        owned_secret_env = secret_env
+    refs = {
+        validate_runner_env_name(name, "Runner secret_env name"): ref
+        for name, ref in secret_env_refs(owned_secret_env).items()
+    }
+    identities: set[str] = set()
+    for name in refs:
+        identity = runner_env_name_identity(
+            name,
+            case_sensitive=case_sensitive_env_names,
+        )
+        if identity in identities:
+            raise ValueError("Runner secret_env contains duplicate environment variable names.")
+        identities.add(identity)
     if secret_resolver is not None:
         validate_secret_resolver(secret_resolver)
     if refs and secret_resolver is None:
@@ -68,6 +95,22 @@ def normalize_runner_secret_env(
     return refs, secret_resolver
 
 
+def validate_secret_env_collisions(
+    env: Mapping[str, str],
+    secret_env: Mapping[str, SecretRef] | Mapping[str, ResolvedSecret],
+    *,
+    case_sensitive: bool = True,
+) -> None:
+    """Reject ambiguous explicit/declared environment ownership without lookup."""
+
+    explicit_names = {runner_env_name_identity(name, case_sensitive=case_sensitive) for name in env}
+    secret_names = {
+        runner_env_name_identity(name, case_sensitive=case_sensitive) for name in secret_env
+    }
+    if not explicit_names.isdisjoint(secret_names):
+        raise ValueError("Runner env key collides with declared secret_env.")
+
+
 def merge_secret_env_values(
     env: dict[str, str],
     resolved: Mapping[str, ResolvedSecret],
@@ -78,10 +121,9 @@ def merge_secret_env_values(
     reverse) is ambiguous, so collisions fail closed.
     """
 
+    validate_secret_env_collisions(env, resolved)
     merged = dict(env)
     for name, secret in resolved.items():
-        if name in merged:
-            raise ValueError(f"Runner env key collides with declared secret_env: {name}")
         merged[name] = secret.value.get_secret_value()
     return merged
 
@@ -125,18 +167,14 @@ def runner_env_file(environment: Mapping[str, str]) -> Iterator[str | None]:
     ``None`` when there is no env to pass.
     """
 
+    validate_runner_env_file_environment(environment)
     if not environment:
         yield None
         return
     fd, path = tempfile.mkstemp(prefix="cayu-runner-env-")
     try:
-        with os.fdopen(fd, "w") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             for key, value in environment.items():
-                if "\n" in key or "=" in key or "\n" in value:
-                    raise ValueError(
-                        f"Runner env var {key!r} cannot be passed via env-file: names "
-                        "cannot contain '=' and neither names nor values may contain newlines."
-                    )
                 handle.write(f"{key}={value}\n")
         # The file now owns the transport representation. Do not keep the raw
         # mapping alive in this generator while the subprocess is awaited.
@@ -145,3 +183,27 @@ def runner_env_file(environment: Mapping[str, str]) -> Iterator[str | None]:
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
+
+
+def validate_runner_env_file_environment(environment: Mapping[str, str]) -> None:
+    """Validate Docker's line-oriented key/value transport without exposing content."""
+
+    for key, value in environment.items():
+        key = require_durable_text(key, "Runner env-file key")
+        value = require_durable_text(value, "Runner env-file value")
+        if (
+            not key
+            or key.startswith("#")
+            or key.startswith("\ufeff")
+            or "=" in key
+            or " " in key
+            or "\t" in key
+            or "\n" in key
+            or "\r" in key
+        ):
+            raise ValueError("Runner env-file key cannot be represented by Docker.")
+        if "\n" in value or "\r" in value:
+            raise ValueError("Runner env-file value cannot contain line breaks.")
+        line_size = len(f"{key}={value}".encode())
+        if line_size > DOCKER_ENV_FILE_MAX_LINE_BYTES:
+            raise ValueError("Runner env-file line exceeds Docker's supported size.")

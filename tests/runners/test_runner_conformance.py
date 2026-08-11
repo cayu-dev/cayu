@@ -807,6 +807,7 @@ LAMBDA_MICROVM = RunnerConformanceRegistration(
 )
 
 REGISTRATIONS = (LOCAL, DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
+OVERLAY_REGISTRATIONS = (DOCKER, E2B, LAMBDA_MICROVM, MICROSANDBOX)
 CLEANUP_CASES = tuple(
     (registration, policy)
     for registration in REGISTRATIONS
@@ -1198,6 +1199,133 @@ def test_runner_conformance_removes_explicit_environment_authority(
             )
             assert result.exit_code == 0
             assert result.stdout == "absent\n"
+        finally:
+            await harness.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+def test_runner_conformance_rejects_invalid_environment_names_before_dispatch(
+    registration: RunnerConformanceRegistration,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    canary = "runner-conformance-invalid-name-canary"
+    invalid_names = (
+        " ",
+        f" {canary}",
+        f"{canary} ",
+        f"{canary}\x00",
+        f"{canary}\ud800",
+        f"{canary}=value",
+        f"{canary}\nvalue",
+    )
+    marker = tmp_path / "invalid-environment-dispatched"
+
+    async def run() -> None:
+        harness = await registration.factory(tmp_path, monkeypatch)
+        try:
+            command = ExecCommand.process(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            )
+            for invalid_name in invalid_names:
+                with pytest.raises(ValueError) as raised:
+                    await harness.runner.exec(command, env={invalid_name: "value"})
+                assert canary not in f"{raised.value!s} {raised.value!r}"
+                assert not marker.exists()
+
+                with pytest.raises(ValueError) as raised:
+                    await harness.runner.exec(command, env_remove=(invalid_name,))
+                assert canary not in f"{raised.value!s} {raised.value!r}"
+                assert not marker.exists()
+        finally:
+            await harness.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("registration", REGISTRATIONS, ids=lambda item: item.name)
+def test_runner_conformance_rejects_transport_invalid_scalars_before_dispatch(
+    registration: RunnerConformanceRegistration,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "transport-invalid-dispatched"
+
+    async def run() -> None:
+        harness = await registration.factory(tmp_path, monkeypatch)
+        try:
+            valid_command = ExecCommand.process(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            )
+            for invalid_value in (
+                "invalid\x00value",
+                "invalid\ud800value",
+            ):
+                with pytest.raises(ValueError):
+                    await harness.runner.exec(valid_command, env={"VALUE": invalid_value})
+                assert not marker.exists()
+
+            for invalid_cwd in ("invalid\x00cwd", "invalid\ud800cwd"):
+                with pytest.raises(ValueError):
+                    await harness.runner.exec(valid_command, cwd=invalid_cwd)
+                assert not marker.exists()
+
+            for command_kind in ("process", "shell"):
+                for invalid_text in ("invalid\x00command", "invalid\ud800command"):
+                    command = (
+                        ExecCommand.process(sys.executable, "--version")
+                        if command_kind == "process"
+                        else ExecCommand.bash("true")
+                    )
+                    if command_kind == "process":
+                        assert command.argv is not None
+                        command.argv[-1] = invalid_text
+                    else:
+                        command.shell = invalid_text
+                    with pytest.raises(ValueError):
+                        await harness.runner.exec(command)
+                    assert not marker.exists()
+        finally:
+            await harness.aclose()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("registration", OVERLAY_REGISTRATIONS, ids=lambda item: item.name)
+@pytest.mark.parametrize(
+    "invalid_overlay",
+    (
+        {"INVALID\x00NAME": "value"},
+        {"VALUE": "invalid\ud800value"},
+    ),
+)
+def test_runner_conformance_revalidates_stored_overlay_before_dispatch(
+    registration: RunnerConformanceRegistration,
+    invalid_overlay: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = tmp_path / "invalid-overlay-dispatched"
+
+    async def run() -> None:
+        harness = await registration.factory(tmp_path, monkeypatch)
+        try:
+            overlay_runner: Any = harness.runner
+            overlay_runner.env_overlay = invalid_overlay
+            command = ExecCommand.process(
+                sys.executable,
+                "-c",
+                f"from pathlib import Path; Path({str(marker)!r}).touch()",
+            )
+            with pytest.raises(ValueError):
+                await harness.runner.exec(command)
+            assert not marker.exists()
         finally:
             await harness.aclose()
 

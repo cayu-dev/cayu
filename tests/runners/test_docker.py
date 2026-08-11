@@ -209,6 +209,43 @@ def test_runner_rejects_relative_default_cwd():
         DockerRunner("a", docker_path="/usr/bin/docker", default_cwd="relative/dir")
 
 
+@pytest.mark.parametrize("invalid_text", ("/workspace\x00bad", "/workspace\ud800bad"))
+def test_runner_rejects_nonportable_default_cwd(invalid_text: str) -> None:
+    with pytest.raises(ValueError, match="default_cwd"):
+        DockerRunner("a", docker_path="/usr/bin/docker", default_cwd=invalid_text)
+
+
+@pytest.mark.parametrize("invalid_text", ("/workspace\x00bad", "/workspace\ud800bad"))
+def test_runner_revalidates_mutated_default_cwd_before_secret_resolution(
+    invalid_text: str,
+) -> None:
+    class _CountingVault(StaticVault):
+        def __init__(self) -> None:
+            super().__init__({"token": "secret-value"})
+            self.resolve_calls = 0
+
+        async def resolve(self, ref, *, scope=None):  # type: ignore[no-untyped-def]
+            self.resolve_calls += 1
+            return await super().resolve(ref, scope=scope)
+
+    vault = _CountingVault()
+    runner = DockerRunner(
+        "a",
+        docker_path="/usr/bin/docker",
+        secret_env={"TOKEN": SecretRef(name="token")},
+        secret_resolver=vault,
+    )
+    runner.default_cwd = invalid_text
+
+    async def run() -> None:
+        with pytest.raises(ValueError, match="default_cwd"):
+            await runner.exec(ExecCommand.process("true"))
+
+    asyncio.run(run())
+
+    assert vault.resolve_calls == 0
+
+
 def test_runner_normalizes_default_cwd():
     r = DockerRunner("a", docker_path="/usr/bin/docker", default_cwd="/workspace/../work")
     assert r.default_cwd == "/work"
@@ -1048,3 +1085,86 @@ def test_create_prevalidates_secret_env_mode_before_docker_calls(monkeypatch):
                 credential_mode="virtual_egress",
             )
         )
+
+
+def test_create_owns_validated_secret_env_across_docker_awaits(monkeypatch):
+    first_call_started = asyncio.Event()
+    release_first_call = asyncio.Event()
+    calls = 0
+
+    async def fake_run_subprocess(command, **kwargs):
+        nonlocal calls
+        del command, kwargs
+        calls += 1
+        if calls == 1:
+            first_call_started.set()
+            await release_first_call.wait()
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    secret_env = {"API_TOKEN": SecretRef(name="api_token")}
+    resolver = StaticVault({"api_token": "sk-super-secret-token"})
+
+    async def run() -> DockerRunner:
+        create_task = asyncio.create_task(
+            DockerRunner.create(
+                "a1",
+                docker_path="/usr/bin/docker",
+                replace=False,
+                close_action="none",
+                secret_env=secret_env,
+                secret_resolver=resolver,
+            )
+        )
+        await first_call_started.wait()
+        secret_env.clear()
+        secret_env["INVALID\nNAME"] = SecretRef(name="api_token")
+        release_first_call.set()
+        return await create_task
+
+    runner = asyncio.run(run())
+
+    assert tuple(runner.secret_env) == ("API_TOKEN",)
+    assert runner.secret_resolver is resolver
+    assert calls == 2
+
+
+def test_exec_owns_command_before_resolving_secrets(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    dispatched_argv: list[list[str] | None] = []
+
+    class BlockingVault(StaticVault):
+        async def resolve(self, ref, *, scope=None):
+            started.set()
+            await release.wait()
+            return await super().resolve(ref, scope=scope)
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        dispatched_argv.append(command.argv)
+        return ExecResult()
+
+    monkeypatch.setattr("cayu.runners.docker.run_subprocess", fake_run_subprocess)
+    runner = DockerRunner(
+        "validation-probe",
+        docker_path="/unreachable/docker",
+        secret_env={"API_TOKEN": SecretRef(name="api_token")},
+        secret_resolver=BlockingVault({"api_token": "secret-value"}),
+    )
+    command = ExecCommand.process("original-command", "original-argument")
+
+    async def run() -> None:
+        task = asyncio.create_task(runner.exec(command))
+        await started.wait()
+        assert command.argv is not None
+        command.argv[:] = ["mutated-command"]
+        release.set()
+        await task
+
+    asyncio.run(run())
+
+    rendered = repr(dispatched_argv)
+    assert "original-command" in rendered
+    assert "original-argument" in rendered
+    assert "mutated-command" not in rendered

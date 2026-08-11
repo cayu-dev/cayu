@@ -338,6 +338,17 @@ def reset_fake_e2b() -> None:
     FakeAsyncSandbox.next_sandbox = None
 
 
+@pytest.mark.parametrize("invalid_text", ("/workspace\x00bad", "/workspace\ud800bad"))
+def test_e2b_runner_rejects_nonportable_default_cwd(invalid_text: str) -> None:
+    with pytest.raises(ValueError, match="default_cwd"):
+        E2BRunner(object(), sandbox_id="e2b-test", default_cwd=invalid_text)
+
+    runner = E2BRunner(object(), sandbox_id="e2b-test")
+    runner.default_cwd = invalid_text
+    with pytest.raises(ValueError, match="default_cwd"):
+        runner.resolve_cwd()
+
+
 def test_e2b_runner_create_passes_e2b_lifecycle_options() -> None:
     async def run() -> E2BRunner:
         reset_fake_e2b()

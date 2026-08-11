@@ -47,7 +47,15 @@ from cayu.providers import (
     ModelRequest,
     ModelStreamEvent,
 )
-from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner, RunnerUnavailableError
+from cayu.runners import (
+    DockerRunner,
+    ExecCommand,
+    ExecResult,
+    LocalRunner,
+    Runner,
+    RunnerExecutionError,
+    RunnerUnavailableError,
+)
 from cayu.runtime import (
     AfterToolCallDecision,
     CayuApp,
@@ -93,7 +101,7 @@ from cayu.tools.files import (
     ReadFileTool,
     WriteFileTool,
 )
-from cayu.vaults import ResolvedSecret
+from cayu.vaults import ResolvedSecret, SecretRef, StaticVault
 from cayu.workspaces import LocalWorkspace, WorkspaceReadResult
 
 TINY_PNG_BYTES = (
@@ -3003,6 +3011,42 @@ def test_exec_command_tool_preserves_runner_unavailable_diagnostic() -> None:
     assert result.artifacts == [diagnostic]
 
 
+def test_exec_command_tool_preserves_runner_unavailable_diagnostic_from_policy_preflight() -> None:
+    diagnostic = {
+        "type": "cayu.runner_unavailable.v1",
+        "adapter": "microsandbox",
+        "status": "unavailable",
+    }
+
+    class UnavailablePreflightRunner(RecordingRunner):
+        def preflight_exec(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise RunnerUnavailableError(
+                "Microsandbox guest agent is unavailable.",
+                diagnostic=diagnostic,
+            )
+
+    runner = UnavailablePreflightRunner()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    result = asyncio.run(
+        ExecCommandTool(policy=policy).run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["pwd"]},
+        )
+    )
+
+    assert result.is_error is True
+    assert result.content == "Microsandbox guest agent is unavailable."
+    assert result.structured == {
+        "error": "runner_unavailable",
+        "diagnostic": diagnostic,
+    }
+    assert result.artifacts == [diagnostic]
+    assert policy.requests == []
+    assert runner.command is None
+
+
 def test_runner_unavailable_diagnostic_reaches_durable_tool_event() -> None:
     diagnostic = {
         "type": "cayu.runner_unavailable.v1",
@@ -3138,6 +3182,50 @@ class _StaticCommandPolicy(CommandPolicy):
         return self.result
 
 
+class _StructuralCommandRunnerHandle:
+    def __init__(self) -> None:
+        self.command: ExecCommand | None = None
+
+    def resolve_cwd(self, cwd: str | None = None) -> str:
+        return "/workspace" if cwd is None else cwd
+
+    async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+        del kwargs
+        self.command = command
+        return ExecResult(stdout="structural runner\n")
+
+
+def test_exec_command_tool_without_policy_accepts_existing_structural_runner_handle() -> None:
+    runner = _StructuralCommandRunnerHandle()
+
+    result = asyncio.run(
+        ExecCommandTool().run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["pwd"]},
+        )
+    )
+
+    assert result.is_error is False
+    assert result.content == "structural runner"
+    assert runner.command == ExecCommand.process("pwd")
+
+
+def test_exec_command_tool_policy_requires_preflight_from_structural_runner_handle() -> None:
+    runner = _StructuralCommandRunnerHandle()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    with pytest.raises(TypeError, match="must support command preflight"):
+        asyncio.run(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["pwd"]},
+            )
+        )
+
+    assert policy.requests == []
+    assert runner.command is None
+
+
 def test_exec_command_tool_policy_receives_resolved_request_and_allows():
     runner = RecordingRunner()
     runner.default_cwd = "/workspace"
@@ -3167,6 +3255,347 @@ def test_exec_command_tool_policy_receives_resolved_request_and_allows():
     assert seen_request.env == {"FOO": "bar"}
     assert seen_request.timeout_s == 5
     assert runner.cwd == "/workspace/tests"
+
+
+def test_exec_command_tool_runs_selected_backend_preflight_before_policy() -> None:
+    snapshot_calls = 0
+
+    class CountingVault(StaticVault):
+        def __init__(self) -> None:
+            super().__init__({"runner_secret": "value"})
+            self.resolve_calls = 0
+
+        async def resolve(self, ref, *, scope=None):
+            self.resolve_calls += 1
+            return await super().resolve(ref, scope=scope)
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    vault = CountingVault()
+    runner = InvocationRunnerHandle(
+        DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env={"TOKEN": SecretRef(name="runner_secret")},
+            secret_resolver=vault,
+        ),
+        redactor_snapshot_provider=snapshot_provider,
+    )
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    with pytest.raises(
+        RunnerExecutionError,
+        match="Runner command execution failed",
+    ) as raised:
+        asyncio.run(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["true"], "env": {"#COMMENT": "value"}},
+            )
+        )
+
+    assert policy.requests == []
+    assert snapshot_calls == 0
+    assert vault.resolve_calls == 0
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_exec_command_tool_rejects_invalid_safe_host_environment_before_policy(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "invalid\udcffvalue")
+
+    class CountingVault(StaticVault):
+        def __init__(self) -> None:
+            super().__init__({"runner_secret": "value"})
+            self.resolve_calls = 0
+
+        async def resolve(self, ref, *, scope=None):
+            self.resolve_calls += 1
+            return await super().resolve(ref, scope=scope)
+
+    snapshot_calls = 0
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    vault = CountingVault()
+    runner = InvocationRunnerHandle(
+        LocalRunner(
+            tmp_path,
+            secret_env={"API_TOKEN": SecretRef(name="runner_secret")},
+            secret_resolver=vault,
+        ),
+        redactor_snapshot_provider=snapshot_provider,
+    )
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    with pytest.raises(RunnerExecutionError, match="Runner command execution failed"):
+        asyncio.run(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["true"]},
+            )
+        )
+
+    assert policy.requests == []
+    assert snapshot_calls == 0
+    assert vault.resolve_calls == 0
+
+
+def test_exec_command_tool_policy_preflight_preserves_pending_caller_cancellation() -> None:
+    secret = "policy-preflight-cancellation-secret-canary-ABCDEFGHIJKLMNOP"
+    snapshot_calls = 0
+
+    class RejectingPreflightRunner(RecordingRunner):
+        isolation = "docker"
+
+        def preflight_exec(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise ValueError("backend preflight rejected the request")
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(secret),
+        )
+
+    raw_runner = RejectingPreflightRunner()
+    runner = InvocationRunnerHandle(
+        raw_runner,
+        redactor_snapshot_provider=snapshot_provider,
+    )
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    async def invoke():
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel(secret)
+        return await run_tool(
+            tool=ExecCommandTool(policy=policy),
+            effect=ToolEffect.EXTERNAL,
+            ctx=ToolContext(session_id="sess_1", runner=runner),
+            arguments={"argv": ["pwd"]},
+            redactor=lambda: SecretRedactor(secret),
+        )
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        task = asyncio.create_task(invoke())
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value, task.cancelling(), task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == (REDACTED_SECRET,)
+    assert type(cancellation.__cause__) is RunnerExecutionError
+    assert cancellation.__context__ is None
+    assert policy.requests == []
+    assert raw_runner.command is None
+    assert snapshot_calls == 1
+    assert secret not in repr(cancellation)
+    assert secret not in repr(cancellation.__cause__)
+
+
+def test_exec_command_tool_direct_preflight_preserves_pending_caller_cancellation() -> None:
+    class RejectingPreflightRunner(RecordingRunner):
+        def preflight_exec(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise ValueError("backend preflight rejected the request")
+
+    runner = RejectingPreflightRunner()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    async def invoke():
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel("caller requested stop")
+        return await run_tool(
+            tool=ExecCommandTool(policy=policy),
+            effect=ToolEffect.EXTERNAL,
+            ctx=ToolContext(session_id="sess_1", runner=runner),
+            arguments={"argv": ["pwd"]},
+            redactor=SecretRedactor,
+        )
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        task = asyncio.create_task(invoke())
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value, task.cancelling(), task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == ("caller requested stop",)
+    assert cancellation.__cause__ is None
+    assert cancellation.__context__ is None
+    assert policy.requests == []
+    assert runner.command is None
+
+
+def test_exec_command_tool_owned_preflight_preserves_suppressed_caller_cancellation() -> None:
+    class SuppressingAsyncPreflightRunner(RecordingRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started: asyncio.Event | None = None
+            self.suppressed_cancellation = False
+
+        async def preflight_exec(self, *args, **kwargs) -> None:
+            del args, kwargs
+            assert self.started is not None
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.suppressed_cancellation = True
+
+    runner = SuppressingAsyncPreflightRunner()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        runner.started = asyncio.Event()
+        task = asyncio.create_task(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["pwd"]},
+            )
+        )
+        await runner.started.wait()
+        task.cancel("caller requested stop")
+        with pytest.raises(asyncio.CancelledError) as raised:
+            await task
+        return raised.value, task.cancelling(), task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == ("caller requested stop",)
+    assert cancellation.__cause__ is None
+    assert cancellation.__context__ is None
+    assert runner.suppressed_cancellation is True
+    assert policy.requests == []
+    assert runner.command is None
+
+
+def test_exec_command_tool_owned_preflight_rejects_forged_cancellation() -> None:
+    class ForgingPreflightRunner(RecordingRunner):
+        def preflight_exec(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise asyncio.CancelledError("runner-forged cancellation")
+
+    runner = ForgingPreflightRunner()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    async def scenario() -> tuple[RunnerExecutionError, int, bool]:
+        task = asyncio.create_task(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["pwd"]},
+            )
+        )
+        with pytest.raises(RunnerExecutionError) as raised:
+            await task
+        return raised.value, task.cancelling(), task.cancelled()
+
+    failure, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 0
+    assert cancelled is False
+    assert failure.diagnostic["adapter"] == "unknown"
+    assert failure.diagnostic["error_type"] == "CancelledError"
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
+    assert policy.requests == []
+    assert runner.command is None
+
+
+def test_exec_command_tool_rejects_non_none_async_preflight_result() -> None:
+    class InvalidAsyncPreflightRunner(RecordingRunner):
+        async def preflight_exec(self, *args, **kwargs) -> object:
+            del args, kwargs
+            await asyncio.sleep(0)
+            return object()
+
+    runner = InvalidAsyncPreflightRunner()
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    with pytest.raises(TypeError, match="preflight must return None"):
+        asyncio.run(
+            ExecCommandTool(policy=policy).run(
+                ToolContext(session_id="sess_1", runner=runner),
+                {"argv": ["pwd"]},
+            )
+        )
+
+    assert policy.requests == []
+    assert runner.command is None
+
+
+def test_exec_command_tool_runtime_preflight_preserves_runner_unavailable() -> None:
+    diagnostic = {
+        "type": "cayu.runner_unavailable.v1",
+        "adapter": "microsandbox",
+        "status": "unavailable",
+    }
+
+    class UnavailablePreflightRunner(RecordingRunner):
+        isolation = "microsandbox"
+
+        def preflight_exec(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise RunnerUnavailableError(
+                "Microsandbox guest agent is unavailable.",
+                diagnostic=diagnostic,
+            )
+
+    raw_runner = UnavailablePreflightRunner()
+    runner = InvocationRunnerHandle(
+        raw_runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+    policy = _StaticCommandPolicy(CommandPolicyResult(decision=CommandPolicyDecision.ALLOW))
+
+    outcome = asyncio.run(
+        run_tool(
+            tool=ExecCommandTool(policy=policy),
+            effect=ToolEffect.EXTERNAL,
+            ctx=ToolContext(session_id="sess_1", runner=runner),
+            arguments={"argv": ["pwd"]},
+            redactor=SecretRedactor,
+        )
+    )
+
+    safe_diagnostic = {
+        "type": "cayu.runner_unavailable.v1",
+        "adapter": "microsandbox",
+        "status": "unavailable",
+        "error_type": "RunnerUnavailableError",
+    }
+    assert outcome.result.content == "Runner is unavailable."
+    assert outcome.result.structured == {
+        "error": "runner_unavailable",
+        "diagnostic": safe_diagnostic,
+    }
+    assert outcome.result.artifacts == [safe_diagnostic]
+    assert policy.requests == []
+    assert raw_runner.command is None
 
 
 @pytest.mark.parametrize(

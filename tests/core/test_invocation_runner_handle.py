@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
+import warnings
+from pathlib import Path
+from typing import Any
 
 import pytest
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 from tests.core._workload_secret_support import FakeProvider, collect_events
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
+import cayu.runners.local as local_runner_module
 import cayu.runtime._invocation_secrets as invocation_secrets_module
 import cayu.tools._runner as runner_module
 from cayu._exception_groups import iter_exception_tree
@@ -509,6 +514,342 @@ class _MisreportedBoundedRunner(Runner):
             stdout_truncated=False,
             stdout_bytes=64,
         )
+
+
+def test_invocation_runner_handle_hides_invalid_command_input_before_snapshot() -> None:
+    secret = "invocation-command-secret-canary-ABCDEFGHIJKLMNOP"
+    snapshot_calls = 0
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(secret),
+        )
+
+    handle = InvocationRunnerHandle(
+        _BlockingRunner(),
+        redactor_snapshot_provider=snapshot_provider,
+    )
+    command = ExecCommand.process(
+        "curl",
+        "-H",
+        f"Authorization: Bearer {secret}",
+        "valid",
+    )
+    assert command.argv is not None
+    command.argv[-1] = "invalid\x00argument"
+
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(handle.exec(command))
+
+    assert snapshot_calls == 0
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert secret not in rendered
+    assert "Authorization: Bearer" not in rendered
+    assert type(raised.value) is ValidationError
+    assert secret not in repr(raised.value.errors())
+    assert secret not in raised.value.json()
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    current = raised.value.__traceback__
+    while current is not None:
+        frame = current.tb_frame
+        if is_cayu_source_filename(frame.f_code.co_filename):
+            assert secret not in repr(frame.f_locals)
+        current = current.tb_next
+
+
+@pytest.mark.parametrize(
+    "invalid_input",
+    (
+        "command_type",
+        "cwd",
+        "environment",
+        "env_remove",
+        "timeout",
+        "stdin",
+        "output_limit",
+    ),
+)
+def test_invocation_runner_handle_validates_portable_request_before_snapshot(
+    invalid_input: str,
+) -> None:
+    secret = "INVOCATION_PREFLIGHT_SECRET_CANARY_ABCDEFGHIJKLMNOP"
+    snapshot_calls = 0
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(secret),
+        )
+
+    handle = InvocationRunnerHandle(
+        _BlockingRunner(),
+        redactor_snapshot_provider=snapshot_provider,
+    )
+    command: Any = ExecCommand.process("true")
+    kwargs: dict[str, Any] = {}
+    if invalid_input == "command_type":
+        command = {"secret": secret}
+    elif invalid_input == "cwd":
+        kwargs["cwd"] = f"{secret}\ud800"
+    elif invalid_input == "environment":
+        kwargs["env"] = {"TOKEN": secret, "INVALID": "invalid\x00value"}
+    elif invalid_input == "env_remove":
+        kwargs["env_remove"] = (secret, "invalid\x00name")
+    elif invalid_input == "timeout":
+        kwargs["timeout_s"] = secret
+    elif invalid_input == "stdin":
+        kwargs["stdin"] = f"{secret}\ud800"
+    else:
+        kwargs["output_limit_bytes"] = secret
+
+    with pytest.raises(RunnerExecutionError) as raised:
+        asyncio.run(handle.exec(command, **kwargs))
+
+    assert snapshot_calls == 0
+    assert raised.value.diagnostic["error_type"] in {"Exception", "TypeError", "ValueError"}
+    assert secret not in f"{raised.value!s} {raised.value!r}"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    current = raised.value.__traceback__
+    while current is not None:
+        frame = current.tb_frame
+        if is_cayu_source_filename(frame.f_code.co_filename):
+            assert secret not in repr(frame.f_locals)
+        current = current.tb_next
+
+
+def test_invocation_preflight_rejects_mutated_local_root_before_secret_state(
+    tmp_path,
+) -> None:
+    class CountingVault(StaticVault):
+        def __init__(self) -> None:
+            super().__init__({"runner-token": "secret-value"})
+            self.resolve_calls = 0
+
+        async def resolve(self, ref, *, scope=None):  # type: ignore[no-untyped-def]
+            self.resolve_calls += 1
+            return await super().resolve(ref, scope=scope)
+
+    vault = CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"TOKEN": SecretRef(name="runner-token")},
+        secret_resolver=vault,
+    )
+    runner.root = Path(f"{tmp_path}/invalid\x00root")
+    snapshot_calls = 0
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=snapshot_provider,
+    )
+
+    with pytest.raises(RunnerExecutionError):
+        asyncio.run(handle.exec(ExecCommand.process("true")))
+
+    assert snapshot_calls == 0
+    assert vault.resolve_calls == 0
+
+
+def test_invocation_preflight_does_not_emit_mutated_command_serializer_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    secret = "mutated-command-serializer-secret-canary-ABCDEFGHIJKLMNOP"
+
+    class SecretBearingValue:
+        def __repr__(self) -> str:
+            return secret
+
+    runner = _CancellationSuppressingRunner()
+    snapshot_calls = 0
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=snapshot_provider,
+    )
+    command = ExecCommand.process("true")
+    assert command.argv is not None
+    command.argv[0] = SecretBearingValue()  # type: ignore[list-item]
+
+    with (
+        warnings.catch_warnings(record=True) as emitted,
+        caplog.at_level(logging.WARNING),
+        pytest.raises(ValidationError) as raised,
+    ):
+        warnings.simplefilter("always")
+        asyncio.run(handle.exec(command))
+
+    captured = capsys.readouterr()
+    diagnostic_output = " ".join(
+        (
+            str(raised.value),
+            repr(raised.value),
+            captured.out,
+            captured.err,
+            *(record.getMessage() for record in caplog.records),
+            *(str(record.message) for record in emitted),
+        )
+    )
+    assert emitted == []
+    assert secret not in diagnostic_output
+    assert snapshot_calls == 0
+    assert runner.called is False
+
+
+@pytest.mark.parametrize(
+    ("case_sensitive", "override_name"),
+    ((True, "API_TOKEN"), (False, "api_token")),
+)
+def test_invocation_preflight_rejects_local_secret_collision_before_secret_state(
+    case_sensitive: bool,
+    override_name: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CountingVault(StaticVault):
+        def __init__(self) -> None:
+            super().__init__({"runner-token": "secret-value"})
+            self.resolve_calls = 0
+
+        async def resolve(self, ref, *, scope=None):  # type: ignore[no-untyped-def]
+            self.resolve_calls += 1
+            return await super().resolve(ref, scope=scope)
+
+    monkeypatch.setattr(
+        local_runner_module,
+        "_local_environment_names_case_sensitive",
+        lambda: case_sensitive,
+    )
+    vault = CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name="runner-token")},
+        secret_resolver=vault,
+    )
+    snapshot_calls = 0
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=snapshot_provider,
+    )
+
+    with pytest.raises(RunnerExecutionError):
+        asyncio.run(
+            handle.exec(
+                ExecCommand.process("true"),
+                env={override_name: "override"},
+            )
+        )
+
+    assert snapshot_calls == 0
+    assert vault.resolve_calls == 0
+
+
+def test_invocation_preflight_failure_preserves_pending_caller_cancellation() -> None:
+    secret = "pending-preflight-cancellation-secret-canary-ABCDEFGHIJKLMNOP"
+    snapshot_calls = 0
+    runner = _CancellationSuppressingRunner()
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(secret),
+        )
+
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=snapshot_provider,
+    )
+
+    async def invoke() -> ExecResult:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel(secret)
+        return await handle.exec(
+            ExecCommand.process("never-dispatched"),
+            env={"TOKEN": secret, "INVALID": "invalid\x00value"},
+        )
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        task = asyncio.create_task(invoke())
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return exc_info.value, task.cancelling(), task.cancelled()
+
+    cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert runner.called is False
+    assert snapshot_calls == 1
+    assert cancellation.args == (REDACTED_SECRET,)
+    assert type(cancellation.__cause__) is RunnerExecutionError
+    assert cancellation.__cause__.diagnostic["error_type"] == "Exception"
+    assert cancellation.__context__ is None
+    assert secret not in repr(cancellation)
+    assert secret not in repr(cancellation.__cause__)
+
+
+@pytest.mark.parametrize("operation", ("preflight_exec", "exec"))
+def test_invocation_preflight_does_not_trust_runner_cancellation(operation: str) -> None:
+    class ForgingPreflightRunner(Runner):
+        isolation = "docker"
+
+        def preflight_exec(self, command: ExecCommand, **kwargs) -> None:
+            del command, kwargs
+            raise asyncio.CancelledError("runner-forged cancellation")
+
+        async def exec(self, command: ExecCommand, **kwargs) -> ExecResult:
+            del command, kwargs
+            raise AssertionError("Forged preflight cancellation must prevent dispatch.")
+
+    handle = InvocationRunnerHandle(
+        ForgingPreflightRunner(),
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+
+    async def scenario() -> tuple[RunnerExecutionError, int]:
+        method = getattr(handle, operation)
+        with pytest.raises(RunnerExecutionError) as raised:
+            await method(ExecCommand.process("never-dispatched"))
+        task = asyncio.current_task()
+        assert task is not None
+        return raised.value, task.cancelling()
+
+    failure, cancelling = asyncio.run(scenario())
+
+    assert cancelling == 0
+    assert failure.diagnostic["adapter"] == "docker"
+    assert failure.diagnostic["error_type"] == "CancelledError"
+    assert failure.__cause__ is None
+    assert failure.__context__ is None
 
 
 def test_invocation_runner_handle_preserves_real_caller_cancellation() -> None:
@@ -2829,6 +3170,123 @@ def test_invocation_runner_handle_forwards_environment_removals() -> None:
     asyncio.run(scenario())
 
     assert runner.last_kwargs["env_remove"] == ("GIT_CONFIG_COUNT", "GIT_DIR")
+
+
+@pytest.mark.parametrize("invalid_remove", (None, [], {}))
+def test_invocation_runner_handle_preserves_falsey_invalid_environment_removals(
+    invalid_remove,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = StaticVault({"runner-secret": "runner-secret-value-canary"})
+    resolve_calls = 0
+    original_resolve = vault.resolve
+
+    async def counting_resolve(ref, *, scope=None):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return await original_resolve(ref, scope=scope)
+
+    monkeypatch.setattr(vault, "resolve", counting_resolve)
+    marker = tmp_path / "invalid-environment-dispatched"
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name="runner-secret")},
+        secret_resolver=vault,
+    )
+    handle = InvocationRunnerHandle(
+        runner,
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+
+    with pytest.raises(RunnerExecutionError) as exc_info:
+        asyncio.run(
+            handle.exec(
+                ExecCommand.process(
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ),
+                env_remove=invalid_remove,  # type: ignore[arg-type]
+            )
+        )
+
+    assert exc_info.value.diagnostic["error_type"] == "TypeError"
+    assert resolve_calls == 0
+    assert not marker.exists()
+
+
+def test_invocation_runner_handle_owns_environment_before_operation_checkpoint(
+    tmp_path,
+) -> None:
+    environment = {"ORIGINAL": "value"}
+
+    def mutate_environment() -> None:
+        environment.clear()
+        environment["INVALID\x00NAME"] = "changed"
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        asyncio.get_running_loop().call_soon(mutate_environment)
+        return InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        )
+
+    handle = InvocationRunnerHandle(
+        LocalRunner(tmp_path),
+        redactor_snapshot_provider=snapshot_provider,
+    )
+
+    result = asyncio.run(
+        handle.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import os; print(os.environ['ORIGINAL'])",
+            ),
+            env=environment,
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "value\n"
+    assert environment == {"INVALID\x00NAME": "changed"}
+
+
+def test_invocation_runner_handle_owns_command_before_operation_checkpoint(
+    tmp_path,
+) -> None:
+    marker = tmp_path / "mutated-command-ran"
+    command = ExecCommand.process(sys.executable, "-c", "print('owned-command')")
+
+    def mutate_command() -> None:
+        assert command.argv is not None
+        command.argv[:] = [
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).touch()",
+        ]
+
+    def snapshot_provider() -> InvocationRedactorSnapshot:
+        asyncio.get_running_loop().call_soon(mutate_command)
+        return InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        )
+
+    handle = InvocationRunnerHandle(
+        LocalRunner(tmp_path),
+        redactor_snapshot_provider=snapshot_provider,
+    )
+
+    result = asyncio.run(handle.exec(command))
+
+    assert result.exit_code == 0
+    assert result.stdout == "owned-command\n"
+    assert not marker.exists()
 
 
 def test_invocation_runner_handle_preserves_custom_adapter_cleanup_evidence() -> None:

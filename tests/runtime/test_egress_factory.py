@@ -5,7 +5,7 @@ import contextlib
 from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from tests.runners.lambda_microvm_harness import (
@@ -54,7 +54,14 @@ from cayu.environments.factory import (
     environment_factory_cleanup_settlement_task,
 )
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runners import LambdaMicroVMRunner, LocalRunner, RunnerExecutionError
+from cayu.runners import (
+    DockerRunner,
+    E2BRunner,
+    LambdaMicroVMRunner,
+    LocalRunner,
+    MicrosandboxRunner,
+    RunnerExecutionError,
+)
 from cayu.runners.base import ExecCommand, ExecResult, Runner
 from cayu.runtime import CayuApp, InMemorySessionStore, RunRequest
 from cayu.runtime._environment_lifecycle import (
@@ -92,6 +99,7 @@ from cayu.runtime.egress import (
     VirtualCredentialSpec,
     VirtualEgressEnvironmentFactory,
     _await_cleanup_task,
+    _EgressManagedRunner,
     _workspace_dispatch_settlement_kind,
 )
 from cayu.testing import verify_provider_credential_isolation
@@ -5299,6 +5307,380 @@ def test_factory_preserves_trusted_execution_for_aws_workspace_lifecycle(
         "--",
         "/workspace",
     ]
+
+
+@pytest.mark.parametrize("method", ("exec", "exec_redacted", "exec_system"))
+@pytest.mark.parametrize(
+    ("invalid_kwargs", "error_type"),
+    (
+        ({"env": {"INVALID\x00NAME": "value"}}, ValueError),
+        ({"env": {"VALID": "invalid\x00value"}}, ValueError),
+        ({"env": {"VALID": "invalid\ud800value"}}, ValueError),
+        ({"env_remove": ("INVALID\x00NAME",)}, ValueError),
+        ({"env_remove": None}, TypeError),
+        ({"cwd": "/outside-runner-root"}, ValueError),
+        ({"timeout_s": 0}, ValueError),
+        ({"stdin": b"invalid"}, TypeError),
+        ({"output_limit_bytes": 0}, ValueError),
+    ),
+)
+def test_managed_runner_rejects_invalid_environment_before_dispatch_admission(
+    method: str,
+    invalid_kwargs: dict[str, Any],
+    error_type: type[Exception],
+) -> None:
+    class _RecordingRunner(Runner):
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command
+            self.calls.append(dict(kwargs))
+            return ExecResult()
+
+    inner = _RecordingRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id=f"sess_invalid_env_{method}",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+        invoke = getattr(managed, method)
+        kwargs = dict(invalid_kwargs)
+        if method == "exec_redacted":
+            kwargs["redactor"] = SecretRedactor()
+
+        with pytest.raises(error_type):
+            await invoke(ExecCommand.process("invalid"), **kwargs)
+
+        assert inner.calls == []
+        assert managed._active_workspace_dispatches == set()
+        assert managed._uncertain_workspace_dispatches == {}
+
+        valid_kwargs: dict[str, Any] = {"env_remove": ("REMOVE_ME",)}
+        if method == "exec_redacted":
+            valid_kwargs["redactor"] = SecretRedactor()
+        assert (await invoke(ExecCommand.process("valid"), **valid_kwargs)).exit_code == 0
+        assert len(inner.calls) == 1
+        await managed.close()
+
+    asyncio.run(run())
+
+    assert inner.is_closed
+    assert adapter.torn_down == 1
+
+
+def test_managed_docker_preflight_rejects_transport_key_before_secret_state_or_admission() -> None:
+    class _CountingVault(StaticVault):
+        def __init__(self) -> None:
+            super().__init__({"runner-token": "secret-value"})
+            self.resolve_calls = 0
+
+        async def resolve(self, ref, *, scope=None):  # type: ignore[no-untyped-def]
+            self.resolve_calls += 1
+            return await super().resolve(ref, scope=scope)
+
+    vault = _CountingVault()
+    inner = DockerRunner(
+        "managed-preflight",
+        docker_path="/usr/bin/docker",
+        secret_env={"TOKEN": SecretRef(name="runner-token")},
+        secret_resolver=vault,
+    )
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+    registry_calls = 0
+
+    def redactor_snapshot() -> InvocationRedactorSnapshot:
+        nonlocal registry_calls
+        registry_calls += 1
+        return InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_managed_docker_preflight",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+        handle = InvocationRunnerHandle(
+            managed,
+            redactor_snapshot_provider=redactor_snapshot,
+        )
+
+        with pytest.raises(RunnerExecutionError):
+            await handle.exec(
+                ExecCommand.process("true"),
+                env={"#COMMENT": "value"},
+            )
+
+        assert vault.resolve_calls == 0
+        assert registry_calls == 0
+        assert managed._active_workspace_dispatches == set()
+        assert managed._uncertain_workspace_dispatches == {}
+        owner_key = "managed-docker-binding-owner"
+        managed.begin_workspace_binding()
+        managed.finish_workspace_binding(
+            require_mutation_quiescence=True,
+            workspace_owner_key=owner_key,
+        )
+        assert await managed.prepare_workspace_sync(owner_key) is None
+        await managed.finalize_for_binding(
+            outcome=None,
+            require_workspace_mutations_quiescent=True,
+            workspace_owner_key=owner_key,
+        )
+
+    asyncio.run(run())
+
+    assert inner.is_closed
+    assert adapter.torn_down == 1
+
+
+@pytest.mark.parametrize("runner_kind", ("lambda-microvm", "e2b", "microsandbox"))
+def test_managed_remote_preflight_rejects_invalid_overlay_before_secret_state_or_admission(
+    runner_kind: str,
+) -> None:
+    def create_runner() -> Runner:
+        env_overlay = {"INVALID\x00NAME": "value"}
+        if runner_kind == "lambda-microvm":
+            return LambdaMicroVMRunner(
+                object(),
+                microvm_id="mvm-preflight",
+                endpoint="mvm.internal",
+                endpoint_transport=object(),  # type: ignore[arg-type]
+                env_overlay=env_overlay,
+            )
+        if runner_kind == "e2b":
+            return E2BRunner(
+                object(),
+                sandbox_id="e2b-preflight",
+                env_overlay=env_overlay,
+            )
+        return MicrosandboxRunner(
+            object(),
+            name="microsandbox-preflight",
+            env_overlay=env_overlay,
+        )
+
+    inner = create_runner()
+    adapter = _RecordingAdapter(
+        runner_kind=runner_kind,
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+    registry_calls = 0
+
+    def redactor_snapshot() -> InvocationRedactorSnapshot:
+        nonlocal registry_calls
+        registry_calls += 1
+        return InvocationRedactorSnapshot(revision=0, redactor=SecretRedactor())
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id=f"sess_managed_{runner_kind}_preflight",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+        handle = InvocationRunnerHandle(
+            managed,
+            redactor_snapshot_provider=redactor_snapshot,
+        )
+
+        with pytest.raises(RunnerExecutionError):
+            await handle.exec(ExecCommand.process("true"))
+
+        assert registry_calls == 0
+        assert managed._active_workspace_dispatches == set()
+        assert managed._uncertain_workspace_dispatches == {}
+        owner_key = f"managed-{runner_kind}-binding-owner"
+        managed.begin_workspace_binding()
+        managed.finish_workspace_binding(
+            require_mutation_quiescence=True,
+            workspace_owner_key=owner_key,
+        )
+        assert await managed.prepare_workspace_sync(owner_key) is None
+        await managed.finalize_for_binding(
+            outcome=None,
+            require_workspace_mutations_quiescent=True,
+            workspace_owner_key=owner_key,
+        )
+
+    asyncio.run(run())
+
+    assert inner.is_closed
+    assert adapter.torn_down == 1
+
+
+def test_managed_runner_retains_genuine_post_admission_failure_as_uncertain() -> None:
+    class _FailingRunner(Runner):
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            raise RuntimeError("failure after managed admission")
+
+    inner = _FailingRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id="sess_managed_post_admission_failure",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+
+        with pytest.raises(RuntimeError, match="failure after managed admission"):
+            await managed.exec(ExecCommand.process("true"))
+
+        assert managed._active_workspace_dispatches == set()
+        assert len(managed._uncertain_workspace_dispatches) == 1
+        managed.reopen_exec()
+        await managed.close()
+
+    asyncio.run(run())
+
+    assert adapter.torn_down == 1
+
+
+@pytest.mark.parametrize("method", ("exec", "exec_redacted", "exec_system"))
+@pytest.mark.parametrize("command_kind", ("process", "shell"))
+@pytest.mark.parametrize("invalid_text", ("invalid\x00command", "invalid\ud800command"))
+def test_managed_runner_rejects_mutated_command_before_dispatch_admission(
+    method: str,
+    command_kind: str,
+    invalid_text: str,
+) -> None:
+    class _RecordingRunner(Runner):
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            self.calls += 1
+            return ExecResult()
+
+    inner = _RecordingRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id=f"sess_invalid_command_{method}_{command_kind}",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+        command = (
+            ExecCommand.process("valid") if command_kind == "process" else ExecCommand.bash("true")
+        )
+        if command_kind == "process":
+            assert command.argv is not None
+            command.argv[0] = invalid_text
+        else:
+            command.shell = invalid_text
+        kwargs: dict[str, Any] = {}
+        if method == "exec_redacted":
+            kwargs["redactor"] = SecretRedactor()
+
+        with pytest.raises(ValueError):
+            await getattr(managed, method)(command, **kwargs)
+
+        assert inner.calls == 0
+        assert managed._active_workspace_dispatches == set()
+        assert managed._uncertain_workspace_dispatches == {}
+        await managed.close()
+
+    asyncio.run(run())
+
+    assert inner.is_closed
+    assert adapter.torn_down == 1
+
+
+@pytest.mark.parametrize("method", ("exec", "exec_redacted", "exec_system"))
+def test_managed_closed_runner_rejects_before_inner_validation(method: str) -> None:
+    class _ResolvingRunner(Runner):
+        isolation = "docker"
+        default_cwd = "/workspace"
+
+        def __init__(self) -> None:
+            self.resolve_calls = 0
+
+        def resolve_cwd(self, cwd: str | None = None) -> str:
+            self.resolve_calls += 1
+            return super().resolve_cwd(cwd)
+
+        async def exec(self, command: ExecCommand, **kwargs: Any) -> ExecResult:
+            del command, kwargs
+            return ExecResult()
+
+    inner = _ResolvingRunner()
+    adapter = _RecordingAdapter(
+        runner_factory=lambda _request: asyncio.sleep(0, result=inner),
+    )
+
+    async def run() -> None:
+        result = await _virtual_factory(adapter=adapter).create(
+            EnvironmentFactoryRequest(
+                session_id=f"sess_closed_preflight_{method}",
+                agent_name="agent",
+                environment_name="egress-env",
+            )
+        )
+        runner = result.environment.runner
+        assert isinstance(runner, _EgressManagedRunner)
+        managed = cast("_EgressManagedRunner", runner)
+        await managed.close()
+        invoke = getattr(managed, method)
+        kwargs: dict[str, Any] = {"cwd": "/outside-runner-root"}
+        if method == "exec_redacted":
+            kwargs["redactor"] = SecretRedactor()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await invoke(ExecCommand.process("true"), **kwargs)
+
+        assert inner.resolve_calls == 0
+
+    asyncio.run(run())
+
+    assert adapter.torn_down == 1
 
 
 def test_managed_wrapper_preserves_trusted_cancellation_and_inner_exec_latch() -> None:

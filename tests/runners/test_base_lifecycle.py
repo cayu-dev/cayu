@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu.runners._cleanup import RunnerCleanupResult
 from cayu.runners.base import (
@@ -16,6 +17,7 @@ from cayu.runners.base import (
     attach_cancellation_artifacts,
     is_same_or_child,
 )
+from cayu.vaults import SecretRedactor
 
 
 class StubRunner(Runner):
@@ -36,6 +38,22 @@ class StubRunner(Runner):
     ) -> ExecResult:
         self._ensure_exec_open()
         return ExecResult(stdout="ok")
+
+
+class _PreflightRejectingRunner(Runner):
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> ExecResult:
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
+        raise ValueError("Runner preflight rejected the request.")
 
 
 def _artifact(action: str, status: str) -> dict:
@@ -61,6 +79,7 @@ def test_resolve_cwd_shared_implementation():
     runner = StubRunner()
     assert runner.resolve_cwd() == "/workspace"
     assert runner.resolve_cwd("sub/dir") == "/workspace/sub/dir"
+    assert runner.resolve_cwd(" spaced ") == "/workspace/ spaced "
     assert runner.resolve_cwd("sub/../tests") == "/workspace/tests"
     assert runner.resolve_cwd("/workspace") == "/workspace"
     assert runner.resolve_cwd("/workspace/sub/../tests") == "/workspace/tests"
@@ -80,6 +99,27 @@ def test_default_close_and_context_manager():
     assert runner._closed is True
     with pytest.raises(RuntimeError, match="StubRunner is closed."):
         asyncio.run(runner.exec(ExecCommand.process("true")))
+
+
+def test_default_redacted_forwarder_drops_request_inputs_on_rejection() -> None:
+    secret = "default-redacted-forwarder-secret-canary-ABCDEFGHIJKLMNOP"
+
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(
+            _PreflightRejectingRunner().exec_redacted(
+                ExecCommand.process("curl", f"Authorization: Bearer {secret}"),
+                redactor=SecretRedactor(secret),
+                env={"TOKEN": secret},
+                stdin=secret,
+            )
+        )
+
+    current = raised.value.__traceback__
+    while current is not None:
+        frame = current.tb_frame
+        if is_cayu_source_filename(frame.f_code.co_filename):
+            assert secret not in repr(frame.f_locals)
+        current = current.tb_next
 
 
 def test_exec_closed_latch_message_and_reopen():

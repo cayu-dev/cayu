@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
+from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
     AgentSpec,
@@ -375,7 +377,6 @@ def test_git_command_policy_denies_remote_credential_destructive_and_helper_comm
         "file?.py",
         "nested//file.py",
         "a" * 4097,
-        "nul\0path",
     ],
 )
 def test_git_command_policy_rejects_unsafe_or_ambiguous_paths(path: str) -> None:
@@ -388,6 +389,105 @@ def test_git_command_policy_rejects_unsafe_or_ambiguous_paths(path: str) -> None
 def test_git_command_policy_empty_path_is_rejected_by_process_command_shape() -> None:
     with pytest.raises(ValueError, match="argv entries must be non-empty"):
         _request(*_SAFE_PREFIX, "add", "--", "")
+
+
+def test_git_command_policy_nul_path_is_rejected_by_command_boundary() -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        _request(*_SAFE_PREFIX, "add", "--", "nul\0path")
+
+
+def test_command_request_validation_hides_secret_bearing_command_input() -> None:
+    secret = "command-request-secret-canary-ABCDEFGHIJKLMNOP"
+    command = ExecCommand.process(
+        "curl",
+        "-H",
+        f"Authorization: Bearer {secret}",
+        "valid",
+    )
+    assert command.argv is not None
+    command.argv[-1] = "invalid\x00argument"
+
+    with pytest.raises(ValueError) as raised:
+        CommandRequest(
+            command=command,
+            canonical_cwd="/workspace/repo",
+            timeout_s=30,
+        )
+
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert secret not in rendered
+    assert "Authorization: Bearer" not in rendered
+    assert type(raised.value) is ValidationError
+    assert secret not in repr(raised.value.errors())
+    assert secret not in raised.value.json()
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    current = raised.value.__traceback__
+    while current is not None:
+        frame = current.tb_frame
+        if is_cayu_source_filename(frame.f_code.co_filename):
+            assert all(secret not in repr(value) for value in frame.f_locals.values())
+        current = current.tb_next
+
+
+@pytest.mark.parametrize(
+    "validation_entrance",
+    ("model_validate", "model_validate_json", "model_validate_strings"),
+)
+def test_command_request_model_validation_drops_rejected_input(
+    validation_entrance: str,
+) -> None:
+    secret = "command-request-validation-secret-canary-ABCDEFGHIJKLMNOP"
+    payload = {
+        "command": {
+            "kind": "process",
+            "argv": [
+                "curl",
+                "-H",
+                f"Authorization: Bearer {secret}",
+                "invalid\x00argument",
+            ],
+        },
+        "canonical_cwd": "/workspace/repo",
+        "timeout_s": 30,
+    }
+
+    with pytest.raises(ValueError) as raised:
+        if validation_entrance == "model_validate":
+            CommandRequest.model_validate(payload)
+        elif validation_entrance == "model_validate_json":
+            CommandRequest.model_validate_json(json.dumps(payload))
+        else:
+            CommandRequest.model_validate_strings(payload)
+
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert secret not in rendered
+    assert "Authorization: Bearer" not in rendered
+    assert type(raised.value) is ValidationError
+    assert secret not in repr(raised.value.errors())
+    assert secret not in raised.value.json()
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_command_request_validation_preserves_safe_error_structure() -> None:
+    with pytest.raises(ValidationError) as raised:
+        CommandRequest.model_validate(
+            {
+                "command": "not-a-command",
+                "timeout_s": "not-an-integer",
+                "unexpected": "value",
+            }
+        )
+
+    errors = raised.value.errors()
+    assert len(errors) == 3
+    assert {(error["type"], error["loc"]) for error in errors} == {
+        ("model_type", ("command",)),
+        ("int_parsing", ("timeout_s",)),
+        ("extra_forbidden", ("invalid_input",)),
+    }
+    assert all(error.get("input") is None for error in errors)
 
 
 def test_git_command_policy_bounds_number_of_explicit_paths() -> None:

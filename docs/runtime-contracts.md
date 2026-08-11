@@ -3966,10 +3966,25 @@ Runner output capture is bounded by `output_limit_bytes` and returns `stdout_tru
 
 `Runner.exec(..., env_remove=(...))` lets a trusted Cayu caller remove named
 variables after ordinary/injected environment construction. Built-in runners
-apply removals before enforced backend overlays, so a read-only tool can clear
-ambient process-selection authority without weakening mandatory egress or
-sandbox configuration. Custom runners must accept the keyword and apply the
-same ordering.
+validate each execution request's command text, `cwd`, and caller-provided environment
+additions/removal names before resolving runner secrets or starting external preparation
+for that request. Command argv/shell, `cwd`, and caller-provided environment values reject
+NUL and Unicode surrogate code points; stdin permits NUL but rejects surrogates. Runners
+snapshot and revalidate enforced backend overlays at the execution boundary, and reject
+additional backend-specific transport limitations before dispatch—for example, Docker
+env-file keys use Docker's whitespace/comment grammar, values cannot contain line breaks,
+and complete lines are size-bounded. Invocation and managed-runner wrappers call the
+selected runner's side-effect-free `preflight_exec(...)` seam before consulting invocation
+secret state, admitting workspace dispatch, or evaluating an application `CommandPolicy`;
+execution still revalidates the owned request at the backend boundary. If authentic caller
+cancellation is already pending when preflight
+rejects, cancellation remains authoritative and the invocation wrapper may consult its
+secret snapshot only to redact the cancellation reason; runner `SecretRef` resolution and
+dispatch remain skipped. Effective stored default working directories are revalidated on
+every resolution. Runners apply removals before enforced backend
+overlays, so a read-only tool can clear ambient process-selection authority without
+weakening mandatory egress or sandbox configuration. Custom runners must accept the
+keyword, validate before side effects, and apply the same scalar rules and ordering.
 
 ### Execution admission
 

@@ -1,24 +1,80 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 import time
+from typing import Any, cast
 
 import pytest
+from pydantic import ValidationError
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 import cayu.runners._subprocess as subprocess_module
-from cayu.runners import ExecCommand, LocalRunner
+import cayu.runners.docker as docker_runner_module
+import cayu.runners.local as local_runner_module
+from cayu.runners import DockerRunner, ExecCommand, ExecResult, LocalRunner, Runner
+from cayu.runners._secrets import DOCKER_ENV_FILE_MAX_LINE_BYTES
 from cayu.runners._subprocess import (
     SubprocessCommand,
     copy_runner_env,
+    remove_runner_env,
     run_subprocess,
     validate_output_limit,
     validate_stdin,
     validate_timeout,
 )
-from cayu.vaults import REDACTED_SECRET, SecretRedactor
+from cayu.vaults import REDACTED_SECRET, SecretEnv, SecretRedactor, SecretRef, StaticVault
+
+_ENV_NAME_CANARY = "runner-environment-name-canary"
+_SECRET_NAME = "runner_secret_name"
+_SECRET_VALUE = "runner-secret-value-canary"
+
+_INVALID_ENV_NAMES = (
+    pytest.param(None, id="not-string"),
+    pytest.param("", id="empty"),
+    pytest.param(" ", id="blank"),
+    pytest.param(f" {_ENV_NAME_CANARY}", id="leading-whitespace"),
+    pytest.param(f"{_ENV_NAME_CANARY} ", id="trailing-whitespace"),
+    pytest.param(f"{_ENV_NAME_CANARY}\x00", id="nul"),
+    pytest.param(f"{_ENV_NAME_CANARY}\ud800", id="surrogate"),
+    pytest.param(f"{_ENV_NAME_CANARY}=value", id="equals"),
+    pytest.param(f"{_ENV_NAME_CANARY}\nvalue", id="newline"),
+    pytest.param(f"{_ENV_NAME_CANARY}\rvalue", id="carriage-return"),
+)
+
+
+def _assert_cayu_validation_traceback_does_not_retain(
+    error: BaseException,
+    secret: str,
+) -> None:
+    current = error.__traceback__
+    while current is not None:
+        frame = current.tb_frame
+        if is_cayu_source_filename(frame.f_code.co_filename):
+            assert all(secret not in repr(value) for value in frame.f_locals.values())
+        current = current.tb_next
+
+
+class _CountingVault(StaticVault):
+    def __init__(self) -> None:
+        super().__init__({_SECRET_NAME: _SECRET_VALUE})
+        self.resolve_calls = 0
+
+    async def resolve(self, ref, *, scope=None):
+        self.resolve_calls += 1
+        return await super().resolve(ref, scope=scope)
+
+
+class _PortablePreflightRunner(Runner):
+    async def exec(
+        self,
+        command: ExecCommand,
+        **kwargs: Any,
+    ) -> ExecResult:
+        del command, kwargs
+        return ExecResult()
 
 
 def test_subprocess_command_accepts_exactly_one_command_shape() -> None:
@@ -66,6 +122,227 @@ def test_subprocess_command_rejects_invalid_argv_and_shell() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         SubprocessCommand(shell=" ")
 
+    for invalid_text in ("invalid\x00command", "invalid\ud800command"):
+        with pytest.raises(ValueError):
+            SubprocessCommand(argv=[invalid_text])
+        with pytest.raises(ValueError):
+            SubprocessCommand(shell=invalid_text)
+        with pytest.raises(ValueError):
+            ExecCommand.process(invalid_text)
+        with pytest.raises(ValueError):
+            ExecCommand.bash(invalid_text)
+
+
+def test_exec_command_validation_hides_secret_bearing_sibling_arguments() -> None:
+    secret = "command-validation-secret-canary-ABCDEFGHIJKLMNOP"
+
+    with pytest.raises(ValueError) as raised:
+        ExecCommand.process(
+            "curl",
+            "-H",
+            f"Authorization: Bearer {secret}",
+            "invalid\x00argument",
+        )
+
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert secret not in rendered
+    assert "Authorization: Bearer" not in rendered
+    assert type(raised.value) is ValidationError
+    assert secret not in repr(raised.value.errors())
+    assert secret not in raised.value.json()
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    _assert_cayu_validation_traceback_does_not_retain(raised.value, secret)
+
+
+@pytest.mark.parametrize(
+    "validation_entrance",
+    ("model_validate", "model_validate_json", "model_validate_strings"),
+)
+def test_exec_command_model_validation_drops_rejected_input(
+    validation_entrance: str,
+) -> None:
+    secret = "command-model-validation-secret-canary-ABCDEFGHIJKLMNOP"
+    payload = {
+        "kind": "process",
+        "argv": [
+            "curl",
+            "-H",
+            f"Authorization: Bearer {secret}",
+            "invalid\x00argument",
+        ],
+    }
+
+    with pytest.raises(ValueError) as raised:
+        if validation_entrance == "model_validate":
+            ExecCommand.model_validate(payload)
+        elif validation_entrance == "model_validate_json":
+            ExecCommand.model_validate_json(json.dumps(payload))
+        else:
+            ExecCommand.model_validate_strings(payload)
+
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert secret not in rendered
+    assert "Authorization: Bearer" not in rendered
+    assert type(raised.value) is ValidationError
+    assert secret not in repr(raised.value.errors())
+    assert secret not in raised.value.json()
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    _assert_cayu_validation_traceback_does_not_retain(raised.value, secret)
+
+
+def test_exec_command_validation_preserves_safe_error_structure() -> None:
+    with pytest.raises(ValidationError) as raised:
+        ExecCommand.model_validate(
+            {
+                "kind": "unknown",
+                "argv": "not-a-list",
+                "unexpected": "value",
+            }
+        )
+
+    errors = raised.value.errors()
+    assert len(errors) == 3
+    assert {(error["type"], error["loc"]) for error in errors} == {
+        ("literal_error", ("kind",)),
+        ("list_type", ("argv",)),
+        ("extra_forbidden", ("invalid_input",)),
+    }
+    assert all(error.get("input") is None for error in errors)
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize(
+    "public_method",
+    ("preflight_exec", "exec", "exec_redacted", "exec_system"),
+)
+@pytest.mark.parametrize("invalid_input", ("command", "environment"))
+def test_direct_runner_preflight_drops_secret_bearing_command_traceback(
+    runner_kind: str,
+    public_method: str,
+    invalid_input: str,
+    tmp_path,
+) -> None:
+    secret = "direct-runner-command-secret-canary-ABCDEFGHIJKLMNOP"
+    if runner_kind == "local":
+        runner = LocalRunner(tmp_path)
+    else:
+        runner = DockerRunner("validation-probe", docker_path="/unreachable/docker")
+    command = ExecCommand.process(
+        "curl",
+        "-H",
+        f"Authorization: Bearer {secret}",
+        "valid",
+    )
+    assert command.argv is not None
+    kwargs: dict[str, Any] = {}
+    if invalid_input == "command":
+        command.argv[-1] = "invalid\x00argument"
+    else:
+        kwargs["env"] = {"VALUE": "invalid\x00value"}
+
+    with pytest.raises(ValueError) as raised:
+        if public_method == "preflight_exec":
+            runner.preflight_exec(command, **kwargs)
+        elif public_method == "exec":
+            asyncio.run(runner.exec(command, **kwargs))
+        elif public_method == "exec_redacted":
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                    **kwargs,
+                )
+            )
+        else:
+            asyncio.run(runner.exec_system(command, **kwargs))
+
+    assert secret not in str(raised.value)
+    if isinstance(raised.value, ValidationError):
+        assert secret not in repr(raised.value.errors())
+    _assert_cayu_validation_traceback_does_not_retain(raised.value, secret)
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize(
+    "public_method",
+    ("preflight_exec", "exec", "exec_redacted", "exec_system"),
+)
+@pytest.mark.parametrize(
+    "secret_input",
+    ("environment", "stdin", "cwd", "env_remove", "partial_environment"),
+)
+def test_direct_runner_preflight_drops_secret_bearing_sibling_inputs(
+    runner_kind: str,
+    public_method: str,
+    secret_input: str,
+    tmp_path,
+) -> None:
+    secret = "DIRECT_RUNNER_INPUT_SECRET_CANARY_ABCDEFGHIJKLMNOP"
+    if runner_kind == "local":
+        runner = LocalRunner(tmp_path)
+    else:
+        runner = DockerRunner("validation-probe", docker_path="/unreachable/docker")
+    command = ExecCommand.process("valid")
+    kwargs: dict[str, Any]
+    if secret_input == "partial_environment":
+        kwargs = {
+            "env": {
+                "TOKEN": secret,
+                "INVALID": "invalid\x00value",
+            }
+        }
+    elif secret_input in {"environment", "stdin", "env_remove"}:
+        assert command.argv is not None
+        command.argv[-1] = "invalid\x00argument"
+        if secret_input == "environment":
+            kwargs = {"env": {"TOKEN": secret}}
+        elif secret_input == "stdin":
+            kwargs = {"stdin": secret}
+        else:
+            kwargs = {"env_remove": (secret,)}
+    else:
+        assert command.argv is not None
+        command.argv[-1] = "invalid\x00argument"
+        (tmp_path / secret).mkdir()
+        kwargs = {"cwd": secret}
+
+    with pytest.raises(ValueError) as raised:
+        if public_method == "preflight_exec":
+            runner.preflight_exec(command, **kwargs)
+        elif public_method == "exec":
+            asyncio.run(runner.exec(command, **kwargs))
+        elif public_method == "exec_redacted":
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                    **kwargs,
+                )
+            )
+        else:
+            asyncio.run(runner.exec_system(command, **kwargs))
+
+    assert secret not in str(raised.value)
+    _assert_cayu_validation_traceback_does_not_retain(raised.value, secret)
+
+
+def test_base_runner_direct_preflight_drops_secret_bearing_sibling_inputs() -> None:
+    secret = "BASE_PREFLIGHT_SECRET_CANARY_ABCDEFGHIJKLMNOP"
+    command = ExecCommand.process("valid", f"Authorization: Bearer {secret}")
+    assert command.argv is not None
+    command.argv[0] = "invalid\x00argument"
+
+    with pytest.raises(ValueError) as raised:
+        _PortablePreflightRunner().preflight_exec(
+            command,
+            env={"TOKEN": secret},
+        )
+
+    assert secret not in str(raised.value)
+    _assert_cayu_validation_traceback_does_not_retain(raised.value, secret)
+
 
 def test_runner_env_copy_can_inherit_or_isolate_parent_env(monkeypatch) -> None:
     monkeypatch.setenv("CAYU_PARENT_ENV", "visible")
@@ -77,6 +354,97 @@ def test_runner_env_copy_can_inherit_or_isolate_parent_env(monkeypatch) -> None:
     isolated = copy_runner_env({"CHILD": "set"}, inherit_env=False)
     assert "CAYU_PARENT_ENV" not in isolated
     assert isolated == {"CHILD": "set"}
+
+    multiline = "first line\nsecond line\rthird line"
+    assert copy_runner_env({"MULTILINE": multiline}, inherit_env=False) == {"MULTILINE": multiline}
+
+
+@pytest.mark.parametrize("public_method", ("preflight_exec", "exec", "exec_redacted"))
+def test_local_runner_rejects_invalid_inherited_environment_before_secret_resolution(
+    public_method: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(" PADDED_INHERITED_NAME ", "invalid")
+    vault = _CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        inherit_env=True,
+        secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+
+    with pytest.raises(ValueError, match="env key"):
+        if public_method == "preflight_exec":
+            runner.preflight_exec(ExecCommand.process("true"))
+        elif public_method == "exec":
+            asyncio.run(runner.exec(ExecCommand.process("true")))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    ExecCommand.process("true"),
+                    redactor=SecretRedactor(),
+                )
+            )
+
+    assert vault.resolve_calls == 0
+
+
+def test_local_runner_cwd_preserves_valid_surrounding_spaces(tmp_path) -> None:
+    spaced = tmp_path / " spaced "
+    spaced.mkdir()
+
+    assert LocalRunner(tmp_path).resolve_cwd(" spaced ") == str(spaced.resolve())
+
+
+def test_local_runner_root_preserves_valid_surrounding_spaces(tmp_path) -> None:
+    spaced_root = tmp_path / " workspace "
+    spaced_root.mkdir()
+    runner = LocalRunner(spaced_root)
+
+    assert runner.resolve_cwd() == str(spaced_root.resolve())
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "from pathlib import Path; print(Path.cwd().name)",
+            )
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == " workspace \n"
+
+
+@pytest.mark.parametrize("invalid_suffix", ("bad\x00root", "bad\ud800root"))
+def test_local_runner_rejects_mutated_nonportable_root_before_secret_resolution(
+    invalid_suffix: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vault = _CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+    runner.root = tmp_path / invalid_suffix
+    spawn_calls = 0
+
+    async def unexpected_spawn(*args: Any, **kwargs: Any) -> ExecResult:
+        nonlocal spawn_calls
+        del args, kwargs
+        spawn_calls += 1
+        return ExecResult()
+
+    monkeypatch.setattr(local_runner_module, "run_subprocess", unexpected_spawn)
+
+    with pytest.raises(ValueError, match="root"):
+        asyncio.run(runner.exec(ExecCommand.process("true")))
+
+    assert vault.resolve_calls == 0
+    assert spawn_calls == 0
 
 
 def test_run_subprocess_does_not_inherit_parent_env_by_default(tmp_path, monkeypatch) -> None:
@@ -117,6 +485,664 @@ def test_runner_env_copy_rejects_invalid_env() -> None:
         copy_runner_env([], inherit_env=False)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("name", _INVALID_ENV_NAMES)
+def test_runner_env_additions_and_removals_share_exact_name_validation(name) -> None:
+    with pytest.raises(ValueError) as addition_error:
+        copy_runner_env({name: "value"}, inherit_env=False)
+    with pytest.raises(ValueError) as removal_error:
+        remove_runner_env({"VALID": "value"}, (name,))
+
+    rendered = (
+        f"{addition_error.value!s} {addition_error.value!r} "
+        f"{removal_error.value!s} {removal_error.value!r}"
+    )
+    assert _ENV_NAME_CANARY not in rendered
+
+
+@pytest.mark.parametrize("invalid_remove", (None, "PATH", ["PATH"]))
+def test_runner_env_removals_reject_invalid_container_types(invalid_remove: Any) -> None:
+    with pytest.raises(TypeError, match="tuple"):
+        remove_runner_env(
+            {"PATH": "value"},
+            cast("tuple[str, ...]", invalid_remove),
+        )
+
+
+@pytest.mark.parametrize("name", ("VALID_NAME", "ÜNICODE_NAME", "INNER SPACE"))
+def test_runner_env_additions_and_removals_preserve_valid_names(name: str) -> None:
+    assert copy_runner_env({name: "value"}, inherit_env=False) == {name: "value"}
+    assert remove_runner_env({name: "value", "KEEP": "yes"}, (name, name)) == {"KEEP": "yes"}
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+@pytest.mark.parametrize("invalid_argument", ("env", "env_remove"))
+def test_runner_rejects_invalid_environment_before_resolving_secrets(
+    runner_kind: str,
+    public_method: str,
+    invalid_argument: str,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    secret_env = [SecretEnv(name="API_TOKEN", ref=SecretRef(name=_SECRET_NAME))]
+    runner = (
+        LocalRunner(tmp_path, secret_env=secret_env, secret_resolver=vault)
+        if runner_kind == "local"
+        else DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env=secret_env,
+            secret_resolver=vault,
+        )
+    )
+    invalid_name = f"{_ENV_NAME_CANARY}\x00"
+
+    async def invoke() -> None:
+        command = ExecCommand.process(
+            sys.executable,
+            "-c",
+            "raise SystemExit(99)",
+        )
+        if public_method == "exec":
+            if invalid_argument == "env":
+                await runner.exec(command, env={invalid_name: "value"})
+            else:
+                await runner.exec(command, env_remove=(invalid_name,))
+        elif invalid_argument == "env":
+            await runner.exec_redacted(
+                command,
+                redactor=SecretRedactor(),
+                env={invalid_name: "value"},
+            )
+        else:
+            await runner.exec_redacted(
+                command,
+                redactor=SecretRedactor(),
+                env_remove=(invalid_name,),
+            )
+
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(invoke())
+
+    assert vault.resolve_calls == 0
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert _ENV_NAME_CANARY not in rendered
+    assert _SECRET_NAME not in rendered
+    assert _SECRET_VALUE not in rendered
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+def test_runner_rejects_secret_env_collision_before_resolving_secrets(
+    runner_kind: str,
+    public_method: str,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    runner = (
+        LocalRunner(
+            tmp_path,
+            secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+            secret_resolver=vault,
+        )
+        if runner_kind == "local"
+        else DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+            secret_resolver=vault,
+        )
+    )
+    command = ExecCommand.process(sys.executable, "-c", "raise SystemExit(99)")
+
+    with pytest.raises(ValueError, match="collides with declared secret_env"):
+        if public_method == "exec":
+            asyncio.run(runner.exec(command, env={"API_TOKEN": "override"}))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                    env={"API_TOKEN": "override"},
+                )
+            )
+
+    assert vault.resolve_calls == 0
+
+
+def test_local_runner_rejects_safe_host_env_collision_before_resolving_secrets(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+    vault = _CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"PATH": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+
+    with pytest.raises(ValueError, match="collides with declared secret_env"):
+        asyncio.run(runner.exec(ExecCommand.process("true")))
+
+    assert vault.resolve_calls == 0
+
+
+@pytest.mark.parametrize("public_method", ("preflight_exec", "exec", "exec_redacted"))
+def test_local_runner_rejects_invalid_safe_host_environment_before_resolving_secrets(
+    public_method: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PATH", "invalid\udcffvalue")
+    vault = _CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+
+    with pytest.raises(ValueError, match="env value"):
+        if public_method == "preflight_exec":
+            runner.preflight_exec(ExecCommand.process("true"))
+        elif public_method == "exec":
+            asyncio.run(runner.exec(ExecCommand.process("true")))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    ExecCommand.process("true"),
+                    redactor=SecretRedactor(),
+                )
+            )
+
+    assert vault.resolve_calls == 0
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+@pytest.mark.parametrize(
+    ("invalid_kwargs", "error_type"),
+    (
+        ({"cwd": "/outside-runner-root"}, ValueError),
+        ({"cwd": "invalid\x00cwd"}, ValueError),
+        ({"cwd": "invalid\ud800cwd"}, ValueError),
+        ({"timeout_s": 0}, ValueError),
+        ({"stdin": b"invalid"}, TypeError),
+        ({"stdin": "\ud800"}, ValueError),
+        ({"env": {"VALUE": "invalid\x00value"}}, ValueError),
+        ({"env": {"VALUE": "invalid\ud800value"}}, ValueError),
+        ({"output_limit_bytes": 0}, ValueError),
+    ),
+)
+def test_runner_rejects_invalid_command_inputs_before_resolving_secrets(
+    runner_kind: str,
+    public_method: str,
+    invalid_kwargs: dict[str, Any],
+    error_type: type[Exception],
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    secret_env = [SecretEnv(name="API_TOKEN", ref=SecretRef(name=_SECRET_NAME))]
+    runner = (
+        LocalRunner(tmp_path, secret_env=secret_env, secret_resolver=vault)
+        if runner_kind == "local"
+        else DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env=secret_env,
+            secret_resolver=vault,
+        )
+    )
+    command = ExecCommand.process(sys.executable, "-c", "raise SystemExit(99)")
+
+    with pytest.raises(error_type):
+        if public_method == "exec":
+            asyncio.run(runner.exec(command, **invalid_kwargs))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                    **invalid_kwargs,
+                )
+            )
+
+    assert vault.resolve_calls == 0
+
+
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+@pytest.mark.parametrize(
+    "invalid_environment",
+    (
+        {"VALUE": "invalid\nvalue"},
+        {"VALUE": "invalid\rvalue"},
+        {"INNER SPACE": "value"},
+        {"INNER\tTAB": "value"},
+        {"#COMMENT": "value"},
+        {"\ufeffBOM": "value"},
+        {"VALUE": "x" * (DOCKER_ENV_FILE_MAX_LINE_BYTES - len("VALUE=") + 1)},
+    ),
+)
+def test_docker_rejects_unrepresentable_env_file_before_resolving_secrets(
+    public_method: str,
+    invalid_environment: dict[str, str],
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    runner = DockerRunner(
+        "validation-probe",
+        docker_path="/unreachable/docker",
+        secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+    command = ExecCommand.process(sys.executable, "--version")
+
+    with pytest.raises(ValueError) as raised:
+        if public_method == "exec":
+            asyncio.run(runner.exec(command, env=invalid_environment))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                    env=invalid_environment,
+                )
+            )
+
+    assert vault.resolve_calls == 0
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert _SECRET_NAME not in rendered
+    assert _SECRET_VALUE not in rendered
+
+
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+@pytest.mark.parametrize(
+    "invalid_overlay",
+    (
+        {"VALUE": "invalid\x00value"},
+        {"INNER SPACE": "value"},
+    ),
+)
+def test_docker_revalidates_stored_overlay_before_resolving_secrets(
+    public_method: str,
+    invalid_overlay: dict[str, str],
+) -> None:
+    vault = _CountingVault()
+    runner = DockerRunner(
+        "validation-probe",
+        docker_path="/unreachable/docker",
+        secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+    runner.env_overlay = invalid_overlay
+    command = ExecCommand.process(sys.executable, "--version")
+
+    with pytest.raises(ValueError):
+        if public_method == "exec":
+            asyncio.run(runner.exec(command))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                )
+            )
+
+    assert vault.resolve_calls == 0
+
+
+def test_docker_owns_overlay_snapshot_across_secret_resolution(monkeypatch) -> None:
+    captured_environment: dict[str, str] = {}
+
+    class _BlockingVault(_CountingVault):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def resolve(self, ref, *, scope=None):
+            self.resolve_calls += 1
+            self.started.set()
+            await self.release.wait()
+            return await StaticVault.resolve(self, ref, scope=scope)
+
+    async def fake_run_subprocess(command, **kwargs):
+        del kwargs
+        assert command.argv is not None
+        env_path = command.argv[command.argv.index("--env-file") + 1]
+        with open(env_path, encoding="utf-8") as handle:
+            for line in handle:
+                key, value = line.rstrip("\n").split("=", 1)
+                captured_environment[key] = value
+        return ExecResult()
+
+    monkeypatch.setattr(docker_runner_module, "run_subprocess", fake_run_subprocess)
+
+    async def run() -> None:
+        vault = _BlockingVault()
+        runner = DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+            secret_resolver=vault,
+            env_overlay={"OVERLAY": "owned"},
+        )
+        operation = asyncio.create_task(runner.exec(ExecCommand.process("true")))
+        await vault.started.wait()
+        runner.env_overlay.clear()
+        runner.env_overlay["OVERLAY"] = "mutated"
+        runner.env_overlay["INVALID"] = "invalid\x00value"
+        vault.release.set()
+        await operation
+
+        assert vault.resolve_calls == 1
+
+    asyncio.run(run())
+
+    assert captured_environment["OVERLAY"] == "owned"
+    assert "INVALID" not in captured_environment
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+@pytest.mark.parametrize("command_kind", ("process", "shell"))
+@pytest.mark.parametrize("invalid_text", ("invalid\x00command", "invalid\ud800command"))
+def test_runner_revalidates_mutated_command_text_before_resolving_secrets(
+    runner_kind: str,
+    public_method: str,
+    command_kind: str,
+    invalid_text: str,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    runner = (
+        LocalRunner(
+            tmp_path,
+            secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+            secret_resolver=vault,
+        )
+        if runner_kind == "local"
+        else DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+            secret_resolver=vault,
+        )
+    )
+    command = (
+        ExecCommand.process(sys.executable, "--version")
+        if command_kind == "process"
+        else ExecCommand.bash("true")
+    )
+    if command_kind == "process":
+        assert command.argv is not None
+        command.argv[-1] = invalid_text
+    else:
+        command.shell = invalid_text
+
+    with pytest.raises(ValueError):
+        if public_method == "exec":
+            asyncio.run(runner.exec(command))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                )
+            )
+
+    assert vault.resolve_calls == 0
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize(
+    "invalid_name",
+    (f"{_ENV_NAME_CANARY}=value", f"{_ENV_NAME_CANARY}\nvalue"),
+)
+def test_runner_rejects_invalid_declared_secret_environment_name(
+    runner_kind: str,
+    invalid_name: str,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    secret_env = {invalid_name: SecretRef(name=_SECRET_NAME)}
+
+    with pytest.raises(ValueError) as raised:
+        if runner_kind == "local":
+            LocalRunner(tmp_path, secret_env=secret_env, secret_resolver=vault)
+        else:
+            DockerRunner(
+                "validation-probe",
+                docker_path="/unreachable/docker",
+                secret_env=secret_env,
+                secret_resolver=vault,
+            )
+
+    assert vault.resolve_calls == 0
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert _ENV_NAME_CANARY not in rendered
+    assert _SECRET_NAME not in rendered
+    assert _SECRET_VALUE not in rendered
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+def test_runner_revalidates_mutated_stored_secret_environment_before_resolution(
+    runner_kind: str,
+    public_method: str,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    runner = (
+        LocalRunner(
+            tmp_path,
+            secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+            secret_resolver=vault,
+        )
+        if runner_kind == "local"
+        else DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+            secret_resolver=vault,
+        )
+    )
+    invalid_name = f"{_ENV_NAME_CANARY}=value"
+    runner.secret_env.clear()
+    runner.secret_env[invalid_name] = SecretRef(name=_SECRET_NAME)
+    command = ExecCommand.process(sys.executable, "-c", "raise SystemExit(99)")
+
+    with pytest.raises(ValueError) as raised:
+        if public_method == "exec":
+            asyncio.run(runner.exec(command))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    command,
+                    redactor=SecretRedactor(),
+                )
+            )
+
+    assert vault.resolve_calls == 0
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert _ENV_NAME_CANARY not in rendered
+    assert _SECRET_NAME not in rendered
+    assert _SECRET_VALUE not in rendered
+
+
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+@pytest.mark.parametrize("mutated_after_construction", (False, True))
+@pytest.mark.parametrize(
+    "invalid_name",
+    (f"#{_ENV_NAME_CANARY}", f"{_ENV_NAME_CANARY} SPACE"),
+)
+def test_docker_rejects_unrepresentable_declared_secret_name_before_resolution(
+    public_method: str,
+    mutated_after_construction: bool,
+    invalid_name: str,
+) -> None:
+    vault = _CountingVault()
+    runner = DockerRunner(
+        "validation-probe",
+        docker_path="/unreachable/docker",
+        secret_env=(
+            {"API_TOKEN": SecretRef(name=_SECRET_NAME)}
+            if mutated_after_construction
+            else {invalid_name: SecretRef(name=_SECRET_NAME)}
+        ),
+        secret_resolver=vault,
+    )
+    if mutated_after_construction:
+        runner.secret_env.clear()
+        runner.secret_env[invalid_name] = SecretRef(name=_SECRET_NAME)
+
+    with pytest.raises(ValueError) as raised:
+        if public_method == "exec":
+            asyncio.run(runner.exec(ExecCommand.process("true")))
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    ExecCommand.process("true"),
+                    redactor=SecretRedactor(),
+                )
+            )
+
+    assert vault.resolve_calls == 0
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert _ENV_NAME_CANARY not in rendered
+    assert _SECRET_NAME not in rendered
+    assert _SECRET_VALUE not in rendered
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+def test_runner_stored_secret_mutation_preserves_raw_secret_opt_out(
+    runner_kind: str,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    runner = (
+        LocalRunner(
+            tmp_path,
+            secret_resolver=vault,
+            allow_raw_secret_env=False,
+        )
+        if runner_kind == "local"
+        else DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_resolver=vault,
+            allow_raw_secret_env=False,
+        )
+    )
+    runner.secret_env["API_TOKEN"] = SecretRef(name=_SECRET_NAME)
+
+    with pytest.raises(ValueError, match="allow_raw_secret_env"):
+        asyncio.run(runner.exec(ExecCommand.process(sys.executable, "--version")))
+
+    assert vault.resolve_calls == 0
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize(
+    "invalid_name",
+    (f"{_ENV_NAME_CANARY}=value", f"{_ENV_NAME_CANARY}\nvalue"),
+)
+def test_runner_rejects_duplicate_invalid_secret_environment_name_safely(
+    runner_kind: str,
+    invalid_name: str,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    secret_env = [
+        SecretEnv(name=invalid_name, ref=SecretRef(name=_SECRET_NAME)),
+        SecretEnv(name=invalid_name, ref=SecretRef(name=_SECRET_NAME)),
+    ]
+
+    with pytest.raises(ValueError) as raised:
+        if runner_kind == "local":
+            LocalRunner(tmp_path, secret_env=secret_env, secret_resolver=vault)
+        else:
+            DockerRunner(
+                "validation-probe",
+                docker_path="/unreachable/docker",
+                secret_env=secret_env,
+                secret_resolver=vault,
+            )
+
+    assert vault.resolve_calls == 0
+    rendered = f"{raised.value!s} {raised.value!r}"
+    assert _ENV_NAME_CANARY not in rendered
+    assert _SECRET_NAME not in rendered
+    assert _SECRET_VALUE not in rendered
+
+
+@pytest.mark.parametrize("runner_kind", ("local", "docker"))
+@pytest.mark.parametrize("public_method", ("exec", "exec_redacted"))
+@pytest.mark.parametrize("invalid_remove", (None, "PATH", ["PATH"]))
+def test_runner_rejects_invalid_env_remove_container_before_resolving_secrets(
+    runner_kind: str,
+    public_method: str,
+    invalid_remove: Any,
+    tmp_path,
+) -> None:
+    vault = _CountingVault()
+    secret_env = [SecretEnv(name="API_TOKEN", ref=SecretRef(name=_SECRET_NAME))]
+    runner = (
+        LocalRunner(tmp_path, secret_env=secret_env, secret_resolver=vault)
+        if runner_kind == "local"
+        else DockerRunner(
+            "validation-probe",
+            docker_path="/unreachable/docker",
+            secret_env=secret_env,
+            secret_resolver=vault,
+        )
+    )
+    env_remove = cast("tuple[str, ...]", invalid_remove)
+
+    with pytest.raises(TypeError, match="tuple"):
+        if public_method == "exec":
+            asyncio.run(
+                runner.exec(
+                    ExecCommand.process(sys.executable, "-c", "raise SystemExit(99)"),
+                    env_remove=env_remove,
+                )
+            )
+        else:
+            asyncio.run(
+                runner.exec_redacted(
+                    ExecCommand.process(sys.executable, "-c", "raise SystemExit(99)"),
+                    redactor=SecretRedactor(),
+                    env_remove=env_remove,
+                )
+            )
+
+    assert vault.resolve_calls == 0
+
+
+def test_local_runner_applies_valid_removal_after_secret_injection(tmp_path) -> None:
+    vault = _CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('API_TOKEN', 'absent'))",
+            ),
+            env_remove=("API_TOKEN",),
+        )
+    )
+
+    assert vault.resolve_calls == 1
+    assert result.exit_code == 0
+    assert result.stdout == "absent\n"
+
+
 def test_local_runner_cancellation_does_not_retain_raw_environment(
     tmp_path,
 ) -> None:
@@ -153,7 +1179,7 @@ def test_local_runner_cancellation_does_not_retain_raw_environment(
                 )
         traceback = traceback.tb_next
 
-    with pytest.raises(ValueError, match="keys"):
+    with pytest.raises(ValueError, match="env key"):
         copy_runner_env({" ": "bad"}, inherit_env=False)
 
     with pytest.raises(ValueError, match="values"):
@@ -168,11 +1194,200 @@ def test_runner_validation_helpers_reject_invalid_values() -> None:
 
     with pytest.raises(TypeError, match="stdin"):
         validate_stdin(b"bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="surrogate"):
+        validate_stdin("\ud800")
 
     with pytest.raises(TypeError, match="output_limit_bytes"):
         validate_output_limit("1")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="greater than zero"):
         validate_output_limit(0)
+
+
+def test_run_subprocess_rejects_unencodable_stdin_before_spawning(monkeypatch) -> None:
+    spawn_calls = 0
+
+    def unexpected_spawn(*args, **kwargs):
+        nonlocal spawn_calls
+        del args, kwargs
+        spawn_calls += 1
+        raise AssertionError("invalid stdin must not create a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_spawn)
+
+    with pytest.raises(ValueError, match="surrogate"):
+        asyncio.run(
+            run_subprocess(
+                SubprocessCommand(argv=[sys.executable, "-c", "pass"]),
+                stdin="\ud800",
+            )
+        )
+
+    assert spawn_calls == 0
+
+
+@pytest.mark.parametrize("command_kind", ("process", "shell"))
+@pytest.mark.parametrize("invalid_text", ("invalid\x00command", "invalid\ud800command"))
+def test_run_subprocess_revalidates_mutated_command_before_spawning(
+    command_kind: str,
+    invalid_text: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spawn_calls = 0
+
+    def unexpected_spawn(*args, **kwargs):
+        nonlocal spawn_calls
+        del args, kwargs
+        spawn_calls += 1
+        raise AssertionError("invalid command must not create a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_spawn)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", unexpected_spawn)
+    command = (
+        SubprocessCommand(argv=[sys.executable, "--version"])
+        if command_kind == "process"
+        else SubprocessCommand(shell="true")
+    )
+    if command_kind == "process":
+        assert command.argv is not None
+        command.argv[-1] = invalid_text
+    else:
+        command.shell = invalid_text
+
+    with pytest.raises(ValueError):
+        asyncio.run(run_subprocess(command))
+
+    assert spawn_calls == 0
+
+
+def test_local_runner_uses_windows_environment_name_identity_before_secret_lookup(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        local_runner_module,
+        "_local_environment_names_case_sensitive",
+        lambda: False,
+    )
+    vault = _CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"API_TOKEN": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+
+    with pytest.raises(ValueError, match="collides with declared secret_env"):
+        asyncio.run(
+            runner.exec(
+                ExecCommand.process(sys.executable, "-c", "pass"),
+                env={"api_token": "override"},
+            )
+        )
+
+    assert vault.resolve_calls == 0
+
+
+def test_local_runner_uses_windows_environment_name_identity_for_removal(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        local_runner_module,
+        "_local_environment_names_case_sensitive",
+        lambda: False,
+    )
+    runner = LocalRunner(tmp_path)
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import os; print('MixedCase' in os.environ)",
+            ),
+            env={"MixedCase": "value"},
+            env_remove=("MIXEDCASE",),
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "False\n"
+
+
+def test_local_runner_rejects_windows_equivalent_explicit_duplicates_before_lookup(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        local_runner_module,
+        "_local_environment_names_case_sensitive",
+        lambda: False,
+    )
+    vault = _CountingVault()
+    runner = LocalRunner(
+        tmp_path,
+        secret_env={"DECLARED_SECRET": SecretRef(name=_SECRET_NAME)},
+        secret_resolver=vault,
+    )
+
+    with pytest.raises(ValueError, match="duplicate environment variable names"):
+        asyncio.run(
+            runner.exec(
+                ExecCommand.process(sys.executable, "-c", "pass"),
+                env={"EXPLICIT_NAME": "first", "explicit_name": "second"},
+            )
+        )
+
+    assert vault.resolve_calls == 0
+
+
+def test_local_runner_rejects_windows_equivalent_secret_duplicates_before_lookup(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        local_runner_module,
+        "_local_environment_names_case_sensitive",
+        lambda: False,
+    )
+    vault = _CountingVault()
+
+    with pytest.raises(ValueError, match="duplicate environment variable names"):
+        LocalRunner(
+            tmp_path,
+            secret_env={
+                "API_TOKEN": SecretRef(name=_SECRET_NAME),
+                "api_token": SecretRef(name=_SECRET_NAME),
+            },
+            secret_resolver=vault,
+        )
+
+    assert vault.resolve_calls == 0
+
+
+def test_local_runner_windows_explicit_environment_replaces_inherited_equivalent(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        local_runner_module,
+        "_local_environment_names_case_sensitive",
+        lambda: False,
+    )
+    runner = LocalRunner(tmp_path, inherit_env=True)
+
+    result = asyncio.run(
+        runner.exec(
+            ExecCommand.process(
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('PATH', '')); print(os.environ['Path'])",
+            ),
+            env={"Path": "explicit-path"},
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "\nexplicit-path\n"
 
 
 def test_run_subprocess_executes_process_and_bounds_output(tmp_path) -> None:
@@ -225,6 +1440,46 @@ def test_run_subprocess_reports_missing_command(tmp_path) -> None:
     assert "Command not found" in result.stderr
     assert result.stdout_bytes == 0
     assert result.stderr_bytes == len(result.stderr.encode("utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("spawn_error", "exit_code", "message"),
+    (
+        (FileNotFoundError(), 127, "Command not found"),
+        (PermissionError(), 126, "Command not executable"),
+    ),
+)
+def test_run_subprocess_spawn_diagnostic_uses_owned_command(
+    monkeypatch,
+    tmp_path,
+    spawn_error: OSError,
+    exit_code: int,
+    message: str,
+) -> None:
+    spawn_started = asyncio.Event()
+    release_spawn = asyncio.Event()
+
+    async def fail_spawn(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        spawn_started.set()
+        await release_spawn.wait()
+        raise spawn_error
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+
+    async def run() -> ExecResult:
+        command = SubprocessCommand(argv=["owned-command"])
+        task = asyncio.create_task(run_subprocess(command, cwd=tmp_path, env={}))
+        await spawn_started.wait()
+        assert command.argv is not None
+        command.argv[0] = "mutated\ud800command"
+        release_spawn.set()
+        return await task
+
+    result = asyncio.run(run())
+
+    assert result.exit_code == exit_code
+    assert result.stderr == f"{message}: owned-command"
 
 
 def test_run_subprocess_times_out_and_returns_partial_output(tmp_path) -> None:

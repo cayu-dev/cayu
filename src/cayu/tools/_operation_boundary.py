@@ -20,6 +20,16 @@ class InvocationOperationOutcome(Generic[_ResultT]):
     cancellation: asyncio.CancelledError | None = None
 
 
+async def await_invocation_cancellation_checkpoint() -> asyncio.CancelledError | None:
+    """Deliver one currently pending caller cancellation without dispatching work."""
+
+    try:
+        await asyncio.sleep(0)
+    except asyncio.CancelledError as exc:
+        return exc
+    return None
+
+
 async def await_invocation_operation(
     operation_factory: Callable[[], Awaitable[_ResultT]],
 ) -> InvocationOperationOutcome[_ResultT]:

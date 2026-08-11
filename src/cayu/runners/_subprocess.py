@@ -5,9 +5,9 @@ import contextlib
 import os
 import signal
 import subprocess
-from collections.abc import Iterable
 from pathlib import Path
 
+from cayu._validation import require_durable_clean_nonblank, require_durable_text
 from cayu.runners._redacted_output import RedactedOutputCapture
 from cayu.runners.base import ExecResult
 from cayu.vaults import SecretRedactor
@@ -31,15 +31,48 @@ _TASKKILL_ENV_KEYS = (
 )
 
 
-def remove_runner_env(environment: dict[str, str], keys: Iterable[str]) -> dict[str, str]:
+def validate_runner_env_name(value: str, field_name: str) -> str:
+    """Return one portable environment-variable name without normalizing it."""
+
+    name = require_durable_clean_nonblank(value, field_name)
+    if "=" in name:
+        raise ValueError(f"`{field_name}` must not contain '='.")
+    if "\n" in name or "\r" in name:
+        raise ValueError(f"`{field_name}` must not contain line breaks.")
+    return name
+
+
+def validate_runner_env_remove(keys: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate and own removal names before runner preparation can suspend."""
+
+    if type(keys) is not tuple:
+        raise TypeError("Runner env_remove must be a tuple.")
+    return tuple(validate_runner_env_name(key, "Runner env_remove entry") for key in keys)
+
+
+def runner_env_name_identity(name: str, *, case_sensitive: bool) -> str:
+    """Return the backend-specific identity used for environment names."""
+
+    return name if case_sensitive else name.upper()
+
+
+def remove_runner_env(
+    environment: dict[str, str],
+    keys: tuple[str, ...],
+    *,
+    case_sensitive: bool = True,
+) -> dict[str, str]:
     """Return an environment without explicitly forbidden variables."""
 
-    removed: set[str] = set()
-    for key in keys:
-        if type(key) is not str or not key:
-            raise ValueError("Runner env_remove entries must be non-empty strings.")
-        removed.add(key)
-    return {key: value for key, value in environment.items() if key not in removed}
+    removed = {
+        runner_env_name_identity(key, case_sensitive=case_sensitive)
+        for key in validate_runner_env_remove(keys)
+    }
+    return {
+        key: value
+        for key, value in environment.items()
+        if runner_env_name_identity(key, case_sensitive=case_sensitive) not in removed
+    }
 
 
 class SubprocessCommand:
@@ -61,11 +94,13 @@ class SubprocessCommand:
             for item in argv:
                 if type(item) is not str or not item.strip():
                     raise ValueError("Subprocess argv entries must be non-empty strings.")
+                require_durable_text(item, "Subprocess argv entry")
             self.argv = list(argv)
             self.shell = None
             return
         if type(shell) is not str or not shell.strip():
             raise ValueError("Subprocess shell command must be a non-empty string.")
+        require_durable_text(shell, "Subprocess shell command")
         self.argv = None
         self.shell = shell
 
@@ -91,8 +126,15 @@ async def run_subprocess(
 
     if type(command) is not SubprocessCommand:
         raise TypeError("run_subprocess command must be a SubprocessCommand.")
+    owned_command = (
+        SubprocessCommand(argv=command.argv)
+        if command.argv is not None
+        else SubprocessCommand(shell=command.shell)
+    )
+    del command
     timeout = validate_timeout(timeout_s)
     standard_input = validate_stdin(stdin)
+    input_bytes = standard_input.encode("utf-8") if standard_input is not None else None
     output_limit = validate_output_limit(output_limit_bytes)
     if output_redactor is not None and not isinstance(output_redactor, SecretRedactor):
         raise TypeError("run_subprocess output_redactor must be a SecretRedactor.")
@@ -103,10 +145,10 @@ async def run_subprocess(
     use_new_session = os.name == "posix" if start_new_session is None else start_new_session
 
     try:
-        if command.argv is not None:
+        if owned_command.argv is not None:
             if os.name == "posix":
                 spawn = asyncio.create_subprocess_exec(
-                    *command.argv,
+                    *owned_command.argv,
                     cwd=working_dir,
                     env=environment,
                     stdin=asyncio.subprocess.PIPE,
@@ -116,7 +158,7 @@ async def run_subprocess(
                 )
             else:
                 spawn = asyncio.create_subprocess_exec(
-                    *command.argv,
+                    *owned_command.argv,
                     cwd=working_dir,
                     env=environment,
                     stdin=asyncio.subprocess.PIPE,
@@ -124,11 +166,11 @@ async def run_subprocess(
                     stderr=asyncio.subprocess.PIPE,
                 )
         else:
-            if command.shell is None:
+            if owned_command.shell is None:
                 raise ValueError("Subprocess shell command cannot be None.")
             if os.name == "posix":
                 spawn = asyncio.create_subprocess_shell(
-                    command.shell,
+                    owned_command.shell,
                     cwd=working_dir,
                     env=environment,
                     stdin=asyncio.subprocess.PIPE,
@@ -138,7 +180,7 @@ async def run_subprocess(
                 )
             else:
                 spawn = asyncio.create_subprocess_shell(
-                    command.shell,
+                    owned_command.shell,
                     cwd=working_dir,
                     env=environment,
                     stdin=asyncio.subprocess.PIPE,
@@ -150,7 +192,7 @@ async def run_subprocess(
         environment = {}
         process = await spawn
     except FileNotFoundError:
-        message = f"Command not found: {command.command_name}"
+        message = f"Command not found: {owned_command.command_name}"
         return _redact_and_bound_exec_result(
             ExecResult(
                 stderr=message,
@@ -162,7 +204,7 @@ async def run_subprocess(
             output_limit=output_limit,
         )
     except PermissionError:
-        message = f"Command not executable: {command.command_name}"
+        message = f"Command not executable: {owned_command.command_name}"
         return _redact_and_bound_exec_result(
             ExecResult(
                 stderr=message,
@@ -174,7 +216,6 @@ async def run_subprocess(
             output_limit=output_limit,
         )
 
-    input_bytes = standard_input.encode("utf-8") if standard_input is not None else None
     stdout = RedactedOutputCapture(redactor=redactor, limit=output_limit)
     stderr = RedactedOutputCapture(redactor=redactor, limit=output_limit)
     stdin_task = asyncio.create_task(_write_stdin(process, input_bytes))
@@ -230,18 +271,67 @@ async def run_subprocess(
     )
 
 
-def copy_runner_env(env: dict[str, str] | None, *, inherit_env: bool) -> dict[str, str]:
-    base_env = os.environ.copy() if inherit_env else {}
+def merge_runner_env_overrides(
+    base_env: dict[str, str],
+    overrides: dict[str, str],
+    *,
+    case_sensitive: bool,
+) -> dict[str, str]:
+    """Apply explicit values using the backend's environment-name identity."""
+
+    override_names = {
+        runner_env_name_identity(name, case_sensitive=case_sensitive) for name in overrides
+    }
+    merged = {
+        name: value
+        for name, value in base_env.items()
+        if runner_env_name_identity(name, case_sensitive=case_sensitive) not in override_names
+    }
+    merged.update(overrides)
+    return merged
+
+
+def copy_runner_env(
+    env: dict[str, str] | None,
+    *,
+    inherit_env: bool,
+    case_sensitive: bool = True,
+) -> dict[str, str]:
+    if env is not None and type(env) is not dict:
+        raise TypeError("Runner env must be a dictionary.")
+    base_env = (
+        _copy_runner_env_entries(os.environ.copy(), case_sensitive=case_sensitive)
+        if inherit_env
+        else {}
+    )
     if env is None:
         return base_env
-    if type(env) is not dict:
-        raise TypeError("Runner env must be a dictionary.")
-    copied = base_env
+    copied = _copy_runner_env_entries(env, case_sensitive=case_sensitive)
+    return merge_runner_env_overrides(
+        base_env,
+        copied,
+        case_sensitive=case_sensitive,
+    )
+
+
+def _copy_runner_env_entries(
+    env: dict[str, str],
+    *,
+    case_sensitive: bool,
+) -> dict[str, str]:
+    """Validate and own one environment source under backend name identity."""
+
+    copied: dict[str, str] = {}
+    identities: set[str] = set()
     for key, value in env.items():
-        if type(key) is not str or not key.strip():
-            raise ValueError("Runner env keys must be non-empty strings.")
+        key = validate_runner_env_name(key, "Runner env key")
         if type(value) is not str:
             raise ValueError("Runner env values must be strings.")
+        value = require_durable_text(value, "Runner env value")
+        identity = runner_env_name_identity(key, case_sensitive=case_sensitive)
+        if identity in identities:
+            raise ValueError("Runner env contains duplicate environment variable names.")
+        identities.add(identity)
         copied[key] = value
     return copied
 
@@ -261,6 +351,10 @@ def validate_stdin(stdin: str | None) -> str | None:
         return None
     if type(stdin) is not str:
         raise TypeError("Runner stdin must be a string.")
+    try:
+        stdin.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("Runner stdin must not contain Unicode surrogate code points.") from None
     return stdin
 
 

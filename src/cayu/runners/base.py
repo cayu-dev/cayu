@@ -2,9 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import posixpath
+import traceback
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal, Self, TypeVar, cast
+from collections.abc import Callable, Mapping
+from functools import wraps
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Literal,
+    LiteralString,
+    NoReturn,
+    ParamSpec,
+    Self,
+    TypeVar,
+    cast,
+)
 
 from pydantic import (
     BaseModel,
@@ -12,11 +24,21 @@ from pydantic import (
     Field,
     StrictBool,
     StrictInt,
+    ValidationError,
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
-from cayu._validation import copy_json_value, require_nonblank
+from cayu._validation import (
+    DurableValueError,
+    copy_json_value,
+    extract_durable_value_error,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+    require_durable_text,
+    require_nonblank,
+)
 from cayu.runners._cleanup import RunnerCleanupResult
 from cayu.runners._diagnostics import (
     trusted_runner_error_type_name,
@@ -49,6 +71,292 @@ RunnerWorkspaceCapabilityT = TypeVar(
     "RunnerWorkspaceCapabilityT",
     bound=RunnerWorkspaceCapability,
 )
+
+_COMMAND_VALIDATION_TITLES = frozenset({"CommandRequest", "ExecCommand"})
+_COMMAND_VALIDATION_LOCATIONS = frozenset(
+    {
+        "argv",
+        "canonical_cwd",
+        "command",
+        "cwd",
+        "env",
+        "kind",
+        "shell",
+        "stdin",
+        "timeout_s",
+    }
+)
+_SAFE_COMMAND_SHAPE_MESSAGES = frozenset(
+    {
+        "Process commands require non-empty argv.",
+        "Process argv entries must be non-empty strings.",
+        "Process commands cannot define shell script.",
+        "Shell commands require a non-empty script.",
+        "Shell commands cannot define argv.",
+    }
+)
+
+
+def _safe_command_validation_failure(
+    exc: ValidationError,
+    *,
+    title: str,
+) -> ValidationError:
+    """Return a fresh command error that cannot retain rejected input."""
+
+    details = [_safe_command_error_detail(error) for error in exc.errors(include_input=False)]
+    if not details:
+        details = [_generic_command_error_detail(())]
+    return ValidationError.from_exception_data(
+        title if title in _COMMAND_VALIDATION_TITLES else "Runner command",
+        details,
+        hide_input=True,
+    )
+
+
+def _safe_command_error_detail(error: Mapping[str, Any]) -> InitErrorDetails:
+    location = _safe_command_error_location(error.get("loc"))
+    error_type = error.get("type")
+    context = error.get("ctx")
+    if error.get("msg") == "Runner command is invalid.":
+        return _generic_command_error_detail(location, error_type=error_type)
+    if error_type == "value_error" and type(context) is dict:
+        safe_failure = _safe_command_value_failure(context.get("error"))
+        return InitErrorDetails(
+            type="value_error",
+            loc=location,
+            input=None,
+            ctx={"error": safe_failure},
+        )
+    if type(error_type) is str and context is None:
+        return InitErrorDetails(
+            type=error_type,
+            loc=location,
+            input=None,
+        )
+    return _generic_command_error_detail(location, error_type=error_type)
+
+
+def _safe_command_value_failure(value: object) -> ValueError:
+    durable_failure = (
+        extract_durable_value_error(value) if isinstance(value, BaseException) else None
+    )
+    if durable_failure is not None:
+        return DurableValueError(
+            durable_failure.code,
+            durable_failure.field_name,
+            path=durable_failure.path,
+        )
+    if type(value) is ValueError and len(value.args) == 1:
+        message = value.args[0]
+        if type(message) is str and message in _SAFE_COMMAND_SHAPE_MESSAGES:
+            return ValueError(message)
+    return ValueError("Runner command is invalid.")
+
+
+def _safe_command_error_location(value: object) -> tuple[str | int, ...]:
+    if type(value) not in {list, tuple}:
+        return ()
+    location: list[str | int] = []
+    for item in cast("list[object] | tuple[object, ...]", value):
+        if type(item) is int and item >= 0:
+            location.append(item)
+            continue
+        if type(item) is str and item in _COMMAND_VALIDATION_LOCATIONS:
+            location.append(item)
+            continue
+        location.append("invalid_input")
+        break
+    return tuple(location)
+
+
+def _generic_command_error_detail(
+    location: tuple[str | int, ...],
+    *,
+    error_type: object = "value_error",
+) -> InitErrorDetails:
+    raw_code = (
+        error_type
+        if type(error_type) is str
+        and 0 < len(error_type) <= 128
+        and all(
+            character.isascii() and (character.isalnum() or character == "_")
+            for character in error_type
+        )
+        else "value_error"
+    )
+    code = cast("LiteralString", raw_code)
+    return InitErrorDetails(
+        type=PydanticCustomError(code, "Runner command is invalid."),
+        loc=location,
+        input=None,
+    )
+
+
+def _raise_clean_command_validation_failure(error: ValidationError) -> NoReturn:
+    """Raise a sanitized validation failure without retaining an old traceback."""
+
+    error.__traceback__ = None
+    raise error from None
+
+
+def _clear_preflight_traceback_frames(error: BaseException) -> None:
+    """Drop inactive validation-frame locals without changing the failure."""
+
+    traceback.clear_frames(error.__traceback__)
+
+
+_PreflightP = ParamSpec("_PreflightP")
+_PreflightResultT = TypeVar("_PreflightResultT")
+
+
+def _clean_runner_preflight(
+    operation: Callable[_PreflightP, _PreflightResultT],
+) -> Callable[_PreflightP, _PreflightResultT]:
+    """Publish preflight failures without retaining rejected request locals."""
+
+    @wraps(operation)
+    def clean_preflight(
+        *args: _PreflightP.args,
+        **kwargs: _PreflightP.kwargs,
+    ) -> _PreflightResultT:
+        try:
+            return operation(*args, **kwargs)
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            published_error = error
+            del args, kwargs, error
+            published_error.__traceback__ = None
+            raise published_error from None
+
+    return clean_preflight
+
+
+_CommandValidationResultT = TypeVar("_CommandValidationResultT")
+_COMMAND_VALIDATION_MISSING = object()
+
+
+def _capture_command_validation(
+    operation: Callable[[], _CommandValidationResultT],
+    *,
+    title: str,
+) -> tuple[_CommandValidationResultT | object, ValidationError | None]:
+    """Run one Pydantic entrance and detach any rejected input from its error."""
+
+    try:
+        return operation(), None
+    except ValidationError as exc:
+        return (
+            _COMMAND_VALIDATION_MISSING,
+            _safe_command_validation_failure(exc, title=title),
+        )
+
+
+class _CommandValidationModel(BaseModel):
+    """Pydantic command model that never exposes rejected input."""
+
+    @classmethod
+    def model_validate(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        extra: Any = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        validate = [super().model_validate]
+        result, validation_failure = _capture_command_validation(
+            lambda: validate[0](
+                obj,
+                strict=strict,
+                extra=extra,
+                from_attributes=from_attributes,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            ),
+            title=cls.__name__,
+        )
+        obj = None
+        context = None
+        validate.clear()
+        if validation_failure is not None:
+            _raise_clean_command_validation_failure(validation_failure)
+        return cast("Self", result)
+
+    @classmethod
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        extra: Any = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        validate = [super().model_validate_json]
+        result, validation_failure = _capture_command_validation(
+            lambda: validate[0](
+                json_data,
+                strict=strict,
+                extra=extra,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            ),
+            title=cls.__name__,
+        )
+        json_data = ""
+        context = None
+        validate.clear()
+        if validation_failure is not None:
+            _raise_clean_command_validation_failure(validation_failure)
+        return cast("Self", result)
+
+    @classmethod
+    def model_validate_strings(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        extra: Any = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        validate = [super().model_validate_strings]
+        result, validation_failure = _capture_command_validation(
+            lambda: validate[0](
+                obj,
+                strict=strict,
+                extra=extra,
+                context=context,
+                by_alias=by_alias,
+                by_name=by_name,
+            ),
+            title=cls.__name__,
+        )
+        obj = None
+        context = None
+        validate.clear()
+        if validation_failure is not None:
+            _raise_clean_command_validation_failure(validation_failure)
+        return cast("Self", result)
+
+    def __init__(self, **data: Any) -> None:
+        initialize = [super().__init__]
+        _, validation_failure = _capture_command_validation(
+            lambda: initialize[0](**data),
+            title=type(self).__name__,
+        )
+        data.clear()
+        initialize.clear()
+        if validation_failure is not None:
+            _raise_clean_command_validation_failure(validation_failure)
 
 
 class RunnerUnavailableError(RuntimeError):
@@ -204,14 +512,14 @@ def is_same_or_child(path: str, root: str) -> bool:
     return path == root or path.startswith(f"{root.rstrip('/')}/")
 
 
-class ExecCommand(BaseModel):
+class ExecCommand(_CommandValidationModel):
     """Command to execute.
 
     `argv` is the default safe process form. `shell` is reserved for explicit
     shell scripts where parsing, expansion, and quoting are intentional.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     kind: Literal["process", "shell"] = "process"
     argv: list[str] | None = None
@@ -226,11 +534,23 @@ class ExecCommand(BaseModel):
 
     @classmethod
     def process(cls, *argv: str) -> ExecCommand:
-        return cls(kind="process", argv=list(argv))
+        validation_failure: ValidationError | None = None
+        try:
+            return cls(kind="process", argv=list(argv))
+        except ValidationError as exc:
+            validation_failure = exc
+        argv = ()
+        _raise_clean_command_validation_failure(validation_failure)
 
     @classmethod
     def bash(cls, script: str) -> ExecCommand:
-        return cls(kind="shell", shell=script)
+        validation_failure: ValidationError | None = None
+        try:
+            return cls(kind="shell", shell=script)
+        except ValidationError as exc:
+            validation_failure = exc
+        script = ""
+        _raise_clean_command_validation_failure(validation_failure)
 
     @model_validator(mode="after")
     def validate_shape(self) -> ExecCommand:
@@ -240,6 +560,7 @@ class ExecCommand(BaseModel):
             for item in self.argv:
                 if type(item) is not str or not item.strip():
                     raise ValueError("Process argv entries must be non-empty strings.")
+                require_durable_text(item, "Process argv entry")
             if self.shell is not None:
                 raise ValueError("Process commands cannot define shell script.")
         if self.kind == "shell":
@@ -247,9 +568,24 @@ class ExecCommand(BaseModel):
                 raise ValueError("Shell commands require a non-empty script.")
             if type(self.shell) is not str or not self.shell.strip():
                 raise ValueError("Shell commands require a non-empty script.")
+            require_durable_text(self.shell, "Shell command")
             if self.argv is not None:
                 raise ValueError("Shell commands cannot define argv.")
         return self
+
+
+def copy_exec_command(command: ExecCommand) -> ExecCommand:
+    """Return a detached, revalidated exact ``ExecCommand`` snapshot."""
+
+    if type(command) is not ExecCommand:
+        raise TypeError("Runner command must be an ExecCommand.")
+    validation_failure: ValidationError | None = None
+    try:
+        return ExecCommand.model_validate(command.model_dump(mode="python", warnings=False))
+    except ValidationError as exc:
+        validation_failure = exc
+    del command
+    _raise_clean_command_validation_failure(validation_failure)
 
 
 class ExecResult(BaseModel):
@@ -302,6 +638,51 @@ class Runner(ABC):
     _exec_closed: bool = False
     _exec_closed_reason: str | None = None
 
+    @_clean_runner_preflight
+    def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate one complete request without lookup, dispatch, or mutation.
+
+        Wrappers call this seam before consulting invocation-scoped secret state
+        or admitting managed workspace work. Backends with stricter transport
+        rules override it and must remain side-effect free.
+        """
+
+        from cayu.runners._subprocess import (
+            copy_runner_env,
+            validate_output_limit,
+            validate_runner_env_remove,
+            validate_stdin,
+            validate_timeout,
+        )
+
+        self._ensure_exec_open()
+        owned_command = copy_exec_command(command)
+        owned_cwd = self.resolve_cwd(cwd)
+        owned_env = copy_runner_env(env, inherit_env=False)
+        owned_env_remove = validate_runner_env_remove(env_remove)
+        owned_timeout = validate_timeout(timeout_s)
+        owned_stdin = validate_stdin(stdin)
+        owned_output_limit = validate_output_limit(output_limit_bytes)
+        del (
+            owned_command,
+            owned_cwd,
+            owned_env,
+            owned_env_remove,
+            owned_timeout,
+            owned_stdin,
+            owned_output_limit,
+        )
+
     @abstractmethod
     async def exec(
         self,
@@ -347,9 +728,18 @@ class Runner(ABC):
             "stdin": stdin,
             "output_limit_bytes": output_limit_bytes,
         }
-        if env_remove:
+        if type(env_remove) is not tuple or env_remove:
             kwargs["env_remove"] = env_remove
-        result = await self.exec(command, **kwargs)
+        operation = self.exec(command, **kwargs)
+        del command, cwd, env, env_remove, timeout_s, stdin, kwargs
+        try:
+            result = await operation
+        except BaseException:
+            redactor = SecretRedactor()
+            output_limit_bytes = None
+            raise
+        finally:
+            del operation
         return redact_completed_exec_result(
             result,
             redactor=redactor,
@@ -376,9 +766,14 @@ class Runner(ABC):
             "stdin": stdin,
             "output_limit_bytes": output_limit_bytes,
         }
-        if env_remove:
+        if type(env_remove) is not tuple or env_remove:
             kwargs["env_remove"] = env_remove
-        return await self.exec(command, **kwargs)
+        operation = self.exec(command, **kwargs)
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes, kwargs
+        try:
+            return await operation
+        finally:
+            del operation
 
     async def close(self) -> None:
         """Release the runner. The default implementation only marks it closed."""
@@ -459,10 +854,13 @@ class Runner(ABC):
         input is accepted only when it is already contained by the runner root,
         making canonicalization idempotent for policy-authorized execution.
         """
-        root = posixpath.normpath(self.default_cwd)
+        root_value = require_durable_clean_nonblank(self.default_cwd, "default_cwd")
+        if not posixpath.isabs(root_value):
+            raise ValueError("Runner default_cwd must be an absolute path.")
+        root = posixpath.normpath(root_value)
         if cwd is None:
             return root
-        requested_cwd = require_nonblank(cwd, "cwd")
+        requested_cwd = require_durable_nonblank(cwd, "cwd")
         if posixpath.isabs(requested_cwd):
             resolved = posixpath.normpath(requested_cwd)
             if not is_same_or_child(resolved, root):

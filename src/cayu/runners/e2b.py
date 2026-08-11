@@ -14,7 +14,7 @@ from typing import Any, Literal, cast
 from uuid import uuid4
 
 from cayu._exception_groups import add_exception_note_safely, exception_tree_contains
-from cayu._validation import require_clean_nonblank
+from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
     DEFAULT_RUNNER_CANCELLATION_CLEANUP_POLICY,
@@ -42,7 +42,10 @@ from cayu.runners.base import (
     RunnerExecutionError,
     RunnerWorkspaceCapability,
     RunnerWorkspaceCapabilityT,
+    _clean_runner_preflight,
+    _clear_preflight_traceback_frames,
     attach_cancellation_artifacts,
+    copy_exec_command,
     runner_execution_error,
 )
 from cayu.vaults import SecretRedactor
@@ -1079,8 +1082,7 @@ class E2BRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
-        env = None
-        stdin = None
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
         return await operation
 
     async def exec_redacted(
@@ -1107,9 +1109,63 @@ class E2BRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
-        env = None
-        stdin = None
+        del command, redactor, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
         return await operation
+
+    @_clean_runner_preflight
+    def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate the complete E2B request without provider activity."""
+
+        prepared = self._prepare_exec_request(
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        del prepared
+
+    def _prepare_exec_request(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> tuple[str, dict[str, str], int | None, str | None, int | None, str]:
+        """Own one complete E2B request before dispatch admission."""
+
+        if type(command) is not ExecCommand:
+            raise TypeError("E2BRunner command must be an ExecCommand.")
+        self._ensure_exec_open()
+        owned_command = copy_exec_command(command)
+        working_dir = self.resolve_cwd(cwd)
+        environment = copy_runner_env(env, inherit_env=False)
+        env_overlay = copy_runner_env(self.env_overlay, inherit_env=False)
+        environment = remove_runner_env(environment, env_remove)
+        if env_overlay:
+            environment.update(env_overlay)
+        timeout = validate_timeout(timeout_s)
+        standard_input = validate_stdin(stdin)
+        output_limit = validate_output_limit(output_limit_bytes)
+        script = _command_to_e2b_script(owned_command)
+        script = _export_path_inside_e2b_command(script, environment)
+        return working_dir, environment, timeout, standard_input, output_limit, script
 
     async def _exec(
         self,
@@ -1123,22 +1179,39 @@ class E2BRunner(Runner):
         stdin: str | None,
         output_limit_bytes: int | None,
     ) -> ExecResult:
-        if type(command) is not ExecCommand:
-            raise TypeError("E2BRunner command must be an ExecCommand.")
-        self._ensure_exec_open()
-
-        working_dir = self.resolve_cwd(cwd)
-        environment = copy_runner_env(env, inherit_env=False)
-        environment = remove_runner_env(environment, env_remove)
+        try:
+            (
+                working_dir,
+                environment,
+                timeout,
+                standard_input,
+                output_limit,
+                script,
+            ) = self._prepare_exec_request(
+                command,
+                cwd=cwd,
+                env=env,
+                env_remove=env_remove,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                output_limit_bytes=output_limit_bytes,
+            )
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            working_dir = ""
+            environment = {}
+            standard_input = None
+            script = ""
+            cwd = None
+            env = None
+            env_remove = ()
+            stdin = None
+            del output_redactor
+            raise
+        finally:
+            del command
         env = None
-        if self.env_overlay:
-            environment.update(self.env_overlay)
-        timeout = validate_timeout(timeout_s)
-        standard_input = validate_stdin(stdin)
         stdin = None
-        output_limit = validate_output_limit(output_limit_bytes)
-        script = _command_to_e2b_script(command)
-        script = _export_path_inside_e2b_command(script, environment)
         stdout = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
         stderr = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
         handle = None
@@ -1461,7 +1534,7 @@ def _validate_exec_user(user: str | None) -> str | None:
 
 
 def _validate_guest_root(path: str) -> str:
-    root = require_clean_nonblank(path, "default_cwd")
+    root = require_durable_clean_nonblank(path, "default_cwd")
     if not posixpath.isabs(root):
         raise ValueError("E2BRunner default_cwd must be an absolute guest path.")
     return posixpath.normpath(root)

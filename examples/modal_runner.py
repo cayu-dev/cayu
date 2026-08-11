@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import posixpath
+import traceback
+from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
@@ -47,6 +49,18 @@ DEFAULT_MODAL_CWD = "/workspace"
 # Best-effort cancellation cleanup is bounded so a hung terminate can't make
 # cancellation itself hang (built-in runners bound cleanup the same way).
 DEFAULT_MODAL_CANCEL_TIMEOUT_S = 5.0
+
+
+@dataclass(frozen=True)
+class _PreparedModalExecRequest:
+    """One fully owned request safe to carry across the Modal SDK await."""
+
+    argv: tuple[str, ...]
+    workdir: str
+    environment_items: tuple[tuple[str, str], ...]
+    timeout_s: int | None
+    stdin: str | None
+    output_limit_bytes: int | None
 
 
 class ModalRunner(Runner):
@@ -109,17 +123,19 @@ class ModalRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
-        if type(command) is not ExecCommand:
-            raise TypeError("ModalRunner command must be an ExecCommand.")
-
-        working_dir = self.resolve_cwd(cwd)
-        environment = _copy_env(env)
-        for key in env_remove:
-            environment.pop(key, None)
-        argv = _command_argv(command)
-        limit = _validate_output_limit(output_limit_bytes)
+        prepared = self._prepare_exec_request(
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
 
         async def run() -> ExecResult:
+            environment = dict(prepared.environment_items)
             # Modal's exec takes a plain env dict via `env=` (the guide also shows
             # `secrets=[Secret.from_dict(env)]`; both work). Modal's native `timeout=`
             # bounds the command server-side WITHOUT tearing down the sandbox: at the
@@ -136,16 +152,25 @@ class ModalRunner(Runner):
             # production runner streams into a bounded buffer (see `_LimitedBytes` in
             # src/cayu/runners/microsandbox.py) so large output can't exhaust memory.
             process = await self._sandbox.exec.aio(
-                *argv, workdir=working_dir, env=environment, timeout=timeout_s
+                *prepared.argv,
+                workdir=prepared.workdir,
+                env=environment,
+                timeout=prepared.timeout_s,
             )
-            if stdin is not None:
-                process.stdin.write(stdin.encode("utf-8"))
+            if prepared.stdin is not None:
+                process.stdin.write(prepared.stdin.encode("utf-8"))
                 process.stdin.write_eof()
                 await process.stdin.drain.aio()
-            stdout, stdout_truncated = _truncate(await process.stdout.read.aio(), limit)
-            stderr, stderr_truncated = _truncate(await process.stderr.read.aio(), limit)
+            stdout, stdout_truncated = _truncate(
+                await process.stdout.read.aio(),
+                prepared.output_limit_bytes,
+            )
+            stderr, stderr_truncated = _truncate(
+                await process.stderr.read.aio(),
+                prepared.output_limit_bytes,
+            )
             exit_code = await process.wait.aio()
-            if timeout_s is not None and exit_code == -1:
+            if prepared.timeout_s is not None and exit_code == -1:
                 # Modal killed the command at its server-side `timeout=` deadline.
                 # Report the runner's timeout contract (exit_code -9, matching the
                 # built-in sandbox runners) and keep the partial output read above. A
@@ -181,6 +206,74 @@ class ModalRunner(Runner):
                 artifacts=[_cleanup_artifact(self.isolation, terminated)]
             ) from exc
 
+    def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate the complete Modal request without SDK activity."""
+
+        try:
+            prepared = self._prepare_exec_request(
+                command,
+                cwd=cwd,
+                env=env,
+                env_remove=env_remove,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                output_limit_bytes=output_limit_bytes,
+            )
+        except BaseException as error:
+            traceback.clear_frames(error.__traceback__)
+            published_error = error
+            del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
+            del error, self
+            published_error.__traceback__ = None
+            raise published_error from None
+        del prepared
+
+    def _prepare_exec_request(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> _PreparedModalExecRequest:
+        """Own and validate one complete request before Modal dispatch."""
+
+        if type(command) is not ExecCommand:
+            raise TypeError("ModalRunner command must be an ExecCommand.")
+        self._ensure_exec_open()
+        owned_command = ExecCommand.model_validate(
+            command.model_dump(mode="python", warnings=False)
+        )
+        working_dir = self.resolve_cwd(cwd)
+        environment = _copy_env(env)
+        for key in _copy_env_remove(env_remove):
+            environment.pop(key, None)
+        argv = tuple(_command_argv(owned_command))
+        timeout = _validate_timeout(timeout_s)
+        standard_input = _validate_stdin(stdin)
+        limit = _validate_output_limit(output_limit_bytes)
+        return _PreparedModalExecRequest(
+            argv=argv,
+            workdir=working_dir,
+            environment_items=tuple(environment.items()),
+            timeout_s=timeout,
+            stdin=standard_input,
+            output_limit_bytes=limit,
+        )
+
 
 def _command_argv(command: ExecCommand) -> list[str]:
     """Translate an ExecCommand into argv. Modal exec takes argv natively, so
@@ -199,14 +292,47 @@ def _copy_env(env: dict[str, str] | None) -> dict[str, str]:
     (The built-in runners use cayu.runners._subprocess.copy_runner_env.)"""
     if env is None:
         return {}
+    if type(env) is not dict:
+        raise TypeError("Runner env must be a dictionary.")
     copied: dict[str, str] = {}
     for key, value in env.items():
-        if type(key) is not str or not key.strip():
-            raise ValueError("Runner env keys must be non-empty strings.")
+        key = _validate_env_name(key, "Runner env key")
         if type(value) is not str:
             raise ValueError("Runner env values must be strings.")
+        value = _require_transport_text(value, "Runner env value", allow_nul=False)
         copied[key] = value
     return copied
+
+
+def _copy_env_remove(keys: tuple[str, ...]) -> tuple[str, ...]:
+    if type(keys) is not tuple:
+        raise TypeError("Runner env_remove must be a tuple.")
+    return tuple(_validate_env_name(key, "Runner env_remove entry") for key in keys)
+
+
+def _validate_env_name(value: str, field_name: str) -> str:
+    name = _require_transport_text(value, field_name, allow_nul=False)
+    if not name.strip():
+        raise ValueError(f"{field_name} must not be blank.")
+    if name != name.strip():
+        raise ValueError(f"{field_name} must not have surrounding whitespace.")
+    if "=" in name:
+        raise ValueError(f"{field_name} must not contain '='.")
+    if "\n" in name or "\r" in name:
+        raise ValueError(f"{field_name} must not contain line breaks.")
+    return name
+
+
+def _require_transport_text(value: str, field_name: str, *, allow_nul: bool) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a string.")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{field_name} must not contain Unicode surrogate code points.") from None
+    if not allow_nul and "\0" in value:
+        raise ValueError(f"{field_name} must not contain NUL characters.")
+    return value
 
 
 def _truncate(data: bytes | str, limit: int | None) -> tuple[str, bool]:
@@ -227,9 +353,28 @@ def _validate_output_limit(value: int | None) -> int | None:
     return value
 
 
+def _validate_timeout(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError("timeout_s must be an integer.")
+    if value <= 0:
+        raise ValueError("timeout_s must be greater than zero.")
+    return value
+
+
+def _validate_stdin(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _require_transport_text(value, "stdin", allow_nul=True)
+
+
 def _validate_guest_root(path: str) -> str:
-    if type(path) is not str or not path.strip():
-        raise ValueError("default_cwd must be a non-empty string.")
+    path = _require_transport_text(path, "default_cwd", allow_nul=False)
+    if not path.strip():
+        raise ValueError("default_cwd must not be blank.")
+    if path != path.strip():
+        raise ValueError("default_cwd must not have surrounding whitespace.")
     if not posixpath.isabs(path):
         raise ValueError("ModalRunner default_cwd must be an absolute guest path.")
     return posixpath.normpath(path)

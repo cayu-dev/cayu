@@ -5092,7 +5092,7 @@ def test_local_runner_rejects_invalid_inputs(tmp_path):
     with pytest.raises(TypeError, match="dictionary"):
         asyncio.run(runner.exec(ExecCommand.process("env"), env=[]))  # type: ignore[arg-type]
 
-    with pytest.raises(ValueError, match="keys"):
+    with pytest.raises(ValueError, match="env key"):
         asyncio.run(runner.exec(ExecCommand.process("env"), env={" ": "bad"}))
 
     with pytest.raises(ValueError, match="values"):

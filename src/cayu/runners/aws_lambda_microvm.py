@@ -10,7 +10,11 @@ from typing import Any, Literal, Protocol
 
 import httpx
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    require_clean_nonblank,
+    require_durable_clean_nonblank,
+)
 from cayu.providers._http import SharedAsyncClient
 from cayu.runners._cleanup import (
     DEFAULT_RUNNER_CANCEL_TIMEOUT_SECONDS,
@@ -36,7 +40,10 @@ from cayu.runners.base import (
     ExecResult,
     Runner,
     RunnerSystemExecutionMode,
+    _clean_runner_preflight,
+    _clear_preflight_traceback_frames,
     attach_cancellation_artifacts,
+    copy_exec_command,
 )
 from cayu.vaults import SecretRedactor
 
@@ -308,6 +315,7 @@ class LambdaMicroVMRunner(Runner):
         env_overlay: Mapping[str, str] | None = None,
     ) -> LambdaMicroVMRunner:
         image = require_clean_nonblank(image_identifier, "image_identifier")
+        guest_root = _validate_guest_root(default_cwd)
         control_client, owns_client = _control_client(
             client=client,
             region_name=region_name,
@@ -342,7 +350,7 @@ class LambdaMicroVMRunner(Runner):
             image_identifier=_response_string(response, "imageArn") or image,
             image_version=_response_string(response, "imageVersion") or image_version,
             region_name=region_name,
-            default_cwd=default_cwd,
+            default_cwd=guest_root,
             close_action=close_action,
             endpoint_transport=endpoint_transport,
             owns_client=owns_client,
@@ -385,6 +393,7 @@ class LambdaMicroVMRunner(Runner):
         env_overlay: Mapping[str, str] | None = None,
     ) -> LambdaMicroVMRunner:
         identifier = require_clean_nonblank(microvm_id, "microvm_id")
+        guest_root = _validate_guest_root(default_cwd)
         control_client, owns_client = _control_client(
             client=client,
             region_name=region_name,
@@ -405,7 +414,7 @@ class LambdaMicroVMRunner(Runner):
             image_identifier=_response_string(response, "imageArn"),
             image_version=_response_string(response, "imageVersion"),
             region_name=region_name,
-            default_cwd=default_cwd,
+            default_cwd=guest_root,
             close_action=close_action,
             endpoint_transport=endpoint_transport,
             owns_client=owns_client,
@@ -435,7 +444,7 @@ class LambdaMicroVMRunner(Runner):
         stdin: str | None = None,
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
-        return await self._exec(
+        operation = self._exec(
             command,
             execution_profile="agent",
             output_redactor=None,
@@ -446,6 +455,8 @@ class LambdaMicroVMRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
+        return await operation
 
     async def exec_redacted(
         self,
@@ -461,7 +472,7 @@ class LambdaMicroVMRunner(Runner):
     ) -> ExecResult:
         if not isinstance(redactor, SecretRedactor):
             raise TypeError("LambdaMicroVMRunner redactor must be a SecretRedactor.")
-        return await self._exec(
+        operation = self._exec(
             command,
             execution_profile="agent",
             output_redactor=redactor,
@@ -472,6 +483,8 @@ class LambdaMicroVMRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
+        del command, redactor, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
+        return await operation
 
     async def exec_system(
         self,
@@ -485,7 +498,7 @@ class LambdaMicroVMRunner(Runner):
         output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ) -> ExecResult:
         """Run a control-plane lifecycle command outside the unprivileged agent profile."""
-        return await self._exec(
+        operation = self._exec(
             command,
             execution_profile="trusted",
             output_redactor=None,
@@ -496,6 +509,62 @@ class LambdaMicroVMRunner(Runner):
             stdin=stdin,
             output_limit_bytes=output_limit_bytes,
         )
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
+        return await operation
+
+    @_clean_runner_preflight
+    def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate the complete sidecar request without provider activity."""
+
+        prepared = self._prepare_exec_request(
+            command,
+            cwd=cwd,
+            env=env,
+            env_remove=env_remove,
+            timeout_s=timeout_s,
+            stdin=stdin,
+            output_limit_bytes=output_limit_bytes,
+        )
+        del prepared
+
+    def _prepare_exec_request(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        env_remove: tuple[str, ...],
+        timeout_s: int | None,
+        stdin: str | None,
+        output_limit_bytes: int | None,
+    ) -> tuple[ExecCommand, str, dict[str, str], int | None, str | None, int | None]:
+        """Own one complete sidecar request before dispatch admission."""
+
+        if type(command) is not ExecCommand:
+            raise TypeError("LambdaMicroVMRunner command must be an ExecCommand.")
+        self._ensure_exec_open()
+        owned_command = copy_exec_command(command)
+        working_dir = self.resolve_cwd(cwd)
+        environment = copy_runner_env(env, inherit_env=False)
+        env_overlay = copy_runner_env(self.env_overlay, inherit_env=False)
+        environment = remove_runner_env(environment, env_remove)
+        if env_overlay:
+            # Applied last: enforced egress configuration must win over model env.
+            environment.update(env_overlay)
+        timeout = validate_timeout(timeout_s)
+        standard_input = validate_stdin(stdin)
+        output_limit = validate_output_limit(output_limit_bytes)
+        return owned_command, working_dir, environment, timeout, standard_input, output_limit
 
     async def _exec(
         self,
@@ -510,42 +579,62 @@ class LambdaMicroVMRunner(Runner):
         stdin: str | None,
         output_limit_bytes: int | None,
     ) -> ExecResult:
-        if type(command) is not ExecCommand:
-            raise TypeError("LambdaMicroVMRunner command must be an ExecCommand.")
-        self._ensure_exec_open()
-        working_dir = self.resolve_cwd(cwd)
-        environment = copy_runner_env(env, inherit_env=False)
-        environment = remove_runner_env(environment, env_remove)
-        if self.env_overlay:
-            # Applied last: enforced egress configuration must win over model env.
-            environment.update(self.env_overlay)
-        timeout = validate_timeout(timeout_s)
-        standard_input = validate_stdin(stdin)
-        output_limit = validate_output_limit(output_limit_bytes)
-        command_id = f"cmd-{uuid.uuid4()}"
-        payload: dict[str, Any] = {
-            "execution_profile": execution_profile,
-            "kind": command.kind,
-            "cwd": working_dir,
-            "env": environment,
-            "stdin_base64": (
-                base64.b64encode(standard_input.encode("utf-8")).decode("ascii")
-                if standard_input is not None
-                else None
-            ),
-            "timeout_s": timeout,
-            "output_limit_bytes": output_limit,
-            # The sidecar does not receive the workload-secret registry. When
-            # host-side redaction is required, it must therefore omit a
-            # pre-truncated channel whose missing suffix could complete a
-            # secret. Ordinary/system executions retain their established
-            # bounded-output contract.
-            "omit_truncated_output": output_redactor is not None,
-        }
-        if command.kind == "process":
-            payload["argv"] = list(command.argv or [])
-        else:
-            payload["shell"] = command.shell
+        try:
+            (
+                owned_command,
+                working_dir,
+                environment,
+                timeout,
+                standard_input,
+                output_limit,
+            ) = self._prepare_exec_request(
+                command,
+                cwd=cwd,
+                env=env,
+                env_remove=env_remove,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                output_limit_bytes=output_limit_bytes,
+            )
+            command_id = f"cmd-{uuid.uuid4()}"
+            payload: dict[str, Any] = {
+                "execution_profile": execution_profile,
+                "kind": owned_command.kind,
+                "cwd": working_dir,
+                "env": environment,
+                "stdin_base64": (
+                    base64.b64encode(standard_input.encode("utf-8")).decode("ascii")
+                    if standard_input is not None
+                    else None
+                ),
+                "timeout_s": timeout,
+                "output_limit_bytes": output_limit,
+                # The sidecar does not receive the workload-secret registry. When
+                # host-side redaction is required, it must therefore omit a
+                # pre-truncated channel whose missing suffix could complete a
+                # secret. Ordinary/system executions retain their established
+                # bounded-output contract.
+                "omit_truncated_output": output_redactor is not None,
+            }
+            if owned_command.kind == "process":
+                payload["argv"] = list(owned_command.argv or [])
+            else:
+                payload["shell"] = owned_command.shell
+        except BaseException as error:
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            working_dir = ""
+            environment = {}
+            standard_input = None
+            payload = {}
+            cwd = None
+            env = None
+            env_remove = ()
+            stdin = None
+            output_redactor = None
+            raise
+        finally:
+            del command
         handle = _LambdaMicroVMCommandHandle(self, command_id)
         start_acknowledged = False
         loop = asyncio.get_running_loop()
@@ -1102,7 +1191,7 @@ def _endpoint_base_url(endpoint: str) -> str:
 
 
 def _validate_guest_root(value: str) -> str:
-    root = require_clean_nonblank(value, "default_cwd")
+    root = require_durable_clean_nonblank(value, "default_cwd")
     if not root.startswith("/"):
         raise ValueError("LambdaMicroVMRunner default_cwd must be an absolute guest path.")
     return root.rstrip("/") or "/"

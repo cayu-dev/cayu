@@ -8,11 +8,14 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
+from pydantic import ValidationError
+
 from cayu._exception_groups import (
     exception_group_children,
     rebuild_exception_group,
     set_exception_cause,
 )
+from cayu._validation import require_durable_nonblank
 from cayu.runners import (
     DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
     ExecCommand,
@@ -33,8 +36,22 @@ from cayu.runners._diagnostics import (
     trusted_runner_exception_type_name,
 )
 from cayu.runners._redacted_output import redact_completed_exec_result
-from cayu.runners.base import runner_execution_error
-from cayu.tools._operation_boundary import await_invocation_operation
+from cayu.runners._subprocess import (
+    copy_runner_env,
+    validate_output_limit,
+    validate_runner_env_remove,
+    validate_stdin,
+    validate_timeout,
+)
+from cayu.runners.base import (
+    _clear_preflight_traceback_frames,
+    copy_exec_command,
+    runner_execution_error,
+)
+from cayu.tools._operation_boundary import (
+    await_invocation_cancellation_checkpoint,
+    await_invocation_operation,
+)
 from cayu.tools._redaction import resolve_invocation_redactor_snapshot
 from cayu.tools._resources import invocation_workspace_authenticated_cwd
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -80,6 +97,89 @@ class InvocationRunnerHandle:
         self.__redactor_snapshot_provider = redactor_snapshot_provider
         self.__ambiguous_capture_observer = ambiguous_capture_observer
 
+    async def preflight_exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = DEFAULT_EXEC_OUTPUT_LIMIT_BYTES,
+    ) -> None:
+        """Validate the selected runner without consulting invocation secrets."""
+
+        command_validation_failure = False
+        preflight_failure: BaseException | None = None
+        try:
+            try:
+                owned_command = copy_exec_command(command)
+            except ValidationError:
+                command_validation_failure = True
+                raise
+            owned_cwd = None if cwd is None else require_durable_nonblank(cwd, "cwd")
+            owned_env = None if env is None else copy_runner_env(env, inherit_env=False)
+            owned_env_remove = validate_runner_env_remove(env_remove)
+            owned_timeout = validate_timeout(timeout_s)
+            owned_stdin = validate_stdin(stdin)
+            owned_output_limit = validate_output_limit(output_limit_bytes)
+            self.__runner.preflight_exec(
+                owned_command,
+                cwd=owned_cwd,
+                env=owned_env,
+                env_remove=owned_env_remove,
+                timeout_s=owned_timeout,
+                stdin=owned_stdin,
+                output_limit_bytes=owned_output_limit,
+            )
+        except BaseException as error:
+            preflight_failure = _classify_invocation_preflight_failure(
+                self.__runner,
+                error,
+                command_validation_failure=command_validation_failure,
+            )
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            owned_cwd = None
+            owned_env = None
+            owned_env_remove = ()
+            owned_timeout = None
+            owned_stdin = None
+            owned_output_limit = None
+            cwd = None
+            env = None
+            env_remove = ()
+            timeout_s = None
+            stdin = None
+            output_limit_bytes = None
+        finally:
+            del command
+        if preflight_failure is not None:
+            preflight_failure.__traceback__ = None
+            caller_cancellation = await await_invocation_cancellation_checkpoint()
+            if caller_cancellation is not None:
+                cancellation_type, cancellation_args, cancellation_artifacts = (
+                    _detached_runner_cancellation_state(
+                        caller_cancellation,
+                        redactor=_current_runner_redactor(
+                            self.__redactor_snapshot_provider,
+                        ),
+                        caller_cancelled=True,
+                    )
+                )
+                cancellation_cause = preflight_failure
+                del caller_cancellation, preflight_failure, self
+                _raise_clean_runner_cancellation(
+                    cancellation_type,
+                    cancellation_args,
+                    cancellation_artifacts,
+                    cause=cancellation_cause,
+                )
+            published_failure = preflight_failure
+            del preflight_failure, self
+            raise published_failure from None
+
     async def exec(
         self,
         command: ExecCommand,
@@ -93,6 +193,79 @@ class InvocationRunnerHandle:
     ) -> ExecResult:
         """Dispatch with the invocation registry current at the call boundary."""
 
+        # Validate and own the complete portable request before consulting the
+        # invocation secret registry or reaching a cancellation checkpoint.
+        command_validation_failure = False
+        preflight_failure: BaseException | None = None
+        try:
+            try:
+                owned_command = copy_exec_command(command)
+            except ValidationError:
+                command_validation_failure = True
+                raise
+            owned_cwd = None if cwd is None else require_durable_nonblank(cwd, "cwd")
+            owned_env = None if env is None else copy_runner_env(env, inherit_env=False)
+            owned_env_remove = validate_runner_env_remove(env_remove)
+            owned_timeout = validate_timeout(timeout_s)
+            owned_stdin = validate_stdin(stdin)
+            owned_output_limit = validate_output_limit(output_limit_bytes)
+            self.__runner.preflight_exec(
+                owned_command,
+                cwd=owned_cwd,
+                env=owned_env,
+                env_remove=owned_env_remove,
+                timeout_s=owned_timeout,
+                stdin=owned_stdin,
+                output_limit_bytes=owned_output_limit,
+            )
+        except BaseException as error:
+            preflight_failure = _classify_invocation_preflight_failure(
+                self.__runner,
+                error,
+                command_validation_failure=command_validation_failure,
+            )
+            _clear_preflight_traceback_frames(error)
+            owned_command = None
+            owned_cwd = None
+            owned_env = None
+            owned_env_remove = ()
+            owned_timeout = None
+            owned_stdin = None
+            owned_output_limit = None
+            cwd = None
+            env = None
+            env_remove = ()
+            timeout_s = None
+            stdin = None
+            output_limit_bytes = None
+        finally:
+            del command
+        if preflight_failure is not None:
+            preflight_failure.__traceback__ = None
+            caller_cancellation = await await_invocation_cancellation_checkpoint()
+            if caller_cancellation is not None:
+                cancellation_type, cancellation_args, cancellation_artifacts = (
+                    _detached_runner_cancellation_state(
+                        caller_cancellation,
+                        redactor=_current_runner_redactor(
+                            self.__redactor_snapshot_provider,
+                        ),
+                        caller_cancelled=True,
+                    )
+                )
+                cancellation_cause = preflight_failure
+                del caller_cancellation, preflight_failure, self
+                _raise_clean_runner_cancellation(
+                    cancellation_type,
+                    cancellation_args,
+                    cancellation_artifacts,
+                    cause=cancellation_cause,
+                )
+            published_failure = preflight_failure
+            del preflight_failure, self
+            raise published_failure from None
+        if owned_command is None:  # pragma: no cover - preflight construction invariant
+            raise AssertionError("Runner preflight completed without an owned command.")
         initial = resolve_invocation_redactor_snapshot(self.__redactor_snapshot_provider)
         initial_revision = initial.revision
         result: ExecResult | None = None
@@ -109,18 +282,18 @@ class InvocationRunnerHandle:
         ) = None
         kwargs: dict[str, Any] = {
             "redactor": initial.redactor,
-            "cwd": cwd,
-            "env": env,
-            "timeout_s": timeout_s,
-            "stdin": stdin,
-            "output_limit_bytes": output_limit_bytes,
+            "cwd": owned_cwd,
+            "env": owned_env,
+            "timeout_s": owned_timeout,
+            "stdin": owned_stdin,
+            "output_limit_bytes": owned_output_limit,
         }
-        if env_remove:
-            kwargs["env_remove"] = env_remove
+        if owned_env_remove:
+            kwargs["env_remove"] = owned_env_remove
 
         def operation_factory(
             runner: Runner = self.__runner,
-            command: ExecCommand = command,
+            command: ExecCommand = owned_command,
             kwargs: dict[str, Any] = kwargs,
         ) -> Awaitable[ExecResult]:
             return runner.exec_redacted(command, **kwargs)
@@ -129,7 +302,22 @@ class InvocationRunnerHandle:
         del operation_factory
         # The boundary coroutine now exclusively owns the request factory.
         # Remove raw command input before this public frame starts awaiting.
-        del command, cwd, env, env_remove, stdin, kwargs, initial
+        del (
+            owned_command,
+            owned_cwd,
+            owned_env,
+            owned_env_remove,
+            owned_timeout,
+            owned_stdin,
+            cwd,
+            env,
+            env_remove,
+            timeout_s,
+            stdin,
+            output_limit_bytes,
+            kwargs,
+            initial,
+        )
         try:
             outcome = await operation
         finally:
@@ -255,12 +443,12 @@ class InvocationRunnerHandle:
         projected = redact_completed_exec_result(
             result,
             redactor=current.redactor,
-            output_limit_bytes=output_limit_bytes,
+            output_limit_bytes=owned_output_limit,
             omit_pretruncated=current.revision != initial_revision,
         )
         if self.__ambiguous_capture_observer is not None and _has_ambiguous_capture(
             projected,
-            output_limit_bytes=output_limit_bytes,
+            output_limit_bytes=owned_output_limit,
         ):
             self.__ambiguous_capture_observer(current.revision)
         return projected.model_copy(
@@ -507,6 +695,25 @@ def _safe_runner_execution_error(
         error,
         adapter=_safe_runner_adapter(runner),
     )
+
+
+def _classify_invocation_preflight_failure(
+    runner: Runner,
+    error: BaseException,
+    *,
+    command_validation_failure: bool,
+) -> BaseException:
+    """Preserve only caller-owned validation and authenticated control signals."""
+
+    if command_validation_failure:
+        return error
+    if isinstance(error, asyncio.CancelledError):
+        return _safe_runner_execution_error(runner, error)
+    if not isinstance(error, Exception):
+        return error
+    if isinstance(error, RunnerUnavailableError):
+        return _safe_runner_unavailable_error(runner, error)
+    return _safe_runner_execution_error(runner, error)
 
 
 def _has_ambiguous_capture(
