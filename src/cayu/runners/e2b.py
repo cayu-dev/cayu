@@ -1138,6 +1138,7 @@ class E2BRunner(Runner):
         stdin = None
         output_limit = validate_output_limit(output_limit_bytes)
         script = _command_to_e2b_script(command)
+        script = _export_path_inside_e2b_command(script, environment)
         stdout = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
         stderr = RedactedOutputCapture(redactor=output_redactor, limit=output_limit)
         handle = None
@@ -1510,6 +1511,15 @@ def _command_to_e2b_script(command: ExecCommand) -> str:
     if command.shell is None:
         raise ValueError("Shell commands require a script.")
     return command.shell
+
+
+def _export_path_inside_e2b_command(script: str, environment: Mapping[str, str]) -> str:
+    """Preserve PATH despite E2B normalizing it before starting Bash."""
+
+    path = environment.get("PATH")
+    if path is None:
+        return script
+    return f"export PATH={shlex.quote(path)}; {script}"
 
 
 def _exec_result_from_e2b_result(

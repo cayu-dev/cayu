@@ -568,12 +568,12 @@ def test_e2b_runner_hardened_handoff_seals_root_capability() -> None:
     guest_setup_index = next(
         index
         for index, call in enumerate(sandbox.commands.calls)
-        if call["cmd"] == "guest-setup-marker"
+        if call["cmd"].endswith("; guest-setup-marker")
     )
     guest_probe_index = next(
         index
         for index, call in enumerate(sandbox.commands.calls)
-        if call["cmd"] == "guest-probe-marker"
+        if call["cmd"].endswith("; guest-probe-marker")
     )
     assert (
         verification_calls[0][0] < guest_setup_index < guest_probe_index < verification_calls[1][0]
@@ -1430,6 +1430,24 @@ def test_e2b_runner_applies_trusted_env_overlay_after_command_env() -> None:
         "STRIPE_SECRET_KEY": "sk_test_cayu_virtual",
         "VISIBLE": "1",
     }
+
+
+def test_e2b_runner_exports_path_inside_provider_command() -> None:
+    sandbox = FakeSandbox()
+    runner = E2BRunner(
+        sandbox,
+        env_overlay={"PATH": "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"},
+        e2b_module=FakeE2BModule,
+    )
+
+    asyncio.run(runner.exec(ExecCommand.process("python", "-m", "agent")))
+
+    assert sandbox.commands.calls[0]["cmd"] == (
+        "export PATH=/app/.venv/bin:/usr/local/bin:/usr/bin:/bin; python -m agent"
+    )
+    assert sandbox.commands.calls[0]["envs"]["PATH"] == (
+        "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+    )
 
 
 def test_e2b_runner_returns_nonzero_exit_as_exec_result() -> None:
