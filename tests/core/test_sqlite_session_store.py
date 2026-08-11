@@ -1869,35 +1869,6 @@ def test_sqlite_session_store_rejects_duplicate_sessions_and_mismatched_events(t
     asyncio.run(run_store_operations())
 
 
-def test_sqlite_session_store_persists_updated_session_model_across_reopen(tmp_path):
-    db_path = tmp_path / "sessions.sqlite"
-    store = SQLiteSessionStore(db_path)
-
-    async def create_and_update() -> None:
-        await store.create(
-            RunRequest(
-                agent_name="assistant",
-                session_id="sess_reopen_model",
-                messages=[Message.text("user", "hi")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="initial-model"),
-        )
-        await store.update_model("sess_reopen_model", "upgraded-model")
-        await _close(store)
-
-    asyncio.run(create_and_update())
-
-    reopened = SQLiteSessionStore(db_path)
-
-    async def assert_reopened() -> None:
-        loaded = await reopened.load("sess_reopen_model")
-        assert loaded is not None
-        assert loaded.model == "upgraded-model"
-        await _close(reopened)
-
-    asyncio.run(assert_reopened())
-
-
 def test_sqlite_session_store_validate_mode_fails_fast_on_uninitialized(tmp_path):
     # validate-at-startup (ADR 0001 Q4): a store opened in validate mode against an
     # empty database fails fast instead of silently creating the schema.

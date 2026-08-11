@@ -5539,10 +5539,6 @@ class SessionStore(ABC):
         """Update session status and return the updated session."""
 
     @abstractmethod
-    async def update_model(self, session_id: str, model: str) -> Session:
-        """Update the active model for a session and return the updated session."""
-
-    @abstractmethod
     async def transition_status(
         self,
         session_id: str,
@@ -7530,25 +7526,6 @@ class InMemorySessionStore(SessionStore):
             from_statuses=set(SessionStatus),
             to_status=status,
         )
-
-    async def update_model(self, session_id: str, model: str) -> Session:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        model = require_clean_nonblank(model, "model")
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None:
-                raise KeyError(f"Session not found: {session_id}")
-            _assert_session_run_epoch(session_id, session)
-            now = datetime.now(UTC)
-            updated = session.model_copy(
-                update={
-                    "model": model,
-                    "updated_at": now,
-                    "last_activity_at": now,
-                }
-            )
-            self._sessions[session_id] = updated
-            return updated.model_copy(deep=True)
 
     async def delete_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")

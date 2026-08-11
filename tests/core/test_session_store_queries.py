@@ -2541,43 +2541,6 @@ def test_session_stores_append_and_load_transcript_messages(
 
 
 @pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
-def test_session_stores_update_session_active_model(
-    store_factory: StoreFactory,
-    tmp_path,
-):
-    store = _make_store(store_factory, tmp_path)
-
-    async def run_store_operations() -> None:
-        session = await store.create(
-            RunRequest(
-                agent_name="builder",
-                session_id="sess_model",
-                messages=[Message.text("user", "build")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="initial-model"),
-        )
-
-        assert session.model == "initial-model"
-
-        updated = await store.update_model("sess_model", "upgraded-model")
-        assert updated.model == "upgraded-model"
-        assert updated.updated_at >= session.updated_at
-
-        loaded = await store.load("sess_model")
-        assert loaded is not None
-        assert loaded.model == "upgraded-model"
-
-        with pytest.raises(ValueError, match="model"):
-            await store.update_model("sess_model", " ")
-        with pytest.raises(KeyError, match="Session not found"):
-            await store.update_model("missing_session", "other-model")
-
-        await _close_store(store)
-
-    asyncio.run(run_store_operations())
-
-
-@pytest.mark.parametrize("store_factory", [InMemorySessionStore, SQLiteSessionStore])
 def test_session_stores_transition_status_atomically(
     store_factory: StoreFactory,
     tmp_path,

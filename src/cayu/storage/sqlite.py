@@ -2010,40 +2010,6 @@ class SQLiteSessionStore(SessionStore):
             to_status=status,
         )
 
-    async def update_model(self, session_id: str, model: str) -> Session:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        model = require_clean_nonblank(model, "model")
-        updated_at = datetime.now(UTC)
-        expected_run_epoch = _current_session_run_epoch(session_id)
-        async with self._lock:
-            with self._connection:
-                epoch_clause = "" if expected_run_epoch is None else " AND run_epoch = ?"
-                params: list[object] = [
-                    model,
-                    sqlite_support.format_datetime(updated_at),
-                    sqlite_support.format_datetime(updated_at),
-                    session_id,
-                ]
-                if expected_run_epoch is not None:
-                    params.append(expected_run_epoch)
-                cursor = self._connection.execute(
-                    f"""
-                    UPDATE cayu_sessions
-                    SET model = ?, updated_at = ?, last_activity_at = ?
-                    WHERE id = ?{epoch_clause}
-                    """,
-                    params,
-                )
-            if cursor.rowcount != 1:
-                if expected_run_epoch is not None:
-                    _raise_session_write_conflict(self._connection, session_id, expected_run_epoch)
-                raise KeyError(f"Session not found: {session_id}")
-
-            loaded = self._load_unlocked(session_id)
-            if loaded is None:
-                raise KeyError(f"Session not found: {session_id}")
-            return loaded
-
     async def delete_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         async with self._lock:

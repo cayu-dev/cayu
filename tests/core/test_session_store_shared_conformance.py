@@ -4582,14 +4582,6 @@ def test_session_store_conformance_rejects_nonportable_identifiers_and_query_tex
                 identity=_identity(),
             )
 
-            with pytest.raises(DurableValueError) as invalid_model:
-                await store.update_model(session_id, invalid_text)
-            assert invalid_model.value.code == code
-            assert "workload-secret-value" not in str(invalid_model.value)
-            loaded = await store.load(session_id)
-            assert loaded is not None
-            assert loaded.model == "fake-model"
-
             with pytest.raises(DurableValueError) as invalid_identifier:
                 await store.update_metadata(invalid_text, {"mutated": True})
             assert invalid_identifier.value.code == code
@@ -14574,7 +14566,7 @@ def test_session_store_conformance_validates_exact_fork_transcript_atomically(
                 ("sess_rejected_fork_false", False),
                 ("sess_rejected_fork_ambiguous", 1),
             ):
-                with pytest.raises(ValueError, match="workload secret"):
+                with pytest.raises(ValueError, match="atomic copy validation"):
                     await session_store.create_fork_with_transcript_validation(
                         source_session_id=source.id,
                         fork=Session(

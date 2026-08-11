@@ -6902,42 +6902,6 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             to_status=status,
         )
 
-    async def update_model(self, session_id: str, model: str) -> Session:
-        session_id = require_clean_nonblank(session_id, "session_id")
-        model = require_clean_nonblank(model, "model")
-        await self._ensure_ready()
-        updated_at = datetime.now(UTC)
-        expected_run_epoch = _current_session_run_epoch(session_id)
-        async with self._connection() as conn:
-            async with conn.cursor() as cur:
-                if expected_run_epoch is None:
-                    await cur.execute(
-                        """
-                        UPDATE cayu_sessions
-                        SET model = %s, updated_at = %s, last_activity_at = %s
-                        WHERE id = %s
-                        """,
-                        (model, updated_at, updated_at, session_id),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        UPDATE cayu_sessions
-                        SET model = %s, updated_at = %s, last_activity_at = %s
-                        WHERE id = %s AND run_epoch = %s
-                        """,
-                        (model, updated_at, updated_at, session_id, expected_run_epoch),
-                    )
-                if cur.rowcount != 1:
-                    if expected_run_epoch is not None:
-                        await _raise_session_write_conflict(cur, session_id, expected_run_epoch)
-                    raise KeyError(f"Session not found: {session_id}")
-                loaded = await self._load(cur, session_id)
-            await conn.commit()
-            if loaded is None:
-                raise KeyError(f"Session not found: {session_id}")
-            return loaded
-
     async def delete_session(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")
         await self._ensure_ready()

@@ -2299,34 +2299,6 @@ def test_postgres_session_store_append_and_load_transcript_messages(postgres_dsn
     _run(postgres_dsn, ops)
 
 
-def test_postgres_session_store_update_session_active_model(postgres_dsn):
-    async def ops(store):
-        session = await store.create(
-            RunRequest(
-                agent_name="builder",
-                session_id="sess_model",
-                messages=[Message.text("user", "build")],
-            ),
-            identity=SessionIdentity(provider_name="fake", model="initial-model"),
-        )
-        assert session.model == "initial-model"
-
-        updated = await store.update_model("sess_model", "upgraded-model")
-        assert updated.model == "upgraded-model"
-        assert updated.updated_at >= session.updated_at
-
-        loaded = await store.load("sess_model")
-        assert loaded is not None
-        assert loaded.model == "upgraded-model"
-
-        with pytest.raises(ValueError, match="model"):
-            await store.update_model("sess_model", " ")
-        with pytest.raises(KeyError, match="Session not found"):
-            await store.update_model("missing_session", "other-model")
-
-    _run(postgres_dsn, ops)
-
-
 def test_postgres_session_store_transition_status_atomically(postgres_dsn):
     async def ops(store):
         await store.create(
