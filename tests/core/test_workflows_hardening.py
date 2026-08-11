@@ -90,13 +90,18 @@ from cayu.workflows import (
     WorkflowContext,
     WorkflowJournal,
     WorkflowJournalContext,
+    WorkflowJournalReplayEvidence,
+    WorkflowStepCompletionSnapshot,
     WorkflowSupersededError,
+    canonical_workflow_step_completion_ids,
     gated_loop,
     parallel,
     pipeline,
     step,
 )
-from cayu.workflows._step_identity import gated_loop_step_id
+from cayu.workflows._step_identity import (
+    gated_loop_step_id,
+)
 
 
 async def _passing_gate(item, result):
@@ -276,9 +281,70 @@ class MemoryJournal:
                 continue
             if event.type != EventType.WORKFLOW_STEP_COMPLETED:
                 continue
-            if self._event_attempt_id(event) == active_attempt_id:
-                completed.add(event.payload["step_id"])
+            if self._event_attempt_id(event) != active_attempt_id:
+                continue
+            step_id = event.payload.get("step_id")
+            if isinstance(step_id, str) and step_id:
+                completed.add(step_id)
         return completed
+
+    async def completed_step_snapshot(
+        self,
+        *,
+        attempt_id: str,
+    ) -> WorkflowStepCompletionSnapshot:
+        latest_attempt, _sequence = self._latest_attempt()
+        attempt_marker = next(
+            (
+                event
+                for event in reversed(self.events)
+                if event.type == WORKFLOW_ATTEMPT_EVENT_TYPE
+                and self._event_attempt_id(event) == attempt_id
+            ),
+            None,
+        )
+        if latest_attempt != attempt_id:
+            return canonical_workflow_step_completion_ids(
+                (),
+                session_id=(
+                    attempt_marker.session_id
+                    if attempt_marker is not None
+                    else "empty-workflow-run"
+                ),
+                workflow_name=(
+                    attempt_marker.workflow_name
+                    if attempt_marker is not None and attempt_marker.workflow_name is not None
+                    else "empty-workflow"
+                ),
+                attempt_id=attempt_id,
+            )
+        completed: list[Event] = []
+        active_attempt_id: str | None = None
+        for event in self.events:
+            if event.type == WORKFLOW_ATTEMPT_EVENT_TYPE:
+                active_attempt_id = self._event_attempt_id(event)
+                continue
+            if event.type != EventType.WORKFLOW_STEP_COMPLETED:
+                continue
+            if self._event_attempt_id(event) == active_attempt_id:
+                completed.append(event)
+        if not completed:
+            assert attempt_marker is not None
+            assert attempt_marker.workflow_name is not None
+            return canonical_workflow_step_completion_ids(
+                (),
+                session_id=attempt_marker.session_id,
+                workflow_name=attempt_marker.workflow_name,
+                attempt_id=attempt_id,
+            )
+        workflow_name = completed[0].workflow_name
+        assert workflow_name is not None
+        return canonical_workflow_step_completion_ids(
+            completed,
+            session_id=completed[0].session_id,
+            workflow_name=workflow_name,
+            attempt_id=attempt_id,
+        )
 
     async def latest_step_child_session_id(
         self,
@@ -347,6 +413,48 @@ class MemoryJournal:
         if not isinstance(event_attempt, str) or not event_attempt:
             raise ValueError("Workflow journal events require a non-empty attempt_id payload.")
         return event_attempt
+
+
+class PreviousContractMemoryJournal(MemoryJournal):
+    """Custom journal implementing Cayu's former raw-ID replay contract."""
+
+    completed_step_snapshot = None  # type: ignore[assignment]
+
+
+class NaiveRawSnapshotJournal(MemoryJournal):
+    """Migration attempt that incorrectly wraps the former raw-ID result."""
+
+    async def completed_step_snapshot(
+        self,
+        *,
+        attempt_id: str,
+    ) -> WorkflowStepCompletionSnapshot:
+        return WorkflowStepCompletionSnapshot(
+            step_ids=frozenset(await self.completed_step_ids(attempt_id=attempt_id))
+        )
+
+
+class FixedCompletionEvidenceJournal(MemoryJournal):
+    def __init__(self) -> None:
+        super().__init__()
+        self.completion_evidence: Any = ()
+        self.expected_session_id = ""
+        self.expected_workflow_name = ""
+        self.snapshot_override: Any = None
+
+    async def completed_step_snapshot(
+        self,
+        *,
+        attempt_id: str,
+    ) -> WorkflowStepCompletionSnapshot:
+        if self.snapshot_override is not None:
+            return self.snapshot_override
+        return canonical_workflow_step_completion_ids(
+            self.completion_evidence,
+            session_id=self.expected_session_id,
+            workflow_name=self.expected_workflow_name,
+            attempt_id=attempt_id,
+        )
 
 
 class BlockingCurrentAttemptJournal(MemoryJournal):
@@ -524,6 +632,428 @@ def test_gated_loop_replays_legacy_identity_without_cross_skipping_collision() -
     asyncio.run(run())
 
     assert calls == ["c"]
+
+
+@pytest.mark.parametrize("journal_kind", ["event-store", "custom"])
+def test_authentic_legacy_v2_shaped_id_does_not_complete_unrelated_modern_item(
+    journal_kind: str,
+) -> None:
+    app = CayuApp(enable_logging=False)
+    run_id = "wf-legacy-modern-prefix-collision"
+    if journal_kind == "custom":
+        custom_journal = MemoryJournal()
+
+        def journal_factory(_context: WorkflowJournalContext) -> WorkflowJournal:
+            return custom_journal
+
+        workflow = TinyWorkflow(app, journal_factory=journal_factory)
+    else:
+        workflow = TinyWorkflow(app)
+    first = workflow.context(run_id)
+    unrelated_modern_id = gated_loop_step_id("orders", "42")
+    legacy_item_key = unrelated_modern_id.removeprefix("gated-loop:v2:")
+
+    async def seed_legacy_completion() -> None:
+        await first.journal.append(first.event(WORKFLOW_ATTEMPT_EVENT_TYPE))
+        appended = await first.journal.append_current_attempt(
+            first.event(
+                EventType.WORKFLOW_STEP_COMPLETED,
+                payload={
+                    "step_id": unrelated_modern_id,
+                    "item_key": legacy_item_key,
+                    "kind": "gated_loop",
+                    "passed": True,
+                    "outcome": "pass",
+                    "child_session_id": "legacy-child",
+                },
+            ),
+            attempt_id=first.attempt_id,
+        )
+        assert appended is True
+
+    asyncio.run(seed_legacy_completion())
+
+    resumed = workflow.context(run_id)
+    legacy_calls: list[str] = []
+    modern_calls: list[str] = []
+
+    async def legacy_do(item: str) -> StepResult:
+        legacy_calls.append(item)
+        return StepResult(step_id="legacy-do", session_id="legacy-child-rerun")
+
+    async def modern_do(item: str) -> StepResult:
+        modern_calls.append(item)
+        return StepResult(step_id="modern-do", session_id="modern-child")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            resumed,
+            [legacy_item_key],
+            do=legacy_do,
+            gate=_passing_gate,
+            key=str,
+            name="v2",
+        ):
+            pass
+        async for _event in gated_loop(
+            resumed,
+            ["42"],
+            do=modern_do,
+            gate=_passing_gate,
+            key=str,
+            name="orders",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert legacy_calls == []
+    assert modern_calls == ["42"]
+
+
+def test_previous_contract_custom_journal_cannot_authorize_ambiguous_gated_loop_id() -> None:
+    app = CayuApp(enable_logging=False)
+    journal = PreviousContractMemoryJournal()
+
+    def journal_factory(_context: WorkflowJournalContext) -> WorkflowJournal:
+        return journal
+
+    assert isinstance(journal, WorkflowJournal)
+    assert not isinstance(journal, WorkflowJournalReplayEvidence)
+
+    workflow = TinyWorkflow(app, journal_factory=journal_factory)
+    first = workflow.context("wf-previous-contract-collision")
+    colliding_modern_id = gated_loop_step_id("orders", "42")
+    legacy_item_key = colliding_modern_id.removeprefix("gated-loop:v2:")
+
+    async def seed_legacy_completion() -> None:
+        await first.journal.append(first.event(WORKFLOW_ATTEMPT_EVENT_TYPE))
+        appended = await first.journal.append_current_attempt(
+            first.event(
+                EventType.WORKFLOW_STEP_COMPLETED,
+                payload={
+                    "step_id": colliding_modern_id,
+                    "item_key": legacy_item_key,
+                    "kind": "gated_loop",
+                    "passed": True,
+                    "outcome": "pass",
+                    "child_session_id": "legacy-child",
+                },
+            ),
+            attempt_id=first.attempt_id,
+        )
+        assert appended is True
+        assert await journal.completed_step_ids(attempt_id=first.attempt_id) == {
+            colliding_modern_id
+        }
+
+    asyncio.run(seed_legacy_completion())
+    event_count_before_replay = len(journal.events)
+    resumed = workflow.context("wf-previous-contract-collision")
+    calls: list[str] = []
+
+    async def do(item: str) -> StepResult:
+        calls.append(item)
+        return StepResult(step_id="do", session_id="child")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            resumed,
+            ["42"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="orders",
+        ):
+            pass
+
+    with pytest.raises(TypeError, match="WorkflowJournalReplayEvidence"):
+        asyncio.run(run())
+
+    assert calls == []
+    assert len(journal.events) == event_count_before_replay
+
+    naive_journal = NaiveRawSnapshotJournal()
+    naive_journal.events = list(journal.events)
+    resumed.journal = naive_journal
+    with pytest.raises(TypeError, match="canonical_workflow_step_completion_ids"):
+        asyncio.run(run())
+
+    assert calls == []
+
+    migrated_journal = MemoryJournal()
+    migrated_journal.events = list(naive_journal.events)
+    resumed.journal = migrated_journal
+    asyncio.run(run())
+
+    assert calls == ["42"]
+
+
+@pytest.mark.parametrize(
+    "evidence_update,expected_error",
+    [
+        pytest.param("list", TypeError, id="mutable-result"),
+        pytest.param("forged", TypeError, id="forged-snapshot"),
+        pytest.param("mutated", TypeError, id="mutated-snapshot"),
+        pytest.param("other-scope", TypeError, id="transplanted-snapshot"),
+        pytest.param("other-attempt", TypeError, id="wrong-attempt-snapshot"),
+        pytest.param({"type": EventType.WORKFLOW_STEP_STARTED}, ValueError, id="wrong-type"),
+        pytest.param({"session_id": "other-run"}, ValueError, id="wrong-run"),
+        pytest.param({"workflow_name": "other-workflow"}, ValueError, id="wrong-workflow"),
+        pytest.param({"payload": {"attempt_id": ""}}, ValueError, id="blank-attempt"),
+    ],
+)
+def test_gated_loop_revalidates_custom_journal_completion_evidence_before_callback(
+    evidence_update: str | dict[str, Any],
+    expected_error: type[Exception],
+) -> None:
+    app = CayuApp(enable_logging=False)
+    journal = FixedCompletionEvidenceJournal()
+
+    def journal_factory(_context: WorkflowJournalContext) -> WorkflowJournal:
+        return journal
+
+    ctx = TinyWorkflow(app, journal_factory=journal_factory).context(
+        "wf-custom-completion-evidence"
+    )
+    journal.expected_session_id = ctx.session_id
+    journal.expected_workflow_name = ctx.workflow_name
+    valid_event = ctx.event(
+        EventType.WORKFLOW_STEP_COMPLETED,
+        payload={
+            "step_id": gated_loop_step_id("orders", "42"),
+            "step_id_version": 2,
+            "kind": "gated_loop",
+            "loop_name": "orders",
+            "item_key": "42",
+            "child_session_id": "child",
+        },
+    )
+    if evidence_update == "list":
+        journal.snapshot_override = [gated_loop_step_id("orders", "42")]
+    elif evidence_update == "forged":
+        forged = object.__new__(WorkflowStepCompletionSnapshot)
+        object.__setattr__(
+            forged,
+            "_step_ids",
+            frozenset({gated_loop_step_id("orders", "42")}),
+        )
+        journal.snapshot_override = forged
+    elif evidence_update == "mutated":
+        mutated = canonical_workflow_step_completion_ids(
+            (valid_event,),
+            session_id=ctx.session_id,
+            workflow_name=ctx.workflow_name,
+            attempt_id=ctx.attempt_id,
+        )
+        object.__setattr__(
+            mutated,
+            "_step_ids",
+            frozenset({gated_loop_step_id("other", "item")}),
+        )
+        journal.snapshot_override = mutated
+    elif evidence_update == "other-scope":
+        other_event = valid_event.model_copy(update={"session_id": "other-run"})
+        journal.snapshot_override = canonical_workflow_step_completion_ids(
+            (other_event,),
+            session_id="other-run",
+            workflow_name=ctx.workflow_name,
+            attempt_id=ctx.attempt_id,
+        )
+    elif evidence_update == "other-attempt":
+        journal.snapshot_override = canonical_workflow_step_completion_ids(
+            (valid_event,),
+            session_id=ctx.session_id,
+            workflow_name=ctx.workflow_name,
+            attempt_id="other-attempt",
+        )
+    else:
+        journal.completion_evidence = (valid_event.model_copy(update=evidence_update),)
+    calls: list[str] = []
+
+    async def do(item: str) -> StepResult:
+        calls.append(item)
+        return StepResult(step_id="do", session_id="child")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            ctx,
+            ["42"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="orders",
+        ):
+            pass
+
+    with pytest.raises(expected_error):
+        asyncio.run(run())
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "legacy_evidence",
+    [
+        pytest.param({}, id="missing-kind"),
+        pytest.param({"kind": "ordinary"}, id="wrong-kind"),
+        pytest.param({"kind": ""}, id="blank-kind"),
+        pytest.param({"kind": True}, id="boolean-kind"),
+        pytest.param({"kind": "gated_loop", "item_key": None}, id="missing-item-key"),
+        pytest.param({"kind": "gated_loop", "item_key": True}, id="boolean-item-key"),
+        pytest.param({"kind": "gated_loop", "item_key": 1}, id="numeric-item-key"),
+        pytest.param({"kind": "gated_loop", "item_key": []}, id="list-item-key"),
+        pytest.param({"kind": "gated_loop", "item_key": {}}, id="object-item-key"),
+        pytest.param({"kind": "gated_loop", "item_key": ""}, id="empty-item-key"),
+        pytest.param({"kind": "gated_loop", "item_key": " "}, id="blank-item-key"),
+        pytest.param(
+            {"kind": "gated_loop", "item_key": " item"},
+            id="leading-whitespace-item-key",
+        ),
+        pytest.param(
+            {"kind": "gated_loop", "item_key": "item "},
+            id="trailing-whitespace-item-key",
+        ),
+        pytest.param(
+            {"kind": "gated_loop", "step_id_version": None},
+            id="version-field-present",
+        ),
+    ],
+)
+def test_gated_loop_does_not_replay_lookalike_without_authentic_legacy_evidence(
+    legacy_evidence: dict[str, Any],
+) -> None:
+    app = CayuApp(enable_logging=False)
+    run_id = "wf-legacy-lookalike"
+    attempt_id = "legacy-attempt"
+    journal = EventStoreJournal(app.session_store, run_id, "tiny")
+    unrelated_modern_id = gated_loop_step_id("orders", "42")
+    legacy_item_key = unrelated_modern_id.removeprefix("gated-loop:v2:")
+
+    async def seed_lookalike_completion() -> None:
+        await journal.append(
+            Event(
+                type=WORKFLOW_ATTEMPT_EVENT_TYPE,
+                session_id=run_id,
+                workflow_name="tiny",
+                payload={"attempt_id": attempt_id},
+            )
+        )
+        payload: dict[str, Any] = {
+            "step_id": unrelated_modern_id,
+            "item_key": legacy_item_key,
+            "passed": True,
+            "outcome": "pass",
+            "child_session_id": "lookalike-child",
+            "attempt_id": attempt_id,
+            **legacy_evidence,
+        }
+        appended = await journal.append_current_attempt(
+            Event(
+                type=EventType.WORKFLOW_STEP_COMPLETED,
+                session_id=run_id,
+                workflow_name="tiny",
+                payload=payload,
+            ),
+            attempt_id=attempt_id,
+        )
+        assert appended is True
+
+    asyncio.run(seed_lookalike_completion())
+
+    resumed = TinyWorkflow(app).context(run_id)
+    calls: list[str] = []
+
+    async def do(item: str) -> StepResult:
+        calls.append(item)
+        return StepResult(step_id=f"do-{item}", session_id=f"child-{item}")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            resumed,
+            ["42"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="orders",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert calls == ["42"]
+
+
+def test_sqlite_replay_migrates_only_authentic_legacy_gated_loop_evidence(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "legacy-gated-loop.db"
+    run_id = "wf-sqlite-legacy-gated-loop"
+    attempt_id = "legacy-attempt"
+    first_app = CayuApp(enable_logging=False, session_store=SQLiteSessionStore(db_path))
+    journal = EventStoreJournal(first_app.session_store, run_id, "tiny")
+
+    async def seed_legacy_completions() -> None:
+        await journal.append(
+            Event(
+                type=WORKFLOW_ATTEMPT_EVENT_TYPE,
+                session_id=run_id,
+                workflow_name="tiny",
+                payload={"attempt_id": attempt_id},
+            )
+        )
+        for item_key, kind in (
+            ("ambiguous-before", None),
+            ("authentic", "gated_loop"),
+            ("ambiguous-after", "ordinary"),
+        ):
+            payload: dict[str, Any] = {
+                "step_id": f"gated-loop:loop:{item_key}",
+                "item_key": item_key,
+                "passed": True,
+                "outcome": "pass",
+                "child_session_id": f"legacy-child-{item_key}",
+                "attempt_id": attempt_id,
+            }
+            if kind is not None:
+                payload["kind"] = kind
+            appended = await journal.append_current_attempt(
+                Event(
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id=run_id,
+                    workflow_name="tiny",
+                    payload=payload,
+                ),
+                attempt_id=attempt_id,
+            )
+            assert appended is True
+
+    asyncio.run(seed_legacy_completions())
+    asyncio.run(first_app.session_store.close())
+
+    resumed_app = CayuApp(enable_logging=False, session_store=SQLiteSessionStore(db_path))
+    resumed = TinyWorkflow(resumed_app).context(run_id)
+    calls: list[str] = []
+
+    async def do(item: str) -> StepResult:
+        calls.append(item)
+        return StepResult(step_id=f"do-{item}", session_id=f"child-{item}")
+
+    async def run() -> None:
+        async for _event in gated_loop(
+            resumed,
+            ["ambiguous-before", "authentic", "ambiguous-after"],
+            do=do,
+            gate=_passing_gate,
+            key=str,
+            name="loop",
+        ):
+            pass
+
+    asyncio.run(run())
+
+    assert calls == ["ambiguous-before", "ambiguous-after"]
+    asyncio.run(resumed_app.session_store.close())
 
 
 @pytest.mark.parametrize(
@@ -1047,6 +1577,68 @@ def test_workflow_journal_completed_steps_pages_past_event_query_limit():
     completed = asyncio.run(run())
     assert len(completed) == 5001
     assert {"s0", "s5000"} <= completed
+
+
+def test_workflow_journal_completion_snapshot_retains_only_canonical_identities():
+    app = CayuApp(enable_logging=False)
+    store = app.session_store
+
+    async def run() -> WorkflowStepCompletionSnapshot:
+        attempt_id = "attempt-compact"
+        await store.create(
+            RunRequest(
+                agent_name="wf",
+                session_id="wf-compact-completions",
+                messages=[],
+                metadata={"cayu.workflow": "wf"},
+            ),
+            identity=SessionIdentity(
+                provider_name=WORKFLOW_JOURNAL_PROVIDER,
+                model=WORKFLOW_JOURNAL_MODEL,
+            ),
+        )
+        await store.append_events(
+            "wf-compact-completions",
+            [
+                Event(
+                    type=WORKFLOW_ATTEMPT_EVENT_TYPE,
+                    session_id="wf-compact-completions",
+                    workflow_name="wf",
+                    payload={"attempt_id": attempt_id},
+                ),
+                Event(
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="wf-compact-completions",
+                    workflow_name="wf",
+                    payload={
+                        "step_id": "s1",
+                        "attempt_id": attempt_id,
+                        "detail": "x" * 1_000_000,
+                    },
+                ),
+                Event(
+                    type=EventType.WORKFLOW_STEP_COMPLETED,
+                    session_id="wf-compact-completions",
+                    workflow_name="wf",
+                    payload={
+                        "step_id": "s1",
+                        "attempt_id": attempt_id,
+                        "detail": "y" * 1_000_000,
+                    },
+                ),
+            ],
+        )
+        return await EventStoreJournal(
+            store,
+            "wf-compact-completions",
+            "wf",
+        ).completed_step_snapshot(attempt_id=attempt_id)
+
+    snapshot = asyncio.run(run())
+
+    assert type(snapshot) is WorkflowStepCompletionSnapshot
+    assert snapshot.step_ids == frozenset({"s1"})
+    assert not hasattr(snapshot, "events")
 
 
 def test_workflow_journal_latest_child_session_pages_past_event_query_limit():
@@ -1809,6 +2401,10 @@ def test_workflow_exports_keep_root_package_focused():
     assert workflows.JournalFactory is JournalFactory
     assert workflows.WorkflowJournal is WorkflowJournal
     assert workflows.WorkflowJournalContext is WorkflowJournalContext
+    assert workflows.WorkflowJournalReplayEvidence is WorkflowJournalReplayEvidence
+    assert workflows.WorkflowStepCompletionSnapshot is WorkflowStepCompletionSnapshot
+    assert callable(workflows.canonical_workflow_step_completion_ids)
+    assert callable(workflows.copy_workflow_step_completion_snapshot)
     assert workflows.EventStoreJournal is EventStoreJournal
 
     assert not hasattr(cayu, "WORKFLOW_JOURNAL_MODEL")

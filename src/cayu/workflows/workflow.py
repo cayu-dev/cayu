@@ -57,6 +57,8 @@ from cayu.workflows.journal import (
     EventStoreJournal,
     WorkflowJournal,
     WorkflowJournalContext,
+    WorkflowJournalReplayEvidence,
+    copy_workflow_step_completion_snapshot,
     validate_workflow_journal_event_type,
 )
 from cayu.workflows.models import (
@@ -1111,14 +1113,25 @@ async def gated_loop(
     before the item completion is journaled, so ``on_pass`` and ``on_fail`` must
     tolerate at-least-once execution after a crash.
     """
-    loop_name = (
-        require_clean_nonblank(name, "gated_loop name")
-        if name is not None
-        else ctx.next_gated_loop_name()
+    explicit_loop_name = (
+        require_clean_nonblank(name, "gated_loop name") if name is not None else None
     )
-    ctx._register_gated_loop_name(loop_name)
+    if not isinstance(ctx.journal, WorkflowJournalReplayEvidence):
+        raise TypeError(
+            "Evidence-safe gated_loop replay requires the optional "
+            "WorkflowJournalReplayEvidence capability; custom journals using the "
+            "former ID-only contract must expose a canonical completion snapshot."
+        )
     await ctx._check_fence()
-    completed = await ctx.journal.completed_step_ids(attempt_id=ctx.attempt_id)
+    completed_snapshot = copy_workflow_step_completion_snapshot(
+        await ctx.journal.completed_step_snapshot(attempt_id=ctx.attempt_id),
+        session_id=ctx.session_id,
+        workflow_name=ctx.workflow_name,
+        attempt_id=ctx.attempt_id,
+    )
+    completed = completed_snapshot.step_ids
+    loop_name = explicit_loop_name or ctx.next_gated_loop_name()
+    ctx._register_gated_loop_name(loop_name)
     seen_item_keys: set[str] = set()
     for index, item in enumerate(items):
         raw_key = key(item) if key is not None else str(index)

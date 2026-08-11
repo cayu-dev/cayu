@@ -8,12 +8,13 @@ source of truth for resume, step replay, and takeover detection.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid5
+from weakref import WeakKeyDictionary
 
-from cayu._validation import require_clean_nonblank
+from cayu._validation import require_clean_nonblank, require_durable_clean_nonblank
 from cayu.core.events import Event, EventType, event_with_runtime_generated_id
 from cayu.core.workflows import WORKFLOW_ATTEMPT_EVENT_TYPE
 from cayu.runtime import (
@@ -25,7 +26,7 @@ from cayu.runtime import (
     SessionStatus,
     SessionStore,
 )
-from cayu.workflows._step_identity import upgraded_legacy_gated_loop_step_id
+from cayu.workflows._step_identity import replay_eligible_completed_step_id
 
 # Identity stamped on the synthetic session that holds a workflow run's journal.
 # The session is never executed by ``app.run``; it only anchors the append-only
@@ -50,6 +51,160 @@ def _event_attempt_id(event: Event) -> str:
     if isinstance(attempt_id, str) and attempt_id:
         return attempt_id
     raise ValueError("Workflow journal events require a non-empty attempt_id payload.")
+
+
+class WorkflowStepCompletionSnapshot:
+    """Opaque, transient completion identities derived from durable evidence.
+
+    Instances cannot be constructed directly. Custom journals create them
+    through :func:`canonical_workflow_step_completion_ids` so their scope and
+    identities remain bound to the evidence that authorized them.
+    """
+
+    __slots__ = ("__weakref__", "_step_ids")
+
+    _step_ids: frozenset[str]
+
+    def __new__(cls, *args: object, **kwargs: object):
+        del cls, args, kwargs
+        raise TypeError(
+            "WorkflowStepCompletionSnapshot values must be created by "
+            "canonical_workflow_step_completion_ids()."
+        )
+
+    @property
+    def step_ids(self) -> frozenset[str]:
+        return self._step_ids
+
+    def __setattr__(self, name: str, value: object) -> None:
+        del name, value
+        raise TypeError("WorkflowStepCompletionSnapshot values are immutable.")
+
+    def __delattr__(self, name: str) -> None:
+        del name
+        raise TypeError("WorkflowStepCompletionSnapshot values are immutable.")
+
+    def __repr__(self) -> str:
+        return f"WorkflowStepCompletionSnapshot(step_ids={self.step_ids!r})"
+
+    def __reduce__(self):
+        raise TypeError("WorkflowStepCompletionSnapshot values are transient.")
+
+
+_WORKFLOW_STEP_COMPLETION_SNAPSHOT_AUTHORITY: WeakKeyDictionary[
+    WorkflowStepCompletionSnapshot,
+    tuple[str, str, str, frozenset[str]],
+] = WeakKeyDictionary()
+
+
+def _workflow_step_completion_snapshot(
+    step_ids: frozenset[str],
+    *,
+    session_id: str,
+    workflow_name: str,
+    attempt_id: str,
+) -> WorkflowStepCompletionSnapshot:
+    if type(step_ids) is not frozenset:
+        raise TypeError("Canonical completed step ids must be a frozenset.")
+    session_id = require_clean_nonblank(session_id, "session_id")
+    workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
+    attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+    for step_id in step_ids:
+        require_durable_clean_nonblank(step_id, "completed step_id")
+    snapshot = object.__new__(WorkflowStepCompletionSnapshot)
+    object.__setattr__(snapshot, "_step_ids", step_ids)
+    _WORKFLOW_STEP_COMPLETION_SNAPSHOT_AUTHORITY[snapshot] = (
+        session_id,
+        workflow_name,
+        attempt_id,
+        step_ids,
+    )
+    return snapshot
+
+
+def _canonical_workflow_step_completion_id(
+    event: Event,
+    *,
+    session_id: str,
+    workflow_name: str,
+) -> str | None:
+    if type(event) is not Event:
+        raise TypeError("Workflow completion evidence must contain Event instances.")
+    if event.type != EventType.WORKFLOW_STEP_COMPLETED:
+        raise ValueError("Workflow completion evidence may contain only completed events.")
+    if event.session_id != session_id:
+        raise ValueError("Workflow completion event session_id must match the workflow run id.")
+    if event.workflow_name != workflow_name:
+        raise ValueError("Workflow completion event workflow_name must match the workflow name.")
+    if type(event.payload) is not dict:
+        raise TypeError("Workflow completion event payload must be a dictionary.")
+    _event_attempt_id(event)
+    return replay_eligible_completed_step_id(event.payload)
+
+
+def canonical_workflow_step_completion_ids(
+    events: Iterable[Event],
+    *,
+    session_id: str,
+    workflow_name: str,
+    attempt_id: str,
+) -> WorkflowStepCompletionSnapshot:
+    """Build compact replay evidence from attempt-fenced completed events.
+
+    This is the public canonicalization boundary for custom workflow journals.
+    The journal owns attempt-fenced selection; workflow core independently
+    validates the returned snapshot shape before trusting its identities.
+    """
+
+    session_id = require_clean_nonblank(session_id, "session_id")
+    workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
+    require_clean_nonblank(attempt_id, "attempt_id")
+    completed: set[str] = set()
+    for event in events:
+        completed_step_id = _canonical_workflow_step_completion_id(
+            event,
+            session_id=session_id,
+            workflow_name=workflow_name,
+        )
+        if completed_step_id is not None:
+            completed.add(completed_step_id)
+    return _workflow_step_completion_snapshot(
+        frozenset(completed),
+        session_id=session_id,
+        workflow_name=workflow_name,
+        attempt_id=attempt_id,
+    )
+
+
+def copy_workflow_step_completion_snapshot(
+    snapshot: WorkflowStepCompletionSnapshot,
+    *,
+    session_id: str,
+    workflow_name: str,
+    attempt_id: str,
+) -> WorkflowStepCompletionSnapshot:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    workflow_name = require_clean_nonblank(workflow_name, "workflow_name")
+    attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
+    if type(snapshot) is not WorkflowStepCompletionSnapshot:
+        raise TypeError("completed_step_snapshot must return a WorkflowStepCompletionSnapshot.")
+    try:
+        step_ids = snapshot._step_ids
+    except AttributeError:
+        raise TypeError("completed_step_snapshot returned forged completion evidence.") from None
+    authority = _WORKFLOW_STEP_COMPLETION_SNAPSHOT_AUTHORITY.get(snapshot)
+    if (
+        authority is None
+        or authority[:3] != (session_id, workflow_name, attempt_id)
+        or authority[3] is not step_ids
+    ):
+        raise TypeError("completed_step_snapshot returned forged completion evidence.")
+    return _workflow_step_completion_snapshot(
+        step_ids,
+        session_id=session_id,
+        workflow_name=workflow_name,
+        attempt_id=attempt_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +251,13 @@ class WorkflowJournal(Protocol):
         ...
 
     async def completed_step_ids(self, *, attempt_id: str) -> set[str]:
-        """Step ids with recorded ``workflow.step.completed`` events."""
+        """Legacy ID-only inspection of completed steps.
+
+        ``gated_loop`` authorizes replay from a completion snapshot instead;
+        an ID-only set cannot prove whether a v2-shaped ID is modern evidence or
+        a byte-identical legacy collision. Existing implementations may retain
+        their former raw-ID projection for compatibility.
+        """
         ...
 
     async def step_replay_ids(
@@ -110,6 +271,19 @@ class WorkflowJournal(Protocol):
 
     async def latest_attempt_id(self) -> str | None:
         """Newest journaled workflow-attempt id, if any."""
+        ...
+
+
+@runtime_checkable
+class WorkflowJournalReplayEvidence(Protocol):
+    """Optional journal capability for evidence-safe gated-loop replay."""
+
+    async def completed_step_snapshot(
+        self,
+        *,
+        attempt_id: str,
+    ) -> WorkflowStepCompletionSnapshot:
+        """Helper-built identities from attempt-fenced durable completions."""
         ...
 
 
@@ -197,10 +371,23 @@ class EventStoreJournal:
             )
 
     async def completed_step_ids(self, *, attempt_id: str) -> set[str]:
+        snapshot = await self.completed_step_snapshot(attempt_id=attempt_id)
+        return set(snapshot.step_ids)
+
+    async def completed_step_snapshot(
+        self,
+        *,
+        attempt_id: str,
+    ) -> WorkflowStepCompletionSnapshot:
         attempt_id = require_clean_nonblank(attempt_id, "attempt_id")
         latest_attempt_id, _sequence = await self._latest_attempt()
         if latest_attempt_id != attempt_id:
-            return set()
+            return _workflow_step_completion_snapshot(
+                frozenset(),
+                session_id=self._session_id,
+                workflow_name=self._workflow_name,
+                attempt_id=attempt_id,
+            )
         completed: set[str] = set()
         active_attempt_id: str | None = None
         async for record in self._iter_workflow_records(None):
@@ -212,22 +399,19 @@ class EventStoreJournal:
                 continue
             if _event_attempt_id(event) != active_attempt_id:
                 continue
-            step_id = event.payload.get("step_id")
-            if isinstance(step_id, str) and step_id:
-                completed.add(step_id)
-                item_key = event.payload.get("item_key")
-                if (
-                    "step_id_version" not in event.payload
-                    and isinstance(item_key, str)
-                    and item_key
-                ):
-                    upgraded_step_id = upgraded_legacy_gated_loop_step_id(
-                        step_id,
-                        item_key,
-                    )
-                    if upgraded_step_id is not None:
-                        completed.add(upgraded_step_id)
-        return completed
+            completed_step_id = _canonical_workflow_step_completion_id(
+                event,
+                session_id=self._session_id,
+                workflow_name=self._workflow_name,
+            )
+            if completed_step_id is not None:
+                completed.add(completed_step_id)
+        return _workflow_step_completion_snapshot(
+            frozenset(completed),
+            session_id=self._session_id,
+            workflow_name=self._workflow_name,
+            attempt_id=attempt_id,
+        )
 
     async def latest_step_child_session_id(
         self,

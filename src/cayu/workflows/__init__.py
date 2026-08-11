@@ -9,6 +9,10 @@ from cayu.workflows.journal import (
     EventStoreJournal,
     WorkflowJournal,
     WorkflowJournalContext,
+    WorkflowJournalReplayEvidence,
+    WorkflowStepCompletionSnapshot,
+    canonical_workflow_step_completion_ids,
+    copy_workflow_step_completion_snapshot,
 )
 from cayu.workflows.models import (
     GateOutcome,
@@ -48,7 +52,11 @@ __all__ = [
     "WorkflowContext",
     "WorkflowJournal",
     "WorkflowJournalContext",
+    "WorkflowJournalReplayEvidence",
+    "WorkflowStepCompletionSnapshot",
     "WorkflowSupersededError",
+    "canonical_workflow_step_completion_ids",
+    "copy_workflow_step_completion_snapshot",
     "gated_loop",
     "normalize_gate_outcome",
     "parallel",

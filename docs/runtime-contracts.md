@@ -2177,10 +2177,30 @@ reservation retains one winner before child execution.
 from the canonical `(loop_name, item_key)` tuple. Delimiters, Unicode, and long
 keys therefore cannot make distinct tuples share the old concatenated identity.
 The source `loop_name`, `item_key`, and identity version remain in each journal
-payload for audit and migration. Resume also recognizes a legacy
-`gated-loop:{loop_name}:{item_key}` completion when its separately stored
-`item_key` proves the one unambiguous v2 tuple; it never treats the delimiter
-collision counterpart as completed.
+payload for audit and migration. Resume recognizes a legacy
+`gated-loop:{loop_name}:{item_key}` completion only when the unversioned event
+also carries the historical `kind="gated_loop"` marker and a clean, separately
+stored `item_key` that proves the one unambiguous v2 tuple. A missing or malformed
+kind, or an item key that is malformed or conflicts with the raw ID, never
+creates a v2 completion alias. The raw reserved legacy ID remains audit evidence
+rather than a second executable completion identity. Current v2 records enter
+the completion set only when their version, kind, source tuple, and hashed ID are
+coherent, so a legacy ID shaped like another item's v2 ID cannot complete that
+unrelated item. `gated_loop` does not authorize replay from the lossy
+`WorkflowJournal.completed_step_ids` set. The default journal reduces
+attempt-fenced completed events to a compact `WorkflowStepCompletionSnapshot`
+while scanning them. Custom journals opt into the separate
+`WorkflowJournalReplayEvidence` capability and build the same snapshot through
+the public `canonical_workflow_step_completion_ids` helper. Snapshots cannot be
+constructed directly from the former raw-ID set: their transient authority binds
+the canonical identities to the run, workflow, and current attempt supplied to
+the helper, and workflow core revalidates that complete scope before replay.
+Forged, mutated, transplanted, and reconstructed snapshots fail closed. This
+leaves the base `WorkflowJournal` extension contract unchanged while ensuring
+complete events and unrelated payload fields are not retained across replay
+pages. An unmigrated custom journal remains a valid journal but fails before
+`gated_loop` mutates local loop state or invokes an item callback, rather than
+treating an ambiguous raw ID as completion.
 
 Schema revision 29 adds the workflow-step replay and attempt-marker indexes.
 The revision is additive and preserves revision 28's rolling-compatibility floor,
