@@ -146,6 +146,7 @@ class ArtifactReadRequest:
     initial_read: ArtifactReadResult
     options: ReadFileOptions
     structured: dict
+    _missing_as_result: bool = False
 
 
 class ArtifactReader(Protocol):
@@ -321,6 +322,7 @@ class ReadFileTool(Tool):
                 max_bytes=max_bytes,
                 max_attachment_bytes=max_attachment_bytes,
                 pages=pages,
+                missing_as_result=True,
             )
         raise AssertionError("unreachable")
 
@@ -681,6 +683,7 @@ async def _read_workspace_file_attachment(
         max_bytes=max_bytes,
         max_attachment_bytes=max_attachment_bytes,
         pages=pages,
+        missing_as_result=False,
     )
     return _workspace_snapshot_result(
         path=path,
@@ -850,6 +853,7 @@ async def _read_artifact(
     max_bytes: int,
     max_attachment_bytes: int,
     pages: str | None,
+    missing_as_result: bool,
 ) -> ToolResult:
     artifact_store = _require_artifact_store(ctx)
     if artifact_store is None:
@@ -862,6 +866,10 @@ async def _read_artifact(
         )
     except InvalidArtifactIdError as exc:
         return invalid_tool_arguments_result(exc)
+    except FileNotFoundError:
+        if missing_as_result:
+            return _missing_artifact_result(artifact_id)
+        raise
     artifact = result.metadata
     access_error = _artifact_access_error(ctx, artifact)
     if access_error is not None:
@@ -891,10 +899,14 @@ async def _read_artifact(
             pages=pages,
         ),
         structured=structured,
+        _missing_as_result=missing_as_result,
     )
     for reader in artifact_readers:
         if reader.can_read(artifact):
-            return await reader.read(request)
+            try:
+                return await reader.read(request)
+            except _ArtifactReadNotFound:
+                return _missing_artifact_result(artifact_id)
     return ToolResult(
         content=(
             f"Artifact {artifact.id} ({artifact.filename}) is {artifact.content_type} "
@@ -952,6 +964,7 @@ class ImageArtifactReader:
             artifact_store,
             artifact.id,
             max_bytes=request.options.max_attachment_bytes,
+            missing_as_result=request._missing_as_result,
         )
         attachment_artifact = artifact
         if result.truncated:
@@ -959,6 +972,7 @@ class ImageArtifactReader:
                 artifact_store,
                 artifact.id,
                 max_bytes=MAX_IMAGE_SOURCE_BYTES,
+                missing_as_result=request._missing_as_result,
             )
             if source.truncated:
                 return ToolResult(
@@ -1114,6 +1128,7 @@ class PdfArtifactReader:
                 artifact_store,
                 artifact.id,
                 max_bytes=request.options.max_attachment_bytes,
+                missing_as_result=request._missing_as_result,
             )
             validation_error = _validate_pdf_bytes(result.content)
             if validation_error is not None:
@@ -1140,6 +1155,7 @@ class PdfArtifactReader:
                     artifact_store,
                     artifact.id,
                     max_bytes=MAX_PDF_SOURCE_BYTES,
+                    missing_as_result=request._missing_as_result,
                 )
                 if source.truncated:
                     return ToolResult(
@@ -1942,12 +1958,22 @@ async def _read_artifact_store(
     artifact_id: str,
     *,
     max_bytes: int,
+    missing_as_result: bool = False,
 ) -> ArtifactReadResult:
-    return copy_artifact_read_result(
-        await artifact_store.read_bytes(artifact_id, max_bytes=max_bytes),
-        expected_artifact_id=artifact_id,
-        max_content_bytes=max_bytes,
-    )
+    try:
+        return copy_artifact_read_result(
+            await artifact_store.read_bytes(artifact_id, max_bytes=max_bytes),
+            expected_artifact_id=artifact_id,
+            max_content_bytes=max_bytes,
+        )
+    except FileNotFoundError as exc:
+        if missing_as_result:
+            raise _ArtifactReadNotFound from exc
+        raise
+
+
+class _ArtifactReadNotFound(Exception):
+    pass
 
 
 def _missing_workspace_result() -> ToolResult:
@@ -1960,6 +1986,14 @@ def _missing_workspace_result() -> ToolResult:
 def _missing_artifact_store_result() -> ToolResult:
     return ToolResult(
         content="No artifact store configured for this tool call.",
+        is_error=True,
+    )
+
+
+def _missing_artifact_result(artifact_id: str) -> ToolResult:
+    return ToolResult(
+        content="Artifact was not found.",
+        structured={"artifact_id": artifact_id, "reason": "not_found"},
         is_error=True,
     )
 

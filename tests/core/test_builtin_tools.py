@@ -30,7 +30,7 @@ from cayu import (
     SecretRedactor,
     file_attachment,
 )
-from cayu.artifacts import LocalArtifactStore
+from cayu.artifacts import ArtifactStoreUnavailableError, LocalArtifactStore
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.core.tools import (
     _POLICY_DENIAL_TEXT_MAX_BYTES,
@@ -102,6 +102,7 @@ TINY_PNG_BYTES = (
     b"\x00\x00\x00\x0cIDATx\x9cc\xf8\xcf\xc0\x00\x00"
     b"\x03\x01\x01\x00\xc9\xfe\x92\xef\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+MISSING_ARTIFACT_ID = f"art_{'0' * 32}"
 
 
 class FakeProvider(ModelProvider):
@@ -317,6 +318,114 @@ class SyntheticArtifactStore(ArtifactStore):
             total_bytes=self.size_bytes,
             truncated=read_size < self.size_bytes,
         )
+
+    async def list(self, **kwargs):
+        raise NotImplementedError
+
+    async def delete(self, artifact_id: str) -> None:
+        raise NotImplementedError
+
+
+class FailingReadArtifactStore(ArtifactStore):
+    id = "failing-read"
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def put_bytes(self, content: bytes, **kwargs):
+        raise NotImplementedError
+
+    async def read_bytes(self, artifact_id: str, *, max_bytes: int | None = None):
+        del artifact_id, max_bytes
+        raise self.error
+
+    async def list(self, **kwargs):
+        raise NotImplementedError
+
+    async def delete(self, artifact_id: str) -> None:
+        raise NotImplementedError
+
+
+class DisappearingRereadArtifactStore(ArtifactStore):
+    id = "disappearing-reread"
+
+    def __init__(
+        self,
+        *,
+        artifact_id: str,
+        filename: str,
+        content_type: str,
+        content: bytes,
+        error: FileNotFoundError,
+        session_id: str = "sess_1",
+    ) -> None:
+        self.artifact_id = artifact_id
+        self.filename = filename
+        self.content_type = content_type
+        self.content = content
+        self.error = error
+        self.session_id = session_id
+        self.read_count = 0
+
+    async def put_bytes(self, content: bytes, **kwargs):
+        raise NotImplementedError
+
+    async def read_bytes(self, artifact_id: str, *, max_bytes: int | None = None):
+        assert artifact_id == self.artifact_id
+        self.read_count += 1
+        if self.read_count > 1:
+            raise self.error
+        content = self.content if max_bytes is None else self.content[:max_bytes]
+        return ArtifactReadResult(
+            metadata=ArtifactMetadata(
+                id=self.artifact_id,
+                filename=self.filename,
+                content_type=self.content_type,
+                size_bytes=len(self.content),
+                session_id=self.session_id,
+            ),
+            content=content,
+            total_bytes=len(self.content),
+            truncated=len(content) < len(self.content),
+        )
+
+    async def list(self, **kwargs):
+        raise NotImplementedError
+
+    async def delete(self, artifact_id: str) -> None:
+        raise NotImplementedError
+
+
+class VanishingPublishedArtifactStore(FailingReadArtifactStore):
+    async def put_bytes(self, content: bytes, **kwargs):
+        return ArtifactMetadata(
+            id=MISSING_ARTIFACT_ID,
+            filename=kwargs["filename"],
+            content_type=kwargs["content_type"],
+            size_bytes=len(content),
+            scope=kwargs["scope"],
+            session_id=kwargs.get("session_id"),
+            agent_name=kwargs.get("agent_name"),
+            environment_name=kwargs.get("environment_name"),
+            metadata=kwargs.get("metadata", {}),
+        )
+
+
+class BlockingReadArtifactStore(ArtifactStore):
+    id = "blocking-read"
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def put_bytes(self, content: bytes, **kwargs):
+        raise NotImplementedError
+
+    async def read_bytes(self, artifact_id: str, *, max_bytes: int | None = None):
+        del artifact_id, max_bytes
+        self.started.set()
+        await self.release.wait()
+        raise AssertionError("cancelled artifact read unexpectedly resumed")
 
     async def list(self, **kwargs):
         raise NotImplementedError
@@ -1581,6 +1690,25 @@ def test_read_file_returns_not_found_error_when_workspace_attachment_disappears(
     assert result.is_error is True
 
 
+def test_read_file_does_not_misclassify_missing_published_workspace_snapshot(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = LocalWorkspace(workspace_root, workspace_id="local")
+    error = FileNotFoundError("published artifact disappeared")
+    artifact_store = VanishingPublishedArtifactStore(error)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+    asyncio.run(workspace.write_bytes("invoice.pdf", _tiny_pdf_bytes()))
+
+    with pytest.raises(FileNotFoundError) as raised:
+        asyncio.run(ReadFileTool().run(ctx, {"path": "invoice.pdf"}))
+
+    assert raised.value is error
+
+
 def test_read_file_forwards_pages_for_workspace_pdf_snapshot(tmp_path):
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
@@ -2011,6 +2139,150 @@ def test_artifact_store_tools_read_and_list_artifacts(tmp_path):
     ]
     assert "shared.txt" in list_environment_result.content
     assert list_environment_result.structured["scope"] == "environment"
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["raw", "invocation-wrapped"])
+def test_read_file_returns_structured_result_for_missing_local_artifact(
+    tmp_path,
+    wrapped: bool,
+) -> None:
+    local_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    artifact_store: ArtifactStore = local_store
+    if wrapped:
+        tracker = InvocationSecretTracker(SecretRedactor())
+        artifact_store = InvocationArtifactStoreHandle(
+            local_store,
+            redactor_snapshot_provider=tracker.snapshot,
+            capture_observer=tracker.record_ambiguous_output_capture,
+        )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": MISSING_ARTIFACT_ID}))
+
+    assert result.content == "Artifact was not found."
+    assert result.structured == {
+        "artifact_id": MISSING_ARTIFACT_ID,
+        "reason": "not_found",
+    }
+    assert result.is_error is True
+
+
+def test_read_file_keeps_invalid_artifact_id_distinct_from_absence(tmp_path) -> None:
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": "invalid"}))
+
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "must match the local artifact id format" in result.content
+    assert result.content != "Artifact was not found."
+    assert result.is_error is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermissionError("artifact authorization failed"),
+        ArtifactStoreUnavailableError("artifact backend unavailable"),
+        ExceptionGroup(
+            "ambiguous artifact failure",
+            [FileNotFoundError("missing"), PermissionError("denied")],
+        ),
+    ],
+    ids=["authorization", "unavailable", "grouped"],
+)
+def test_read_file_does_not_misclassify_non_absence_artifact_failures(
+    error: BaseException,
+) -> None:
+    artifact_store = FailingReadArtifactStore(error)
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    with pytest.raises(type(error)) as raised:
+        asyncio.run(ReadFileTool().run(ctx, {"artifact_id": MISSING_ARTIFACT_ID}))
+
+    assert raised.value is error
+
+
+def test_read_file_preserves_real_task_cancellation_during_artifact_read() -> None:
+    async def exercise() -> None:
+        artifact_store = BlockingReadArtifactStore()
+        ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+        task = asyncio.create_task(ReadFileTool().run(ctx, {"artifact_id": MISSING_ARTIFACT_ID}))
+        await artifact_store.started.wait()
+
+        task.cancel()
+
+        assert task.cancelling() == 1
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert task.cancelled() is True
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("filename", "content_type", "content"),
+    [
+        pytest.param("image.png", "image/png", TINY_PNG_BYTES, id="image"),
+        pytest.param("document.pdf", "application/pdf", None, id="pdf"),
+    ],
+)
+def test_read_file_returns_missing_result_when_native_artifact_disappears_during_reread(
+    filename: str,
+    content_type: str,
+    content: bytes | None,
+) -> None:
+    if content is None:
+        content = _tiny_pdf_bytes()
+    backend_canary = "/private/backend/tenant-secret/disappeared-artifact"
+    artifact_store = DisappearingRereadArtifactStore(
+        artifact_id=MISSING_ARTIFACT_ID,
+        filename=filename,
+        content_type=content_type,
+        content=content,
+        error=FileNotFoundError(backend_canary),
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"artifact_id": MISSING_ARTIFACT_ID}))
+
+    assert result.content == "Artifact was not found."
+    assert result.structured == {
+        "artifact_id": MISSING_ARTIFACT_ID,
+        "reason": "not_found",
+    }
+    assert result.is_error is True
+    assert artifact_store.read_count == 2
+    assert backend_canary not in json.dumps(result.model_dump(mode="json"))
+
+
+def test_read_file_does_not_misclassify_custom_reader_file_not_found() -> None:
+    class MissingDependencyReader:
+        def can_read(self, artifact: ArtifactMetadata) -> bool:
+            return artifact.content_type == "application/x-custom"
+
+        async def read(self, request: ArtifactReadRequest) -> ToolResult:
+            del request
+            raise FileNotFoundError("custom reader dependency was not found")
+
+    artifact_store = DisappearingRereadArtifactStore(
+        artifact_id=MISSING_ARTIFACT_ID,
+        filename="custom.bin",
+        content_type="application/x-custom",
+        content=b"custom",
+        error=FileNotFoundError("store reread should not occur"),
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+
+    with pytest.raises(FileNotFoundError, match="custom reader dependency"):
+        asyncio.run(
+            ReadFileTool(extra_artifact_readers=[MissingDependencyReader()]).run(
+                ctx,
+                {"artifact_id": MISSING_ARTIFACT_ID},
+            )
+        )
+
+    assert artifact_store.read_count == 1
 
 
 def test_read_file_requires_exactly_one_source(tmp_path):
@@ -3762,6 +4034,78 @@ def test_exec_command_tool_returns_error_without_runner():
 
     assert result.is_error is True
     assert result.content == "No runner configured for this tool call."
+
+
+def test_runtime_treats_missing_artifact_as_recoverable_safe_tool_result() -> None:
+    backend_canary = "/private/backend/tenant-secret/missing-artifact"
+    artifact_store = DisappearingRereadArtifactStore(
+        artifact_id=MISSING_ARTIFACT_ID,
+        filename="missing.png",
+        content_type="image/png",
+        content=TINY_PNG_BYTES,
+        error=FileNotFoundError(backend_canary),
+        session_id="sess_missing_artifact",
+    )
+    provider = FakeProvider(
+        [
+            [
+                ModelStreamEvent.tool_call(
+                    id="call_1",
+                    name="read_file",
+                    arguments={"artifact_id": MISSING_ARTIFACT_ID},
+                ),
+                ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+            ],
+            [ModelStreamEvent.completed({"finish_reason": "stop"})],
+        ]
+    )
+    app = CayuApp(enable_logging=False)
+    app.register_provider(provider, default=True)
+    app.register_environment(
+        Environment(EnvironmentSpec(name="local-dev"), artifact_store=artifact_store),
+        default=True,
+    )
+    app.register_agent(
+        AgentSpec(name="assistant", model="fake-model"),
+        tools=[ReadFileTool()],
+    )
+
+    events = asyncio.run(
+        collect_events(
+            app,
+            RunRequest(
+                agent_name="assistant",
+                session_id="sess_missing_artifact",
+                messages=[Message.text("user", "read the artifact")],
+            ),
+        )
+    )
+
+    assert events[-1].type == EventType.SESSION_COMPLETED
+    failed = next(event for event in events if event.type == EventType.TOOL_CALL_FAILED)
+    assert failed.payload["result"]["content"] == "Artifact was not found."
+    assert failed.payload["result"]["structured"] == {
+        "artifact_id": MISSING_ARTIFACT_ID,
+        "reason": "not_found",
+    }
+    assert failed.payload["result"]["is_error"] is True
+    assert all(event.type != EventType.TOOL_CALL_COMPLETED for event in events)
+    assert artifact_store.read_count == 2
+    assert len(provider.requests) == 2
+
+    transcript = asyncio.run(app.session_store.load_transcript("sess_missing_artifact"))
+    published = json.dumps(
+        {
+            "events": [event.model_dump(mode="json") for event in events],
+            "transcript": [message.model_dump(mode="json") for message in transcript],
+            "provider_request": [
+                message.model_dump(mode="json") for message in provider.requests[1].messages
+            ],
+        },
+        sort_keys=True,
+    )
+    assert backend_canary not in published
+    assert "Artifact was not found." in published
 
 
 def test_runtime_passes_environment_services_to_tool_context(tmp_path):
