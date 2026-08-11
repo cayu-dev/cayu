@@ -99,6 +99,7 @@ from cayu.runtime import (
     DispatchStatus,
     InMemoryEventSink,
     LoopPolicy,
+    ModelTarget,
     ResolutionActor,
     ResumeRequest,
     RetryPolicy,
@@ -3163,13 +3164,13 @@ def test_resume_request_requires_existing_session_id_and_new_messages():
     request = ResumeRequest(
         session_id="sess_existing",
         messages=[Message.text("user", "continue")],
-        model="upgraded-model",
+        target=ModelTarget(provider_name="fake", model="upgraded-model"),
         metadata={"source": "test"},
     )
 
     assert request.session_id == "sess_existing"
     assert request.messages[0].content[0].text == "continue"
-    assert request.model == "upgraded-model"
+    assert request.target == ModelTarget(provider_name="fake", model="upgraded-model")
     assert request.metadata == {"source": "test"}
     assert request.max_steps == 16
 
@@ -3186,7 +3187,7 @@ def test_resume_request_requires_existing_session_id_and_new_messages():
         ResumeRequest(
             session_id="sess_existing",
             messages=[Message.text("user", "continue")],
-            model=" ",
+            target=ModelTarget(provider_name="fake", model=" "),
         )
 
 

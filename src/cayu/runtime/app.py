@@ -2011,7 +2011,7 @@ class CayuApp:
         resume_request = ResumeRequest(
             session_id=request.session_id,
             messages=request.messages,
-            model=request.model,
+            target=request.target,
             metadata=request.metadata,
             max_steps=request.max_steps,
             limits=request.limits,

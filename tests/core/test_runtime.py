@@ -157,6 +157,7 @@ from cayu.runtime import (
     MessageWindowContextPolicy,
     ModelCompactor,
     ModelPrice,
+    ModelTarget,
     NativeStructuredOutputUnsupported,
     ObservedDeltaContextEstimator,
     ParameterConstrainedToolPolicy,
@@ -23590,7 +23591,7 @@ def test_cayu_app_resume_model_updates_session_active_model():
             ResumeRequest(
                 session_id="sess_model_update",
                 messages=[Message.text("user", "second request")],
-                model="upgraded-model",
+                target=ModelTarget(provider_name="fake", model="upgraded-model"),
             ),
         )
     )
@@ -23598,8 +23599,9 @@ def test_cayu_app_resume_model_updates_session_active_model():
     session_after_update = asyncio.run(store.load("sess_model_update"))
     assert session_after_update is not None
     assert session_after_update.model == "upgraded-model"
-    assert second_events[1].type == EventType.MODEL_STARTED
-    assert second_events[1].payload["model"] == "upgraded-model"
+    assert second_events[0].type == EventType.SESSION_MODEL_SWITCHED
+    model_started = next(event for event in second_events if event.type == EventType.MODEL_STARTED)
+    assert model_started.payload["model"] == "upgraded-model"
 
     asyncio.run(
         collect_resume_events(
@@ -54079,12 +54081,12 @@ def test_in_memory_session_store_checkpoints_json_state_and_isolates_it():
         asyncio.run(store.checkpoint("sess_checkpoint", "bad"))  # type: ignore[arg-type]
 
 
-def test_resume_request_rejects_blank_model():
+def test_resume_request_rejects_blank_model_target():
     with pytest.raises(ValueError, match="model"):
         ResumeRequest(
             session_id="sess_blank_model",
             messages=[Message.text("user", "hi")],
-            model=" ",
+            target=ModelTarget(provider_name="fake", model=" "),
         )
 
 

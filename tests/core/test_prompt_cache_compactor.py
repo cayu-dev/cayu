@@ -19,6 +19,7 @@ from cayu import (
     LocalArtifactStore,
     Message,
     ModelCompactor,
+    ModelTarget,
     PromptCacheCompactor,
     ResumeRequest,
     RetryPolicy,
@@ -1623,7 +1624,7 @@ def test_cayu_app_resume_model_override_cannot_reuse_previous_model_cache() -> N
             app.resume(
                 ResumeRequest(
                     session_id="app-cache-model-override",
-                    model="new-model",
+                    target=ModelTarget(provider_name="sequenced", model="new-model"),
                     messages=[Message.text("user", "second request")],
                 )
             )

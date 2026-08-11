@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from cayu.core import AgentSpec, Event, EventType, Message
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
-from cayu.runtime import CayuApp, ResumeRequest, RunRequest
+from cayu.runtime import CayuApp, ModelTarget, ResumeRequest, RunRequest
 from cayu.runtime.sessions import copy_run_request
 
 
@@ -370,7 +370,7 @@ def test_resume_honors_session_provider_not_model_pattern_route() -> None:
             app,
             ResumeRequest(
                 session_id="sess_model_pattern_resume",
-                model="claude-sonnet-4-6",
+                target=ModelTarget(provider_name="openai", model="claude-sonnet-4-6"),
                 messages=[Message.text("user", "again")],
             ),
         )

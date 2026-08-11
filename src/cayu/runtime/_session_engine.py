@@ -80,6 +80,7 @@ from cayu.runtime import _approval_publication as approval_publication
 from cayu.runtime import _approval_support as approval_support
 from cayu.runtime import _invocation_secrets as invocation_secrets
 from cayu.runtime import _model_completion_publication as model_completion_publication
+from cayu.runtime import _model_target as model_target
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
 from cayu.runtime import _session_request_boundary as session_request_boundary
@@ -224,6 +225,7 @@ from cayu.runtime.context import (
     sanitize_context_build_error_checkpoint,
     sanitize_context_build_result_checkpoint,
     sanitize_context_compaction_telemetry,
+    validate_context_messages,
 )
 from cayu.runtime.costs import (
     SessionCostSummary,
@@ -291,6 +293,7 @@ from cayu.runtime.sessions import (
     _INCOMPLETE_RECOVERY_CLAIM_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_CHECKPOINT_KEY,
     _SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    FORK_TRANSCRIPT_VALIDATION_ERROR,
     INITIAL_TRANSCRIPT_PENDING_CHECKPOINT_KEY,
     SESSION_STARTED_INPUT_CONTRACT_PAYLOAD_KEY,
     CompactSessionRequest,
@@ -306,6 +309,7 @@ from cayu.runtime.sessions import (
     InteractionTransitionResult,
     InteractionTransitionSpec,
     InterruptSessionRequest,
+    ModelTarget,
     ResumeRequest,
     RunRequest,
     RuntimePublicationRequest,
@@ -314,6 +318,7 @@ from cayu.runtime.sessions import (
     SessionForkSourceNotFound,
     SessionIdentity,
     SessionMessageDeliveryBatch,
+    SessionModelTransition,
     SessionOperationPublication,
     SessionOrder,
     SessionQuery,
@@ -322,6 +327,7 @@ from cayu.runtime.sessions import (
     SessionStatusConflict,
     SessionStore,
     TranscriptQuery,
+    TranscriptSnapshot,
     _activate_session_interaction,
     _checkpoint_with_session_run_operation,
     _clear_session_interaction_recovered_active_through,
@@ -337,6 +343,7 @@ from cayu.runtime.sessions import (
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
+    _session_metadata_with_model_projection,
     _session_run_operation_from_checkpoint,
     _set_session_interaction_recovered_active_through,
     attribute_event_to_current_interaction,
@@ -350,6 +357,8 @@ from cayu.runtime.sessions import (
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     session_input_contract_evidence,
+    session_input_messages_sha256,
+    session_model_projection_cursor,
 )
 from cayu.runtime.stop_policy import (
     RunLimits,
@@ -876,6 +885,25 @@ def _interaction_transition_replay_is_authoritatively_rejected(
         if not isinstance(candidate, BaseExceptionGroup)
     )
     return bool(leaves) and all(isinstance(leaf, SessionStatusConflict) for leaf in leaves)
+
+
+def _transcript_snapshot_messages(snapshot: TranscriptSnapshot) -> list[Message]:
+    return [detach_message(record.message) for record in snapshot.records]
+
+
+def _project_model_target_snapshot(
+    snapshot: TranscriptSnapshot,
+    projection_cursor: int,
+) -> model_target.PortableTranscriptProjection:
+    """Project retained rows preceding one permanent absolute cursor."""
+
+    if projection_cursor > snapshot.cursor:
+        raise ValueError("Model-target projection cursor exceeds the session transcript.")
+    prefix_count = sum(record.index < projection_cursor for record in snapshot.records)
+    return model_target.project_portable_transcript_prefix(
+        _transcript_snapshot_messages(snapshot),
+        prefix_count,
+    )
 
 
 def _session_operation_heartbeat_failure(task: asyncio.Task[None]) -> BaseException:
@@ -4186,13 +4214,27 @@ class SessionEngine:
             loaded_session.environment_name
         )
         environment_name = _environment_name(registered_environment)
-        transcript = await self.session_store.load_transcript(loaded_session.id)
-        source_transcript_cursor = len(transcript)
-        if source_transcript_cursor != request.expected_transcript_cursor:
-            raise ValueError(
-                "Session compaction source transcript cursor is stale: expected "
-                f"{request.expected_transcript_cursor}, current {source_transcript_cursor}."
-            )
+        transcript_snapshot = await self.session_store.load_transcript_snapshot(loaded_session.id)
+        try:
+            source_transcript_cursor = transcript_snapshot.cursor
+            if source_transcript_cursor != request.expected_transcript_cursor:
+                raise ValueError(
+                    "Session compaction source transcript cursor is stale: expected "
+                    f"{request.expected_transcript_cursor}, current {source_transcript_cursor}."
+                )
+            projection_cursor = session_model_projection_cursor(loaded_session)
+            if projection_cursor:
+                transcript = list(
+                    _project_model_target_snapshot(
+                        transcript_snapshot,
+                        projection_cursor,
+                    ).messages
+                )
+            else:
+                transcript = _transcript_snapshot_messages(transcript_snapshot)
+            retained_transcript_count = len(transcript_snapshot.records)
+        finally:
+            del transcript_snapshot
         transcript, transcript_is_valid = session_request_boundary.redact_transcript(
             transcript,
             redactor=self._secret_redactor,
@@ -4204,7 +4246,7 @@ class SessionEngine:
                 "Session transcript contains a workload secret in execution authority "
                 "and cannot be compacted."
             ) from None
-        if len(transcript) != source_transcript_cursor:
+        if len(transcript) != retained_transcript_count:
             raise AssertionError("Session transcript projection changed its message count.")
 
         candidate_app_policy_budget_limits = budget_limits_for_session(
@@ -7804,9 +7846,30 @@ class SessionEngine:
                 field_name=field_name,
                 redactor=self._secret_redactor,
             )
+        loaded_projection_cursor = session_model_projection_cursor(loaded_session)
 
         registered_agent = self._get_registered_agent(loaded_session.agent_name)
-        registered_provider = self._get_registered_provider(loaded_session.provider_name)
+        requested_target = request.target
+        target_changed = requested_target is not None and (
+            requested_target.provider_name != loaded_session.provider_name
+            or requested_target.model != loaded_session.model
+        )
+        request_projection = None
+        if target_changed or loaded_projection_cursor:
+            request_projection = model_target.project_portable_transcript(request.messages)
+            if (
+                request_projection.provider_state_parts_dropped
+                or request_projection.thinking_parts_dropped
+            ):
+                raise ValueError(
+                    "New resume messages after model-target adoption cannot contain "
+                    "provider state or thinking parts."
+                )
+        registered_provider = self._get_registered_provider(
+            requested_target.provider_name
+            if target_changed and requested_target is not None
+            else loaded_session.provider_name
+        )
         # Checked before the status transition so it surfaces to the caller.
         _require_native_structured_output_support(
             request.structured_output, registered_provider=registered_provider
@@ -7814,19 +7877,35 @@ class SessionEngine:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
-        if self._secret_redactor.has_values:
-            preflight_transcript = await self.session_store.load_transcript(loaded_session.id)
-            redacted_preflight, transcript_is_valid = session_request_boundary.redact_transcript(
-                preflight_transcript,
-                redactor=self._secret_redactor,
-                field_name="session.transcript",
+        if loaded_projection_cursor or self._secret_redactor.has_values:
+            preflight_snapshot = await self.session_store.load_transcript_snapshot(
+                loaded_session.id
             )
-            redacted_preflight.clear()
-            if not transcript_is_valid:
-                raise ValueError(
-                    "Session transcript contains a workload secret in execution authority "
-                    "and cannot be resumed."
-                ) from None
+            preflight_transcript: list[Message] = []
+            try:
+                preflight_transcript = _transcript_snapshot_messages(preflight_snapshot)
+                if loaded_projection_cursor:
+                    _project_model_target_snapshot(
+                        preflight_snapshot,
+                        loaded_projection_cursor,
+                    )
+                if self._secret_redactor.has_values:
+                    redacted_preflight, transcript_is_valid = (
+                        session_request_boundary.redact_transcript(
+                            preflight_transcript,
+                            redactor=self._secret_redactor,
+                            field_name="session.transcript",
+                        )
+                    )
+                    redacted_preflight.clear()
+                    if not transcript_is_valid:
+                        raise ValueError(
+                            "Session transcript contains a workload secret in execution "
+                            "authority and cannot be resumed."
+                        ) from None
+            finally:
+                preflight_transcript.clear()
+                del preflight_snapshot
 
         run_operation_id = str(uuid4())
 
@@ -7933,6 +8012,10 @@ class SessionEngine:
         pending_model_completion = (
             await self._recovery_coordinator.preflight_model_completion_boundary(loaded_session)
         )
+        if target_changed and pending_model_completion:
+            raise RuntimeError(
+                "A session model target cannot change while model-completion recovery is pending."
+            )
         (
             loaded_session,
             checkpoint,
@@ -7947,6 +8030,63 @@ class SessionEngine:
         existing_deferred_input = await self.session_store.load_deferred_interaction_input(
             loaded_session.id
         )
+        if target_changed and (pending_round is not None or existing_deferred_input is not None):
+            raise RuntimeError(
+                "A session model target cannot change while tool-round recovery or deferred "
+                "interaction input is pending."
+            )
+        source_transcript: list[Message] | None = None
+        source_transcript_digest: str | None = None
+        source_transcript_cursor: int | None = None
+        provider_state_parts_dropped = 0
+        thinking_parts_dropped = 0
+        if target_changed:
+            if requested_target is None:
+                raise AssertionError("Changed model target lost its requested identity.")
+            source_snapshot = await self.session_store.load_transcript_snapshot(loaded_session.id)
+            try:
+                source_transcript = _transcript_snapshot_messages(source_snapshot)
+                source_transcript_cursor = source_snapshot.cursor
+            finally:
+                del source_snapshot
+            portable_projection = None
+            try:
+                source_transcript_digest = session_input_messages_sha256(source_transcript)
+                portable_projection = model_target.project_portable_transcript(source_transcript)
+                provider_state_parts_dropped = portable_projection.provider_state_parts_dropped
+                thinking_parts_dropped = portable_projection.thinking_parts_dropped
+                if request_projection is None:
+                    raise AssertionError("Changed model target lost its request projection.")
+                portable_source_messages, transcript_is_valid = (
+                    session_request_boundary.redact_transcript(
+                        list(portable_projection.messages),
+                        redactor=self._secret_redactor,
+                        field_name="session.transcript",
+                    )
+                )
+                if not transcript_is_valid:
+                    raise ValueError(
+                        "Session transcript contains a workload secret in execution authority "
+                        "and cannot be resumed."
+                    ) from None
+                portable_messages = [
+                    *portable_source_messages,
+                    *request_projection.messages,
+                ]
+                portable_source_messages.clear()
+                validate_context_messages(portable_messages)
+                hook_messages = [detach_message(message) for message in portable_messages]
+                portable_messages.clear()
+                try:
+                    registered_provider.provider.preflight_portable_messages(
+                        model=requested_target.model,
+                        messages=hook_messages,
+                    )
+                finally:
+                    hook_messages.clear()
+            finally:
+                source_transcript.clear()
+                portable_projection = None
         if continuing_recovery_boundary:
             interaction_id = await self._activate_latest_open_interaction(loaded_session.id)
             if interaction_id is None:
@@ -7963,6 +8103,61 @@ class SessionEngine:
                 environment_name=_environment_name(registered_environment),
                 interaction_id=interaction_id,
             )
+        model_transition = None
+        model_transition_event = None
+        if target_changed:
+            if (
+                requested_target is None
+                or source_transcript_digest is None
+                or source_transcript_cursor is None
+            ):
+                raise AssertionError("Changed model target lost its portable projection.")
+            model_transition_event = event_with_runtime_payload_authority(
+                event_with_runtime_envelope_authority(
+                    event_with_runtime_generated_id(
+                        Event(
+                            id=str(uuid4()),
+                            type=EventType.SESSION_MODEL_SWITCHED,
+                            session_id=loaded_session.id,
+                            interaction_id=interaction_id,
+                            timestamp=(
+                                interaction_started_event.timestamp
+                                if interaction_started_event is not None
+                                else self._clock()
+                            ),
+                            agent_name=registered_agent.spec.name,
+                            environment_name=_environment_name(registered_environment),
+                            payload={
+                                "source_provider_name": loaded_session.provider_name,
+                                "source_model": loaded_session.model,
+                                "target_provider_name": requested_target.provider_name,
+                                "target_model": requested_target.model,
+                                "provider_changed": (
+                                    loaded_session.provider_name != requested_target.provider_name
+                                ),
+                                "model_changed": loaded_session.model != requested_target.model,
+                                "provider_state_parts_dropped": provider_state_parts_dropped,
+                                "thinking_parts_dropped": thinking_parts_dropped,
+                                "source_transcript_cursor": source_transcript_cursor,
+                                "cache_state_dropped": True,
+                                "full_transcript_projection": True,
+                            },
+                        )
+                    ),
+                    "session_id",
+                    "interaction_id",
+                ),
+                "source_provider_name",
+                "source_model",
+                "target_provider_name",
+                "target_model",
+            )
+            model_transition = SessionModelTransition(
+                target=requested_target,
+                event=model_transition_event,
+                source_transcript_digest=source_transcript_digest,
+                source_transcript_cursor=source_transcript_cursor,
+            )
         if (
             existing_deferred_input is not None
             and existing_deferred_input.interaction_id != interaction_id
@@ -7978,6 +8173,9 @@ class SessionEngine:
             ),
             *request.messages,
         ]
+        model_transition_kwargs: dict[str, Any] = {}
+        if model_transition is not None:
+            model_transition_kwargs["model_transition"] = model_transition
         try:
             session = await self.session_store.transition_status_and_checkpoint(
                 loaded_session.id,
@@ -7988,6 +8186,7 @@ class SessionEngine:
                 interaction_source_messages=interaction_source_messages,
                 continued_interaction_id=(interaction_id if continuing_recovery_boundary else None),
                 defer_interaction_source=continuing_recovery_boundary,
+                **model_transition_kwargs,
             )
         except BaseException:
             if continuing_recovery_boundary:
@@ -7998,9 +8197,15 @@ class SessionEngine:
                 raise RuntimeError("New interaction admission produced no interaction identity.")
             _activate_session_interaction(session.id, interaction_id)
         try:
-            if interaction_started_event is not None:
-                await self._event_writer.fan_out_persisted([interaction_started_event])
-                yield interaction_started_event
+            admission_events = [
+                event
+                for event in (model_transition_event, interaction_started_event)
+                if event is not None
+            ]
+            if admission_events:
+                await self._event_writer.fan_out_persisted(admission_events)
+                for admission_event in admission_events:
+                    yield admission_event
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
                 session
             )
@@ -8024,9 +8229,14 @@ class SessionEngine:
                 await self.session_store.release_run_fence(session.id)
                 _deactivate_session_interaction(session.id)
                 return
-            if request.model is not None:
-                session = await self.session_store.update_model(session.id, request.model)
-            transcript = await self.session_store.load_transcript(session.id)
+            projection_cursor = session_model_projection_cursor(session)
+            if projection_cursor:
+                transcript_snapshot = await self.session_store.load_transcript_snapshot(session.id)
+                transcript = list(
+                    _project_model_target_snapshot(transcript_snapshot, projection_cursor).messages
+                )
+            else:
+                transcript = await self.session_store.load_transcript(session.id)
             transcript, transcript_is_valid = session_request_boundary.redact_transcript(
                 transcript,
                 redactor=self._secret_redactor,
@@ -8298,6 +8508,75 @@ class SessionEngine:
             )
         registered_environment = self._get_registered_environment_for_session(environment_name)
 
+        source_projection_cursor = session_model_projection_cursor(source_session)
+        model_changed = model != source_session.model
+        expected_fork_transcript: tuple[Message, ...] | None = None
+        fork_projection_cursor = 0
+        if model_changed or source_projection_cursor:
+            source_snapshot = await self.session_store.load_transcript_snapshot(source_session.id)
+            if source_projection_cursor > source_snapshot.cursor:
+                del source_snapshot
+                raise ValueError(
+                    "Source session model-target projection cursor exceeds its transcript."
+                )
+            if request.transcript_cursor is not None:
+                if request.transcript_cursor > source_snapshot.cursor:
+                    del source_snapshot
+                    raise ValueError("transcript_cursor is greater than source transcript length.")
+                selected_source_records = [
+                    record
+                    for record in source_snapshot.records
+                    if record.index < request.transcript_cursor
+                ]
+            else:
+                selected_source_records = list(source_snapshot.records)
+            expected_fork_transcript = tuple(
+                detach_message(record.message) for record in selected_source_records
+            )
+            if (
+                self._secret_redactor.has_values
+                and not session_request_boundary.fork_transcript_is_secret_free(
+                    expected_fork_transcript,
+                    redactor=self._secret_redactor,
+                )
+            ):
+                selected_source_records.clear()
+                expected_fork_transcript = None
+                del source_snapshot
+                raise ValueError(FORK_TRANSCRIPT_VALIDATION_ERROR) from None
+            if model_changed:
+                portable_projection = None
+                portable_messages: list[Message] = []
+                try:
+                    portable_projection = model_target.project_portable_transcript(
+                        list(expected_fork_transcript)
+                    )
+                    portable_messages = [
+                        detach_message(message) for message in portable_projection.messages
+                    ]
+                    validate_context_messages(portable_messages)
+                    try:
+                        registered_provider.provider.preflight_portable_messages(
+                            model=model,
+                            messages=portable_messages,
+                        )
+                    finally:
+                        portable_messages.clear()
+                    fork_projection_cursor = len(expected_fork_transcript)
+                except BaseException:
+                    expected_fork_transcript = None
+                    portable_projection = None
+                    portable_messages.clear()
+                    selected_source_records.clear()
+                    del source_snapshot
+                    raise
+            else:
+                fork_projection_cursor = sum(
+                    record.index < source_projection_cursor for record in selected_source_records
+                )
+            selected_source_records.clear()
+            del source_snapshot
+
         def reject_active_or_expired_recovery_claim(
             source_checkpoint: dict[str, Any] | None,
         ) -> dict[str, Any] | None:
@@ -8414,7 +8693,9 @@ class SessionEngine:
             return fork_checkpoint
 
         def transcript_validator(messages: tuple[Message, ...]) -> bool:
-            return session_request_boundary.fork_transcript_is_secret_free(
+            return (
+                expected_fork_transcript is None or messages == expected_fork_transcript
+            ) and session_request_boundary.fork_transcript_is_secret_free(
                 messages,
                 redactor=self._secret_redactor,
             )
@@ -8424,12 +8705,20 @@ class SessionEngine:
             policy=source_registered_agent.tool_policy,
             request_metadata=source_session.metadata,
         )
-        fork_metadata = request.metadata
+        fork_metadata = copy_json_value(request.metadata, "metadata")
         if inherited_taint_labels:
             fork_metadata = metadata_with_taint_labels(
-                request.metadata,
+                fork_metadata,
                 inherited_taint_labels | taint_labels_from_metadata(request.metadata),
             )
+        fork_metadata = _session_metadata_with_model_projection(
+            fork_metadata,
+            target=ModelTarget(
+                provider_name=registered_provider.name,
+                model=model,
+            ),
+            transcript_cursor=fork_projection_cursor,
+        )
 
         runtime_generated_session_id: str | None = None
         destination_session_id = request.session_id
@@ -8503,7 +8792,7 @@ class SessionEngine:
             )
         )
         try:
-            if self._secret_redactor.has_values:
+            if self._secret_redactor.has_values or expected_fork_transcript is not None:
                 created = await self.session_store.create_fork_with_transcript_validation(
                     source_session_id=source_session.id,
                     fork=fork_session,
@@ -8804,6 +9093,29 @@ class SessionEngine:
             await materialize_deferred_messages()
 
         provider = registered_provider.provider
+        model_projection_cursor = session_model_projection_cursor(session)
+        model_projection_prefix_count = 0
+        if model_projection_cursor:
+            model_projection_snapshot = await self.session_store.load_transcript_snapshot(
+                session.id
+            )
+            if model_projection_cursor > model_projection_snapshot.cursor:
+                raise ValueError("Model-target projection cursor exceeds the session transcript.")
+            deferred_tail_count = len(messages_to_append) if messages_deferred else 0
+            retained_message_count = len(messages) - deferred_tail_count
+            if retained_message_count < 0 or retained_message_count != len(
+                model_projection_snapshot.records
+            ):
+                raise RuntimeError(
+                    "Model-facing transcript does not match the retained durable transcript."
+                )
+            model_projection_prefix_count = sum(
+                record.index < model_projection_cursor
+                for record in model_projection_snapshot.records
+            )
+        # Resume admission already supplied the model-facing projection. A new
+        # session cannot carry projection authority. Later durable transcript
+        # reloads are projected from indexed snapshots below.
         messages = [
             redact_runtime_message_for_boundary(
                 message,
@@ -9274,6 +9586,21 @@ class SessionEngine:
                         continue_active_interaction=True,
                     ):
                         yield event
+                # Recovery paths can rematerialize the durable transcript. Reapply the
+                # stable retained-prefix projection to the already boundary-sanitized
+                # in-memory messages without sanitizing runtime tool controls twice.
+                if model_projection_cursor:
+                    if len(messages) < model_projection_prefix_count:
+                        raise RuntimeError(
+                            "Model-facing transcript lost its retained projection prefix."
+                        )
+                    messages[:] = model_target.project_portable_transcript_prefix(
+                        messages,
+                        model_projection_prefix_count,
+                    ).messages
+                source_transcript_cursor = await self.session_store.load_transcript_cursor(
+                    session.id
+                )
                 budget_evaluation = await limit_gate.evaluate_budget(
                     self._get_budget_policy(),
                     execution_identity=model_step_identity,
@@ -9319,6 +9646,7 @@ class SessionEngine:
                 model_step_events = model_step_run.execute(
                     step=step,
                     messages=messages,
+                    source_transcript_cursor=source_transcript_cursor,
                     model_step_identity=model_step_identity,
                     request_variant=request_variant,
                 )

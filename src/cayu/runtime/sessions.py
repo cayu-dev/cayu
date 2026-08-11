@@ -827,8 +827,8 @@ class RunRequest(BaseModel):
     # request.provider_name -> agent spec provider_name -> model-pattern route ->
     # app default provider.
     provider_name: str | None = None
-    # Per-run model override for new sessions. Resume keeps the stored session
-    # model unless ResumeRequest.model is set.
+    # Per-run model override for new sessions. Resume keeps the stored execution
+    # target unless ResumeRequest.target is set.
     model: str | None = None
     environment_name: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1005,7 +1005,7 @@ class ResumeRequest(BaseModel):
 
     session_id: str
     messages: list[Message]
-    model: str | None = None
+    target: ModelTarget | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
@@ -1054,7 +1054,7 @@ class ResumeRequest(BaseModel):
     def copy_loop_policies(cls, value) -> tuple[LoopPolicy, ...]:
         return validate_loop_policies(value, field_name="loop_policies")
 
-    @field_validator("session_id", "model")
+    @field_validator("session_id")
     @classmethod
     def validate_optional_nonblank_strings(
         cls,
@@ -1952,7 +1952,8 @@ def checkpoint_root_field_projection_from_storage(
 
 ForkTranscriptValidator = Callable[[tuple[Message, ...]], bool]
 FORK_TRANSCRIPT_VALIDATION_ERROR = (
-    "Fork transcript contains a workload secret and cannot be copied without "
+    "Fork transcript failed atomic copy validation because it changed after "
+    "preflight or contains a workload secret and cannot be copied without "
     "changing durable conversation history."
 )
 
@@ -11470,7 +11471,14 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
     return ResumeRequest(
         session_id=request.session_id,
         messages=[detach_message(message) for message in messages],
-        model=request.model,
+        target=(
+            None
+            if request.target is None
+            else ModelTarget(
+                provider_name=request.target.provider_name,
+                model=request.target.model,
+            )
+        ),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),

@@ -1755,11 +1755,17 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
     class PostPreflightTranscriptStore(InMemorySessionStore):
         def __init__(self) -> None:
             super().__init__()
-            self.transcript_loads = 0
+            self.preflight_loaded = False
+            self.injected = False
+
+        async def load_transcript_snapshot(self, session_id: str):
+            snapshot = await super().load_transcript_snapshot(session_id)
+            self.preflight_loaded = True
+            return snapshot
 
         async def load_transcript(self, session_id: str) -> list[Message]:
-            self.transcript_loads += 1
-            if self.transcript_loads == 2:
+            if self.preflight_loaded and not self.injected:
+                self.injected = True
                 await self.append_transcript_messages(
                     session_id,
                     [

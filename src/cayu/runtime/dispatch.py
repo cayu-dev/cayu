@@ -29,6 +29,7 @@ from cayu.runtime.retry_policy import RetryPolicy, copy_retry_policy
 from cayu.runtime.sessions import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
+    ModelTarget,
     SessionStatusConflict,
 )
 from cayu.runtime.stop_policy import RunLimits, copy_run_limits
@@ -64,7 +65,7 @@ class DispatchRequest(BaseModel):
     messages: list[Message]
     dispatch_id: str = Field(default_factory=lambda: str(uuid4()))
     task_id: str | None = None
-    model: str | None = None
+    target: ModelTarget | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
@@ -113,7 +114,7 @@ class DispatchRequest(BaseModel):
     def copy_loop_policies(cls, value) -> tuple[LoopPolicy, ...]:
         return validate_loop_policies(value, field_name="loop_policies")
 
-    @field_validator("session_id", "dispatch_id", "task_id", "model")
+    @field_validator("session_id", "dispatch_id", "task_id")
     @classmethod
     def validate_optional_nonblank_strings(
         cls,
@@ -592,7 +593,14 @@ def copy_dispatch_request(request: DispatchRequest) -> DispatchRequest:
         messages=[detach_message(message) for message in request.messages],
         dispatch_id=request.dispatch_id,
         task_id=request.task_id,
-        model=request.model,
+        target=(
+            None
+            if request.target is None
+            else ModelTarget(
+                provider_name=request.target.provider_name,
+                model=request.target.model,
+            )
+        ),
         metadata=copy_durable_json_value(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
@@ -623,7 +631,11 @@ def redact_dispatch_request(
         ("session_id", request.session_id),
         ("dispatch_id", request.dispatch_id),
         ("task_id", request.task_id),
-        ("model", request.model),
+        (
+            "target.provider_name",
+            None if request.target is None else request.target.provider_name,
+        ),
+        ("target.model", None if request.target is None else request.target.model),
     ):
         if value is not None and redactor.redact_text(value) != value:
             raise ValueError(
@@ -696,7 +708,14 @@ def redact_dispatch_request(
         ],
         dispatch_id=request.dispatch_id,
         task_id=request.task_id,
-        model=request.model,
+        target=(
+            None
+            if request.target is None
+            else ModelTarget(
+                provider_name=request.target.provider_name,
+                model=request.target.model,
+            )
+        ),
         metadata=metadata,
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),

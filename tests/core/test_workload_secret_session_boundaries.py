@@ -21,6 +21,7 @@ from cayu.runtime import (
     ForkSessionRequest,
     InMemorySessionStore,
     InterruptSessionRequest,
+    ModelTarget,
     PublicAuthorityAliasCodec,
     PublicAuthorityAliasKeyring,
     ResolutionActor,
@@ -934,7 +935,7 @@ def test_cayu_app_rejects_secret_bearing_resume_model_before_session_mutation() 
                 app,
                 ResumeRequest(
                     session_id="sess_resume_model_authority",
-                    model=secret,
+                    target=ModelTarget(provider_name="fake", model=secret),
                     messages=[Message.text("user", "continue")],
                 ),
             )

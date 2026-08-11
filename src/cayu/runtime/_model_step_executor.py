@@ -4378,9 +4378,14 @@ class ModelStepRun:
         *,
         step: int,
         messages: list[Message],
+        source_transcript_cursor: int,
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant = RequestVariant.INITIAL,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        if type(source_transcript_cursor) is not int:
+            raise TypeError("source_transcript_cursor must be an int.")
+        if source_transcript_cursor < 0:
+            raise ValueError("source_transcript_cursor must be >= 0.")
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
         context_messages: list[Message]
@@ -4599,6 +4604,7 @@ class ModelStepRun:
             model_request=model_request,
             step=step,
             messages=messages,
+            source_transcript_cursor=source_transcript_cursor,
             model_step_identity=model_step_identity,
             request_variant=request_variant,
         )
@@ -4614,9 +4620,16 @@ class ModelStepRun:
         model_request: ModelRequest,
         step: int,
         messages: list[Message],
+        source_transcript_cursor: int | None = None,
         model_step_identity: ModelStepIdentity,
         request_variant: RequestVariant = RequestVariant.INITIAL,
     ) -> AsyncIterator[tuple[Event | None, ModelStepFlowOutcome | None]]:
+        if source_transcript_cursor is None:
+            source_transcript_cursor = len(messages)
+        elif type(source_transcript_cursor) is not int:
+            raise TypeError("source_transcript_cursor must be an int.")
+        elif source_transcript_cursor < 0:
+            raise ValueError("source_transcript_cursor must be >= 0.")
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
         initial_model_attempt_identity = model_step_identity.new_attempt()
@@ -4818,11 +4831,9 @@ class ModelStepRun:
                 model_attempt_identity=model_attempt_identity,
             )
 
-        # `messages` is the full reconstructed transcript, not the compacted
-        # provider context. The store verifies this proposed cursor atomically
-        # during stage preparation, so any in-memory/durable drift fails before
-        # provider-controlled code runs.
-        source_transcript_cursor = len(messages)
+        # The provider-facing transcript may contain only retained rows after
+        # physical retention. The separately loaded permanent cursor is the
+        # store fence and logical-step identity authority.
         logical_step_id = model_step_identity.model_step_id
         next_dispatch_ordinal = 0
 
@@ -4940,7 +4951,7 @@ class ModelStepRun:
             request_variant=request_variant,
             model_step_identity=model_step_identity,
             initial_model_attempt_identity=initial_model_attempt_identity,
-            transcript_cursor_before_request=len(messages),
+            transcript_cursor_before_request=source_transcript_cursor,
             record_model_completion=record_model_completion,
             settle_provider_dispatch=settle_provider_dispatch,
             prepare_provider_dispatch=prepare_provider_dispatch,

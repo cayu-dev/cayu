@@ -12,6 +12,7 @@ from cayu.runtime._message_redaction import (
 from cayu.runtime.approvals import ResolutionActor
 from cayu.runtime.public_authority import public_authority_alias_is_reserved
 from cayu.runtime.sessions import (
+    MODEL_TARGET_PROJECTION_METADATA_KEY,
     CompactSessionRequest,
     EnqueueSessionMessageRequest,
     ForkSessionRequest,
@@ -145,10 +146,15 @@ def prepare_resume_request(
         field_name="session_id",
         redactor=redactor,
     )
-    for field_name in ("model",):
+    if request.target is not None:
         require_secret_free_session_authority(
-            getattr(request, field_name),
-            field_name=field_name,
+            request.target.provider_name,
+            field_name="target.provider_name",
+            redactor=redactor,
+        )
+        require_secret_free_session_authority(
+            request.target.model,
+            field_name="target.model",
             redactor=redactor,
         )
     return request.model_copy(
@@ -289,6 +295,12 @@ def _require_secret_free_fork_policy_metadata(
 ) -> None:
     """Reject fork policy authority before descriptive metadata is redacted."""
 
+    if MODEL_TARGET_PROJECTION_METADATA_KEY in metadata:
+        metadata.clear()
+        raise ForkAuthorityError(
+            f"metadata[{MODEL_TARGET_PROJECTION_METADATA_KEY!r}] is runtime-owned "
+            "model-target authority."
+        ) from None
     try:
         labels = taint_labels_from_metadata(metadata)
     except (TypeError, ValueError):

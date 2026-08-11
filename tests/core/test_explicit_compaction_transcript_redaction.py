@@ -36,6 +36,7 @@ from cayu.runtime import (
     RunRequest,
     SessionIdentity,
     SessionStatus,
+    TranscriptSnapshot,
 )
 from cayu.runtime.context import ContextBuildResult
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
@@ -968,8 +969,8 @@ def test_explicit_compaction_rechecks_cursor_after_projecting_snapshot() -> None
             self.snapshot_loaded = asyncio.Event()
             self.release_snapshot = asyncio.Event()
 
-        async def load_transcript(self, session_id: str) -> list[Message]:
-            snapshot = await super().load_transcript(session_id)
+        async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+            snapshot = await super().load_transcript_snapshot(session_id)
             self.snapshot_loaded.set()
             await self.release_snapshot.wait()
             return snapshot
