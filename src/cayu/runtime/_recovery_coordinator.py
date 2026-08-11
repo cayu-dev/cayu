@@ -173,7 +173,6 @@ from cayu.runtime.sessions import (
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
-    TranscriptQuery,
     _activate_session_interaction,
     _activate_session_run_fence,
     _checkpoint_with_session_run_operation,
@@ -1240,23 +1239,21 @@ class RecoveryCoordinator:
                 reservation_ids=completed_stage.reservation_ids,
             )
 
-        transcript_page = await self._session_store.query_transcript(
-            TranscriptQuery(
-                session_id=session.id,
-                offset=(
-                    pointer.transcript_end_cursor
-                    if pointer.assistant_message_deferred
-                    else max(0, pointer.transcript_end_cursor - 1)
-                ),
-                limit=2,
-            )
+        transcript_window = await self._session_store.load_transcript_window(
+            session.id,
+            start_index=(
+                pointer.transcript_end_cursor
+                if pointer.assistant_message_deferred
+                else max(0, pointer.transcript_end_cursor - 1)
+            ),
+            limit=2,
         )
-        if transcript_page.total_records < pointer.transcript_end_cursor:
+        if transcript_window.cursor < pointer.transcript_end_cursor:
             raise RuntimeError("The durable model-step pointer extends beyond the transcript.")
         if pointer.assistant_message_published and (
-            not transcript_page.records
-            or transcript_page.records[0].index != pointer.transcript_end_cursor - 1
-            or transcript_page.records[0].message.role != MessageRole.ASSISTANT
+            not transcript_window.records
+            or transcript_window.records[0].index != pointer.transcript_end_cursor - 1
+            or transcript_window.records[0].message.role != MessageRole.ASSISTANT
         ):
             raise RuntimeError(
                 "The durable model-step pointer does not identify its assistant message."
@@ -1280,8 +1277,8 @@ class RecoveryCoordinator:
                     "quarantined_assistant_message",
                     None,
                 )
-            elif transcript_page.records:
-                assistant_message = transcript_page.records[0].message
+            elif transcript_window.records:
+                assistant_message = transcript_window.records[0].message
             assistant_call_parts = tuple(
                 part
                 for part in (() if assistant_message is None else assistant_message.content)
@@ -1290,7 +1287,7 @@ class RecoveryCoordinator:
             assistant_calls = tuple(
                 (part.tool_call_id, part.tool_name, part.arguments) for part in assistant_call_parts
             )
-            if transcript_page.total_records == pointer.transcript_end_cursor:
+            if transcript_window.cursor == pointer.transcript_end_cursor:
                 if pending_pause is None:
                     raise RuntimeError(
                         "The latest model completion requires a pending tool round, but its "
@@ -1338,7 +1335,7 @@ class RecoveryCoordinator:
                         "A pending tool pause remains after its source model step advanced."
                     )
                 next_record = (
-                    transcript_page.records[1] if len(transcript_page.records) > 1 else None
+                    transcript_window.records[1] if len(transcript_window.records) > 1 else None
                 )
                 tool_results = (
                     tuple(
@@ -1442,7 +1439,7 @@ class RecoveryCoordinator:
             pointer=pointer,
             completion_event=copy_event(completion_event),
             pending_tool_round=pending_round,
-            transcript_cursor=transcript_page.total_records,
+            transcript_cursor=transcript_window.cursor,
             recovery_events=recovery_events,
         )
 
@@ -3874,7 +3871,14 @@ class RecoveryCoordinator:
             )
         )
         try:
-            transcript = await self._session_store.load_transcript(session.id)
+            transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
+            try:
+                transcript = [
+                    detach_message(record.message) for record in transcript_snapshot.records
+                ]
+                approval_transcript_cursor = transcript_snapshot.cursor
+            finally:
+                del transcript_snapshot
             approval_events = await self._session_store.load_events(session.id)
             history = approval_support.approval_resolution_history(
                 events=approval_events,
@@ -4654,7 +4658,7 @@ class RecoveryCoordinator:
                 referenced_events=lifecycle_events,
                 expected_statuses={SessionStatus.RUNNING},
                 expected_run_epoch=session.run_epoch,
-                expected_transcript_cursor=len(transcript),
+                expected_transcript_cursor=approval_transcript_cursor,
             )
             prepared_events = prepared_close.request.events
             if len(prepared_events) != 1:
@@ -6907,6 +6911,9 @@ class RecoveryCoordinator:
             await self.materialize_deferred_input_if_present(request.session.id)
             request.messages[:] = await self._session_store.load_transcript(request.session.id)
             return
+        expected_transcript_cursor = await self._session_store.load_transcript_cursor(
+            request.session.id
+        )
         source_checkpoint = await self._session_store.load_checkpoint(request.session.id)
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(source_checkpoint)
         if (
@@ -6929,6 +6936,7 @@ class RecoveryCoordinator:
                 pending_round=pending_round,
                 source_checkpoint=source_checkpoint,
                 retry_allowed=False,
+                expected_transcript_cursor=expected_transcript_cursor,
             ):
                 yield event
             return
@@ -7015,7 +7023,6 @@ class RecoveryCoordinator:
             session_id=request.session.id,
             pending_round=pending_round,
         )
-        durable_transcript = await self._session_store.load_transcript(request.session.id)
         prepared = tool_round_publication.prepare_tool_round_publication(
             session_id=request.session.id,
             pending_round=pending_round,
@@ -7027,7 +7034,7 @@ class RecoveryCoordinator:
                 SessionStatus.INTERRUPTED,
             },
             expected_run_epoch=request.session.run_epoch,
-            expected_transcript_cursor=len(durable_transcript),
+            expected_transcript_cursor=expected_transcript_cursor,
         )
         cancellation = await self._publish_tool_round_with_exact_replay(prepared)
         materialized = await self.materialize_expected_deferred_input(
@@ -7140,6 +7147,7 @@ class RecoveryCoordinator:
         pending_round: tool_round_recovery.PendingToolRound,
         source_checkpoint: dict[str, Any] | None,
         retry_allowed: bool,
+        expected_transcript_cursor: int,
     ) -> AsyncGenerator[Event, None]:
         """Rebuild one reserved finalizer round from its durable model output."""
 
@@ -7351,7 +7359,7 @@ class RecoveryCoordinator:
                 SessionStatus.INTERRUPTED,
             },
             expected_run_epoch=session.run_epoch,
-            expected_transcript_cursor=insert_at,
+            expected_transcript_cursor=expected_transcript_cursor,
             extension=extension,
         )
         cancellation = await self._publish_tool_round_with_exact_replay(prepared)
@@ -7546,6 +7554,7 @@ class RecoveryCoordinator:
         messages: list[Message],
         tail_message_count: int = 0,
         incomplete_recovery_claimed: bool = False,
+        expected_transcript_cursor: int | None = None,
     ) -> AsyncGenerator[Event, None]:
         """Repair one durable pending round strictly from recorded evidence."""
         checkpoint = await self._session_store.load_checkpoint(session.id)
@@ -7556,6 +7565,10 @@ class RecoveryCoordinator:
         )
         if pending_round is None:
             return
+        if expected_transcript_cursor is None:
+            expected_transcript_cursor = await self._session_store.load_transcript_cursor(
+                session.id
+            )
         environment_name = _environment_name(registered_environment)
         if pending_round.agent_name != registered_agent.spec.name:
             raise RuntimeError(
@@ -7626,6 +7639,7 @@ class RecoveryCoordinator:
                 pending_round=pending_round,
                 source_checkpoint=checkpoint,
                 retry_allowed=session.status == SessionStatus.RUNNING,
+                expected_transcript_cursor=expected_transcript_cursor,
             ):
                 yield event
             return
@@ -8033,7 +8047,7 @@ class RecoveryCoordinator:
                 SessionStatus.INTERRUPTED,
             },
             expected_run_epoch=session.run_epoch,
-            expected_transcript_cursor=insert_at,
+            expected_transcript_cursor=expected_transcript_cursor,
         )
         cancellation = await self._publish_tool_round_with_exact_replay(prepared)
         materialized = await self.materialize_expected_deferred_input(
@@ -9945,7 +9959,14 @@ class RecoveryCoordinator:
             )
 
         if pending_tool_round is not None and pending_approval is None:
-            transcript = await self._session_store.load_transcript(session.id)
+            transcript_snapshot = await self._session_store.load_transcript_snapshot(session.id)
+            try:
+                transcript = [
+                    detach_message(record.message) for record in transcript_snapshot.records
+                ]
+                expected_transcript_cursor = transcript_snapshot.cursor
+            finally:
+                del transcript_snapshot
             try:
                 async for event in self.recover_pending_tool_round(
                     session=session,
@@ -9953,6 +9974,7 @@ class RecoveryCoordinator:
                     registered_environment=registered_environment,
                     messages=transcript,
                     incomplete_recovery_claimed=True,
+                    expected_transcript_cursor=expected_transcript_cursor,
                 ):
                     events.append(event)
             except ToolApprovalRequired:

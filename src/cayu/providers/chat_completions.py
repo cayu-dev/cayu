@@ -55,6 +55,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    _preflight_provider_portable_messages,
     copy_usage_dialect,
     privacy_safe_provider_option_projection,
 )
@@ -241,6 +242,29 @@ class ChatCompletionsProvider(ModelProvider):
 
     name = "openai_chat"
     usage_dialect = UsageDialect.OPENAI
+
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+    ) -> None:
+        _preflight_provider_portable_messages(
+            model=model,
+            messages=messages,
+            tools=tools,
+            supports_system_messages=True,
+            supports_tool_history=True,
+            supports_tool_definitions=True,
+            supports_file_attachments=True,
+            tool_name_validator=_validate_chat_completions_tool_name,
+            tool_definition_validator=lambda tool: _chat_completions_tool(
+                tool,
+                clean_schemas=self.clean_schemas,
+                strip_additional_properties=self.strip_additional_properties,
+            ),
+        )
 
     def __init__(
         self,
@@ -1249,11 +1273,7 @@ def _chat_completions_tool(
     if not isinstance(tool, Mapping):
         raise ValueError("Tool definitions must be objects.")
     name = _require_mapping_string(tool, "name")
-    if not _CHAT_COMPLETIONS_TOOL_NAME_RE.fullmatch(name):
-        raise ValueError(
-            "Chat Completions tool names must contain 1-64 letters, numbers, "
-            "underscores, or hyphens."
-        )
+    _validate_chat_completions_tool_name(name)
     description = tool.get("description", "")
     if not isinstance(description, str):
         raise ValueError("Tool description must be a string.")
@@ -1278,6 +1298,14 @@ def _chat_completions_tool(
             "parameters": parameters,
         },
     }
+
+
+def _validate_chat_completions_tool_name(name: str) -> None:
+    if not _CHAT_COMPLETIONS_TOOL_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "Chat Completions tool names must contain 1-64 letters, numbers, "
+            "underscores, or hyphens."
+        )
 
 
 def _clean_schema(

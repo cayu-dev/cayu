@@ -2283,24 +2283,14 @@ class ModelStepExecutor:
         thinking: ThinkingConfig | None,
         step: int,
     ) -> ModelRequest:
-        model_tools = [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": deepcopy(tool.schema),
-            }
-            for tool in registered_agent.tools.values()
-        ]
-        model_messages = context_messages
-        if (
-            structured_output is not None
-            and structured_output.strategy == StructuredOutputStrategy.TOOL
-        ):
-            model_tools.append(structured_output_tool_spec(structured_output))
-            model_messages = _with_structured_output_tool_instruction(
-                context_messages,
-                structured_output,
-            )
+        model_tools = _model_request_tools(
+            registered_agent=registered_agent,
+            structured_output=structured_output,
+        )
+        model_messages = _model_request_messages(
+            messages=context_messages,
+            structured_output=structured_output,
+        )
 
         resolved_attachments, unresolvable_prompt_ids = await _resolved_file_attachments(
             messages=model_messages,
@@ -6984,6 +6974,44 @@ def _session_agent_spec(
     )
 
 
+def _model_request_tools(
+    *,
+    registered_agent: runtime_records.RegisteredAgentState,
+    structured_output: StructuredOutputSpec | None,
+) -> list[dict[str, Any]]:
+    """Build detached tool declarations shared by preflight and model dispatch."""
+
+    tools = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": deepcopy(tool.schema),
+        }
+        for tool in registered_agent.tools.values()
+    ]
+    if (
+        structured_output is not None
+        and structured_output.strategy == StructuredOutputStrategy.TOOL
+    ):
+        tools.append(structured_output_tool_spec(structured_output))
+    return tools
+
+
+def _model_request_messages(
+    *,
+    messages: list[Message],
+    structured_output: StructuredOutputSpec | None,
+) -> list[Message]:
+    """Return the complete statically determined message surface for one request."""
+
+    if (
+        structured_output is not None
+        and structured_output.strategy == StructuredOutputStrategy.TOOL
+    ):
+        return _with_structured_output_tool_instruction(messages, structured_output)
+    return messages
+
+
 def _context_pressure_overhead(
     *,
     registered_provider: runtime_records.RegisteredProvider,
@@ -6996,20 +7024,15 @@ def _context_pressure_overhead(
     profile = copy_model_context_pressure_profile(
         registered_provider.provider.context_pressure_profile
     )
-    tools = [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": deepcopy(tool.schema),
-        }
-        for tool in registered_agent.tools.values()
-    ]
+    tools = _model_request_tools(
+        registered_agent=registered_agent,
+        structured_output=structured_output,
+    )
     structured_output_instruction: str | None = None
     if (
         structured_output is not None
         and structured_output.strategy == StructuredOutputStrategy.TOOL
     ):
-        tools.append(structured_output_tool_spec(structured_output))
         structured_output_instruction = structured_output_tool_instruction(structured_output)
 
     request_options: dict[str, Any] = {

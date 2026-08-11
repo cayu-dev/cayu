@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Mapping
 from enum import StrEnum
 from typing import Any, cast
 
@@ -17,8 +17,19 @@ from cayu._validation import (
     require_durable_text,
     require_nonblank,
 )
+from cayu.artifacts.attachments import file_attachment_from_payload
 from cayu.core.billing import BillingIdentity
-from cayu.core.messages import Message, detach_message
+from cayu.core.messages import (
+    FilePart,
+    Message,
+    MessageRole,
+    ProviderStatePart,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+    ToolResultPart,
+    detach_message,
+)
 from cayu.providers.cache import CachePolicy, RequestCacheProjection
 from cayu.providers.operations import (
     ProviderOperationAdapter,
@@ -77,6 +88,103 @@ def privacy_safe_provider_option_projection(value: object) -> dict[str, Any]:
         and key in _REQUEST_FOOTPRINT_SAFE_PROVIDER_OPTION_KEYS
         and option is not None
     }
+
+
+def _preflight_provider_portable_messages(
+    *,
+    model: str,
+    messages: list[Message],
+    tools: list[dict[str, Any]],
+    supports_system_messages: bool,
+    supports_tool_history: bool,
+    supports_tool_definitions: bool,
+    supports_file_attachments: bool,
+    tool_name_validator: Callable[[str], None] | None = None,
+    tool_definition_validator: Callable[[Mapping[str, Any]], object] | None = None,
+) -> None:
+    """Validate the portable request material explicitly supported by one adapter."""
+
+    require_clean_nonblank(model, "model")
+    if type(messages) is not list or any(type(message) is not Message for message in messages):
+        raise TypeError("Portable messages must be a list of exact Message instances.")
+    if type(tools) is not list or any(type(tool) is not dict for tool in tools):
+        raise TypeError("Portable tools must be a list of exact dictionaries.")
+    if type(supports_system_messages) is not bool:
+        raise TypeError("supports_system_messages must be a bool.")
+    if type(supports_tool_history) is not bool:
+        raise TypeError("supports_tool_history must be a bool.")
+    if type(supports_tool_definitions) is not bool:
+        raise TypeError("supports_tool_definitions must be a bool.")
+    if type(supports_file_attachments) is not bool:
+        raise TypeError("supports_file_attachments must be a bool.")
+    if tool_name_validator is not None and not callable(tool_name_validator):
+        raise TypeError("tool_name_validator must be callable or None.")
+    if tool_definition_validator is not None and not callable(tool_definition_validator):
+        raise TypeError("tool_definition_validator must be callable or None.")
+
+    for message in messages:
+        if message.role is MessageRole.SYSTEM and not supports_system_messages:
+            raise ValueError("Target provider does not declare system-message support.")
+        for part in message.content:
+            if type(part) is TextPart:
+                continue
+            if type(part) is ToolCallPart:
+                if not supports_tool_history:
+                    raise ValueError(
+                        "Target provider does not declare portable tool-history support."
+                    )
+                if tool_name_validator is not None:
+                    tool_name_validator(part.tool_name)
+                continue
+            if type(part) is ToolResultPart:
+                if not supports_tool_history:
+                    raise ValueError(
+                        "Target provider does not declare portable tool-history support."
+                    )
+                if tool_name_validator is not None:
+                    tool_name_validator(part.tool_name)
+                for artifact in part.artifacts:
+                    try:
+                        attachment = file_attachment_from_payload(artifact)
+                    except (TypeError, ValueError):
+                        raise ValueError(
+                            "Portable tool-result artifact claims an invalid file attachment."
+                        ) from None
+                    if attachment is not None and not supports_file_attachments:
+                        raise ValueError(
+                            "Target provider does not declare portable file-attachment support."
+                        )
+                continue
+            if type(part) is FilePart:
+                if supports_file_attachments:
+                    continue
+                raise ValueError(
+                    "Target provider does not declare portable file-attachment support."
+                )
+            if type(part) in {ProviderStatePart, ThinkingPart}:
+                raise ValueError(
+                    "Portable target messages cannot contain provider state or thinking parts."
+                )
+            raise TypeError("Portable target messages contain an unsupported message part.")
+
+    if tools and not supports_tool_definitions:
+        raise ValueError("Target provider does not declare portable tool-definition support.")
+    for tool in tools:
+        copied_tool = copy_durable_json_value(tool, "portable tools")
+        if type(copied_tool) is not dict:
+            raise AssertionError("Portable tool copying changed its object shape.")
+        name = copied_tool.get("name")
+        if type(name) is not str:
+            raise ValueError("Portable tool definitions require a string name.")
+        require_clean_nonblank(name, "tool name")
+        description = copied_tool.get("description", "")
+        if type(description) is not str:
+            raise ValueError("Portable tool definitions require a string description.")
+        input_schema = copied_tool.get("input_schema", {})
+        if type(input_schema) is not dict:
+            raise ValueError("Portable tool definitions require an object input_schema.")
+        if tool_definition_validator is not None:
+            tool_definition_validator(copied_tool)
 
 
 class ModelStreamEventType(StrEnum):
@@ -850,19 +958,27 @@ class ModelProvider(ABC):
         *,
         model: str,
         messages: list[Message],
+        tools: list[dict[str, Any]],
     ) -> None:
-        """Reject neutral transcript content this adapter cannot render.
+        """Reject portable messages or active tools this adapter cannot render.
 
         The runtime calls this side-effect-free hook before durably adopting a
-        different provider/model target. Built-in and custom adapters that support
-        only a subset of Cayu message parts must override it and raise ``ValueError``
-        before any provider I/O. The default accepts the complete provider-neutral
-        ``Message`` contract.
+        different provider/model target. Adapters must explicitly override this
+        method to admit system messages, tool history, active tool definitions, or
+        file attachments. The conservative default accepts only user/assistant text
+        with no active tools, so an existing custom provider cannot silently claim
+        support for request material its renderer may reject.
         """
 
-        require_clean_nonblank(model, "model")
-        if type(messages) is not list or any(type(message) is not Message for message in messages):
-            raise TypeError("Portable messages must be a list of exact Message instances.")
+        _preflight_provider_portable_messages(
+            model=model,
+            messages=messages,
+            tools=tools,
+            supports_system_messages=False,
+            supports_tool_history=False,
+            supports_tool_definitions=False,
+            supports_file_attachments=False,
+        )
 
     async def billing_identity_for_request(
         self,

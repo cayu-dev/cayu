@@ -1173,7 +1173,7 @@ class ToolRoundExecutor:
         )
         events = [checkpoint_event, requested_event]
         target_checkpoint = publish_policy_and_approval(session, checkpoint)
-        transcript_cursor = len(await self._session_store.load_transcript(session.id))
+        transcript_cursor = await self._session_store.load_transcript_cursor(session.id)
         prepared = approval_publication.prepare_approval_publication(
             session_id=session.id,
             publication_id=f"approval-open:{approval.approval_id}",
@@ -4028,7 +4028,9 @@ class ToolRoundRun:
                 SessionStatus.INTERRUPTING,
             },
             expected_run_epoch=session.run_epoch,
-            expected_transcript_cursor=len(messages),
+            expected_transcript_cursor=(
+                await executor._session_store.load_transcript_cursor(session.id)
+            ),
         )
         cancellation = await tool_round_publication.publish_tool_round_with_exact_replay(
             prepared_publication,

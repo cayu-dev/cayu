@@ -61,6 +61,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    _preflight_provider_portable_messages,
     privacy_safe_provider_option_projection,
 )
 from cayu.providers.cache import (
@@ -309,6 +310,25 @@ class AnthropicProvider(ModelProvider):
 
     name = "anthropic"
     usage_dialect = UsageDialect.ANTHROPIC
+
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+    ) -> None:
+        _preflight_provider_portable_messages(
+            model=model,
+            messages=messages,
+            tools=tools,
+            supports_system_messages=True,
+            supports_tool_history=True,
+            supports_tool_definitions=True,
+            supports_file_attachments=True,
+            tool_name_validator=_validate_anthropic_tool_name,
+            tool_definition_validator=_anthropic_tool,
+        )
 
     @property
     def context_pressure_profile(self) -> ModelContextPressureProfile:
@@ -1580,10 +1600,7 @@ def _anthropic_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(tool, Mapping):
         raise ValueError("Tool definitions must be objects.")
     name = _require_mapping_string(tool, "name")
-    if not _ANTHROPIC_TOOL_NAME_RE.fullmatch(name):
-        raise ValueError(
-            "Anthropic tool names must contain 1-64 letters, numbers, underscores, or hyphens."
-        )
+    _validate_anthropic_tool_name(name)
     description = tool.get("description", "")
     if not isinstance(description, str):
         raise ValueError("Tool description must be a string.")
@@ -1595,6 +1612,13 @@ def _anthropic_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
         "description": description,
         "input_schema": copy_json_value(input_schema, "input_schema"),
     }
+
+
+def _validate_anthropic_tool_name(name: str) -> None:
+    if not _ANTHROPIC_TOOL_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "Anthropic tool names must contain 1-64 letters, numbers, underscores, or hyphens."
+        )
 
 
 def _require_mapping_string(value: Mapping[str, Any], key: str) -> str:

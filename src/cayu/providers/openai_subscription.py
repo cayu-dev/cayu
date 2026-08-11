@@ -29,6 +29,7 @@ import httpx
 
 from cayu._validation import require_clean_nonblank, require_finite
 from cayu._version import package_version
+from cayu.core.messages import Message
 from cayu.providers._credential_boundary import (
     ProviderStreamCleanupError,
     aclosing_provider_stream,
@@ -54,6 +55,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    _preflight_provider_portable_messages,
     privacy_safe_provider_option_projection,
 )
 from cayu.providers.openai import (
@@ -63,6 +65,8 @@ from cayu.providers.openai import (
     HttpxOpenAITransport,
     OpenAITransport,
     _effective_openai_request_options,
+    _openai_tool,
+    _validate_openai_tool_name,
     build_openai_payload,
     openai_stream_events,
     preflight_openai_native_structured_output_schema,
@@ -623,6 +627,25 @@ class OpenAISubscriptionProvider(ModelProvider):
     name = "openai_subscription"
     usage_dialect = UsageDialect.OPENAI
     supports_native_structured_output = True
+
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+    ) -> None:
+        _preflight_provider_portable_messages(
+            model=model,
+            messages=messages,
+            tools=tools,
+            supports_system_messages=True,
+            supports_tool_history=True,
+            supports_tool_definitions=True,
+            supports_file_attachments=True,
+            tool_name_validator=_validate_openai_tool_name,
+            tool_definition_validator=_openai_tool,
+        )
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         projected = privacy_safe_provider_option_projection(

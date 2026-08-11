@@ -135,6 +135,8 @@ from cayu.runtime._model_step_executor import (
     ModelStepFlowOutcome,
     ModelStepLimitEvaluationRequest,
     _detach_model_request,
+    _model_request_messages,
+    _model_request_tools,
     _session_agent_spec,
 )
 from cayu.runtime._recovery_coordinator import (
@@ -7963,15 +7965,19 @@ class SessionEngine:
                     "Session is awaiting user input. Answer it with "
                     "resolve_user_input(...) before resuming with new messages."
                 )
-            if (
-                current_session.status == SessionStatus.COMPLETED
-                and tool_round_recovery.pending_tool_round_from_checkpoint(
+            if target_changed or current_session.status == SessionStatus.COMPLETED:
+                checkpoint_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
                     updated_checkpoint,
                     redactor=self._secret_redactor,
                     consume_on_rejection=True,
                 )
-                is not None
-            ):
+            else:
+                checkpoint_pending_round = None
+            if checkpoint_pending_round is not None:
+                if target_changed:
+                    raise RuntimeError(
+                        "A session model target cannot change while tool-round recovery is pending."
+                    )
                 raise RuntimeError(
                     "Completed session has an inconsistent pending tool round. "
                     "Inspect or recover the session state before resuming it."
@@ -8075,15 +8081,25 @@ class SessionEngine:
                 ]
                 portable_source_messages.clear()
                 validate_context_messages(portable_messages)
-                hook_messages = [detach_message(message) for message in portable_messages]
+                hook_messages = _model_request_messages(
+                    messages=[detach_message(message) for message in portable_messages],
+                    structured_output=request.structured_output,
+                )
+                hook_tools: list[dict[str, Any]] = []
                 portable_messages.clear()
                 try:
+                    hook_tools = _model_request_tools(
+                        registered_agent=registered_agent,
+                        structured_output=request.structured_output,
+                    )
                     registered_provider.provider.preflight_portable_messages(
                         model=requested_target.model,
                         messages=hook_messages,
+                        tools=hook_tools,
                     )
                 finally:
                     hook_messages.clear()
+                    hook_tools.clear()
             finally:
                 source_transcript.clear()
                 portable_projection = None
@@ -8232,9 +8248,15 @@ class SessionEngine:
             projection_cursor = session_model_projection_cursor(session)
             if projection_cursor:
                 transcript_snapshot = await self.session_store.load_transcript_snapshot(session.id)
-                transcript = list(
-                    _project_model_target_snapshot(transcript_snapshot, projection_cursor).messages
-                )
+                try:
+                    transcript = list(
+                        _project_model_target_snapshot(
+                            transcript_snapshot,
+                            projection_cursor,
+                        ).messages
+                    )
+                finally:
+                    del transcript_snapshot
             else:
                 transcript = await self.session_store.load_transcript(session.id)
             transcript, transcript_is_valid = session_request_boundary.redact_transcript(
@@ -8554,14 +8576,22 @@ class SessionEngine:
                     portable_messages = [
                         detach_message(message) for message in portable_projection.messages
                     ]
-                    validate_context_messages(portable_messages)
+                    if portable_messages:
+                        validate_context_messages(portable_messages)
+                    hook_tools: list[dict[str, Any]] = []
                     try:
+                        hook_tools = _model_request_tools(
+                            registered_agent=registered_agent,
+                            structured_output=None,
+                        )
                         registered_provider.provider.preflight_portable_messages(
                             model=model,
                             messages=portable_messages,
+                            tools=hook_tools,
                         )
                     finally:
                         portable_messages.clear()
+                        hook_tools.clear()
                     fork_projection_cursor = len(expected_fork_transcript)
                 except BaseException:
                     expected_fork_transcript = None
@@ -9099,20 +9129,25 @@ class SessionEngine:
             model_projection_snapshot = await self.session_store.load_transcript_snapshot(
                 session.id
             )
-            if model_projection_cursor > model_projection_snapshot.cursor:
-                raise ValueError("Model-target projection cursor exceeds the session transcript.")
-            deferred_tail_count = len(messages_to_append) if messages_deferred else 0
-            retained_message_count = len(messages) - deferred_tail_count
-            if retained_message_count < 0 or retained_message_count != len(
-                model_projection_snapshot.records
-            ):
-                raise RuntimeError(
-                    "Model-facing transcript does not match the retained durable transcript."
+            try:
+                if model_projection_cursor > model_projection_snapshot.cursor:
+                    raise ValueError(
+                        "Model-target projection cursor exceeds the session transcript."
+                    )
+                deferred_tail_count = len(messages_to_append) if messages_deferred else 0
+                retained_message_count = len(messages) - deferred_tail_count
+                if retained_message_count < 0 or retained_message_count != len(
+                    model_projection_snapshot.records
+                ):
+                    raise RuntimeError(
+                        "Model-facing transcript does not match the retained durable transcript."
+                    )
+                model_projection_prefix_count = sum(
+                    record.index < model_projection_cursor
+                    for record in model_projection_snapshot.records
                 )
-            model_projection_prefix_count = sum(
-                record.index < model_projection_cursor
-                for record in model_projection_snapshot.records
-            )
+            finally:
+                del model_projection_snapshot
         # Resume admission already supplied the model-facing projection. A new
         # session cannot carry projection authority. Later durable transcript
         # reloads are projected from indexed snapshots below.
@@ -9334,6 +9369,7 @@ class SessionEngine:
             recovered_structured_outcome: Event | None = None
             recovered_structured_retry = False
             recovery_tail_message_count = len(messages_to_append)
+            recovery_expected_transcript_cursor: int | None = None
             if pending_tool_round_source_transcript_cursor is not None:
                 checkpoint = await self.session_store.load_checkpoint(session.id)
                 entrance_pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(
@@ -9348,17 +9384,35 @@ class SessionEngine:
                     entrance_pending_round is None
                     or entrance_pending_round.assistant_message_state == "published"
                 )
-                if pending_result_cursor > len(messages):
-                    raise RuntimeError(
-                        "Pending tool round transcript cursor exceeds the resume context."
+                pending_snapshot = await self.session_store.load_transcript_snapshot(session.id)
+                try:
+                    pending_result_position = pending_snapshot.retained_position(
+                        pending_result_cursor
                     )
-                recovery_tail_message_count = len(messages) - pending_result_cursor
+                    expected_resume_message_count = len(pending_snapshot.records) + (
+                        len(messages_to_append) if messages_deferred else 0
+                    )
+                    if len(messages) != expected_resume_message_count:
+                        raise RuntimeError(
+                            "Pending tool round resume context does not exactly match the "
+                            "retained transcript and deferred interaction input."
+                        )
+                    recovery_expected_transcript_cursor = pending_snapshot.cursor
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Pending tool round transcript cursor is unavailable in the "
+                        "retained resume context."
+                    ) from exc
+                finally:
+                    del pending_snapshot
+                recovery_tail_message_count = len(messages) - pending_result_position
             async for event in self._recovery_coordinator.recover_pending_tool_round(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 messages=messages,
                 tail_message_count=recovery_tail_message_count,
+                expected_transcript_cursor=recovery_expected_transcript_cursor,
             ):
                 if event.type in {
                     EventType.STRUCTURED_OUTPUT_VALIDATED,
@@ -9948,7 +10002,9 @@ class SessionEngine:
                             SessionStatus.INTERRUPTING,
                         },
                         expected_run_epoch=session.run_epoch,
-                        expected_transcript_cursor=len(messages),
+                        expected_transcript_cursor=(
+                            await self.session_store.load_transcript_cursor(session.id)
+                        ),
                         extension=extension,
                     )
                     cancellation = (
@@ -11649,7 +11705,7 @@ class SessionEngine:
             [call.tool_call_id for call in pending_round.tool_calls],
             tool_round_identity=tool_round_recovery.pending_tool_round_identity(pending_round),
         )
-        durable_transcript = await self.session_store.load_transcript(session.id)
+        durable_transcript_cursor = await self.session_store.load_transcript_cursor(session.id)
         prepared = tool_round_publication.prepare_tool_round_publication(
             session_id=session.id,
             pending_round=pending_round,
@@ -11660,7 +11716,7 @@ class SessionEngine:
                 SessionStatus.INTERRUPTING,
             },
             expected_run_epoch=session.run_epoch,
-            expected_transcript_cursor=len(durable_transcript),
+            expected_transcript_cursor=durable_transcript_cursor,
         )
         cancellation = await tool_round_publication.publish_tool_round_with_exact_replay(
             prepared,
@@ -11821,7 +11877,9 @@ class SessionEngine:
             referenced_events=lifecycle_events,
             expected_statuses={SessionStatus.RUNNING},
             expected_run_epoch=session.run_epoch,
-            expected_transcript_cursor=len(messages),
+            expected_transcript_cursor=(
+                await self.session_store.load_transcript_cursor(session.id)
+            ),
         )
         prepared_events = prepared_close.request.events
         if len(prepared_events) != 1:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from cayu._validation import copy_json_value
+from cayu.core.messages import Message
 from cayu.providers import (
     ModelProvider,
     ModelRequest,
@@ -20,6 +21,7 @@ from cayu.providers import (
     ProviderOperationStatus,
     copy_model_stream_event,
 )
+from cayu.providers.base import _preflight_provider_portable_messages
 from cayu.runtime.structured_output import STRUCTURED_OUTPUT_TOOL_NAME
 
 
@@ -52,6 +54,23 @@ class ScriptedModelProvider(ModelProvider):
     """
 
     name = "scripted"
+
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+    ) -> None:
+        _preflight_provider_portable_messages(
+            model=model,
+            messages=messages,
+            tools=tools,
+            supports_system_messages=True,
+            supports_tool_history=True,
+            supports_tool_definitions=True,
+            supports_file_attachments=True,
+        )
 
     def __init__(
         self,

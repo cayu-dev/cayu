@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
 from cayu._validation import require_clean_nonblank, require_finite
+from cayu.core.messages import Message
 from cayu.providers._credential_boundary import (
     aclosing_provider_stream,
     detach_provider_call_traceback,
@@ -29,7 +30,9 @@ from cayu.providers._http import (
 )
 from cayu.providers.anthropic import (
     _anthropic_overflow_message,
+    _anthropic_tool,
     _effective_anthropic_request_options,
+    _validate_anthropic_tool_name,
     anthropic_response_events,
     anthropic_stream_events,
     build_anthropic_payload,
@@ -46,6 +49,7 @@ from cayu.providers.base import (
     ModelStreamEvent,
     ModelStreamEventType,
     UsageDialect,
+    _preflight_provider_portable_messages,
     privacy_safe_provider_option_projection,
 )
 
@@ -272,6 +276,25 @@ class VertexProvider(ModelProvider):
 
     name = "vertex"
     usage_dialect = UsageDialect.ANTHROPIC
+
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+    ) -> None:
+        _preflight_provider_portable_messages(
+            model=model,
+            messages=messages,
+            tools=tools,
+            supports_system_messages=True,
+            supports_tool_history=True,
+            supports_tool_definitions=True,
+            supports_file_attachments=True,
+            tool_name_validator=_validate_anthropic_tool_name,
+            tool_definition_validator=_anthropic_tool,
+        )
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         effective_options = _effective_anthropic_request_options(

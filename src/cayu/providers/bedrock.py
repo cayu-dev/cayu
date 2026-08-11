@@ -6,6 +6,7 @@ import contextlib
 import importlib
 import json
 import math
+import re
 import threading
 from collections.abc import AsyncIterator, Mapping, Sequence
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -21,6 +22,7 @@ from cayu.artifacts import (
 from cayu.core.billing import BillingIdentity, PricingContext
 from cayu.core.messages import (
     FilePart,
+    Message,
     MessageRole,
     ProviderStatePart,
     TextPart,
@@ -45,6 +47,7 @@ from cayu.providers.base import (
     ModelRequest,
     ModelStreamEvent,
     UsageDialect,
+    _preflight_provider_portable_messages,
 )
 
 DEFAULT_BEDROCK_MAX_TOKENS = 4096
@@ -63,6 +66,7 @@ BedrockResourceType = Literal[
 BedrockProfileScope = Literal["global", "geographic"]
 _BEDROCK_RESOURCE_TYPES = frozenset(get_args(BedrockResourceType))
 _BEDROCK_PROFILE_SCOPES = frozenset(get_args(BedrockProfileScope))
+_BEDROCK_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SAFE_BEDROCK_STRUCTURED_FIELDS = frozenset(
     {
         "AccessDeniedException",
@@ -289,6 +293,25 @@ class BedrockProvider(ModelProvider):
     name = "bedrock"
     billing_provider_name = "bedrock"
     usage_dialect = UsageDialect.ANTHROPIC
+
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+        tools: list[dict[str, Any]],
+    ) -> None:
+        _preflight_provider_portable_messages(
+            model=model,
+            messages=messages,
+            tools=tools,
+            supports_system_messages=True,
+            supports_tool_history=True,
+            supports_tool_definitions=True,
+            supports_file_attachments=True,
+            tool_name_validator=_validate_bedrock_tool_name,
+            tool_definition_validator=_bedrock_tool,
+        )
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
         inference, _ = _bedrock_request_options(
@@ -1035,6 +1058,7 @@ def _bedrock_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(tool, Mapping):
         raise ValueError("Tool definitions must be objects.")
     name = _required_string(tool, "name")
+    _validate_bedrock_tool_name(name)
     description = tool.get("description", "")
     if type(description) is not str:
         raise ValueError("Tool descriptions must be strings.")
@@ -1048,6 +1072,13 @@ def _bedrock_tool(tool: Mapping[str, Any]) -> dict[str, Any]:
             "inputSchema": {"json": copy_json_value(schema, "tool input schema")},
         }
     }
+
+
+def _validate_bedrock_tool_name(name: str) -> None:
+    if not _BEDROCK_TOOL_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "Bedrock tool names must contain 1-64 letters, numbers, underscores, or hyphens."
+        )
 
 
 def _canonical_bedrock_usage(usage: Mapping[str, Any]) -> dict[str, Any]:
