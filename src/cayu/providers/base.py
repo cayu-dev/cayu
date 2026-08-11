@@ -845,6 +845,25 @@ class ModelProvider(ABC):
             if key not in _DEFAULT_FINGERPRINT_RUNTIME_OPTION_KEYS and value is not None
         }
 
+    def preflight_portable_messages(
+        self,
+        *,
+        model: str,
+        messages: list[Message],
+    ) -> None:
+        """Reject neutral transcript content this adapter cannot render.
+
+        The runtime calls this side-effect-free hook before durably adopting a
+        different provider/model target. Built-in and custom adapters that support
+        only a subset of Cayu message parts must override it and raise ``ValueError``
+        before any provider I/O. The default accepts the complete provider-neutral
+        ``Message`` contract.
+        """
+
+        require_clean_nonblank(model, "model")
+        if type(messages) is not list or any(type(message) is not Message for message in messages):
+            raise TypeError("Portable messages must be a list of exact Message instances.")
+
     async def billing_identity_for_request(
         self,
         request: ModelRequest,

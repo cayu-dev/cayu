@@ -170,6 +170,7 @@ from cayu.runtime.sessions import (
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
     SessionModelCompletionStageConflict,
+    SessionModelTransition,
     SessionOperationalSnapshot,
     SessionOperationPublication,
     SessionOperationTransform,
@@ -197,6 +198,7 @@ from cayu.runtime.sessions import (
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    TranscriptSnapshot,
     UsageRollupQuery,
     _activate_session_run_fence,
     _active_model_completion_stage_record,
@@ -215,6 +217,7 @@ from cayu.runtime.sessions import (
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
     _copy_session_event_batch,
+    _copy_session_model_transition,
     _copy_terminal_session_evidence_limits,
     _copy_transition_interaction_admission,
     _copy_workflow_step_reservation,
@@ -259,6 +262,7 @@ from cayu.runtime.sessions import (
     _runtime_publication_receipt_record,
     _runtime_publication_referenced_event_ids,
     _runtime_publication_storage_key,
+    _session_metadata_after_model_transition,
     _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline,
     _terminal_publication_delete_block_reason,
@@ -283,6 +287,7 @@ from cayu.runtime.sessions import (
     _validate_runtime_publication_event_references,
     _validate_runtime_publication_replay_receipt,
     _validate_session_fork_source,
+    _validate_session_model_transition,
     _validate_session_operation_record_keys,
     _validate_status_set,
     _validate_tool_round_call_ids,
@@ -7191,6 +7196,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         interaction_source_messages: list[Message] | None = None,
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
+        model_transition: SessionModelTransition | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -7206,6 +7212,12 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             interaction_source_messages,
             continued_interaction_id=continued_interaction_id,
             defer_interaction_source=defer_interaction_source,
+        )
+        prepared_model_transition = _copy_session_model_transition(
+            session_id,
+            model_transition,
+            interaction_id=(None if admission is None else admission[1]),
+            interaction_is_new=(admission is not None and admission[0] is not None),
         )
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
@@ -7231,24 +7243,68 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             transformed_checkpoint, "checkpoint"
                         )
 
-                    await cur.execute(
-                        """
-                        UPDATE cayu_sessions
-                        SET status = %s, updated_at = %s, last_activity_at = %s,
-                            run_epoch = run_epoch + %s,
-                            event_seq = event_seq + %s
-                        WHERE id = %s
-                        RETURNING event_seq
-                        """,
-                        (
-                            str(to_status),
-                            updated_at,
-                            updated_at,
-                            1 if to_status == SessionStatus.RUNNING else 0,
-                            1 if admission is not None and admission[0] is not None else 0,
-                            session_id,
-                        ),
+                    transition_metadata = None
+                    if prepared_model_transition is not None:
+                        await cur.execute(
+                            "SELECT message FROM cayu_transcript_messages "
+                            "WHERE session_id = %s ORDER BY session_order ASC FOR UPDATE",
+                            (session_id,),
+                        )
+                        transcript_rows = await cur.fetchall()
+                        _validate_session_model_transition(
+                            loaded,
+                            [Message.model_validate(row[0]) for row in transcript_rows],
+                            await _transcript_cursor(cur, session_id),
+                            prepared_model_transition,
+                        )
+                        transition_metadata = _session_metadata_after_model_transition(
+                            loaded, prepared_model_transition
+                        )
+
+                    admission_events = []
+                    if prepared_model_transition is not None:
+                        admission_events.append(prepared_model_transition.event)
+                    if admission is not None and admission[0] is not None:
+                        admission_events.append(admission[0])
+
+                    transition_values = (
+                        str(to_status),
+                        updated_at,
+                        updated_at,
+                        1 if to_status == SessionStatus.RUNNING else 0,
+                        len(admission_events),
                     )
+                    if prepared_model_transition is None:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET status = %s, updated_at = %s, last_activity_at = %s,
+                                run_epoch = run_epoch + %s,
+                                event_seq = event_seq + %s
+                            WHERE id = %s
+                            RETURNING event_seq
+                            """,
+                            (*transition_values, session_id),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET status = %s, updated_at = %s, last_activity_at = %s,
+                                run_epoch = run_epoch + %s,
+                                event_seq = event_seq + %s,
+                                provider_name = %s, model = %s, metadata = %s
+                            WHERE id = %s
+                            RETURNING event_seq
+                            """,
+                            (
+                                *transition_values,
+                                prepared_model_transition.target.provider_name,
+                                prepared_model_transition.target.model,
+                                _dumps(transition_metadata),
+                                session_id,
+                            ),
+                        )
                     order_row = await cur.fetchone()
                     if order_row is None:
                         raise KeyError(f"Session not found: {session_id}")
@@ -7257,7 +7313,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             cur, session_id, transformed_checkpoint, updated_at
                         )
                     if admission is not None:
-                        started_event, interaction_id, source_messages, defer_source = admission
+                        _started_event, interaction_id, source_messages, defer_source = admission
                         await self._register_public_authorities(
                             cur,
                             session_id,
@@ -7273,9 +7329,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             not defer_source or existing_deferred[0] != interaction_id
                         ):
                             raise RuntimeError("Session already has deferred interaction input.")
-                        if started_event is not None:
+                        for event_offset, admission_event in enumerate(admission_events):
                             lookup_key, projection, projection_bytes = (
-                                pending_action_event_storage_values(started_event)
+                                pending_action_event_storage_values(admission_event)
                             )
                             await cur.execute(
                                 """
@@ -7292,26 +7348,25 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 """,
                                 (
                                     session_id,
-                                    order_row[0],
-                                    started_event.id,
+                                    order_row[0] - len(admission_events) + event_offset + 1,
+                                    admission_event.id,
                                     interaction_id,
-                                    str(started_event.type),
-                                    pg_support.to_utc(started_event.timestamp),
-                                    started_event.agent_name,
-                                    started_event.environment_name,
-                                    started_event.workflow_name,
-                                    started_event.tool_name,
-                                    _dumps(started_event.payload),
-                                    _dumps(started_event.model_dump(mode="json")),
+                                    str(admission_event.type),
+                                    pg_support.to_utc(admission_event.timestamp),
+                                    admission_event.agent_name,
+                                    admission_event.environment_name,
+                                    admission_event.workflow_name,
+                                    admission_event.tool_name,
+                                    _dumps(admission_event.payload),
+                                    _dumps(admission_event.model_dump(mode="json")),
                                     lookup_key,
                                     projection,
                                     projection_bytes,
                                 ),
                             )
+                        if admission_events:
                             await self._enqueue_persisted_event_side_effects(
-                                cur,
-                                session_id,
-                                [started_event],
+                                cur, session_id, admission_events
                             )
                         if defer_source:
                             await cur.execute(
@@ -7349,14 +7404,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                 await conn.commit()
             except UniqueViolation as exc:
                 await conn.rollback()
-                existing_event_id = (
-                    None
-                    if admission is None or admission[0] is None
-                    else await self._first_existing_event_id(
+                existing_event_id = None
+                if admission is not None:
+                    existing_event_id = await self._first_existing_event_id(
                         session_id,
-                        [admission[0].id],
+                        [
+                            *(
+                                [prepared_model_transition.event.id]
+                                if prepared_model_transition is not None
+                                else []
+                            ),
+                            *([admission[0].id] if admission[0] is not None else []),
+                        ],
                     )
-                )
                 if existing_event_id is not None:
                     raise ValueError(
                         f"Event already exists for session {session_id}: {existing_event_id}"
@@ -7365,14 +7425,19 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             except Exception:
                 await conn.rollback()
                 raise
-            transitioned = loaded.model_copy(
-                update={
-                    "status": to_status,
-                    "updated_at": updated_at,
-                    "last_activity_at": updated_at,
-                    "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
-                }
-            )
+            transition_updates: dict[str, Any] = {
+                "status": to_status,
+                "updated_at": updated_at,
+                "last_activity_at": updated_at,
+                "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
+            }
+            if prepared_model_transition is not None:
+                transition_updates.update(
+                    provider_name=prepared_model_transition.target.provider_name,
+                    model=prepared_model_transition.target.model,
+                    metadata=transition_metadata,
+                )
+            transitioned = loaded.model_copy(update=transition_updates)
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(transitioned)
             return transitioned
@@ -13236,6 +13301,104 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             )
             rows = await cur.fetchall()
             return [Message(**_json_obj(row[0])) for row in rows]
+
+    async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT session.transcript_seq,
+                       transcript.session_order - 1 AS transcript_index,
+                       transcript.interaction_id,
+                       transcript.message
+                FROM cayu_sessions AS session
+                LEFT JOIN cayu_transcript_messages AS transcript
+                  ON transcript.session_id = session.id
+                WHERE session.id = %s
+                ORDER BY transcript.session_order ASC
+                """,
+                (session_id,),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                raise KeyError(f"Session not found: {session_id}")
+            return TranscriptSnapshot(
+                records=[
+                    TranscriptRecord(
+                        index=row[1],
+                        interaction_id=row[2],
+                        message=Message(**_json_obj(row[3])),
+                    )
+                    for row in rows
+                    if row[1] is not None
+                ],
+                cursor=int(rows[0][0]),
+            )
+
+    async def load_transcript_cursor(self, session_id: str) -> int:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT transcript_seq FROM cayu_sessions WHERE id = %s",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            return int(row[0])
+
+    async def load_transcript_window(
+        self,
+        session_id: str,
+        *,
+        start_index: int,
+        limit: int,
+    ) -> TranscriptSnapshot:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(start_index) is not int:
+            raise TypeError("start_index must be an integer.")
+        if not 0 <= start_index <= MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("start_index exceeds the durable integer limit.")
+        if type(limit) is not int:
+            raise TypeError("limit must be an integer.")
+        if not 1 <= limit <= 5000:
+            raise ValueError("limit must be between 1 and 5000.")
+
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT session.transcript_seq,
+                       transcript.session_order - 1 AS transcript_index,
+                       transcript.interaction_id,
+                       transcript.message
+                FROM cayu_sessions AS session
+                LEFT JOIN cayu_transcript_messages AS transcript
+                  ON transcript.session_id = session.id
+                 AND transcript.session_order > %s
+                WHERE session.id = %s
+                ORDER BY transcript.session_order ASC
+                LIMIT %s
+                """,
+                (start_index, session_id, limit),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                raise KeyError(f"Session not found: {session_id}")
+            return TranscriptSnapshot(
+                records=[
+                    TranscriptRecord(
+                        index=row[1],
+                        interaction_id=row[2],
+                        message=Message(**_json_obj(row[3])),
+                    )
+                    for row in rows
+                    if row[1] is not None
+                ],
+                cursor=int(rows[0][0]),
+            )
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         query = copy_transcript_query(query)

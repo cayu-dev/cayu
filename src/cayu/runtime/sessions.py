@@ -68,6 +68,7 @@ from cayu.core.events import (
 from cayu.core.messages import (
     Message,
     MessageRole,
+    ProviderStatePart,
     ThinkingPart,
     ToolCallPart,
     ToolResultPart,
@@ -80,6 +81,7 @@ from cayu.runtime._model_completion_publication import (
     LAST_MODEL_STEP_PUBLICATION_CHECKPOINT_KEY,
     ModelStepPublicationCheckpoint,
 )
+from cayu.runtime._model_target import project_portable_transcript
 from cayu.runtime._terminal_evidence import (
     SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
     TERMINAL_EVENT_TYPES,
@@ -646,6 +648,9 @@ class SessionStatus(StrEnum):
 
 SESSION_MESSAGE_CONTENT_MAX_BYTES = 65_536
 SESSION_MESSAGE_DELIVERY_BATCH_LIMIT = 100
+MODEL_TARGET_PROJECTION_METADATA_KEY = "cayu:model_target_projection"
+MODEL_TARGET_PROJECTION_RECORD_TYPE = "cayu.model-target-projection"
+MODEL_TARGET_PROJECTION_SCHEMA_VERSION = 1
 SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
 SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
 
@@ -691,6 +696,34 @@ def replace_session_user_metadata(
         if is_runtime_owned_session_metadata_key(key)
     }
     return {**replacement, **runtime_metadata}
+
+
+def session_model_projection_cursor(session: Session) -> int:
+    """Return the durable prefix whose provider-native state is invalidated."""
+
+    raw = session.metadata.get(MODEL_TARGET_PROJECTION_METADATA_KEY)
+    if raw is None:
+        return 0
+    expected_keys = {
+        "record_type",
+        "schema_version",
+        "provider_name",
+        "model",
+        "transcript_cursor",
+    }
+    if type(raw) is not dict or set(raw) != expected_keys:
+        raise ValueError("Session model-target projection metadata is malformed.")
+    if (
+        raw.get("record_type") != MODEL_TARGET_PROJECTION_RECORD_TYPE
+        or raw.get("schema_version") != MODEL_TARGET_PROJECTION_SCHEMA_VERSION
+        or raw.get("provider_name") != session.provider_name
+        or raw.get("model") != session.model
+    ):
+        raise ValueError("Session model-target projection metadata conflicts with the session.")
+    cursor = raw.get("transcript_cursor")
+    if type(cursor) is not int or not 0 <= cursor <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Session model-target projection cursor is malformed.")
+    return cursor
 
 
 class SessionMessageDeliveryMode(StrEnum):
@@ -823,7 +856,14 @@ class RunRequest(BaseModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return copy_durable_json_object(value, "metadata")
+        copied = copy_durable_json_object(value, "metadata")
+        if MODEL_TARGET_PROJECTION_METADATA_KEY in copied:
+            copied.clear()
+            raise ValueError(
+                f"metadata[{MODEL_TARGET_PROJECTION_METADATA_KEY!r}] is runtime-owned "
+                "model-target authority."
+            )
+        return copied
 
     @field_validator("labels", mode="before")
     @classmethod
@@ -930,6 +970,30 @@ def session_input_contract_evidence(
         f"v1:{message_start_index}:{len(request.messages)}:{redaction_mode}:"
         f"{output_mode}:sha256:{messages_sha256}"
     )
+
+
+class ModelTarget(BaseModel):
+    """An application-selected provider and model pair for one session epoch."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    provider_name: str
+    model: str
+
+    @field_validator("provider_name", "model")
+    @classmethod
+    def validate_nonblank_fields(cls, value: str, info) -> str:
+        return require_clean_nonblank(value, info.field_name)
+
+
+@dataclass(frozen=True)
+class SessionModelTransition:
+    """Runtime-owned material committed with a clean-boundary model switch."""
+
+    target: ModelTarget
+    event: Event
+    source_transcript_digest: str
+    source_transcript_cursor: int
 
 
 class ResumeRequest(BaseModel):
@@ -4670,6 +4734,40 @@ class TranscriptPage(BaseModel):
     total_records: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
 
 
+class TranscriptSnapshot(BaseModel):
+    """Retained transcript records plus the permanent append cursor."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    records: list[TranscriptRecord] = Field(default_factory=list)
+    cursor: StrictInt = Field(ge=0, le=MAX_DURABLE_JSON_INTEGER)
+
+    @model_validator(mode="after")
+    def validate_record_order(self) -> TranscriptSnapshot:
+        indices = [record.index for record in self.records]
+        if indices != sorted(indices) or len(indices) != len(set(indices)):
+            raise ValueError("Transcript snapshot records must have unique ascending indices.")
+        if indices and indices[-1] >= self.cursor:
+            raise ValueError("Transcript snapshot records must precede its append cursor.")
+        return self
+
+    def retained_position(self, cursor: int) -> int:
+        """Map an absolute transcript cursor to this retained record sequence."""
+
+        if type(cursor) is not int:
+            raise TypeError("Transcript cursor must be an integer.")
+        if not 0 <= cursor <= self.cursor:
+            raise ValueError("Transcript cursor exceeds the snapshot append cursor.")
+        indices = [record.index for record in self.records]
+        position = bisect_left(indices, cursor)
+        if position < len(indices):
+            if indices[position] != cursor:
+                raise ValueError("Transcript cursor is not available in retained history.")
+        elif cursor != self.cursor:
+            raise ValueError("Transcript cursor is not available in retained history.")
+        return position
+
+
 class SessionListResult(BaseModel):
     """One page of a session listing plus its keyset cursor and (optional) total count."""
 
@@ -5465,8 +5563,9 @@ class SessionStore(ABC):
         interaction_source_messages: list[Message] | None = None,
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
+        model_transition: SessionModelTransition | None = None,
     ) -> Session:
-        """Atomically persist a transition/checkpoint and optional interaction admission."""
+        """Atomically persist status, checkpoint, interaction, and target adoption."""
 
     @abstractmethod
     async def transition_status_if_no_queued_messages(
@@ -6567,6 +6666,54 @@ class SessionStore(ABC):
         """
 
     @abstractmethod
+    async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+        """Load retained records and the permanent cursor in one read snapshot.
+
+        Unlike ``len(load_transcript(...))``, ``cursor`` does not move backwards
+        when a backend applies physical transcript retention.
+        """
+
+    async def load_transcript_cursor(self, session_id: str) -> int:
+        """Load the permanent append cursor without requiring retained rows."""
+
+        return (await self.load_transcript_snapshot(session_id)).cursor
+
+    async def load_transcript_window(
+        self,
+        session_id: str,
+        *,
+        start_index: int,
+        limit: int,
+    ) -> TranscriptSnapshot:
+        """Load a bounded absolute-index window and its permanent append cursor.
+
+        Stores may override this method to avoid loading the complete retained
+        transcript. The default keeps custom stores correct through their atomic
+        ``load_transcript_snapshot`` implementation.
+        """
+
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(start_index) is not int:
+            raise TypeError("start_index must be an integer.")
+        if not 0 <= start_index <= MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("start_index exceeds the durable integer limit.")
+        if type(limit) is not int:
+            raise TypeError("limit must be an integer.")
+        if not 1 <= limit <= 5000:
+            raise ValueError("limit must be between 1 and 5000.")
+        snapshot = await self.load_transcript_snapshot(session_id)
+        start = bisect_left(
+            [record.index for record in snapshot.records],
+            start_index,
+        )
+        return TranscriptSnapshot(
+            records=[
+                record.model_copy(deep=True) for record in snapshot.records[start : start + limit]
+            ],
+            cursor=snapshot.cursor,
+        )
+
+    @abstractmethod
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         """Query provider-neutral transcript messages with stable message indexes.
 
@@ -7642,6 +7789,7 @@ class InMemorySessionStore(SessionStore):
         interaction_source_messages: list[Message] | None = None,
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
+        model_transition: SessionModelTransition | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -7655,6 +7803,12 @@ class InMemorySessionStore(SessionStore):
             interaction_source_messages,
             continued_interaction_id=continued_interaction_id,
             defer_interaction_source=defer_interaction_source,
+        )
+        prepared_model_transition = _copy_session_model_transition(
+            session_id,
+            model_transition,
+            interaction_id=(None if admission is None else admission[1]),
+            interaction_is_new=(admission is not None and admission[0] is not None),
         )
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
@@ -7687,20 +7841,40 @@ class InMemorySessionStore(SessionStore):
                 ):
                     raise RuntimeError("Session already has deferred interaction input.")
 
+            if prepared_model_transition is not None:
+                _validate_session_model_transition(
+                    session,
+                    self._transcripts.get(session_id, []),
+                    len(self._transcripts.get(session_id, [])),
+                    prepared_model_transition,
+                )
+
             now = datetime.now(UTC)
-            updated = session.model_copy(
-                update={
-                    "status": to_status,
-                    "updated_at": now,
-                    "last_activity_at": now,
-                    "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
-                }
-            )
+            session_updates: dict[str, Any] = {
+                "status": to_status,
+                "updated_at": now,
+                "last_activity_at": now,
+                "run_epoch": session.run_epoch + (to_status == SessionStatus.RUNNING),
+            }
+            if prepared_model_transition is not None:
+                session_updates.update(
+                    provider_name=prepared_model_transition.target.provider_name,
+                    model=prepared_model_transition.target.model,
+                    metadata=_session_metadata_after_model_transition(
+                        session, prepared_model_transition
+                    ),
+                )
+            updated = session.model_copy(update=session_updates)
             prepared_events: _PreparedInMemoryEventAppend | None = None
+            admission_events = []
+            if prepared_model_transition is not None:
+                admission_events.append(prepared_model_transition.event)
             if admission is not None and admission[0] is not None:
+                admission_events.append(admission[0])
+            if admission_events:
                 prepared_events = self._prepare_event_append_unlocked(
                     updated,
-                    [admission[0]],
+                    admission_events,
                 )
             prepared_checkpoint = (
                 None
@@ -10853,6 +11027,32 @@ class InMemorySessionStore(SessionStore):
             if session_id not in self._sessions:
                 raise KeyError(f"Session not found: {session_id}")
             return [detach_message(message) for message in self._transcripts.get(session_id, [])]
+
+    async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            messages = self._transcripts.get(session_id, [])
+            interaction_ids = self._transcript_interaction_ids.get(session_id, [])
+            return TranscriptSnapshot(
+                records=[
+                    TranscriptRecord(
+                        index=index,
+                        interaction_id=interaction_ids[index],
+                        message=detach_message(message),
+                    )
+                    for index, message in enumerate(messages)
+                ],
+                cursor=len(messages),
+            )
+
+    async def load_transcript_cursor(self, session_id: str) -> int:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            return len(self._transcripts.get(session_id, []))
 
     async def query_transcript(self, query: TranscriptQuery) -> TranscriptPage:
         query = copy_transcript_query(query)
@@ -15054,6 +15254,126 @@ def _copy_transition_interaction_admission(
         _detach_transcript_messages(source_messages),
         defer_interaction_source,
     )
+
+
+def _copy_session_model_transition(
+    session_id: str,
+    transition: SessionModelTransition | None,
+    *,
+    interaction_id: str | None,
+    interaction_is_new: bool,
+) -> SessionModelTransition | None:
+    if transition is None:
+        return None
+    if type(transition) is not SessionModelTransition:
+        raise TypeError("model_transition must be a SessionModelTransition.")
+    if not interaction_is_new or interaction_id is None:
+        raise ValueError("A model transition requires a newly admitted interaction.")
+    if type(transition.target) is not ModelTarget:
+        raise TypeError("model_transition.target must be a ModelTarget.")
+    event = copy_event(transition.event)
+    if event.type != EventType.SESSION_MODEL_SWITCHED:
+        raise ValueError("model_transition.event must be session.model.switched.")
+    if event.session_id != session_id:
+        raise ValueError("model_transition.event belongs to a different session.")
+    if event.interaction_id != interaction_id:
+        raise ValueError("model_transition.event belongs to a different interaction.")
+    source_digest = transition.source_transcript_digest
+    _require_raw_sha256_digest(source_digest)
+    source_cursor = transition.source_transcript_cursor
+    if type(source_cursor) is not int or not 0 <= source_cursor <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("model_transition.source_transcript_cursor is malformed.")
+    return SessionModelTransition(
+        target=ModelTarget(
+            provider_name=transition.target.provider_name,
+            model=transition.target.model,
+        ),
+        event=event,
+        source_transcript_digest=source_digest,
+        source_transcript_cursor=source_cursor,
+    )
+
+
+def _validate_session_model_transition(
+    session: Session,
+    current_transcript: Sequence[Message],
+    current_transcript_cursor: int,
+    transition: SessionModelTransition,
+) -> None:
+    if session_input_messages_sha256(tuple(current_transcript)) != (
+        transition.source_transcript_digest
+    ):
+        raise SessionStatusConflict(
+            "Session transcript changed while the model transition was being prepared."
+        )
+    if current_transcript_cursor != transition.source_transcript_cursor:
+        raise SessionStatusConflict(
+            "Session transcript cursor changed while the model transition was being prepared."
+        )
+    project_portable_transcript(list(current_transcript))
+    target = transition.target
+    if (session.provider_name, session.model) == (target.provider_name, target.model):
+        raise ValueError("A model transition must change the provider or model.")
+    provider_state_parts = sum(
+        type(part) is ProviderStatePart
+        for message in current_transcript
+        for part in message.content
+    )
+    thinking_parts = sum(
+        type(part) is ThinkingPart for message in current_transcript for part in message.content
+    )
+    expected_payload = {
+        "source_provider_name": session.provider_name,
+        "source_model": session.model,
+        "target_provider_name": target.provider_name,
+        "target_model": target.model,
+        "provider_changed": session.provider_name != target.provider_name,
+        "model_changed": session.model != target.model,
+        "provider_state_parts_dropped": provider_state_parts,
+        "thinking_parts_dropped": thinking_parts,
+        "source_transcript_cursor": transition.source_transcript_cursor,
+        "cache_state_dropped": True,
+        "full_transcript_projection": True,
+    }
+    if transition.event.payload != expected_payload:
+        raise ValueError("The model-transition event conflicts with its durable transition.")
+
+
+def _session_metadata_after_model_transition(
+    session: Session,
+    transition: SessionModelTransition,
+) -> dict[str, Any]:
+    return _session_metadata_with_model_projection(
+        session.metadata,
+        target=transition.target,
+        transcript_cursor=transition.source_transcript_cursor,
+    )
+
+
+def _session_metadata_with_model_projection(
+    metadata: dict[str, Any],
+    *,
+    target: ModelTarget,
+    transcript_cursor: int,
+) -> dict[str, Any]:
+    """Replace runtime-owned model projection authority on a metadata copy."""
+
+    if type(target) is not ModelTarget:
+        raise TypeError("target must be a ModelTarget.")
+    if type(transcript_cursor) is not int or not 0 <= transcript_cursor <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("Model-target projection cursor exceeds the durable integer limit.")
+    copied = copy_durable_json_object(metadata, "session.metadata")
+    copied.pop(MODEL_TARGET_PROJECTION_METADATA_KEY, None)
+    if transcript_cursor == 0:
+        return copied
+    copied[MODEL_TARGET_PROJECTION_METADATA_KEY] = {
+        "record_type": MODEL_TARGET_PROJECTION_RECORD_TYPE,
+        "schema_version": MODEL_TARGET_PROJECTION_SCHEMA_VERSION,
+        "provider_name": target.provider_name,
+        "model": target.model,
+        "transcript_cursor": transcript_cursor,
+    }
+    return copy_durable_json_object(copied, "session.metadata")
 
 
 def _validate_interaction_page(

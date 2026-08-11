@@ -1953,6 +1953,24 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_MESSAGE_QUEUED] = message_policy
     policies[EventType.SESSION_MESSAGE_DELIVERED] = message_policy
+    policies[EventType.SESSION_MODEL_SWITCHED] = _observed_policy(
+        "cache_state_dropped full_transcript_projection model_changed "
+        "provider_changed provider_state_parts_dropped source_model "
+        "source_provider_name source_transcript_cursor target_model target_provider_name "
+        "thinking_parts_dropped",
+        authority_keys={
+            "source_model",
+            "source_provider_name",
+            "target_model",
+            "target_provider_name",
+        },
+        public_authority_keys={
+            "source_model",
+            "source_provider_name",
+            "target_model",
+            "target_provider_name",
+        },
+    )
     policies[EventType.SESSION_RUN_FENCED] = _observed_policy(
         "inactive_before metadata previous_run_epoch reason run_epoch",
         untrusted_container_keys={"metadata"},

@@ -43,6 +43,7 @@ from cayu.runtime.sessions import (
     MAX_PENDING_ACTION_LEDGER_EVENTS_PER_CALL,
     MAX_PENDING_ACTION_TOOL_CALLS,
     MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
+    MODEL_TARGET_PROJECTION_METADATA_KEY,
     RUNTIME_PUBLICATION_MAX_EVENT_BINDINGS,
     RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX,
     SESSION_INSPECTION_LABEL_LIMIT,
@@ -98,6 +99,7 @@ from cayu.runtime.sessions import (
     SessionMessageDeliveryBatch,
     SessionMessageQueueStatus,
     SessionModelCompletionStageConflict,
+    SessionModelTransition,
     SessionOperationalSnapshot,
     SessionOperationPublication,
     SessionOperationTransform,
@@ -126,6 +128,7 @@ from cayu.runtime.sessions import (
     TranscriptPage,
     TranscriptQuery,
     TranscriptRecord,
+    TranscriptSnapshot,
     UsageRollupQuery,
     _activate_session_run_fence,
     _active_model_completion_stage_record,
@@ -144,6 +147,7 @@ from cayu.runtime.sessions import (
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
     _copy_session_event_batch,
+    _copy_session_model_transition,
     _copy_terminal_session_evidence_limits,
     _copy_transition_interaction_admission,
     _copy_workflow_step_reservation,
@@ -188,6 +192,7 @@ from cayu.runtime.sessions import (
     _runtime_publication_receipt_record,
     _runtime_publication_referenced_event_ids,
     _runtime_publication_storage_key,
+    _session_metadata_after_model_transition,
     _session_run_operation_from_checkpoint,
     _stored_mcp_manifest_baseline_json,
     _terminal_publication_delete_block_reason,
@@ -212,6 +217,7 @@ from cayu.runtime.sessions import (
     _validate_runtime_publication_event_references,
     _validate_runtime_publication_replay_receipt,
     _validate_session_fork_source,
+    _validate_session_model_transition,
     _validate_session_operation_record_keys,
     _validate_status_set,
     _validate_tool_round_call_ids,
@@ -2300,6 +2306,7 @@ class SQLiteSessionStore(SessionStore):
         interaction_source_messages: list[Message] | None = None,
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
+        model_transition: SessionModelTransition | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -2315,6 +2322,12 @@ class SQLiteSessionStore(SessionStore):
             interaction_source_messages,
             continued_interaction_id=continued_interaction_id,
             defer_interaction_source=defer_interaction_source,
+        )
+        prepared_model_transition = _copy_session_model_transition(
+            session_id,
+            model_transition,
+            interaction_id=(None if admission is None else admission[1]),
+            interaction_is_new=(admission is not None and admission[0] is not None),
         )
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
@@ -2341,23 +2354,65 @@ class SQLiteSessionStore(SessionStore):
                         "checkpoint",
                     )
 
+                transition_metadata = None
+                if prepared_model_transition is not None:
+                    transcript_rows = self._connection.execute(
+                        "SELECT message_json FROM cayu_transcript_messages "
+                        "WHERE session_id = ? ORDER BY session_order ASC",
+                        (session_id,),
+                    ).fetchall()
+                    _validate_session_model_transition(
+                        loaded,
+                        [
+                            Message.model_validate(json.loads(row["message_json"]))
+                            for row in transcript_rows
+                        ],
+                        _transcript_cursor(self._connection, session_id),
+                        prepared_model_transition,
+                    )
+                    transition_metadata = _session_metadata_after_model_transition(
+                        loaded, prepared_model_transition
+                    )
+
                 placeholders = ", ".join("?" for _ in allowed_statuses)
-                cursor = self._connection.execute(
-                    f"""
-                    UPDATE cayu_sessions
-                    SET status = ?, updated_at = ?, last_activity_at = ?,
-                        run_epoch = run_epoch + ?
-                    WHERE id = ? AND status IN ({placeholders})
-                    """,
-                    (
-                        str(to_status),
-                        sqlite_support.format_datetime(updated_at),
-                        sqlite_support.format_datetime(updated_at),
-                        1 if to_status == SessionStatus.RUNNING else 0,
-                        session_id,
-                        *(str(status) for status in allowed_statuses),
-                    ),
+                transition_values = (
+                    str(to_status),
+                    sqlite_support.format_datetime(updated_at),
+                    sqlite_support.format_datetime(updated_at),
+                    1 if to_status == SessionStatus.RUNNING else 0,
                 )
+                if prepared_model_transition is None:
+                    cursor = self._connection.execute(
+                        f"""
+                        UPDATE cayu_sessions
+                        SET status = ?, updated_at = ?, last_activity_at = ?,
+                            run_epoch = run_epoch + ?
+                        WHERE id = ? AND status IN ({placeholders})
+                        """,
+                        (
+                            *transition_values,
+                            session_id,
+                            *(str(status) for status in allowed_statuses),
+                        ),
+                    )
+                else:
+                    cursor = self._connection.execute(
+                        f"""
+                        UPDATE cayu_sessions
+                        SET status = ?, updated_at = ?, last_activity_at = ?,
+                            run_epoch = run_epoch + ?, provider_name = ?, model = ?,
+                            metadata_json = ?
+                        WHERE id = ? AND status IN ({placeholders})
+                        """,
+                        (
+                            *transition_values,
+                            prepared_model_transition.target.provider_name,
+                            prepared_model_transition.target.model,
+                            sqlite_support.json_dumps(transition_metadata),
+                            session_id,
+                            *(str(status) for status in allowed_statuses),
+                        ),
+                    )
                 if cursor.rowcount != 1:
                     current = self._load_unlocked(session_id)
                     if current is None:
@@ -2399,9 +2454,14 @@ class SQLiteSessionStore(SessionStore):
                         not defer_source or existing_deferred["interaction_id"] != interaction_id
                     ):
                         raise RuntimeError("Session already has deferred interaction input.")
+                    admission_events = []
+                    if prepared_model_transition is not None:
+                        admission_events.append(prepared_model_transition.event)
                     if started_event is not None:
+                        admission_events.append(started_event)
+                    for admission_event in admission_events:
                         lookup_key, projection, projection_bytes = (
-                            pending_action_event_storage_values(started_event)
+                            pending_action_event_storage_values(admission_event)
                         )
                         self._connection.execute(
                             """
@@ -2415,24 +2475,23 @@ class SQLiteSessionStore(SessionStore):
                             """,
                             (
                                 session_id,
-                                started_event.id,
+                                admission_event.id,
                                 interaction_id,
-                                str(started_event.type),
-                                sqlite_support.format_datetime(started_event.timestamp),
-                                started_event.agent_name,
-                                started_event.environment_name,
-                                started_event.workflow_name,
-                                started_event.tool_name,
-                                sqlite_support.json_dumps(started_event.payload),
+                                str(admission_event.type),
+                                sqlite_support.format_datetime(admission_event.timestamp),
+                                admission_event.agent_name,
+                                admission_event.environment_name,
+                                admission_event.workflow_name,
+                                admission_event.tool_name,
+                                sqlite_support.json_dumps(admission_event.payload),
                                 lookup_key,
                                 projection,
                                 projection_bytes,
                             ),
                         )
+                    if admission_events:
                         _enqueue_persisted_event_side_effects(
-                            self._connection,
-                            session_id,
-                            [started_event],
+                            self._connection, session_id, admission_events
                         )
                     if defer_source:
                         self._connection.execute(
@@ -2466,23 +2525,35 @@ class SQLiteSessionStore(SessionStore):
                             ],
                         )
                 self._connection.commit()
-                transitioned = loaded.model_copy(
-                    update={
-                        "status": to_status,
-                        "updated_at": updated_at,
-                        "last_activity_at": updated_at,
-                        "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
-                    }
-                )
+                transition_updates: dict[str, Any] = {
+                    "status": to_status,
+                    "updated_at": updated_at,
+                    "last_activity_at": updated_at,
+                    "run_epoch": loaded.run_epoch + (to_status == SessionStatus.RUNNING),
+                }
+                if prepared_model_transition is not None:
+                    transition_updates.update(
+                        provider_name=prepared_model_transition.target.provider_name,
+                        model=prepared_model_transition.target.model,
+                        metadata=transition_metadata,
+                    )
+                transitioned = loaded.model_copy(update=transition_updates)
             except sqlite3.IntegrityError as exc:
                 self._connection.rollback()
                 existing_event_id = (
                     None
-                    if admission is None or admission[0] is None
+                    if admission is None
                     else _first_existing_event_id(
                         self._connection,
                         session_id,
-                        [admission[0].id],
+                        [
+                            *(
+                                [prepared_model_transition.event.id]
+                                if prepared_model_transition is not None
+                                else []
+                            ),
+                            *([admission[0].id] if admission[0] is not None else []),
+                        ],
                     )
                 )
                 if existing_event_id is not None:
@@ -6615,8 +6686,10 @@ class SQLiteSessionStore(SessionStore):
         Retains the ``keep_last`` newest transcript messages (by insertion order)
         for ``session_id`` and deletes the rest, bounding transcript growth for
         long-lived sessions. Active model stages, pending tool rounds, and
-        immutable publication receipts pin the transcript until their recovery
-        material is no longer needed. Returns the number of messages deleted.
+        immutable publication receipts pin their recovery material. Active
+        model-target projection runs also pin the transcript; their permanent
+        absolute cursor makes retention safe again at a terminal boundary.
+        Returns the number of messages deleted.
         """
         if type(keep_last) is not int:
             raise TypeError("compact_transcript 'keep_last' must be an int.")
@@ -6642,6 +6715,12 @@ class SQLiteSessionStore(SessionStore):
                     FROM cayu_checkpoints
                     WHERE session_id = ?
                       AND json_type(state_json, '$.pending_tool_round') IS NOT NULL
+                    UNION ALL
+                    SELECT 1
+                    FROM cayu_sessions
+                    WHERE id = ?
+                      AND status IN (?, ?, ?)
+                      AND json_type(metadata_json, ?) IS NOT NULL
                     LIMIT 1
                     """,
                     (
@@ -6649,6 +6728,11 @@ class SQLiteSessionStore(SessionStore):
                         RUNTIME_PUBLICATION_OPERATION_KEY_PREFIX + "*",
                         MODEL_COMPLETION_ACTIVE_STAGE_STORAGE_KEY,
                         session_id,
+                        session_id,
+                        str(SessionStatus.PENDING),
+                        str(SessionStatus.RUNNING),
+                        str(SessionStatus.INTERRUPTING),
+                        f'$."{MODEL_TARGET_PROJECTION_METADATA_KEY}"',
                     ),
                 ).fetchone()
                 if durability_guard is not None:
@@ -8313,6 +8397,102 @@ class SQLiteSessionStore(SessionStore):
                 (session_id,),
             ).fetchall()
             return [Message(**json.loads(row["message_json"])) for row in rows]
+
+        return await self._run_read(query)
+
+    async def load_transcript_snapshot(self, session_id: str) -> TranscriptSnapshot:
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def query(connection: sqlite3.Connection) -> TranscriptSnapshot:
+            rows = connection.execute(
+                """
+                SELECT session.transcript_seq,
+                       transcript.session_order - 1 AS transcript_index,
+                       transcript.interaction_id,
+                       transcript.message_json
+                FROM cayu_sessions AS session
+                LEFT JOIN cayu_transcript_messages AS transcript
+                  ON transcript.session_id = session.id
+                WHERE session.id = ?
+                ORDER BY transcript.session_order ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            if not rows:
+                raise KeyError(f"Session not found: {session_id}")
+            return TranscriptSnapshot(
+                records=[
+                    TranscriptRecord(
+                        index=row["transcript_index"],
+                        interaction_id=row["interaction_id"],
+                        message=Message(**json.loads(row["message_json"])),
+                    )
+                    for row in rows
+                    if row["transcript_index"] is not None
+                ],
+                cursor=int(rows[0]["transcript_seq"]),
+            )
+
+        return await self._run_read(query)
+
+    async def load_transcript_cursor(self, session_id: str) -> int:
+        session_id = require_clean_nonblank(session_id, "session_id")
+
+        def query(connection: sqlite3.Connection) -> int:
+            if not _session_exists(connection, session_id):
+                raise KeyError(f"Session not found: {session_id}")
+            return _transcript_cursor(connection, session_id)
+
+        return await self._run_read(query)
+
+    async def load_transcript_window(
+        self,
+        session_id: str,
+        *,
+        start_index: int,
+        limit: int,
+    ) -> TranscriptSnapshot:
+        session_id = require_clean_nonblank(session_id, "session_id")
+        if type(start_index) is not int:
+            raise TypeError("start_index must be an integer.")
+        if not 0 <= start_index <= MAX_DURABLE_JSON_INTEGER:
+            raise ValueError("start_index exceeds the durable integer limit.")
+        if type(limit) is not int:
+            raise TypeError("limit must be an integer.")
+        if not 1 <= limit <= 5000:
+            raise ValueError("limit must be between 1 and 5000.")
+
+        def query(connection: sqlite3.Connection) -> TranscriptSnapshot:
+            rows = connection.execute(
+                """
+                SELECT session.transcript_seq,
+                       transcript.session_order - 1 AS transcript_index,
+                       transcript.interaction_id,
+                       transcript.message_json
+                FROM cayu_sessions AS session
+                LEFT JOIN cayu_transcript_messages AS transcript
+                  ON transcript.session_id = session.id
+                 AND transcript.session_order > ?
+                WHERE session.id = ?
+                ORDER BY transcript.session_order ASC
+                LIMIT ?
+                """,
+                (start_index, session_id, limit),
+            ).fetchall()
+            if not rows:
+                raise KeyError(f"Session not found: {session_id}")
+            return TranscriptSnapshot(
+                records=[
+                    TranscriptRecord(
+                        index=row["transcript_index"],
+                        interaction_id=row["interaction_id"],
+                        message=Message(**json.loads(row["message_json"])),
+                    )
+                    for row in rows
+                    if row["transcript_index"] is not None
+                ],
+                cursor=int(rows[0]["transcript_seq"]),
+            )
 
         return await self._run_read(query)
 
