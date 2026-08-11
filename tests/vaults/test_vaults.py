@@ -391,6 +391,72 @@ def test_secret_redactor_discards_ambiguous_pretruncated_prefix_at_every_split()
         assert truncated is True
 
 
+@pytest.mark.parametrize("character", ["¢", "€", "😀"])
+def test_secret_redactor_reports_incomplete_utf8_suffix_at_every_split(
+    character: str,
+) -> None:
+    redactor = SecretRedactor()
+    encoded = character.encode("utf-8")
+
+    for split in range(1, len(encoded)):
+        projected, truncated = redactor.redact_utf8_head(
+            b"safe:" + encoded[:split],
+            max_bytes=64,
+            source_complete=False,
+        )
+
+        assert projected == "safe:"
+        assert truncated is True
+
+
+@pytest.mark.parametrize("character", ["¢", "€", "😀"])
+def test_secret_redactor_preserves_complete_utf8_and_authoritative_eof_semantics(
+    character: str,
+) -> None:
+    redactor = SecretRedactor()
+    encoded = character.encode("utf-8")
+
+    for source_complete in (False, True):
+        projected, truncated = redactor.redact_utf8_head(
+            b"safe:" + encoded,
+            max_bytes=64,
+            source_complete=source_complete,
+        )
+
+        assert projected == f"safe:{character}"
+        assert truncated is False
+
+    for split in range(1, len(encoded)):
+        projected, truncated = redactor.redact_utf8_head(
+            b"safe:" + encoded[:split],
+            max_bytes=64,
+            source_complete=True,
+        )
+
+        assert projected == "safe:�"
+        assert truncated is False
+
+
+def test_secret_redactor_preserves_complete_malformed_utf8_and_multibyte_bound() -> None:
+    redactor = SecretRedactor()
+
+    malformed, malformed_truncated = redactor.redact_utf8_head(
+        b"safe:\xff",
+        max_bytes=64,
+        source_complete=True,
+    )
+    bounded, bounded_truncated = redactor.redact_utf8_head(
+        "safe:€".encode(),
+        max_bytes=6,
+        source_complete=True,
+    )
+
+    assert malformed == "safe:�"
+    assert malformed_truncated is False
+    assert bounded == "safe:"
+    assert bounded_truncated is True
+
+
 @pytest.mark.parametrize("max_bytes", [1, 16, len(REDACTED_SECRET), 64])
 def test_secret_redactor_bounds_complete_text_only_after_redaction(max_bytes: int) -> None:
     secret = "workload-secret-canary-ABCDEFGHIJKLMNOP"

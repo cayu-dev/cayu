@@ -234,7 +234,8 @@ class SecretRedactor:
         ``source_complete=False`` means the caller did not observe authoritative
         EOF. The streaming redactor therefore discards every suffix whose safety
         could depend on unavailable bytes instead of treating the captured prefix
-        as a complete value.
+        as a complete value. Bytes buffered by the incremental UTF-8 decoder are
+        likewise withheld and reported as truncation.
         """
 
         if type(value) is not bytes:
@@ -265,7 +266,9 @@ class SecretRedactor:
                 content.extend(stream.feed(normalized))
                 content.extend(stream.finish_complete())
             else:
-                truncated = stream.abort()
+                decoder_truncated = bool(decoder.getstate()[0])
+                stream_truncated = stream.abort()
+                truncated = decoder_truncated or stream_truncated
         except SecretRedactionCapacityError as exc:
             content.extend(exc.released)
             truncated = True
