@@ -166,6 +166,15 @@ _INTERACTION_STATUS_BY_EVENT = {
     EventType.INTERACTION_FAILED: "failed",
     EventType.INTERACTION_INTERRUPTED: "interrupted",
 }
+_INTERACTION_TERMINAL_EVENT_TYPE_VALUES = frozenset(
+    str(event_type)
+    for event_type in {
+        EventType.INTERACTION_PAUSED,
+        EventType.INTERACTION_COMPLETED,
+        EventType.INTERACTION_FAILED,
+        EventType.INTERACTION_INTERRUPTED,
+    }
+)
 _INTERRUPTION_TYPES = frozenset(
     {
         "limit_reached",
@@ -332,6 +341,9 @@ _DECLARED_FIXED_CONTROLS: Mapping[
     EventType,
     Mapping[tuple[str, ...], frozenset[Any]],
 ] = {
+    EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED: {
+        ("transition_event_type",): _INTERACTION_TERMINAL_EVENT_TYPE_VALUES,
+    },
     EventType.TOOL_CALL_STARTED: {
         ("arguments_state",): frozenset({"quarantined"}),
     },
@@ -1838,18 +1850,19 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_FAILED] = _observed_policy(
         "approval_id binding_cleanup durable_value_error_code durable_value_error_path "
-        "error error_type interruption_type "
+        "error error_type interaction_transition_failures interruption_type "
         "manual_recovery_required model_attempt_id model_step_id tool_call_id "
         f"tool_name tool_round_id {terminal_finalization_keys}",
         authority_keys={"session_run_operation_id"},
         aliased_authority_keys={"approval_id", "tool_call_id", "tool_round_id"},
-        untrusted_container_keys={"binding_cleanup"} | terminal_finalization_containers,
+        untrusted_container_keys={"binding_cleanup", "interaction_transition_failures"}
+        | terminal_finalization_containers,
     )
     policies[EventType.SESSION_INTERRUPTED] = _observed_policy(
         "abandoned actual approval approval_close_intent approval_id "
         "approval_metadata_truncated cost_summary durable_value_error_code "
         "durable_value_error_path error error_type input_id interruption_request_id "
-        "interruption_type limit manual_recovery_persisted "
+        "interaction_transition_failures interruption_type limit manual_recovery_persisted "
         "manual_recovery_persistence_unknown manual_recovery_required "
         "manual_recovery_stale_live_failure maximum message metadata model_attempt_id "
         "model_step_id persistence_reconciliation_error_type policy_metadata reason "
@@ -1877,6 +1890,7 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
         ),
         untrusted_container_keys={
             "approval",
+            "interaction_transition_failures",
             "metadata",
             "policy_metadata",
             "user_input",
@@ -2178,6 +2192,10 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
 
     policies[EventType.RUNTIME_SINK_FAILED] = _observed_policy(
         "error error_type event_id event_sequence event_type sink"
+    )
+    policies[EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED] = _observed_policy(
+        "interaction_transition_failures transition_event_type",
+        untrusted_container_keys={"interaction_transition_failures"},
     )
     policies[EventType.MEMORY_SEARCH] = _observed_policy(
         "hit_count query results truncated",

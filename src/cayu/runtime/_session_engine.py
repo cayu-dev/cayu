@@ -11,15 +11,23 @@ import sys
 import threading
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, NoReturn
+from typing import Any, NoReturn, TypeVar
 from uuid import uuid4
 
 from pydantic import ValidationError
 
-from cayu._exception_groups import exception_cause, iter_exception_tree, set_exception_cause
+from cayu._exception_groups import (
+    exception_cause,
+    exception_group_children,
+    iter_exception_tree,
+    rebuild_exception_group,
+    set_exception_cause,
+)
+from cayu._exception_state import pop_exception_state, set_exception_state
 from cayu._task_wait import (
     ShieldedTaskOutcome,
     await_shielded_task_outcome,
@@ -296,6 +304,7 @@ from cayu.runtime.sessions import (
     IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
     InteractionTransitionResult,
+    InteractionTransitionSpec,
     InterruptSessionRequest,
     ResumeRequest,
     RunRequest,
@@ -308,6 +317,7 @@ from cayu.runtime.sessions import (
     SessionOperationPublication,
     SessionOrder,
     SessionQuery,
+    SessionRunFenced,
     SessionStatus,
     SessionStatusConflict,
     SessionStore,
@@ -315,6 +325,7 @@ from cayu.runtime.sessions import (
     _activate_session_interaction,
     _checkpoint_with_session_run_operation,
     _clear_session_interaction_recovered_active_through,
+    _clear_session_interaction_settlement,
     _close_session_interaction,
     _current_session_interaction_id,
     _current_session_interaction_recovered_active_through,
@@ -324,6 +335,8 @@ from cayu.runtime.sessions import (
     _event_with_session_run_operation,
     _incomplete_recovery_claim_from_checkpoint,
     _initial_transcript_pending_interaction_id,
+    _latest_session_invocation_interaction_is_settled,
+    _mark_session_interaction_settled,
     _session_run_operation_from_checkpoint,
     _set_session_interaction_recovered_active_through,
     attribute_event_to_current_interaction,
@@ -331,6 +344,7 @@ from cayu.runtime.sessions import (
     copy_compact_session_request,
     copy_incomplete_session_recovery_request,
     copy_incomplete_sessions_recovery_request,
+    copy_interaction_transition_spec,
     copy_resume_request,
     copy_run_request,
     runtime_publication_checkpoint_mutation,
@@ -430,6 +444,30 @@ _SESSION_OPERATION_CLAIM_HEARTBEAT_STOP_TIMEOUT_SECONDS = 0.1
 
 _SESSION_OPERATION_STORE_WAIT_TIMEOUT_SECONDS = 5.0
 
+_INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS = 3
+
+_INTERACTION_TRANSITION_REPLAY_WINDOW_SECONDS = 30.0
+
+_INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE = "_cayu_interaction_transition_run_fence"
+
+_INTERACTION_TRANSITION_RUN_FENCE_AUTHORITY = object()
+
+_INTERACTION_TRANSITION_REPLAY_FAILURE_AUTHORITY = object()
+
+_INTERACTION_TRANSITION_REPLAY_ATTEMPTS_ATTRIBUTE = "_cayu_interaction_transition_replay_attempts"
+
+_INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE = (
+    "_cayu_interaction_transition_cancellation_outcome"
+)
+
+_INTERACTION_TRANSITION_CANCELLATION_OUTCOME_AUTHORITY = object()
+
+_INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DEPTH = 8
+
+_INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DESCENDANTS = 32
+
+_ExceptionT = TypeVar("_ExceptionT", bound=BaseException)
+
 _INTERRUPTION_TYPE_OPERATOR_REQUESTED = "operator_requested"
 
 _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED = "runtime_interrupted"
@@ -439,6 +477,405 @@ _INTERRUPTION_TYPE_TOOL_APPROVAL_REQUIRED = "tool_approval_required"
 _INTERRUPTION_TYPE_USER_INPUT_REQUIRED = "user_input_required"
 
 _INTERRUPTION_TYPE_LIMIT_REACHED = "limit_reached"
+
+
+@dataclass(frozen=True, slots=True)
+class _InteractionTransitionCancellationOutcome:
+    """Authenticated immutable evidence carried to the outer run boundary."""
+
+    authority: object
+    transition_settled: bool
+    encoded_failure_diagnostics: str
+    encoded_transition_spec: str | None
+
+
+def _interaction_transition_failure_contains_run_fence(error: BaseException) -> bool:
+    return any(isinstance(candidate, SessionRunFenced) for candidate in iter_exception_tree(error))
+
+
+def _mark_interaction_transition_run_fence(error: BaseException) -> None:
+    BaseException.__setattr__(
+        error,
+        _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
+        _INTERACTION_TRANSITION_RUN_FENCE_AUTHORITY,
+    )
+
+
+def _is_interaction_transition_run_fence(error: BaseException) -> bool:
+    try:
+        authority = BaseException.__getattribute__(
+            error,
+            _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
+        )
+    except (AttributeError, TypeError):
+        return False
+    return authority is _INTERACTION_TRANSITION_RUN_FENCE_AUTHORITY
+
+
+def _interaction_transition_replay_failure(
+    failures: list[Exception],
+) -> Exception:
+    """Return one ordered terminal failure without flattening attempt groups."""
+
+    if not failures:
+        raise AssertionError("Interaction transition replay had no failures.")
+    unique_failures = _unique_exception_identities(failures)
+    if len(failures) == 1:
+        failure = unique_failures[0]
+    else:
+        failure = ExceptionGroup(
+            "Interaction transition publication failed across replay attempts.",
+            unique_failures,
+        )
+        BaseException.__setattr__(
+            failure,
+            "_cayu_interaction_transition_replay_failure",
+            _INTERACTION_TRANSITION_REPLAY_FAILURE_AUTHORITY,
+        )
+        BaseException.__setattr__(
+            failure,
+            _INTERACTION_TRANSITION_REPLAY_ATTEMPTS_ATTRIBUTE,
+            tuple(failures),
+        )
+    return failure
+
+
+def _interaction_transition_replay_failures(
+    error: BaseException,
+) -> tuple[Exception, ...] | None:
+    """Return runtime-owned replay failures for durable diagnostics."""
+
+    try:
+        authority = BaseException.__getattribute__(
+            error,
+            "_cayu_interaction_transition_replay_failure",
+        )
+    except (AttributeError, TypeError):
+        return None
+    if authority is not _INTERACTION_TRANSITION_REPLAY_FAILURE_AUTHORITY or not isinstance(
+        error,
+        ExceptionGroup,
+    ):
+        return None
+    try:
+        attempts = BaseException.__getattribute__(
+            error,
+            _INTERACTION_TRANSITION_REPLAY_ATTEMPTS_ATTRIBUTE,
+        )
+    except (AttributeError, TypeError):
+        return None
+    if (
+        type(attempts) is not tuple
+        or len(attempts) < 2
+        or any(not isinstance(attempt, Exception) for attempt in attempts)
+    ):
+        return None
+    return attempts
+
+
+def _interaction_transition_failure_diagnostics(
+    failures: tuple[BaseException, ...],
+    *,
+    redactor: SecretRedactor,
+) -> list[dict[str, Any]]:
+    """Return bounded ordered diagnostics without flattening attempt groups."""
+
+    remaining_descendants = _INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DESCENDANTS
+    root_identities = {id(failure) for failure in failures}
+    seen_identities = set(root_identities)
+
+    def project(error: BaseException, *, depth: int) -> dict[str, Any]:
+        nonlocal remaining_descendants
+        projected = exception_diagnostic(error, redactor=redactor).payload_fields()
+        if not isinstance(error, BaseExceptionGroup):
+            return projected
+        children = exception_group_children(error)
+        if children is None:
+            projected["children_unavailable"] = True
+            return projected
+        if depth >= _INTERACTION_TRANSITION_DIAGNOSTIC_MAX_DEPTH:
+            projected["children_truncated"] = len(children)
+            return projected
+
+        projected_children: list[dict[str, Any]] = []
+        duplicate_children = 0
+        truncated_children = 0
+        for child in children:
+            child_identity = id(child)
+            if child_identity in seen_identities:
+                duplicate_children += 1
+                continue
+            if remaining_descendants <= 0:
+                truncated_children += 1
+                continue
+            seen_identities.add(child_identity)
+            remaining_descendants -= 1
+            projected_children.append(project(child, depth=depth + 1))
+        if projected_children:
+            projected["children"] = projected_children
+        if duplicate_children:
+            projected["duplicate_children_omitted"] = duplicate_children
+        if truncated_children:
+            projected["children_truncated"] = truncated_children
+        return projected
+
+    return [project(failure, depth=0) for failure in failures]
+
+
+def _unique_exception_identities(
+    failures: Iterable[_ExceptionT],
+) -> list[_ExceptionT]:
+    """Preserve first-seen order without recording one exception object twice."""
+
+    unique: list[_ExceptionT] = []
+    for failure in failures:
+        if not any(existing is failure for existing in unique):
+            unique.append(failure)
+    return unique
+
+
+async def _run_interaction_transition_cancellation_cleanup_steps(
+    cancellation: asyncio.CancelledError,
+    *,
+    steps: tuple[tuple[str, Callable[[], Awaitable[None]]], ...],
+) -> tuple[tuple[str, BaseException], ...]:
+    """Keep this cancellation's attempt and cleanup failures jointly visible.
+
+    The shared recovery helper intentionally keeps historical causes behind the
+    current cleanup group. Interaction-transition acknowledgement failures are
+    different: they and the cancellation cleanup belong to one bounded replay
+    handoff, so this narrow boundary exposes both without changing sibling
+    recovery classification contracts.
+    """
+
+    attempt_failures = exception_cause(cancellation)
+    cleanup_failures = await _run_recovery_cleanup_steps(
+        authoritative_failure=cancellation,
+        steps=steps,
+    )
+    cleanup_cause = exception_cause(cancellation)
+    if (
+        cleanup_failures
+        and attempt_failures is not None
+        and cleanup_cause is not None
+        and cleanup_cause is not attempt_failures
+    ):
+        set_exception_cause(cleanup_cause, None)
+        set_exception_cause(
+            cancellation,
+            BaseExceptionGroup(
+                "Interaction transition attempt and cancellation cleanup failures.",
+                _unique_exception_identities([attempt_failures, cleanup_cause]),
+            ),
+        )
+    return cleanup_failures
+
+
+def _normalize_interaction_transition_child_cancellation(
+    error: BaseException | None,
+) -> BaseException | None:
+    """Classify store-owned cancellation without fabricating caller cancellation."""
+
+    if isinstance(error, asyncio.CancelledError):
+        return unexpected_child_cancellation_error(
+            error,
+            operation="Interaction transition publication",
+        )
+    if not isinstance(error, BaseExceptionGroup) or not any(
+        isinstance(candidate, asyncio.CancelledError) for candidate in iter_exception_tree(error)
+    ):
+        return error
+    return rebuild_exception_group(
+        error,
+        group_message="Interaction transition publication child failures.",
+        leaf_mapper=lambda child: (
+            unexpected_child_cancellation_error(
+                child,
+                operation="Interaction transition publication",
+            )
+            if isinstance(child, asyncio.CancelledError)
+            else child
+        ),
+        invalid_leaf_factory=lambda: RuntimeError(
+            "Interaction transition publication returned an unreadable exception group."
+        ),
+    )
+
+
+def _validated_interaction_transition_result(
+    value: object,
+    *,
+    transition: InteractionTransitionSpec,
+) -> InteractionTransitionResult:
+    """Detach and verify one extension-controlled publication result."""
+
+    if type(value) is not InteractionTransitionResult:
+        raise TypeError("Session store returned an invalid interaction transition result.")
+    try:
+        result = InteractionTransitionResult(
+            session=value.session,
+            event=value.event,
+            status_changed=value.status_changed,
+            replayed=value.replayed,
+        )
+    except (AttributeError, TypeError, ValueError):
+        raise TypeError(
+            "Session store returned an invalid interaction transition result."
+        ) from None
+    if result.event != transition.event:
+        raise RuntimeError("Interaction transition publication returned a conflicting event.")
+    if result.session.id != transition.event.session_id:
+        raise RuntimeError("Interaction transition publication returned a conflicting session.")
+    if result.status_changed:
+        if result.session.status is not transition.to_status:
+            raise RuntimeError(
+                "Interaction transition publication changed status does not match its session."
+            )
+    elif (
+        not transition.only_if_no_queued_messages
+        or result.session.status not in transition.from_statuses
+    ):
+        raise RuntimeError("Interaction transition publication unchanged status is inconsistent.")
+    return result
+
+
+def _attach_interaction_transition_cancellation_outcome(
+    cancellation: asyncio.CancelledError,
+    *,
+    transition_settled: bool,
+    failure_diagnostics: list[dict[str, Any]],
+    transition: InteractionTransitionSpec | None,
+) -> None:
+    """Carry only authenticated, durable-safe transition settlement evidence."""
+
+    copied_diagnostics = copy_durable_json_value(
+        failure_diagnostics,
+        "interaction transition cancellation diagnostics",
+    )
+    if type(copied_diagnostics) is not list:
+        raise TypeError("Interaction transition cancellation diagnostics must be a list.")
+    outcome = _InteractionTransitionCancellationOutcome(
+        authority=_INTERACTION_TRANSITION_CANCELLATION_OUTCOME_AUTHORITY,
+        transition_settled=transition_settled,
+        encoded_failure_diagnostics=json.dumps(
+            copied_diagnostics,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ),
+        encoded_transition_spec=(
+            None
+            if transition is None
+            else json.dumps(
+                copy_interaction_transition_spec(transition).model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        ),
+    )
+    if not set_exception_state(
+        cancellation,
+        _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
+        outcome,
+    ):
+        raise RuntimeError("Could not attach interaction transition cancellation outcome.")
+
+
+def _pop_interaction_transition_cancellation_outcome(
+    cancellation: asyncio.CancelledError,
+) -> tuple[bool, list[dict[str, Any]], InteractionTransitionSpec | None] | None:
+    """Consume transition evidence only when it came from the owned store boundary."""
+
+    outcome = pop_exception_state(
+        cancellation,
+        _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
+    )
+    if (
+        type(outcome) is not _InteractionTransitionCancellationOutcome
+        or outcome.authority is not _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_AUTHORITY
+        or type(outcome.transition_settled) is not bool
+        or type(outcome.encoded_failure_diagnostics) is not str
+        or (
+            outcome.encoded_transition_spec is not None
+            and type(outcome.encoded_transition_spec) is not str
+        )
+    ):
+        return None
+    try:
+        decoded = json.loads(outcome.encoded_failure_diagnostics)
+        copied = copy_durable_json_value(
+            decoded,
+            "interaction transition cancellation diagnostics",
+        )
+        transition = (
+            None
+            if outcome.encoded_transition_spec is None
+            else InteractionTransitionSpec.model_validate(
+                json.loads(outcome.encoded_transition_spec)
+            )
+        )
+    except Exception:
+        return None
+    if type(copied) is not list or any(type(item) is not dict for item in copied):
+        return None
+    return outcome.transition_settled, copied, transition
+
+
+def _raise_interaction_transition_cancellation(
+    cancellation: asyncio.CancelledError,
+    secondary_failures: Iterable[BaseException] = (),
+    *,
+    transition_settled: bool = False,
+    failure_diagnostics: list[dict[str, Any]] | None = None,
+    transition: InteractionTransitionSpec | None = None,
+) -> NoReturn:
+    """Redeliver caller cancellation with every settled secondary outcome."""
+
+    current_failures = list(secondary_failures)
+    if any(
+        _interaction_transition_failure_contains_run_fence(failure) for failure in current_failures
+    ):
+        _mark_interaction_transition_run_fence(cancellation)
+    _attach_interaction_transition_cancellation_outcome(
+        cancellation,
+        transition_settled=transition_settled,
+        failure_diagnostics=[] if failure_diagnostics is None else failure_diagnostics,
+        transition=transition,
+    )
+    preserved: list[BaseException] = []
+    existing_cause = exception_cause(cancellation)
+    if existing_cause is not None:
+        preserved.append(existing_cause)
+    preserved = _unique_exception_identities([*preserved, *current_failures])
+    if preserved:
+        cause: BaseException = (
+            preserved[0]
+            if len(preserved) == 1
+            else BaseExceptionGroup(
+                "Interaction transition cancellation and store failures.",
+                preserved,
+            )
+        )
+        if not set_exception_cause(cancellation, cause):
+            raise BaseExceptionGroup(
+                "Interaction transition cancellation and store failures.",
+                [cancellation, cause],
+            ) from None
+    raise cancellation from exception_cause(cancellation)
+
+
+def _interaction_transition_replay_is_authoritatively_rejected(
+    error: BaseException,
+) -> bool:
+    """Return whether retry cannot reconcile the rejected transition."""
+
+    leaves = tuple(
+        candidate
+        for candidate in iter_exception_tree(error)
+        if not isinstance(candidate, BaseExceptionGroup)
+    )
+    return bool(leaves) and all(isinstance(leaf, SessionStatusConflict) for leaf in leaves)
 
 
 def _session_operation_heartbeat_failure(task: asyncio.Task[None]) -> BaseException:
@@ -2204,9 +2641,10 @@ class SessionEngine:
             SessionStatus.INTERRUPTED,
         }:
             return result
-        _, interaction_event, _ = await self._publish_interaction_transition(
+        _, interaction_event, _ = await self._publish_sibling_interaction_transition(
             session=session,
             registered_agent=registered_agent,
+            registered_environment=registered_environment,
             environment_name=_environment_name(registered_environment),
             to_status=session.status,
             from_statuses={session.status},
@@ -2655,32 +3093,282 @@ class SessionEngine:
             )
             return transitioned, None, True
 
-        publication_kwargs = {
-            "event": event,
-            "from_statuses": (
-                {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
-                if from_statuses is None
-                else from_statuses
-            ),
-            "to_status": to_status,
-            "only_if_no_queued_messages": only_if_no_queued_messages,
-        }
-        try:
-            result: InteractionTransitionResult = (
-                await self.session_store.publish_interaction_transition(
+        replay_event = copy_event(event)
+        replay_from_statuses = frozenset(
+            {SessionStatus.RUNNING, SessionStatus.INTERRUPTING}
+            if from_statuses is None
+            else from_statuses
+        )
+        replay_transition = InteractionTransitionSpec(
+            event=replay_event,
+            from_statuses=tuple(replay_from_statuses),
+            to_status=to_status,
+            only_if_no_queued_messages=only_if_no_queued_messages,
+        )
+        result: InteractionTransitionResult | None = None
+        pending_cancellation: asyncio.CancelledError | None = None
+        replay_failures: list[Exception] = []
+        replay_deadline: float | None = None
+        loop = asyncio.get_running_loop()
+        for attempt in range(_INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS):
+            transition_task = asyncio.create_task(
+                self.session_store.publish_interaction_transition(
                     session.id,
-                    **publication_kwargs,
+                    event=copy_event(replay_transition.event),
+                    from_statuses=set(replay_transition.from_statuses),
+                    to_status=replay_transition.to_status,
+                    only_if_no_queued_messages=(replay_transition.only_if_no_queued_messages),
                 )
             )
-        except Exception:
-            result = await self.session_store.publish_interaction_transition(
-                session.id,
-                **publication_kwargs,
-            )
+            outcome = await await_shielded_task_outcome(transition_task)
+            attempt_failure = _normalize_interaction_transition_child_cancellation(outcome.error)
+            attempt_result: InteractionTransitionResult | None = None
+            if attempt_failure is None and outcome.result is not None:
+                try:
+                    attempt_result = _validated_interaction_transition_result(
+                        outcome.result,
+                        transition=replay_transition,
+                    )
+                except (RuntimeError, TypeError) as result_failure:
+                    attempt_failure = result_failure
+            if outcome.cancellation is not None:
+                if attempt_failure is not None:
+                    cancellation_failures = [*replay_failures, attempt_failure]
+                    _raise_interaction_transition_cancellation(
+                        outcome.cancellation,
+                        cancellation_failures,
+                        failure_diagnostics=_interaction_transition_failure_diagnostics(
+                            tuple(cancellation_failures),
+                            redactor=self._secret_redactor,
+                        ),
+                        transition=replay_transition,
+                    )
+                if attempt_result is None:
+                    cancellation_failures = [
+                        *replay_failures,
+                        RuntimeError("Interaction transition publication returned no result."),
+                    ]
+                    _raise_interaction_transition_cancellation(
+                        outcome.cancellation,
+                        cancellation_failures,
+                        failure_diagnostics=_interaction_transition_failure_diagnostics(
+                            tuple(cancellation_failures),
+                            redactor=self._secret_redactor,
+                        ),
+                        transition=replay_transition,
+                    )
+                result = attempt_result
+                pending_cancellation = outcome.cancellation
+                break
+            if attempt_failure is None:
+                if attempt_result is None:
+                    attempt_failure = RuntimeError(
+                        "Interaction transition publication returned no result."
+                    )
+                else:
+                    result = attempt_result
+                    break
+            if not isinstance(attempt_failure, Exception):
+                if replay_failures:
+                    raise BaseExceptionGroup(
+                        "Interaction transition replay and fatal store failure.",
+                        _unique_exception_identities([*replay_failures, attempt_failure]),
+                    ) from None
+                raise attempt_failure
+            prior_failures = list(replay_failures)
+            replay_failures.append(attempt_failure)
+            if _interaction_transition_failure_contains_run_fence(attempt_failure):
+                _mark_interaction_transition_run_fence(attempt_failure)
+                if prior_failures:
+                    _raise_primary_with_secondary_failure(
+                        attempt_failure,
+                        _interaction_transition_replay_failure(prior_failures),
+                        group_message=("Interaction transition replay failure and run-fence loss."),
+                    )
+                raise attempt_failure
+            terminal_failure = _interaction_transition_replay_failure(replay_failures)
+            if _interaction_transition_replay_is_authoritatively_rejected(attempt_failure):
+                raise terminal_failure from None
+            if attempt + 1 >= _INTERACTION_TRANSITION_REPLAY_MAX_ATTEMPTS:
+                raise terminal_failure from None
+            if replay_deadline is None:
+                replay_deadline = loop.time() + _INTERACTION_TRANSITION_REPLAY_WINDOW_SECONDS
+            if loop.time() >= replay_deadline:
+                raise terminal_failure from None
+            # Give cancellation and a competing run-fence owner a boundary
+            # before replay. The completed store task above is positively
+            # settled before ownership cleanup or another attempt may begin.
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError as cancellation:
+                _raise_interaction_transition_cancellation(
+                    cancellation,
+                    replay_failures,
+                    failure_diagnostics=_interaction_transition_failure_diagnostics(
+                        tuple(replay_failures),
+                        redactor=self._secret_redactor,
+                    ),
+                    transition=replay_transition,
+                )
+            if loop.time() >= replay_deadline:
+                raise terminal_failure from None
+        if result is None:  # pragma: no cover - the bounded loop returns or raises
+            raise AssertionError("Interaction transition replay produced no result.")
+        if result.event.interaction_id is None:
+            raise RuntimeError("Interaction transition result lost its interaction identity.")
+        _mark_session_interaction_settled(
+            session.id,
+            result.event.interaction_id,
+        )
         if result.event.type in INTERACTION_TERMINAL_EVENT_TYPES:
             _close_session_interaction(session.id)
+        if pending_cancellation is not None:
+            # The atomic store publication already owns a durable side-effect
+            # handoff. Redeliver cancellation at this settled boundary instead
+            # of beginning extension-controlled budget or sink work.
+            _raise_interaction_transition_cancellation(
+                pending_cancellation,
+                replay_failures,
+                transition_settled=True,
+                failure_diagnostics=_interaction_transition_failure_diagnostics(
+                    tuple(replay_failures),
+                    redactor=self._secret_redactor,
+                ),
+                transition=replay_transition,
+            )
         await self._event_writer.fan_out_persisted([result.event])
         return result.session, result.event, result.status_changed
+
+    async def _reconcile_sibling_interaction_transition_cancellation(
+        self,
+        cancellation: asyncio.CancelledError,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        finalize_unsettled: bool,
+    ) -> None:
+        """Consume transition handoff evidence outside the main run loop."""
+
+        if _is_interaction_transition_run_fence(cancellation):
+            pop_exception_state(
+                cancellation,
+                _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
+            )
+            pop_exception_state(
+                cancellation,
+                _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
+            )
+            return
+
+        transition_cancellation_outcome = _pop_interaction_transition_cancellation_outcome(
+            cancellation
+        )
+        interaction_transition_failures: list[dict[str, Any]] = []
+        interaction_transition: InteractionTransitionSpec | None = None
+        if transition_cancellation_outcome is not None:
+            (
+                transition_settled,
+                interaction_transition_failures,
+                interaction_transition,
+            ) = transition_cancellation_outcome
+        else:
+            transition_settled = False
+
+        if not interaction_transition_failures and (
+            transition_settled or _latest_session_invocation_interaction_is_settled(session.id)
+        ):
+            return
+        if not interaction_transition_failures and not finalize_unsettled:
+            return
+
+        recovery_request = RecoveryAbandonedSessionRequest(
+            session=session,
+            registered_agent=registered_agent,
+            registered_environment=registered_environment,
+            environment_name=environment_name,
+            interaction_transition_failures=tuple(interaction_transition_failures),
+            interaction_transition=interaction_transition,
+        )
+        if interaction_transition_failures and interaction_transition is not None:
+            committed_transition_recorded = False
+
+            async def record_committed_transition_cancellation() -> None:
+                nonlocal committed_transition_recorded
+                committed_transition_recorded = await self._recovery_coordinator._record_committed_interaction_transition_cancellation(
+                    recovery_request
+                )
+
+            diagnostic_failures = await _run_interaction_transition_cancellation_cleanup_steps(
+                cancellation,
+                steps=(
+                    (
+                        "committed sibling interaction-transition cancellation diagnostics",
+                        record_committed_transition_cancellation,
+                    ),
+                ),
+            )
+            if committed_transition_recorded or diagnostic_failures:
+                return
+        if transition_settled or _latest_session_invocation_interaction_is_settled(session.id):
+            return
+        if not finalize_unsettled:
+            return
+        cancellation_cleanup_steps = (
+            (
+                "cancelled sibling interaction-transition finalization",
+                lambda: self._recovery_coordinator.finalize_abandoned_session_run(recovery_request),
+            ),
+        )
+        if interaction_transition_failures:
+            await _run_interaction_transition_cancellation_cleanup_steps(
+                cancellation,
+                steps=cancellation_cleanup_steps,
+            )
+        else:
+            await _run_recovery_cleanup_steps(
+                authoritative_failure=cancellation,
+                steps=cancellation_cleanup_steps,
+            )
+
+    async def _publish_sibling_interaction_transition(
+        self,
+        *,
+        session: Session,
+        registered_agent: runtime_records.RegisteredAgentState,
+        registered_environment: runtime_records.RegisteredEnvironment | None,
+        environment_name: str | None,
+        to_status: SessionStatus,
+        only_if_no_queued_messages: bool = False,
+        from_statuses: set[SessionStatus] | None = None,
+        recovered_active_through: datetime | None = None,
+        observed_at: datetime | None = None,
+        finalize_unsettled_cancellation: bool = True,
+    ) -> tuple[Session, Event | None, bool]:
+        """Publish from a caller not enclosed by ``_run_session`` cleanup."""
+
+        try:
+            return await self._publish_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                to_status=to_status,
+                only_if_no_queued_messages=only_if_no_queued_messages,
+                from_statuses=from_statuses,
+                recovered_active_through=recovered_active_through,
+                observed_at=observed_at,
+            )
+        except asyncio.CancelledError as cancellation:
+            await self._reconcile_sibling_interaction_transition_cancellation(
+                cancellation,
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                finalize_unsettled=finalize_unsettled_cancellation,
+            )
+            raise
 
     async def resume_interaction(
         self,
@@ -2927,9 +3615,10 @@ class SessionEngine:
                 session,
                 interaction_failed_event,
                 _,
-            ) = await self._publish_interaction_transition(
+            ) = await self._publish_sibling_interaction_transition(
                 session=session,
                 registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 environment_name=_environment_name(registered_environment),
                 to_status=SessionStatus.FAILED,
                 observed_at=failure_interaction_observed_at,
@@ -6999,16 +7688,24 @@ class SessionEngine:
                 self._session_control.end_interruption_request(loaded_session.id)
             raise
 
-        (
-            session,
-            _interaction_event,
-            _,
-        ) = await self._publish_interaction_transition(
-            session=session,
-            registered_agent=registered_agent,
-            environment_name=_environment_name(registered_environment),
-            to_status=SessionStatus.INTERRUPTED,
-        )
+        terminal_event_stream: AsyncIterator[Event] | None = None
+        try:
+            (
+                session,
+                _interaction_event,
+                _,
+            ) = await self._publish_sibling_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=_environment_name(registered_environment),
+                to_status=SessionStatus.INTERRUPTED,
+            )
+        except BaseException:
+            if request_marker_active:
+                request_marker_active = False
+                self._session_control.end_interruption_request(loaded_session.id)
+            raise
         payload = await self._load_pending_session_interrupt_payload(
             session.id,
             default={
@@ -7019,7 +7716,6 @@ class SessionEngine:
                 "interruption_request_id": interrupt_payload["interruption_request_id"],
             },
         )
-        terminal_event_stream: AsyncIterator[Event] | None = None
         try:
             existing_interrupt_event = await self._session_control.latest_interrupted_event(
                 session.id,
@@ -7416,9 +8112,10 @@ class SessionEngine:
                         session,
                         interaction_failed_event,
                         _,
-                    ) = await self._publish_interaction_transition(
+                    ) = await self._publish_sibling_interaction_transition(
                         session=session,
                         registered_agent=registered_agent,
+                        registered_environment=registered_environment,
                         environment_name=_environment_name(registered_environment),
                         to_status=SessionStatus.FAILED,
                     )
@@ -9350,9 +10047,10 @@ class SessionEngine:
                 session,
                 interaction_paused_event,
                 _,
-            ) = await self._publish_interaction_transition(
+            ) = await self._publish_sibling_interaction_transition(
                 session=session,
                 registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
             )
@@ -9400,9 +10098,10 @@ class SessionEngine:
                 session,
                 interaction_paused_event,
                 _,
-            ) = await self._publish_interaction_transition(
+            ) = await self._publish_sibling_interaction_transition(
                 session=session,
                 registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 environment_name=environment_name,
                 to_status=SessionStatus.INTERRUPTED,
             )
@@ -9465,6 +10164,71 @@ class SessionEngine:
                 yield event
             return
         except asyncio.CancelledError as cancellation:
+            if _is_interaction_transition_run_fence(cancellation):
+                # The owned transition attempt proved that this worker lost
+                # authority. Preserve caller cancellation without attempting
+                # abandoned-run writes under the stale epoch. The transition
+                # handoff is runtime-only evidence for cleanup that this branch
+                # must not perform, so do not let it escape on the public error.
+                pop_exception_state(
+                    cancellation,
+                    _INTERACTION_TRANSITION_CANCELLATION_OUTCOME_ATTRIBUTE,
+                )
+                pop_exception_state(
+                    cancellation,
+                    _INTERACTION_TRANSITION_RUN_FENCE_ATTRIBUTE,
+                )
+                raise
+            transition_cancellation_outcome = _pop_interaction_transition_cancellation_outcome(
+                cancellation
+            )
+            interaction_transition_failures: list[dict[str, Any]] = []
+            interaction_transition: InteractionTransitionSpec | None = None
+            if transition_cancellation_outcome is not None:
+                (
+                    transition_settled,
+                    interaction_transition_failures,
+                    interaction_transition,
+                ) = transition_cancellation_outcome
+            else:
+                transition_settled = False
+            if interaction_transition_failures and interaction_transition is not None:
+                committed_transition_recorded = False
+
+                async def record_committed_transition_cancellation() -> None:
+                    nonlocal committed_transition_recorded
+                    committed_transition_recorded = await self._recovery_coordinator._record_committed_interaction_transition_cancellation(
+                        RecoveryAbandonedSessionRequest(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=environment_name,
+                            run_started_at=run_started_at,
+                            turn_usage_tracker=turn_usage_tracker,
+                            active_run=active_run,
+                            interaction_transition_failures=tuple(interaction_transition_failures),
+                            interaction_transition=interaction_transition,
+                        )
+                    )
+
+                diagnostic_failures = await _run_interaction_transition_cancellation_cleanup_steps(
+                    cancellation,
+                    steps=(
+                        (
+                            "committed interaction-transition cancellation diagnostics",
+                            record_committed_transition_cancellation,
+                        ),
+                    ),
+                )
+                if committed_transition_recorded or diagnostic_failures:
+                    # Exact committed evidence, or inability to classify it,
+                    # forbids a later cleanup branch from rewriting status.
+                    raise
+            if transition_settled or _latest_session_invocation_interaction_is_settled(session.id):
+                # The authoritative interaction/session decision already
+                # committed. Its durable side-effect handoff remains
+                # recoverable, so abandoned-run cleanup must not rewrite it.
+                raise
             if detach_billing_identity_cancellation(cancellation) is not None:
                 # The outer run boundary owns credential-safe detachment and
                 # environment finalization for billing-hook cancellations.
@@ -9488,6 +10252,7 @@ class SessionEngine:
                     run_started_at=run_started_at,
                     turn_usage_tracker=turn_usage_tracker,
                     active_run=active_run,
+                    interaction_transition_failures=tuple(interaction_transition_failures),
                 ):
                     interruption_events.append(event)
                 for event in interruption_events:
@@ -9504,29 +10269,38 @@ class SessionEngine:
                 ):
                     pass
 
-            await _run_recovery_cleanup_steps(
-                authoritative_failure=cancellation,
-                steps=(
-                    (
-                        "cancelled tool-round finalization",
-                        close_cancelled_tool_round,
-                    ),
-                    (
-                        "cancelled session finalization",
-                        lambda: self._recovery_coordinator.finalize_abandoned_session_run(
-                            RecoveryAbandonedSessionRequest(
-                                session=session,
-                                registered_agent=registered_agent,
-                                registered_environment=registered_environment,
-                                environment_name=environment_name,
-                                run_started_at=run_started_at,
-                                turn_usage_tracker=turn_usage_tracker,
-                                active_run=active_run,
-                            )
-                        ),
+            cancellation_cleanup_steps = (
+                (
+                    "cancelled tool-round finalization",
+                    close_cancelled_tool_round,
+                ),
+                (
+                    "cancelled session finalization",
+                    lambda: self._recovery_coordinator.finalize_abandoned_session_run(
+                        RecoveryAbandonedSessionRequest(
+                            session=session,
+                            registered_agent=registered_agent,
+                            registered_environment=registered_environment,
+                            environment_name=environment_name,
+                            run_started_at=run_started_at,
+                            turn_usage_tracker=turn_usage_tracker,
+                            active_run=active_run,
+                            interaction_transition_failures=tuple(interaction_transition_failures),
+                            interaction_transition=interaction_transition,
+                        )
                     ),
                 ),
             )
+            if interaction_transition_failures:
+                await _run_interaction_transition_cancellation_cleanup_steps(
+                    cancellation,
+                    steps=cancellation_cleanup_steps,
+                )
+            else:
+                await _run_recovery_cleanup_steps(
+                    authoritative_failure=cancellation,
+                    steps=cancellation_cleanup_steps,
+                )
             raise
         except GeneratorExit as abandonment:
             # The consumer closed the event stream (client disconnect / abandoned
@@ -9534,6 +10308,10 @@ class SessionEngine:
             # stranding it in RUNNING; an async generator must not yield while
             # handling GeneratorExit, so the terminal emission is drained, not
             # streamed.
+            if _latest_session_invocation_interaction_is_settled(session.id):
+                # Closing after an authoritative transition was exposed must
+                # not rewrite the completed/paused interaction decision.
+                raise
             await materialize_deferred_messages_after_failure()
             try:
                 await self._recovery_coordinator.finalize_abandoned_session_run(
@@ -9557,6 +10335,8 @@ class SessionEngine:
         except TerminalEventPublicationUncertain:
             raise
         except Exception as exc:
+            if _is_interaction_transition_run_fence(exc):
+                raise
             if _is_runtime_interaction_lifecycle_publication_rejection(
                 exc,
                 session_id=session.id,
@@ -9630,9 +10410,10 @@ class SessionEngine:
                 session,
                 interaction_failed_event,
                 _,
-            ) = await self._publish_interaction_transition(
+            ) = await self._publish_sibling_interaction_transition(
                 session=session,
                 registered_agent=registered_agent,
+                registered_environment=registered_environment,
                 environment_name=environment_name,
                 to_status=SessionStatus.FAILED,
                 observed_at=failure_interaction_observed_at,
@@ -9644,6 +10425,14 @@ class SessionEngine:
                 diagnostic=failure_diagnostic,
                 redactor=self._secret_redactor,
             )
+            transition_replay_failures = _interaction_transition_replay_failures(exc)
+            if transition_replay_failures is not None:
+                payload["interaction_transition_failures"] = (
+                    _interaction_transition_failure_diagnostics(
+                        transition_replay_failures,
+                        redactor=self._secret_redactor,
+                    )
+                )
             if isinstance(exc, resume_ledger.ToolCallEvidenceConflict):
                 payload[resume_ledger.TOOL_EVIDENCE_CONFLICT_PAYLOAD_KEY] = True
             if task_failure_error is not None:
@@ -9696,6 +10485,7 @@ class SessionEngine:
                                 current_task,
                             )
                     finally:
+                        _clear_session_interaction_settlement(session.id)
                         _deactivate_session_interaction(session.id)
 
     async def _emit_turn_completed(
@@ -9710,12 +10500,14 @@ class SessionEngine:
     ) -> tuple[Event, ...]:
         interaction_id = _current_session_interaction_id(session.id)
         if interaction_id is not None and status != SessionStatus.COMPLETED:
-            _, interaction_event, _ = await self._publish_interaction_transition(
+            _, interaction_event, _ = await self._publish_sibling_interaction_transition(
                 session=session,
                 registered_agent=registered_agent,
+                registered_environment=None,
                 environment_name=environment_name,
                 to_status=status,
                 from_statuses={status},
+                finalize_unsettled_cancellation=False,
             )
         else:
             interaction_event = None
@@ -10050,6 +10842,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            reconcile_transition_cancellation=False,
         ):
             yield event
 
@@ -10109,7 +10902,10 @@ class SessionEngine:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        reconcile_transition_cancellation: bool,
     ) -> AsyncGenerator[Event, None]:
+        if type(reconcile_transition_cancellation) is not bool:
+            raise TypeError("reconcile_transition_cancellation must be a bool.")
         if tool_round_identity is None and pending_approval_to_clear is not None:
             tool_round_identity = ToolRoundIdentity(
                 tool_round_id=pending_approval_to_clear.tool_round_id,
@@ -10147,16 +10943,29 @@ class SessionEngine:
             ):
                 yield event
 
-        (
-            interrupted_session,
-            interaction_interrupted_event,
-            _,
-        ) = await self._publish_interaction_transition(
-            session=session,
-            registered_agent=registered_agent,
-            environment_name=environment_name,
-            to_status=SessionStatus.INTERRUPTED,
-        )
+        if reconcile_transition_cancellation:
+            (
+                interrupted_session,
+                interaction_interrupted_event,
+                _,
+            ) = await self._publish_sibling_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                registered_environment=registered_environment,
+                environment_name=environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+            )
+        else:
+            (
+                interrupted_session,
+                interaction_interrupted_event,
+                _,
+            ) = await self._publish_interaction_transition(
+                session=session,
+                registered_agent=registered_agent,
+                environment_name=environment_name,
+                to_status=SessionStatus.INTERRUPTED,
+            )
         if interaction_interrupted_event is not None:
             yield interaction_interrupted_event
         terminal_payload = {
@@ -10232,6 +11041,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            reconcile_transition_cancellation=False,
         ):
             yield event
 
@@ -10280,6 +11090,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            reconcile_transition_cancellation=False,
         ):
             yield event
 
@@ -10332,6 +11143,7 @@ class SessionEngine:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            reconcile_transition_cancellation=False,
         ):
             yield event
 
@@ -11039,6 +11851,7 @@ class SessionEngine:
         run_started_at: float | None = None,
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
+        interaction_transition_failures: tuple[dict[str, Any], ...] = (),
     ) -> AsyncGenerator[Event, None]:
         clear_current_task_cancellation()
         current_task = asyncio.current_task()
@@ -11055,23 +11868,37 @@ class SessionEngine:
                     loaded_interrupted,
                     interaction_event,
                     _,
-                ) = await self._publish_interaction_transition(
+                ) = await self._publish_sibling_interaction_transition(
                     session=loaded_interrupted,
                     registered_agent=registered_agent,
+                    registered_environment=registered_environment,
                     environment_name=environment_name,
                     to_status=SessionStatus.INTERRUPTED,
+                    finalize_unsettled_cancellation=False,
                 )
             payload = await self._load_pending_session_interrupt_payload(session.id, default={})
+            if interaction_transition_failures:
+                copied_failures = copy_durable_json_value(
+                    list(interaction_transition_failures),
+                    "interaction transition cancellation diagnostics",
+                )
+                if type(copied_failures) is not list:
+                    raise TypeError(
+                        "Interaction transition cancellation diagnostics must be a list."
+                    )
+                payload["interaction_transition_failures"] = copied_failures
             if (
                 interaction_event is None
                 and _current_session_interaction_id(session.id) is not None
             ):
-                _, interaction_event, _ = await self._publish_interaction_transition(
+                _, interaction_event, _ = await self._publish_sibling_interaction_transition(
                     session=loaded_interrupted,
                     registered_agent=registered_agent,
+                    registered_environment=registered_environment,
                     environment_name=environment_name,
                     to_status=SessionStatus.INTERRUPTED,
                     from_statuses={SessionStatus.INTERRUPTED},
+                    finalize_unsettled_cancellation=False,
                 )
             if interaction_event is not None:
                 yield interaction_event

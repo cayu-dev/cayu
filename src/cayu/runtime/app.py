@@ -2607,9 +2607,10 @@ class CayuApp:
         self,
         request: RecoveryAbandonedTurnRequest,
     ) -> Session:
-        finalized, _, _ = await self._session_engine._publish_interaction_transition(
+        finalized, _, _ = await self._session_engine._publish_sibling_interaction_transition(
             session=request.session,
             registered_agent=request.registered_agent,
+            registered_environment=request.registered_environment,
             environment_name=request.environment_name,
             to_status=SessionStatus.INTERRUPTED,
         )
@@ -3004,6 +3005,8 @@ class CayuApp:
         turn_usage_tracker: SessionUsageTracker | None = None,
         active_run: ActiveSessionRun[SessionUsageTracker] | None = None,
     ) -> AsyncIterator[Event]:
+        # This adapter is owned by RecoveryCoordinator, not SessionEngine._run_session,
+        # so its terminal transition must consume the sibling cancellation handoff.
         stream = self._session_engine._stop_session_for_limit_reached(
             session=session,
             registered_agent=registered_agent,
@@ -3022,6 +3025,7 @@ class CayuApp:
             run_started_at=run_started_at,
             turn_usage_tracker=turn_usage_tracker,
             active_run=active_run,
+            reconcile_transition_cancellation=True,
         )
         async with _close_delegated_event_stream(stream) as owned_stream:
             async for item in owned_stream:

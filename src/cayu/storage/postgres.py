@@ -136,7 +136,9 @@ from cayu.runtime.sessions import (
     EventSummary,
     ForkTranscriptValidator,
     InteractionAttribution,
+    InteractionTransitionReceiptResult,
     InteractionTransitionResult,
+    InteractionTransitionSpec,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -222,6 +224,7 @@ from cayu.runtime.sessions import (
     _event_input_contract_is_runtime_owned,
     _initial_transcript_pending_checkpoint,
     _interaction_transition_receipt_record,
+    _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
     _model_completion_stage_abandonment_record,
     _model_completion_stage_preparation_record,
@@ -233,6 +236,7 @@ from cayu.runtime.sessions import (
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
     _prepare_interaction_transition,
+    _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
     _prepare_session_fork_request,
     _PreparedModelCompletionStage,
@@ -7444,19 +7448,17 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
-        (
-            session_id,
-            copied_event,
-            allowed_statuses,
-            target_status,
-            conditional,
-        ) = _prepare_interaction_transition(
+        session_id, transition = _prepare_interaction_transition(
             session_id,
             event=event,
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
         )
+        copied_event = transition.event
+        allowed_statuses = set(transition.from_statuses)
+        target_status = transition.to_status
+        conditional = transition.only_if_no_queued_messages
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         await self._ensure_ready()
         async with self._connection() as conn:
@@ -7480,10 +7482,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     if receipt_row is not None:
                         receipt = _reconstruct_interaction_transition_receipt(
                             _json_obj(receipt_row[0]),
-                            event=copied_event,
-                            from_statuses=allowed_statuses,
-                            to_status=target_status,
-                            only_if_no_queued_messages=conditional,
+                            transition=transition,
                         )
                         if (
                             existing_row is not None
@@ -7615,6 +7614,54 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             event=copied_event,
             status_changed=not queued,
         )
+
+    async def load_interaction_transition_receipt(
+        self,
+        session_id: str,
+        *,
+        transition: InteractionTransitionSpec,
+    ) -> InteractionTransitionReceiptResult | None:
+        session_id, copied_transition = _prepare_interaction_transition_receipt_lookup(
+            session_id,
+            transition=transition,
+        )
+        copied_event = copied_transition.event
+        receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
+        await self._ensure_ready()
+        async with self._connection() as conn, conn.cursor() as cur:
+            await cur.execute(
+                "SELECT operation.record, retained.event "
+                "FROM cayu_sessions AS session "
+                "LEFT JOIN cayu_session_operations AS operation "
+                "ON operation.session_id = session.id AND operation.idempotency_key = %s "
+                "LEFT JOIN cayu_events AS retained "
+                "ON retained.session_id = session.id AND retained.event_id = %s "
+                "WHERE session.id = %s",
+                (receipt_storage_key, copied_event.id, session_id),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            receipt_record, existing_record = row
+            if receipt_record is None:
+                if existing_record is not None:
+                    raise RuntimeError(
+                        "Interaction transition event exists without its immutable receipt."
+                    )
+                return None
+            receipt = _reconstruct_interaction_transition_receipt(
+                _json_obj(receipt_record),
+                transition=copied_transition,
+            )
+            if existing_record is not None and Event(**_json_obj(existing_record)) != receipt.event:
+                raise RuntimeError(
+                    "Interaction transition receipt conflicts with retained event history."
+                )
+            return InteractionTransitionReceiptResult(
+                session=receipt.session,
+                transition=_interaction_transition_spec_from_receipt(receipt),
+                status_changed=receipt.status_changed,
+            )
 
     async def fence_stalled_run(
         self,

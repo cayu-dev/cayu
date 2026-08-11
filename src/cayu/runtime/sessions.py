@@ -294,6 +294,10 @@ _SESSION_INVOCATION_INTERACTION_IDS: ContextVar[dict[str, tuple[str, ...]] | Non
     "cayu_session_invocation_interaction_ids",
     default=None,
 )
+_SESSION_SETTLED_INTERACTION_IDS: ContextVar[dict[str, str] | None] = ContextVar(
+    "cayu_session_settled_interaction_ids",
+    default=None,
+)
 
 
 class _InheritInteractionAttribution:
@@ -308,6 +312,7 @@ UNASSOCIATED_RUNTIME_EVENT_TYPES: frozenset[EventType] = frozenset(
         EventType.SESSION_COMPLETED,
         EventType.SESSION_FAILED,
         EventType.SESSION_INTERRUPTED,
+        EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED,
     }
 )
 
@@ -353,6 +358,40 @@ def _clear_session_interaction_recovered_active_through(session_id: str) -> None
 def _current_session_invocation_interaction_ids(session_id: str) -> tuple[str, ...]:
     interactions = _SESSION_INVOCATION_INTERACTION_IDS.get()
     return () if interactions is None else interactions.get(session_id, ())
+
+
+def _mark_session_interaction_settled(session_id: str, interaction_id: str) -> None:
+    """Record the exact interaction settled by the current stream invocation."""
+
+    session_id = require_clean_nonblank(session_id, "session_id")
+    interaction_id = require_clean_nonblank(interaction_id, "interaction_id")
+    settled = dict(_SESSION_SETTLED_INTERACTION_IDS.get() or {})
+    settled[session_id] = interaction_id
+    _SESSION_SETTLED_INTERACTION_IDS.set(settled)
+
+
+def _latest_session_invocation_interaction_is_settled(session_id: str) -> bool:
+    """Return whether this invocation durably settled its latest interaction."""
+
+    settled = _SESSION_SETTLED_INTERACTION_IDS.get()
+    if settled is None:
+        return False
+    settled_interaction_id = settled.get(session_id)
+    invocation_interaction_ids = _current_session_invocation_interaction_ids(session_id)
+    return bool(
+        settled_interaction_id is not None
+        and invocation_interaction_ids
+        and settled_interaction_id == invocation_interaction_ids[-1]
+    )
+
+
+def _clear_session_interaction_settlement(session_id: str) -> None:
+    settled = _SESSION_SETTLED_INTERACTION_IDS.get()
+    if settled is None or session_id not in settled:
+        return
+    remaining = dict(settled)
+    remaining.pop(session_id)
+    _SESSION_SETTLED_INTERACTION_IDS.set(remaining or None)
 
 
 def resolve_interaction_attribution(
@@ -408,6 +447,10 @@ def _activate_session_interaction(session_id: str, interaction_id: str) -> None:
     invocation_interactions = dict(_SESSION_INVOCATION_INTERACTION_IDS.get() or {})
     seen = invocation_interactions.get(session_id, ())
     if interaction_id not in seen:
+        # A newly admitted invocation may legitimately reuse an open interaction
+        # during recovery. Settlement from the previous invocation must not make
+        # cancellation of the resumed work look already committed.
+        _clear_session_interaction_settlement(session_id)
         invocation_interactions[session_id] = (*seen, interaction_id)
         _SESSION_INVOCATION_INTERACTION_IDS.set(invocation_interactions)
 
@@ -430,6 +473,7 @@ def _close_session_interaction(session_id: str) -> None:
 
 def _deactivate_session_interaction(session_id: str) -> None:
     _close_session_interaction(session_id)
+    _clear_session_interaction_settlement(session_id)
     invocation_interactions = _SESSION_INVOCATION_INTERACTION_IDS.get()
     if invocation_interactions is not None and session_id in invocation_interactions:
         remaining_invocations = dict(invocation_interactions)
@@ -456,6 +500,10 @@ class _SessionRunFenceContext:
         invocation_interaction_ids = _SESSION_INVOCATION_INTERACTION_IDS.get()
         self._invocation_interaction_ids = (
             None if invocation_interaction_ids is None else dict(invocation_interaction_ids)
+        )
+        settled_interaction_ids = _SESSION_SETTLED_INTERACTION_IDS.get()
+        self._settled_interaction_ids = (
+            None if settled_interaction_ids is None else dict(settled_interaction_ids)
         )
 
     @classmethod
@@ -497,6 +545,12 @@ class _SessionRunFenceContext:
         invocation_interaction_ids_token = _SESSION_INVOCATION_INTERACTION_IDS.set(
             invocation_interaction_ids
         )
+        settled_interaction_ids = (
+            None if self._settled_interaction_ids is None else dict(self._settled_interaction_ids)
+        )
+        settled_interaction_ids_token = _SESSION_SETTLED_INTERACTION_IDS.set(
+            settled_interaction_ids
+        )
         context_token = _ACTIVE_SESSION_RUN_FENCE_CONTEXT.set((self, ref(task)))
         try:
             yield
@@ -525,7 +579,14 @@ class _SessionRunFenceContext:
                 if current_invocation_interaction_ids is None
                 else dict(current_invocation_interaction_ids)
             )
+            current_settled_interaction_ids = _SESSION_SETTLED_INTERACTION_IDS.get()
+            self._settled_interaction_ids = (
+                None
+                if current_settled_interaction_ids is None
+                else dict(current_settled_interaction_ids)
+            )
             _ACTIVE_SESSION_RUN_FENCE_CONTEXT.reset(context_token)
+            _SESSION_SETTLED_INTERACTION_IDS.reset(settled_interaction_ids_token)
             _SESSION_INVOCATION_INTERACTION_IDS.reset(invocation_interaction_ids_token)
             _SESSION_INTERACTION_RECOVERED_ACTIVE_THROUGH.reset(recovered_active_through_token)
             _SESSION_INTERACTION_STARTED_AT.reset(interaction_started_at_token)
@@ -1161,6 +1222,110 @@ class InteractionTransitionResult(BaseModel):
     @classmethod
     def copy_event(cls, value: Event) -> Event:
         return copy_event(value)
+
+
+class InteractionTransitionSpec(BaseModel):
+    """Complete caller-owned identity of one interaction transition."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    event: Event
+    from_statuses: tuple[SessionStatus, ...]
+    to_status: SessionStatus
+    only_if_no_queued_messages: StrictBool = False
+
+    @field_validator("event")
+    @classmethod
+    def copy_event(cls, value: Event) -> Event:
+        return copy_event(value)
+
+    @field_validator("from_statuses")
+    @classmethod
+    def canonicalize_source_statuses(
+        cls,
+        value: tuple[SessionStatus, ...],
+    ) -> tuple[SessionStatus, ...]:
+        if not value:
+            raise ValueError("Interaction transition requires source statuses.")
+        if len(set(value)) != len(value):
+            raise ValueError("Interaction transition source statuses must be unique.")
+        return tuple(sorted(value, key=str))
+
+    @model_validator(mode="after")
+    def validate_transition_shape(self) -> InteractionTransitionSpec:
+        if self.event.interaction_id is None:
+            raise ValueError("Interaction transition event must have an interaction_id.")
+        statuses_by_event_type: dict[str, set[SessionStatus]] = {
+            EventType.INTERACTION_PAUSED: {
+                SessionStatus.FAILED,
+                SessionStatus.INTERRUPTED,
+            },
+            EventType.INTERACTION_COMPLETED: {SessionStatus.COMPLETED},
+            EventType.INTERACTION_FAILED: {SessionStatus.FAILED},
+            EventType.INTERACTION_INTERRUPTED: {SessionStatus.INTERRUPTED},
+        }
+        expected_statuses = statuses_by_event_type.get(self.event.type)
+        if expected_statuses is None:
+            raise ValueError("event must be a terminal or paused interaction lifecycle event.")
+        if self.to_status not in expected_statuses:
+            rendered_statuses = ", ".join(sorted(str(status) for status in expected_statuses))
+            raise ValueError(
+                f"{self.event.type} requires session status in "
+                f"{{{rendered_statuses}}}, not {self.to_status}."
+            )
+        if self.only_if_no_queued_messages and self.event.type != EventType.INTERACTION_COMPLETED:
+            raise ValueError("only_if_no_queued_messages is valid only for interaction.completed.")
+        return self
+
+
+class InteractionTransitionReceiptResult(BaseModel):
+    """Read-only exact receipt evidence for one interaction transition."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
+
+    session: Session
+    transition: InteractionTransitionSpec
+    status_changed: StrictBool
+    replayed: Literal[True] = True
+
+    @field_validator("session")
+    @classmethod
+    def copy_session(cls, value: Session) -> Session:
+        return copy_session(value)
+
+    @field_validator("transition")
+    @classmethod
+    def copy_transition(
+        cls,
+        value: InteractionTransitionSpec,
+    ) -> InteractionTransitionSpec:
+        return copy_interaction_transition_spec(value)
+
+    @model_validator(mode="after")
+    def validate_result(self) -> InteractionTransitionReceiptResult:
+        if self.session.id != self.transition.event.session_id:
+            raise ValueError("Interaction transition receipt belongs to a different session.")
+        if self.status_changed:
+            if self.session.status is not self.transition.to_status:
+                raise ValueError(
+                    "Interaction transition receipt changed status does not match its session."
+                )
+        elif (
+            not self.transition.only_if_no_queued_messages
+            or self.session.status not in self.transition.from_statuses
+        ):
+            raise ValueError("Interaction transition receipt unchanged status is inconsistent.")
+        return self
 
 
 class _InteractionTransitionReceipt(BaseModel):
@@ -5327,9 +5492,30 @@ class SessionStore(ABC):
 
         A completion guarded by ``only_if_no_queued_messages`` always publishes
         the interaction event, but leaves the session status unchanged when
-        queued input remains. Repeating the exact event identity reconstructs
-        the committed result without re-evaluating that queue boundary.
+        queued input remains. Repeating the exact complete transition
+        reconstructs the committed result without re-evaluating that queue
+        boundary. Reusing its event identity with different transition data
+        fails closed.
         """
+
+    async def load_interaction_transition_receipt(
+        self,
+        session_id: str,
+        *,
+        transition: InteractionTransitionSpec,
+    ) -> InteractionTransitionReceiptResult | None:
+        """Load immutable evidence for one exact interaction transition.
+
+        Stores that support acknowledgement-loss recovery must implement this
+        read-only boundary. The default keeps existing custom stores source
+        compatible while making unsupported cancellation reconciliation fail
+        closed instead of issuing another transition publication.
+        """
+
+        del session_id, transition
+        raise NotImplementedError(
+            "This session store does not support interaction-transition receipt lookup."
+        )
 
     @abstractmethod
     async def fence_stalled_run(
@@ -7607,19 +7793,17 @@ class InMemorySessionStore(SessionStore):
         to_status: SessionStatus,
         only_if_no_queued_messages: bool = False,
     ) -> InteractionTransitionResult:
-        (
-            session_id,
-            copied_event,
-            allowed_statuses,
-            target_status,
-            conditional,
-        ) = _prepare_interaction_transition(
+        session_id, transition = _prepare_interaction_transition(
             session_id,
             event=event,
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
         )
+        copied_event = transition.event
+        allowed_statuses = set(transition.from_statuses)
+        target_status = transition.to_status
+        conditional = transition.only_if_no_queued_messages
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -7632,10 +7816,7 @@ class InMemorySessionStore(SessionStore):
             if receipt_record is not None:
                 receipt = _reconstruct_interaction_transition_receipt(
                     receipt_record,
-                    event=copied_event,
-                    from_statuses=allowed_statuses,
-                    to_status=target_status,
-                    only_if_no_queued_messages=conditional,
+                    transition=transition,
                 )
                 if existing is not None and existing.event != receipt.event:
                     raise RuntimeError(
@@ -7682,6 +7863,45 @@ class InMemorySessionStore(SessionStore):
                 session=updated,
                 event=copied_event,
                 status_changed=not queued,
+            )
+
+    async def load_interaction_transition_receipt(
+        self,
+        session_id: str,
+        *,
+        transition: InteractionTransitionSpec,
+    ) -> InteractionTransitionReceiptResult | None:
+        session_id, copied_transition = _prepare_interaction_transition_receipt_lookup(
+            session_id,
+            transition=transition,
+        )
+        copied_event = copied_transition.event
+        receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
+        async with self._lock:
+            if session_id not in self._sessions:
+                raise KeyError(f"Session not found: {session_id}")
+            receipt_record = self._session_operation_records.get(session_id, {}).get(
+                receipt_storage_key
+            )
+            existing = self._event_records_by_id.get((session_id, copied_event.id))
+            if receipt_record is None:
+                if existing is not None:
+                    raise RuntimeError(
+                        "Interaction transition event exists without its immutable receipt."
+                    )
+                return None
+            receipt = _reconstruct_interaction_transition_receipt(
+                receipt_record,
+                transition=copied_transition,
+            )
+            if existing is not None and existing.event != receipt.event:
+                raise RuntimeError(
+                    "Interaction transition receipt conflicts with retained event history."
+                )
+            return InteractionTransitionReceiptResult(
+                session=receipt.session,
+                transition=_interaction_transition_spec_from_receipt(receipt),
+                status_changed=receipt.status_changed,
             )
 
     async def fence_stalled_run(
@@ -11338,14 +11558,7 @@ def _interaction_transition_receipt_record(
     return receipt.model_dump(mode="json")
 
 
-def _reconstruct_interaction_transition_receipt(
-    record: object,
-    *,
-    event: Event,
-    from_statuses: set[SessionStatus],
-    to_status: SessionStatus,
-    only_if_no_queued_messages: bool,
-) -> _InteractionTransitionReceipt:
+def _load_interaction_transition_receipt(record: object) -> _InteractionTransitionReceipt:
     try:
         receipt = _InteractionTransitionReceipt.model_validate(record)
         digest_payload = receipt.model_dump(mode="json", exclude={"record_digest"})
@@ -11353,16 +11566,35 @@ def _reconstruct_interaction_transition_receipt(
             raise ValueError
     except (TypeError, ValueError) as exc:
         raise RuntimeError("Stored interaction-transition receipt is invalid.") from exc
-    if (
-        receipt.event != event
-        or set(receipt.from_statuses) != from_statuses
-        or receipt.to_status is not to_status
-        or receipt.only_if_no_queued_messages is not only_if_no_queued_messages
-    ):
-        raise ValueError(
-            "Interaction transition event identity was reused with different data "
-            "for the transition."
-        )
+    return receipt
+
+
+def _interaction_transition_spec_from_receipt(
+    receipt: _InteractionTransitionReceipt,
+) -> InteractionTransitionSpec:
+    return InteractionTransitionSpec(
+        event=receipt.event,
+        from_statuses=receipt.from_statuses,
+        to_status=receipt.to_status,
+        only_if_no_queued_messages=receipt.only_if_no_queued_messages,
+    )
+
+
+def _validate_interaction_transition_receipt_spec(
+    receipt: _InteractionTransitionReceipt,
+    transition: InteractionTransitionSpec,
+) -> None:
+    if _interaction_transition_spec_from_receipt(receipt) != transition:
+        raise ValueError("Interaction transition identity was reused with different data.")
+
+
+def _reconstruct_interaction_transition_receipt(
+    record: object,
+    *,
+    transition: InteractionTransitionSpec,
+) -> _InteractionTransitionReceipt:
+    receipt = _load_interaction_transition_receipt(record)
+    _validate_interaction_transition_receipt_spec(receipt, transition)
     return receipt
 
 
@@ -14688,6 +14920,28 @@ def _copy_queued_interaction_started_event(
     return copied
 
 
+def copy_interaction_transition_spec(
+    value: InteractionTransitionSpec,
+) -> InteractionTransitionSpec:
+    """Return a validated detached copy of one complete transition identity."""
+
+    if type(value) is not InteractionTransitionSpec:
+        raise TypeError("transition must be an InteractionTransitionSpec.")
+    return InteractionTransitionSpec.model_validate(value.model_dump(mode="python"))
+
+
+def _prepare_interaction_transition_receipt_lookup(
+    session_id: str,
+    *,
+    transition: InteractionTransitionSpec,
+) -> tuple[str, InteractionTransitionSpec]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    copied_transition = copy_interaction_transition_spec(transition)
+    if copied_transition.event.session_id != session_id:
+        raise ValueError("Interaction transition event belongs to a different session.")
+    return session_id, copied_transition
+
+
 def _prepare_interaction_transition(
     session_id: str,
     *,
@@ -14695,46 +14949,25 @@ def _prepare_interaction_transition(
     from_statuses: set[SessionStatus],
     to_status: SessionStatus,
     only_if_no_queued_messages: bool,
-) -> tuple[str, Event, set[SessionStatus], SessionStatus, bool]:
+) -> tuple[str, InteractionTransitionSpec]:
     session_id = require_clean_nonblank(session_id, "session_id")
     if type(event) is not Event:
         raise TypeError("event must be an Event.")
-    copied_event = copy_event(event)
-    if copied_event.session_id != session_id:
-        raise ValueError("Interaction transition event belongs to a different session.")
-    if copied_event.interaction_id is None:
-        raise ValueError("Interaction transition event must have an interaction_id.")
-    statuses_by_event_type: dict[str, set[SessionStatus]] = {
-        EventType.INTERACTION_PAUSED: {
-            SessionStatus.FAILED,
-            SessionStatus.INTERRUPTED,
-        },
-        EventType.INTERACTION_COMPLETED: {SessionStatus.COMPLETED},
-        EventType.INTERACTION_FAILED: {SessionStatus.FAILED},
-        EventType.INTERACTION_INTERRUPTED: {SessionStatus.INTERRUPTED},
-    }
-    expected_statuses = statuses_by_event_type.get(copied_event.type)
-    if expected_statuses is None:
-        raise ValueError("event must be a terminal or paused interaction lifecycle event.")
+    if type(from_statuses) is not set:
+        raise TypeError("from_statuses must be a set.")
     if not isinstance(to_status, SessionStatus):
         raise ValueError("to_status must be a SessionStatus.")
-    if to_status not in expected_statuses:
-        rendered_statuses = ", ".join(sorted(str(status) for status in expected_statuses))
-        raise ValueError(
-            f"{copied_event.type} requires session status in "
-            f"{{{rendered_statuses}}}, not {to_status}."
-        )
     if type(only_if_no_queued_messages) is not bool:
         raise TypeError("only_if_no_queued_messages must be a bool.")
-    if only_if_no_queued_messages and copied_event.type != EventType.INTERACTION_COMPLETED:
-        raise ValueError("only_if_no_queued_messages is valid only for interaction.completed.")
-    return (
-        session_id,
-        copied_event,
-        _validate_status_set(from_statuses, "from_statuses"),
-        to_status,
-        only_if_no_queued_messages,
+    transition = InteractionTransitionSpec(
+        event=copy_event(event),
+        from_statuses=tuple(_validate_status_set(from_statuses, "from_statuses")),
+        to_status=to_status,
+        only_if_no_queued_messages=only_if_no_queued_messages,
     )
+    if transition.event.session_id != session_id:
+        raise ValueError("Interaction transition event belongs to a different session.")
+    return session_id, transition
 
 
 def _copy_interaction_admission(

@@ -67,6 +67,7 @@ from cayu.runtime import (
     IncompleteSessionRecoveryAction,
     IncompleteSessionRecoveryRequest,
     InMemorySessionStore,
+    InteractionTransitionSpec,
     InterruptSessionRequest,
     McpManifestBaseline,
     ModelCompactor,
@@ -574,6 +575,18 @@ class _UnusedForkProvider(ModelProvider):
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         del request
+        yield ModelStreamEvent.completed({"finish_reason": "stop"})
+
+
+class _TransitionReplayConformanceProvider(ModelProvider):
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        self.requests.append(request)
+        yield ModelStreamEvent.text_delta("completed")
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
@@ -13385,10 +13398,25 @@ def test_session_store_conformance_interaction_transition_is_atomic_and_reconstr
                 from_statuses={SessionStatus.RUNNING},
                 to_status=SessionStatus.FAILED,
             )
+            failed_transition = InteractionTransitionSpec(
+                event=failed,
+                from_statuses=(SessionStatus.RUNNING,),
+                to_status=SessionStatus.FAILED,
+            )
             assert published.status_changed is True
             assert published.replayed is False
             assert published.session.status is SessionStatus.FAILED
             assert published.event == failed
+
+            loaded_receipt = await store.load_interaction_transition_receipt(
+                session_id,
+                transition=failed_transition,
+            )
+            assert loaded_receipt is not None
+            assert loaded_receipt.status_changed is True
+            assert loaded_receipt.replayed is True
+            assert loaded_receipt.session == published.session
+            assert loaded_receipt.transition == failed_transition
 
             store = await _reopen_store(session_store_case, store)
             replayed = await store.publish_interaction_transition(
@@ -13412,6 +13440,13 @@ def test_session_store_conformance_interaction_transition_is_atomic_and_reconstr
                     event=failed.model_copy(update={"payload": {"changed": True}}),
                     from_statuses={SessionStatus.RUNNING},
                     to_status=SessionStatus.FAILED,
+                )
+            with pytest.raises(ValueError, match="different data"):
+                await store.load_interaction_transition_receipt(
+                    session_id,
+                    transition=failed_transition.model_copy(
+                        update={"event": failed.model_copy(update={"payload": {"changed": True}})}
+                    ),
                 )
 
             receipt_storage_key = (
@@ -13437,6 +13472,14 @@ def test_session_store_conformance_interaction_transition_is_atomic_and_reconstr
                 RuntimeError,
                 match="Stored interaction-transition receipt is invalid",
             ):
+                await store.load_interaction_transition_receipt(
+                    session_id,
+                    transition=failed_transition,
+                )
+            with pytest.raises(
+                RuntimeError,
+                match="Stored interaction-transition receipt is invalid",
+            ):
                 await store.publish_interaction_transition(
                     session_id,
                     event=failed,
@@ -13444,6 +13487,173 @@ def test_session_store_conformance_interaction_transition_is_atomic_and_reconstr
                     to_status=SessionStatus.FAILED,
                 )
         finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+def test_session_store_conformance_receipt_lookup_rejects_non_event_transition_conflicts(
+    session_store_case,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+
+        async def publish_and_reject_conflict(
+            *,
+            suffix: str,
+            event_type: EventType,
+            stored_from_statuses: set[SessionStatus],
+            stored_to_status: SessionStatus,
+            stored_queue_guard: bool,
+            conflicting_from_statuses: tuple[SessionStatus, ...],
+            conflicting_to_status: SessionStatus,
+            conflicting_queue_guard: bool,
+        ) -> None:
+            session_id = f"sess_interaction_receipt_conflict_{suffix}"
+            interaction_id = f"interaction-receipt-conflict-{suffix}"
+            started = Event(
+                id=f"evt_interaction_receipt_conflict_started_{suffix}",
+                type=EventType.INTERACTION_STARTED,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            await store.create(
+                RunRequest(
+                    agent_name="assistant",
+                    session_id=session_id,
+                    messages=[Message.text("user", "start")],
+                ),
+                identity=_identity(),
+                interaction_started_event=started,
+                interaction_source_messages=[Message.text("user", "start")],
+            )
+            event = Event(
+                id=f"evt_interaction_receipt_conflict_{suffix}",
+                type=event_type,
+                session_id=session_id,
+                interaction_id=interaction_id,
+            )
+            await store.publish_interaction_transition(
+                session_id,
+                event=event,
+                from_statuses=stored_from_statuses,
+                to_status=stored_to_status,
+                only_if_no_queued_messages=stored_queue_guard,
+            )
+            conflicting = InteractionTransitionSpec(
+                event=event,
+                from_statuses=conflicting_from_statuses,
+                to_status=conflicting_to_status,
+                only_if_no_queued_messages=conflicting_queue_guard,
+            )
+            with pytest.raises(ValueError, match="different data"):
+                await store.load_interaction_transition_receipt(
+                    session_id,
+                    transition=conflicting,
+                )
+
+        try:
+            await publish_and_reject_conflict(
+                suffix="source_statuses",
+                event_type=EventType.INTERACTION_FAILED,
+                stored_from_statuses={SessionStatus.RUNNING},
+                stored_to_status=SessionStatus.FAILED,
+                stored_queue_guard=False,
+                conflicting_from_statuses=(SessionStatus.INTERRUPTING,),
+                conflicting_to_status=SessionStatus.FAILED,
+                conflicting_queue_guard=False,
+            )
+            await publish_and_reject_conflict(
+                suffix="target_status",
+                event_type=EventType.INTERACTION_PAUSED,
+                stored_from_statuses={SessionStatus.RUNNING},
+                stored_to_status=SessionStatus.FAILED,
+                stored_queue_guard=False,
+                conflicting_from_statuses=(SessionStatus.RUNNING,),
+                conflicting_to_status=SessionStatus.INTERRUPTED,
+                conflicting_queue_guard=False,
+            )
+            await publish_and_reject_conflict(
+                suffix="queue_guard",
+                event_type=EventType.INTERACTION_COMPLETED,
+                stored_from_statuses={SessionStatus.RUNNING},
+                stored_to_status=SessionStatus.COMPLETED,
+                stored_queue_guard=True,
+                conflicting_from_statuses=(SessionStatus.RUNNING,),
+                conflicting_to_status=SessionStatus.COMPLETED,
+                conflicting_queue_guard=False,
+            )
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("lost_acknowledgements", [1, 2])
+def test_runtime_conformance_replays_exact_interaction_transition_after_ack_loss(
+    session_store_case,
+    lost_acknowledgements: int,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        session_id = (
+            f"interaction-transition-ack-loss-{lost_acknowledgements}-{session_store_case[0]}"
+        )
+        original_publish = store.publish_interaction_transition
+        attempted_events: list[Event] = []
+        remaining = lost_acknowledgements
+        try:
+
+            async def publish_then_lose_ack(session_id: str, **kwargs):
+                nonlocal remaining
+                event = kwargs["event"]
+                if event.type == EventType.INTERACTION_COMPLETED:
+                    attempted_events.append(event.model_copy(deep=True))
+                result = await original_publish(session_id, **kwargs)
+                if event.type == EventType.INTERACTION_COMPLETED and remaining > 0:
+                    remaining -= 1
+                    raise ConnectionError("interaction transition acknowledgement lost")
+                return result
+
+            store.publish_interaction_transition = publish_then_lose_ack  # type: ignore[method-assign]
+            provider = _TransitionReplayConformanceProvider()
+            app = CayuApp(session_store=store, enable_logging=False)
+            app.register_provider(provider, default=True)
+            app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+            emitted = [
+                event
+                async for event in app.run(
+                    RunRequest(
+                        session_id=session_id,
+                        agent_name="assistant",
+                        messages=[Message.text("user", "complete")],
+                    )
+                )
+            ]
+
+            assert emitted[-1].type == EventType.SESSION_COMPLETED
+            assert remaining == 0
+            assert len(attempted_events) == lost_acknowledgements + 1
+            assert all(event == attempted_events[0] for event in attempted_events)
+            assert len(provider.requests) == 1
+
+            store.publish_interaction_transition = original_publish  # type: ignore[method-assign]
+            store = await _reopen_store(session_store_case, store)
+            session = await store.load(session_id)
+            durable = await store.load_events(session_id)
+            assert session is not None
+            assert session.status is SessionStatus.COMPLETED
+            terminal_indexes = [
+                index
+                for index, event in enumerate(durable)
+                if event.type == EventType.INTERACTION_COMPLETED
+            ]
+            assert len(terminal_indexes) == 1
+            assert all(event.interaction_id is None for event in durable[terminal_indexes[0] + 1 :])
+            assert sum(event.type == EventType.SESSION_COMPLETED for event in durable) == 1
+        finally:
+            await store.release_run_fence(session_id)
             await _close_store(store)
 
     asyncio.run(run())
@@ -13495,6 +13705,18 @@ def test_session_store_conformance_interaction_completion_replays_queue_decision
             )
             assert publication.status_changed is False
             assert publication.session.status is SessionStatus.RUNNING
+            receipt = await store.load_interaction_transition_receipt(
+                session_id,
+                transition=InteractionTransitionSpec(
+                    event=completed,
+                    from_statuses=(SessionStatus.RUNNING,),
+                    to_status=SessionStatus.COMPLETED,
+                    only_if_no_queued_messages=True,
+                ),
+            )
+            assert receipt is not None
+            assert receipt.status_changed is False
+            assert receipt.session.status is SessionStatus.RUNNING
 
             await store.deliver_queued_session_messages(
                 session_id,

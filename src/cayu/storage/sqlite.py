@@ -64,7 +64,9 @@ from cayu.runtime.sessions import (
     EventSummary,
     ForkTranscriptValidator,
     InteractionAttribution,
+    InteractionTransitionReceiptResult,
     InteractionTransitionResult,
+    InteractionTransitionSpec,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
     McpManifestPublicationResult,
@@ -151,6 +153,7 @@ from cayu.runtime.sessions import (
     _event_input_contract_is_runtime_owned,
     _initial_transcript_pending_checkpoint,
     _interaction_transition_receipt_record,
+    _interaction_transition_spec_from_receipt,
     _interaction_transition_storage_key,
     _model_completion_stage_abandonment_record,
     _model_completion_stage_preparation_record,
@@ -162,6 +165,7 @@ from cayu.runtime.sessions import (
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
     _prepare_interaction_transition,
+    _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
     _prepare_session_fork_request,
     _PreparedModelCompletionStage,
@@ -2673,19 +2677,17 @@ class SQLiteSessionStore(SessionStore):
     ) -> InteractionTransitionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
-        (
-            session_id,
-            copied_event,
-            allowed_statuses,
-            target_status,
-            conditional,
-        ) = _prepare_interaction_transition(
+        session_id, transition = _prepare_interaction_transition(
             session_id,
             event=event,
             from_statuses=from_statuses,
             to_status=to_status,
             only_if_no_queued_messages=only_if_no_queued_messages,
         )
+        copied_event = transition.event
+        allowed_statuses = set(transition.from_statuses)
+        target_status = transition.to_status
+        conditional = transition.only_if_no_queued_messages
         receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
 
         def statement(connection: sqlite3.Connection) -> InteractionTransitionResult:
@@ -2711,10 +2713,7 @@ class SQLiteSessionStore(SessionStore):
                             json.loads(receipt_row["record_json"]),
                             "interaction transition receipt",
                         ),
-                        event=copied_event,
-                        from_statuses=allowed_statuses,
-                        to_status=target_status,
-                        only_if_no_queued_messages=conditional,
+                        transition=transition,
                     )
                     if existing_row is not None and _event_from_row(existing_row) != receipt.event:
                         raise RuntimeError(
@@ -2827,6 +2826,65 @@ class SQLiteSessionStore(SessionStore):
                 raise
 
         return await self._run_write(statement)
+
+    async def load_interaction_transition_receipt(
+        self,
+        session_id: str,
+        *,
+        transition: InteractionTransitionSpec,
+    ) -> InteractionTransitionReceiptResult | None:
+        session_id, copied_transition = _prepare_interaction_transition_receipt_lookup(
+            session_id,
+            transition=transition,
+        )
+        copied_event = copied_transition.event
+        receipt_storage_key = _interaction_transition_storage_key(copied_event.id)
+
+        def statement(
+            connection: sqlite3.Connection,
+        ) -> InteractionTransitionReceiptResult | None:
+            selected_event_columns = ", ".join(
+                f"retained.{column} AS {column}" for column in _EVENT_COLUMN_NAMES
+            )
+            row = connection.execute(
+                f"SELECT operation.record_json AS receipt_record_json, "
+                f"{selected_event_columns} "
+                "FROM cayu_sessions AS session "
+                "LEFT JOIN cayu_session_operations AS operation "
+                "ON operation.session_id = session.id AND operation.idempotency_key = ? "
+                "LEFT JOIN cayu_events AS retained "
+                "ON retained.session_id = session.id AND retained.event_id = ? "
+                "WHERE session.id = ?",
+                (receipt_storage_key, copied_event.id, session_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            receipt_record_json = row["receipt_record_json"]
+            retained_event_exists = row["event_id"] is not None
+            if receipt_record_json is None:
+                if retained_event_exists:
+                    raise RuntimeError(
+                        "Interaction transition event exists without its immutable receipt."
+                    )
+                return None
+            receipt = _reconstruct_interaction_transition_receipt(
+                copy_durable_json_object(
+                    json.loads(receipt_record_json),
+                    "interaction transition receipt",
+                ),
+                transition=copied_transition,
+            )
+            if retained_event_exists and _event_from_row(row) != receipt.event:
+                raise RuntimeError(
+                    "Interaction transition receipt conflicts with retained event history."
+                )
+            return InteractionTransitionReceiptResult(
+                session=receipt.session,
+                transition=_interaction_transition_spec_from_receipt(receipt),
+                status_changed=receipt.status_changed,
+            )
+
+        return await self._run_read(statement)
 
     async def release_run_fence(self, session_id: str) -> None:
         session_id = require_clean_nonblank(session_id, "session_id")

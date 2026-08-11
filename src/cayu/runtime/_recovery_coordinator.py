@@ -37,6 +37,7 @@ from cayu._task_wait import (
 )
 from cayu._validation import (
     canonical_durable_json_bytes,
+    copy_durable_json_value,
     copy_json_value,
     require_clean_nonblank,
 )
@@ -160,6 +161,8 @@ from cayu.runtime.sessions import (
     IncompleteSessionRecoveryResult,
     IncompleteSessionsRecoveryPage,
     IncompleteSessionsRecoveryRequest,
+    InteractionTransitionReceiptResult,
+    InteractionTransitionSpec,
     ModelCompletionStage,
     RuntimePublicationReceipt,
     Session,
@@ -180,6 +183,7 @@ from cayu.runtime.sessions import (
     _incomplete_recovery_claim_from_checkpoint,
     _session_run_operation_from_checkpoint,
     _SessionRunOperation,
+    copy_interaction_transition_spec,
     runtime_publication_checkpoint_value_digest,
 )
 from cayu.runtime.stop_policy import RunLimits, StopDecision, copy_run_limits, has_run_limits
@@ -705,13 +709,11 @@ async def _run_recovery_cleanup_steps(
                 f"{operation}: {type(cleanup_failure).__name__}. "
                 "The original failure remains authoritative."
             )
-        _prepend_exception_cause(
-            authoritative_failure,
-            BaseExceptionGroup(
-                "Continuation recovery cleanup failures",
-                [failure for _operation, failure in failures],
-            ),
+        cleanup_group = BaseExceptionGroup(
+            "Continuation recovery cleanup failures",
+            [failure for _operation, failure in failures],
         )
+        _prepend_exception_cause(authoritative_failure, cleanup_group)
         return failures
 
     operation, first_failure = cleanup_failures[0]
@@ -810,6 +812,7 @@ class RecoveryInterruptionRequest:
 class RecoveryAbandonedTurnRequest:
     session: Session
     registered_agent: runtime_records.RegisteredAgentState
+    registered_environment: runtime_records.RegisteredEnvironment | None
     environment_name: str | None
     run_started_at: float | None
     usage_tracker: SessionUsageTracker | None
@@ -825,6 +828,8 @@ class RecoveryAbandonedSessionRequest:
     run_started_at: float | None = None
     turn_usage_tracker: SessionUsageTracker | None = None
     active_run: ActiveSessionRun[SessionUsageTracker] | None = None
+    interaction_transition_failures: tuple[dict[str, Any], ...] = ()
+    interaction_transition: InteractionTransitionSpec | None = None
 
 
 @dataclass(frozen=True)
@@ -8048,11 +8053,18 @@ class RecoveryCoordinator:
         request: RecoveryAbandonedSessionRequest,
     ) -> None:
         """Best-effort finalization for a live session whose event stream closed."""
+        if (
+            request.interaction_transition_failures
+            and request.interaction_transition is not None
+            and await self._record_committed_interaction_transition_cancellation(request)
+        ):
+            return
         try:
             finalized = await self._abandoned_turn_completed(
                 RecoveryAbandonedTurnRequest(
                     session=request.session,
                     registered_agent=request.registered_agent,
+                    registered_environment=request.registered_environment,
                     environment_name=request.environment_name,
                     run_started_at=request.run_started_at,
                     usage_tracker=request.turn_usage_tracker,
@@ -8079,7 +8091,21 @@ class RecoveryCoordinator:
                 if loaded is None or loaded.status is not SessionStatus.INTERRUPTED:
                     return
                 finalized = loaded
-        with contextlib.suppress(BaseException):
+        payload: dict[str, Any] = {
+            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
+            "reason": _ABANDONED_RUN_REASON,
+            "abandoned": True,
+        }
+        if request.interaction_transition_failures:
+            copied_failures = copy_durable_json_value(
+                list(request.interaction_transition_failures),
+                "interaction transition cancellation diagnostics",
+            )
+            if type(copied_failures) is not list:
+                raise TypeError("Interaction transition cancellation diagnostics must be a list.")
+            payload["interaction_transition_failures"] = copied_failures
+
+        async def emit_interrupted() -> None:
             async for _ in self._emit_terminal_event_with_hooks(
                 RecoveryTerminalEventRequest(
                     event=Event(
@@ -8087,11 +8113,7 @@ class RecoveryCoordinator:
                         session_id=finalized.id,
                         agent_name=request.registered_agent.spec.name,
                         environment_name=request.environment_name,
-                        payload={
-                            "interruption_type": _INTERRUPTION_TYPE_RUNTIME_INTERRUPTED,
-                            "reason": _ABANDONED_RUN_REASON,
-                            "abandoned": True,
-                        },
+                        payload=payload,
                     ),
                     phase=RuntimeHookPhase.AFTER_SESSION_INTERRUPTED,
                     session=finalized,
@@ -8100,6 +8122,72 @@ class RecoveryCoordinator:
                 )
             ):
                 pass
+
+        if request.interaction_transition_failures:
+            # These failures are the only durable explanation for an ambiguous
+            # transition that exact readback proved absent. Let the owned
+            # cancellation cleanup preserve a publication failure instead of
+            # silently discarding both pieces of evidence.
+            await emit_interrupted()
+        else:
+            with contextlib.suppress(BaseException):
+                await emit_interrupted()
+
+    async def _record_committed_interaction_transition_cancellation(
+        self,
+        request: RecoveryAbandonedSessionRequest,
+    ) -> bool:
+        """Record acknowledgement failures only after exact durable readback."""
+
+        if request.interaction_transition is None:
+            return False
+        expected = copy_interaction_transition_spec(request.interaction_transition)
+        if (
+            expected.event.session_id != request.session.id
+            or expected.event.interaction_id is None
+            or expected.event.type
+            not in {
+                *INTERACTION_TERMINAL_EVENT_TYPES,
+                EventType.INTERACTION_PAUSED,
+            }
+        ):
+            raise RuntimeError(
+                "Interaction transition cancellation evidence is not a settled event "
+                "for the abandoned session."
+            )
+        receipt = await self._session_store.load_interaction_transition_receipt(
+            request.session.id,
+            transition=expected,
+        )
+        if receipt is None:
+            return False
+        receipt = InteractionTransitionReceiptResult.model_validate(receipt)
+        if receipt.transition != expected or receipt.session.id != request.session.id:
+            raise RuntimeError(
+                "Interaction transition cancellation evidence conflicts with its durable receipt."
+            )
+        copied_failures = copy_durable_json_value(
+            list(request.interaction_transition_failures),
+            "interaction transition cancellation diagnostics",
+        )
+        if type(copied_failures) is not list:
+            raise TypeError("Interaction transition cancellation diagnostics must be a list.")
+        await self._event_writer.persist(
+            event_with_runtime_envelope_authority(
+                Event(
+                    type=(EventType.RUNTIME_INTERACTION_TRANSITION_ACKNOWLEDGEMENT_FAILED),
+                    session_id=request.session.id,
+                    agent_name=request.registered_agent.spec.name,
+                    environment_name=request.environment_name,
+                    payload={
+                        "transition_event_type": str(expected.event.type),
+                        "interaction_transition_failures": copied_failures,
+                    },
+                ),
+                "session_id",
+            )
+        )
+        return True
 
     async def finalize_abandoned_session_by_id(
         self,
