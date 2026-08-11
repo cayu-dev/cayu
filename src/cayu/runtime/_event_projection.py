@@ -2098,8 +2098,9 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     policies[EventType.CONTEXT_OVERFLOW_FAILED] = overflow_policy
 
     knowledge_policy = _observed_policy(
-        "durable_value_error_code durable_value_error_path error error_type hit_count "
-        "injected_bytes model_step_id policy query query_chars sources tool_call_id "
+        "anchor_transcript_index candidate_count durable_value_error_code "
+        "durable_value_error_path error error_type format hit_count injected_bytes "
+        "manifest_truncated model_step_id policy projection query query_chars sources "
         "total_hits_known truncated",
         untrusted_container_keys={"sources"},
     )

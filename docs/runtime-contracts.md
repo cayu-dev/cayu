@@ -5492,36 +5492,100 @@ that scope part of the registered agent/tool configuration or instructions.
 
 Apps can also use `KnowledgeInjectionPolicy` when knowledge should be recalled
 automatically before a model call instead of only through explicit tools. The
-policy first builds its wrapped context-policy projection, derives a bounded
-query from the text parts of that projection's latest user message, and searches
-the active environment's `knowledge_store`. If that latest user message has no
-non-blank text, the policy skips the search instead of falling back to an earlier
-turn. The query honors `query_max_chars`, namespace, labels, kinds,
+policy may wrap another context policy, but nesting one
+`KnowledgeInjectionPolicy` inside another is rejected because one policy owns
+the session's frozen retrieval state; use its filters to define one retrieval
+surface. The
+policy identifies the transcript's latest eligible user message, rehydrates any
+previously frozen manifests, and searches the active environment's
+`knowledge_store` when that latest message is new and has non-blank text. It
+never falls back to an earlier turn. Runtime-authored user-role messages used for
+structured-output repair or before-stop continuation are marked by exact message
+digest in the same atomic write that appends them to the transcript, so recovery
+does not mistake them for user input and a later real user message is not
+suppressed. They do not start a new search. The query honors `query_max_chars`,
+namespace, labels, kinds,
 visibilities, aspects, impact targets, source type/id, search mode, expiry
-handling, `max_hits`, and `max_bytes`.
+handling, `max_hits`, and `max_bytes`; injection `max_bytes` is capped at 128 KiB.
 
-When the search returns hits, the policy appends a self-contained synthetic tool
-round to the end of the wrapped projection — after the latest real user message
-in the normal and compacted projections. The assistant message calls
-`cayu_knowledge_retrieval` with id `cayu_knowledge_step_{step}` and the configured
-namespace; the following tool-result message uses the same name/id and carries
-the bounded retrieved text. That text is untrusted reference data, not a user or
-system instruction. In an untruncated payload, the configurable `prefix` is
-followed by an explicit warning, then the retrieved snippets are enclosed by
-`<untrusted_knowledge>` / `</untrusted_knowledge>` markers. When `max_bytes`
-clips the payload, the tail is replaced by `[knowledge context truncated]`.
-The synthetic round is projection-only: it is sent in model-facing context but
-is not appended to the durable transcript.
+When the search returns hits, the policy prepends a bounded candidate manifest as
+the first text part of the latest user message before invoking the wrapped
+context policy. Token-pressure decisions, provider token counting, compaction,
+and prompt-cache-prefix construction therefore see the same augmented message
+that can reach the provider. If the wrapped policy removes the anchor, the
+manifest and its checkpoint frame are discarded rather than being attached to a
+different message with identical content. The
+original user text and file parts remain separate and unchanged after that part.
+The manifest uses the versioned `cayu.knowledge_candidates.v1` format: valid JSON
+enclosed by `<cayu_knowledge_candidates>` / `</cayu_knowledge_candidates>` markers.
+It contains entry ids, kinds, source metadata, and bounded excerpts, plus an
+explicit notice that the candidates are runtime-retrieved, potentially incomplete
+or untrusted reference data rather than the user's words or instructions. Marker
+characters inside retrieved values are JSON-escaped so retrieved content cannot
+forge the outer envelope. The configurable `prefix` is included when the byte
+bound permits it. If all hit fields cannot fit, Cayu omits optional metadata,
+clips only an excerpt at a character boundary, or omits later candidates; the
+envelope remains valid JSON and records `truncated: true` instead of cutting
+through JSON or a trust marker.
+
+The candidate manifest is a discovery surface, not fabricated model history. An
+agent may use the ordinary `read_knowledge` tool, when the app registered it, to
+load the complete bounded content for any knowledge kind. Kinds such as `skill`,
+`procedure`, or an app-defined future kind are metadata; there is no kind-specific
+loader. Automatic injection does not register a hidden tool and does not fabricate
+assistant tool calls or tool-result messages, so the request remains compatible
+with strict provider tool-history validation. The augmented message is
+runtime-authored context: it is sent in model-facing context but is not appended
+to the user-authored durable transcript.
+
+Retrieval is frozen once per user turn. Cayu stores the bounded, secret-redacted
+candidate payload and its user-message anchor in typed runtime checkpoint state
+under `knowledge_injection`; fixed envelope text is reconstructed
+deterministically rather than stored as an opaque serialized string. Cayu never
+stores raw search hits there. Every later model
+step for that turn — including tool-result follow-ups, retries, cache-prefix
+construction, and recovery from provider-managed reasoning state — reuses the
+exact same manifest before the wrapped policy runs. Knowledge returned by a real
+tool call remains ordinary tool-result context and does not mutate the frozen
+candidates. New or changed knowledge becomes eligible on the next user turn.
+Zero-hit searches and `fail_open=True` failures are also frozen, so one tool
+round cannot repeatedly query a failing store. The absence of an active
+knowledge store is frozen as well, preventing a later environment rebind from
+retroactively injecting into a user message that the provider has already seen.
+When trimming or compaction
+removes an anchored user message from model-facing context, Cayu prunes its
+checkpoint frame. This keeps the provider-visible history and prompt-cache
+prefix stable without mislabeling runtime retrieval as user-authored data. When
+multiple transcript anchors have identical complete projected messages, Cayu
+retains every indistinguishable anchor instead of guessing which occurrence a
+custom context policy kept. Frozen frames are rehydrated even when a later
+context build has no active knowledge store, because new search capability and
+existing provider history are separate concerns.
+
+The frozen history also has an aggregate serialized checkpoint bound. The
+`max_checkpoint_bytes` default is 1 MiB and may be configured up to 16 MiB; it
+must be at least `max_bytes`. Cayu applies the wrapped policy and prunes removed
+anchors before checking this total. If the surviving frames still exceed the
+bound, context construction fails closed before provider dispatch instead of
+silently evicting a manifest and destabilizing previously visible history. Long
+uncompacted sessions should use a bounded or checkpoint-compacting wrapped policy
+or deliberately raise this explicit limit.
 
 `knowledge.search.started` records that a search was attempted and its safe
 query/filter bounds; `knowledge.search.completed` records hit counts and search
 truncation, including zero-hit searches; and `knowledge.search.failed` records
-the lookup failure. `knowledge.injected` proves the synthetic round was added to
-the model-facing projection and records its hit count, byte count, tool-call id,
-and source metadata without copying retrieved text into the event. It does not
-prove that a later provider request completed. Search failures fail closed by
-default; configure `fail_open=True` to emit the failure and continue without the
-synthetic round.
+the lookup failure. Search telemetry becomes durable as retrieval runs, before
+any wrapped-policy operation it causally precedes, such as compaction.
+`knowledge.injected` is emitted after the wrapped projection accepts the anchored
+message and remains atomic with the resulting checkpoint update. It proves the
+candidate manifest was added to the model-facing projection for a new user turn
+and records its hit count, candidate count, byte count, format version,
+truncation state, projection location, and source metadata without copying
+retrieved text into the event. It does not prove that a later provider request
+completed. Reusing a frozen frame does not emit a second search or injection
+event. Search failures fail closed by default; configure
+`fail_open=True` to emit the failure, freeze that outcome for the turn, and
+continue without a candidate manifest.
 
 This slice does not add graph retrieval, remote source connectors, background
 remembering workers, or agent-led mutation of existing knowledge. Those layers

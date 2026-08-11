@@ -1029,8 +1029,9 @@ class ReadKnowledgeTool(Tool):
         name="read_knowledge",
         effect=ToolEffect.NONE,
         description=(
-            "Read bounded chunks from a knowledge entry returned by search_knowledge. "
-            "Use entry_id with an optional chunk_index and around window to expand context."
+            "Read bounded chunks from any knowledge entry returned by automatic "
+            "knowledge candidates, search_knowledge, or list_knowledge. Use entry_id "
+            "with an optional chunk_index and around window to expand context."
         ),
         input_schema={
             "type": "object",

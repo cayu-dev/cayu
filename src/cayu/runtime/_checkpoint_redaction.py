@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from cayu._validation import copy_json_value
+from cayu.runtime.checkpoints import CHECKPOINT_SCHEMA_VERSION_KEY
 from cayu.runtime.structured_output import json_schema_contains_secret
 from cayu.vaults import SecretRedactor
 
@@ -61,6 +62,7 @@ _DURABLE_ENUM_STRING_FIELDS = frozenset(
 _DURABLE_SHA256_STRING_FIELDS = frozenset(
     {
         "resolution_request_digest",
+        "user_message_sha256",
     }
 )
 _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_STRING_FIELDS) | {
@@ -76,6 +78,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "aliases",
     "allow_unpriced",
     "arguments",
+    "anchor_transcript_index",
     "as_of",
     "backoff_multiplier",
     "batch",
@@ -86,12 +89,18 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "cache_write_input_per_million",
     "cache_write_ttls",
     "contextual_pricing_requirements",
+    "candidate_count",
+    "candidates",
+    "chunk_id",
+    "chunk_index",
+    "compact_notice",
     "context_compaction",
     "created_at",
     "currency",
     "deferred_messages",
     "dimensions",
     "duration_seconds",
+    "entry_id",
     "effort",
     "effective_from",
     "effective_through",
@@ -109,6 +118,9 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "json_schema",
     "key",
     "kind",
+    "label",
+    "knowledge_injection",
+    "runtime_authored_user_message",
     "limits",
     "match",
     "match_prefixes",
@@ -131,6 +143,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "min_input_tokens",
     "min_total_tokens",
     "model",
+    "namespace",
     "options",
     "output_per_million",
     "path",
@@ -149,6 +162,7 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "question",
     "quarantined_assistant_message",
     "reason",
+    "rank",
     "repair_prompt",
     "requires_cache_write_ttls",
     "reservation",
@@ -162,14 +176,21 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "retry_policy",
     "retry_request",
     "scope",
+    "score",
+    "score_kind",
+    "score_normalized",
     "schedules",
     "session_operations",
     "source",
+    "source_id",
+    "source_type",
+    "source_uri",
     "standard",
     "structured_output",
     "structured_output_attempt",
     "structured_output_validation",
     "summary",
+    "title",
     "thinking",
     "timezone",
     "tool_calls",
@@ -197,10 +218,13 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "failure_recorded",
     "instruction_digest",
     "instruction_present",
+    "injected_bytes",
     "last_input_tokens",
     "last_total_tokens",
     "last_transcript_cursor",
     "operation_id",
+    "manifest",
+    "manifest_truncated",
     "progress",
     "provider_count_context_window_tokens",
     "provider_count_input_tokens",
@@ -211,8 +235,11 @@ _DURABLE_STRUCTURE_KEYS = (_DURABLE_STRUCTURE_STRING_FIELDS | _DURABLE_SHA256_ST
     "status",
     "staged_terminals",
     "trigger_estimated_context_tokens",
+    "turns",
+    "truncated",
     "updated_at",
     "valid",
+    "excerpt",
 }
 _DURABLE_UNTRUSTED_CONTAINERS = frozenset(
     {
@@ -257,10 +284,13 @@ _QUARANTINED_ASSISTANT_MESSAGE_UNTRUSTED_CONTAINERS = frozenset(
 )
 _DURABLE_ROOT_STRUCTURE_KEYS = frozenset(
     {
+        CHECKPOINT_SCHEMA_VERSION_KEY,
         "context_compaction",
         "environment_factory_allocation_owner",
         "environment_factory_reconnect",
         "incomplete_session_recovery_claim",
+        "knowledge_injection",
+        "runtime_authored_user_message",
         "pending_interruption_cascade",
         "pending_session_interrupt",
         "approval_resolution_intent",

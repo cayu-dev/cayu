@@ -178,6 +178,7 @@ from cayu.runtime.context import (
     _AutomaticCompactionRunner,
     _compaction_completion_publisher_scope,
     _compaction_model_attempt_identity_scope,
+    _context_knowledge_search_telemetry_publisher_scope,
     _context_secret_redactor_scope,
     _defer_billing_identity_cancellation_scope,
     context_build_termination_compaction_telemetry,
@@ -4383,11 +4384,23 @@ class ModelStepRun:
         model_step_identity = copy_model_step_identity(model_step_identity)
         request_variant = RequestVariant(request_variant)
         context_messages: list[Message]
-        compaction_budget_events: list[Event] = []
+        context_operation_events: list[Event] = []
         published_compaction_attempt_ids: set[str] = set()
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
+
+        async def publish_knowledge_search_telemetry(
+            telemetry: ContextKnowledgeTelemetry,
+        ) -> None:
+            event = _context_knowledge_telemetry_event(
+                telemetry=telemetry,
+                session=self._session,
+                registered_agent=self._registered_agent,
+                environment_name=self._environment_name,
+                model_step_identity=model_step_identity,
+            )
+            context_operation_events.append(await self._executor._event_writer.emit(event))
 
         async def run_automatic_compaction(
             compactor: ContextCompactor,
@@ -4398,7 +4411,7 @@ class ModelStepRun:
         ) -> CompactionResult:
             await self._persist_automatic_compaction_started(
                 compaction_started,
-                published_events=compaction_budget_events,
+                published_events=context_operation_events,
                 start_events=compaction_start_events,
                 model_step_identity=model_step_identity,
             )
@@ -4407,7 +4420,7 @@ class ModelStepRun:
                 await self._persist_automatic_compaction_completions(
                     compaction_identity_ledger.identify_payloads(payloads),
                     published_attempt_ids=published_compaction_attempt_ids,
-                    published_events=compaction_budget_events,
+                    published_events=context_operation_events,
                     completion_events=compaction_completion_events,
                 )
 
@@ -4417,7 +4430,7 @@ class ModelStepRun:
                     compaction_request=compaction_request,
                     execute=execute,
                     completed_payloads=completed_payloads,
-                    budget_events=compaction_budget_events,
+                    budget_events=context_operation_events,
                     messages=messages,
                     step=step,
                     model_step_identity=model_step_identity,
@@ -4463,6 +4476,7 @@ class ModelStepRun:
                 build_cache_prefix_request=self._cache_prefix_request_builder(step=step),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
+                publish_knowledge_search_telemetry=publish_knowledge_search_telemetry,
             )
         except ContextBuildError as exc:
             (
@@ -4479,10 +4493,10 @@ class ModelStepRun:
                 ),
                 compaction_started_published=any(
                     event.type == EventType.CONTEXT_COMPACTION_STARTED
-                    for event in compaction_budget_events
+                    for event in context_operation_events
                 ),
             )
-            for event in compaction_budget_events:
+            for event in context_operation_events:
                 yield event, None
             for event in context_failure_events:
                 yield event, None
@@ -4521,7 +4535,7 @@ class ModelStepRun:
                 ),
                 compaction_started_published=any(
                     event.type == EventType.CONTEXT_COMPACTION_STARTED
-                    for event in compaction_budget_events
+                    for event in context_operation_events
                 ),
                 cancellation_requests_before_build=context_build_cancellation_requests,
             )
@@ -4541,10 +4555,10 @@ class ModelStepRun:
             ),
             compaction_started_published=any(
                 event.type == EventType.CONTEXT_COMPACTION_STARTED
-                for event in compaction_budget_events
+                for event in context_operation_events
             ),
         )
-        for event in compaction_budget_events:
+        for event in context_operation_events:
             yield event, None
         for event in context_success_events:
             yield event, None
@@ -5107,12 +5121,24 @@ class ModelStepRun:
         if initial_model_attempt_identity.model_step_id != model_step_identity.model_step_id:
             raise ValueError("Initial provider attempt belongs to a different model step.")
         overflow_policy = self._registered_agent.context_overflow_policy
-        compaction_budget_events: list[Event] = []
+        context_operation_events: list[Event] = []
         published_compaction_attempt_ids: set[str] = set()
         compaction_start_events: list[Event] = []
         compaction_completion_events: dict[str, Event] = {}
         compaction_identity_ledger = _CompactionExecutionIdentityLedger(model_step_identity)
         latest_model_attempt_identity: ModelAttemptIdentity | None = None
+
+        async def publish_knowledge_search_telemetry(
+            telemetry: ContextKnowledgeTelemetry,
+        ) -> None:
+            event = _context_knowledge_telemetry_event(
+                telemetry=telemetry,
+                session=self._session,
+                registered_agent=self._registered_agent,
+                environment_name=self._environment_name,
+                model_step_identity=model_step_identity,
+            )
+            context_operation_events.append(await self._executor._event_writer.emit(event))
 
         def record_model_attempt_identity(identity: ModelAttemptIdentity) -> None:
             nonlocal latest_model_attempt_identity
@@ -5199,7 +5225,7 @@ class ModelStepRun:
         ) -> CompactionResult:
             await self._persist_automatic_compaction_started(
                 compaction_started,
-                published_events=compaction_budget_events,
+                published_events=context_operation_events,
                 start_events=compaction_start_events,
                 model_step_identity=model_step_identity,
             )
@@ -5208,7 +5234,7 @@ class ModelStepRun:
                 await self._persist_automatic_compaction_completions(
                     compaction_identity_ledger.identify_payloads(payloads),
                     published_attempt_ids=published_compaction_attempt_ids,
-                    published_events=compaction_budget_events,
+                    published_events=context_operation_events,
                     completion_events=compaction_completion_events,
                 )
 
@@ -5218,7 +5244,7 @@ class ModelStepRun:
                     compaction_request=compaction_request,
                     execute=execute,
                     completed_payloads=completed_payloads,
-                    budget_events=compaction_budget_events,
+                    budget_events=context_operation_events,
                     messages=messages,
                     step=step,
                     model_step_identity=model_step_identity,
@@ -5264,6 +5290,7 @@ class ModelStepRun:
                 build_cache_prefix_request=self._cache_prefix_request_builder(step=step),
                 secret_redactor=self._executor._secret_redactor,
                 run_compaction=run_automatic_compaction,
+                publish_knowledge_search_telemetry=publish_knowledge_search_telemetry,
                 force_bounded_compaction=True,
             )
         except ContextBuildError as exc:
@@ -5281,10 +5308,10 @@ class ModelStepRun:
                 ),
                 compaction_started_published=any(
                     event.type == EventType.CONTEXT_COMPACTION_STARTED
-                    for event in compaction_budget_events
+                    for event in context_operation_events
                 ),
             )
-            for event in compaction_budget_events:
+            for event in context_operation_events:
                 yield event, None
             for event in context_failure_events:
                 yield event, None
@@ -5355,7 +5382,7 @@ class ModelStepRun:
                 ),
                 compaction_started_published=any(
                     event.type == EventType.CONTEXT_COMPACTION_STARTED
-                    for event in compaction_budget_events
+                    for event in context_operation_events
                 ),
                 cancellation_requests_before_build=context_build_cancellation_requests,
             )
@@ -5375,10 +5402,10 @@ class ModelStepRun:
             ),
             compaction_started_published=any(
                 event.type == EventType.CONTEXT_COMPACTION_STARTED
-                for event in compaction_budget_events
+                for event in context_operation_events
             ),
         )
-        for event in compaction_budget_events:
+        for event in context_operation_events:
             yield event, None
         for event in context_success_events:
             yield event, None
@@ -5995,7 +6022,17 @@ class ModelStepRun:
             if compaction_start_durable:
                 reconciled_start_events.append(compaction_start_event.model_copy(deep=True))
 
-        prepared_events: list[Event] = []
+        prepared_events = [
+            _context_knowledge_telemetry_event(
+                telemetry=telemetry,
+                session=self._session,
+                registered_agent=self._registered_agent,
+                environment_name=self._environment_name,
+                model_step_identity=model_step_identity,
+            )
+            for telemetry in knowledge_telemetry
+            if telemetry.event_type != EventType.KNOWLEDGE_INJECTED
+        ]
         for telemetry in compaction_telemetry:
             if (
                 telemetry.event_type == EventType.MODEL_COMPLETED
@@ -6057,6 +6094,7 @@ class ModelStepRun:
                 model_step_identity=model_step_identity,
             )
             for telemetry in knowledge_telemetry
+            if telemetry.event_type == EventType.KNOWLEDGE_INJECTED
         )
 
         async def persist() -> tuple[list[Event], BaseException | None]:
@@ -7010,6 +7048,8 @@ async def _build_context(
     build_cache_prefix_request: Callable[[list[Message]], Awaitable[ModelRequest]] | None,
     secret_redactor: SecretRedactor,
     run_compaction: _AutomaticCompactionRunner | None = None,
+    publish_knowledge_search_telemetry: Callable[[ContextKnowledgeTelemetry], Awaitable[None]]
+    | None = None,
     force_bounded_compaction: bool = False,
 ) -> tuple[
     list[Message],
@@ -7048,6 +7088,9 @@ async def _build_context(
         try:
             with (
                 _context_secret_redactor_scope(secret_redactor),
+                _context_knowledge_search_telemetry_publisher_scope(
+                    publish_knowledge_search_telemetry
+                ),
                 _defer_billing_identity_cancellation_scope(),
                 _automatic_compaction_runner_scope(run_compaction),
             ):

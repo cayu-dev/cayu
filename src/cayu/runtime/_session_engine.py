@@ -210,6 +210,7 @@ from cayu.runtime.context import (
     _context_secret_redactor_scope,
     _defer_billing_identity_cancellation_scope,
     _durable_compaction_completion_evidence,
+    _runtime_authored_user_message_checkpoint_transform,
     context_build_termination_compaction_telemetry,
     project_compaction_invocation_checkpoint,
     sanitize_context_build_error_checkpoint,
@@ -8613,15 +8614,16 @@ class SessionEngine:
                     return
                 model_step_flow_outcome: ModelStepFlowOutcome | None = None
                 close_new_pending_round_on_interrupt = True
+                request_variant = (
+                    RequestVariant.STRUCTURED_OUTPUT_REPAIR
+                    if structured_output_retries
+                    else RequestVariant.INITIAL
+                )
                 model_step_events = model_step_run.execute(
                     step=step,
                     messages=messages,
                     model_step_identity=model_step_identity,
-                    request_variant=(
-                        RequestVariant.STRUCTURED_OUTPUT_REPAIR
-                        if structured_output_retries
-                        else RequestVariant.INITIAL
-                    ),
+                    request_variant=request_variant,
                 )
                 try:
                     async for event, flow_outcome in model_step_events:
@@ -9107,9 +9109,18 @@ class SessionEngine:
                             ),
                         )
                         messages.append(repair_message)
-                        await self.session_store.append_transcript_messages(
-                            session.id,
-                            [repair_message],
+                        runtime_message_transform = (
+                            _runtime_authored_user_message_checkpoint_transform(
+                                anchor_index=len(messages) - 1,
+                                message=repair_message,
+                            )
+                        )
+                        await (
+                            self.session_store.append_transcript_messages_and_transform_checkpoint(
+                                session.id,
+                                [repair_message],
+                                runtime_message_transform,
+                            )
                         )
                         yield await self._event_writer.emit(
                             _structured_output_event(
@@ -9165,9 +9176,16 @@ class SessionEngine:
                                 )
                             repair_message = before_stop_decision.message
                             messages.append(repair_message)
-                            await self.session_store.append_transcript_messages(
+                            runtime_message_transform = (
+                                _runtime_authored_user_message_checkpoint_transform(
+                                    anchor_index=len(messages) - 1,
+                                    message=repair_message,
+                                )
+                            )
+                            await self.session_store.append_transcript_messages_and_transform_checkpoint(
                                 session.id,
                                 [repair_message],
+                                runtime_message_transform,
                             )
                             continue
                         if before_stop_decision.action == BeforeStopAction.INTERRUPT:
