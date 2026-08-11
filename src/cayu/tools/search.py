@@ -17,7 +17,11 @@ from cayu._validation import (
 )
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, RunnerUnavailableError
-from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._errors import (
+    reject_unknown_tool_arguments,
+    structured_invalid_arguments,
+    tool_argument_validation,
+)
 from cayu.vaults import SecretRedactor
 
 DEFAULT_SEARCH_LIMIT = 100
@@ -53,6 +57,9 @@ DEFAULT_SEARCH_EXCLUDE_DIRECTORIES = (
 _MATCH_SEPARATOR = "\x1f"
 _MATCH_SEPARATOR_ARG = r"\x1f"
 _PREVIEW_TRUNCATION_MARKER = " [match preview truncated]"
+_SEARCH_TEXT_ARGUMENTS = frozenset(
+    {"pattern", "path", "glob", "mode", "limit", "offset", "case_sensitive"}
+)
 
 
 class _SearchEntryTooLargeError(ValueError):
@@ -206,6 +213,8 @@ class SearchTextTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_SEARCH_TEXT_ARGUMENTS)
         runner = ctx.runner
         if runner is None:
             return ToolResult(

@@ -41,6 +41,12 @@ def invalid_tool_arguments_result(exc: Exception) -> ToolResult:
     )
 
 
+def reject_unknown_tool_arguments(args: dict[str, Any], *, allowed: frozenset[str]) -> None:
+    """Reject unsupported keys without reflecting caller-controlled names or values."""
+    if set(args) - allowed:
+        raise ValueError("Tool arguments contain unknown fields.")
+
+
 @contextmanager
 def tool_argument_validation() -> Iterator[None]:
     """Mark model-controlled argument validation without catching later failures."""

@@ -3558,7 +3558,13 @@ provider-neutral tool strategy.
 `stream_include_usage=False` supports servers that reject stream options; and
 `allow_http=True` is the explicit opt-in for local HTTP services such as
 Ollama or vLLM. `clean_schemas=True` removes schema keywords commonly rejected
-by compatible services.
+by compatible services while preserving closed-object declarations where the
+target schema dialect supports them. The Gemini OpenAI-compatible endpoint is
+detected and additionally removes `additionalProperties`; set
+`strip_additional_properties=True` explicitly for another compatible service
+that requires the same projection. When a provider cannot represent that
+keyword, the built-in workspace/file tools covered by this contract still reject
+unknown arguments with the normal structured invalid-arguments result.
 
 Each streamed Chat Completions chunk may carry at most one choice, and a choice
 index cannot change across chunks. Streamed tool-call indexes and IDs become

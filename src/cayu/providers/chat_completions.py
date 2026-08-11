@@ -82,9 +82,11 @@ _RESERVED_CHAT_COMPLETIONS_OPTIONS = {
     "stream_options",
 }
 _CHAT_COMPLETIONS_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-# JSON Schema keys rejected by some OpenAI-compatible vendors (notably Google
-# Gemini), stripped recursively when clean_schemas is enabled.
-_UNSUPPORTED_SCHEMA_KEYS = {"additionalProperties", "$schema"}
+# JSON Schema keys rejected broadly enough by OpenAI-compatible vendors to strip
+# whenever schema cleaning is enabled. Gemini additionally rejects
+# ``additionalProperties``; endpoint detection or an explicit compatibility
+# option selects that projection so other providers retain closed schemas.
+_UNSUPPORTED_SCHEMA_KEYS = {"$schema"}
 # JSON Schema keys whose values are name->subschema maps (arbitrary property
 # names, not schema keywords), so their keys must be preserved when cleaning.
 _SUBSCHEMA_MAP_KEYS = {"properties", "patternProperties", "$defs", "definitions"}
@@ -258,6 +260,7 @@ class ChatCompletionsProvider(ModelProvider):
         extra_headers: Mapping[str, str] | None = None,
         api_version: str | None = None,
         clean_schemas: bool = True,
+        strip_additional_properties: bool | None = None,
         document_encoding: str = DEFAULT_DOCUMENT_ENCODING,
         usage_dialect: UsageDialect | str | None = None,
     ) -> None:
@@ -333,6 +336,16 @@ class ChatCompletionsProvider(ModelProvider):
         if type(clean_schemas) is not bool:
             raise TypeError("clean_schemas must be a bool.")
         self.clean_schemas = clean_schemas
+        if (
+            strip_additional_properties is not None
+            and type(strip_additional_properties) is not bool
+        ):
+            raise TypeError("strip_additional_properties must be a bool or None.")
+        self.strip_additional_properties = (
+            urlsplit(effective_url).hostname == "generativelanguage.googleapis.com"
+            if strip_additional_properties is None
+            else strip_additional_properties
+        )
         self.document_encoding = _validate_document_encoding(document_encoding)
 
     def request_footprint_options(self, request: ModelRequest) -> dict[str, Any]:
@@ -369,6 +382,7 @@ class ChatCompletionsProvider(ModelProvider):
                 request,
                 stream=True,
                 clean_schemas=self.clean_schemas,
+                strip_additional_properties=self.strip_additional_properties,
                 options_key=self.name,
                 document_encoding=self.document_encoding,
                 include_usage=self.stream_include_usage,
@@ -495,6 +509,7 @@ def build_chat_completions_payload(
     *,
     stream: bool = False,
     clean_schemas: bool = True,
+    strip_additional_properties: bool = False,
     options_key: str = "openai",
     document_encoding: str = DEFAULT_DOCUMENT_ENCODING,
     include_usage: bool = True,
@@ -503,6 +518,8 @@ def build_chat_completions_payload(
         raise TypeError("request must be a ModelRequest.")
     if type(clean_schemas) is not bool:
         raise TypeError("clean_schemas must be a bool.")
+    if type(strip_additional_properties) is not bool:
+        raise TypeError("strip_additional_properties must be a bool.")
     if type(include_usage) is not bool:
         raise TypeError("include_usage must be a bool.")
     document_encoding = _validate_document_encoding(document_encoding)
@@ -532,7 +549,14 @@ def build_chat_completions_payload(
         "model": request.model,
         "messages": messages,
     }
-    tools = [_chat_completions_tool(tool, clean_schemas=clean_schemas) for tool in request.tools]
+    tools = [
+        _chat_completions_tool(
+            tool,
+            clean_schemas=clean_schemas,
+            strip_additional_properties=strip_additional_properties,
+        )
+        for tool in request.tools
+    ]
     if tools:
         payload["tools"] = tools
     if stream:
@@ -1216,7 +1240,12 @@ def _json_arguments(arguments: Mapping[str, Any]) -> str:
     return json.dumps(copied, sort_keys=True, separators=(",", ":"))
 
 
-def _chat_completions_tool(tool: Mapping[str, Any], *, clean_schemas: bool) -> dict[str, Any]:
+def _chat_completions_tool(
+    tool: Mapping[str, Any],
+    *,
+    clean_schemas: bool,
+    strip_additional_properties: bool,
+) -> dict[str, Any]:
     if not isinstance(tool, Mapping):
         raise ValueError("Tool definitions must be objects.")
     name = _require_mapping_string(tool, "name")
@@ -1234,7 +1263,10 @@ def _chat_completions_tool(tool: Mapping[str, Any], *, clean_schemas: bool) -> d
     # Both paths produce a fresh structure; the final whole-payload copy_json_value
     # re-validates JSON-safety, so a separate per-schema copy here would be redundant.
     parameters = (
-        _clean_schema(input_schema)
+        _clean_schema(
+            input_schema,
+            strip_additional_properties=strip_additional_properties,
+        )
         if clean_schemas
         else copy_json_value(input_schema, "input_schema")
     )
@@ -1248,25 +1280,48 @@ def _chat_completions_tool(tool: Mapping[str, Any], *, clean_schemas: bool) -> d
     }
 
 
-def _clean_schema(schema: Any, *, in_property_map: bool = False) -> Any:
+def _clean_schema(
+    schema: Any,
+    *,
+    strip_additional_properties: bool,
+    in_property_map: bool = False,
+) -> Any:
     """Recursively strip JSON Schema keywords some vendors reject (e.g. Gemini).
 
     Keys in ``_UNSUPPORTED_SCHEMA_KEYS`` are dropped only where they are schema
     *keywords* (direct keys of a schema object). Inside name->subschema maps
     (``properties``, ``$defs``, ...) the keys are arbitrary names, so a property
     literally named ``additionalProperties`` is preserved and only its subschema
-    value is cleaned.
+    value is cleaned. When ``strip_additional_properties`` is true, occurrences
+    of that schema keyword are removed as a vendor-specific compatibility step.
     """
     if isinstance(schema, dict):
         if in_property_map:
-            return {name: _clean_schema(value) for name, value in schema.items()}
+            return {
+                name: _clean_schema(
+                    value,
+                    strip_additional_properties=strip_additional_properties,
+                )
+                for name, value in schema.items()
+            }
         return {
-            key: _clean_schema(value, in_property_map=key in _SUBSCHEMA_MAP_KEYS)
+            key: _clean_schema(
+                value,
+                strip_additional_properties=strip_additional_properties,
+                in_property_map=key in _SUBSCHEMA_MAP_KEYS,
+            )
             for key, value in schema.items()
             if key not in _UNSUPPORTED_SCHEMA_KEYS
+            and not (strip_additional_properties and key == "additionalProperties")
         }
     if isinstance(schema, list):
-        return [_clean_schema(item) for item in schema]
+        return [
+            _clean_schema(
+                item,
+                strip_additional_properties=strip_additional_properties,
+            )
+            for item in schema
+        ]
     return schema
 
 

@@ -32,6 +32,7 @@ from cayu.artifacts._images import decode_verified_image_format
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.tools._errors import (
     invalid_tool_arguments_result,
+    reject_unknown_tool_arguments,
     structured_invalid_arguments,
     tool_argument_validation,
 )
@@ -66,6 +67,17 @@ MAX_FILE_REVISION_CHARS = 4096
 DEFAULT_LIST_LIMIT = 500
 MAX_LIST_LIMIT = 10_000
 _READ_FILE_TRUNCATION_MARKER = "\n\n[file truncated]"
+
+_READ_FILE_ARGUMENTS = frozenset(
+    {"path", "artifact_id", "max_bytes", "offset", "max_attachment_bytes", "pages"}
+)
+_EDIT_FILE_ARGUMENTS = frozenset(
+    {"path", "expected_revision", "edits", "max_bytes", "max_diff_bytes"}
+)
+_DELETE_FILE_ARGUMENTS = frozenset({"path", "expected_revision", "max_bytes"})
+_WRITE_FILE_ARGUMENTS = frozenset({"path", "content", "mode", "expected_revision", "max_bytes"})
+_LIST_FILES_ARGUMENTS = frozenset({"pattern", "limit"})
+_LIST_ARTIFACTS_ARGUMENTS = frozenset({"scope", "limit"})
 
 IMAGE_CONTENT_TYPES = FILE_ATTACHMENT_IMAGE_CONTENT_TYPES
 PDF_CONTENT_TYPE = "application/pdf"
@@ -204,6 +216,7 @@ def _read_file_tool_spec(
                     ),
                 },
             },
+            "additionalProperties": False,
         },
     )
 
@@ -263,6 +276,7 @@ class ReadFileTool(Tool):
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
         with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_READ_FILE_ARGUMENTS)
             path = _optional_arg_string(args, "path")
             artifact_id = _optional_arg_string(args, "artifact_id")
             if (path is None) == (artifact_id is None):
@@ -1337,6 +1351,8 @@ class EditFileTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_EDIT_FILE_ARGUMENTS)
         workspace = _require_workspace(ctx)
         if workspace is None:
             return _missing_workspace_result()
@@ -1564,6 +1580,8 @@ class DeleteFileTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_DELETE_FILE_ARGUMENTS)
         workspace = _require_workspace(ctx)
         if workspace is None:
             return _missing_workspace_result()
@@ -1673,6 +1691,8 @@ class WriteFileTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_WRITE_FILE_ARGUMENTS)
         workspace = _require_workspace(ctx)
         if workspace is None:
             return _missing_workspace_result()
@@ -1766,11 +1786,14 @@ class ListFilesTool(Tool):
                     "default": DEFAULT_LIST_LIMIT,
                 },
             },
+            "additionalProperties": False,
         },
     )
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_LIST_FILES_ARGUMENTS)
         workspace = _require_workspace(ctx)
         if workspace is None:
             return _missing_workspace_result()
@@ -1826,11 +1849,14 @@ class ListArtifactsTool(Tool):
                     "default": DEFAULT_LIST_LIMIT,
                 },
             },
+            "additionalProperties": False,
         },
     )
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
+        with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_LIST_ARTIFACTS_ARGUMENTS)
         artifact_store = _require_artifact_store(ctx)
         if artifact_store is None:
             return _missing_artifact_store_result()

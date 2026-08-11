@@ -43,6 +43,7 @@ from cayu.providers import (
 from cayu.providers._http import MAX_PROVIDER_ERROR_BODY_CHARS, _TrustedSseJsonEvent
 from cayu.providers._sse import aiter_sse_json_events
 from cayu.providers.chat_completions import chat_completions_stream_events
+from cayu.tools import ListArtifactsTool, ListFilesTool, ReadFileTool
 
 
 async def _collect_events(app: CayuApp, request: RunRequest) -> list[Event]:
@@ -300,7 +301,7 @@ def test_build_chat_completions_payload_nests_and_cleans_tool_schemas() -> None:
         ],
     )
 
-    payload = build_chat_completions_payload(request)
+    payload = build_chat_completions_payload(request, strip_additional_properties=True)
 
     tool = payload["tools"][0]
     assert tool["type"] == "function"
@@ -331,7 +332,7 @@ def test_build_chat_completions_payload_keeps_property_named_like_a_stripped_key
         ],
     )
 
-    payload = build_chat_completions_payload(request)
+    payload = build_chat_completions_payload(request, strip_additional_properties=True)
 
     parameters = payload["tools"][0]["function"]["parameters"]
     # The top-level schema keyword is stripped...
@@ -355,6 +356,88 @@ def test_build_chat_completions_payload_keeps_schema_when_cleaning_disabled() ->
     payload = build_chat_completions_payload(request, clean_schemas=False)
 
     assert payload["tools"][0]["function"]["parameters"]["additionalProperties"] is False
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [ReadFileTool(), ListFilesTool(), ListArtifactsTool()],
+    ids=["read", "list-files", "list-artifacts"],
+)
+def test_build_chat_completions_payload_cleaner_preserves_closed_file_tool_schema(
+    tool: Tool,
+) -> None:
+    request = ModelRequest(
+        model="gpt-test",
+        messages=[Message.text("user", "Inspect files.")],
+        tools=[
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.schema,
+            }
+        ],
+    )
+
+    payload = build_chat_completions_payload(request)
+
+    parameters = payload["tools"][0]["function"]["parameters"]
+    assert parameters["additionalProperties"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("provider_options", "clean_schemas", "preserves_closed_schema"),
+    [
+        ({}, True, True),
+        (
+            {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+            True,
+            False,
+        ),
+        ({"strip_additional_properties": True}, True, False),
+        (
+            {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+            False,
+            True,
+        ),
+    ],
+    ids=[
+        "generic-cleaned",
+        "google-cleaned",
+        "explicit-compatibility-cleaned",
+        "google-cleaning-disabled",
+    ],
+)
+async def test_provider_projects_closed_schema_for_selected_compatibility_mode(
+    provider_options: dict[str, Any],
+    clean_schemas: bool,
+    preserves_closed_schema: bool,
+) -> None:
+    transport = RecordingTransport(stream_events=[[_finish_chunk("stop")]])
+    provider = ChatCompletionsProvider(
+        api_key="test-key",
+        clean_schemas=clean_schemas,
+        transport=transport,
+        **provider_options,
+    )
+    tool = ReadFileTool()
+    request = ModelRequest(
+        model="test-model",
+        messages=[Message.text("user", "Inspect files.")],
+        tools=[
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.schema,
+            }
+        ],
+    )
+
+    events = [event async for event in provider.stream(request)]
+
+    assert [event.type for event in events] == [ModelStreamEventType.COMPLETED]
+    parameters = transport.calls[0]["payload"]["tools"][0]["function"]["parameters"]
+    assert (parameters.get("additionalProperties") is False) is preserves_closed_schema
 
 
 def test_build_chat_completions_payload_passes_provider_options() -> None:

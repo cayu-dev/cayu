@@ -9,7 +9,11 @@ from typing import Any, cast
 from cayu._validation import require_nonblank, require_unicode_scalar_text
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner, RunnerUnavailableError
-from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._errors import (
+    reject_unknown_tool_arguments,
+    structured_invalid_arguments,
+    tool_argument_validation,
+)
 from cayu.tools._runner import InvocationRunnerHandle
 from cayu.vaults import REDACTED_SECRET, SecretRedactor
 from cayu.workspaces import LocalWorkspace, RunnerBoundWorkspace
@@ -22,6 +26,9 @@ GIT_STATUS_CAPTURE_BYTES = 1024 * 1024
 GIT_CHANGES_TIMEOUT_SECONDS = 30
 MAX_GIT_DIFF_OFFSET_BYTES = 4 * 1024 * 1024
 _TRUNCATION_MARKER = "\n[git changes truncated]"
+_GIT_CHANGES_ARGUMENTS = frozenset(
+    {"mode", "scope", "paths", "offset", "diff_offset", "limit", "max_result_bytes"}
+)
 _GIT_ENV_REMOVE = (
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
@@ -99,6 +106,8 @@ class GitChangesTool(Tool):
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+        with tool_argument_validation():
+            reject_unknown_tool_arguments(args, allowed=_GIT_CHANGES_ARGUMENTS)
         runner = ctx.runner
         if runner is None:
             return ToolResult(

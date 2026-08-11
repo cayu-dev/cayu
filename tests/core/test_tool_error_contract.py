@@ -18,10 +18,14 @@ from cayu.core.tools import ToolContext, ToolResult
 from cayu.runners import LocalRunner
 from cayu.runtime.sessions import InMemorySessionStore
 from cayu.tools import (
+    DeleteFileTool,
+    EditFileTool,
     ExecCommandTool,
+    GitChangesTool,
     ListArtifactsTool,
     ListFilesTool,
     ReadFileTool,
+    SearchTextTool,
     SubagentResultTool,
     SubagentSpec,
     SubagentTool,
@@ -179,6 +183,82 @@ def test_read_file_invalid_arguments_return_structured_error(tmp_path):
 
     result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "pages": "1\ud800"}))
     _assert_invalid_arguments(result, match="surrogate")
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        (ReadFileTool(), {"path": "notes.txt", "zeta": 1, "alpha": 2}),
+        (ListFilesTool(), {"zeta": 1, "alpha": 2}),
+        (ListArtifactsTool(), {"zeta": 1, "alpha": 2}),
+        (SearchTextTool(), {"pattern": "needle", "zeta": 1, "alpha": 2}),
+        (GitChangesTool(), {"zeta": 1, "alpha": 2}),
+        (
+            WriteFileTool(),
+            {
+                "path": "notes.txt",
+                "content": "replacement",
+                "mode": "create",
+                "zeta": 1,
+                "alpha": 2,
+            },
+        ),
+        (
+            EditFileTool(),
+            {
+                "path": "notes.txt",
+                "expected_revision": "revision-1",
+                "edits": [{"old_text": "before", "new_text": "after"}],
+                "zeta": 1,
+                "alpha": 2,
+            },
+        ),
+        (
+            DeleteFileTool(),
+            {
+                "path": "notes.txt",
+                "expected_revision": "revision-1",
+                "zeta": 1,
+                "alpha": 2,
+            },
+        ),
+    ],
+    ids=[
+        "read",
+        "list-files",
+        "list-artifacts",
+        "search-text",
+        "git-changes",
+        "write",
+        "edit",
+        "delete",
+    ],
+)
+def test_workspace_file_tools_reject_unknown_arguments_before_resource_lookup(tool, args):
+    result = asyncio.run(tool.run(ToolContext(session_id="sess_1"), args))
+
+    _assert_invalid_arguments(result, match="unknown fields")
+    assert "alpha" not in result.content
+    assert "zeta" not in result.content
+
+
+@pytest.mark.parametrize(
+    ("tool", "properties"),
+    [
+        (
+            ReadFileTool(),
+            {"path", "artifact_id", "max_bytes", "offset", "max_attachment_bytes", "pages"},
+        ),
+        (ListFilesTool(), {"pattern", "limit"}),
+        (ListArtifactsTool(), {"scope", "limit"}),
+    ],
+    ids=["read", "list-files", "list-artifacts"],
+)
+def test_read_and_list_file_tool_schemas_are_closed(tool, properties):
+    schema = tool.schema
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == properties
 
 
 def test_write_file_invalid_arguments_return_structured_error(tmp_path):
