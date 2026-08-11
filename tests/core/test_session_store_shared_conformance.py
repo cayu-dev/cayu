@@ -18,7 +18,11 @@ from tests.core._workload_secret_support import FakeProvider
 
 import cayu.runtime._model_step_executor as model_step_executor_module
 import cayu.runtime._session_engine as session_engine_module
-from cayu import SQLiteSessionStore
+from cayu import (
+    SQLiteSessionStore,
+    TerminalSessionEvidenceError,
+    TerminalSessionEvidenceErrorCode,
+)
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     DurableValueError,
@@ -1270,6 +1274,121 @@ def test_session_store_conformance_repairs_pre_boundary_resume_failure(
             ]
             assert records[-1].event.payload["session_run_operation_id"] == operation_id
             assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+        finally:
+            await _close_store(store)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "lifecycle_event_type",
+    (
+        EventType.SESSION_STARTED,
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_FORKED,
+    ),
+)
+def test_session_store_conformance_repairs_terminal_older_than_current_lifecycle(
+    session_store_case,
+    lifecycle_event_type: EventType,
+) -> None:
+    async def run() -> None:
+        store = await _open_store(session_store_case)
+        lifecycle_label = lifecycle_event_type.value.replace(".", "-")
+        session_id = f"terminal-evidence-pre-boundary-{lifecycle_label}"
+        operation_id = "93f3184b-976c-4fdc-8889-c2918890581b"
+        try:
+            await store.create(
+                RunRequest(
+                    agent_name="removed_agent",
+                    session_id=session_id,
+                    messages=[Message.text("user", "finish")],
+                ),
+                identity=_identity(),
+            )
+            await store.update_status(session_id, SessionStatus.COMPLETED)
+            await store.append_events(
+                session_id,
+                [
+                    Event(
+                        id=f"terminal-evidence-{lifecycle_label}-older-other-operation",
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session_id,
+                        payload={"session_run_operation_id": "older-operation"},
+                    ),
+                    Event(
+                        id=f"terminal-evidence-{lifecycle_label}-older-matching-operation",
+                        type=EventType.SESSION_COMPLETED,
+                        session_id=session_id,
+                        payload={"session_run_operation_id": operation_id},
+                    ),
+                ],
+            )
+            await store.transition_status_and_checkpoint(
+                session_id,
+                from_statuses={SessionStatus.COMPLETED},
+                to_status=SessionStatus.RUNNING,
+                checkpoint_transform=lambda current_session, checkpoint: (
+                    _checkpoint_with_session_run_operation(
+                        checkpoint=checkpoint,
+                        current_session=current_session,
+                        operation_id=operation_id,
+                    )
+                ),
+            )
+            await store.append_event(
+                session_id,
+                Event(
+                    id=f"terminal-evidence-newest-{lifecycle_label}-boundary",
+                    type=lifecycle_event_type,
+                    session_id=session_id,
+                ),
+            )
+            await store.update_status(session_id, SessionStatus.COMPLETED)
+
+            store = await _reopen_store(session_store_case, store)
+            with pytest.raises(TerminalSessionEvidenceError) as missing:
+                await store.load_terminal_session_evidence(session_id)
+            assert missing.value.code is TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_MISSING
+            await store.release_run_fence(session_id)
+
+            repaired = await CayuApp(
+                session_store=store,
+                enable_logging=False,
+            ).recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
+            records = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_COMPLETED,
+                )
+            )
+            assert repaired.actions == (IncompleteSessionRecoveryAction.REPAIRED_TERMINAL_EVIDENCE,)
+            assert [record.event.type for record in records] == [
+                EventType.SESSION_COMPLETED,
+                EventType.SESSION_COMPLETED,
+                EventType.SESSION_COMPLETED,
+            ]
+            assert [record.event.id for record in records[:2]] == [
+                f"terminal-evidence-{lifecycle_label}-older-other-operation",
+                f"terminal-evidence-{lifecycle_label}-older-matching-operation",
+            ]
+            assert records[-1].event.payload["terminal_evidence_repaired"] is True
+            assert records[-1].event.payload["session_run_operation_id"] == operation_id
+            assert await store.load_checkpoint(session_id) == {CHECKPOINT_SCHEMA_VERSION_KEY: 2}
+
+            store = await _reopen_store(session_store_case, store)
+            settled = await CayuApp(
+                session_store=store,
+                enable_logging=False,
+            ).recover_incomplete_session(IncompleteSessionRecoveryRequest(session_id=session_id))
+            settled_records = await store.query_events(
+                EventQuery(
+                    session_id=session_id,
+                    event_type=EventType.SESSION_COMPLETED,
+                )
+            )
+            assert settled.actions == (IncompleteSessionRecoveryAction.SKIPPED_TERMINAL,)
+            assert settled_records == records
         finally:
             await _close_store(store)
 

@@ -93,7 +93,7 @@ def classify_current_terminal_evidence(
         return CurrentTerminalEvidence(
             events=tuple(
                 event
-                for event in evidence_events
+                for event in events_after_lifecycle
                 if event.type in TERMINAL_EVENT_TYPES
                 and event.payload.get(SESSION_RUN_OPERATION_ID_PAYLOAD_KEY) == run_operation_id
             ),

@@ -38,7 +38,11 @@ from cayu import (
     TranscriptRecord,
 )
 from cayu._validation import compact_json_utf8_size
-from cayu.runtime._terminal_evidence import SESSION_RUN_OPERATION_ID_PAYLOAD_KEY
+from cayu.runtime._terminal_evidence import (
+    SESSION_RUN_OPERATION_ID_PAYLOAD_KEY,
+    TERMINAL_EVIDENCE_QUERY_LIMIT,
+    classify_current_terminal_evidence,
+)
 from cayu.runtime.sessions import (
     RunnerObservedEventIdentity,
     _assemble_terminal_session_evidence,
@@ -1007,6 +1011,118 @@ def test_terminal_evidence_classification_binds_a_pending_publication_marker() -
             records=(current,),
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "lifecycle_event_type",
+    (
+        EventType.SESSION_STARTED,
+        EventType.SESSION_RESUMED,
+        EventType.SESSION_FORKED,
+    ),
+)
+def test_terminal_evidence_marker_never_crosses_the_newest_lifecycle(
+    lifecycle_event_type: EventType,
+) -> None:
+    marker = TerminalPublicationMarker(operation_id="operation-2", run_epoch=2)
+    lifecycle = _event_record(5, lifecycle_event_type)
+    older_matching_terminal = _event_record(
+        4,
+        EventType.SESSION_COMPLETED,
+        operation_id=marker.operation_id,
+    )
+
+    _assert_error_code(
+        TerminalSessionEvidenceErrorCode.TERMINAL_EVENT_MISSING,
+        lambda: _classify(
+            session=_session(run_epoch=marker.run_epoch),
+            marker=marker,
+            records=(lifecycle, older_matching_terminal),
+        ),
+    )
+
+
+def test_terminal_evidence_scopes_interruption_identity_after_the_lifecycle() -> None:
+    interruption_request_id = "interrupt-after-resume"
+    classification = classify_current_terminal_evidence(
+        evidence_events=(
+            _event_record(5, EventType.SESSION_RESUMED).event,
+            _event_record(
+                4,
+                EventType.SESSION_INTERRUPTED,
+                payload={"interruption_request_id": interruption_request_id},
+            ).event,
+        ),
+        expected_event_type=EventType.SESSION_INTERRUPTED,
+        run_operation_id=None,
+        interruption_request_id=interruption_request_id,
+    )
+
+    assert classification.events == ()
+    assert classification.latest_lifecycle_event_type is EventType.SESSION_RESUMED
+
+
+def test_terminal_evidence_preserves_strict_current_operation_classification() -> None:
+    operation_id = "current-operation"
+    current = _event_record(
+        6,
+        EventType.SESSION_COMPLETED,
+        operation_id=operation_id,
+    ).event
+    duplicate = _event_record(
+        5,
+        EventType.SESSION_COMPLETED,
+        operation_id=operation_id,
+    ).event
+    conflicting = _event_record(
+        4,
+        EventType.SESSION_FAILED,
+        operation_id=operation_id,
+    ).event
+    another_operation = _event_record(
+        3,
+        EventType.SESSION_COMPLETED,
+        operation_id="another-operation",
+    ).event
+
+    duplicates = classify_current_terminal_evidence(
+        evidence_events=(current, duplicate),
+        expected_event_type=EventType.SESSION_COMPLETED,
+        run_operation_id=operation_id,
+        interruption_request_id=None,
+    )
+    assert duplicates.events == (current, duplicate)
+
+    conflict = classify_current_terminal_evidence(
+        evidence_events=(current, conflicting),
+        expected_event_type=EventType.SESSION_COMPLETED,
+        run_operation_id=operation_id,
+        interruption_request_id=None,
+    )
+    assert conflict.events == (current, conflicting)
+
+    multiple_operations = classify_current_terminal_evidence(
+        evidence_events=(current, another_operation),
+        expected_event_type=EventType.SESSION_COMPLETED,
+        run_operation_id=operation_id,
+        interruption_request_id=None,
+    )
+    assert multiple_operations.events == (current,)
+
+
+def test_terminal_evidence_rejects_input_beyond_the_store_query_bound() -> None:
+    events = tuple(
+        _event_record(sequence, EventType.SESSION_COMPLETED).event
+        for sequence in range(1, TERMINAL_EVIDENCE_QUERY_LIMIT + 2)
+    )
+
+    with pytest.raises(ValueError, match="exceeds its bounded query"):
+        classify_current_terminal_evidence(
+            evidence_events=events,
+            expected_event_type=EventType.SESSION_COMPLETED,
+            run_operation_id=None,
+            interruption_request_id=None,
+        )
 
 
 def test_terminal_evidence_classification_rejects_incomplete_publication_authority() -> None:
