@@ -6,7 +6,12 @@ import posixpath
 from collections.abc import Sequence
 from typing import Any
 
-from cayu._validation import require_clean_nonblank, require_nonblank
+from cayu._validation import (
+    MAX_DURABLE_JSON_INTEGER,
+    require_clean_nonblank,
+    require_durable_text,
+    require_nonblank,
+)
 from cayu.runners import DEFAULT_EXEC_OUTPUT_LIMIT_BYTES, ExecCommand, LocalRunner, Runner
 from cayu.workspaces._guest_guard import (
     GUEST_DESCRIPTOR_GUARD_SOURCE,
@@ -29,6 +34,7 @@ from cayu.workspaces.base import (
     _validate_workspace_positive_limit,
     _validate_workspace_relative_path,
     _validate_workspace_revision,
+    matches_list_pattern,
     translate_list_pattern,
     validate_list_pattern,
 )
@@ -644,17 +650,15 @@ class RunnerWorkspace(RunnerBoundWorkspace, BoundedTarReader, TarWriter):
             str(RUNNER_WORKSPACE_LIST_PAYLOAD_LIMIT_BYTES),
             output_limit_bytes=_json_list_output_limit(),
         )
-        paths = result["paths"]
-        total_count = result["total_count"]
-        if not isinstance(paths, list):
-            raise TypeError("Runner workspace list returned invalid paths.")
-        if type(total_count) is not int:
-            raise TypeError("Runner workspace list returned invalid total_count.")
-        return WorkspaceListResult(
-            paths=tuple(paths),
-            total_count=total_count,
-            truncated=total_count > len(paths),
+        validated = _validate_workspace_list_result(
+            result,
+            pattern=pattern,
+            effective_limit=effective_limit,
         )
+        del result
+        if isinstance(validated, Exception):
+            raise validated from None
+        return validated
 
     async def read_tar_bytes(
         self,
@@ -783,6 +787,54 @@ def _validate_optional_cwd(cwd: str | None) -> str | None:
 
 def _validate_relative_path(path: str) -> str:
     return _validate_workspace_relative_path(path)
+
+
+def _validate_workspace_list_result(
+    result: dict[str, Any],
+    *,
+    pattern: str,
+    effective_limit: int,
+) -> WorkspaceListResult | TypeError | ValueError:
+    paths = result.get("paths")
+    total_count = result.get("total_count")
+    if type(paths) is not list:
+        return TypeError("Runner workspace list returned invalid paths.")
+    if type(total_count) is not int:
+        return TypeError("Runner workspace list returned invalid total_count.")
+
+    validated_paths: list[str] = []
+    for path in paths:
+        if type(path) is not str:
+            return TypeError("Runner workspace list returned a non-string path.")
+        try:
+            path = require_durable_text(path, "Runner workspace list path")
+            normalized = _validate_relative_path(path)
+        except (TypeError, ValueError):
+            return ValueError("Runner workspace list returned an invalid path.")
+        if path != normalized:
+            return ValueError("Runner workspace list returned a non-normalized path.")
+        validated_paths.append(path)
+
+    if len(set(validated_paths)) != len(validated_paths):
+        return ValueError("Runner workspace list returned duplicate paths.")
+    if validated_paths != sorted(validated_paths):
+        return ValueError("Runner workspace list returned paths in non-deterministic order.")
+    if any(not matches_list_pattern(path, pattern) for path in validated_paths):
+        return ValueError("Runner workspace list returned a path outside the requested pattern.")
+    if total_count < 0:
+        return ValueError("Runner workspace list returned a negative total_count.")
+    if total_count > MAX_DURABLE_JSON_INTEGER:
+        return ValueError("Runner workspace list returned an oversized total_count.")
+    if total_count < len(validated_paths):
+        return ValueError("Runner workspace list total_count is smaller than its paths.")
+    if len(validated_paths) > effective_limit:
+        return ValueError("Runner workspace list returned more paths than the effective limit.")
+
+    return WorkspaceListResult(
+        paths=tuple(validated_paths),
+        total_count=total_count,
+        truncated=total_count > len(validated_paths),
+    )
 
 
 def _validate_required_limit(value: int, field_name: str) -> int:

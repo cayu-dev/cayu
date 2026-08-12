@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import sys
 import tarfile
@@ -20,10 +21,12 @@ from guard_harness import (
 
 import cayu.workspaces._guest_guard as guest_guard_module
 import cayu.workspaces.runner as runner_workspace_module
+from cayu._validation import MAX_DURABLE_JSON_INTEGER
 from cayu.core.tools import ToolContext
-from cayu.runners import LocalRunner
+from cayu.environments import SyncBinding
+from cayu.runners import ExecCommand, ExecResult, LocalRunner, Runner
 from cayu.tools import ListFilesTool, ReadFileTool, WriteFileTool
-from cayu.workspaces import BoundedTarReader, RunnerWorkspace, TarWriter
+from cayu.workspaces import BoundedTarReader, LocalWorkspace, RunnerWorkspace, TarWriter
 from cayu.workspaces._tar import tar_archive_size_bound
 
 
@@ -33,6 +36,48 @@ def _workspace(root) -> RunnerWorkspace:
         workspace_id="runner",
         python_executable=sys.executable,
     )
+
+
+class _ListResultRunner(Runner):
+    default_cwd = "/workspace"
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        self.exec_calls = 0
+
+    @property
+    def resource_key(self) -> tuple[object, ...]:
+        return ("list-result-runner", id(self))
+
+    async def exec(
+        self,
+        command: ExecCommand,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        env_remove: tuple[str, ...] = (),
+        timeout_s: int | None = None,
+        stdin: str | None = None,
+        output_limit_bytes: int | None = None,
+    ) -> ExecResult:
+        self.exec_calls += 1
+        del command, cwd, env, env_remove, timeout_s, stdin, output_limit_bytes
+        return ExecResult(stdout=json.dumps(self.payload))
+
+
+def _list_runner_payload(
+    payload: dict[str, Any],
+    *,
+    pattern: str = "**/*",
+    limit: int | None = 10,
+    default_list_limit: int = 500,
+):
+    workspace = RunnerWorkspace(
+        _ListResultRunner(payload),
+        workspace_id="custom-runner",
+        default_list_limit=default_list_limit,
+    )
+    return asyncio.run(workspace.list(pattern, limit=limit))
 
 
 def _tar_bytes(entries: tuple[tuple[str, bytes], ...]) -> bytes:
@@ -113,6 +158,205 @@ def test_runner_workspace_reads_writes_and_lists_through_runner(tmp_path) -> Non
     assert list_result.paths == ("notes/a.txt", "root.txt")
     assert list_result.total_count == 2
     assert list_result.truncated is False
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_paths", "expected_total", "expected_truncated"),
+    (
+        (
+            {"ok": True, "paths": ["a.txt", "nested/b.txt"], "total_count": 2},
+            ("a.txt", "nested/b.txt"),
+            2,
+            False,
+        ),
+        (
+            {"ok": True, "paths": ["a.txt"], "total_count": 3},
+            ("a.txt",),
+            3,
+            True,
+        ),
+        ({"ok": True, "paths": [], "total_count": 0}, (), 0, False),
+    ),
+)
+def test_runner_workspace_validates_custom_runner_list_evidence(
+    payload,
+    expected_paths,
+    expected_total,
+    expected_truncated,
+) -> None:
+    result = _list_runner_payload(payload)
+
+    assert result.paths == expected_paths
+    assert result.total_count == expected_total
+    assert result.truncated is expected_truncated
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "../outside.txt",
+        "nested/../outside.txt",
+        "/absolute.txt",
+        "",
+        "   ",
+        ".",
+        "./file.txt",
+        "nested/./file.txt",
+        "nested//file.txt",
+        "nested/file.txt/",
+    ),
+)
+def test_runner_workspace_rejects_invalid_or_non_normalized_runner_list_paths(path) -> None:
+    with pytest.raises(ValueError, match="path"):
+        _list_runner_payload({"ok": True, "paths": [path], "total_count": 1})
+
+
+@pytest.mark.parametrize("path", ("safe\x00.txt", "safe\ud800.txt"))
+def test_runner_workspace_rejects_nonportable_runner_list_paths(path) -> None:
+    with pytest.raises(ValueError, match="invalid path") as captured:
+        _list_runner_payload({"ok": True, "paths": [path], "total_count": 1})
+
+    assert path not in str(captured.value)
+    assert path not in repr(captured.value)
+
+
+@pytest.mark.parametrize("path", (None, True, 1, 1.5, {}, []))
+def test_runner_workspace_rejects_non_string_runner_list_paths(path) -> None:
+    with pytest.raises(TypeError, match="non-string path"):
+        _list_runner_payload({"ok": True, "paths": [path], "total_count": 1})
+
+
+@pytest.mark.parametrize(
+    ("paths", "pattern", "message"),
+    (
+        (["a.txt", "a.txt"], "**/*", "duplicate"),
+        (["b.txt", "a.txt"], "**/*", "non-deterministic order"),
+        (["a.md"], "*.txt", "requested pattern"),
+        (["nested/a.txt"], "*.txt", "requested pattern"),
+    ),
+)
+def test_runner_workspace_rejects_contradictory_runner_list_paths(
+    paths,
+    pattern,
+    message,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _list_runner_payload(
+            {"ok": True, "paths": paths, "total_count": len(paths)},
+            pattern=pattern,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"ok": True, "total_count": 0},
+        {"ok": True, "paths": None, "total_count": 0},
+        {"ok": True, "paths": {}, "total_count": 0},
+    ),
+)
+def test_runner_workspace_rejects_malformed_runner_list_paths(payload) -> None:
+    with pytest.raises(TypeError, match="invalid paths"):
+        _list_runner_payload(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"ok": True, "paths": []},
+        {"ok": True, "paths": [], "total_count": None},
+        {"ok": True, "paths": [], "total_count": True},
+        {"ok": True, "paths": [], "total_count": "0"},
+    ),
+)
+def test_runner_workspace_rejects_malformed_runner_list_total_count(payload) -> None:
+    with pytest.raises(TypeError, match="invalid total_count"):
+        _list_runner_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    (
+        ({"ok": True, "paths": [], "total_count": -1}, "negative total_count"),
+        (
+            {"ok": True, "paths": ["a.txt", "b.txt"], "total_count": 1},
+            "smaller than its paths",
+        ),
+    ),
+)
+def test_runner_workspace_rejects_invalid_runner_list_counts(payload, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        _list_runner_payload(payload)
+
+
+def test_runner_workspace_rejects_oversized_runner_list_total_count() -> None:
+    with pytest.raises(ValueError, match="oversized total_count"):
+        _list_runner_payload(
+            {
+                "ok": True,
+                "paths": [],
+                "total_count": MAX_DURABLE_JSON_INTEGER + 1,
+            }
+        )
+
+
+def test_sync_binding_rejects_nonportable_runner_list_before_target_mutation(tmp_path) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = LocalWorkspace(source_root, workspace_id="source")
+    runner = _ListResultRunner(
+        {
+            "ok": True,
+            "paths": ["a.txt", "z\x00.txt"],
+            "total_count": 2,
+        }
+    )
+    target = RunnerWorkspace(runner, workspace_id="target")
+
+    async def bind() -> None:
+        await SyncBinding(target_workspace=target).bind(
+            source,
+            None,
+            session_id="sess_nonportable_runner_list",
+        )
+
+    with pytest.raises(ValueError, match="invalid path"):
+        asyncio.run(bind())
+
+    assert runner.exec_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("limit", "default_list_limit"),
+    ((1, 500), (None, 1)),
+)
+def test_runner_workspace_rejects_paths_over_effective_list_limit(
+    limit,
+    default_list_limit,
+) -> None:
+    with pytest.raises(ValueError, match="effective limit"):
+        _list_runner_payload(
+            {"ok": True, "paths": ["a.txt", "b.txt"], "total_count": 2},
+            limit=limit,
+            default_list_limit=default_list_limit,
+        )
+
+
+def test_runner_workspace_list_validation_does_not_echo_invalid_path() -> None:
+    canary = "secret-list-path-canary"
+
+    with pytest.raises(ValueError) as captured:
+        _list_runner_payload(
+            {"ok": True, "paths": [f"../{canary}"], "total_count": 1},
+        )
+
+    assert canary not in str(captured.value)
+    assert canary not in repr(captured.value)
+    current = captured.value.__traceback__
+    while current is not None:
+        if "/src/cayu/" in current.tb_frame.f_code.co_filename:
+            assert all(canary not in repr(value) for value in current.tb_frame.f_locals.values())
+        current = current.tb_next
 
 
 def test_runner_workspace_deletes_files_through_runner(tmp_path) -> None:
