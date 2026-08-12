@@ -27,9 +27,11 @@ class _S3Client:
         self.put_calls: list[dict[str, Any]] = []
         self.get_calls: list[dict[str, Any]] = []
         self.delete_calls: list[dict[str, Any]] = []
+        self.delete_errors_by_suffix: dict[str, str] = {}
         self.fail_put_suffix: str | None = None
         self.fail_put_once_suffix: str | None = None
         self.fail_get_code: str | None = None
+        self.fail_delete_code: str | None = None
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         self.put_calls.append(kwargs)
@@ -77,9 +79,24 @@ class _S3Client:
 
     def delete_objects(self, **kwargs: Any) -> dict[str, Any]:
         self.delete_calls.append(kwargs)
+        if self.fail_delete_code is not None:
+            raise _ClientError(self.fail_delete_code)
+        errors: list[dict[str, str]] = []
         for item in kwargs["Delete"]["Objects"]:
+            matching_suffix = next(
+                (suffix for suffix in self.delete_errors_by_suffix if item["Key"].endswith(suffix)),
+                None,
+            )
+            if matching_suffix is not None:
+                errors.append(
+                    {
+                        "Key": item["Key"],
+                        "Code": self.delete_errors_by_suffix[matching_suffix],
+                    }
+                )
+                continue
             self.objects.pop((kwargs["Bucket"], item["Key"]), None)
-        return {"Deleted": kwargs["Delete"]["Objects"]}
+        return {"Errors": errors}
 
 
 class _BlockingContentUploadS3Client(_S3Client):
@@ -164,6 +181,81 @@ def test_s3_artifact_store_uses_range_for_bounded_read() -> None:
     assert read.truncated is True
     content_get = next(call for call in client.get_calls if call["Key"].endswith("/content"))
     assert content_get["Range"] == "bytes=0-2"
+
+
+@pytest.mark.parametrize("failed_suffix", ["/content", "/metadata.json"])
+def test_s3_artifact_store_rejects_partial_delete_errors(failed_suffix: str) -> None:
+    client = _S3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact = asyncio.run(
+        store.put_bytes(b"content", filename="artifact.txt", session_id="sess_1")
+    )
+    client.delete_errors_by_suffix[failed_suffix] = "AccessDenied"
+
+    with pytest.raises(
+        ArtifactStoreUnavailableError,
+        match="DeleteObjects returned 1 per-object error.*AccessDenied",
+    ):
+        asyncio.run(store.delete(artifact.id))
+
+    assert ("bucket", f"cayu/artifacts/{artifact.id}{failed_suffix}") in client.objects
+
+
+def test_s3_artifact_store_rejects_errors_for_every_deleted_object() -> None:
+    client = _S3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact = asyncio.run(
+        store.put_bytes(b"content", filename="artifact.txt", session_id="sess_1")
+    )
+    client.delete_errors_by_suffix = {
+        "/content": "AccessDenied",
+        "/metadata.json": "InternalError",
+    }
+
+    with pytest.raises(
+        ArtifactStoreUnavailableError,
+        match=(
+            "DeleteObjects returned 2 per-object errors "
+            r"\(codes: AccessDenied, InternalError\)"
+        ),
+    ):
+        asyncio.run(store.delete(artifact.id))
+
+
+def test_s3_artifact_store_keeps_delete_error_diagnostics_bounded() -> None:
+    client = _S3Client()
+    store = S3ArtifactStore("bucket", client=client)
+    artifact = asyncio.run(
+        store.put_bytes(b"content", filename="artifact.txt", session_id="sess_1")
+    )
+    secret = "credential-secret-" * 100
+    client.delete_errors_by_suffix["/content"] = secret
+
+    with pytest.raises(ArtifactStoreUnavailableError) as raised:
+        asyncio.run(store.delete(artifact.id))
+
+    assert str(raised.value) == ("S3 DeleteObjects returned 1 per-object error (codes: Unknown).")
+    assert secret not in str(raised.value)
+
+
+def test_s3_artifact_store_preserves_typed_backend_delete_failures() -> None:
+    client = _S3Client()
+    client.fail_delete_code = "ServiceUnavailable"
+    store = S3ArtifactStore("bucket", client=client)
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="could not delete") as raised:
+        asyncio.run(store.delete(f"art_{'5' * 32}"))
+
+    assert isinstance(raised.value.__cause__, _ClientError)
+
+
+def test_s3_artifact_store_delete_remains_idempotent_for_missing_objects() -> None:
+    client = _S3Client()
+    store = S3ArtifactStore("bucket", client=client)
+
+    asyncio.run(store.delete(f"art_{'6' * 32}"))
+
+    assert client.objects == {}
 
 
 def test_s3_artifact_store_lists_all_metadata_then_applies_limit() -> None:
@@ -324,6 +416,19 @@ def test_s3_artifact_store_removes_content_when_metadata_commit_fails() -> None:
         asyncio.run(store.put_bytes(b"orphan", filename="orphan.txt", session_id="sess_1"))
 
     assert client.objects == {}
+    assert len(client.delete_calls) == 1
+
+
+def test_s3_artifact_store_keeps_failed_write_cleanup_best_effort() -> None:
+    client = _S3Client()
+    client.fail_put_suffix = "metadata.json"
+    client.delete_errors_by_suffix["/content"] = "AccessDenied"
+    store = S3ArtifactStore("bucket", client=client)
+
+    with pytest.raises(ArtifactStoreUnavailableError, match="commit"):
+        asyncio.run(store.put_bytes(b"orphan", filename="orphan.txt", session_id="sess_1"))
+
+    assert any(key.endswith("/content") for _, key in client.objects)
     assert len(client.delete_calls) == 1
 
 

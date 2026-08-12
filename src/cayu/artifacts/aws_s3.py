@@ -343,6 +343,8 @@ class S3ArtifactStore(ArtifactStore):
         )
         try:
             await asyncio.to_thread(self._delete_keys, client, keys)
+        except ArtifactStoreUnavailableError:
+            raise
         except Exception as exc:
             raise ArtifactStoreUnavailableError(
                 "S3 artifact store could not delete artifact content."
@@ -433,9 +435,33 @@ class S3ArtifactStore(ArtifactStore):
             return
 
     def _delete_keys(self, client: Any, keys: tuple[str, ...]) -> None:
-        client.delete_objects(
+        response = client.delete_objects(
             Bucket=self.bucket,
             Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True},
+        )
+        if not isinstance(response, Mapping):
+            raise ArtifactStoreUnavailableError("S3 DeleteObjects returned an invalid response.")
+        errors = response.get("Errors")
+        if errors is None or errors == []:
+            return
+        if not isinstance(errors, Sequence) or isinstance(errors, (str, bytes, bytearray)):
+            raise ArtifactStoreUnavailableError(
+                "S3 DeleteObjects returned an invalid per-object error collection."
+            )
+        safe_codes: list[str] = []
+        for error in errors[:3]:
+            code = error.get("Code") if isinstance(error, Mapping) else None
+            safe_code = (
+                code
+                if type(code) is str and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", code)
+                else "Unknown"
+            )
+            if safe_code not in safe_codes:
+                safe_codes.append(safe_code)
+        error_label = "error" if len(errors) == 1 else "errors"
+        raise ArtifactStoreUnavailableError(
+            f"S3 DeleteObjects returned {len(errors)} per-object {error_label} "
+            f"(codes: {', '.join(safe_codes)})."
         )
 
     async def _get_client(self) -> Any:
