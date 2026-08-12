@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from cayu import (
     CayuApp,
@@ -360,6 +361,69 @@ def test_eval_run_comparison_detaches_already_validated_case_comparisons() -> No
     assert comparison.cases[0] is not source
     assert comparison.cases[0].case_id == "case"
     assert comparison.cases[0].regressions == ("status regressed",)
+
+
+def _comparison_input(model_type: type, field_name: str, value: object) -> dict[str, object]:
+    if model_type is EvalCaseComparison:
+        return {"case_id": "case", field_name: value}
+    return {
+        "baseline_run_id": "baseline",
+        "current_run_id": "current",
+        "baseline_suite_id": "suite",
+        "current_suite_id": "suite",
+        "baseline_status": EvalStatus.PASSED,
+        "current_status": EvalStatus.PASSED,
+        field_name: value,
+    }
+
+
+@pytest.mark.parametrize("model_type", [EvalCaseComparison, EvalRunComparison])
+@pytest.mark.parametrize("field_name", ["baseline_score", "current_score"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_eval_comparison_scores_reject_nonfinite_values(
+    model_type: type,
+    field_name: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValidationError):
+        model_type.model_validate(_comparison_input(model_type, field_name, value))
+
+
+@pytest.mark.parametrize("model_type", [EvalCaseComparison, EvalRunComparison])
+@pytest.mark.parametrize("field_name", ["baseline_score", "current_score"])
+@pytest.mark.parametrize("value", [-0.01, 1.01])
+def test_eval_comparison_scores_reject_out_of_range_values(
+    model_type: type,
+    field_name: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValidationError):
+        model_type.model_validate(_comparison_input(model_type, field_name, value))
+
+
+@pytest.mark.parametrize("model_type", [EvalCaseComparison, EvalRunComparison])
+@pytest.mark.parametrize("field_name", ["baseline_score", "current_score"])
+@pytest.mark.parametrize("value", [True, "0.5"])
+def test_eval_comparison_scores_preserve_strict_type_validation(
+    model_type: type,
+    field_name: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        model_type.model_validate(_comparison_input(model_type, field_name, value))
+
+
+@pytest.mark.parametrize("model_type", [EvalCaseComparison, EvalRunComparison])
+@pytest.mark.parametrize("field_name", ["baseline_score", "current_score"])
+@pytest.mark.parametrize("value", [None, 0.0, 1.0])
+def test_eval_comparison_scores_accept_none_and_range_boundaries(
+    model_type: type,
+    field_name: str,
+    value: float | None,
+) -> None:
+    comparison = model_type.model_validate(_comparison_input(model_type, field_name, value))
+
+    assert getattr(comparison, field_name) == value
 
 
 def test_eval_plan_detaches_suite_but_preserves_application_reference() -> None:

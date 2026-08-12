@@ -1277,9 +1277,9 @@ def test_comparison_exports_reject_nonfinite_score():
     run = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
     comparison = compare_eval_runs(run, run).model_copy(update={"baseline_score": float("nan")})
 
-    with pytest.raises(ValueError, match="non_finite_number"):
+    with pytest.raises(ValueError, match="finite_number"):
         comparison_to_json(comparison)
-    with pytest.raises(ValueError, match="non_finite_number"):
+    with pytest.raises(ValueError, match="finite_number"):
         render_comparison_html(comparison)
 
 

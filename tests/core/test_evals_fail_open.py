@@ -244,10 +244,27 @@ def test_score_tolerance_still_flags_a_real_drop():
 
 def test_score_tolerance_rejects_invalid_values():
     base = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
+    for value in (-0.1, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="score_tolerance"):
+            compare_eval_runs(base, base, score_tolerance=value)
+    for value in (True, "0.1"):
+        with pytest.raises(TypeError, match="score_tolerance"):
+            compare_eval_runs(base, base, score_tolerance=value)  # type: ignore[arg-type]
+
+
+def test_score_tolerance_accepts_finite_nonnegative_values():
+    base = _run(EvalStatus.PASSED, 1.0, [_case_result("a", EvalStatus.PASSED, 1.0)])
+
+    assert compare_eval_runs(base, base, score_tolerance=0.0).regressions == ()
+    assert compare_eval_runs(base, base, score_tolerance=2.0).regressions == ()
+
+
+def test_positive_infinite_score_tolerance_cannot_suppress_regression():
+    base = _run(EvalStatus.PASSED, 0.9, [_case_result("a", EvalStatus.PASSED, 0.9)])
+    current = _run(EvalStatus.PASSED, 0.6, [_case_result("a", EvalStatus.PASSED, 0.6)])
+
     with pytest.raises(ValueError, match="score_tolerance"):
-        compare_eval_runs(base, base, score_tolerance=-0.1)
-    with pytest.raises(TypeError, match="score_tolerance"):
-        compare_eval_runs(base, base, score_tolerance=True)
+        compare_eval_runs(base, current, score_tolerance=float("inf"))
 
 
 def test_trials_average_the_per_assertion_score():

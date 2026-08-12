@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 from functools import partial
+from math import isfinite
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -57,8 +58,8 @@ class EvalCaseComparison(BaseModel):
     case_id: str
     baseline_status: EvalStatus | None = None
     current_status: EvalStatus | None = None
-    baseline_score: StrictFloat | None = None
-    current_score: StrictFloat | None = None
+    baseline_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    current_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     regressions: tuple[str, ...] = Field(default_factory=tuple)
 
     @field_validator("case_id")
@@ -83,8 +84,8 @@ class EvalRunComparison(BaseModel):
     current_suite_id: str
     baseline_status: EvalStatus
     current_status: EvalStatus
-    baseline_score: StrictFloat | None = None
-    current_score: StrictFloat | None = None
+    baseline_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
+    current_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False)
     regressions: tuple[str, ...] = Field(default_factory=tuple)
     cases: tuple[EvalCaseComparison, ...] = Field(default_factory=tuple)
 
@@ -356,8 +357,8 @@ def compare_eval_runs(
     """
     if type(score_tolerance) not in (int, float) or isinstance(score_tolerance, bool):
         raise TypeError("compare_eval_runs score_tolerance must be a number.")
-    if score_tolerance != score_tolerance or score_tolerance < 0:  # rejects NaN and negatives
-        raise ValueError("compare_eval_runs score_tolerance must be >= 0.")
+    if not isfinite(score_tolerance) or score_tolerance < 0:
+        raise ValueError("compare_eval_runs score_tolerance must be finite and >= 0.")
     if baseline.suite_id != current.suite_id:
         raise ValueError(
             "Cannot compare eval runs from different suites: "
