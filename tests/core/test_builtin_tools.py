@@ -2624,6 +2624,339 @@ def test_read_file_dedupes_repeated_pdf_page_extraction(tmp_path):
     assert listing.total_count == 2
 
 
+def test_read_file_reapplies_attachment_limit_to_reused_pdf_derivation(
+    tmp_path,
+    monkeypatch,
+):
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(1),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+    derived_pdf = b"%PDF-1.7\n" + (b"x" * 190)
+    monkeypatch.setattr(
+        files_module,
+        "_extract_pdf_pages",
+        lambda content, pages: (derived_pdf, " showing page 1"),
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+    tool = ReadFileTool()
+
+    permissive = asyncio.run(
+        tool.run(
+            ctx,
+            {
+                "artifact_id": pdf.id,
+                "pages": "1",
+                "max_attachment_bytes": len(derived_pdf),
+            },
+        )
+    )
+    strict = asyncio.run(
+        tool.run(
+            ctx,
+            {
+                "artifact_id": pdf.id,
+                "pages": "1",
+                "max_attachment_bytes": len(derived_pdf) - 1,
+            },
+        )
+    )
+    reconstructed_store = LocalArtifactStore(
+        tmp_path / "artifacts",
+        store_id="artifacts",
+    )
+    reconstructed_ctx = ToolContext(
+        session_id="sess_1",
+        artifact_store=reconstructed_store,
+    )
+
+    async def reuse_concurrently() -> tuple[ToolResult, ToolResult]:
+        args = {
+            "artifact_id": pdf.id,
+            "pages": "1",
+            "max_attachment_bytes": len(derived_pdf),
+        }
+        first, second = await asyncio.gather(
+            tool.run(reconstructed_ctx, args),
+            tool.run(reconstructed_ctx, args),
+        )
+        return first, second
+
+    reused = asyncio.run(reuse_concurrently())
+
+    assert permissive.is_error is False
+    assert strict.is_error is True
+    assert strict.artifacts == ()
+    assert "attachment_artifact_id" not in strict.structured
+    assert f"max_attachment_bytes={len(derived_pdf) - 1}" in strict.content
+    assert all(result.is_error is False for result in reused)
+    assert {result.structured["attachment_artifact_id"] for result in reused} == {
+        permissive.structured["attachment_artifact_id"]
+    }
+    listing = asyncio.run(artifact_store.list(scope=ArtifactScope.SESSION, session_id="sess_1"))
+    assert listing.total_count == 2
+
+
+def test_read_file_can_cache_pdf_derivation_after_a_strict_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(1),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+    derived_pdf = b"%PDF-1.7\n" + (b"x" * 190)
+    monkeypatch.setattr(
+        files_module,
+        "_extract_pdf_pages",
+        lambda content, pages: (derived_pdf, " showing page 1"),
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+    tool = ReadFileTool()
+
+    strict = asyncio.run(
+        tool.run(
+            ctx,
+            {
+                "artifact_id": pdf.id,
+                "pages": "1",
+                "max_attachment_bytes": len(derived_pdf) - 1,
+            },
+        )
+    )
+    permissive = asyncio.run(
+        tool.run(
+            ctx,
+            {
+                "artifact_id": pdf.id,
+                "pages": "1",
+                "max_attachment_bytes": len(derived_pdf),
+            },
+        )
+    )
+
+    assert strict.is_error is True
+    assert strict.artifacts == ()
+    assert permissive.is_error is False
+    listing = asyncio.run(artifact_store.list(scope=ArtifactScope.SESSION, session_id="sess_1"))
+    assert listing.total_count == 2
+
+
+def test_read_file_rebuilds_missing_and_corrupt_pdf_derivations(
+    tmp_path,
+    monkeypatch,
+):
+    artifact_root = tmp_path / "artifacts"
+    artifact_store = LocalArtifactStore(artifact_root, store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(1),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+    derived_pdf = b"%PDF-1.7\n" + (b"x" * 190)
+    extraction_count = 0
+
+    def extract(content: bytes, pages: str | None):
+        nonlocal extraction_count
+        extraction_count += 1
+        return derived_pdf, " showing page 1"
+
+    monkeypatch.setattr(files_module, "_extract_pdf_pages", extract)
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+    args = {
+        "artifact_id": pdf.id,
+        "pages": "1",
+        "max_attachment_bytes": len(derived_pdf),
+    }
+
+    first = asyncio.run(ReadFileTool().run(ctx, args))
+    first_id = first.structured["attachment_artifact_id"]
+    asyncio.run(artifact_store.delete(first_id))
+    rebuilt_missing = asyncio.run(ReadFileTool().run(ctx, args))
+    missing_id = rebuilt_missing.structured["attachment_artifact_id"]
+    (artifact_root / missing_id / "content").write_bytes(b"y" * len(derived_pdf))
+    strict_args = {
+        **args,
+        "max_attachment_bytes": len(derived_pdf) - 1,
+    }
+    rejected_corrupt = asyncio.run(ReadFileTool().run(ctx, strict_args))
+    extraction_count_after_strict_rebuild = extraction_count
+    rebuilt_corrupt = asyncio.run(ReadFileTool().run(ctx, args))
+
+    assert rebuilt_missing.is_error is False
+    assert missing_id != first_id
+    assert rejected_corrupt.is_error is True
+    assert rejected_corrupt.artifacts == ()
+    assert extraction_count_after_strict_rebuild == 3
+    assert rebuilt_corrupt.is_error is False
+    assert rebuilt_corrupt.structured["attachment_artifact_id"] != missing_id
+    assert extraction_count == 4
+
+
+def test_read_file_reapplies_attachment_limit_to_reused_image_derivation(
+    tmp_path,
+    monkeypatch,
+):
+    artifact_store = RecordingLocalArtifactStore(tmp_path / "artifacts")
+    image = asyncio.run(
+        artifact_store.put_bytes(
+            TINY_PNG_BYTES,
+            filename="image.png",
+            content_type="image/png",
+            session_id="sess_1",
+        )
+    )
+    monkeypatch.setattr(
+        files_module,
+        "_resize_image_bytes",
+        lambda content, *, content_type, max_bytes: (TINY_PNG_BYTES, "image/png"),
+    )
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+    args = {"artifact_id": image.id, "max_attachment_bytes": 10}
+
+    fresh = asyncio.run(ReadFileTool().run(ctx, args))
+    reused = asyncio.run(ReadFileTool().run(ctx, args))
+
+    assert fresh.is_error is True
+    assert fresh.artifacts == ()
+    assert reused.is_error is True
+    assert reused.artifacts == ()
+    assert artifact_store.put_count == 2
+
+
+def test_read_file_validates_cached_image_derivations_after_reconstruction(
+    tmp_path,
+    monkeypatch,
+):
+    image_module = import_module("PIL.Image")
+    source_buffer = io.BytesIO()
+    image_module.new("RGB", (64, 64), "white").save(source_buffer, format="PNG")
+    artifact_root = tmp_path / "artifacts"
+    artifact_store = LocalArtifactStore(artifact_root, store_id="artifacts")
+    image = asyncio.run(
+        artifact_store.put_bytes(
+            source_buffer.getvalue(),
+            filename="image.png",
+            content_type="image/png",
+            session_id="sess_1",
+        )
+    )
+    resize_count = 0
+
+    def resize(content: bytes, *, content_type: str, max_bytes: int):
+        nonlocal resize_count
+        resize_count += 1
+        return TINY_PNG_BYTES, "image/png"
+
+    monkeypatch.setattr(files_module, "_resize_image_bytes", resize)
+    args = {
+        "artifact_id": image.id,
+        "max_attachment_bytes": len(TINY_PNG_BYTES),
+    }
+    first = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="sess_1", artifact_store=artifact_store),
+            args,
+        )
+    )
+    first_id = first.structured["attachment_artifact_id"]
+    reconstructed_store = LocalArtifactStore(artifact_root, store_id="artifacts")
+    reconstructed_ctx = ToolContext(
+        session_id="sess_1",
+        artifact_store=reconstructed_store,
+    )
+
+    async def reuse_concurrently() -> tuple[ToolResult, ToolResult]:
+        first_reuse, second_reuse = await asyncio.gather(
+            ReadFileTool().run(reconstructed_ctx, args),
+            ReadFileTool().run(reconstructed_ctx, args),
+        )
+        return first_reuse, second_reuse
+
+    reused = asyncio.run(reuse_concurrently())
+    (artifact_root / first_id / "content").write_bytes(b"x" * len(TINY_PNG_BYTES))
+    rebuilt = asyncio.run(ReadFileTool().run(reconstructed_ctx, args))
+
+    assert first.is_error is False
+    assert all(result.is_error is False for result in reused)
+    assert {result.structured["attachment_artifact_id"] for result in reused} == {first_id}
+    assert rebuilt.is_error is False
+    assert rebuilt.structured["attachment_artifact_id"] != first_id
+    assert resize_count == 2
+
+
+def test_read_file_admits_custom_reader_attachments_at_the_final_boundary(tmp_path):
+    artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
+    pdf = asyncio.run(
+        artifact_store.put_bytes(
+            _multi_page_pdf_bytes(1),
+            filename="report.pdf",
+            content_type="application/pdf",
+            session_id="sess_1",
+        )
+    )
+
+    class AttachingCustomPdfReader:
+        def __init__(self, advertised_size: int) -> None:
+            self.advertised_size = advertised_size
+
+        def can_read(self, artifact) -> bool:
+            return artifact.content_type == "application/pdf"
+
+        async def read(self, request: ArtifactReadRequest) -> ToolResult:
+            return ToolResult(
+                content="custom attachment",
+                artifacts=[
+                    file_attachment(
+                        artifact_id=request.artifact.id,
+                        kind="document",
+                        filename=request.artifact.filename,
+                        content_type=request.artifact.content_type,
+                        size_bytes=self.advertised_size,
+                    )
+                ],
+            )
+
+    ctx = ToolContext(session_id="sess_1", artifact_store=artifact_store)
+    oversized = asyncio.run(
+        ReadFileTool(artifact_readers=[AttachingCustomPdfReader(pdf.size_bytes)]).run(
+            ctx,
+            {
+                "artifact_id": pdf.id,
+                "max_attachment_bytes": pdf.size_bytes - 1,
+            },
+        )
+    )
+    understated = asyncio.run(
+        ReadFileTool(artifact_readers=[AttachingCustomPdfReader(pdf.size_bytes - 1)]).run(
+            ctx,
+            {
+                "artifact_id": pdf.id,
+                "max_attachment_bytes": pdf.size_bytes,
+            },
+        )
+    )
+
+    assert oversized.is_error is True
+    assert oversized.artifacts == ()
+    assert understated.is_error is True
+    assert understated.artifacts == ()
+    assert "changed before admission" in understated.content
+
+
 def test_read_file_dedupes_across_page_selections(tmp_path):
     artifact_store = LocalArtifactStore(tmp_path / "artifacts", store_id="artifacts")
     pdf = asyncio.run(

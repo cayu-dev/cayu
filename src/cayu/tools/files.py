@@ -8,6 +8,7 @@ import json
 import mimetypes
 import ntpath
 import posixpath
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import import_module
@@ -27,6 +28,7 @@ from cayu.artifacts import (
     InvalidArtifactIdError,
     copy_artifact_read_result,
     file_attachment,
+    file_attachment_from_payload,
 )
 from cayu.artifacts._images import decode_verified_image_format
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
@@ -128,6 +130,7 @@ class _InvalidPdfPageRange(ValueError):
 class ReadFileOptions:
     max_bytes: int = DEFAULT_READ_LIMIT_BYTES
     max_attachment_bytes: int = DEFAULT_ATTACHMENT_LIMIT_BYTES
+    max_attachment_validation_bytes: int = DEFAULT_MAX_ATTACHMENT_LIMIT_BYTES
     pages: str | None = None
 
 
@@ -300,15 +303,19 @@ class ReadFileTool(Tool):
             pages = _optional_arg_string(args, "pages")
             if path is not None:
                 path = _validate_workspace_path_argument(path)
+            options = ReadFileOptions(
+                max_bytes=max_bytes,
+                max_attachment_bytes=max_attachment_bytes,
+                max_attachment_validation_bytes=self.max_attachment_limit_bytes,
+                pages=pages,
+            )
         if path is not None:
             return await _read_workspace_file(
                 ctx,
                 path=path,
                 artifact_readers=self.artifact_readers,
-                max_bytes=max_bytes,
                 offset=offset,
-                max_attachment_bytes=max_attachment_bytes,
-                pages=pages,
+                options=options,
             )
         if artifact_id is not None:
             if offset != 0:
@@ -319,9 +326,7 @@ class ReadFileTool(Tool):
                 ctx,
                 artifact_id=artifact_id,
                 artifact_readers=self.artifact_readers,
-                max_bytes=max_bytes,
-                max_attachment_bytes=max_attachment_bytes,
-                pages=pages,
+                options=options,
                 missing_as_result=True,
             )
         raise AssertionError("unreachable")
@@ -361,10 +366,8 @@ async def _read_workspace_file(
     *,
     path: str,
     artifact_readers: list[ArtifactReader],
-    max_bytes: int,
     offset: int,
-    max_attachment_bytes: int,
-    pages: str | None,
+    options: ReadFileOptions,
 ) -> ToolResult:
     workspace = _require_workspace(ctx)
     if workspace is None:
@@ -380,7 +383,7 @@ async def _read_workspace_file(
                 workspace,
                 path,
                 offset=offset,
-                max_bytes=max_bytes,
+                max_bytes=options.max_bytes,
             )
         except _WorkspaceFileNotFoundError:
             return _missing_workspace_file_result("Read", path)
@@ -389,9 +392,7 @@ async def _read_workspace_file(
             path=path,
             content_type=content_type,
             artifact_readers=artifact_readers,
-            max_bytes=max_bytes,
-            max_attachment_bytes=max_attachment_bytes,
-            pages=pages,
+            options=options,
             initial_result=result,
         )
 
@@ -405,7 +406,7 @@ async def _read_workspace_file(
             fetch_offset = offset
             trailing_window_bytes = 0
         prefix_bytes = offset - fetch_offset
-        requested_read_limit = prefix_bytes + max_bytes + trailing_window_bytes
+        requested_read_limit = prefix_bytes + options.max_bytes + trailing_window_bytes
         result, effective_read_limit = await _read_workspace_bytes(
             workspace,
             path,
@@ -487,7 +488,7 @@ async def _read_workspace_file(
                 ),
                 observed_window_end=observed_window_end,
             )
-    effective_page_limit_bytes = min(max_bytes, workspace_page_limit_bytes)
+    effective_page_limit_bytes = min(options.max_bytes, workspace_page_limit_bytes)
     if exact_eof:
         page, next_offset = b"", None
     else:
@@ -497,7 +498,7 @@ async def _read_workspace_file(
             content_type=content_type,
             requested_offset=offset,
             max_bytes=effective_page_limit_bytes,
-            caller_max_bytes=max_bytes,
+            caller_max_bytes=options.max_bytes,
             effective_read_limit_bytes=effective_read_limit,
             workspace_page_limit_bytes=workspace_page_limit_bytes,
             raw_read_limit_exhausted=raw_read_limit_exhausted,
@@ -519,7 +520,7 @@ async def _read_workspace_file(
             truncated=next_offset is not None,
             inspectable=False,
         )
-    if pages is not None:
+    if options.pages is not None:
         return invalid_tool_arguments_result(
             ValueError("Tool argument `pages` is only valid for PDF files.")
         )
@@ -542,7 +543,7 @@ async def _read_workspace_file(
             window_offset=result.offset,
             page_offset=offset,
             page_end=page_end,
-            max_bytes=max_bytes,
+            max_bytes=options.max_bytes,
             source_complete=next_offset is None,
         )
     else:
@@ -755,9 +756,7 @@ async def _read_workspace_file_attachment(
     path: str,
     content_type: str,
     artifact_readers: list[ArtifactReader],
-    max_bytes: int,
-    max_attachment_bytes: int,
-    pages: str | None,
+    options: ReadFileOptions,
     initial_result: WorkspaceReadResult,
 ) -> ToolResult:
     artifact_store = _require_artifact_store(ctx)
@@ -827,9 +826,7 @@ async def _read_workspace_file_attachment(
         ctx,
         artifact_id=snapshot.id,
         artifact_readers=artifact_readers,
-        max_bytes=max_bytes,
-        max_attachment_bytes=max_attachment_bytes,
-        pages=pages,
+        options=options,
         missing_as_result=False,
     )
     return _workspace_snapshot_result(
@@ -1005,9 +1002,7 @@ async def _read_artifact(
     *,
     artifact_id: str,
     artifact_readers: list[ArtifactReader],
-    max_bytes: int,
-    max_attachment_bytes: int,
-    pages: str | None,
+    options: ReadFileOptions,
     missing_as_result: bool,
 ) -> ToolResult:
     artifact_store = _require_artifact_store(ctx)
@@ -1017,7 +1012,7 @@ async def _read_artifact(
         result = await _read_artifact_store(
             artifact_store,
             artifact_id,
-            max_bytes=max_bytes,
+            max_bytes=options.max_bytes,
         )
     except InvalidArtifactIdError as exc:
         return invalid_tool_arguments_result(exc)
@@ -1048,18 +1043,15 @@ async def _read_artifact(
         artifact_store=artifact_store,
         artifact=artifact,
         initial_read=result,
-        options=ReadFileOptions(
-            max_bytes=max_bytes,
-            max_attachment_bytes=max_attachment_bytes,
-            pages=pages,
-        ),
+        options=options,
         structured=structured,
         _missing_as_result=missing_as_result,
     )
     for reader in artifact_readers:
         if reader.can_read(artifact):
             try:
-                return await reader.read(request)
+                reader_result = await reader.read(request)
+                return await _admit_artifact_reader_attachments(request, reader_result)
             except _ArtifactReadNotFound:
                 return _missing_artifact_result(artifact_id)
     return ToolResult(
@@ -1069,6 +1061,89 @@ async def _read_artifact(
             "content type. Register a custom tool if this format should be inspectable."
         ),
         structured=structured,
+        is_error=True,
+    )
+
+
+async def _admit_artifact_reader_attachments(
+    request: ArtifactReadRequest,
+    result: ToolResult,
+) -> ToolResult:
+    attachments = []
+    for payload in result.artifacts:
+        try:
+            attachment = file_attachment_from_payload(payload)
+        except (TypeError, ValueError):
+            return _attachment_admission_error(
+                request,
+                "Artifact reader returned an invalid file attachment reference.",
+            )
+        if attachment is not None:
+            attachments.append(attachment)
+    for attachment in attachments:
+        if attachment.size_bytes > request.options.max_attachment_bytes:
+            return _attachment_size_error(
+                request,
+                size_bytes=attachment.size_bytes,
+            )
+        try:
+            stored = await _read_artifact_store(
+                request.artifact_store,
+                attachment.artifact_id,
+                max_bytes=request.options.max_attachment_bytes,
+                missing_as_result=request._missing_as_result,
+            )
+        except _ArtifactReadNotFound:
+            return _attachment_admission_error(
+                request,
+                "Artifact reader attachment is no longer available.",
+            )
+        except (InvalidArtifactIdError, TypeError, ValueError):
+            return _attachment_admission_error(
+                request,
+                "Artifact reader attachment could not be validated.",
+            )
+        if stored.truncated:
+            return _attachment_size_error(
+                request,
+                size_bytes=stored.total_bytes,
+            )
+        access_error = _artifact_access_error(request.ctx, stored.metadata)
+        if access_error is not None:
+            return _attachment_admission_error(
+                request,
+                "Artifact reader attachment is not available in this context.",
+            )
+        if (
+            stored.metadata.size_bytes != attachment.size_bytes
+            or stored.metadata.content_type != attachment.content_type
+        ):
+            return _attachment_admission_error(
+                request,
+                "Artifact reader attachment changed before admission.",
+            )
+    return result
+
+
+def _attachment_size_error(
+    request: ArtifactReadRequest,
+    *,
+    size_bytes: int,
+) -> ToolResult:
+    return _attachment_admission_error(
+        request,
+        f"File attachment is {size_bytes} bytes, which exceeds "
+        f"max_attachment_bytes={request.options.max_attachment_bytes}.",
+    )
+
+
+def _attachment_admission_error(
+    request: ArtifactReadRequest,
+    message: str,
+) -> ToolResult:
+    return ToolResult(
+        content=message,
+        structured=request.structured,
         is_error=True,
     )
 
@@ -1168,7 +1243,12 @@ class ImageArtifactReader:
                 operation="resize_image",
                 params=str(request.options.max_attachment_bytes),
             )
-            reused = await _find_derived_artifact(artifact_store, request.ctx, derivation_key)
+            reused = await _find_derived_artifact(
+                artifact_store,
+                request.ctx,
+                derivation_key,
+                max_attachment_validation_bytes=request.options.max_attachment_validation_bytes,
+            )
             if reused is not None:
                 attachment_artifact = reused
             else:
@@ -1327,7 +1407,12 @@ class PdfArtifactReader:
                 operation="extract_pdf_pages",
                 params=request.options.pages or "",
             )
-            reused = await _find_derived_artifact(artifact_store, request.ctx, derivation_key)
+            reused = await _find_derived_artifact(
+                artifact_store,
+                request.ctx,
+                derivation_key,
+                max_attachment_validation_bytes=request.options.max_attachment_validation_bytes,
+            )
             if reused is not None:
                 attachment_artifact = reused
                 page_note = reused.metadata.get("page_note", "")
@@ -2520,6 +2605,8 @@ async def _find_derived_artifact(
     artifact_store: ArtifactStore,
     ctx: ToolContext,
     derivation_key: str,
+    *,
+    max_attachment_validation_bytes: int,
 ) -> ArtifactMetadata | None:
     """Return a previously derived session artifact for this derivation, if any.
 
@@ -2538,8 +2625,27 @@ async def _find_derived_artifact(
     except Exception:
         return None
     for meta in listing.artifacts:
-        if meta.metadata.get("cayu_derivation_key") == derivation_key:
-            return meta
+        if meta.metadata.get("cayu_derivation_key") != derivation_key:
+            continue
+        if meta.size_bytes > max_attachment_validation_bytes:
+            continue
+        try:
+            stored = await _read_artifact_store(
+                artifact_store,
+                meta.id,
+                max_bytes=max_attachment_validation_bytes,
+            )
+        except Exception:
+            continue
+        content_hash = meta.metadata.get("content_hash")
+        if (
+            not stored.truncated
+            and stored.metadata.size_bytes == meta.size_bytes
+            and type(content_hash) is str
+            and re.fullmatch(r"[0-9a-f]{64}", content_hash)
+            and _content_hash(stored.content) == content_hash
+        ):
+            return stored.metadata
     return None
 
 
