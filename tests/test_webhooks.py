@@ -6,6 +6,8 @@ import hmac
 from typing import Any
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from cayu import WebhookSignatureError, verify_webhook_signature, webhook_task_id
 
@@ -33,6 +35,30 @@ def test_verify_rejects_missing_signature() -> None:
 
 def test_verify_rejects_non_string_signature() -> None:
     signature: Any = b"sha256=x"
+    assert verify_webhook_signature("s3cret", b"{}", signature) is False
+
+
+def test_verify_rejects_non_ascii_signature_without_raising() -> None:
+    assert verify_webhook_signature("s3cret", b"{}", "sha256=é") is False
+
+
+@given(st.text())
+def test_verify_is_total_for_arbitrary_unicode_signatures(signature: str) -> None:
+    assert type(verify_webhook_signature("s3cret", b"{}", signature)) is bool
+
+
+@pytest.mark.parametrize(
+    "signature",
+    [
+        "sha256=" + ("0" * 63),
+        "sha256=" + ("0" * 62),
+        "sha256=" + ("g" * 64),
+        "sha1=" + ("0" * 64),
+        "sha256=sha1=" + ("0" * 64),
+    ],
+    ids=["odd-length", "wrong-length", "invalid-hex", "wrong-prefix", "duplicate-algorithm"],
+)
+def test_verify_rejects_malformed_signature_syntax(signature: str) -> None:
     assert verify_webhook_signature("s3cret", b"{}", signature) is False
 
 
@@ -64,11 +90,22 @@ def test_verify_rejects_invalid_prefix() -> None:
     prefix: Any = 123
     with pytest.raises(WebhookSignatureError, match="prefix must be a string"):
         verify_webhook_signature("s", b"{}", "sha256=x", prefix=prefix)
+    with pytest.raises(WebhookSignatureError, match="prefix must contain only ASCII"):
+        verify_webhook_signature("s", b"{}", "sha256=x", prefix="é=")
 
 
 def test_verify_raises_on_unsupported_algorithm() -> None:
     with pytest.raises(WebhookSignatureError):
         verify_webhook_signature("s", b"b", "x", algorithm="not-a-real-hash")
+
+
+def test_verify_configuration_errors_precede_untrusted_signature_parsing() -> None:
+    with pytest.raises(WebhookSignatureError, match="secret must be non-empty"):
+        verify_webhook_signature("", b"{}", None)
+    with pytest.raises(WebhookSignatureError, match="body must be bytes"):
+        verify_webhook_signature("s", "not-bytes", None)  # type: ignore[arg-type]
+    with pytest.raises(WebhookSignatureError, match="Unsupported HMAC algorithm"):
+        verify_webhook_signature("s", b"{}", None, algorithm="not-a-real-hash")
 
 
 def test_webhook_task_id_is_deterministic_and_distinct() -> None:

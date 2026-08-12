@@ -50,13 +50,15 @@ def verify_webhook_signature(
 
     Defaults verify GitHub's ``X-Hub-Signature-256`` (``sha256`` digest, ``sha256=``
     prefix). For a provider that sends a bare hex digest, pass ``prefix=""``.
+    Malformed untrusted signature values return ``False``; invalid verifier
+    configuration raises :class:`WebhookSignatureError`.
     """
-    if not signature:
-        return False
-    if type(signature) is not str:
-        return False
     if type(prefix) is not str:
         raise WebhookSignatureError("prefix must be a string.")
+    try:
+        prefix_bytes = prefix.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise WebhookSignatureError("prefix must contain only ASCII characters.") from exc
     if not isinstance(body, (bytes, bytearray)):
         raise WebhookSignatureError("body must be bytes.")
     if isinstance(secret, str):
@@ -73,8 +75,26 @@ def verify_webhook_signature(
         mac = hmac.new(key, bytes(body), algorithm)
     except (ValueError, TypeError) as exc:
         raise WebhookSignatureError(f"Unsupported HMAC algorithm: {algorithm!r}") from exc
-    expected = prefix + mac.hexdigest()
-    return hmac.compare_digest(expected, signature)
+    if not signature:
+        return False
+    if type(signature) is not str:
+        return False
+    try:
+        signature_bytes = signature.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if not signature_bytes.startswith(prefix_bytes):
+        return False
+    received_hex = signature_bytes[len(prefix_bytes) :]
+    if len(received_hex) != mac.digest_size * 2:
+        return False
+    try:
+        received_digest = bytes.fromhex(received_hex.decode("ascii"))
+    except ValueError:
+        return False
+    if len(received_digest) != mac.digest_size:
+        return False
+    return hmac.compare_digest(mac.digest(), received_digest)
 
 
 def webhook_task_id(*parts: str, namespace: str = "webhook") -> str:

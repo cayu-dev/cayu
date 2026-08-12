@@ -80,3 +80,8 @@ Stripe hook), your app terminates the HTTP request and enqueues a `Task`, then a
 `run_task_worker` loop picks it up. `cayu.webhooks.verify_webhook_signature` and
 `webhook_task_id` cover the verify-and-enqueue-idempotently step. The
 [PR-reviewer recipe](recipes/pr-reviewer.md) shows that end to end.
+
+`verify_webhook_signature` returns `False` for malformed untrusted header values,
+including non-ASCII or invalid hexadecimal signatures. It raises
+`WebhookSignatureError` only for invalid verifier configuration or caller inputs,
+such as an unsupported algorithm, invalid secret, or non-bytes request body.
