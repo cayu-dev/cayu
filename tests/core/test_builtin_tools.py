@@ -2858,6 +2858,50 @@ def test_exec_command_tool_redacts_at_runner_capture_before_output_bound(tmp_pat
     assert result.structured["stdout_truncated"] is True
 
 
+def test_exec_command_tool_reports_output_suppressed_by_invocation_runner() -> None:
+    suppressed = "abcdef"
+    runner = InvocationRunnerHandle(
+        RecordingRunner(ExecResult(stdout=suppressed, stdout_bytes=len(suppressed))),
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+
+    result = asyncio.run(
+        ExecCommandTool().run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["emit"], "max_output_bytes": 3},
+        )
+    )
+
+    assert result.structured["stdout"] == ""
+    assert result.structured["stdout_truncated"] is True
+    assert "[output truncated]" in result.content
+    assert suppressed not in json.dumps(result.model_dump(mode="json"))
+
+
+def test_exec_command_tool_preserves_normal_status_for_empty_output() -> None:
+    runner = InvocationRunnerHandle(
+        RecordingRunner(ExecResult()),
+        redactor_snapshot_provider=lambda: InvocationRedactorSnapshot(
+            revision=0,
+            redactor=SecretRedactor(),
+        ),
+    )
+
+    result = asyncio.run(
+        ExecCommandTool().run(
+            ToolContext(session_id="sess_1", runner=runner),
+            {"argv": ["true"]},
+        )
+    )
+
+    assert result.content == "Command exited with code 0."
+    assert result.structured["stdout_truncated"] is False
+    assert result.structured["stderr_truncated"] is False
+
+
 def test_builtin_tools_truncate_model_facing_large_outputs(tmp_path):
     workspace = LocalWorkspace(tmp_path, workspace_id="local")
     file_ctx = ToolContext(session_id="sess_1", workspace=workspace)

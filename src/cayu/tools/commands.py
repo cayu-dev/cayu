@@ -609,7 +609,7 @@ def _command_content(
             return f"{reason}\n\nstdout:\n{output}{suffix}"
         if error:
             return f"{reason}\n\nstderr:\n{error}{suffix}"
-        return reason
+        return f"{reason}{suffix}"
     if cancelled:
         reason = "Command was cancelled."
         if output and error:
@@ -618,7 +618,7 @@ def _command_content(
             return f"{reason}\n\nstdout:\n{output}{suffix}"
         if error:
             return f"{reason}\n\nstderr:\n{error}{suffix}"
-        return reason
+        return f"{reason}{suffix}"
     if exit_code != 0:
         reason = f"Command exited with code {exit_code}."
         if output and error:
@@ -627,11 +627,11 @@ def _command_content(
             return f"{reason}\n\nstdout:\n{output}{suffix}"
         if error:
             return f"{reason}\n\nstderr:\n{error}{suffix}"
-        return reason
+        return f"{reason}{suffix}"
     if output and error:
         return f"stdout:\n{output}\n\nstderr:\n{error}{suffix}"
     if output:
         return f"{output}{suffix}"
     if error:
         return f"{error}{suffix}"
-    return f"Command exited with code {exit_code}."
+    return f"Command exited with code {exit_code}.{suffix}"

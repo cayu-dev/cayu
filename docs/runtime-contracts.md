@@ -3988,6 +3988,10 @@ Runner commands use `ExecCommand`:
 The runtime should not pass a single ambiguous command string to runners. Use process mode unless shell parsing, expansion, and quoting are intentional.
 Runner output capture is bounded by `output_limit_bytes` and returns `stdout_truncated` / `stderr_truncated` flags when output is capped. Direct runner calls default to 1 MiB per stream; the model-facing `exec_command` tool passes its smaller 50,000-byte default into the runner. This limit belongs in the runner, not only in tool post-processing, so commands cannot exhaust runtime memory before the model-facing result is built. Runners continue draining both streams after the capture bound is reached so a child cannot block on a full pipe. `ExecResult.stdout_bytes` and `stderr_bytes` report the total bytes observed before truncation when the adapter can know that value; `None` means the total is unavailable, not zero. The captured strings may therefore be smaller than their total byte counts.
 
+When either truncation flag is set, `ExecCommandTool` includes an explicit truncation marker in
+model-facing content even if conservative runner validation suppressed every captured byte. The
+suppressed bytes remain absent from both content and structured output.
+
 `Runner.exec(..., env_remove=(...))` lets a trusted Cayu caller remove named
 variables after ordinary/injected environment construction. Built-in runners
 validate each execution request's command text, `cwd`, and caller-provided environment
