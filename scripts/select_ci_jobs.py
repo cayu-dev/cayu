@@ -109,7 +109,14 @@ def _affects_dashboard(path: str) -> bool:
 def _affects_release_artifacts(path: str) -> bool:
     if path in _RELEASE_EXACT_PATHS:
         return True
-    if path.startswith(("dashboard/", "maintenance/model_catalog/", "src/cayu/data/")):
+    if path.startswith(
+        (
+            "dashboard/",
+            "maintenance/model_catalog/",
+            "src/cayu/cli/",
+            "src/cayu/data/",
+        )
+    ):
         return True
     return (
         path.startswith("src/cayu/")

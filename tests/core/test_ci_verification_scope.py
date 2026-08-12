@@ -85,6 +85,16 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
     )
 
 
+def test_cloud_cli_changes_select_release_artifact_lane() -> None:
+    expected = VerificationScope(
+        dashboard=False,
+        release_artifacts=True,
+        sqlite_cancellation=False,
+    )
+    assert select_pull_request_jobs(["src/cayu/cli/cloud.py"]) == expected
+    assert select_pull_request_jobs(["src/cayu/cli/_cloud_project.py"]) == expected
+
+
 def test_dependency_or_scope_changes_fail_open() -> None:
     all_jobs = VerificationScope(
         dashboard=True,

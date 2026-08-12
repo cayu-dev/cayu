@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Callable
 
 from cayu._version import package_version
@@ -81,9 +82,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _build_parser()
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "cloud":
+        from cayu.cli.cloud import run_cloud_cli
 
-    args = parser.parse_args(argv)
+        return run_cloud_cli(arguments[1:])
+
+    parser = _build_parser()
+    args = parser.parse_args(arguments)
     runner = getattr(args, "_runner", None)
     if runner is not None:
         return runner(args)

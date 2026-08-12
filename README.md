@@ -105,6 +105,75 @@ The scaffold is credential-free and includes:
 Open the generated project, describe the requested job in the existing agent,
 and keep its public test/eval seam intact.
 
+### Deploy with Cayu Cloud
+
+Cloud commands ship in the same `cayu` package; no additional CLI package is
+required. Cayu Cloud is currently invite-only. The CLI connects to the production
+service at `https://cloud.cayu.dev` by default.
+
+```bash
+cayu cloud --help
+cayu cloud login
+cayu cloud whoami
+cayu cloud init
+cayu cloud deploy
+```
+
+Set `CAYU_CLOUD_API_URL` before login to use a staging or local service; the saved
+login remembers that endpoint. Login uses WorkOS device authorization. It opens the
+browser when possible and always prints a verification URL and one-time user code for
+SSH, containers, Cursor, Codex, and Claude Code. The resulting Organization-scoped
+session is stored privately and refreshed automatically; no WorkOS secret is embedded
+in Cayu. Use `--no-browser` when a human will open the displayed URL on another device.
+Login selects the WorkOS session over any previously persisted private context; a later
+`cayu cloud context use PATH` deliberately switches back to that automation context.
+The context API key is used only with its stored endpoint. To override that endpoint
+with `CAYU_CLOUD_API_URL`, provide an explicit `CAYU_CLOUD_API_KEY` or
+`CAYU_CLOUD_API_KEY_FILE`; otherwise Cayu rejects the mismatch before making a request.
+
+`cayu cloud init` generates the small deployment descriptor from standard
+`pyproject.toml` metadata and a configured Cayu server, worker, or console
+script. Review the generated process topology before deploying it. Existing
+descriptors are never replaced unless `--force` is explicit.
+
+The default command packages the current local working directory and uploads it
+directly to the selected Cayu Cloud Organization as an immutable source bundle.
+It includes an applied patch and does not require GitHub, a clean worktree, a
+commit, or a push. Git-ignored files and common local credential/cache paths are
+omitted.
+
+Deploy creates or updates the application slug declared in `cayu-cloud.toml`.
+`--application SLUG` overrides that create-or-update slug; check it carefully because
+a valid typo creates a separate application.
+
+Deploy output and local evidence redact runtime environment values. Cayu verifies the
+evidence destination before Cloud mutation; if only the final evidence write fails after
+a successful rollout, deploy still exits successfully with `evidence_id: null` and an
+`evidence.status: unavailable` diagnostic.
+
+To deploy an exact remote GitHub revision instead, pass its canonical URL and
+40-character commit. For a private source, make authentication available to the
+process that runs Cayu:
+
+```bash
+gh auth status --hostname github.com
+# For noninteractive CI or an isolated Codex/Claude Code home:
+GH_TOKEN="$GITHUB_TOKEN" cayu cloud deploy \
+  https://github.com/example/agent --revision COMMIT_SHA
+```
+
+GitHub CLI credentials stored in a desktop keychain may not be reachable after
+changing `HOME`, even when `GH_CONFIG_DIR` points at an authenticated GitHub CLI
+configuration. In that case, pass a short-lived `GH_TOKEN` explicitly. Cayu
+does not persist the token in its Cloud context or include GitHub CLI stderr in
+its JSON errors. Public GitHub repositories remain deployable without GitHub
+authentication.
+
+For CI and other noninteractive automation, the existing
+`CAYU_CLOUD_API_KEY`, `CAYU_CLOUD_API_KEY_FILE`, and private Cloud-context
+options remain available. Explicit automation credentials take precedence over
+the saved interactive login.
+
 ### Run an agent
 
 This compact example shows the core API. Real projects should put the same
