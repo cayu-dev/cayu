@@ -134,6 +134,7 @@ def test_cloud_wait_options_reject_nonfinite_values_before_authentication(
 @pytest.mark.parametrize(
     "application",
     [
+        "agent07",
         "../source-bundles/uploads",
         "nested/application",
         "research agent",
@@ -157,12 +158,92 @@ def test_cloud_deploy_rejects_noncanonical_application_before_authentication(
         "error": {
             "category": "invalid_input",
             "message": (
-                "Application must be a canonical lowercase Cayu Cloud slug "
-                "containing only letters, numbers, and hyphens."
+                "Application must be an 8-63 character lowercase Cayu Cloud slug "
+                "containing only letters, numbers, and interior hyphens."
             ),
         },
         "ok": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("application_value", "expected_message"),
+    [
+        (
+            '"agent07"',
+            "Manifest application slug must be 8-63 lowercase letters, numbers, "
+            "or interior hyphens.",
+        ),
+        (
+            "12345678",
+            "cayu-cloud.toml application must be a string.",
+        ),
+    ],
+)
+def test_cloud_deploy_rejects_invalid_manifest_application_before_authentication(
+    application_value: str,
+    expected_message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "cayu-cloud.toml").write_text(
+        f"""
+schema_version = 1
+application = {application_value}
+name = "Invalid Agent"
+version = "1.0.0"
+entrypoint = "python agent.py"
+capabilities = ["model.generate"]
+cpu_millis = 1000
+memory_mb = 1024
+timeout_seconds = 600
+environment = "python"
+compatibility = "cayu>=0.1"
+policy_version = "v1"
+"""
+    )
+
+    def unexpected_client(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("invalid manifest slug reached Cloud authentication")
+
+    monkeypatch.setattr(cloud_cli, "_cloud_client", unexpected_client)
+
+    assert (
+        main(
+            [
+                "cloud",
+                "--evidence-dir",
+                str(tmp_path / "evidence"),
+                "deploy",
+                str(tmp_path),
+            ]
+        )
+        == 2
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "category": "manifest_invalid",
+            "message": expected_message,
+        },
+        "ok": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("application", "valid"),
+    [
+        ("a" * 7, False),
+        ("a" * 8, True),
+        ("a" * 63, True),
+        ("a" * 64, False),
+        ("agent---name", True),
+        ("agent-name-", False),
+    ],
+)
+def test_cloud_application_slug_contract(application: str, valid: bool) -> None:
+    assert cloud_project.is_application_slug(application) is valid
 
 
 @pytest.mark.parametrize(
@@ -404,13 +485,32 @@ def test_cloud_init_validates_generated_manifest_before_writing(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "agent"\nversion = "not a valid version!"\n'
+        '[project]\nname = "agent-app"\nversion = "not a valid version!"\n'
     )
 
     assert main(["cloud", "init", str(tmp_path)]) == 2
 
     output = json.loads(capsys.readouterr().out)
     assert output["error"]["category"] == "manifest_invalid"
+    assert not (tmp_path / "cayu-cloud.toml").exists()
+
+
+def test_cloud_init_rejects_a_project_name_shorter_than_the_agent_slug_minimum(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "agent"\nversion = "0.1.0"\n')
+
+    assert main(["cloud", "init", str(tmp_path)]) == 2
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"] == {
+        "category": "project_invalid",
+        "message": (
+            "The project name must produce an 8-63 character lowercase Cayu Cloud "
+            "application slug containing only letters, numbers, and interior hyphens."
+        ),
+    }
     assert not (tmp_path / "cayu-cloud.toml").exists()
 
 

@@ -26,6 +26,7 @@ from cayu.cli._cloud_auth import (
 from cayu.cli._cloud_evidence import EvidenceRecorder
 from cayu.cli._cloud_private_state import write_private_json as _write_private_json
 from cayu.cli._cloud_project import (
+    ResolvedCloudProject,
     initialize_project,
     is_application_slug,
     resolve_project,
@@ -384,6 +385,13 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
         return {"operation": "evidence.verify", "result": recorder.verify()}
     if arguments.command == "deploy":
         recorder.preflight()
+        if not arguments.no_wait:
+            _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
+        project = resolve_project(
+            arguments.source,
+            manifest_path=arguments.manifest,
+            revision=arguments.revision,
+        )
     if arguments.command == "doctor":
         context_path = _selected_context_path(arguments.context)
         context = _read_context(context_path) if context_path is not None else {}
@@ -421,6 +429,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any]:
             arguments,
             client=client,
             recorder=recorder,
+            project=project,
         )
     if arguments.command == "deployment":
         return _deployment(arguments, client=client)
@@ -557,16 +566,10 @@ def _deploy(
     *,
     client: CloudApiClient,
     recorder: EvidenceRecorder,
+    project: ResolvedCloudProject,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
-    if not arguments.no_wait:
-        _validate_wait(arguments.poll_seconds, arguments.wait_seconds)
-    project = resolve_project(
-        arguments.source,
-        manifest_path=arguments.manifest,
-        revision=arguments.revision,
-    )
     application = _resolve_application(
         client,
         reference=arguments.application or project.manifest.application,
@@ -1192,8 +1195,8 @@ def _application_slug(value: str) -> str:
     if not is_application_slug(value):
         raise CloudCommandError(
             "invalid_input",
-            "Application must be a canonical lowercase Cayu Cloud slug "
-            "containing only letters, numbers, and hyphens.",
+            "Application must be an 8-63 character lowercase Cayu Cloud slug "
+            "containing only letters, numbers, and interior hyphens.",
         )
     return value
 

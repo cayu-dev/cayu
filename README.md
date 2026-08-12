@@ -142,7 +142,8 @@ It includes an applied patch and does not require GitHub, a clean worktree, a
 commit, or a push. Git-ignored files and common local credential/cache paths are
 omitted.
 
-Deploy creates or updates the application slug declared in `cayu-cloud.toml`.
+Deploy creates or updates the 8-63 character application slug declared in
+`cayu-cloud.toml`. Slugs use lowercase letters, numbers, and interior hyphens.
 `--application SLUG` overrides that create-or-update slug; check it carefully because
 a valid typo creates a separate application.
 

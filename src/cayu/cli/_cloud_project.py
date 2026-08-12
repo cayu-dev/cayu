@@ -21,7 +21,7 @@ import httpx
 from cayu.cli._cloud_api import CloudApiError
 
 _COMMIT = re.compile(r"[0-9a-f]{40}\Z")
-_APPLICATION = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+_APPLICATION = re.compile(r"[a-z0-9][a-z0-9-]{6,61}[a-z0-9]\Z")
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}\Z")
 _CAPABILITY = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
 _POLICY_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -137,6 +137,12 @@ class CloudProjectManifest:
                 "manifest_invalid",
                 "Application processes require cayu-cloud.toml schema_version 2.",
             )
+        application = payload.get("application")
+        if type(application) is not str:
+            raise CloudApiError(
+                "manifest_invalid",
+                "cayu-cloud.toml application must be a string.",
+            )
         try:
             web = payload.get("web")
             worker = payload.get("worker")
@@ -156,7 +162,7 @@ class CloudProjectManifest:
             ):
                 raise TypeError("env must be a string table")
             manifest = cls(
-                application=str(payload["application"]),
+                application=application,
                 name=str(payload["name"]),
                 version=str(payload["version"]),
                 entrypoint=str(payload["entrypoint"]),
@@ -201,7 +207,11 @@ class CloudProjectManifest:
 
     def validate(self) -> None:
         if not is_application_slug(self.application):
-            raise CloudApiError("manifest_invalid", "Manifest application slug is invalid.")
+            raise CloudApiError(
+                "manifest_invalid",
+                "Manifest application slug must be 8-63 lowercase letters, numbers, "
+                "or interior hyphens.",
+            )
         if not self.name or len(self.name) > 128:
             raise CloudApiError("manifest_invalid", "Manifest application name is invalid.")
         if _VERSION.fullmatch(self.version) is None:
@@ -408,7 +418,8 @@ def _application_slug(value: str) -> str:
     if not is_application_slug(slug):
         raise CloudApiError(
             "project_invalid",
-            "The project name cannot be converted to a Cayu Cloud application slug.",
+            "The project name must produce an 8-63 character lowercase Cayu Cloud "
+            "application slug containing only letters, numbers, and interior hyphens.",
         )
     return slug
 

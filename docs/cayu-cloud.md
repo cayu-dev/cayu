@@ -12,8 +12,9 @@ cayu cloud deploy .
 cayu cloud service status --application my-agent
 ```
 
-`cayu cloud deploy` creates the application slug declared in `cayu-cloud.toml`
-when it does not exist, then updates it on later deploys. `--application SLUG`
+`cayu cloud deploy` creates the 8-63 character application slug declared in
+`cayu-cloud.toml` when it does not exist, then updates it on later deploys. Slugs use
+lowercase letters, numbers, and interior hyphens. `--application SLUG`
 selects a different create-or-update slug; check it carefully because a valid typo
 creates a separate application.
 
