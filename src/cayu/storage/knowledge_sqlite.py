@@ -334,11 +334,18 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("SQLiteKnowledgeStore supports only auto and keyword search modes.")
         fts_query, preview_terms = _sqlite_knowledge_fts_query(knowledge_query)
+        none_fts_query = _sqlite_knowledge_none_fts_query(knowledge_query)
         where_sql, params = _knowledge_filter_sql(knowledge_query)
         async with self._lock:
-            total_hits_known = self._count_search_hits_unlocked(fts_query, where_sql, params)
+            total_hits_known = self._count_search_hits_unlocked(
+                fts_query,
+                none_fts_query,
+                where_sql,
+                params,
+            )
             unique_rows = self._search_unique_rows_unlocked(
                 fts_query=fts_query,
+                none_fts_query=none_fts_query,
                 where_sql=where_sql,
                 params=params,
                 limit=knowledge_query.limit,
@@ -403,9 +410,11 @@ class SQLiteKnowledgeStore(KnowledgeStore):
     def _count_search_hits_unlocked(
         self,
         fts_query: str,
+        none_fts_query: str | None,
         where_sql: str,
         params: list[object],
     ) -> int:
+        none_sql, none_params = _sqlite_knowledge_none_filter_sql(none_fts_query)
         row = self._connection.execute(
             f"""
             SELECT COUNT(DISTINCT e.id)
@@ -415,9 +424,10 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             JOIN cayu_knowledge_entries AS e
                 ON e.id = c.entry_id
             WHERE cayu_knowledge_chunks_fts MATCH ?
+            {none_sql}
             {where_sql}
             """,
-            [fts_query, *params],
+            [fts_query, *none_params, *params],
         ).fetchone()
         return 0 if row is None else int(row[0])
 
@@ -425,10 +435,12 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         self,
         *,
         fts_query: str,
+        none_fts_query: str | None,
         where_sql: str,
         params: list[object],
         limit: int,
     ) -> list[sqlite3.Row]:
+        none_sql, none_params = _sqlite_knowledge_none_filter_sql(none_fts_query)
         unique_rows: list[sqlite3.Row] = []
         seen_entry_ids: set[str] = set()
         offset = 0
@@ -445,6 +457,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                 JOIN cayu_knowledge_entries AS e
                     ON e.id = c.entry_id
                 WHERE cayu_knowledge_chunks_fts MATCH ?
+                {none_sql}
                 {where_sql}
                 ORDER BY fts_score ASC,
                          COALESCE(e.importance, 0.0) DESC,
@@ -453,7 +466,7 @@ class SQLiteKnowledgeStore(KnowledgeStore):
                          c.chunk_index ASC
                 LIMIT ? OFFSET ?
                 """,
-                [fts_query, *params, _SEARCH_PAGE_SIZE, offset],
+                [fts_query, *none_params, *params, _SEARCH_PAGE_SIZE, offset],
             ).fetchall()
             if not rows:
                 break
@@ -1029,14 +1042,6 @@ def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
     all_groups = _dedupe_search_token_groups(
         [group for term in query.all_terms for group in _structured_search_token_groups(term)]
     )
-    none_terms = _dedupe_search_tokens(
-        [
-            token
-            for term in query.none_terms
-            for group in _structured_search_token_groups(term)
-            for token in group
-        ]
-    )
     phrases = [phrase.casefold() for phrase in query.phrases]
     positive_parts: list[str] = []
     if any_terms:
@@ -1053,8 +1058,6 @@ def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
     if not positive_parts:
         raise ValueError("Knowledge query requires positive search terms.")
     fts_query = " AND ".join(positive_parts)
-    for term in none_terms:
-        fts_query += f" NOT {_sqlite_fts_quote(term)}"
     preview_terms = _dedupe_search_tokens(
         [
             *any_terms,
@@ -1063,6 +1066,37 @@ def _sqlite_knowledge_fts_query(query: KnowledgeQuery) -> tuple[str, list[str]]:
         ]
     )
     return fts_query, preview_terms
+
+
+def _sqlite_knowledge_none_fts_query(query: KnowledgeQuery) -> str | None:
+    none_terms = _dedupe_search_tokens(
+        [
+            token
+            for term in query.none_terms
+            for group in _structured_search_token_groups(term)
+            for token in group
+        ]
+    )
+    if not none_terms:
+        return None
+    return " OR ".join(_sqlite_fts_quote(term) for term in none_terms)
+
+
+def _sqlite_knowledge_none_filter_sql(
+    none_fts_query: str | None,
+) -> tuple[str, list[object]]:
+    if none_fts_query is None:
+        return "", []
+    return (
+        """
+        AND e.id NOT IN (
+            SELECT DISTINCT cayu_knowledge_chunks_fts.entry_id
+            FROM cayu_knowledge_chunks_fts
+            WHERE cayu_knowledge_chunks_fts MATCH ?
+        )
+        """,
+        [none_fts_query],
+    )
 
 
 def _sqlite_list_facet_sql(

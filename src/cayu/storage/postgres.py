@@ -5307,7 +5307,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         await self._lazy_backfill_search_scope(query)
         semantic_query_text = _semantic_query_text(query)
         query_vector = await self._embed_query(query, semantic_query_text)
-        rows, candidate_limit_reached = await self._semantic_search_rows(query, query_vector)
+        (
+            rows,
+            candidate_limit_reached,
+            semantic_total_hits_known_floor,
+        ) = await self._semantic_search_rows(query, query_vector)
         async with self._pool.connection() as conn, conn.cursor() as cur:
             scored, byte_truncated = await self._scored_semantic_rows(
                 cur,
@@ -5315,6 +5319,11 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 query,
             )
         total_hits_known_floor = len(scored)
+        if query.mode is KnowledgeSearchMode.SEMANTIC:
+            total_hits_known_floor = max(
+                total_hits_known_floor,
+                semantic_total_hits_known_floor,
+            )
         if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}:
             keyword_query = query.model_copy(update={"mode": KnowledgeSearchMode.KEYWORD})
             try:
@@ -5342,18 +5351,22 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             query,
             score_kind=score_kind,
         )
+        total_hits_known = max(
+            result.total_hits_known if result.total_hits_known is not None else len(result.hits),
+            total_hits_known_floor,
+        )
         return KnowledgeSearchResult(
             query=result.query,
             hits=result.hits,
-            truncated=byte_truncated or result.truncated or candidate_limit_reached,
+            truncated=(
+                byte_truncated
+                or result.truncated
+                or candidate_limit_reached
+                or len(result.hits) < total_hits_known
+            ),
             limit=result.limit,
             max_bytes=result.max_bytes,
-            total_hits_known=max(
-                result.total_hits_known
-                if result.total_hits_known is not None
-                else len(result.hits),
-                total_hits_known_floor,
-            ),
+            total_hits_known=total_hits_known,
         )
 
     async def _reconcile_embedding_schema(self) -> None:
@@ -5471,7 +5484,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         self,
         query: KnowledgeQuery,
         query_vector: list[float],
-    ) -> tuple[list[tuple[str, str, float]], bool]:
+    ) -> tuple[list[tuple[str, str, float]], bool, int]:
         where_sql, params = _postgres_knowledge_filter_sql(query)
         none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
         vector_literal = _postgres_vector_literal(query_vector)
@@ -5490,7 +5503,23 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             if query.mode in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.HYBRID}
             else [semantic_min_score]
         )
-        async with self._pool.connection() as conn, conn.cursor() as cur:
+        async with (
+            self._pool.connection() as conn,
+            conn.transaction(),
+            conn.cursor() as cur,
+        ):
+            if query.none_terms:
+                # pgvector applies WHERE filters after its bounded approximate
+                # HNSW scan. A dense set of nearer excluded entries could
+                # therefore consume the complete ANN candidate budget before a
+                # valid lower-ranked entry is visited. Use an exact vector scan
+                # for entry-wide negative filters so the indexed lexical
+                # anti-filter is authoritative before Cayu's candidate limit.
+                # These settings are transaction-local so ordinary semantic
+                # searches retain HNSW and pooled connections cannot leak the
+                # exact-search policy to later requests.
+                await cur.execute("SET LOCAL enable_indexscan = off")
+                await cur.execute("SET LOCAL enable_seqscan = on")
             await cur.execute(
                 cast(
                     "LiteralString",
@@ -5535,7 +5564,8 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                         entry_id,
                         chunk_id,
                         normalized_score,
-                        (SELECT COUNT(*) FROM nearest_chunks) AS candidate_count
+                        (SELECT COUNT(*) FROM nearest_chunks) AS candidate_chunk_count,
+                        (SELECT COUNT(*) FROM filtered_entries) AS candidate_entry_count
                     FROM filtered_entries
                     ORDER BY normalized_score DESC,
                              importance DESC,
@@ -5559,9 +5589,14 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 ],
             )
             rows = await cur.fetchall()
-        candidate_count = 0 if not rows else int(rows[0][3])
-        candidate_limit_reached = candidate_count >= candidate_limit
-        return [(str(row[0]), str(row[1]), float(row[2])) for row in rows], candidate_limit_reached
+        candidate_chunk_count = 0 if not rows else int(rows[0][3])
+        candidate_entry_count = 0 if not rows else int(rows[0][4])
+        candidate_limit_reached = candidate_chunk_count >= candidate_limit
+        return (
+            [(str(row[0]), str(row[1]), float(row[2])) for row in rows],
+            candidate_limit_reached,
+            candidate_entry_count,
+        )
 
     async def _backfill_candidate_chunks(
         self,
@@ -5569,8 +5604,12 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         limit: int,
         *,
         refresh_existing: bool,
+        search_query: KnowledgeQuery | None = None,
     ) -> list[KnowledgeChunk]:
         where_sql, params = _postgres_knowledge_list_filter_sql(query)
+        none_sql, none_params = (
+            ("", []) if search_query is None else _postgres_knowledge_none_filter_sql(search_query)
+        )
         current_embedding_join_sql = ""
         missing_embedding_filter_sql = ""
         current_embedding_params: list[object] = []
@@ -5601,6 +5640,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     {current_embedding_join_sql}
                     WHERE TRUE
                     {where_sql}
+                    {none_sql}
                     {missing_embedding_filter_sql}
                     ORDER BY COALESCE(e.importance, 0.0) DESC,
                              e.updated_at DESC,
@@ -5609,7 +5649,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     LIMIT %s
                     """,
                 ),
-                [*current_embedding_params, *params, limit],
+                [*current_embedding_params, *params, *none_params, limit],
             )
             return [_knowledge_chunk_from_row(row) for row in await cur.fetchall()]
 
@@ -5767,6 +5807,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 list_query,
                 _PGVECTOR_LAZY_BACKFILL_LIMIT,
                 refresh_existing=False,
+                search_query=query,
             )
             if chunks:
                 await self._embed_chunks(chunks)
@@ -15081,14 +15122,6 @@ def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str, list[str]]
             for group in _structured_knowledge_search_token_groups(term)
         ]
     )
-    none_terms = _dedupe_knowledge_search_tokens(
-        [
-            token
-            for term in query.none_terms
-            for group in _structured_knowledge_search_token_groups(term)
-            for token in group
-        ]
-    )
     phrase_queries = [_postgres_phrase_query(phrase) for phrase in query.phrases]
     phrase_terms = _dedupe_knowledge_search_tokens(
         [term for phrase in query.phrases for term in _tokenize_knowledge_search_text(phrase)]
@@ -15103,8 +15136,6 @@ def _postgres_knowledge_ts_query(query: KnowledgeQuery) -> tuple[str, list[str]]
     if not positive_parts:
         raise ValueError("Knowledge query requires positive search terms.")
     ts_query = " & ".join(positive_parts)
-    for term in none_terms:
-        ts_query += f" & !{term}"
     preview_terms = _dedupe_knowledge_search_tokens(
         [*any_terms, *(term for group in all_groups for term in group), *phrase_terms]
     )
@@ -15130,14 +15161,6 @@ def _postgres_knowledge_search_filter_sql(query: KnowledgeQuery) -> tuple[str, l
             for group in _structured_knowledge_search_token_groups(term)
         ]
     )
-    none_terms = _dedupe_knowledge_search_tokens(
-        [
-            token
-            for term in query.none_terms
-            for group in _structured_knowledge_search_token_groups(term)
-            for token in group
-        ]
-    )
     phrase_queries = [_postgres_phrase_query(phrase) for phrase in query.phrases]
     clauses: list[str] = []
     params: list[object] = []
@@ -15156,13 +15179,10 @@ def _postgres_knowledge_search_filter_sql(query: KnowledgeQuery) -> tuple[str, l
             phrase_clauses.append(clause)
             params.extend(clause_params)
         clauses.append("(" + " OR ".join(phrase_clauses) + ")")
-    for term in none_terms:
-        clause, clause_params = _postgres_document_match_clause(term)
-        clauses.append(f"NOT {clause}")
-        params.extend(clause_params)
     if not any_terms and not all_groups and not phrase_queries:
         raise ValueError("Knowledge query requires positive search terms.")
-    return cast("LiteralString", " AND ".join(clauses)), params
+    none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
+    return cast("LiteralString", " AND ".join(clauses) + none_sql), [*params, *none_params]
 
 
 def _postgres_knowledge_none_filter_sql(query: KnowledgeQuery) -> tuple[str, list[object]]:
@@ -15174,15 +15194,28 @@ def _postgres_knowledge_none_filter_sql(query: KnowledgeQuery) -> tuple[str, lis
             for token in group
         ]
     )
-    clauses: list[str] = []
-    params: list[object] = []
-    for term in none_terms:
-        clause, clause_params = _postgres_document_match_clause(term)
-        clauses.append(f"NOT {clause}")
-        params.extend(clause_params)
-    if not clauses:
-        return "", params
-    return cast("LiteralString", " AND " + " AND ".join(clauses)), params
+    if not none_terms:
+        return "", []
+    none_ts_query = "(" + " | ".join(none_terms) + ")"
+    return (
+        cast(
+            "LiteralString",
+            """
+            AND NOT (
+                to_tsvector('simple', COALESCE(e.title, '')) @@ to_tsquery('simple', %s)
+                OR to_tsvector('simple', e.text) @@ to_tsquery('simple', %s)
+                OR EXISTS (
+                    SELECT 1
+                    FROM cayu_knowledge_chunks AS excluded_chunk
+                    WHERE excluded_chunk.entry_id = e.id
+                      AND to_tsvector('simple', excluded_chunk.text)
+                          @@ to_tsquery('simple', %s)
+                )
+            )
+            """,
+        ),
+        [none_ts_query, none_ts_query, none_ts_query],
+    )
 
 
 def _postgres_document_match_clause(ts_query: str) -> tuple[LiteralString, list[object]]:

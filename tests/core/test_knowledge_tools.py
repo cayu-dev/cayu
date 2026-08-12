@@ -247,6 +247,39 @@ def test_search_knowledge_accepts_structured_boolean_terms() -> None:
     assert [hit["entry_id"] for hit in result.structured["hits"]] == ["github"]
 
 
+def test_search_knowledge_none_terms_exclude_sibling_chunks() -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        await store.put_entry_with_chunks(
+            KnowledgeEntry(id="excluded", text="Integration summary."),
+            [
+                KnowledgeChunk(
+                    id="excluded:0",
+                    entry_id="excluded",
+                    chunk_index=0,
+                    text="GitHub push credential instructions.",
+                ),
+                KnowledgeChunk(
+                    id="excluded:1",
+                    entry_id="excluded",
+                    chunk_index=1,
+                    text="Deprecated proxy guidance.",
+                ),
+            ],
+        )
+        await store.put_entry(KnowledgeEntry(id="safe", text="GitHub credential instructions."))
+        return await SearchKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"query": "github", "none": ["deprecated"]},
+        )
+
+    result = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured is not None
+    assert [hit["entry_id"] for hit in result.structured["hits"]] == ["safe"]
+
+
 def test_search_knowledge_schema_keeps_portable_validation_hints() -> None:
     schema = SearchKnowledgeTool.spec.input_schema
 

@@ -5335,11 +5335,14 @@ updates vectors on entry/chunk writes, reuses persisted vectors across process
 restarts, and leaves plain `PostgresKnowledgeStore` usable without pgvector.
 Semantic search uses chunks that already have vectors, with pgvector HNSW
 indexing when `embedding_dimensions <= 2000`; larger dimensions use exact
-pgvector search. Bulk backfill for existing knowledge is explicit via
-`backfill_embeddings(..., limit=N)`, which embeds a bounded batch of matching
-chunks. By default backfill only embeds missing or stale vectors; pass
-`refresh_existing=True` to re-embed chunks whose current vector already matches
-the configured model and dimensions.
+pgvector search. Semantic queries with `none_terms` also use an exact vector
+scan so excluded entries cannot consume HNSW's bounded internal candidate list;
+the entry-wide negative filter remains inside indexed Postgres SQL before
+Cayu's semantic candidate limit. Bulk backfill for existing knowledge is
+explicit via `backfill_embeddings(..., limit=N)`, which embeds a bounded batch
+of matching chunks. By default backfill only embeds missing or stale vectors;
+pass `refresh_existing=True` to re-embed chunks whose current vector already
+matches the configured model and dimensions.
 
 Postgres embedding operational contract:
 
@@ -5379,6 +5382,10 @@ Postgres embedding operational contract:
   keyword fields (`any_terms`, `all_terms`, `none_terms`, `phrases`), namespace,
   labels, kinds, status/visibility filters, aspects, impact targets, source
   filters, mode, result limit, and preview byte cap.
+  `none_terms` exclude an entire entry when any forbidden term appears in the
+  entry title, entry text, or any of its chunks. Stores apply that exclusion
+  before ranking candidates, counting results, or enforcing result and semantic
+  candidate limits in every supported search mode.
 - `KnowledgeSearchResult`: result envelope containing copied hits, truncation
   metadata, configured limits, and `total_hits_known` when the backend can count
   candidates.

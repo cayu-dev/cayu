@@ -4,6 +4,10 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.core.knowledge_none_terms_conformance import (
+    assert_entry_wide_none_terms_conformance,
+    assert_entry_wide_none_terms_precede_chunk_pagination,
+)
 
 from cayu.embeddings import (
     TextEmbedding,
@@ -102,13 +106,18 @@ def _new_store(dsn: str):
     return PostgresKnowledgeStore(dsn, min_size=1, max_size=4, schema_mode=SchemaMode.CREATE)
 
 
-def _new_embedding_store(dsn: str, provider: KeywordEmbeddingProvider):
+def _new_embedding_store(
+    dsn: str,
+    provider: KeywordEmbeddingProvider,
+    *,
+    max_size: int = 4,
+):
     from cayu import PostgresEmbeddingKnowledgeStore
 
     return PostgresEmbeddingKnowledgeStore(
         dsn,
         min_size=1,
-        max_size=4,
+        max_size=max_size,
         schema_mode=SchemaMode.CREATE,
         embedding_provider=provider,
         embedding_model="test-embedding",
@@ -768,6 +777,225 @@ def test_postgres_knowledge_store_structured_keyword_search(postgres_dsn: str) -
     assert [hit.entry.id for hit in result.hits] == ["github_secret"]
 
 
+def test_postgres_knowledge_store_applies_none_terms_to_the_complete_entry(
+    postgres_dsn: str,
+) -> None:
+    async def ops(store) -> None:
+        await assert_entry_wide_none_terms_conformance(
+            store,
+            mode=KnowledgeSearchMode.KEYWORD,
+        )
+
+    _run(postgres_dsn, ops)
+
+
+def test_postgres_knowledge_store_filters_none_terms_before_chunk_pagination(
+    postgres_dsn: str,
+) -> None:
+    async def ops(store) -> None:
+        await assert_entry_wide_none_terms_precede_chunk_pagination(store)
+
+    _run(postgres_dsn, ops)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [KnowledgeSearchMode.SEMANTIC, KnowledgeSearchMode.HYBRID],
+)
+def test_postgres_embedding_store_applies_none_terms_to_the_complete_entry(
+    postgres_dsn: str,
+    mode: KnowledgeSearchMode,
+) -> None:
+    async def ops() -> None:
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(postgres_dsn, KeywordEmbeddingProvider())
+        try:
+            await assert_entry_wide_none_terms_conformance(
+                store,
+                mode=mode,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(ops())
+
+
+def test_postgres_embedding_none_terms_do_not_consume_semantic_candidate_limit(
+    postgres_dsn: str,
+) -> None:
+    async def ops() -> tuple[list[str], int | None, bool]:
+        from cayu.storage.postgres import (
+            _EMBEDDING_SPACE_VERSION,
+            _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER,
+            _postgres_knowledge_filter_sql,
+            _postgres_knowledge_none_filter_sql,
+            _postgres_vector_literal,
+        )
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = _new_embedding_store(
+            postgres_dsn,
+            KeywordEmbeddingProvider(),
+            # Keep the planner controls and the store search on one session.
+            max_size=1,
+        )
+        try:
+            # Exceed pgvector's default HNSW candidate list so the exact safe
+            # vector cannot be reached after nearer candidates are excluded.
+            for index in range(64):
+                await store.put_entry(
+                    KnowledgeEntry(
+                        id=f"excluded_{index}",
+                        title="Deprecated integration",
+                        text=f"GitHub credential instructions {index}.",
+                    )
+                )
+            await store.put_entry(
+                KnowledgeEntry(
+                    id="safe",
+                    text="Invoice payment instructions for the valid lower-ranked candidate.",
+                )
+            )
+            query = KnowledgeQuery(
+                text="github",
+                none_terms=["deprecated"],
+                mode=KnowledgeSearchMode.SEMANTIC,
+                min_score=0.5,
+                limit=1,
+            )
+            where_sql, params = _postgres_knowledge_filter_sql(query)
+            none_sql, none_params = _postgres_knowledge_none_filter_sql(query)
+            vector_literal = _postgres_vector_literal(_test_embedding_vector("github"))
+            candidate_limit = max(
+                query.limit,
+                query.limit * _PGVECTOR_SEMANTIC_CANDIDATE_MULTIPLIER,
+            )
+            hnsw_query = f"""
+                SELECT e.id
+                FROM cayu_knowledge_embeddings AS emb
+                JOIN cayu_knowledge_chunks AS c ON c.id = emb.chunk_id
+                JOIN cayu_knowledge_entries AS e ON e.id = emb.entry_id
+                WHERE emb.model = %s
+                  AND emb.dimensions = %s
+                  AND emb.embedding_space_version = %s
+                  AND (emb.content_hash = c.content_hash OR c.content_hash IS NULL)
+                {where_sql}
+                {none_sql}
+                ORDER BY emb.embedding <=> %s::vector
+                LIMIT %s
+            """
+            hnsw_params = [
+                store.embedding_model,
+                store.embedding_dimensions,
+                _EMBEDDING_SPACE_VERSION,
+                *params,
+                *none_params,
+                vector_literal,
+                candidate_limit,
+            ]
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute("ANALYZE cayu_knowledge_embeddings")
+                # Make HNSW authoritative and shrink its internal candidate
+                # list below the number of nearer excluded entries.
+                await cur.execute("SET enable_seqscan = off")
+                await cur.execute("SET enable_sort = off")
+                await cur.execute("SET hnsw.ef_search = 1")
+                await cur.execute("EXPLAIN " + hnsw_query, hnsw_params)
+                plan = "\n".join(str(row[0]) for row in await cur.fetchall())
+                await cur.execute(hnsw_query, hnsw_params)
+                raw_hnsw_entry_ids = [str(row[0]) for row in await cur.fetchall()]
+                await cur.execute("SET enable_sort = on")
+            assert "idx_cayu_knowledge_embeddings_embedding_hnsw" in plan
+            assert raw_hnsw_entry_ids == []
+
+            result = await store.search(query)
+            async with store._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute("SHOW enable_seqscan")
+                assert (await cur.fetchone())[0] == "off"
+                await cur.execute("SHOW enable_indexscan")
+                assert (await cur.fetchone())[0] == "on"
+                await cur.execute("SHOW enable_sort")
+                assert (await cur.fetchone())[0] == "on"
+                await cur.execute("SHOW hnsw.ef_search")
+                assert (await cur.fetchone())[0] == "1"
+        finally:
+            await store.close()
+        return (
+            [hit.entry.id for hit in result.hits],
+            result.total_hits_known,
+            result.truncated,
+        )
+
+    assert asyncio.run(ops()) == (["safe"], 1, False)
+
+
+def test_postgres_embedding_lazy_backfill_filters_none_terms_before_limit(
+    postgres_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def ops() -> tuple[list[str], list[str]]:
+        await _drop_all(postgres_dsn)
+        base_store = _new_store(postgres_dsn)
+        try:
+            await base_store.put_entry_with_chunks(
+                KnowledgeEntry(
+                    id="excluded",
+                    text="Integration summary.",
+                    importance=1.0,
+                ),
+                [
+                    KnowledgeChunk(
+                        id="excluded:0",
+                        entry_id="excluded",
+                        chunk_index=0,
+                        text="GitHub excluded-marker instructions.",
+                    ),
+                    KnowledgeChunk(
+                        id="excluded:1",
+                        entry_id="excluded",
+                        chunk_index=1,
+                        text="Deprecated proxy guidance.",
+                    ),
+                ],
+            )
+            await base_store.put_entry(
+                KnowledgeEntry(
+                    id="safe",
+                    text="GitHub safe-marker instructions.",
+                    importance=0.0,
+                )
+            )
+        finally:
+            await base_store.close()
+
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        import cayu.storage.postgres as postgres_storage
+
+        monkeypatch.setattr(postgres_storage, "_PGVECTOR_LAZY_BACKFILL_LIMIT", 1)
+        provider = KeywordEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        try:
+            result = await store.search(
+                KnowledgeQuery(
+                    text="github",
+                    none_terms=["deprecated"],
+                    mode=KnowledgeSearchMode.SEMANTIC,
+                )
+            )
+        finally:
+            await store.close()
+        embedded_texts = [text for call in provider.calls for text in call]
+        return [hit.entry.id for hit in result.hits], embedded_texts
+
+    hit_ids, embedded_texts = asyncio.run(ops())
+
+    assert hit_ids == ["safe"]
+    assert any("safe-marker" in text for text in embedded_texts)
+    assert all("excluded-marker" not in text for text in embedded_texts)
+
+
 def test_postgres_knowledge_store_searches_entry_text_with_custom_chunks(
     postgres_dsn: str,
 ) -> None:
@@ -1395,7 +1623,7 @@ def test_postgres_embedding_store_excludes_and_reembeds_other_space_versions(
 
             # (a1) semantic read filter excludes the v1 row (call the internal directly → no backfill).
             query_vector = await store._embed_query(query, _semantic_query_text(query))
-            raw_rows, _ = await store._semantic_search_rows(query, query_vector)
+            raw_rows, _, _ = await store._semantic_search_rows(query, query_vector)
 
             # (a2) the missing-embedding check treats the v1 chunk as missing under v2.
             missing = await store._missing_embedding_chunks(await store.read_chunks("doc"))

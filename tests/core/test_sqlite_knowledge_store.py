@@ -6,6 +6,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
+from tests.core.knowledge_none_terms_conformance import (
+    assert_entry_wide_none_terms_conformance,
+    assert_entry_wide_none_terms_precede_chunk_pagination,
+)
 
 from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu.storage import (
@@ -439,6 +443,31 @@ def test_sqlite_knowledge_store_structured_keyword_search(tmp_path) -> None:
     result = asyncio.run(run())
 
     assert [hit.entry.id for hit in result.hits] == ["github_secret"]
+
+
+def test_sqlite_knowledge_store_applies_none_terms_to_the_complete_entry(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(tmp_path / "entry-wide-none-terms.sqlite")
+        try:
+            await assert_entry_wide_none_terms_conformance(
+                store,
+                mode=KnowledgeSearchMode.KEYWORD,
+            )
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_knowledge_store_filters_none_terms_before_chunk_pagination(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(tmp_path / "none-terms-pagination.sqlite")
+        try:
+            await assert_entry_wide_none_terms_precede_chunk_pagination(store)
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
 
 
 def test_sqlite_knowledge_store_searches_entry_text_with_custom_chunks(tmp_path) -> None:

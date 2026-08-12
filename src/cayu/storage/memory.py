@@ -981,13 +981,15 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         knowledge_query = copy_knowledge_query(query)
         if knowledge_query.mode not in {KnowledgeSearchMode.AUTO, KnowledgeSearchMode.KEYWORD}:
             raise ValueError("InMemoryKnowledgeStore supports only auto and keyword search modes.")
+        terms = _knowledge_query_terms(knowledge_query)
         scored: list[tuple[float, KnowledgeEntry, KnowledgeChunk | None, str, str]] = []
         for entry in self._entries.values():
             if not _entry_matches_query(entry, knowledge_query):
                 continue
-            score, chunk, reason, preview_text = _score_entry(
-                entry, self._chunks.get(entry.id, []), knowledge_query
-            )
+            chunks = self._chunks.get(entry.id, [])
+            if _entry_matches_none_terms(entry, chunks, terms):
+                continue
+            score, chunk, reason, preview_text = _score_entry(entry, chunks, knowledge_query)
             if score <= 0:
                 continue
             scored.append((score, entry, chunk, reason, preview_text))

@@ -6,6 +6,9 @@ from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
+from tests.core.knowledge_none_terms_conformance import (
+    assert_entry_wide_none_terms_conformance,
+)
 
 from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu.embeddings import (
@@ -1019,6 +1022,31 @@ def test_in_memory_knowledge_store_structured_keyword_search() -> None:
     result = asyncio.run(run())
 
     assert [hit.entry.id for hit in result.hits] == ["github_secret"]
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        KnowledgeSearchMode.KEYWORD,
+        KnowledgeSearchMode.SEMANTIC,
+        KnowledgeSearchMode.HYBRID,
+    ],
+)
+def test_in_memory_knowledge_stores_apply_none_terms_to_the_complete_entry(
+    mode: KnowledgeSearchMode,
+) -> None:
+    async def run() -> None:
+        store: KnowledgeStore
+        if mode is KnowledgeSearchMode.KEYWORD:
+            store = InMemoryKnowledgeStore()
+        else:
+            store = InMemoryEmbeddingKnowledgeStore(
+                embedding_provider=KeywordEmbeddingProvider(),
+                embedding_model="test-embedding",
+            )
+        await assert_entry_wide_none_terms_conformance(store, mode=mode)
+
+    asyncio.run(run())
 
 
 def test_in_memory_knowledge_store_searches_entry_text_with_custom_chunks() -> None:
