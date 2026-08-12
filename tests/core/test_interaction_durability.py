@@ -68,6 +68,49 @@ from cayu.runtime.interactions import (
 )
 
 
+@pytest.mark.parametrize(
+    ("field_name", "values"),
+    [
+        ("provider_names", ["openai", "openai"]),
+        ("provider_names", ["openai", "anthropic", "openai"]),
+        ("models", ["gpt-5", "gpt-5"]),
+        ("models", ["gpt-5", "claude-opus-4", "gpt-5"]),
+    ],
+    ids=[
+        "adjacent-providers",
+        "non-adjacent-providers",
+        "adjacent-models",
+        "non-adjacent-models",
+    ],
+)
+def test_interaction_summary_rejects_duplicate_provider_and_model_names(
+    field_name: str,
+    values: list[str],
+) -> None:
+    with pytest.raises(ValidationError, match=f"{field_name} must not contain duplicates"):
+        InteractionSummaryEvidence.model_validate(
+            {
+                "status": InteractionStatus.ACTIVE,
+                "start_event_id": "interaction-started",
+                "started_at": datetime(2026, 8, 11, tzinfo=UTC),
+                field_name: values,
+            }
+        )
+
+
+def test_interaction_summary_preserves_distinct_provider_and_model_name_order() -> None:
+    evidence = InteractionSummaryEvidence(
+        status=InteractionStatus.ACTIVE,
+        start_event_id="interaction-started",
+        started_at=datetime(2026, 8, 11, tzinfo=UTC),
+        provider_names=["anthropic", "openai"],
+        models=["claude-opus-4", "gpt-5"],
+    )
+
+    assert evidence.provider_names == ["anthropic", "openai"]
+    assert evidence.models == ["claude-opus-4", "gpt-5"]
+
+
 def test_interaction_summary_rejects_completion_before_start_after_timezone_normalization() -> None:
     started_at = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 

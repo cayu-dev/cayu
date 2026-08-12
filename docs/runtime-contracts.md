@@ -809,6 +809,10 @@ Every run/resume invocation emits `turn.completed` before the terminal session e
 
 ### Conversation interactions
 
+Interaction lifecycle summaries carry provider and model name lists as insertion-ordered sets:
+distinct values retain their first-observed order, and duplicate entries are invalid durable
+evidence.
+
 A session contains many durable interactions. One interaction starts with the user-input batch that is eligible to produce one assistant response and contains every model step, retry, tool round, transcript record, pause, continuation, and runtime event that contributes to that response. `interaction_id` is distinct from session, mutation, run-epoch, tool-round, operation, and provider response identity.
 
 Initial run messages and ordinary resume messages start new interactions. Tool approval and required user input pause the current interaction and later resolutions retain its identity. Queued input that is already eligible before the first provider step joins the not-yet-dispatched interaction. Once an interaction has produced model or tool work, a delivered `next_turn` or `on_idle` batch waits for that interaction's terminal assistant response and starts a new interaction, even when delivery and the next response happen inside the same public runtime invocation. Parallel tool calls keep their own `tool_call_id` and `tool_round_id` while sharing the interaction ID. Explicit idle operations such as application-requested compaction remain intentionally unassociated.

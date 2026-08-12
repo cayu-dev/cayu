@@ -129,10 +129,13 @@ class InteractionSummaryEvidence(BaseModel):
     @field_validator("provider_names", "models")
     @classmethod
     def validate_names(cls, value: list[str], info) -> list[str]:
-        return [
+        names = [
             require_clean_nonblank(item, f"{info.field_name}[{index}]")
             for index, item in enumerate(value)
         ]
+        if len(names) != len(set(names)):
+            raise ValueError(f"{info.field_name} must not contain duplicates.")
+        return names
 
     @field_validator("started_at", "completed_at")
     @classmethod
