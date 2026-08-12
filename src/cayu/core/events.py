@@ -29,6 +29,24 @@ def _empty_runtime_nested_authority() -> frozenset[tuple[tuple[str, ...], str]]:
     return frozenset()
 
 
+def _validate_custom_event_type(event_type: object) -> str:
+    if type(event_type) is not str or _CUSTOM_EVENT_TYPE_RE.fullmatch(event_type) is None:
+        raise ValueError(
+            "Custom event types must use non-empty dot-separated segments "
+            "in the 'custom.' namespace."
+        )
+    return event_type
+
+
+def validate_public_custom_event_type(event_type: object) -> str:
+    """Return one caller-owned custom event type outside Cayu's namespace."""
+
+    event_type = _validate_custom_event_type(event_type)
+    if event_type.startswith("custom.cayu."):
+        raise ValueError("The custom.cayu. namespace is reserved for cayu internals.")
+    return event_type
+
+
 class EventType(StrEnum):
     SERVER_MUTATION_ACCEPTED = "server.mutation.accepted"
 
@@ -263,12 +281,7 @@ class Event(BaseModel):
         except ValueError:
             pass
 
-        if not _CUSTOM_EVENT_TYPE_RE.fullmatch(value):
-            raise ValueError(
-                "Custom event types must use non-empty dot-separated segments "
-                "in the 'custom.' namespace."
-            )
-        return value
+        return _validate_custom_event_type(value)
 
 
 def copy_event(event: Event) -> Event:

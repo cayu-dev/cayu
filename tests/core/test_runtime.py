@@ -23412,7 +23412,7 @@ def test_cayu_app_runtime_hook_rejects_non_custom_emitted_events():
         EventType.HOOK_FAILED,
     ]
     assert events[-1].payload["error"] == (
-        "Hook-emitted custom events must use the custom. namespace."
+        "Custom event types must use non-empty dot-separated segments in the 'custom.' namespace."
     )
 
 

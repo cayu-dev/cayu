@@ -21,7 +21,6 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
-    require_nonblank,
     require_unicode_scalar_text,
 )
 from cayu.artifacts import (
@@ -41,6 +40,7 @@ from cayu.core.events import (
     EventType,
     event_durable_sequence,
     event_with_durable_sequence,
+    validate_public_custom_event_type,
 )
 from cayu.core.messages import (
     FilePart,
@@ -2394,9 +2394,7 @@ class CayuApp:
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> Event:
-        event_type = require_nonblank(event_type, "event_type")
-        if not event_type.startswith("custom."):
-            raise ValueError("Hook-emitted custom events must use the custom. namespace.")
+        event_type = validate_public_custom_event_type(event_type)
         event = Event(
             type=event_type,
             session_id=session_id,
@@ -3258,8 +3256,8 @@ def _validate_workflow_event_batch(
                 "emit_events only accepts workflow. or custom. namespace "
                 f"events; got {event_type!r}."
             )
-        if not allow_cayu_internal and event_type.startswith("custom.cayu."):
-            raise ValueError("The custom.cayu. namespace is reserved for cayu internals.")
+        if not allow_cayu_internal and event_type.startswith("custom."):
+            validate_public_custom_event_type(event_type)
 
 
 def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_records.RegisteredTool:

@@ -18,6 +18,7 @@ from cayu.core.events import (
     copy_event,
     event_id_is_runtime_generated,
     event_with_runtime_payload_authority,
+    validate_public_custom_event_type,
 )
 from cayu.core.tools import ToolResult
 from cayu.runtime.dispatch import DispatchHandle, DispatchRequest, copy_dispatch_handle
@@ -61,7 +62,7 @@ class RuntimeHookRuntime(Protocol):
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> Event:
-        """Emit a custom event from a hook."""
+        """Emit a caller-owned custom event outside ``custom.cayu.*``."""
 
 
 class _HookActionContext:
@@ -178,6 +179,7 @@ class _HookActionContext:
         payload: dict[str, Any] | None = None,
     ) -> Event:
         self._require_publication_actions_allowed()
+        event_type = validate_public_custom_event_type(event_type)
         emitted = await self._runtime.emit_hook_event(
             session_id=session_id or self._session.id,
             event_type=event_type,

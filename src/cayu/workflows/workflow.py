@@ -21,7 +21,12 @@ from cayu._validation import (
     copy_label_map,
     require_clean_nonblank,
 )
-from cayu.core.events import Event, EventType, event_with_runtime_payload_authority
+from cayu.core.events import (
+    Event,
+    EventType,
+    event_with_runtime_payload_authority,
+    validate_public_custom_event_type,
+)
 from cayu.core.messages import Message, MessageRole, TextPart, ToolCallPart
 from cayu.core.thinking import ThinkingConfig
 from cayu.core.workflows import Workflow, WorkflowSpec, copy_workflow_spec
@@ -366,10 +371,7 @@ class WorkflowContext:
         ``custom.cayu.`` is reserved so user events cannot forge or mask attempt
         fence markers.
         """
-        if not event_type.startswith("custom."):
-            raise ValueError("Workflow custom events must use the custom. namespace.")
-        if event_type.startswith("custom.cayu."):
-            raise ValueError("The custom.cayu. namespace is reserved for cayu internals.")
+        event_type = validate_public_custom_event_type(event_type)
         await self._check_fence(establish=False)
         event = self.event(event_type, payload=payload, agent_name=agent_name)
         await self._append_current_attempt_event(event)
