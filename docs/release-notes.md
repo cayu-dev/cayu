@@ -89,6 +89,71 @@ guard.
 
 ## Unreleased
 
+## v0.2.0
+
+`v0.2.0` makes Cayu's durable runtime directly operable as a production agent
+system: completed sessions can become portable eval corpora, delayed tasks stay
+store-gated until their durable availability time, the packaged dashboard owns
+the authenticated eval workflow, and the reserved `cayu cloud` command now
+supports deploying and operating Cayu Cloud applications.
+
+### Highlights
+
+- Runtime-native evals can capture bounded terminal session evidence, promote
+  it into reviewable portable corpora, execute those corpora through the same
+  trusted local core, publish durable results, and compare compatible runs.
+- The packaged `/cayu/` dashboard adds corpus management, durable eval-run
+  control, result inspection, comparisons, CI export, and delayed-task
+  visibility against the versioned server contract.
+- Tasks accept an optional UTC availability time. The store remains
+  authoritative for eligibility, future work cannot be claimed early, and
+  concurrent workers retain the existing lease and acknowledgement-loss
+  guarantees.
+- `cayu cloud` provides authenticated login, deployment, environment and secret
+  management, service inspection, rollback, and bounded operational evidence
+  without changing Cayu's root Python exports or durable runtime schemas.
+- Public boundary objects, provider traffic, tool results, vault values,
+  operational evidence, and eval records now take owned portable snapshots and
+  reject malformed, non-finite, or otherwise unsafe input before it can become
+  durable or externally dispatched.
+
+### Hardening since v0.2.0rc1
+
+- Interaction transitions, terminal recovery, gated-loop replay, and public
+  operation settlement now require positive, lifecycle-scoped durable evidence
+  and recover safely after acknowledgement loss or worker replacement.
+- Runner preflight validates commands and environment removals before secret
+  resolution, while the worked Modal runner applies the same ownership and
+  hostile-input boundary before SDK dispatch.
+- Tool output suppression, duplicate interaction model names, malformed webhook
+  signatures, and out-of-domain eval comparison scores now fail explicitly and
+  safely.
+- Provider, approval, budget, usage, vault, and eval evidence is detached from
+  caller-owned mutable inputs, and HTTP/retry metadata is validated before use.
+
+### Upgrade from v0.1.0
+
+Python 3.11 or newer is required. Stop all `v0.1.0` workers, take an
+application-consistent backup, and upgrade independently deployed Cayu servers,
+dashboards, generated clients, and workers together. Do not run mixed `v0.1.0`
+and `v0.2.0` processes against the same stores.
+
+The storage schema advances from revision 29 to revision 34. Run
+`cayu storage status` followed by `cayu storage migrate` against every
+explicitly configured SQLite or PostgreSQL session store, budget ledger, eval
+store, and task store, then confirm revision 34 with no pending migrations
+before starting `v0.2.0` workers. Revision 34 includes the durable eval catalog,
+run lifecycle, and delayed task availability contracts.
+
+### Verification
+
+Install `cayu==0.2.0` in a clean environment and verify `cayu version`,
+`cayu cloud --help`, and `cayu check --json`. Use fresh stores for a clean
+current-contract smoke test, then exercise a representative durable session,
+eval run, delayed task, and `/cayu/` dashboard journey before production
+rollout. This release does not claim mixed-version operation or compatibility
+with durable stores created by earlier prereleases.
+
 ## v0.2.0rc1
 
 This is the first release candidate for `v0.2.0`. It freezes the current
