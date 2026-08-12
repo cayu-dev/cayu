@@ -158,6 +158,7 @@ from cayu.runtime._run_limits import (
     SessionUsageTracker,
     add_budget_failure_note,
     budget_limit_reached_payload,
+    budget_provider_cleanup_failure,
 )
 from cayu.runtime._session_control import (
     INTERRUPT_REQUESTED_SESSION_STATUSES,
@@ -10809,6 +10810,20 @@ class SessionEngine:
                 diagnostic=failure_diagnostic,
                 redactor=self._secret_redactor,
             )
+            provider_cleanup_failure = budget_provider_cleanup_failure(exc)
+            if provider_cleanup_failure is not None:
+                provider_cleanup_diagnostic = exception_diagnostic(
+                    provider_cleanup_failure,
+                    empty_message="provider iterator cleanup failed",
+                    nonportable_message=(
+                        "Provider iterator cleanup failed with a non-portable diagnostic."
+                    ),
+                    redactor=self._secret_redactor,
+                )
+                payload["provider_cleanup_failure"] = {
+                    **provider_cleanup_diagnostic.payload_fields(),
+                    "phase": "provider_iterator_cleanup",
+                }
             transition_replay_failures = _interaction_transition_replay_failures(exc)
             if transition_replay_failures is not None:
                 payload["interaction_transition_failures"] = (

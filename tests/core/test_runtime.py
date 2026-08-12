@@ -393,6 +393,10 @@ class BlockingBudgetProvider(ModelProvider):
 
 
 class CancellationCleanupFailingBudgetProvider(BlockingBudgetProvider):
+    def __init__(self, cleanup_message: str = "provider cancellation cleanup failed") -> None:
+        super().__init__()
+        self.cleanup_message = cleanup_message
+
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         self.requests.append(request)
         self.started.set()
@@ -400,7 +404,7 @@ class CancellationCleanupFailingBudgetProvider(BlockingBudgetProvider):
             await self.release.wait()
         except asyncio.CancelledError:
             self.cancelled.set()
-            raise RuntimeError("provider cancellation cleanup failed") from None
+            raise RuntimeError(self.cleanup_message) from None
         yield ModelStreamEvent.completed({"finish_reason": "stop"})
 
 
@@ -12584,7 +12588,10 @@ def test_cayu_app_fails_closed_and_charges_reservation_when_heartbeat_is_lost() 
 
 def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -> None:
     async def run():
-        provider = CancellationCleanupFailingBudgetProvider()
+        cleanup_secret = "provider-cleanup-secret-canary"
+        provider = CancellationCleanupFailingBudgetProvider(
+            f"provider cancellation cleanup failed: {cleanup_secret}"
+        )
         ledger = RejectingHeartbeatBudgetLedger()
         limit = BudgetLimit(
             scope="app",
@@ -12598,6 +12605,7 @@ def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -
         app = CayuApp(
             budget_policy=BudgetPolicy(limits=(limit,)),
             budget_ledger=ledger,
+            secret_redactor=SecretRedactor(cleanup_secret),
         )
         app.register_provider(provider, default=True)
         app.register_agent(AgentSpec(name="assistant", model="fake-model"))
@@ -12627,6 +12635,14 @@ def test_cayu_app_keeps_lease_loss_authoritative_when_provider_cleanup_fails() -
     assert provider.cancelled.is_set()
     assert ledger.heartbeat_calls == 3
     assert events[-1].type == EventType.SESSION_FAILED
+    assert events[-1].payload["error_type"] == "BudgetReservationLeaseLost"
+    assert events[-1].payload["error"].startswith("Budget reservation lease was lost:")
+    assert events[-1].payload["provider_cleanup_failure"] == {
+        "error": f"provider cancellation cleanup failed: {REDACTED_SECRET}",
+        "error_type": "RuntimeError",
+        "phase": "provider_iterator_cleanup",
+    }
+    assert "provider-cleanup-secret-canary" not in repr(events[-1].payload)
     assert event_types.count(EventType.BUDGET_RECONCILED) == 1
     assert EventType.BUDGET_RESERVATION_RELEASED not in event_types
     reconciliation = next(event for event in events if event.type == EventType.BUDGET_RECONCILED)

@@ -3145,7 +3145,14 @@ the current rolling/calendar window. Cayu also validates the lease immediately
 before provider work, so a reservation that safely expires while the event stream
 is paused cannot later start an unprotected model call. If the runtime cannot
 renew a live lease, it fails the step closed and reconciles known actual usage,
-or the full reserved amount when the provider outcome is uncertain. Set
+or the full reserved amount when the provider outcome is uncertain. If
+provider-iterator cancellation or cleanup also fails while lease loss is
+authoritative, `session.failed` retains lease loss as its primary `error` and
+`error_type` and adds `provider_cleanup_failure`. That structured diagnostic
+contains only the fixed cleanup phase plus the secondary error type and a
+workload-secret-redacted, UTF-8-bounded message; it never serializes exception
+attributes, traceback state, provider requests, or response bodies. Conservative
+post-dispatch reconciliation remains unchanged. Set
 `reservation_ttl_seconds=None` only when reservations should never expire
 automatically. TTL cleanup only releases reservations whose dispatch fence was
 never committed. A dispatched reservation remains capacity-bearing until exact

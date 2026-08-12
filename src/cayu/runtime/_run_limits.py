@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Generic, Literal, TypeVar
 
 from cayu._exception_groups import add_exception_note_safely, exception_cause
+from cayu._exception_state import exception_state, set_exception_state
 from cayu._task_wait import (
     await_shielded_task_outcome,
     unexpected_child_cancellation_error,
@@ -558,6 +559,55 @@ class BudgetReservationLeaseLost(RuntimeError):
 
 class BudgetReservationLeaseLostBeforeModelDispatch(BudgetReservationLeaseLost):
     """Raised when lease loss is detected before any provider attempt starts."""
+
+
+_PROVIDER_CLEANUP_FAILURE_ATTRIBUTE = "_cayu_budget_provider_cleanup_failure"
+_PROVIDER_CLEANUP_FAILURE_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderCleanupFailureHandoff:
+    failure: BaseException
+    token: object
+
+
+def _record_provider_cleanup_failure(
+    authoritative_failure: BaseException,
+    provider_failure: BaseException,
+) -> None:
+    """Carry a secondary provider failure to the redacting terminal boundary."""
+
+    handoff = _ProviderCleanupFailureHandoff(
+        failure=provider_failure,
+        token=_PROVIDER_CLEANUP_FAILURE_TOKEN,
+    )
+    set_exception_state(
+        authoritative_failure,
+        _PROVIDER_CLEANUP_FAILURE_ATTRIBUTE,
+        handoff,
+    )
+    add_exception_note_safely(
+        authoritative_failure,
+        "Provider iterator cleanup also failed while budget lease loss was handled.",
+    )
+
+
+def budget_provider_cleanup_failure(
+    authoritative_failure: BaseException,
+) -> BaseException | None:
+    """Return only provider cleanup evidence attached by this runtime boundary."""
+
+    handoff = exception_state(
+        authoritative_failure,
+        _PROVIDER_CLEANUP_FAILURE_ATTRIBUTE,
+    )
+    if (
+        type(handoff) is not _ProviderCleanupFailureHandoff
+        or handoff.token is not _PROVIDER_CLEANUP_FAILURE_TOKEN
+        or not isinstance(handoff.failure, BaseException)
+    ):
+        return None
+    return handoff.failure
 
 
 class BudgetDispatchReservationFailed(RuntimeError):
@@ -2390,9 +2440,9 @@ class RunLimitController:
                         except Exception as exc:
                             provider_failure = exc
                     if provider_failure is not None:
-                        heartbeat_failure.add_note(
-                            "Provider iterator failed while budget lease loss was being "
-                            f"handled: {type(provider_failure).__name__}: {provider_failure}"
+                        _record_provider_cleanup_failure(
+                            heartbeat_failure,
+                            provider_failure,
                         )
                     if completed_item is not None:
                         next_item_task = None
