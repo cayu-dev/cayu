@@ -331,17 +331,29 @@ class _WorkspaceFileNotFoundError(RuntimeError):
     pass
 
 
+def _bounded_workspace_read_limit(workspace: Workspace, max_bytes: int) -> int:
+    value = workspace.bounded_read_limit(max_bytes)
+    if type(value) is not int or value <= 0 or value > max_bytes:
+        raise RuntimeError(
+            f"{type(workspace).__name__}.bounded_read_limit() must return a positive integer "
+            f"no greater than max_bytes={max_bytes}."
+        )
+    return value
+
+
 async def _read_workspace_bytes(
     workspace: Workspace,
     path: str,
     *,
     offset: int = 0,
-    max_bytes: int | None = None,
-) -> WorkspaceReadResult:
+    max_bytes: int,
+) -> tuple[WorkspaceReadResult, int]:
+    read_limit = _bounded_workspace_read_limit(workspace, max_bytes)
     try:
-        return await workspace.read_bytes(path, offset=offset, max_bytes=max_bytes)
+        result = await workspace.read_bytes(path, offset=offset, max_bytes=read_limit)
     except FileNotFoundError as exc:
         raise _WorkspaceFileNotFoundError from exc
+    return result, read_limit
 
 
 async def _read_workspace_file(
@@ -364,7 +376,7 @@ async def _read_workspace_file(
                 ValueError("Tool argument `offset` is only valid for workspace text files.")
             )
         try:
-            result = await _read_workspace_bytes(
+            result, _ = await _read_workspace_bytes(
                 workspace,
                 path,
                 offset=offset,
@@ -384,16 +396,29 @@ async def _read_workspace_file(
         )
 
     async def read_window(redactor):
-        redaction_overlap = redactor.pagination_overlap_utf8_bytes
-        fetch_offset = max(0, offset - redaction_overlap - 3)
+        if redactor.has_values:
+            redaction_overlap = redactor.pagination_overlap_utf8_bytes
+            fetch_offset = max(0, offset - redaction_overlap - 3)
+            trailing_window_bytes = redaction_overlap + 4
+        else:
+            redaction_overlap = 0
+            fetch_offset = offset
+            trailing_window_bytes = 0
         prefix_bytes = offset - fetch_offset
-        result = await _read_workspace_bytes(
+        requested_read_limit = prefix_bytes + max_bytes + trailing_window_bytes
+        result, effective_read_limit = await _read_workspace_bytes(
             workspace,
             path,
             offset=fetch_offset,
-            max_bytes=prefix_bytes + max_bytes + redaction_overlap + 4,
+            max_bytes=requested_read_limit,
         )
-        return result, redaction_overlap, fetch_offset
+        return (
+            result,
+            redaction_overlap,
+            fetch_offset,
+            effective_read_limit,
+            effective_read_limit < requested_read_limit,
+        )
 
     try:
         captured = await await_revision_stable_secret_output(ctx, read_window)
@@ -406,7 +431,16 @@ async def _read_workspace_file(
         )
     if captured is None:
         return unstable_secret_redaction_result()
-    (result, redaction_overlap, fetch_offset), capture_snapshot = captured
+    (
+        (
+            result,
+            redaction_overlap,
+            fetch_offset,
+            effective_read_limit,
+            workspace_limit_constrained,
+        ),
+        capture_snapshot,
+    ) = captured
     redactor = capture_snapshot.redactor
     if result.offset != fetch_offset:
         return _secret_redaction_window_unavailable_result(
@@ -414,16 +448,64 @@ async def _read_workspace_file(
             required_window_start=fetch_offset,
             observed_window_start=result.offset,
         )
-    page_or_error = _utf8_workspace_page(
-        result,
-        path=path,
-        content_type=content_type,
-        requested_offset=offset,
-        max_bytes=max_bytes,
+    if offset > result.total_bytes:
+        return _invalid_workspace_read_offset_result(
+            offset=offset,
+            total_bytes=result.total_bytes,
+        )
+    requested_page_start = offset - result.offset
+    observed_requested_page = result.content[requested_page_start:]
+    if observed_requested_page and observed_requested_page[0] & 0xC0 == 0x80:
+        return invalid_tool_arguments_result(
+            ValueError(
+                "Tool argument `offset` splits a UTF-8 character; use the previous "
+                "`next_offset` value."
+            )
+        )
+    raw_read_limit_exhausted = (
+        result.truncated
+        and result.source_bytes_read == effective_read_limit
+        and len(result.content) == effective_read_limit
+        and not result.redaction_truncated
     )
-    if isinstance(page_or_error, ToolResult):
-        return page_or_error
-    page, next_offset = page_or_error
+    workspace_limit_exhausted = workspace_limit_constrained and raw_read_limit_exhausted
+    exact_eof = offset == result.total_bytes
+    observed_window_end = result.offset + len(result.content)
+    workspace_page_limit_bytes = max(0, observed_window_end - offset)
+    if redactor.has_values and observed_window_end < result.total_bytes:
+        safe_page_end = max(offset, observed_window_end - redaction_overlap)
+        workspace_page_limit_bytes = min(
+            workspace_page_limit_bytes,
+            safe_page_end - offset,
+        )
+        if workspace_page_limit_bytes == 0 and offset < result.total_bytes:
+            return _secret_redaction_window_unavailable_result(
+                offset=offset,
+                required_window_end=min(
+                    result.total_bytes,
+                    offset + redaction_overlap + 1,
+                ),
+                observed_window_end=observed_window_end,
+            )
+    effective_page_limit_bytes = min(max_bytes, workspace_page_limit_bytes)
+    if exact_eof:
+        page, next_offset = b"", None
+    else:
+        page_or_error = _utf8_workspace_page(
+            result,
+            path=path,
+            content_type=content_type,
+            requested_offset=offset,
+            max_bytes=effective_page_limit_bytes,
+            caller_max_bytes=max_bytes,
+            effective_read_limit_bytes=effective_read_limit,
+            workspace_page_limit_bytes=workspace_page_limit_bytes,
+            raw_read_limit_exhausted=raw_read_limit_exhausted,
+            workspace_limit_exhausted=workspace_limit_exhausted,
+        )
+        if isinstance(page_or_error, ToolResult):
+            return page_or_error
+        page, next_offset = page_or_error
     if _is_binary_workspace_file(content_type=content_type, content=page):
         if offset != 0:
             return invalid_tool_arguments_result(
@@ -446,14 +528,15 @@ async def _read_workspace_file(
         result.total_bytes,
         page_end + redaction_overlap,
     )
-    observed_window_end = result.offset + len(result.content)
-    if observed_window_end < required_window_end:
+    if not exact_eof and observed_window_end < required_window_end:
         return _secret_redaction_window_unavailable_result(
             offset=offset,
             required_window_end=required_window_end,
             observed_window_end=observed_window_end,
         )
-    if redactor.has_values:
+    if exact_eof:
+        text, redaction_truncated = "", False
+    elif redactor.has_values:
         text, redaction_truncated = redactor.redact_utf8_page(
             result.content,
             window_offset=result.offset,
@@ -545,6 +628,11 @@ def _utf8_workspace_page(
     content_type: str,
     requested_offset: int,
     max_bytes: int,
+    caller_max_bytes: int,
+    effective_read_limit_bytes: int,
+    workspace_page_limit_bytes: int,
+    raw_read_limit_exhausted: bool,
+    workspace_limit_exhausted: bool,
 ) -> tuple[bytes, int | None] | ToolResult:
     if requested_offset > result.total_bytes:
         return _invalid_workspace_read_offset_result(
@@ -553,14 +641,11 @@ def _utf8_workspace_page(
         )
     start = requested_offset - result.offset
     available = result.content[start:]
-    if available and available[0] & 0xC0 == 0x80:
-        return invalid_tool_arguments_result(
-            ValueError(
-                "Tool argument `offset` splits a UTF-8 character; use the previous "
-                "`next_offset` value."
-            )
-        )
     page = available[:max_bytes]
+    caller_page_limit_exhausted = max_bytes == caller_max_bytes and (
+        len(available) > caller_max_bytes or raw_read_limit_exhausted
+    )
+    next_scalar_width = _utf8_scalar_width(available[0]) if available else None
     while page:
         try:
             page.decode("utf-8")
@@ -577,20 +662,78 @@ def _utf8_workspace_page(
                 )
             page = page[: exc.start]
     if not page and requested_offset < result.total_bytes:
+        if (
+            workspace_limit_exhausted
+            and next_scalar_width is not None
+            and workspace_page_limit_bytes < next_scalar_width
+        ):
+            return _workspace_utf8_page_limit_result(
+                requested_offset=requested_offset,
+                effective_read_limit_bytes=effective_read_limit_bytes,
+                effective_page_limit_bytes=workspace_page_limit_bytes,
+            )
+        if caller_max_bytes < 4 and caller_page_limit_exhausted:
+            return ToolResult(
+                content=(
+                    "Text page is too small to contain the next complete UTF-8 character; "
+                    "retry with max_bytes of at least 4."
+                ),
+                structured={
+                    "error": "text_page_too_small",
+                    "offset": requested_offset,
+                    "minimum_max_bytes": 4,
+                },
+                is_error=True,
+            )
+        if workspace_limit_exhausted:
+            return _workspace_utf8_page_limit_result(
+                requested_offset=requested_offset,
+                effective_read_limit_bytes=effective_read_limit_bytes,
+                effective_page_limit_bytes=workspace_page_limit_bytes,
+            )
         return ToolResult(
-            content=(
-                "Text page is too small to contain the next complete UTF-8 character; "
-                "retry with max_bytes of at least 4."
-            ),
+            content="The workspace returned an incomplete UTF-8 character.",
             structured={
                 "error": "text_page_too_small",
                 "offset": requested_offset,
-                "minimum_max_bytes": 4,
             },
             is_error=True,
         )
     end = requested_offset + len(page)
     return page, end if end < result.total_bytes else None
+
+
+def _utf8_scalar_width(first_byte: int) -> int | None:
+    if first_byte <= 0x7F:
+        return 1
+    if 0xC2 <= first_byte <= 0xDF:
+        return 2
+    if 0xE0 <= first_byte <= 0xEF:
+        return 3
+    if 0xF0 <= first_byte <= 0xF4:
+        return 4
+    return None
+
+
+def _workspace_utf8_page_limit_result(
+    *,
+    requested_offset: int,
+    effective_read_limit_bytes: int,
+    effective_page_limit_bytes: int,
+) -> ToolResult:
+    return ToolResult(
+        content=(
+            "The effective workspace read window is too small to contain the next "
+            "safely framed UTF-8 character."
+        ),
+        structured={
+            "error": "text_page_too_small",
+            "offset": requested_offset,
+            "effective_read_limit_bytes": effective_read_limit_bytes,
+            "effective_page_limit_bytes": effective_page_limit_bytes,
+        },
+        is_error=True,
+    )
 
 
 def _invalid_workspace_read_offset_result(*, offset: int, total_bytes: int) -> ToolResult:
@@ -631,7 +774,7 @@ async def _read_workspace_file_attachment(
 
     source_cap = _workspace_attachment_source_cap(content_type)
     try:
-        result = await _read_full_workspace_attachment(
+        result, effective_source_limit = await _read_full_workspace_attachment(
             ctx,
             path=path,
             content_type=content_type,
@@ -658,7 +801,11 @@ async def _read_workspace_file_attachment(
             total_bytes=result.total_bytes,
             truncated=True,
             inspectable=True,
-            reason=(f"Workspace file is too large to inspect natively (max {source_cap} bytes)."),
+            reason=(
+                "Workspace read was incomplete under the effective native-inspection "
+                f"limit (max {effective_source_limit} bytes)."
+            ),
+            effective_read_limit_bytes=effective_source_limit,
         )
 
     snapshot = await artifact_store.put_bytes(
@@ -701,11 +848,15 @@ async def _read_full_workspace_attachment(
     content_type: str,
     initial_result: WorkspaceReadResult,
     max_source_bytes: int,
-) -> WorkspaceReadResult:
+) -> tuple[WorkspaceReadResult, int]:
     workspace = _require_workspace(ctx)
     if workspace is None:
         raise RuntimeError("Workspace disappeared while reading workspace file attachment.")
-    result = await _read_workspace_bytes(workspace, path, max_bytes=max_source_bytes)
+    result, effective_read_limit = await _read_workspace_bytes(
+        workspace,
+        path,
+        max_bytes=max_source_bytes,
+    )
     if (
         not initial_result.truncated
         and not result.truncated
@@ -724,7 +875,7 @@ async def _read_full_workspace_attachment(
         raise WorkspaceFileChangedError(
             "Workspace file content changed while it was being captured as an artifact snapshot."
         )
-    return result
+    return result, effective_read_limit
 
 
 class WorkspaceFileChangedError(RuntimeError):
@@ -786,9 +937,23 @@ def _binary_workspace_file_result(
     truncated: bool,
     inspectable: bool,
     reason: str | None = None,
+    effective_read_limit_bytes: int | None = None,
 ) -> ToolResult:
     if reason is None:
         reason = "Use an artifact or custom parser/tool to inspect this file."
+    structured = {
+        "source": "workspace",
+        "path": path,
+        "bytes": bytes_read,
+        "total_bytes": total_bytes,
+        "content_type": content_type,
+        "encoding": None,
+        "binary": True,
+        "inspectable": inspectable,
+        "truncated": truncated,
+    }
+    if effective_read_limit_bytes is not None:
+        structured["effective_read_limit_bytes"] = effective_read_limit_bytes
     return ToolResult(
         content=(
             f"Workspace file '{path}' appears to be binary "
@@ -796,17 +961,7 @@ def _binary_workspace_file_result(
             "read_file does not decode unsupported binary workspace files as text. "
             f"{reason}"
         ),
-        structured={
-            "source": "workspace",
-            "path": path,
-            "bytes": bytes_read,
-            "total_bytes": total_bytes,
-            "content_type": content_type,
-            "encoding": None,
-            "binary": True,
-            "inspectable": inspectable,
-            "truncated": truncated,
-        },
+        structured=structured,
         is_error=True,
     )
 

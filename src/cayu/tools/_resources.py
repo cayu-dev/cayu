@@ -45,6 +45,16 @@ _WorkspaceCapture = WorkspaceReadResult | _ReadFailure | _ReadCancellation
 _ArtifactCapture = ArtifactReadResult | _ReadFailure | _ReadCancellation
 
 
+def _bounded_workspace_read_limit(workspace: Workspace, max_bytes: int) -> int:
+    value = workspace.bounded_read_limit(max_bytes)
+    if type(value) is not int or value <= 0 or value > max_bytes:
+        raise RuntimeError(
+            f"{type(workspace).__name__}.bounded_read_limit() must return a positive integer "
+            f"no greater than max_bytes={max_bytes}."
+        )
+    return value
+
+
 class InvocationWorkspaceHandle(Workspace):
     """Workspace facade that redacts byte reads before their public bound."""
 
@@ -118,6 +128,8 @@ class InvocationWorkspaceHandle(Workspace):
         fetch_offset = max(0, offset - overlap)
         prefix_bytes = offset - fetch_offset
         fetch_max = None if max_bytes is None else prefix_bytes + max_bytes + overlap
+        if fetch_max is not None:
+            fetch_max = _bounded_workspace_read_limit(self.__workspace, fetch_max)
         captured = await _read_workspace_delegate(
             self.__workspace,
             path=path,

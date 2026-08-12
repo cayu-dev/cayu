@@ -442,6 +442,49 @@ class BlockingReadArtifactStore(ArtifactStore):
         raise NotImplementedError
 
 
+class BoundedReadWorkspace(LocalWorkspace):
+    def __init__(
+        self,
+        root,
+        *,
+        cap: int | None = None,
+        bound_results: list[object] | None = None,
+    ) -> None:
+        super().__init__(root, workspace_id="bounded")
+        self.cap = cap
+        self.bound_results = list(bound_results or ())
+        self.bound_requests: list[int] = []
+        self.read_requests: list[tuple[int, int | None]] = []
+
+    def bounded_read_limit(self, max_bytes: int) -> int:
+        self.bound_requests.append(max_bytes)
+        if self.bound_results:
+            return self.bound_results.pop(0)  # type: ignore[return-value]
+        if self.cap is None:
+            return max_bytes
+        return min(max_bytes, self.cap)
+
+    async def read_bytes(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        max_bytes: int | None = None,
+    ) -> WorkspaceReadResult:
+        self.read_requests.append((offset, max_bytes))
+        return await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+
+
+class RecordingLocalArtifactStore(LocalArtifactStore):
+    def __init__(self, root) -> None:
+        super().__init__(root, store_id="recording")
+        self.put_count = 0
+
+    async def put_bytes(self, content: bytes, **kwargs):
+        self.put_count += 1
+        return await super().put_bytes(content, **kwargs)
+
+
 class CustomPdfReader:
     def can_read(self, artifact) -> bool:
         return artifact.content_type == "application/pdf"
@@ -994,6 +1037,61 @@ def test_read_file_pages_text_and_only_complete_snapshot_has_revision(tmp_path):
     assert suffix.structured["revision"] is None
 
 
+def test_read_file_pages_text_with_workspace_bounded_read_limit(tmp_path):
+    (tmp_path / "notes.txt").write_text("abcde")
+    workspace = BoundedReadWorkspace(tmp_path, cap=2)
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 5}))
+    second = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": first.structured["next_offset"], "max_bytes": 5},
+        )
+    )
+    third = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": second.structured["next_offset"], "max_bytes": 5},
+        )
+    )
+
+    assert workspace.bound_requests == [5, 5, 5]
+    assert workspace.read_requests == [(0, 2), (2, 2), (4, 2)]
+    assert [page.structured["bytes"] for page in (first, second, third)] == [2, 2, 1]
+    assert [page.structured["next_offset"] for page in (first, second, third)] == [2, 4, None]
+    assert [page.structured["truncated"] for page in (first, second, third)] == [
+        True,
+        True,
+        False,
+    ]
+    assert (
+        "".join(
+            page.content.rsplit("[/read_file metadata]\n", 1)[1] for page in (first, second, third)
+        )
+        == "abcde"
+    )
+
+
+@pytest.mark.parametrize("invalid_bound", [None, True, 0, -1, 1.5, 6])
+def test_read_file_rejects_invalid_workspace_bounded_read_limit(tmp_path, invalid_bound):
+    (tmp_path / "notes.txt").write_text("abcde")
+    workspace = BoundedReadWorkspace(tmp_path, bound_results=[invalid_bound])
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"BoundedReadWorkspace\.bounded_read_limit\(\) must return a positive integer "
+            r"no greater than max_bytes=5\."
+        ),
+    ):
+        asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 5}))
+
+    assert workspace.bound_requests == [5]
+    assert workspace.read_requests == []
+
+
 @pytest.mark.parametrize("offset", [5, 8])
 def test_read_file_rejects_workspace_text_offset_past_eof(tmp_path, offset):
     (tmp_path / "tiny.txt").write_text("tiny")
@@ -1008,6 +1106,54 @@ def test_read_file_rejects_workspace_text_offset_past_eof(tmp_path, offset):
     assert result.structured == {"error": "invalid_arguments"}
 
 
+def test_read_file_rejects_bounded_redacted_offset_past_eof(tmp_path):
+    (tmp_path / "tiny.txt").write_text("tiny")
+    workspace = BoundedReadWorkspace(tmp_path, cap=2)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor("TOKEN"),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "tiny.txt", "offset": 8, "max_bytes": 5},
+        )
+    )
+
+    assert workspace.bound_requests == [39]
+    assert workspace.read_requests == [(0, 2)]
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "secret_redaction_window_unavailable" not in result.content
+
+
+def test_read_file_rejects_bounded_redacted_split_utf8_offset(tmp_path):
+    secret = "TOKEN"
+    (tmp_path / "notes.txt").write_text("A€B")
+    workspace = BoundedReadWorkspace(tmp_path, cap=3)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": 2, "max_bytes": 5},
+        )
+    )
+
+    assert workspace.bound_requests == [33]
+    assert workspace.read_requests == [(0, 3)]
+    assert result.is_error is True
+    assert result.structured == {"error": "invalid_arguments"}
+    assert "splits a UTF-8 character" in result.content
+    assert secret not in json.dumps(result.model_dump(mode="json"))
+
+
 def test_read_file_accepts_workspace_text_offset_at_eof(tmp_path):
     (tmp_path / "tiny.txt").write_text("tiny")
     ctx = ToolContext(
@@ -1017,6 +1163,32 @@ def test_read_file_accepts_workspace_text_offset_at_eof(tmp_path):
 
     result = asyncio.run(ReadFileTool().run(ctx, {"path": "tiny.txt", "offset": 4}))
 
+    assert result.is_error is False
+    assert result.content.endswith("[/read_file metadata]\n")
+    assert result.structured["bytes"] == 0
+    assert result.structured["total_bytes"] == 4
+    assert result.structured["offset"] == 4
+    assert result.structured["next_offset"] is None
+    assert result.structured["truncated"] is False
+
+
+def test_read_file_accepts_bounded_workspace_text_offset_at_eof_with_secrets(tmp_path):
+    (tmp_path / "tiny.txt").write_text("tiny")
+    workspace = BoundedReadWorkspace(tmp_path, cap=2)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor("TOKEN"),
+    )
+
+    result = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "tiny.txt", "offset": 4, "max_bytes": 5},
+        )
+    )
+
+    assert workspace.read_requests == [(0, 2)]
     assert result.is_error is False
     assert result.content.endswith("[/read_file metadata]\n")
     assert result.structured["bytes"] == 0
@@ -1104,6 +1276,271 @@ def test_read_file_pages_utf8_only_at_complete_scalar_boundaries(tmp_path):
     assert third.content.endswith("[/read_file metadata]\nB")
     assert split_start.is_error is True
     assert split_start.structured == {"error": "invalid_arguments"}
+
+
+def test_read_file_bounded_pages_preserve_utf8_boundaries(tmp_path):
+    (tmp_path / "notes.txt").write_text("A€B")
+    workspace = BoundedReadWorkspace(tmp_path, cap=2)
+    ctx = ToolContext(session_id="sess_1", workspace=workspace)
+
+    first = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 5}))
+    incomplete = asyncio.run(
+        ReadFileTool().run(
+            ctx,
+            {"path": "notes.txt", "offset": first.structured["next_offset"], "max_bytes": 5},
+        )
+    )
+    complete_workspace = BoundedReadWorkspace(tmp_path, cap=3)
+    complete = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="sess_1", workspace=complete_workspace),
+            {"path": "notes.txt", "offset": 1, "max_bytes": 5},
+        )
+    )
+
+    assert first.content.endswith("[/read_file metadata]\nA")
+    assert first.structured["next_offset"] == 1
+    assert incomplete.is_error is True
+    assert incomplete.structured == {
+        "error": "text_page_too_small",
+        "offset": 1,
+        "effective_read_limit_bytes": 2,
+        "effective_page_limit_bytes": 2,
+    }
+    assert "workspace read window" in incomplete.content.lower()
+    assert "retry with max_bytes" not in incomplete.content
+    assert complete.content.endswith("[/read_file metadata]\n€")
+    assert complete.structured["next_offset"] == 4
+    assert workspace.read_requests == [(0, 2), (1, 2)]
+    assert complete_workspace.read_requests == [(1, 3)]
+
+
+def test_read_file_utf8_error_distinguishes_caller_limit_from_short_workspace_page(tmp_path):
+    class ShortReadWorkspace(BoundedReadWorkspace):
+        def __init__(self, root, *, short_limit: int = 2, **kwargs) -> None:
+            super().__init__(root, **kwargs)
+            self.short_limit = short_limit
+
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            short_limit = None if max_bytes is None else min(max_bytes, self.short_limit)
+            return await super().read_bytes(path, offset=offset, max_bytes=short_limit)
+
+    class ProjectedReadWorkspace(BoundedReadWorkspace):
+        async def read_bytes(
+            self,
+            path: str,
+            *,
+            offset: int = 0,
+            max_bytes: int | None = None,
+        ) -> WorkspaceReadResult:
+            result = await super().read_bytes(path, offset=offset, max_bytes=max_bytes)
+            return WorkspaceReadResult(
+                content=b"",
+                total_bytes=result.total_bytes,
+                truncated=result.truncated,
+                offset=result.offset,
+                source_bytes_read=result.source_bytes_read,
+                redaction_truncated=True,
+            )
+
+    (tmp_path / "notes.txt").write_text("€B")
+    caller_limited = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(
+                session_id="sess_1",
+                workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+            ),
+            {"path": "notes.txt", "max_bytes": 2},
+        )
+    )
+    short_workspace = ShortReadWorkspace(tmp_path)
+    short_page = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="sess_1", workspace=short_workspace),
+            {"path": "notes.txt", "max_bytes": 5},
+        )
+    )
+    constrained_short_workspace = ShortReadWorkspace(tmp_path, cap=4)
+    constrained_short_page = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="sess_1", workspace=constrained_short_workspace),
+            {"path": "notes.txt", "max_bytes": 5},
+        )
+    )
+    caller_underfilled_workspace = ShortReadWorkspace(tmp_path, short_limit=1)
+    caller_underfilled_page = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="sess_1", workspace=caller_underfilled_workspace),
+            {"path": "notes.txt", "max_bytes": 2},
+        )
+    )
+    projected_workspace = ProjectedReadWorkspace(tmp_path, cap=2)
+    projected_page = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="sess_1", workspace=projected_workspace),
+            {"path": "notes.txt", "max_bytes": 5},
+        )
+    )
+
+    assert caller_limited.structured == {
+        "error": "text_page_too_small",
+        "offset": 0,
+        "minimum_max_bytes": 4,
+    }
+    assert "retry with max_bytes" in caller_limited.content
+    assert short_workspace.bound_requests == [5]
+    assert short_page.structured == {
+        "error": "text_page_too_small",
+        "offset": 0,
+    }
+    assert "incomplete UTF-8 character" in short_page.content
+    assert "workspace read limit" not in short_page.content.lower()
+    assert constrained_short_workspace.bound_requests == [5]
+    assert constrained_short_workspace.read_requests == [(0, 2)]
+    assert constrained_short_page.structured == short_page.structured
+    assert "incomplete UTF-8 character" in constrained_short_page.content
+    assert "workspace read limit" not in constrained_short_page.content.lower()
+    assert caller_underfilled_workspace.bound_requests == [2]
+    assert caller_underfilled_workspace.read_requests == [(0, 1)]
+    assert caller_underfilled_page.structured == short_page.structured
+    assert "incomplete UTF-8 character" in caller_underfilled_page.content
+    assert "retry with max_bytes" not in caller_underfilled_page.content
+    assert projected_workspace.bound_requests == [5]
+    assert projected_workspace.read_requests == [(0, 2)]
+    assert projected_page.structured == short_page.structured
+    assert "incomplete UTF-8 character" in projected_page.content
+    assert "workspace read limit" not in projected_page.content.lower()
+
+
+def test_read_file_does_not_blame_limits_for_incomplete_utf8_at_eof(tmp_path):
+    (tmp_path / "notes.txt").write_bytes(b"\xe2\x82")
+    bounded_workspace = BoundedReadWorkspace(tmp_path, cap=2)
+
+    bounded = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(session_id="sess_1", workspace=bounded_workspace),
+            {"path": "notes.txt", "max_bytes": 5},
+        )
+    )
+    caller_limited = asyncio.run(
+        ReadFileTool().run(
+            ToolContext(
+                session_id="sess_1",
+                workspace=LocalWorkspace(tmp_path, workspace_id="local"),
+            ),
+            {"path": "notes.txt", "max_bytes": 2},
+        )
+    )
+
+    expected = {
+        "error": "text_page_too_small",
+        "offset": 0,
+    }
+    assert bounded_workspace.bound_requests == [5]
+    assert bounded_workspace.read_requests == [(0, 2)]
+    assert bounded.structured == expected
+    assert caller_limited.structured == expected
+    for result in (bounded, caller_limited):
+        assert "incomplete UTF-8 character" in result.content
+        assert "workspace read limit" not in result.content.lower()
+        assert "retry with max_bytes" not in result.content
+
+
+def test_read_file_reports_caller_utf8_limit_when_redaction_prefetch_reaches_eof(tmp_path):
+    secret = "TOKEN"
+    (tmp_path / "notes.txt").write_text("😀")
+    workspace = BoundedReadWorkspace(tmp_path)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 2}))
+
+    assert workspace.bound_requests == [28]
+    assert workspace.read_requests == [(0, 28)]
+    assert result.structured == {
+        "error": "text_page_too_small",
+        "offset": 0,
+        "minimum_max_bytes": 4,
+    }
+    assert "retry with max_bytes of at least 4" in result.content
+    assert "workspace read limit" not in result.content.lower()
+    assert secret not in json.dumps(result.model_dump(mode="json"))
+
+
+def test_read_file_wrapper_composes_expanded_redaction_read_with_backend_bound(tmp_path):
+    secret = "TOKEN"
+    (tmp_path / "notes.txt").write_text("abcdef")
+    workspace = BoundedReadWorkspace(tmp_path, cap=2)
+    tracker = InvocationSecretTracker(SecretRedactor(secret))
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=InvocationWorkspaceHandle(
+            workspace,
+            redactor_snapshot_provider=tracker.snapshot,
+            capture_observer=tracker.record_ambiguous_output_capture,
+        ),
+        invocation_secret_redactor=lambda: tracker.redactor,
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 5}))
+
+    assert workspace.bound_requests == [31, 24]
+    assert workspace.read_requests == [(0, 2)]
+    assert result.is_error is True
+    assert secret not in json.dumps(result.model_dump(mode="json"))
+
+
+def test_read_file_resolves_combined_caller_and_workspace_utf8_limits(tmp_path):
+    secret = "TOKEN"
+    (tmp_path / "four-byte.txt").write_text(f"😀{'x' * 40}")
+    (tmp_path / "three-byte.txt").write_text(f"€{'x' * 40}")
+    four_byte_workspace = BoundedReadWorkspace(tmp_path, cap=25)
+    three_byte_workspace = BoundedReadWorkspace(tmp_path, cap=25)
+
+    def read(path: str, workspace: BoundedReadWorkspace) -> ToolResult:
+        return asyncio.run(
+            ReadFileTool().run(
+                ToolContext(
+                    session_id="sess_1",
+                    workspace=workspace,
+                    invocation_secret_redactor=lambda: SecretRedactor(secret),
+                ),
+                {"path": path, "max_bytes": 2},
+            )
+        )
+
+    four_byte = read("four-byte.txt", four_byte_workspace)
+    three_byte = read("three-byte.txt", three_byte_workspace)
+
+    for workspace in (four_byte_workspace, three_byte_workspace):
+        assert workspace.bound_requests == [28]
+        assert workspace.read_requests == [(0, 25)]
+    assert four_byte.structured == {
+        "error": "text_page_too_small",
+        "offset": 0,
+        "effective_read_limit_bytes": 25,
+        "effective_page_limit_bytes": 3,
+    }
+    assert "workspace read window" in four_byte.content.lower()
+    assert "retry with max_bytes" not in four_byte.content
+    assert three_byte.structured == {
+        "error": "text_page_too_small",
+        "offset": 0,
+        "minimum_max_bytes": 4,
+    }
+    assert "retry with max_bytes of at least 4" in three_byte.content
+    assert "workspace read limit" not in three_byte.content.lower()
+    assert secret not in json.dumps(four_byte.model_dump(mode="json"))
+    assert secret not in json.dumps(three_byte.model_dump(mode="json"))
 
 
 def test_read_file_discards_workspace_secret_prefix_after_pretruncated_read(tmp_path):
@@ -1478,6 +1915,79 @@ def test_read_file_redacted_pagination_preserves_utf8_boundaries_and_progress(tm
     assert visible_text == "αβ終わり"
 
 
+def test_read_file_shortens_bounded_page_to_preserve_secret_overlap(tmp_path):
+    secret = "TOKEN"
+    (tmp_path / "notes.txt").write_text(f"abc{secret}{'x' * 40}")
+    workspace = BoundedReadWorkspace(tmp_path, cap=25)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 5}))
+
+    assert workspace.bound_requests == [31]
+    assert workspace.read_requests == [(0, 25)]
+    assert result.is_error is False
+    assert result.content.endswith("[/read_file metadata]\nabc")
+    assert result.structured["bytes"] == 3
+    assert result.structured["next_offset"] == 3
+    assert result.structured["truncated"] is True
+    assert secret not in json.dumps(result.model_dump(mode="json"))
+
+
+def test_read_file_reports_page_capacity_after_secret_overlap(tmp_path):
+    secret = "TOKEN"
+    (tmp_path / "notes.txt").write_text(f"😀{'x' * 40}")
+    workspace = BoundedReadWorkspace(tmp_path, cap=25)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 5}))
+
+    assert workspace.bound_requests == [31]
+    assert workspace.read_requests == [(0, 25)]
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "text_page_too_small",
+        "offset": 0,
+        "effective_read_limit_bytes": 25,
+        "effective_page_limit_bytes": 3,
+    }
+    assert "workspace read window" in result.content.lower()
+    assert "safely framed UTF-8 character" in result.content
+    assert "retry with max_bytes" not in result.content
+    assert secret not in json.dumps(result.model_dump(mode="json"))
+
+
+def test_read_file_fails_closed_when_bound_cannot_preserve_secret_overlap(tmp_path):
+    secret = "TOKEN"
+    (tmp_path / "notes.txt").write_text(f"{secret}{'x' * 40}")
+    workspace = BoundedReadWorkspace(tmp_path, cap=22)
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        invocation_secret_redactor=lambda: SecretRedactor(secret),
+    )
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "notes.txt", "max_bytes": 5}))
+
+    assert workspace.bound_requests == [31]
+    assert workspace.read_requests == [(0, 22)]
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "secret_redaction_window_unavailable",
+        "offset": 0,
+        "required_window_end": 23,
+        "observed_window_end": 22,
+    }
+    assert secret not in json.dumps(result.model_dump(mode="json"))
+
+
 def test_read_file_fails_closed_when_backend_omits_required_redaction_prefix(tmp_path):
     class IncompleteWindowWorkspace(LocalWorkspace):
         async def read_bytes(
@@ -1770,6 +2280,67 @@ def test_read_file_snapshots_workspace_image_as_artifact_attachment(tmp_path):
     assert result.artifacts[0]["artifact_id"] == result.structured["snapshot_artifact_id"]
     assert result.artifacts[0]["kind"] == "image"
     assert result.structured["total_bytes"] == len(TINY_PNG_BYTES)
+
+
+def test_read_file_bounds_initial_and_full_workspace_attachment_reads(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = BoundedReadWorkspace(workspace_root, cap=2)
+    artifact_store = RecordingLocalArtifactStore(tmp_path / "artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+    asyncio.run(workspace.write_bytes("tiny.png", TINY_PNG_BYTES))
+
+    result = asyncio.run(ReadFileTool().run(ctx, {"path": "tiny.png"}))
+
+    assert workspace.bound_requests == [
+        DEFAULT_READ_LIMIT_BYTES,
+        files_module.MAX_IMAGE_SOURCE_BYTES,
+    ]
+    assert workspace.read_requests == [(0, 2), (0, 2)]
+    assert artifact_store.put_count == 0
+    assert result.is_error is True
+    assert result.structured["bytes"] == 2
+    assert result.structured["total_bytes"] == len(TINY_PNG_BYTES)
+    assert result.structured["truncated"] is True
+    assert result.structured["effective_read_limit_bytes"] == 2
+    assert "effective native-inspection limit (max 2 bytes)" in result.content
+    assert str(files_module.MAX_IMAGE_SOURCE_BYTES) not in result.content
+
+
+def test_read_file_rejects_invalid_full_attachment_bound_before_snapshot(tmp_path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    workspace = BoundedReadWorkspace(
+        workspace_root,
+        bound_results=[DEFAULT_READ_LIMIT_BYTES, 0],
+    )
+    artifact_store = RecordingLocalArtifactStore(tmp_path / "artifacts")
+    ctx = ToolContext(
+        session_id="sess_1",
+        workspace=workspace,
+        artifact_store=artifact_store,
+    )
+    asyncio.run(workspace.write_bytes("tiny.png", TINY_PNG_BYTES))
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"BoundedReadWorkspace\.bounded_read_limit\(\) must return a positive integer "
+            rf"no greater than max_bytes={files_module.MAX_IMAGE_SOURCE_BYTES}\."
+        ),
+    ):
+        asyncio.run(ReadFileTool().run(ctx, {"path": "tiny.png"}))
+
+    assert workspace.bound_requests == [
+        DEFAULT_READ_LIMIT_BYTES,
+        files_module.MAX_IMAGE_SOURCE_BYTES,
+    ]
+    assert workspace.read_requests == [(0, DEFAULT_READ_LIMIT_BYTES)]
+    assert artifact_store.put_count == 0
 
 
 def test_read_file_rejects_inspectable_workspace_binary_without_artifact_store(tmp_path):
