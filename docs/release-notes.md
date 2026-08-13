@@ -89,6 +89,29 @@ guard.
 
 ## Unreleased
 
+### MCP transports enforce explicit allocation and time bounds
+
+`McpTransportLimits` now applies one validated message/event byte ceiling,
+aggregate HTTP response ceiling, idle timeout, and absolute call deadline to
+both stdio and Streamable HTTP MCP clients. Stdio framing and HTTP JSON/SSE
+bodies are consumed incrementally with typed overflow, idle, deadline, and
+premature-peer-closure failures. Excessively nested inbound JSON is rejected
+before recursive copying or workload-secret redaction. Fatal shared stdio
+framing closes every waiter; uncertain in-flight stdio timeout or cancellation
+also fences the shared process.
+Isolated HTTP content/protocol failures preserve the logical session only after
+bounded cleanup succeeds; outcome-uncertain timeout, cancellation, or peer/network
+failure fences it. Absolute deadline and cancellation delivery do not wait through
+a fresh cleanup timeout during initialization or built-in-session tool discovery;
+custom sessions that cannot prove synchronous fencing finish close before returning
+a discovery failure. Cancellation-resistant work remains owned by retained cleanup
+while the session is fenced. A server session identifier received during failed
+initialization is retained only for cleanup; after uncertain response work settles,
+Cayu attempts session termination before closing the HTTP client. An established
+session whose completed response misses its semantic-processing deadline receives
+the same bounded termination-before-close ownership. Existing timeout arguments and
+defaults remain compatible when no explicit limits object is supplied.
+
 ## v0.2.0
 
 `v0.2.0` makes Cayu's durable runtime directly operable as a production agent

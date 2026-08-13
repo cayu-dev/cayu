@@ -21,6 +21,7 @@ from cayu.mcp.base import (
     McpResourceResult,
     McpToolDefinition,
     McpToolResult,
+    _McpCallerCancellationBoundary,
 )
 from cayu.vaults import SecretRedactor
 
@@ -82,7 +83,7 @@ class McpPaginatedPage:
 class _PageRequestOutcome:
     page: McpPaginatedPage | None = None
     error: BaseException | None = None
-    cancellation_args: tuple[Any, ...] | None = None
+    cancellation: asyncio.CancelledError | None = None
 
 
 def validate_positive_number(value: float, field_name: str) -> float:
@@ -182,7 +183,7 @@ def safely_redact_jsonrpc_response(
             method=method,
             redactor=redactor,
         )
-    except ValueError:
+    except (RecursionError, ValueError):
         return JsonrpcRedactionResult(
             {},
             "MCP response contained invalid portable JSON.",
@@ -300,9 +301,11 @@ async def collect_paginated(
     page_count = 0
     while True:
         params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
+        outcome: _PageRequestOutcome | None = None
         paginated_page: McpPaginatedPage | None = None
         next_cursor: Any = None
         result: Any = None
+        page: Any = None
         try:
             outcome = await _request_paginated_page(
                 request,
@@ -311,10 +314,10 @@ async def collect_paginated(
                 redactor=resolved_redactor,
             )
             params.clear()
-            if outcome.cancellation_args is not None:
-                raise asyncio.CancelledError(*outcome.cancellation_args) from None
+            if outcome.cancellation is not None:
+                raise outcome.cancellation
             if outcome.error is not None:
-                raise outcome.error from None
+                raise outcome.error
             paginated_page = outcome.page
             if paginated_page is None:
                 raise AssertionError("MCP page request completed without a page.")
@@ -334,8 +337,10 @@ async def collect_paginated(
             items.extend(page)
             next_cursor = paginated_page.next_cursor
             paginated_page.clear_private_authority()
+            outcome = None
             paginated_page = None
             result = None
+            page = None
             if next_cursor is None:
                 return items
             if not isinstance(next_cursor, str):
@@ -365,8 +370,11 @@ async def collect_paginated(
         except BaseException:
             if paginated_page is not None:
                 paginated_page.clear_private_authority()
+            items.clear()
+            outcome = None
             paginated_page = None
             result = None
+            page = None
             next_cursor = None
             cursor = None
             seen_cursor_digests.clear()
@@ -388,15 +396,39 @@ async def _request_paginated_page(
     if type(private_cursor) is str and private_cursor.strip():
         request_redactor = request_redactor.with_secret(private_cursor)
     private_cursor = None
+    cancellation_boundary = _McpCallerCancellationBoundary()
     try:
+        await cancellation_boundary.checkpoint()
         page = await request(method, params)
     except asyncio.CancelledError as cancellation:
         params.clear()
-        cancellation_args = _safe_redacted_cancellation_args(
-            cancellation,
-            redactor=request_redactor,
+        if not cancellation_boundary.caller_cancelled():
+            # Import lazily because the shared transport errors inherit from this
+            # module. A callback-owned cancellation is an ordinary page failure,
+            # not proof that the caller task was cancelled.
+            from cayu.mcp._transport import credential_safe_mcp_transport_failure
+
+            safe_error = credential_safe_mcp_transport_failure(
+                cancellation,
+                redactor=request_redactor,
+                context=f"MCP {method} paginated request was cancelled unexpectedly",
+                max_message_bytes=2048,
+                preserve_cause=True,
+            )
+            return _PageRequestOutcome(error=safe_error)
+        safe_cancellation = asyncio.CancelledError(
+            *_safe_redacted_cancellation_args(
+                cancellation,
+                redactor=request_redactor,
+            )
         )
-        return _PageRequestOutcome(cancellation_args=cancellation_args)
+        _copy_page_request_failure_evidence(
+            cancellation,
+            safe_cancellation,
+            redactor=request_redactor,
+            context=f"MCP {method} paginated request cancellation",
+        )
+        return _PageRequestOutcome(cancellation=safe_cancellation)
     except BaseExceptionGroup as error:
         params.clear()
         detached = _redacted_page_request_group(
@@ -438,6 +470,8 @@ def _redacted_page_request_group(
 ) -> BaseExceptionGroup:
     """Rebuild a grouped page failure without retaining private exception state."""
 
+    from cayu.mcp._transport import credential_safe_mcp_fatal_signal
+
     group_message = f"MCP {method} paginated request reported multiple failures."
     try:
         args = BaseException.__dict__["args"].__get__(error, BaseException)
@@ -448,25 +482,29 @@ def _redacted_page_request_group(
 
     def detach_leaf(leaf: BaseException) -> BaseException:
         if isinstance(leaf, asyncio.CancelledError):
-            return asyncio.CancelledError(
+            detached_leaf = asyncio.CancelledError(
                 *_safe_redacted_cancellation_args(leaf, redactor=redactor)
             )
+            _copy_page_request_failure_evidence(
+                leaf,
+                detached_leaf,
+                redactor=redactor,
+                context=f"MCP {method} paginated request cancellation",
+            )
+            return detached_leaf
         if isinstance(leaf, Exception):
             return _redacted_page_request_error(
                 leaf,
                 method=method,
                 redactor=redactor,
             )
-        args = _safe_redacted_base_exception_args(leaf, redactor=redactor)
-        if isinstance(leaf, KeyboardInterrupt):
-            return KeyboardInterrupt(*args)
-        if isinstance(leaf, SystemExit):
-            return SystemExit(*args)
-        if isinstance(leaf, GeneratorExit):
-            return GeneratorExit(*args)
-        return BaseException(*args)
+        return credential_safe_mcp_fatal_signal(
+            leaf,
+            redactor=redactor,
+            context=f"MCP {method} paginated request failure",
+        )
 
-    return rebuild_exception_group(
+    detached_group = rebuild_exception_group(
         error,
         group_message=group_message,
         leaf_mapper=detach_leaf,
@@ -474,6 +512,13 @@ def _redacted_page_request_group(
             f"MCP {method} paginated request reported an invalid failure group."
         ),
     )
+    _copy_page_request_failure_evidence(
+        error,
+        detached_group,
+        redactor=redactor,
+        context=f"MCP {method} paginated request failure",
+    )
+    return detached_group
 
 
 def _redacted_page_request_error(
@@ -484,22 +529,20 @@ def _redacted_page_request_error(
 ) -> Exception:
     """Copy a safe diagnostic without retaining the private exception traceback."""
 
-    try:
-        message = str(error).strip()
-    except BaseException:
-        message = ""
-    if not message:
-        message = "MCP paginated request failed"
-    error_type = redactor.redact_text_bounded(
-        _safe_exception_type_name(error),
-        max_bytes=256,
+    # Import lazily because the shared transport errors inherit McpProtocolError
+    # from this module. Page requests execute only after both modules are loaded.
+    from cayu.mcp._transport import credential_safe_mcp_transport_failure
+
+    detached = credential_safe_mcp_transport_failure(
+        error,
+        redactor=redactor,
+        context=f"MCP {method} paginated request failed",
+        max_message_bytes=2048,
+        preserve_cause=True,
     )
-    message = redactor.redact_text_bounded(message, max_bytes=2048)
-    if isinstance(error, TimeoutError):
-        return TimeoutError(message)
-    if isinstance(error, McpProtocolError):
-        return McpProtocolError(message)
-    return McpProtocolError(f"MCP {method} page request failed: {error_type}: {message}")
+    if isinstance(detached, Exception):
+        return detached
+    return McpProtocolError(f"MCP {method} page request failed.")
 
 
 def _redacted_page_request_fatal(
@@ -509,22 +552,34 @@ def _redacted_page_request_fatal(
 ) -> BaseException:
     """Rebuild a scalar fatal signal without retaining private exception state."""
 
-    args = _safe_redacted_base_exception_args(error, redactor=redactor)
-    if isinstance(error, KeyboardInterrupt):
-        return KeyboardInterrupt(*args)
-    if isinstance(error, SystemExit):
-        return SystemExit(*args)
-    if isinstance(error, GeneratorExit):
-        return GeneratorExit(*args)
-    return BaseException(*args)
+    from cayu.mcp._transport import credential_safe_mcp_fatal_signal
+
+    return credential_safe_mcp_fatal_signal(
+        error,
+        redactor=redactor,
+        context="MCP paginated request fatal failure",
+    )
 
 
-def _safe_exception_type_name(error: BaseException) -> str:
-    try:
-        name = type.__getattribute__(type(error), "__name__")
-    except BaseException:
-        return "Exception"
-    return name if type(name) is str else "Exception"
+def _copy_page_request_failure_evidence(
+    source: BaseException,
+    target: BaseException,
+    *,
+    redactor: SecretRedactor,
+    context: str,
+) -> None:
+    # Import lazily because the shared transport errors inherit from this
+    # module. Detached failures retain only authenticated MCP ownership and
+    # credential-safe causal evidence.
+    from cayu.mcp._transport import _copy_credential_safe_mcp_failure_evidence
+
+    _copy_credential_safe_mcp_failure_evidence(
+        source,
+        target,
+        redactor=redactor,
+        context=context,
+        preserve_cause=True,
+    )
 
 
 def _safe_redacted_cancellation_args(
@@ -534,46 +589,24 @@ def _safe_redacted_cancellation_args(
 ) -> tuple[Any, ...]:
     """Copy cancellation detail without retaining the private cancellation object."""
 
-    try:
-        args = tuple(cancellation.args)
-    except BaseException:
-        return ()
-    copied: list[Any] = []
-    for value in args:
-        if value is None or type(value) in {bool, int, float}:
-            copied.append(value)
-            continue
-        try:
-            rendered = value if type(value) is str else str(value)
-        except BaseException:
-            rendered = "cancelled"
-        copied.append(redactor.redact_text_bounded(rendered, max_bytes=2048))
-    return tuple(copied)
-
-
-def _safe_redacted_base_exception_args(
-    error: BaseException,
-    *,
-    redactor: SecretRedactor,
-) -> tuple[Any, ...]:
-    """Copy fatal-signal arguments without invoking extension-owned accessors."""
+    from cayu.mcp._transport import _credential_safe_mcp_exception_argument_value
 
     try:
-        args = BaseException.__dict__["args"].__get__(error, BaseException)
+        args = BaseException.__dict__["args"].__get__(cancellation, BaseException)
     except BaseException:
         return ()
     if type(args) is not tuple:
         return ()
     copied: list[Any] = []
     for value in args:
-        if value is None or type(value) in {bool, int, float}:
-            copied.append(value)
-            continue
-        try:
-            rendered = value if type(value) is str else str(value)
-        except BaseException:
-            rendered = "MCP paginated request failed"
-        copied.append(redactor.redact_text_bounded(rendered, max_bytes=2048))
+        copied.append(
+            _credential_safe_mcp_exception_argument_value(
+                value,
+                redactor=redactor,
+                max_bytes=2048,
+                non_text_diagnostic="MCP operation cancelled",
+            )
+        )
     return tuple(copied)
 
 
@@ -600,9 +633,11 @@ def _consume_model_payload(
     return parsed
 
 
-def initialize_result_from_payload(payload: dict[str, Any]) -> McpInitializeResult:
+def initialize_result_from_payload(payload: object) -> McpInitializeResult:
+    if type(payload) is not dict:
+        raise McpProtocolError("MCP initialize result must be an object.")
     return _consume_model_payload(
-        payload,
+        cast("dict[str, Any]", payload),
         _initialize_result_from_payload,
         failure_message="MCP initialize result contained invalid data.",
     )
@@ -655,9 +690,11 @@ def tool_definition_from_payload(payload: object, server_name: str) -> McpToolDe
     )
 
 
-def tool_result_from_payload(payload: dict[str, Any]) -> McpToolResult:
+def tool_result_from_payload(payload: object) -> McpToolResult:
+    if type(payload) is not dict:
+        raise McpProtocolError("MCP tools/call result must be an object.")
     return _consume_model_payload(
-        payload,
+        cast("dict[str, Any]", payload),
         _tool_result_from_payload,
         failure_message="MCP tools/call result contained invalid data.",
     )
@@ -680,9 +717,11 @@ def _tool_result_from_payload(payload: dict[str, Any]) -> McpToolResult:
     )
 
 
-def resource_result_from_payload(payload: dict[str, Any]) -> McpResourceResult:
+def resource_result_from_payload(payload: object) -> McpResourceResult:
+    if type(payload) is not dict:
+        raise McpProtocolError("MCP resources/read result must be an object.")
     return _consume_model_payload(
-        payload,
+        cast("dict[str, Any]", payload),
         _resource_result_from_payload,
         failure_message="MCP resources/read result contained invalid data.",
     )

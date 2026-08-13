@@ -254,6 +254,33 @@ def test_project_worker_command_is_release_visible() -> None:
         assert exit_code in guide
 
 
+def test_mcp_transport_limits_are_documented_as_one_shared_contract() -> None:
+    runtime_contract = " ".join(
+        (_REPO_ROOT / "docs" / "runtime-contracts.md").read_text(encoding="utf-8").split()
+    )
+
+    for required in (
+        "`McpTransportLimits`",
+        "`max_message_bytes`",
+        "`max_response_bytes`",
+        "`idle_timeout_s`",
+        "`total_call_timeout_s`",
+        "The exact ceiling is accepted and the next byte is rejected",
+        "including runtime tool-adapter calls through either built-in transport",
+        "Invalid JSON values inside object-shaped outbound requests fail through a detached",
+        "Inbound JSON and SSE messages use the same nesting envelope",
+        "Fatal stdio framing",
+        "HTTP response failure is isolated",
+        "including during initialization and built-in-session tool discovery",
+        "An injected `McpSession` that cannot make that positive fencing guarantee",
+        "a private settlement task retains that exact work",
+        "established session's response has completed transport cleanup",
+        "session identifiers are installed only after",
+        "accept only 2xx responses (including session-termination DELETEs)",
+    ):
+        assert required in runtime_contract
+
+
 def test_server_auth_tenant_isolation_boundary_is_documented() -> None:
     readme = " ".join((_REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
     runtime_contract = " ".join(

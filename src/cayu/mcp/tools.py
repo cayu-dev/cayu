@@ -11,6 +11,11 @@ from typing import Any
 from cayu._validation import copy_json_value, require_clean_nonblank
 from cayu.core.tools import Tool, ToolContext, ToolEffect, ToolResult, ToolSpec
 from cayu.mcp._jsonrpc import McpProtocolError
+from cayu.mcp._transport import (
+    credential_safe_mcp_fatal_signal,
+    credential_safe_mcp_transport_failure,
+    mcp_json_value_nesting_too_deep,
+)
 from cayu.mcp.base import (
     McpClient,
     McpInitializeResult,
@@ -18,10 +23,14 @@ from cayu.mcp.base import (
     McpSession,
     McpToolDefinition,
     McpToolResult,
+    _close_mcp_session_after_primary_failure,
+    _credential_safe_mcp_cancellation,
+    _McpCallerCancellationBoundary,
+    _retain_mcp_session_close_if_fenced,
     copy_mcp_server_spec,
 )
-from cayu.mcp.http import HttpMcpClient
-from cayu.mcp.stdio import StdioMcpClient
+from cayu.mcp.http import HttpMcpClient, HttpMcpSession
+from cayu.mcp.stdio import StdioMcpClient, StdioMcpSession
 from cayu.vaults import SecretRedactor
 
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -125,10 +134,17 @@ class McpToolAdapter(Tool):
     async def run(self, ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
         if type(args) is not dict:
             raise TypeError("MCP tool arguments must be an object.")
-        arguments = copy_json_value(args, "arguments")
-        if type(arguments) is not dict:
-            raise TypeError("MCP tool arguments must be an object.")
-        result = await self.__binding.toolset.call_tool(self.__binding.mcp_name, arguments)
+        call = self.__binding.toolset.call_tool(
+            self.__binding.mcp_name,
+            args,
+        )
+        args = {}
+        try:
+            result = await call
+        except BaseException:
+            call = None
+            raise
+        call = None
         redactor = self.__binding.toolset.secret_redactor
         mcp_content = result.content
         mcp_structured_content = result.structured_content
@@ -357,29 +373,132 @@ class McpToolset:
         authoritative_server = copy_mcp_server_spec(server)
         mcp_client = client if client is not None else _default_client_for(authoritative_server)
         session = await mcp_client.connect(copy_mcp_server_spec(authoritative_server))
-        sanitized_error: McpProtocolError | None = None
+        sanitized_error: BaseException | None = None
+        discovery_cancellation_boundary = _McpCallerCancellationBoundary()
         try:
+            await discovery_cancellation_boundary.checkpoint()
             definitions = await session.list_tools()
             return cls(
                 server=authoritative_server,
                 session=session,
                 definitions=definitions,
             )
-        except asyncio.CancelledError:
-            await _close_session_after_failed_toolset_connect(session)
-            raise
-        except Exception as exc:
-            await _close_session_after_failed_toolset_connect(session)
-            if not session.secret_redactor.has_values:
-                raise
-            safe_error = session.secret_redactor.redact_text_bounded(
-                str(exc),
-                max_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+        except asyncio.CancelledError as exc:
+            if not discovery_cancellation_boundary.caller_cancelled():
+                public_error = credential_safe_mcp_transport_failure(
+                    exc,
+                    redactor=session.secret_redactor,
+                    context="MCP tool discovery was cancelled unexpectedly",
+                    max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                    preserve_cause=True,
+                )
+                if not _retain_mcp_session_close_if_fenced(
+                    session,
+                    primary_error=public_error,
+                ):
+                    cleanup_cancellation = await _close_mcp_session_after_primary_failure(
+                        session,
+                        primary_error=public_error,
+                        primary_context="MCP tool discovery failed",
+                        cleanup_context="MCP tool discovery cleanup failed",
+                    )
+                    if cleanup_cancellation is not None:
+                        sanitized_error = cleanup_cancellation
+                if sanitized_error is None:
+                    sanitized_error = public_error
+                definitions = ()
+            else:
+                public_cancellation = _credential_safe_mcp_cancellation(
+                    exc,
+                    redactor=session.secret_redactor,
+                )
+                if not _retain_mcp_session_close_if_fenced(
+                    session,
+                    primary_error=public_cancellation,
+                ):
+                    cleanup_cancellation = await _close_mcp_session_after_primary_failure(
+                        session,
+                        primary_error=public_cancellation,
+                        primary_context="MCP tool discovery was cancelled",
+                        cleanup_context="MCP tool discovery cleanup failed",
+                    )
+                    if cleanup_cancellation is not None:
+                        sanitized_error = cleanup_cancellation
+                        definitions = ()
+                    else:
+                        sanitized_error = public_cancellation
+                        definitions = ()
+                else:
+                    sanitized_error = public_cancellation
+                    definitions = ()
+        except TimeoutError as exc:
+            public_error: BaseException = exc
+            if session.secret_redactor.has_values:
+                public_error = credential_safe_mcp_transport_failure(
+                    exc,
+                    redactor=session.secret_redactor,
+                    context="MCP tool discovery failed",
+                    max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                    preserve_cause=True,
+                )
+            if not _retain_mcp_session_close_if_fenced(
+                session,
+                primary_error=public_error,
+            ):
+                cleanup_cancellation = await _close_mcp_session_after_primary_failure(
+                    session,
+                    primary_error=public_error,
+                    primary_context="MCP tool discovery timed out",
+                    cleanup_context="MCP tool discovery cleanup failed",
+                )
+                if cleanup_cancellation is not None:
+                    sanitized_error = cleanup_cancellation
+                    definitions = ()
+            if sanitized_error is None:
+                if public_error is exc:
+                    raise
+                sanitized_error = public_error
+                definitions = ()
+        except (BaseExceptionGroup, Exception) as exc:
+            cleanup_cancellation = await _close_mcp_session_after_primary_failure(
+                session,
+                primary_error=exc,
+                primary_context="MCP tool discovery failed",
+                cleanup_context="MCP tool discovery cleanup failed",
             )
-            sanitized_error = McpProtocolError(f"MCP tool discovery failed: {safe_error}")
+            if cleanup_cancellation is not None:
+                sanitized_error = cleanup_cancellation
+                definitions = ()
+            elif not session.secret_redactor.has_values:
+                raise
+            else:
+                sanitized_error = credential_safe_mcp_transport_failure(
+                    exc,
+                    redactor=session.secret_redactor,
+                    context="MCP tool discovery failed",
+                    max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                    preserve_cause=True,
+                )
+                definitions = ()
+        except BaseException as fatal:
+            cleanup_cancellation = await _close_mcp_session_after_primary_failure(
+                session,
+                primary_error=fatal,
+                primary_context="MCP tool discovery failed",
+                cleanup_context="MCP tool discovery cleanup failed",
+            )
+            if cleanup_cancellation is not None:
+                sanitized_error = cleanup_cancellation
+            else:
+                sanitized_error = credential_safe_mcp_fatal_signal(
+                    fatal,
+                    redactor=session.secret_redactor,
+                    context="MCP tool discovery failed",
+                    max_message_bytes=_MAX_MCP_DISCOVERY_ERROR_BYTES,
+                )
             definitions = ()
         if sanitized_error is not None:
-            raise sanitized_error from None
+            raise sanitized_error
         raise AssertionError("MCP tool discovery returned without a toolset or error.")
 
     @property
@@ -392,7 +511,51 @@ class McpToolset:
         return self.__session.secret_redactor
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
-        return await self.__session.call_tool(name, arguments)
+        # Built-in sessions own a bounded preflight before their defensive copy.
+        # Third-party sessions have no common limits contract, so retain the
+        # historical toolset-owned copy before handing arguments to extensions.
+        call_name = name
+        call_arguments = arguments
+        name = ""
+        arguments = {}
+        preparation_error: BaseException | None = None
+        if type(self.__session) not in {HttpMcpSession, StdioMcpSession}:
+            # Built-in sessions combine nesting and byte validation in their
+            # bounded transport preflight. Custom sessions have no shared size
+            # contract, so retain the adapter's historical validation boundary.
+            if mcp_json_value_nesting_too_deep(call_arguments):
+                call_name = ""
+                call_arguments = {}
+                raise McpProtocolError(
+                    "MCP tool arguments exceeded the supported JSON nesting."
+                ) from None
+            try:
+                call_arguments = copy_json_value(call_arguments, "arguments")
+            except (RecursionError, TypeError, ValueError) as error:
+                preparation_error = credential_safe_mcp_transport_failure(
+                    error,
+                    redactor=self.secret_redactor,
+                    context="MCP tool arguments were invalid",
+                )
+                error = None
+            if preparation_error is not None:
+                call_name = ""
+                call_arguments = {}
+                raise preparation_error from None
+            if type(call_arguments) is not dict:
+                call_name = ""
+                call_arguments = {}
+                raise TypeError("MCP tool arguments must be an object.")
+        call = self.__session.call_tool(call_name, call_arguments)
+        call_name = ""
+        call_arguments = {}
+        try:
+            return await call
+        except BaseException:
+            call = None
+            raise
+        finally:
+            call = None
 
     async def close(self) -> None:
         await self.__session.close()
@@ -766,16 +929,3 @@ def _validate_unique_tool_names(adapters: list[McpToolAdapter]) -> None:
     names = [adapter.name for adapter in adapters]
     if len(names) != len(set(names)):
         raise ValueError("Discovered MCP tools produced duplicate Cayu tool names.")
-
-
-async def _close_session_after_failed_toolset_connect(session: McpSession) -> None:
-    close_task = asyncio.create_task(session.close())
-    while True:
-        try:
-            await asyncio.shield(close_task)
-            return
-        except Exception:
-            return
-        except asyncio.CancelledError:
-            if close_task.done():
-                return

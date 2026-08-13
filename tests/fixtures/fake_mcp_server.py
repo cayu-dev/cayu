@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 
 def main() -> None:
@@ -13,6 +14,38 @@ def main() -> None:
         if "id" not in message:
             continue
         request_id = message["id"]
+        paginated_failure_method = os.environ.get("CAYU_FAKE_MCP_PAGINATED_FAILURE_METHOD")
+        if paginated_failure_method is not None and method == paginated_failure_method:
+            cursor = message.get("params", {}).get("cursor")
+            if cursor is not None:
+                sys.stdout.write("{invalid-json\n")
+                sys.stdout.flush()
+                continue
+            private_identity = os.environ["CAYU_FAKE_MCP_PAGINATED_PRIVATE_IDENTITY"]
+            page_canary = os.environ["CAYU_FAKE_MCP_PAGINATED_PAGE_CANARY"]
+            if method == "resources/list":
+                result = {
+                    "resources": [
+                        {
+                            "uri": private_identity,
+                            "description": page_canary,
+                        }
+                    ],
+                    "nextCursor": "failing-page",
+                }
+            else:
+                result = {
+                    "tools": [
+                        {
+                            "name": private_identity,
+                            "description": page_canary,
+                            "inputSchema": {"type": "object"},
+                        }
+                    ],
+                    "nextCursor": "failing-page",
+                }
+            _write({"jsonrpc": "2.0", "id": request_id, "result": result})
+            continue
         structural_response = os.environ.get("CAYU_FAKE_MCP_STRUCTURAL_RESPONSE")
         structural_method = os.environ.get(
             "CAYU_FAKE_MCP_STRUCTURAL_METHOD",
@@ -140,6 +173,9 @@ def main() -> None:
                 )
             continue
         if method == "initialize":
+            initialize_delay_s = os.environ.get("CAYU_FAKE_MCP_INITIALIZE_DELAY_S")
+            if initialize_delay_s is not None:
+                time.sleep(float(initialize_delay_s))
             protocol_version = os.environ.get(
                 "CAYU_FAKE_MCP_PROTOCOL_VERSION",
                 "2025-06-18",
@@ -189,6 +225,17 @@ def main() -> None:
             params = message.get("params", {})
             name = params.get("name")
             arguments = params.get("arguments", {})
+            if arguments.get("close_stdout"):
+                sys.stdout.close()
+                return
+            if arguments.get("close_stdout_keep_stderr_s") is not None:
+                os.close(sys.stdout.fileno())
+                time.sleep(float(arguments["close_stdout_keep_stderr_s"]))
+                return
+            if arguments.get("invalid_utf8"):
+                sys.stdout.buffer.write(b"\xff\n")
+                sys.stdout.buffer.flush()
+                continue
             if arguments.get("server_request_first"):
                 _write(
                     {
@@ -208,11 +255,34 @@ def main() -> None:
                 )
                 continue
             text = arguments.get("text", "")
+            deep_response_depth = arguments.get("deep_response_depth")
+            if deep_response_depth is not None:
+                _write_deep_tool_response(
+                    request_id,
+                    depth=int(deep_response_depth),
+                    canary=str(arguments.get("deep_response_canary", "")),
+                )
+                continue
             response = _tool_response(
                 request_id,
                 text=text,
                 structured_only=bool(arguments.get("structured_only")),
             )
+            exact_response_bytes = arguments.get("exact_response_bytes")
+            if exact_response_bytes is not None:
+                secret_prefix = (
+                    os.environ.get("CAYU_FAKE_MCP_LIMIT_CANARY", "")
+                    if arguments.get("include_limit_canary")
+                    else ""
+                )
+                response = _tool_response_with_exact_bytes(
+                    request_id,
+                    exact_response_bytes,
+                    prefix=secret_prefix,
+                )
+            if arguments.get("slow_response_delay_s") is not None:
+                _write_slow(response, float(arguments["slow_response_delay_s"]))
+                continue
             if arguments.get("defer_response"):
                 deferred_tool_response = response
                 continue
@@ -266,6 +336,43 @@ def main() -> None:
 def _write(message: object) -> None:
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+
+
+def _write_slow(message: object, delay_s: float) -> None:
+    data = (json.dumps(message, separators=(",", ":")) + "\n").encode()
+    for byte in data:
+        sys.stdout.buffer.write(bytes((byte,)))
+        sys.stdout.buffer.flush()
+        time.sleep(delay_s)
+
+
+def _write_deep_tool_response(request_id: int, *, depth: int, canary: str) -> None:
+    prefix = ('{"jsonrpc":"2.0","id":' + str(request_id) + ',"result":{"nested":').encode()
+    leaf = json.dumps(canary, separators=(",", ":")).encode()
+    sys.stdout.buffer.write(prefix + b"[" * depth + leaf + b"]" * depth + b"}}\n")
+    sys.stdout.buffer.flush()
+
+
+def _tool_response_with_exact_bytes(
+    request_id: int,
+    target_bytes: int,
+    *,
+    prefix: str = "",
+) -> dict:
+    response = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": prefix}],
+            "structuredContent": {},
+        },
+    }
+    encoded = json.dumps(response, separators=(",", ":")).encode()
+    if target_bytes < len(encoded):
+        raise ValueError("exact_response_bytes is smaller than the response envelope")
+    padding = "x" * (target_bytes - len(encoded))
+    response["result"]["content"][0]["text"] = prefix + padding
+    return response
 
 
 def _tool_response(request_id, *, text: str, structured_only: bool) -> dict:

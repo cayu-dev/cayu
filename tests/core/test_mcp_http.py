@@ -712,7 +712,15 @@ def test_http_paginated_mapping_failure_does_not_retain_private_cursor(
             secret_redactor=redactor,
         )
 
-        async def send(_payload: dict[str, Any], request_id: int) -> dict[str, Any]:
+        async def send(
+            _payload: dict[str, Any],
+            request_id: int,
+            *,
+            budget: Any,
+            failure_redactor: SecretRedactor | None = None,
+        ) -> dict[str, Any]:
+            del budget
+            assert failure_redactor is redactor
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -763,7 +771,15 @@ def test_http_invalid_paginated_cursor_does_not_retain_secret_payload(
             secret_redactor=redactor,
         )
 
-        async def send(_payload: dict[str, Any], request_id: int) -> dict[str, Any]:
+        async def send(
+            _payload: dict[str, Any],
+            request_id: int,
+            *,
+            budget: Any,
+            failure_redactor: SecretRedactor | None = None,
+        ) -> dict[str, Any]:
+            del budget
+            assert failure_redactor is redactor
             return {
                 "jsonrpc": "2.0",
                 "id": request_id,
@@ -1058,6 +1074,7 @@ def test_http_redacts_transport_error_without_retaining_raw_exception_cause() ->
     assert secret not in str(error)
     assert REDACTED_SECRET in str(error)
     assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 def test_http_rejects_secret_env() -> None:

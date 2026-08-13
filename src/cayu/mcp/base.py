@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
+from contextlib import suppress
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
+from cayu._exception_groups import exception_cause, set_exception_cause
 from cayu._validation import (
     copy_durable_json_object,
     copy_durable_json_value,
@@ -12,6 +15,11 @@ from cayu._validation import (
     require_durable_clean_nonblank,
     require_durable_nonblank,
     require_durable_text,
+)
+from cayu.mcp._exception_handoffs import (
+    attach_mcp_session_close_task,
+    copy_mcp_failure_handoffs,
+    mcp_session_close_task,
 )
 from cayu.vaults import SecretRedactor, SecretRef, copy_secret_ref
 
@@ -266,6 +274,14 @@ class McpSession(ABC):
     async def close(self) -> None:
         """Close the server connection."""
 
+    def _fence_before_retained_close(self) -> bool:
+        """Synchronously reject new work before close continues in the background.
+
+        This is an internal, fail-closed opt-in. Third-party sessions keep the safe
+        default so a discovery failure is not returned until their close completes.
+        """
+        return False
+
 
 class McpClient(ABC):
     """Factory for initialized MCP sessions."""
@@ -273,3 +289,342 @@ class McpClient(ABC):
     @abstractmethod
     async def connect(self, server: McpServerSpec) -> McpSession:
         """Connect to one MCP server."""
+
+
+_RETAINED_SESSION_CLOSE_TASKS: set[asyncio.Task[None]] = set()
+
+
+class _McpCallerCancellationBoundary:
+    """Distinguish current caller cancellation from child-only cancellation.
+
+    ``Task.cancelling()`` is an absolute request count, so a request already
+    pending when a boundary snapshots it is otherwise indistinguishable from a
+    historical, already-delivered request. The real cancellation checkpoint
+    below resolves that ambiguity before the owned await begins.
+    """
+
+    __slots__ = ("_caller_task", "_checkpoint_delivered", "_request_count")
+
+    def __init__(self) -> None:
+        self._caller_task = asyncio.current_task()
+        self._checkpoint_delivered = False
+        self._request_count = self._caller_task.cancelling() if self._caller_task is not None else 0
+
+    async def checkpoint(self) -> None:
+        try:
+            await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            self._checkpoint_delivered = True
+            raise
+        self._request_count = self._caller_task.cancelling() if self._caller_task is not None else 0
+
+    def caller_cancelled(self) -> bool:
+        if self._checkpoint_delivered:
+            return True
+        return (
+            self._caller_task is not None
+            and asyncio.current_task() is self._caller_task
+            and self._caller_task.cancelling() > self._request_count
+        )
+
+
+def _credential_safe_mcp_session_cleanup_failure(
+    error: BaseException,
+    *,
+    redactor: SecretRedactor,
+    context: str,
+) -> BaseException:
+    # Import lazily: _transport imports _jsonrpc, which imports this base module.
+    from cayu.mcp._transport import credential_safe_mcp_transport_failure
+
+    return credential_safe_mcp_transport_failure(
+        error,
+        redactor=redactor,
+        context=context,
+        preserve_cause=True,
+    )
+
+
+def _attach_mcp_session_cleanup_failure(
+    primary_error: BaseException,
+    cleanup_error: BaseException,
+) -> None:
+    prior_cause = exception_cause(primary_error)
+    if prior_cause is cleanup_error:
+        return
+    combined = (
+        cleanup_error
+        if prior_cause is None
+        else BaseExceptionGroup(
+            "MCP session cleanup failures.",
+            [prior_cause, cleanup_error],
+        )
+    )
+    set_exception_cause(primary_error, combined)
+
+
+async def _await_mcp_session_cleanup_task(
+    cleanup_task: asyncio.Task[None],
+    *,
+    redactor: SecretRedactor,
+    context: str,
+) -> None:
+    """Await owned cleanup while keeping caller cancellation authoritative."""
+
+    caller_cancellation: asyncio.CancelledError | None = None
+    cleanup_failure: BaseException | None = None
+    while True:
+        cancellation_boundary = _McpCallerCancellationBoundary()
+        try:
+            await cancellation_boundary.checkpoint()
+            await asyncio.shield(cleanup_task)
+            break
+        except asyncio.CancelledError as error:
+            received_caller_cancellation = cancellation_boundary.caller_cancelled()
+            if received_caller_cancellation:
+                if caller_cancellation is None:
+                    caller_cancellation = error
+                error = None
+                if not cleanup_task.done():
+                    continue
+                try:
+                    cleanup_task.result()
+                except BaseException as task_error:
+                    cleanup_failure = _credential_safe_mcp_session_cleanup_failure(
+                        task_error,
+                        redactor=redactor,
+                        context=context,
+                    )
+                    task_error = None
+                break
+            cleanup_failure = _credential_safe_mcp_session_cleanup_failure(
+                error,
+                redactor=redactor,
+                context=context,
+            )
+            error = None
+            break
+        except BaseException as error:
+            cleanup_failure = _credential_safe_mcp_session_cleanup_failure(
+                error,
+                redactor=redactor,
+                context=context,
+            )
+            error = None
+            break
+    del cleanup_task
+    if caller_cancellation is not None:
+        if cleanup_failure is not None:
+            _attach_mcp_session_cleanup_failure(caller_cancellation, cleanup_failure)
+        raise caller_cancellation
+    if cleanup_failure is not None:
+        raise cleanup_failure
+
+
+async def _close_mcp_session_with_safe_failure(session: McpSession) -> None:
+    safe_failure: BaseException | None = None
+    try:
+        await session.close()
+    except BaseException as error:
+        safe_failure = _credential_safe_mcp_session_cleanup_failure(
+            error,
+            redactor=session.secret_redactor,
+            context="MCP retained session cleanup failed",
+        )
+        error = None
+    if safe_failure is not None:
+        raise safe_failure
+
+
+def _retain_mcp_session_close(
+    session: McpSession,
+    *,
+    primary_error: BaseException,
+) -> asyncio.Task[None]:
+    """Start failed-connect cleanup without delaying its public control signal.
+
+    An inner transport boundary may already have attached a more exact settlement
+    owner (for example, a cancellation-resistant stdio writer). Retain this close
+    waiter as well, but never replace that exact handoff on the public error.
+    """
+
+    close_task = asyncio.create_task(_close_mcp_session_with_safe_failure(session))
+    _RETAINED_SESSION_CLOSE_TASKS.add(close_task)
+    if _mcp_session_close_task(primary_error) is None:
+        _attach_mcp_session_cleanup_task(primary_error, close_task)
+
+    def completed(task: asyncio.Task[None]) -> None:
+        _RETAINED_SESSION_CLOSE_TASKS.discard(task)
+        # This is the terminal observer for deliberately retained cleanup. Mixed
+        # BaseExceptionGroups (for example, cancellation plus an ordinary close
+        # failure) must not escape into the event loop as a second diagnostic.
+        with suppress(BaseException):
+            task.result()
+
+    close_task.add_done_callback(completed)
+    return close_task
+
+
+def _attach_mcp_session_cleanup_task(
+    primary_error: BaseException,
+    cleanup_task: asyncio.Task[None],
+) -> None:
+    attach_mcp_session_close_task(primary_error, cleanup_task)
+
+
+def _mcp_session_close_task(error: BaseException) -> asyncio.Task[None] | None:
+    return mcp_session_close_task(error)
+
+
+def _retain_mcp_session_close_if_fenced(
+    session: McpSession,
+    *,
+    primary_error: BaseException,
+) -> bool:
+    """Retain close only after the session positively proves synchronous fencing."""
+
+    # Fencing authority belongs to the concrete runtime class. A descendant may
+    # add work or reuse entrances that an inherited proof does not cover. Invoke
+    # the inherited hook so it can still fence entrances it does own, but do not
+    # accept that result as proof for the descendant's complete session boundary.
+    concrete_hook_owner = "_fence_before_retained_close" in type(session).__dict__
+    try:
+        fenced = session._fence_before_retained_close()
+    except asyncio.CancelledError:
+        # This hook is synchronous, so CancelledError cannot be delivery of a new
+        # task cancellation. Treat an extension-raised signal as failed fencing
+        # and finish close before returning the primary failure.
+        return False
+    except BaseException:
+        # Extension fencing is only a synchronous proof probe. Any signal raised
+        # by the probe means fencing was not proved; finish close through the
+        # ordinary owned cleanup path before returning the primary failure.
+        return False
+    if not concrete_hook_owner or fenced is not True:
+        return False
+    _retain_mcp_session_close(session, primary_error=primary_error)
+    return True
+
+
+async def _close_mcp_session_after_primary_failure(
+    session: McpSession,
+    *,
+    primary_error: BaseException,
+    primary_context: str,
+    cleanup_context: str,
+) -> asyncio.CancelledError | None:
+    """Finish unfenced cleanup and retain ordered, credential-safe diagnostics."""
+
+    close_task = asyncio.create_task(_capture_mcp_session_close_failure(session))
+    caller_cancellation: asyncio.CancelledError | None = None
+    cleanup_failure: BaseException | None = None
+    while True:
+        cancellation_boundary = _McpCallerCancellationBoundary()
+        try:
+            await cancellation_boundary.checkpoint()
+            raw_cleanup_failure = await asyncio.shield(close_task)
+            if raw_cleanup_failure is not None:
+                cleanup_failure = _credential_safe_mcp_session_cleanup_failure(
+                    raw_cleanup_failure,
+                    redactor=session.secret_redactor,
+                    context=cleanup_context,
+                )
+                raw_cleanup_failure = None
+            break
+        except asyncio.CancelledError as error:
+            received_caller_cancellation = cancellation_boundary.caller_cancelled()
+            if received_caller_cancellation:
+                if caller_cancellation is None:
+                    caller_cancellation = error
+                error = None
+                if not close_task.done():
+                    continue
+                raw_cleanup_failure = close_task.result()
+                if raw_cleanup_failure is not None:
+                    cleanup_failure = _credential_safe_mcp_session_cleanup_failure(
+                        raw_cleanup_failure,
+                        redactor=session.secret_redactor,
+                        context=cleanup_context,
+                    )
+                    raw_cleanup_failure = None
+                break
+            cleanup_failure = _credential_safe_mcp_session_cleanup_failure(
+                error,
+                redactor=session.secret_redactor,
+                context=cleanup_context,
+            )
+            error = None
+            break
+        except BaseException as error:
+            cleanup_failure = _credential_safe_mcp_session_cleanup_failure(
+                error,
+                redactor=session.secret_redactor,
+                context=cleanup_context,
+            )
+            error = None
+            break
+
+    if caller_cancellation is not None:
+        safe_cancellation = _credential_safe_mcp_cancellation(
+            caller_cancellation,
+            redactor=session.secret_redactor,
+        )
+        safe_primary = _credential_safe_mcp_session_cleanup_failure(
+            primary_error,
+            redactor=session.secret_redactor,
+            context=primary_context,
+        )
+        _attach_mcp_session_cleanup_failure(safe_cancellation, safe_primary)
+        if cleanup_failure is not None:
+            _attach_mcp_session_cleanup_failure(safe_cancellation, cleanup_failure)
+        return safe_cancellation
+    if cleanup_failure is not None:
+        _attach_mcp_session_cleanup_failure(primary_error, cleanup_failure)
+    return None
+
+
+async def _capture_mcp_session_close_failure(
+    session: McpSession,
+) -> BaseException | None:
+    """Capture extension process signals before they can escape an asyncio task."""
+
+    try:
+        await session.close()
+    except BaseException as error:
+        return error
+    return None
+
+
+def _credential_safe_mcp_cancellation(
+    cancellation: asyncio.CancelledError,
+    *,
+    redactor: SecretRedactor,
+) -> asyncio.CancelledError:
+    from cayu.mcp._transport import _credential_safe_mcp_exception_argument_value
+
+    try:
+        args = BaseException.__dict__["args"].__get__(cancellation, BaseException)
+    except BaseException:
+        args = ()
+    copied: list[Any] = []
+    if type(args) is tuple:
+        for value in args:
+            copied.append(
+                _credential_safe_mcp_exception_argument_value(
+                    value,
+                    redactor=redactor,
+                    max_bytes=2048,
+                    non_text_diagnostic="MCP operation cancelled",
+                )
+            )
+    safe_cancellation = asyncio.CancelledError(*copied)
+    copy_mcp_failure_handoffs(cancellation, safe_cancellation)
+    cause = exception_cause(cancellation)
+    if cause is not None and cause is not cancellation:
+        safe_cause = _credential_safe_mcp_session_cleanup_failure(
+            cause,
+            redactor=redactor,
+            context="MCP cancellation diagnostic",
+        )
+        set_exception_cause(safe_cancellation, safe_cause)
+    return safe_cancellation

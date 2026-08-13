@@ -628,7 +628,15 @@ class JsonUtf8SizeCounter:
         if isinstance(value, date):
             return self._string(value.isoformat())
         if type(value) in {int, float}:
-            return self._consume(len(str(value).encode("utf-8")))
+            try:
+                rendered = str(value)
+            except (OverflowError, ValueError):
+                # CPython bounds decimal conversion of very large integers. A
+                # size preflight must fail closed instead of leaking that raw
+                # interpreter error past a caller expecting a bounded result.
+                self.encountered_unsupported_value = True
+                return False
+            return self._consume(len(rendered.encode("utf-8")))
         if isinstance(value, BaseModel):
             fields = type(value).model_fields
             if not self._consume(2):

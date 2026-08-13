@@ -5228,9 +5228,10 @@ The first MCP implementation supports stdio servers:
 - stderr is treated as server logging, not protocol output.
 - The client rejects servers that negotiate an unsupported MCP protocol version.
 - Stdio writes are timeout-bounded separately from server response waits, so a
-  broken or backpressured MCP subprocess cannot hang Cayu before the request
-  timeout starts. A write timeout closes the stdio session because the server may
-  already have received part or all of the JSON-RPC message.
+  broken or backpressured MCP subprocess cannot hang Cayu. The absolute call
+  deadline starts before the write. A write timeout closes the stdio session
+  because the server may already have received part or all of the JSON-RPC
+  message.
 - Timed-out or caller-cancelled in-flight requests send MCP
   `notifications/cancelled` when the request has already been written, except for
   `initialize`, which MCP clients must not cancel. The notification write is
@@ -5365,6 +5366,72 @@ HTTP client constructed with a secret resolver, such as
 injected into request headers at connect time. Each `SecretRef` is resolved
 through the supplied vault/proxy and is never inlined into the spec; plain,
 non-secret values go in `env` (stdio) or `headers` (HTTP).
+
+Every MCP exchange also has a Cayu-owned transport envelope. Pass one immutable
+`McpTransportLimits` to `StdioMcpClient(transport_limits=...)` or
+`HttpMcpClient(transport_limits=...)` to set `max_message_bytes`,
+`max_response_bytes`, `idle_timeout_s`, and `total_call_timeout_s` together.
+The default byte ceilings are 16 MiB per JSON-RPC message or SSE event and
+64 MiB per aggregate HTTP response. When no limits object is supplied, the
+legacy stdio `request_timeout_s` and HTTP `timeout_s` behavior remains: stdio
+uses 30 seconds and HTTP uses 120 seconds for both idle and total time. An
+explicit limits object cannot be combined with the matching legacy timeout;
+HTTP `metadata["timeout"]` remains a per-server compatibility override only
+when the client does not have explicit transport limits.
+
+Limits are enforced while bytes arrive, before a complete untrusted document is
+retained. A stdio message counts its UTF-8 JSON bytes but not its LF or CRLF
+record delimiter. An SSE event counts field framing and its non-terminal line
+endings but not the blank line that dispatches the event. The aggregate HTTP
+limit counts every consumed body byte, including SSE delimiters. The exact
+ceiling is accepted and the next byte is rejected. HTTP requests force redirects
+off, accept only 2xx responses (including session-termination DELETEs), and
+request identity encoding; a compressed response is rejected before its body is
+consumed so decoded allocation cannot bypass the byte ceilings.
+Outbound requests, including runtime tool-adapter calls through either built-in
+transport, whose encoded JSON-RPC envelope exceeds `max_message_bytes` fail
+before Cayu allocates its complete defensive copy. Requests whose JSON nesting
+exceeds Cayu's bounded defensive-copy envelope fail with `McpProtocolError`
+before serialization or dispatch. Invalid JSON values inside object-shaped
+outbound requests fail through a detached, workload-redacted `McpProtocolError`.
+This pre-dispatch validation leaves an initialized transport session reusable.
+Inbound JSON and SSE messages use the same nesting envelope before recursive
+copying or workload-secret redaction. Excessive nesting and decoder recursion
+fail with `McpProtocolError`; stdio closes its shared process and settles every
+waiter, while a completely received HTTP content rejection retains an ordinary
+initialized session after response cleanup.
+
+`McpIdleTimeoutError` and `McpCallDeadlineExceededError` remain catchable as
+`TimeoutError`. `McpMessageTooLargeError`, `McpResponseTooLargeError`, and
+`McpPeerClosedError` remain catchable as `McpProtocolError`. Fatal stdio framing,
+UTF-8, overflow, or peer-closure failures close the shared process and settle all
+pending requests. A stdio idle/total timeout or caller cancellation also fences
+the shared process after the best-effort cancellation notification, because that
+notification does not prove already-dispatched work stopped. An HTTP response
+failure is isolated to that response when it can be closed definitively; bounded
+content and protocol rejections retain the logical session. HTTP idle/total
+timeout after dispatch, caller or unexpected transport cancellation, peer/network
+closure, initialization failure, HTTP 404, or failed/uncertain response cleanup
+closes the HTTP session. A total deadline reached before transport dispatch leaves
+an already-initialized HTTP session reusable because no remote outcome exists to
+fence. Absolute stdio and HTTP deadlines and caller cancellation are
+delivered without adding a fresh cleanup timeout, including during initialization
+and built-in-session tool discovery, because those sessions synchronously fence
+reuse before retaining cleanup. An injected `McpSession` that cannot make that
+positive fencing guarantee finishes `close()` before its discovery failure is
+returned. Stdio retains ordered cancellation-notification/process cleanup; if an
+injected HTTP transport or response close remains in flight, a private settlement
+task retains that exact work while the logical session stays fenced. Bounded
+`close()` waiting never makes either session reusable. During initialization, a
+session identifier from successful response headers remains cleanup-only until
+the full transaction publishes. If later response work is uncertain, retained
+cleanup settles that exact response owner, best-effort terminates the unpublished
+server session, and only then closes the HTTP client. When an established
+session's response has completed transport cleanup but expires during semantic
+processing, Cayu likewise retains bounded server-session termination before
+closing the HTTP client; this cleanup does not extend the public call deadline.
+Response session identifiers are installed only after the bounded response is
+accepted and validated.
 
 OAuth, MCP prompts, sampling, elicitation, and automatic resource injection are
 future layers. MCP resources should remain explicit and policy-controlled instead

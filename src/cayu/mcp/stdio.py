@@ -3,10 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Any
 
-from cayu._validation import copy_json_value, require_clean_nonblank
+from cayu._validation import (
+    copy_json_value,
+    json_utf8_size_within_limit,
+    require_clean_nonblank,
+)
 from cayu.mcp._jsonrpc import (
     DEFAULT_MCP_CLIENT_NAME,
     DEFAULT_MCP_CLIENT_VERSION,
@@ -34,6 +40,20 @@ from cayu.mcp._jsonrpc import (
     validate_positive_integer,
     validate_positive_number,
 )
+from cayu.mcp._transport import (
+    McpCallDeadlineExceededError,
+    McpIdleTimeoutError,
+    McpMessageTooLargeError,
+    McpPeerClosedError,
+    McpTransportLimits,
+    _capture_mcp_owned_task_fatal_signal,
+    _unwrap_mcp_owned_task_result,
+    credential_safe_mcp_fatal_signal,
+    credential_safe_mcp_transport_failure,
+    mcp_json_value_nesting_too_deep,
+    mcp_jsonrpc_request_preflight,
+    resolve_mcp_transport_limits,
+)
 from cayu.mcp.base import (
     McpClient,
     McpInitializeResult,
@@ -43,6 +63,13 @@ from cayu.mcp.base import (
     McpSession,
     McpToolDefinition,
     McpToolResult,
+    _attach_mcp_session_cleanup_task,
+    _await_mcp_session_cleanup_task,
+    _close_mcp_session_after_primary_failure,
+    _credential_safe_mcp_cancellation,
+    _mcp_session_close_task,
+    _McpCallerCancellationBoundary,
+    _retain_mcp_session_close,
     copy_mcp_server_spec,
 )
 from cayu.vaults import (
@@ -80,6 +107,36 @@ DEFAULT_MCP_STDERR_CAPTURE_BYTES = 8192
 # Best-effort grace period to let the stderr drain finish (and reach EOF) after
 # the child closes stdout, so a crash message lands in the captured tail.
 DEFAULT_MCP_STDERR_DRAIN_GRACE_S = 0.2
+_RETAINED_STDIO_WRITE_SETTLEMENT_TASKS: set[asyncio.Task[None]] = set()
+_RETAINED_STDIO_SHUTDOWN_TASKS: set[asyncio.Task[Any]] = set()
+
+
+class _StdioPreDispatchMessageTooLargeError(McpMessageTooLargeError):
+    """Internal proof that stdio size validation rejected before dispatch."""
+
+
+@dataclass(frozen=True, slots=True)
+class _StdioPendingTiming:
+    settled_at: float
+    last_read_activity: float
+    expired_idle_gap: tuple[float, float] | None
+    response_received: bool
+
+
+def _clear_completed_stdio_response(
+    future: asyncio.Future[dict[str, Any]],
+) -> None:
+    """Drop a private response that lost a timeout or cancellation race."""
+
+    if not future.done() or future.cancelled():
+        return
+    try:
+        response = future.result()
+    except BaseException:
+        # Reading the exception prevents asyncio from publishing a second,
+        # uncontrolled diagnostic. Pending failures are already credential-safe.
+        return
+    response.clear()
 
 
 def _base_child_env(inherit_env: bool) -> dict[str, str]:
@@ -104,7 +161,8 @@ class StdioMcpClient(McpClient):
     def __init__(
         self,
         *,
-        request_timeout_s: float = DEFAULT_MCP_REQUEST_TIMEOUT_S,
+        request_timeout_s: float | None = None,
+        transport_limits: McpTransportLimits | None = None,
         write_timeout_s: float = DEFAULT_MCP_WRITE_TIMEOUT_S,
         graceful_shutdown_timeout_s: float = DEFAULT_MCP_GRACEFUL_SHUTDOWN_TIMEOUT_S,
         cancellation_notification_timeout_s: float = DEFAULT_MCP_CANCELLATION_NOTIFICATION_TIMEOUT_S,
@@ -115,10 +173,15 @@ class StdioMcpClient(McpClient):
         inherit_env: bool = False,
         secret_resolver: SecretResolver | None = None,
     ) -> None:
-        self.request_timeout_s = validate_positive_number(
-            request_timeout_s,
-            "request_timeout_s",
+        self.transport_limits = resolve_mcp_transport_limits(
+            transport_limits,
+            legacy_timeout_s=request_timeout_s,
+            default_timeout_s=DEFAULT_MCP_REQUEST_TIMEOUT_S,
+            legacy_field_name="request_timeout_s",
         )
+        self._has_explicit_transport_limits = transport_limits is not None
+        # Retain the legacy observable attribute for callers that inspect it.
+        self.request_timeout_s = self.transport_limits.total_call_timeout_s
         self.write_timeout_s = validate_positive_number(
             write_timeout_s,
             "write_timeout_s",
@@ -178,6 +241,7 @@ class StdioMcpClient(McpClient):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=child_env,
+                limit=self.transport_limits.max_message_bytes + 2,
             )
         finally:
             # The child owns its copied environment after a successful spawn. Do
@@ -186,7 +250,12 @@ class StdioMcpClient(McpClient):
         session = StdioMcpSession(
             server=server,
             process=process,
-            request_timeout_s=self.request_timeout_s,
+            request_timeout_s=(
+                None if self._has_explicit_transport_limits else self.request_timeout_s
+            ),
+            transport_limits=(
+                self.transport_limits if self._has_explicit_transport_limits else None
+            ),
             write_timeout_s=self.write_timeout_s,
             graceful_shutdown_timeout_s=self.graceful_shutdown_timeout_s,
             cancellation_notification_timeout_s=self.cancellation_notification_timeout_s,
@@ -196,15 +265,30 @@ class StdioMcpClient(McpClient):
             max_list_items=self.max_list_items,
             secret_redactor=secret_redactor,
         )
+        cleanup_cancellation: asyncio.CancelledError | None = None
         try:
             await session.initialize()
-        except asyncio.CancelledError:
-            await _close_session_after_failed_connect(session)
+        except asyncio.CancelledError as error:
+            if _mcp_session_close_task(error) is None:
+                _retain_mcp_session_close(session, primary_error=error)
             raise
-        except Exception:
-            await _close_session_after_failed_connect(session)
+        except TimeoutError as error:
+            if _mcp_session_close_task(error) is None:
+                _retain_mcp_session_close(session, primary_error=error)
             raise
-        return session
+        except Exception as error:
+            cleanup_cancellation = await _close_mcp_session_after_primary_failure(
+                session,
+                primary_error=error,
+                primary_context="MCP stdio initialization failed",
+                cleanup_context="MCP stdio initialization cleanup failed",
+            )
+            if cleanup_cancellation is None:
+                raise
+        else:
+            return session
+        assert cleanup_cancellation is not None
+        raise cleanup_cancellation
 
 
 class StdioMcpSession(McpSession):
@@ -213,7 +297,8 @@ class StdioMcpSession(McpSession):
         *,
         server: McpServerSpec,
         process: asyncio.subprocess.Process,
-        request_timeout_s: float,
+        request_timeout_s: float | None = None,
+        transport_limits: McpTransportLimits | None = None,
         write_timeout_s: float,
         graceful_shutdown_timeout_s: float,
         cancellation_notification_timeout_s: float,
@@ -224,10 +309,18 @@ class StdioMcpSession(McpSession):
         secret_redactor: SecretRedactor | None = None,
     ) -> None:
         server = copy_mcp_server_spec(server)
+        resolved_limits = resolve_mcp_transport_limits(
+            transport_limits,
+            legacy_timeout_s=request_timeout_s,
+            default_timeout_s=DEFAULT_MCP_REQUEST_TIMEOUT_S,
+            legacy_field_name="request_timeout_s",
+        )
         self.server = server
         self.process = process
         self._secret_redactor = secret_redactor or SecretRedactor()
-        self.request_timeout_s = request_timeout_s
+        self.transport_limits = resolved_limits
+        self._uses_legacy_request_timeout = transport_limits is None
+        self._request_timeout_s = resolved_limits.total_call_timeout_s
         self.write_timeout_s = write_timeout_s
         self.graceful_shutdown_timeout_s = graceful_shutdown_timeout_s
         self.cancellation_notification_timeout_s = cancellation_notification_timeout_s
@@ -239,6 +332,11 @@ class StdioMcpSession(McpSession):
         self._next_id = 1
         self._closed = False
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._pending_timing: dict[int, _StdioPendingTiming] = {}
+        self._stdout_buffer = bytearray()
+        self._last_read_activity = asyncio.get_running_loop().time()
+        self._last_expired_idle_gap: tuple[float, float] | None = None
+        self._peer_closed_at: float | None = None
         self._write_lock = asyncio.Lock()
         self._stderr_tail = SecretRedactionTail(
             self._secret_redactor,
@@ -247,6 +345,7 @@ class StdioMcpSession(McpSession):
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         self._close_task: asyncio.Task[None] | None = None
+        self._request_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._tool_transport_names: dict[str, str] = {}
         self._resource_transport_uris: dict[str, str] = {}
         self._authority_mapping_lock = asyncio.Lock()
@@ -257,27 +356,86 @@ class StdioMcpSession(McpSession):
             raise McpProtocolError("MCP session has not been initialized.")
         return self._initialize_result
 
-    async def initialize(self) -> None:
-        result = await self._request(
-            "initialize",
-            initialize_params(self.client_name, self.client_version),
+    @property
+    def request_timeout_s(self) -> float:
+        return self._request_timeout_s
+
+    @request_timeout_s.setter
+    def request_timeout_s(self, value: float) -> None:
+        timeout_s = validate_positive_number(value, "request_timeout_s")
+        limits = self.transport_limits
+        updated_limits = McpTransportLimits(
+            max_message_bytes=limits.max_message_bytes,
+            max_response_bytes=limits.max_response_bytes,
+            idle_timeout_s=timeout_s,
+            total_call_timeout_s=timeout_s,
         )
-        if type(result) is not dict:
-            raise McpProtocolError("MCP initialize result must be an object.")
-        initialize_result = initialize_result_from_payload(result)
-        validation_error: McpProtocolError | None = None
+        if getattr(self, "_uses_legacy_request_timeout", False):
+            self.transport_limits = updated_limits
+        self._request_timeout_s = timeout_s
+
+    async def initialize(self) -> None:
+        def parse_initialize_result(result: Any) -> McpInitializeResult:
+            initialize_result = initialize_result_from_payload(result)
+            validation_error: McpProtocolError | None = None
+            try:
+                validate_negotiated_protocol_version(initialize_result.protocol_version)
+            except McpProtocolError as error:
+                validation_error = McpProtocolError(self._secret_redactor.redact_text(str(error)))
+            if validation_error is not None:
+                del initialize_result
+                raise validation_error from None
+            return initialize_result
+
         try:
-            validate_negotiated_protocol_version(initialize_result.protocol_version)
-        except McpProtocolError as exc:
-            validation_error = McpProtocolError(self._secret_redactor.redact_text(str(exc)))
-        if validation_error is not None:
-            del initialize_result
-            raise validation_error from None
-        self._initialize_result = initialize_result
-        await self._notify("notifications/initialized", {})
+            initialize_result = await self._request(
+                "initialize",
+                initialize_params(self.client_name, self.client_version),
+                result_parser=parse_initialize_result,
+            )
+            await self._notify("notifications/initialized", {})
+            self._initialize_result = initialize_result
+        except BaseException as error:
+            self._initialize_result = None
+            self._closed = True
+            _retain_mcp_session_close(self, primary_error=error)
+            raise
 
     async def list_tools(self) -> tuple[McpToolDefinition, ...]:
         transport_names: dict[str, str] = {}
+        parsed_tool_count = 0
+
+        def parse_tools_page(result: Any) -> dict[str, Any]:
+            nonlocal parsed_tool_count
+            if type(result) is not dict:
+                raise McpProtocolError("MCP tools/list result must be an object.")
+            tools = result.get("tools", [])
+            if type(tools) is not list:
+                raise McpProtocolError("MCP tools/list result tools must be a list.")
+            observed_items = parsed_tool_count + len(tools)
+            if observed_items > self.max_list_items:
+                result.clear()
+                raise McpProtocolError(
+                    f"MCP tools/list returned {observed_items} items, exceeding "
+                    f"max_list_items={self.max_list_items}."
+                )
+            parse_failed = False
+            definitions: list[McpToolDefinition] = []
+            try:
+                definitions = [
+                    tool_definition_from_payload(tool, self.server.name) for tool in tools
+                ]
+            except (McpProtocolError, TypeError, ValueError):
+                parse_failed = True
+            finally:
+                result.clear()
+            if parse_failed:
+                definitions.clear()
+                raise McpProtocolError(
+                    "MCP tools/list returned an invalid tool definition."
+                ) from None
+            parsed_tool_count = observed_items
+            return {"tools": definitions}
 
         async def request_page(method: str, params: dict[str, Any]) -> Any:
             return await self._request(
@@ -285,28 +443,22 @@ class StdioMcpSession(McpSession):
                 params,
                 authority_mapping=transport_names,
                 paginated=True,
+                result_parser=parse_tools_page,
             )
 
-        tools = await collect_paginated(
-            request_page,
-            "tools/list",
-            "tools",
-            max_pages=self.max_list_pages,
-            max_items=self.max_list_items,
-            redactor=self._secret_redactor,
-        )
-        definitions: tuple[McpToolDefinition, ...] = ()
-        definition_error = False
         try:
-            definitions = tuple(
-                tool_definition_from_payload(tool, self.server.name) for tool in tools
+            tools = await collect_paginated(
+                request_page,
+                "tools/list",
+                "tools",
+                max_pages=self.max_list_pages,
+                max_items=self.max_list_items,
+                redactor=self._secret_redactor,
             )
-        except (McpProtocolError, TypeError, ValueError):
-            definition_error = True
-        if definition_error:
+        except BaseException:
             transport_names.clear()
-            tools.clear()
-            raise McpProtocolError("MCP tools/list returned an invalid tool definition.") from None
+            raise
+        definitions = tuple(tools)
         async with self._authority_mapping_lock:
             merge_result = merge_jsonrpc_authority_mapping(
                 self._tool_transport_names,
@@ -327,22 +479,68 @@ class StdioMcpSession(McpSession):
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> McpToolResult:
         tool_name = require_clean_nonblank(name, "tool name")
-        copied_arguments = copy_json_value(arguments, "arguments")
-        if type(copied_arguments) is not dict:
-            raise TypeError("MCP tool arguments must be an object.")
-        result = await self._request(
+        if type(arguments) is not dict:
+            if mcp_json_value_nesting_too_deep(arguments):
+                arguments = {}
+                raise McpProtocolError(
+                    "MCP tool arguments exceeded the supported JSON nesting."
+                ) from None
+            copied_arguments = copy_json_value(arguments, "arguments")
+            if type(copied_arguments) is not dict:
+                raise TypeError("MCP tool arguments must be an object.")
+            arguments = copied_arguments
+        request_params = {
+            "name": self._tool_transport_names.get(tool_name, tool_name),
+            "arguments": arguments,
+        }
+        # The request owns its shallow parameter object. Drop caller-owned input
+        # from this public frame before a typed outbound-overflow traceback can
+        # cross the MCP boundary.
+        name = ""
+        tool_name = ""
+        arguments = {}
+        return await self._request(
             "tools/call",
-            {
-                "name": self._tool_transport_names.get(tool_name, tool_name),
-                "arguments": copied_arguments,
-            },
+            request_params,
+            result_parser=tool_result_from_payload,
         )
-        if type(result) is not dict:
-            raise McpProtocolError("MCP tools/call result must be an object.")
-        return tool_result_from_payload(result)
 
     async def list_resources(self) -> tuple[McpResourceDefinition, ...]:
         transport_uris: dict[str, str] = {}
+        parsed_resource_count = 0
+
+        def parse_resources_page(result: Any) -> dict[str, Any]:
+            nonlocal parsed_resource_count
+            if type(result) is not dict:
+                raise McpProtocolError("MCP resources/list result must be an object.")
+            resources = result.get("resources", [])
+            if type(resources) is not list:
+                raise McpProtocolError("MCP resources/list result resources must be a list.")
+            observed_items = parsed_resource_count + len(resources)
+            if observed_items > self.max_list_items:
+                result.clear()
+                raise McpProtocolError(
+                    f"MCP resources/list returned {observed_items} items, exceeding "
+                    f"max_list_items={self.max_list_items}."
+                )
+            parse_failed = False
+            definitions: list[McpResourceDefinition] = []
+            try:
+                definitions = [
+                    resource_definition_from_payload(resource, self.server.name)
+                    for resource in resources
+                ]
+            except (McpProtocolError, TypeError, ValueError):
+                parse_failed = True
+            finally:
+                result.clear()
+            if parse_failed:
+                definitions.clear()
+                raise McpProtocolError(
+                    "MCP resources/list returned an invalid resource definition."
+                ) from None
+            parsed_resource_count = observed_items
+            return {"resources": definitions}
 
         async def request_page(method: str, params: dict[str, Any]) -> Any:
             return await self._request(
@@ -350,31 +548,22 @@ class StdioMcpSession(McpSession):
                 params,
                 authority_mapping=transport_uris,
                 paginated=True,
+                result_parser=parse_resources_page,
             )
 
-        resources = await collect_paginated(
-            request_page,
-            "resources/list",
-            "resources",
-            max_pages=self.max_list_pages,
-            max_items=self.max_list_items,
-            redactor=self._secret_redactor,
-        )
-        definitions: tuple[McpResourceDefinition, ...] = ()
-        definition_error = False
         try:
-            definitions = tuple(
-                resource_definition_from_payload(resource, self.server.name)
-                for resource in resources
+            resources = await collect_paginated(
+                request_page,
+                "resources/list",
+                "resources",
+                max_pages=self.max_list_pages,
+                max_items=self.max_list_items,
+                redactor=self._secret_redactor,
             )
-        except (McpProtocolError, TypeError, ValueError):
-            definition_error = True
-        if definition_error:
+        except BaseException:
             transport_uris.clear()
-            resources.clear()
-            raise McpProtocolError(
-                "MCP resources/list returned an invalid resource definition."
-            ) from None
+            raise
+        definitions = tuple(resources)
         async with self._authority_mapping_lock:
             merge_result = merge_jsonrpc_authority_mapping(
                 self._resource_transport_uris,
@@ -395,52 +584,141 @@ class StdioMcpSession(McpSession):
 
     async def read_resource(self, uri: str) -> McpResourceResult:
         resource_uri = require_clean_nonblank(uri, "resource uri")
-        result = await self._request(
+        return await self._request(
             "resources/read",
             {"uri": self._resource_transport_uris.get(resource_uri, resource_uri)},
+            result_parser=resource_result_from_payload,
         )
-        if type(result) is not dict:
-            raise McpProtocolError("MCP resources/read result must be an object.")
-        return resource_result_from_payload(result)
 
     async def close(self) -> None:
+        sanitized_cancellation: asyncio.CancelledError | None = None
+        try:
+            current_task = asyncio.current_task()
+            request_cleanup_tasks = tuple(
+                task
+                for task in self._request_cleanup_tasks
+                if task is not current_task and not task.done()
+            )
+            if request_cleanup_tasks:
+                await asyncio.gather(
+                    *(asyncio.shield(task) for task in request_cleanup_tasks),
+                    return_exceptions=True,
+                )
+            self._schedule_close()
+            assert self._close_task is not None
+            await _await_mcp_session_cleanup_task(
+                self._close_task,
+                redactor=self._secret_redactor,
+                context="MCP stdio session cleanup failed",
+            )
+        except asyncio.CancelledError as cancellation:
+            sanitized_cancellation = _credential_safe_mcp_cancellation(
+                cancellation,
+                redactor=self._secret_redactor,
+            )
+        if sanitized_cancellation is not None:
+            raise sanitized_cancellation
+
+    def _fence_before_retained_close(self) -> bool:
+        # Even when a subclass must finish its own close synchronously, the
+        # inherited stdio request entrances can be fenced immediately.
+        self._closed = True
+        # Subclasses can own additional dispatch paths or pending work. They must
+        # opt in with their own positive fencing proof rather than inheriting
+        # authority established only for this implementation.
+        return type(self) is StdioMcpSession
+
+    def _schedule_close(self) -> None:
+        self._closed = True
         if self._close_task is None:
-            self._closed = True
-            self._close_task = asyncio.create_task(self._close_impl())
-        cleanup_task = self._close_task
-        was_cancelled = False
-        while True:
-            try:
-                await asyncio.shield(cleanup_task)
-                break
-            except asyncio.CancelledError:
-                was_cancelled = True
-                if cleanup_task.done():
-                    break
-        if was_cancelled:
-            raise asyncio.CancelledError
+            self._close_task = asyncio.create_task(self._close_impl_with_safe_failure())
+            self._close_task.add_done_callback(_consume_task_result)
+
+    async def _close_impl_with_safe_failure(self) -> None:
+        safe_failure: BaseException | None = None
+        try:
+            await self._close_impl()
+        except BaseException as error:
+            safe_failure = credential_safe_mcp_transport_failure(
+                error,
+                redactor=self._secret_redactor,
+                context="MCP stdio session cleanup failed",
+            )
+            error = None
+        if safe_failure is not None:
+            raise safe_failure from None
 
     async def _close_impl(self) -> None:
-        if self.process.returncode is None:
-            await self._close_stdin_for_graceful_shutdown()
+        failures: list[BaseException] = []
+
+        async def settle_shutdown_task(task: asyncio.Task[Any]) -> bool:
+            done, _pending = await asyncio.wait(
+                (task,),
+                timeout=self.graceful_shutdown_timeout_s,
+            )
+            if task not in done:
+                _retain_cancelled_stdio_shutdown_task(task)
+                return False
             try:
-                await asyncio.wait_for(
-                    self.process.wait(),
-                    timeout=self.graceful_shutdown_timeout_s,
+                task.result()
+            except BaseException as error:
+                failures.append(error)
+            return True
+
+        async def wait_for_process_exit(*, final: bool = False) -> bool:
+            if self.process.returncode is not None:
+                return True
+            wait_task = asyncio.create_task(self.process.wait())
+            settled = await settle_shutdown_task(wait_task)
+            process_exited = self.process.returncode is not None
+            if final and not settled and not process_exited:
+                failures.append(
+                    McpProtocolError("MCP stdio process did not exit after it was killed.")
                 )
-            except TimeoutError:
-                self.process.terminate()
+            return process_exited
+
+        if self.process.returncode is None:
+            stdin_close_task = asyncio.create_task(self._close_stdin_for_graceful_shutdown())
+            await settle_shutdown_task(stdin_close_task)
+            process_exited = self.process.returncode is not None
+            if not process_exited:
+                process_exited = await wait_for_process_exit()
+            if not process_exited and self.process.returncode is None:
                 try:
-                    await asyncio.wait_for(
-                        self.process.wait(),
-                        timeout=self.graceful_shutdown_timeout_s,
-                    )
-                except TimeoutError:
+                    self.process.terminate()
+                except ProcessLookupError:
+                    pass
+                except BaseException as error:
+                    failures.append(error)
+                process_exited = self.process.returncode is not None
+                if not process_exited:
+                    process_exited = await wait_for_process_exit()
+            if not process_exited and self.process.returncode is None:
+                try:
                     self.process.kill()
-                    await self.process.wait()
-        self._fail_pending(McpProtocolError("MCP stdio session closed."))
-        await self._cancel_background_task(self._reader_task)
-        await self._cancel_background_task(self._stderr_task)
+                except ProcessLookupError:
+                    pass
+                except BaseException as error:
+                    failures.append(error)
+                if self.process.returncode is None:
+                    await wait_for_process_exit(final=True)
+        try:
+            self._stdout_buffer.clear()
+        except BaseException as error:
+            failures.append(error)
+        try:
+            self._fail_pending(McpProtocolError("MCP stdio session closed."))
+        except BaseException as error:
+            failures.append(error)
+        for task in (self._reader_task, self._stderr_task):
+            try:
+                await self._cancel_background_task(task)
+            except BaseException as error:
+                failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("MCP stdio session cleanup failures.", failures)
 
     async def _request(
         self,
@@ -449,54 +727,206 @@ class StdioMcpSession(McpSession):
         *,
         authority_mapping: dict[str, str] | None = None,
         paginated: bool = False,
+        result_parser: Callable[[Any], Any] | None = None,
     ) -> Any:
         if self._closed:
             raise McpProtocolError("MCP stdio session is closed.")
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        # Legacy sessions retain their mutable timeout alias for compatibility;
+        # an explicit immutable limits object remains authoritative.
+        call_timeout_s = (
+            self.request_timeout_s
+            if self._uses_legacy_request_timeout
+            else self.transport_limits.total_call_timeout_s
+        )
+        idle_timeout_s = self.transport_limits.idle_timeout_s
+        call_deadline = started_at + call_timeout_s
         method_name = require_clean_nonblank(method, "method")
         request_id = self._next_id
         self._next_id += 1
+        request_written = False
+        sanitized_cancellation: asyncio.CancelledError | None = None
+        sanitized_failure: BaseException | None = None
+        preparation_error: BaseException | None = None
+        try:
+            try:
+                request_preflight = mcp_jsonrpc_request_preflight(
+                    request_id,
+                    method_name,
+                    params,
+                    max_bytes=self.transport_limits.max_message_bytes,
+                )
+                if request_preflight.exceeds_limit:
+                    size_error = McpMessageTooLargeError(
+                        "MCP stdio JSON-RPC message exceeded "
+                        f"{self.transport_limits.max_message_bytes} bytes."
+                    )
+                    raise size_error from None
+                if request_preflight.nesting_too_deep:
+                    raise McpProtocolError(
+                        "MCP stdio JSON-RPC request exceeded the supported JSON nesting."
+                    ) from None
+                if loop.time() >= call_deadline:
+                    self._schedule_close()
+                    raise McpCallDeadlineExceededError(
+                        "MCP stdio exchange exceeded its total call deadline."
+                    )
+                payload = jsonrpc_request_payload(request_id, method_name, params)
+            except (RecursionError, TypeError, ValueError) as error:
+                preparation_error = credential_safe_mcp_transport_failure(
+                    error,
+                    redactor=self._secret_redactor,
+                    context=f"MCP {method_name} request preparation failed",
+                )
+                error = None
+        finally:
+            # This shallow container is transport-owned. Scrub every preparation
+            # exit without mutating nested dictionaries still owned by the caller.
+            params.clear()
+        if preparation_error is not None:
+            raise preparation_error from None
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        request_written = False
-        payload = jsonrpc_request_payload(request_id, method_name, params)
+        write_cancellation_boundary = _McpCallerCancellationBoundary()
         try:
+            await write_cancellation_boundary.checkpoint()
             await self._write_with_timeout(
                 payload,
                 timeout_message=f"MCP request {request_id} write timed out.",
+                call_deadline=call_deadline,
             )
             request_written = True
-        except asyncio.CancelledError:
+            payload.clear()
+        except asyncio.CancelledError as error:
             self._pending.pop(request_id, None)
+            self._pending_timing.pop(request_id, None)
             future.cancel()
-            raise
-        except TimeoutError:
+            if self._close_task is not None and _mcp_session_close_task(error) is None:
+                _attach_mcp_session_cleanup_task(error, self._close_task)
+            payload.clear()
+            if write_cancellation_boundary.caller_cancelled():
+                sanitized_cancellation = _credential_safe_mcp_cancellation(
+                    error,
+                    redactor=self._secret_redactor,
+                )
+            else:
+                sanitized_failure = credential_safe_mcp_transport_failure(
+                    error,
+                    redactor=self._secret_redactor,
+                    context="MCP stdio transport write was cancelled unexpectedly",
+                    preserve_cause=True,
+                )
+                if _mcp_session_close_task(sanitized_failure) is None:
+                    self._schedule_close()
+                    assert self._close_task is not None
+                    _attach_mcp_session_cleanup_task(sanitized_failure, self._close_task)
+        except TimeoutError as error:
             self._pending.pop(request_id, None)
+            self._pending_timing.pop(request_id, None)
             future.cancel()
-            raise
-        except Exception:
+            if self._close_task is not None and _mcp_session_close_task(error) is None:
+                _attach_mcp_session_cleanup_task(error, self._close_task)
+            payload.clear()
+            sanitized_failure = credential_safe_mcp_transport_failure(
+                error,
+                redactor=self._secret_redactor,
+                context=f"MCP {method_name} request write timed out",
+                preserve_cause=True,
+            )
+        except (BaseExceptionGroup, Exception) as error:
             self._pending.pop(request_id, None)
+            self._pending_timing.pop(request_id, None)
+            _clear_completed_stdio_response(future)
+            future.cancel()
+            if self._close_task is not None and _mcp_session_close_task(error) is None:
+                _attach_mcp_session_cleanup_task(error, self._close_task)
+            payload.clear()
             raise
+        except (KeyboardInterrupt, SystemExit, GeneratorExit) as error:
+            self._pending.pop(request_id, None)
+            self._pending_timing.pop(request_id, None)
+            _clear_completed_stdio_response(future)
+            future.cancel()
+            payload.clear()
+            sanitized_failure = credential_safe_mcp_fatal_signal(
+                error,
+                redactor=self._secret_redactor,
+                context=f"MCP {method_name} request write failed",
+            )
+            error = None
+        if sanitized_failure is not None:
+            raise sanitized_failure
+        if sanitized_cancellation is not None:
+            raise sanitized_cancellation
+        response_cancellation_boundary = _McpCallerCancellationBoundary()
         try:
-            response = await asyncio.wait_for(future, timeout=self.request_timeout_s)
-        except TimeoutError:
+            await response_cancellation_boundary.checkpoint()
+            response = await self._wait_for_response(
+                future,
+                request_id=request_id,
+                started_at=started_at,
+                call_deadline=call_deadline,
+                idle_timeout_s=idle_timeout_s,
+            )
+        except TimeoutError as error:
             self._pending.pop(request_id, None)
+            self._pending_timing.pop(request_id, None)
+            _clear_completed_stdio_response(future)
+            future.cancel()
             if request_written:
-                await self._send_request_cancelled_notification(
+                self._fence_uncertain_request()
+                self._schedule_uncertain_request_cleanup(
                     request_id,
                     method_name=method_name,
                     reason="Cayu request timed out.",
+                    primary_error=error,
                 )
-            raise TimeoutError(f"MCP request {request_id} timed out.") from None
-        except asyncio.CancelledError:
+            sanitized_failure = credential_safe_mcp_transport_failure(
+                error,
+                redactor=self._secret_redactor,
+                context=f"MCP {method_name} request timed out",
+                preserve_cause=True,
+            )
+        except asyncio.CancelledError as error:
             self._pending.pop(request_id, None)
+            self._pending_timing.pop(request_id, None)
+            _clear_completed_stdio_response(future)
             future.cancel()
+            caller_cancelled = response_cancellation_boundary.caller_cancelled()
+            primary_error: BaseException | None = error
+            if not caller_cancelled:
+                primary_error = credential_safe_mcp_transport_failure(
+                    error,
+                    redactor=self._secret_redactor,
+                    context="MCP stdio response wait was cancelled unexpectedly",
+                    preserve_cause=True,
+                )
             if request_written:
-                await self._send_request_cancelled_notification(
+                assert primary_error is not None
+                self._fence_uncertain_request()
+                self._schedule_uncertain_request_cleanup(
                     request_id,
                     method_name=method_name,
-                    reason="Cayu caller cancelled the request.",
+                    reason=(
+                        "Cayu caller cancelled the request."
+                        if caller_cancelled
+                        else "Cayu response wait was cancelled unexpectedly."
+                    ),
+                    primary_error=primary_error,
                 )
-            raise
+            if caller_cancelled:
+                sanitized_cancellation = _credential_safe_mcp_cancellation(
+                    error,
+                    redactor=self._secret_redactor,
+                )
+            else:
+                sanitized_failure = primary_error
+            primary_error = None
+        if sanitized_failure is not None:
+            raise sanitized_failure
+        if sanitized_cancellation is not None:
+            raise sanitized_cancellation
         redaction_result = safely_redact_jsonrpc_response(
             response,
             method=method_name,
@@ -541,6 +971,15 @@ class StdioMcpSession(McpSession):
         raw_result = None
         response.clear()
         response = {}
+        if loop.time() >= call_deadline:
+            if authority_mapping is not None:
+                authority_mapping.clear()
+            private_cursor = None
+            redacted_response.clear()
+            self._raise_completed_response_deadline(
+                request_id=request_id,
+                method_name=method_name,
+            )
         if mapping_error is not None:
             private_cursor = None
             raise McpProtocolError(
@@ -549,11 +988,40 @@ class StdioMcpSession(McpSession):
                     max_bytes=4096,
                 )
             ) from None
+        result: Any = None
         try:
             result = result_from_jsonrpc_response(redacted_response, method_name)
+            redacted_response.clear()
+            redaction_result = None
+            if result_parser is not None:
+                result = result_parser(result)
         except BaseException:
             private_cursor = None
+            redacted_response.clear()
+            redaction_result = None
+            if type(result) in {dict, list}:
+                result.clear()
+            result = None
+            if loop.time() >= call_deadline:
+                if authority_mapping is not None:
+                    authority_mapping.clear()
+                redacted_response.clear()
+                self._raise_completed_response_deadline(
+                    request_id=request_id,
+                    method_name=method_name,
+                )
             raise
+        if loop.time() >= call_deadline:
+            if authority_mapping is not None:
+                authority_mapping.clear()
+            private_cursor = None
+            if type(result) in {dict, list}:
+                result.clear()
+            redacted_response.clear()
+            self._raise_completed_response_deadline(
+                request_id=request_id,
+                method_name=method_name,
+            )
         if not paginated:
             return result
         if type(result) is dict:
@@ -563,46 +1031,377 @@ class StdioMcpSession(McpSession):
             next_cursor=private_cursor,
         )
 
+    def _raise_completed_response_deadline(
+        self,
+        *,
+        request_id: int,
+        method_name: str,
+    ) -> None:
+        """Fence a completed response that missed its final publication deadline."""
+
+        error = McpCallDeadlineExceededError(
+            f"MCP request {request_id} exceeded its total call deadline during response processing."
+        )
+        self._fence_uncertain_request()
+        self._schedule_close()
+        assert self._close_task is not None
+        _attach_mcp_session_cleanup_task(error, self._close_task)
+        safe_error = credential_safe_mcp_transport_failure(
+            error,
+            redactor=self._secret_redactor,
+            context=f"MCP {method_name} request timed out",
+            preserve_cause=True,
+        )
+        raise safe_error from None
+
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         method_name = require_clean_nonblank(method, "method")
-        await self._write_with_timeout(
-            jsonrpc_notification_payload(method_name, params),
-            timeout_message=f"MCP notification {method_name} write timed out.",
-        )
+        sanitized_cancellation: asyncio.CancelledError | None = None
+        sanitized_failure: BaseException | None = None
+        cancellation_boundary = _McpCallerCancellationBoundary()
+        try:
+            await cancellation_boundary.checkpoint()
+            await self._write_with_timeout(
+                jsonrpc_notification_payload(method_name, params),
+                timeout_message=f"MCP notification {method_name} write timed out.",
+            )
+        except asyncio.CancelledError as cancellation:
+            if cancellation_boundary.caller_cancelled():
+                sanitized_cancellation = _credential_safe_mcp_cancellation(
+                    cancellation,
+                    redactor=self._secret_redactor,
+                )
+            else:
+                sanitized_failure = credential_safe_mcp_transport_failure(
+                    cancellation,
+                    redactor=self._secret_redactor,
+                    context=f"MCP notification {method_name} write was cancelled unexpectedly",
+                    preserve_cause=True,
+                )
+                if _mcp_session_close_task(sanitized_failure) is None:
+                    self._schedule_close()
+                    assert self._close_task is not None
+                    _attach_mcp_session_cleanup_task(sanitized_failure, self._close_task)
+        except (KeyboardInterrupt, SystemExit, GeneratorExit) as error:
+            sanitized_failure = credential_safe_mcp_fatal_signal(
+                error,
+                redactor=self._secret_redactor,
+                context=f"MCP notification {method_name} write failed",
+            )
+            error = None
+        if sanitized_failure is not None:
+            raise sanitized_failure
+        if sanitized_cancellation is not None:
+            raise sanitized_cancellation
+
+    async def _wait_for_response(
+        self,
+        future: asyncio.Future[dict[str, Any]],
+        *,
+        request_id: int,
+        started_at: float,
+        call_deadline: float,
+        idle_timeout_s: float,
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        while True:
+            now = loop.time()
+            last_activity = max(started_at, self._last_read_activity)
+            idle_deadline = last_activity + idle_timeout_s
+            peer_closed_at = getattr(self, "_peer_closed_at", None)
+            if (
+                peer_closed_at is not None
+                and peer_closed_at < call_deadline
+                and peer_closed_at < idle_deadline
+            ):
+                # Peer closure is authoritative as soon as stdout reports EOF.
+                # Stderr enrichment remains optional and cannot extend delivery
+                # beyond this request's original total deadline.
+                await self._await_stderr_drain(deadline=call_deadline)
+                self._pending_timing.pop(request_id, None)
+                _clear_completed_stdio_response(future)
+                raise self._peer_closed_error("MCP stdio process closed stdout.")
+            if now >= call_deadline:
+                raise McpCallDeadlineExceededError(
+                    f"MCP request {request_id} timed out at its total call deadline."
+                )
+            if future.done():
+                if loop.time() >= call_deadline:
+                    raise McpCallDeadlineExceededError(
+                        f"MCP request {request_id} timed out at its total call deadline."
+                    )
+                timing = self._pending_timing.pop(request_id, None)
+                if timing is not None and _stdio_pending_crossed_idle_deadline(
+                    timing,
+                    started_at=started_at,
+                    idle_timeout_s=idle_timeout_s,
+                ):
+                    raise McpIdleTimeoutError(
+                        f"MCP request {request_id} exceeded its idle timeout."
+                    )
+                return future.result()
+            if _stdio_gap_crossed_idle_deadline(
+                self._last_expired_idle_gap,
+                started_at=started_at,
+                idle_timeout_s=idle_timeout_s,
+            ):
+                raise McpIdleTimeoutError(f"MCP request {request_id} exceeded its idle timeout.")
+            if now >= idle_deadline:
+                raise McpIdleTimeoutError(f"MCP request {request_id} exceeded its idle timeout.")
+            await asyncio.wait(
+                {future},
+                timeout=min(call_deadline, idle_deadline) - now,
+            )
 
     async def _write_with_timeout(
         self,
         payload: dict[str, Any],
         *,
         timeout_message: str,
+        call_deadline: float | None = None,
     ) -> None:
+        loop = asyncio.get_running_loop()
+        if call_deadline is None:
+            call_timeout_s = (
+                self.request_timeout_s
+                if self._uses_legacy_request_timeout
+                else self.transport_limits.total_call_timeout_s
+            )
+            call_deadline = loop.time() + call_timeout_s
+        now = loop.time()
+        remaining = call_deadline - now
+        if remaining <= 0:
+            self._schedule_close()
+            raise McpCallDeadlineExceededError(
+                "MCP stdio exchange exceeded its total call deadline."
+            )
+        write_deadline = min(call_deadline, now + self.write_timeout_s)
+        write_task = asyncio.create_task(_capture_mcp_owned_task_fatal_signal(self._write(payload)))
+        payload = {}
+        cancellation_boundary = _McpCallerCancellationBoundary()
+        unexpected_wait_error: McpProtocolError | None = None
         try:
-            await asyncio.wait_for(self._write(payload), timeout=self.write_timeout_s)
-        except TimeoutError:
-            await self._close_after_interrupted_transport_write()
-            raise TimeoutError(timeout_message) from None
-        except (BrokenPipeError, ConnectionResetError) as exc:
-            await self._await_stderr_drain()
-            await self._close_after_interrupted_transport_write()
-            raise self._protocol_error("MCP stdio process closed stdout.") from exc
-        except asyncio.CancelledError:
-            await self._close_after_interrupted_transport_write()
-            raise
+            await cancellation_boundary.checkpoint()
+            now = loop.time()
+            if now >= write_deadline:
+                if now >= call_deadline:
+                    checkpoint_timeout: TimeoutError = McpCallDeadlineExceededError(
+                        "MCP stdio exchange exceeded its total call deadline."
+                    )
+                else:
+                    checkpoint_timeout = TimeoutError(timeout_message)
+                self._schedule_interrupted_write_cleanup(
+                    write_task,
+                    primary_error=checkpoint_timeout,
+                )
+                raise checkpoint_timeout from None
+            done, _ = await asyncio.wait(
+                {write_task},
+                timeout=write_deadline - now,
+            )
+        except asyncio.CancelledError as error:
+            if cancellation_boundary.caller_cancelled():
+                self._schedule_interrupted_write_cleanup(
+                    write_task,
+                    primary_error=error,
+                )
+                raise
+            unexpected_wait_error = McpProtocolError(
+                "MCP stdio write wait was cancelled unexpectedly; session closed."
+            )
+            self._schedule_interrupted_write_cleanup(
+                write_task,
+                primary_error=unexpected_wait_error,
+            )
+            done = set()
+        if unexpected_wait_error is not None:
+            raise unexpected_wait_error from None
+        observed_at = loop.time()
+        if not done or observed_at >= write_deadline:
+            if observed_at >= call_deadline:
+                timeout_error: TimeoutError = McpCallDeadlineExceededError(
+                    "MCP stdio exchange exceeded its total call deadline."
+                )
+            else:
+                timeout_error = TimeoutError(timeout_message)
+            self._schedule_interrupted_write_cleanup(
+                write_task,
+                primary_error=timeout_error,
+            )
+            raise timeout_error from None
+        if write_task.cancelled():
+            unexpected_error = McpProtocolError(
+                "MCP stdio transport write was cancelled unexpectedly; session closed."
+            )
+            self._schedule_interrupted_write_cleanup(
+                write_task,
+                primary_error=unexpected_error,
+            )
+            raise unexpected_error from None
+        peer_closed_error: McpPeerClosedError | None = None
+        pre_dispatch_size_error: McpMessageTooLargeError | None = None
+        uncertain_write_error: BaseException | None = None
+        try:
+            _unwrap_mcp_owned_task_result(write_task.result())
+        except _StdioPreDispatchMessageTooLargeError as error:
+            # This private type is produced only by validation before
+            # stdin.write(). The public type alone is not proof of provenance.
+            pre_dispatch_size_error = McpMessageTooLargeError(str(error))
+        except (BrokenPipeError, ConnectionResetError):
+            try:
+                await self._await_stderr_drain(deadline=call_deadline)
+            except asyncio.CancelledError as cancellation:
+                self._schedule_interrupted_write_cleanup(
+                    write_task,
+                    primary_error=cancellation,
+                )
+                raise
+            peer_closed_error = self._peer_closed_error("MCP stdio process closed stdin.")
+            self._schedule_interrupted_write_cleanup(
+                write_task,
+                primary_error=peer_closed_error,
+            )
+        except (BaseExceptionGroup, Exception) as error:
+            uncertain_write_error = credential_safe_mcp_transport_failure(
+                error,
+                redactor=self._secret_redactor,
+                context="MCP stdio transport write failed",
+            )
+            self._schedule_interrupted_write_cleanup(
+                write_task,
+                primary_error=uncertain_write_error,
+            )
+        except (KeyboardInterrupt, SystemExit, GeneratorExit) as error:
+            uncertain_write_error = credential_safe_mcp_fatal_signal(
+                error,
+                redactor=self._secret_redactor,
+                context="MCP stdio transport write failed",
+            )
+            self._schedule_interrupted_write_cleanup(
+                write_task,
+                primary_error=uncertain_write_error,
+            )
+            error = None
+        except BaseException as error:
+            uncertain_write_error = credential_safe_mcp_transport_failure(
+                error,
+                redactor=self._secret_redactor,
+                context="MCP stdio transport write failed",
+            )
+            self._schedule_interrupted_write_cleanup(
+                write_task,
+                primary_error=uncertain_write_error,
+            )
+            error = None
+        if peer_closed_error is not None:
+            # Raise outside the raw pipe exception handler so it cannot survive as
+            # implicit context on the public, credential-safe transport failure.
+            raise peer_closed_error from None
+        if pre_dispatch_size_error is not None:
+            done.clear()
+            del write_task
+            raise pre_dispatch_size_error from None
+        if uncertain_write_error is not None:
+            # The retained settlement task owns the raw completed writer. Remove
+            # this frame's reference so public traceback locals cannot render its
+            # extension-controlled exception while cleanup is still settling.
+            done.clear()
+            del write_task
+            raise uncertain_write_error from None
 
-    async def _close_after_interrupted_transport_write(self) -> None:
-        if asyncio.current_task() is self._reader_task:
-            close_task = asyncio.create_task(self.close())
-            close_task.add_done_callback(_consume_task_result)
-            return
-        await _close_session_after_failed_connect(self)
+    def _schedule_interrupted_write_cleanup(
+        self,
+        write_task: asyncio.Task[Any],
+        *,
+        primary_error: BaseException,
+    ) -> None:
+        """Fence promptly while retaining the exact possibly-running writer."""
+
+        self._closed = True
+        write_task.cancel()
+        self._schedule_close()
+        assert self._close_task is not None
+        close_task = self._close_task
+        retained_write_task: asyncio.Task[Any] | None = write_task
+
+        async def settle_write_and_session() -> None:
+            nonlocal retained_write_task
+            owned_write_task = retained_write_task
+            assert owned_write_task is not None
+            failures: list[BaseException] = []
+            try:
+                await asyncio.shield(close_task)
+            except BaseException as error:
+                failures.append(
+                    credential_safe_mcp_transport_failure(
+                        error,
+                        redactor=self._secret_redactor,
+                        context="MCP stdio interrupted-write session cleanup failed",
+                    )
+                )
+            cancellation_boundary = _McpCallerCancellationBoundary()
+            try:
+                await cancellation_boundary.checkpoint()
+                _unwrap_mcp_owned_task_result(await asyncio.shield(owned_write_task))
+            except asyncio.CancelledError:
+                if cancellation_boundary.caller_cancelled():
+                    raise
+                # Cancellation of the owned writer was requested above. Session
+                # closure is the positive fence; a cancelled writer adds no failure.
+            except BaseException as error:
+                failures.append(
+                    credential_safe_mcp_transport_failure(
+                        error,
+                        redactor=self._secret_redactor,
+                        context="MCP stdio interrupted transport write failed",
+                    )
+                )
+            retained_write_task = None
+            del owned_write_task
+            if len(failures) == 1:
+                raise failures[0]
+            if failures:
+                raise BaseExceptionGroup(
+                    "MCP stdio interrupted-write cleanup failures.",
+                    failures,
+                )
+
+        settlement_task = asyncio.create_task(settle_write_and_session())
+        _RETAINED_STDIO_WRITE_SETTLEMENT_TASKS.add(settlement_task)
+        _attach_mcp_session_cleanup_task(primary_error, settlement_task)
+
+        def completed(task: asyncio.Task[None]) -> None:
+            _RETAINED_STDIO_WRITE_SETTLEMENT_TASKS.discard(task)
+            _consume_task_result(task)
+
+        settlement_task.add_done_callback(completed)
 
     async def _write(self, payload: dict[str, Any]) -> None:
         if self.process.stdin is None:
             raise McpProtocolError("MCP stdio process stdin is unavailable.")
+        if not json_utf8_size_within_limit(
+            payload,
+            self.transport_limits.max_message_bytes,
+            ensure_ascii=True,
+        ):
+            payload.clear()
+            raise _StdioPreDispatchMessageTooLargeError(
+                "MCP stdio JSON-RPC message exceeded "
+                f"{self.transport_limits.max_message_bytes} bytes."
+            )
         data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        async with self._write_lock:
-            self.process.stdin.write(data + b"\n")
-            await self.process.stdin.drain()
+        payload = {}
+        try:
+            if len(data) > self.transport_limits.max_message_bytes:
+                raise _StdioPreDispatchMessageTooLargeError(
+                    "MCP stdio JSON-RPC message exceeded "
+                    f"{self.transport_limits.max_message_bytes} bytes."
+                )
+            async with self._write_lock:
+                self.process.stdin.write(data + b"\n")
+                await self.process.stdin.drain()
+        finally:
+            data = b""
 
     async def _close_stdin_for_graceful_shutdown(self) -> None:
         stdin = self.process.stdin
@@ -615,6 +1414,9 @@ class StdioMcpSession(McpSession):
                 await wait_closed()
 
     async def _cancel_background_task(self, task: asyncio.Task) -> None:
+        if task.done():
+            _consume_task_result(task)
+            return
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
@@ -629,20 +1431,85 @@ class StdioMcpSession(McpSession):
         if method_name == "initialize":
             return
         notify_task = asyncio.create_task(
-            self._notify(
-                "notifications/cancelled",
-                {"requestId": request_id, "reason": reason},
+            _capture_mcp_owned_task_fatal_signal(
+                self._notify(
+                    "notifications/cancelled",
+                    {"requestId": request_id, "reason": reason},
+                )
             )
         )
         try:
-            await asyncio.wait_for(
+            notify_outcome = await asyncio.wait_for(
                 asyncio.shield(notify_task),
                 timeout=self.cancellation_notification_timeout_s,
             )
+            _unwrap_mcp_owned_task_result(notify_outcome)
         except (Exception, asyncio.CancelledError):
             notify_task.cancel()
             notify_task.add_done_callback(_consume_task_result)
-            await self._close_after_interrupted_transport_write()
+            self._schedule_close()
+            assert self._close_task is not None
+            while True:
+                try:
+                    await asyncio.shield(self._close_task)
+                    break
+                except asyncio.CancelledError:
+                    if self._close_task.done():
+                        break
+
+    def _schedule_uncertain_request_cleanup(
+        self,
+        request_id: int,
+        *,
+        method_name: str,
+        reason: str,
+        primary_error: BaseException,
+    ) -> None:
+        async def notify_then_close() -> None:
+            try:
+                await self._send_request_cancelled_notification(
+                    request_id,
+                    method_name=method_name,
+                    reason=reason,
+                )
+            finally:
+                self._schedule_close()
+                assert self._close_task is not None
+                await _await_mcp_session_cleanup_task(
+                    self._close_task,
+                    redactor=self._secret_redactor,
+                    context="MCP stdio uncertain-request cleanup failed",
+                )
+
+        async def owned_cleanup() -> None:
+            safe_failure: BaseException | None = None
+            try:
+                await notify_then_close()
+            except BaseException as error:
+                safe_failure = credential_safe_mcp_transport_failure(
+                    error,
+                    redactor=self._secret_redactor,
+                    context="MCP stdio uncertain-request cleanup failed",
+                )
+                error = None
+            if safe_failure is not None:
+                raise safe_failure from None
+
+        cleanup_task = asyncio.create_task(owned_cleanup())
+        self._request_cleanup_tasks.add(cleanup_task)
+        _attach_mcp_session_cleanup_task(primary_error, cleanup_task)
+
+        def completed(task: asyncio.Task[None]) -> None:
+            self._request_cleanup_tasks.discard(task)
+            _consume_task_result(task)
+
+        cleanup_task.add_done_callback(completed)
+
+    def _fence_uncertain_request(self) -> None:
+        self._closed = True
+        self._fail_pending(
+            McpProtocolError("MCP stdio session closed after an uncertain request outcome.")
+        )
 
     async def _read_loop(self) -> None:
         error: BaseException | None = None
@@ -673,10 +1540,13 @@ class StdioMcpSession(McpSession):
             # session closed so subsequent requests fast-fail immediately instead
             # of blocking for the full request timeout on a future no reader will
             # ever resolve.
-            self._closed = True
+            self._stdout_buffer.clear()
             self._fail_pending(
                 error if error is not None else McpProtocolError("MCP stdio reader stopped."),
             )
+            self._closed = True
+            if error is not None:
+                self._schedule_close()
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
         message_id = message.get("id")
@@ -685,9 +1555,9 @@ class StdioMcpSession(McpSession):
                 await self._write_server_request_error(message)
             return
         if message_id is None:
-            return
+            raise McpProtocolError("MCP JSON-RPC response is missing an id.")
         if type(message_id) is not int:
-            return
+            raise McpProtocolError("MCP JSON-RPC response id must be an integer.")
         future = self._pending.get(message_id)
         if future is None or future.done():
             return
@@ -701,10 +1571,12 @@ class StdioMcpSession(McpSession):
             copy_error = McpProtocolError("MCP response contained invalid portable JSON.")
         self._pending.pop(message_id, None)
         if copy_error is not None:
+            self._record_pending_timing(message_id, response_received=True)
             future.set_exception(copy_error)
             return
         if type(copied_message) is not dict:
             raise AssertionError("MCP stdio response copy returned a non-object.")
+        self._record_pending_timing(message_id, response_received=True)
         future.set_result(copied_message)
 
     async def _write_server_request_error(self, message: dict[str, Any]) -> None:
@@ -727,34 +1599,56 @@ class StdioMcpSession(McpSession):
     def _fail_pending(self, error: BaseException) -> None:
         pending = self._pending
         self._pending = {}
-        for future in pending.values():
+        for request_id, future in pending.items():
             if not future.done():
-                future.set_exception(error)
+                self._record_pending_timing(request_id, response_received=False)
+                # Exceptions retain mutable traceback, cause, note, and private
+                # handoff state. Publish a detached instance per waiter so one
+                # concurrent caller cannot mutate another caller's diagnostic.
+                future.set_exception(
+                    credential_safe_mcp_transport_failure(
+                        error,
+                        redactor=self._secret_redactor,
+                        context="MCP stdio transport failed",
+                        preserve_cause=True,
+                    )
+                )
+
+    def _record_pending_timing(self, request_id: int, *, response_received: bool) -> None:
+        self._pending_timing[request_id] = _StdioPendingTiming(
+            settled_at=asyncio.get_running_loop().time(),
+            last_read_activity=self._last_read_activity,
+            expired_idle_gap=self._last_expired_idle_gap,
+            response_received=response_received,
+        )
 
     async def _read_message(self) -> dict[str, Any]:
         if self.process.stdout is None:
             raise McpProtocolError("MCP stdio process stdout is unavailable.")
-        line = await self.process.stdout.readline()
-        if not line:
-            # A closed stdout usually means the child crashed on startup. Give
-            # the stderr drain a moment to finish so the crash detail lands in
-            # the captured tail, then attach it to the error.
-            await self._await_stderr_drain()
-            raise self._protocol_error("MCP stdio process closed stdout.")
-        decoded_line = line.decode("utf-8", "replace")
+        line = await self._read_frame()
+        decoded_line = ""
         payload: Any = None
         protocol_error: str | None = None
         try:
-            payload = json.loads(decoded_line)
-        except ValueError:
-            protocol_error = "MCP stdio process wrote invalid JSON."
+            decoded_line = line.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            protocol_error = "MCP stdio process wrote invalid UTF-8."
+        if protocol_error is None:
+            try:
+                payload = json.loads(decoded_line)
+            except RecursionError:
+                protocol_error = "MCP stdio JSON-RPC response exceeded the supported JSON nesting."
+            except ValueError:
+                protocol_error = "MCP stdio process wrote invalid JSON."
         # Drop the transport document before structural validation raises. A
         # valid JSON value with an invalid JSON-RPC envelope remains untrusted
         # and may contain a resolved secret echoed by the server.
         line = b""
         decoded_line = ""
         if protocol_error is None:
-            if type(payload) is not dict:
+            if mcp_json_value_nesting_too_deep(payload):
+                protocol_error = "MCP stdio JSON-RPC response exceeded the supported JSON nesting."
+            elif type(payload) is not dict:
                 protocol_error = "MCP JSON-RPC message must be an object."
             elif payload.get("jsonrpc") != "2.0":
                 protocol_error = "MCP JSON-RPC message must use jsonrpc='2.0'."
@@ -762,6 +1656,52 @@ class StdioMcpSession(McpSession):
             payload = None
             raise self._protocol_error(protocol_error)
         return payload
+
+    async def _read_frame(self) -> bytes:
+        stdout = self.process.stdout
+        if stdout is None:
+            raise McpProtocolError("MCP stdio process stdout is unavailable.")
+        max_bytes = self.transport_limits.max_message_bytes
+        while True:
+            newline_index = self._stdout_buffer.find(b"\n")
+            if newline_index >= 0:
+                frame = bytes(self._stdout_buffer[:newline_index])
+                del self._stdout_buffer[: newline_index + 1]
+                if frame.endswith(b"\r"):
+                    frame = frame[:-1]
+                if len(frame) > max_bytes:
+                    frame = b""
+                    self._stdout_buffer.clear()
+                    raise McpMessageTooLargeError(f"MCP stdio message exceeded {max_bytes} bytes.")
+                return frame
+            buffered = len(self._stdout_buffer)
+            if buffered > max_bytes and not (
+                buffered == max_bytes + 1 and self._stdout_buffer.endswith(b"\r")
+            ):
+                self._stdout_buffer.clear()
+                raise McpMessageTooLargeError(f"MCP stdio message exceeded {max_bytes} bytes.")
+            allocation_ceiling = max_bytes + 2
+            if buffered >= allocation_ceiling:
+                self._stdout_buffer.clear()
+                raise McpMessageTooLargeError(f"MCP stdio message exceeded {max_bytes} bytes.")
+            chunk = await stdout.read(min(65_536, allocation_ceiling - buffered))
+            if not chunk:
+                self._stdout_buffer.clear()
+                self._peer_closed_at = asyncio.get_running_loop().time()
+                # Wake every current waiter before optional stderr enrichment.
+                # The per-request wait path uses the recorded timestamp to keep
+                # peer closure distinct from later idle/total deadline expiry.
+                self._fail_pending(McpPeerClosedError("MCP stdio process closed stdout."))
+                self._schedule_close()
+                await self._await_stderr_drain()
+                raise self._peer_closed_error("MCP stdio process closed stdout.")
+            received_at = asyncio.get_running_loop().time()
+            previous_activity = self._last_read_activity
+            if received_at >= previous_activity + self.transport_limits.idle_timeout_s:
+                self._last_expired_idle_gap = (previous_activity, received_at)
+            self._last_read_activity = received_at
+            self._stdout_buffer.extend(chunk)
+            chunk = b""
 
     async def _drain_stderr(self) -> None:
         stderr = self.process.stderr
@@ -791,30 +1731,80 @@ class StdioMcpSession(McpSession):
             return McpProtocolError(message)
         return McpProtocolError(f"{message} MCP server stderr (tail): {tail}")
 
-    async def _await_stderr_drain(self) -> None:
+    def _peer_closed_error(self, message: str) -> McpPeerClosedError:
+        tail = self._stderr_snapshot()
+        if not tail:
+            return McpPeerClosedError(message)
+        return McpPeerClosedError(f"{message} MCP server stderr (tail): {tail}")
+
+    async def _await_stderr_drain(self, *, deadline: float | None = None) -> None:
         task = self._stderr_task
         if task is None or task.done():
             return
+        timeout_s = DEFAULT_MCP_STDERR_DRAIN_GRACE_S
+        if deadline is not None:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            timeout_s = min(timeout_s, remaining)
         with suppress(Exception):
             await asyncio.wait_for(
                 asyncio.shield(task),
-                timeout=DEFAULT_MCP_STDERR_DRAIN_GRACE_S,
+                timeout=timeout_s,
             )
 
 
+def _stdio_pending_crossed_idle_deadline(
+    timing: _StdioPendingTiming,
+    *,
+    started_at: float,
+    idle_timeout_s: float,
+) -> bool:
+    gap = timing.expired_idle_gap
+    if _stdio_gap_crossed_idle_deadline(
+        gap,
+        started_at=started_at,
+        idle_timeout_s=idle_timeout_s,
+        settled_at=timing.settled_at,
+    ):
+        return True
+    if timing.response_received:
+        return False
+    request_idle_started_at = max(started_at, timing.last_read_activity)
+    return timing.settled_at >= request_idle_started_at + idle_timeout_s
+
+
+def _stdio_gap_crossed_idle_deadline(
+    gap: tuple[float, float] | None,
+    *,
+    started_at: float,
+    idle_timeout_s: float,
+    settled_at: float | None = None,
+) -> bool:
+    if gap is None:
+        return False
+    gap_started_at, activity_resumed_at = gap
+    if settled_at is not None and activity_resumed_at > settled_at:
+        return False
+    request_idle_started_at = max(started_at, gap_started_at)
+    return activity_resumed_at >= request_idle_started_at + idle_timeout_s
+
+
 def _consume_task_result(task: asyncio.Task) -> None:
-    with suppress(Exception, asyncio.CancelledError):
+    # Retained cleanup may deliberately aggregate process-control and ordinary
+    # failures. Consume the complete group at this terminal observer.
+    with suppress(BaseException):
         task.result()
 
 
-async def _close_session_after_failed_connect(session: McpSession) -> None:
-    close_task = asyncio.create_task(session.close())
-    while True:
-        try:
-            await asyncio.shield(close_task)
-            return
-        except Exception:
-            return
-        except asyncio.CancelledError:
-            if close_task.done():
-                return
+def _retain_cancelled_stdio_shutdown_task(task: asyncio.Task[Any]) -> None:
+    """Cancel a timed-out shutdown awaitable without abandoning its exact owner."""
+
+    task.cancel()
+    _RETAINED_STDIO_SHUTDOWN_TASKS.add(task)
+
+    def completed(completed_task: asyncio.Task[Any]) -> None:
+        _RETAINED_STDIO_SHUTDOWN_TASKS.discard(completed_task)
+        _consume_task_result(completed_task)
+
+    task.add_done_callback(completed)

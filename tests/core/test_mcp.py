@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 import sys
+import traceback
 from collections.abc import AsyncIterator, Callable
 from contextlib import suppress
 from pathlib import Path
@@ -25,7 +27,9 @@ from cayu import (
     Event,
     EventQuery,
     EventType,
+    HttpMcpSession,
     McpClient,
+    McpIdleTimeoutError,
     McpInitializeResult,
     McpManifestBaseline,
     McpManifestBaselineLoadResult,
@@ -57,6 +61,7 @@ from cayu import (
     mcp_tool_manifest_tools,
 )
 from cayu.mcp._jsonrpc import MCP_PROTOCOL_VERSION
+from cayu.mcp.base import _mcp_session_close_task, _retain_mcp_session_close
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.runtime import (
     InMemorySessionStore,
@@ -254,6 +259,100 @@ def test_mcp_tool_adapter_includes_structured_content_in_model_text() -> None:
 
     assert result.content == 'Structured MCP content:\n{\n  "echoed": "structured"\n}'
     assert result.structured["mcp_structured_content"] == {"echoed": "structured"}
+
+
+def test_mcp_tool_adapter_rejects_deep_arguments_before_session_dispatch(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "mcp-adapter-deep-argument-secret-canary"
+    definition = McpToolDefinition(name="echo", input_schema={"type": "object"})
+    session = FakeMcpSession(definitions=(definition,))
+    toolset = McpToolset(
+        server=_fake_server_spec(),
+        session=session,
+        definitions=session.definitions,
+    )
+    value: Any = secret
+    for _ in range(1_500):
+        value = [value]
+    arguments = {"large_integer_sibling": 10**5_000, "nested": value}
+
+    from cayu.mcp import _transport as mcp_transport_module
+
+    def fail_if_depth_walk_renders_key(*_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("depth-only MCP validation rendered an object key")
+
+    monkeypatch.setattr(
+        mcp_transport_module._McpJsonUtf8SizeCounter,
+        "_string",
+        fail_if_depth_walk_renders_key,
+    )
+
+    async def run() -> BaseException:
+        with pytest.raises(McpProtocolError, match="supported JSON nesting") as exc_info:
+            await toolset.tools[0].run(
+                ToolContext(session_id="deep-argument", agent_name="test"),
+                arguments,
+            )
+        return exc_info.value
+
+    with caplog.at_level(logging.DEBUG):
+        error = asyncio.run(run())
+
+    assert session.calls == []
+    assert secret not in "".join(traceback.format_exception(error))
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    _assert_traceback_does_not_retain_text(error, secret)
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in record.getMessage() for record in caplog.records)
+    assert all(secret not in str(warning.message) for warning in recwarn)
+    arguments.clear()
+
+
+def test_mcp_tool_adapter_custom_session_owns_arguments_and_sanitizes_invalid_input() -> None:
+    secret = "mcp-custom-session-invalid-argument-secret-canary"
+
+    class SecretSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                definitions=(McpToolDefinition(name="echo", input_schema={"type": "object"}),)
+            )
+            self._secret_redactor = SecretRedactor(secret)
+
+    session = SecretSession()
+    toolset = McpToolset(
+        server=_fake_server_spec(),
+        session=session,
+        definitions=session.definitions,
+    )
+    valid_arguments = {"nested": {"value": "original"}}
+
+    async def run() -> tuple[BaseException, dict[str, Any]]:
+        invalid_arguments = {secret: object()}
+        with pytest.raises(McpProtocolError) as exc_info:
+            await toolset.tools[0].run(
+                ToolContext(session_id="invalid-custom-arguments", agent_name="test"),
+                invalid_arguments,
+            )
+        await toolset.tools[0].run(
+            ToolContext(session_id="valid-custom-arguments", agent_name="test"),
+            valid_arguments,
+        )
+        valid_arguments["nested"]["value"] = "mutated"
+        return exc_info.value, session.calls[0][1]
+
+    error, received = asyncio.run(run())
+
+    assert secret not in "".join(traceback.format_exception(error))
+    _assert_traceback_does_not_retain_text(error, secret)
+    assert session.calls[0][0] == "echo"
+    assert received == {"nested": {"value": "original"}}
 
 
 def test_mcp_tool_adapter_redacts_injected_secrets_echoed_by_server() -> None:
@@ -3585,8 +3684,13 @@ def test_stdio_mcp_client_cleans_pending_request_on_cancellation() -> None:
             payload: dict[str, Any],
             *,
             timeout_message: str,
+            call_deadline: float | None = None,
         ) -> None:
-            await original_write_with_timeout(payload, timeout_message=timeout_message)
+            await original_write_with_timeout(
+                payload,
+                timeout_message=timeout_message,
+                call_deadline=call_deadline,
+            )
             if payload.get("method") == "tools/call":
                 request_written.set()
 
@@ -3625,8 +3729,13 @@ def test_stdio_mcp_client_sends_cancelled_notification_when_request_is_cancelled
             payload: dict[str, Any],
             *,
             timeout_message: str,
+            call_deadline: float | None = None,
         ) -> None:
-            await original_write_with_timeout(payload, timeout_message=timeout_message)
+            await original_write_with_timeout(
+                payload,
+                timeout_message=timeout_message,
+                call_deadline=call_deadline,
+            )
             if payload.get("method") == "tools/call":
                 request_written.set()
 
@@ -3669,18 +3778,22 @@ def test_stdio_mcp_client_cleans_pending_request_when_write_is_cancelled() -> No
 
         try:
             session._write = cancel_write
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(McpProtocolError, match="cancelled unexpectedly"):
                 await session._request("tools/list", {})
             with pytest.raises(McpProtocolError, match="closed"):
                 await session.list_tools()
-            return dict(session._pending), session.process.returncode
+            await asyncio.wait_for(session.process.wait(), timeout=1)
+            current = asyncio.current_task()
+            assert current is not None
+            return dict(session._pending), session.process.returncode, current.cancelling()
         finally:
             await session.close()
 
-    pending, returncode = asyncio.run(run())
+    pending, returncode, cancelling = asyncio.run(run())
 
     assert pending == {}
     assert returncode is not None
+    assert cancelling == 0
 
 
 def test_stdio_mcp_client_times_out_blocked_request_write() -> None:
@@ -3700,6 +3813,7 @@ def test_stdio_mcp_client_times_out_blocked_request_write() -> None:
                 await session._request("tools/list", {})
             with pytest.raises(McpProtocolError, match="closed"):
                 await session.list_tools()
+            await asyncio.wait_for(session.process.wait(), timeout=1)
             return write_started.is_set(), dict(session._pending), session.process.returncode
         finally:
             await session.close()
@@ -4255,6 +4369,82 @@ def test_collect_paginated_detaches_scalar_fatal_signal_with_private_cursor(
     _assert_traceback_does_not_retain_text(error, cursor)
 
 
+@pytest.mark.parametrize("historical_cancellation", [False, True])
+def test_collect_paginated_classifies_callback_cancellation_as_failure(
+    historical_cancellation: bool,
+) -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    cursor = "private-cursor-internal-cancellation-canary"
+    calls = 0
+
+    async def request(method, params):
+        nonlocal calls
+        del method
+        calls += 1
+        if calls == 1:
+            return McpPaginatedPage({"resources": []}, cursor)
+        assert params["cursor"] == cursor
+        raise asyncio.CancelledError(f"callback cancelled with {cursor}")
+
+    async def scenario() -> tuple[BaseException, int]:
+        current = asyncio.current_task()
+        assert current is not None
+        if historical_cancellation:
+            current.cancel("already delivered pagination cancellation")
+            with suppress(asyncio.CancelledError):
+                await asyncio.sleep(0)
+        with pytest.raises(McpProtocolError, match="cancelled unexpectedly") as exc_info:
+            await collect_paginated(
+                request,
+                "resources/list",
+                "resources",
+                redactor=SecretRedactor("different-configured-workload-secret"),
+            )
+        return exc_info.value, current.cancelling()
+
+    error, cancelling = asyncio.run(scenario())
+
+    assert cancelling == int(historical_cancellation)
+    assert cursor not in "".join(traceback.format_exception(error))
+    assert REDACTED_SECRET in str(error)
+
+
+def test_collect_paginated_preserves_cancellation_pending_before_request() -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    request_calls = 0
+
+    async def request(method, params):
+        nonlocal request_calls
+        del method, params
+        request_calls += 1
+        return McpPaginatedPage({"resources": []})
+
+    async def cancelled_operation() -> None:
+        current = asyncio.current_task()
+        assert current is not None
+        current.cancel("pagination cancellation pending at request boundary")
+        await collect_paginated(
+            request,
+            "resources/list",
+            "resources",
+        )
+
+    async def scenario() -> tuple[int, bool, asyncio.CancelledError]:
+        task = asyncio.create_task(cancelled_operation())
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return task.cancelling(), task.cancelled(), exc_info.value
+
+    cancelling, cancelled, error = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert error.args == ("pagination cancellation pending at request boundary",)
+    assert request_calls == 0
+
+
 def test_collect_paginated_does_not_retain_private_cursor_on_real_cancellation() -> None:
     from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
 
@@ -4302,6 +4492,61 @@ def test_collect_paginated_does_not_retain_private_cursor_on_real_cancellation()
     _assert_traceback_does_not_retain_text(cancellation, cursor)
 
 
+def test_collect_paginated_redacts_numeric_secret_from_real_cancellation(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    from cayu.mcp._jsonrpc import McpPaginatedPage, collect_paginated
+
+    secret = "4829017351642089"
+
+    async def scenario() -> tuple[asyncio.CancelledError, int, bool]:
+        second_request_started = asyncio.Event()
+        calls = 0
+
+        async def request(method, params):
+            nonlocal calls
+            del method
+            calls += 1
+            if calls == 1:
+                return McpPaginatedPage({"resources": []}, "next-page")
+            assert params["cursor"] == "next-page"
+            second_request_started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        task = asyncio.create_task(
+            collect_paginated(
+                request,
+                "resources/list",
+                "resources",
+                redactor=SecretRedactor(secret),
+            )
+        )
+        await second_request_started.wait()
+        task.cancel(int(secret))
+        cancelling = task.cancelling()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return exc_info.value, cancelling, task.cancelled()
+
+    with caplog.at_level(logging.DEBUG):
+        cancellation, cancelling, cancelled = asyncio.run(scenario())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert cancellation.args == (REDACTED_SECRET,)
+    assert secret not in repr(cancellation)
+    assert secret not in "".join(traceback.format_exception(cancellation))
+    _assert_traceback_does_not_retain_text(cancellation, secret)
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in record.getMessage() for record in caplog.records)
+    assert all(secret not in str(warning.message) for warning in recwarn)
+
+
 def test_stdio_mcp_client_times_out_blocked_initialized_notification_write() -> None:
     async def run():
         process = await asyncio.create_subprocess_exec(
@@ -4334,6 +4579,7 @@ def test_stdio_mcp_client_times_out_blocked_initialized_notification_write() -> 
         try:
             with pytest.raises(TimeoutError, match="notifications/initialized write timed out"):
                 await session.initialize()
+            await asyncio.wait_for(session.process.wait(), timeout=1)
             return notification_write_started.is_set(), session.process.returncode
         finally:
             await session.close()
@@ -4389,6 +4635,52 @@ def test_stdio_mcp_session_close_finishes_cleanup_when_cancelled() -> None:
     assert stderr_done is True
 
 
+def test_stdio_mcp_session_close_preserves_cancellation_when_cleanup_fails() -> None:
+    secret = "mcp-stdio-cancelled-close-secret-canary"
+
+    async def run() -> tuple[int, bool, BaseException | None, int | None, bool, bool]:
+        session = await StdioMcpClient(graceful_shutdown_timeout_s=0.01).connect(
+            _fake_server_spec()
+        )
+        assert isinstance(session, StdioMcpSession)
+        session._secret_redactor = SecretRedactor(secret)
+        close_started = asyncio.Event()
+        release_close = asyncio.Event()
+
+        async def failing_close_stdin() -> None:
+            close_started.set()
+            await release_close.wait()
+            raise RuntimeError(f"stdio cleanup exposed {secret}")
+
+        session._close_stdin_for_graceful_shutdown = failing_close_stdin
+        close_task = asyncio.create_task(session.close())
+        await close_started.wait()
+        close_task.cancel("cancel stdio MCP close")
+        cancelling = close_task.cancelling()
+        await asyncio.sleep(0)
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError, match="cancel stdio MCP close") as exc_info:
+            await close_task
+        return (
+            cancelling,
+            close_task.cancelled(),
+            exc_info.value.__cause__,
+            session.process.returncode,
+            session._reader_task.done(),
+            session._stderr_task.done(),
+        )
+
+    cancelling, cancelled, cleanup_error, returncode, reader_done, stderr_done = asyncio.run(run())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert isinstance(cleanup_error, McpProtocolError)
+    assert secret not in "".join(traceback.format_exception(cleanup_error))
+    assert returncode is not None
+    assert reader_done is True
+    assert stderr_done is True
+
+
 def test_stdio_mcp_session_close_concurrent_callers_share_cleanup() -> None:
     async def run():
         client = StdioMcpClient()
@@ -4426,14 +4718,632 @@ def test_stdio_mcp_session_close_concurrent_callers_share_cleanup() -> None:
     assert returncode == 0
 
 
-def test_mcp_toolset_connect_closes_session_when_discovery_is_cancelled() -> None:
+def test_mcp_toolset_connect_classifies_internal_discovery_cancellation_as_failure() -> None:
     async def run():
         session = FakeMcpSession(list_tools_error=asyncio.CancelledError())
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(McpProtocolError, match="cancelled unexpectedly"):
             await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
-        return session.closed
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        assert current is not None
+        return session.closed, current.cancelling()
 
-    assert asyncio.run(run()) is True
+    closed, cancelling = asyncio.run(run())
+
+    assert closed is True
+    assert cancelling == 0
+
+
+def test_mcp_toolset_grouped_discovery_failure_closes_and_detaches_extension_session() -> None:
+    secret = "mcp-grouped-discovery-secret-canary"
+    raw_failure = BaseExceptionGroup(
+        f"grouped discovery exposed {secret}",
+        [
+            asyncio.CancelledError(f"discovery cancelled with {secret}"),
+            RuntimeError(f"discovery failed with {secret}"),
+        ],
+    )
+
+    async def run() -> tuple[BaseExceptionGroup, bool, int]:
+        session = FakeMcpSession(list_tools_error=raw_failure)
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        current = asyncio.current_task()
+        assert current is not None
+        return exc_info.value, session.closed, current.cancelling()
+
+    error, closed, cancelling = asyncio.run(run())
+
+    assert error is not raw_failure
+    assert error.__context__ is None
+    assert "CancelledError" in str(error.exceptions[0])
+    assert "RuntimeError" in str(error.exceptions[1])
+    assert secret not in "".join(traceback.format_exception(error))
+    assert closed is True
+    assert cancelling == 0
+
+
+@pytest.mark.parametrize("fatal_type", [SystemExit, GeneratorExit])
+@pytest.mark.parametrize("cleanup_error_type", [None, RuntimeError, SystemExit, KeyboardInterrupt])
+def test_mcp_toolset_scalar_fatal_discovery_failure_finishes_extension_cleanup(
+    fatal_type: type[BaseException],
+    cleanup_error_type: type[BaseException] | None,
+) -> None:
+    secret = f"mcp-{fatal_type.__name__}-discovery-secret-canary"
+    raw_failure = fatal_type(f"discovery exposed {secret}")
+    cleanup_error = (
+        cleanup_error_type(f"cleanup exposed {secret}") if cleanup_error_type is not None else None
+    )
+
+    async def run() -> tuple[BaseException, bool, int]:
+        session = FakeMcpSession(
+            list_tools_error=raw_failure,
+            close_error=cleanup_error,
+        )
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(fatal_type) as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        current = asyncio.current_task()
+        assert current is not None
+        return exc_info.value, session.closed, current.cancelling()
+
+    error, closed, cancelling = asyncio.run(run())
+
+    assert type(error) is fatal_type
+    assert error is not raw_failure
+    assert closed is True
+    assert cancelling == 0
+    assert secret not in "".join(traceback.format_exception(error))
+    assert REDACTED_SECRET in repr(error)
+    assert error.__context__ is None
+    if cleanup_error_type is not None:
+        assert isinstance(error.__cause__, McpProtocolError)
+        assert REDACTED_SECRET in str(error.__cause__)
+    else:
+        assert error.__cause__ is None
+    _assert_traceback_does_not_retain_text(error, secret)
+
+
+def test_mcp_toolset_scalar_fatal_discovery_failure_bounds_hostile_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "mcp-fatal-hostile-diagnostic-secret-canary"
+    render_calls: list[str] = []
+
+    class HostileDiagnostic:
+        def __str__(self) -> str:
+            render_calls.append("str")
+            return secret
+
+        def __repr__(self) -> str:
+            render_calls.append("repr")
+            return secret
+
+    raw_failure = SystemExit(HostileDiagnostic(), secret * 10_000)
+
+    async def run() -> tuple[SystemExit, bool]:
+        session = FakeMcpSession(list_tools_error=raw_failure)
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(SystemExit) as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        return exc_info.value, session.closed
+
+    with caplog.at_level(logging.DEBUG):
+        error, closed = asyncio.run(run())
+
+    assert closed is True
+    assert render_calls == []
+    assert len(repr(error)) < 5_000
+    assert secret not in "".join(traceback.format_exception(error))
+    assert error.__context__ is None
+    _assert_traceback_does_not_retain_text(error, secret)
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in record.getMessage() for record in caplog.records)
+    assert all(secret not in str(warning.message) for warning in recwarn)
+
+
+@pytest.mark.parametrize("safe_code", ["safe exit code", ""])
+def test_mcp_toolset_scalar_system_exit_preserves_safe_code(safe_code: str) -> None:
+    raw_failure = SystemExit(safe_code)
+
+    async def run() -> tuple[SystemExit, bool]:
+        session = FakeMcpSession(list_tools_error=raw_failure)
+        with pytest.raises(SystemExit) as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        return exc_info.value, session.closed
+
+    error, closed = asyncio.run(run())
+
+    assert closed is True
+    assert error is not raw_failure
+    assert error.args == (safe_code,)
+    assert error.code == safe_code
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+def test_mcp_toolset_scalar_fatal_cleanup_preserves_real_caller_cancellation() -> None:
+    secret = "mcp-fatal-cleanup-cancellation-secret-canary"
+
+    class BlockingFailingCloseSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(list_tools_error=SystemExit(f"discovery exposed {secret}"))
+            self._secret_redactor = SecretRedactor(secret)
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed = True
+            raise RuntimeError(f"cleanup exposed {secret}")
+
+    async def run() -> tuple[int, bool, asyncio.CancelledError]:
+        session = BlockingFailingCloseSession()
+        task = asyncio.create_task(
+            connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        )
+        await session.close_started.wait()
+        task.cancel(f"cancel cleanup {secret}")
+        cancelling = task.cancelling()
+        await asyncio.sleep(0)
+        session.release_close.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return cancelling, task.cancelled(), exc_info.value
+
+    cancelling, cancelled, error = asyncio.run(run())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert error.__context__ is None
+    assert isinstance(error.__cause__, BaseExceptionGroup)
+    assert len(error.__cause__.exceptions) == 2
+    assert all(isinstance(item, McpProtocolError) for item in error.__cause__.exceptions)
+    assert secret not in "".join(traceback.format_exception(error))
+    assert REDACTED_SECRET in "".join(traceback.format_exception(error.__cause__))
+
+
+def test_mcp_toolset_discovery_rejects_unauthenticated_failure_handoffs(
+    caplog,
+    capsys,
+) -> None:
+    import logging
+    import warnings
+
+    from cayu.mcp._exception_handoffs import (
+        MCP_HTTP_SETTLEMENT_TASK_ATTRIBUTE,
+        MCP_SESSION_CLOSE_TASK_ATTRIBUTE,
+    )
+
+    secret = "forged-mcp-failure-handoff-secret-canary"
+    render_calls: list[str] = []
+
+    class SecretBearingHandoff:
+        def __str__(self) -> str:
+            render_calls.append("str")
+            return secret
+
+        def __repr__(self) -> str:
+            render_calls.append("repr")
+            return secret
+
+    raw_failure = RuntimeError("extension discovery failed")
+    raw_namespace = BaseException.__dict__["__dict__"].__get__(raw_failure, BaseException)
+    raw_namespace[MCP_SESSION_CLOSE_TASK_ATTRIBUTE] = SecretBearingHandoff()
+    raw_namespace[MCP_HTTP_SETTLEMENT_TASK_ATTRIBUTE] = SecretBearingHandoff()
+
+    async def run() -> tuple[BaseException, bool]:
+        session = FakeMcpSession(list_tools_error=raw_failure)
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(McpProtocolError) as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        return exc_info.value, session.closed
+
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always")
+        with caplog.at_level(logging.WARNING):
+            error, closed = asyncio.run(run())
+
+    public_namespace = BaseException.__dict__["__dict__"].__get__(error, BaseException)
+    assert MCP_SESSION_CLOSE_TASK_ATTRIBUTE not in public_namespace
+    assert MCP_HTTP_SETTLEMENT_TASK_ATTRIBUTE not in public_namespace
+    assert secret not in "".join(traceback.format_exception(error))
+    assert all(secret not in record.getMessage() for record in caplog.records)
+    assert all(secret not in str(warning.message) for warning in captured_warnings)
+    captured_output = capsys.readouterr()
+    assert secret not in captured_output.out
+    assert secret not in captured_output.err
+    _assert_traceback_does_not_retain_text(error, secret)
+    assert render_calls == []
+    assert closed is True
+
+
+def test_mcp_toolset_discovery_timeout_does_not_wait_for_retained_close() -> None:
+    class BlockingCloseSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(list_tools_error=McpIdleTimeoutError("discovery idle timeout"))
+            self.close_started = asyncio.Event()
+            self.close_finished = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        def _fence_before_retained_close(self) -> bool:
+            self.closed = True
+            return True
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.close_finished.set()
+
+    async def run() -> tuple[float, bool]:
+        session = BlockingCloseSession()
+        started_at = asyncio.get_running_loop().time()
+        with pytest.raises(McpIdleTimeoutError, match="idle timeout"):
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        elapsed = asyncio.get_running_loop().time() - started_at
+        await asyncio.wait_for(session.close_started.wait(), timeout=0.1)
+        close_was_pending = not session.close_finished.is_set()
+        session.release_close.set()
+        await asyncio.wait_for(session.close_finished.wait(), timeout=0.1)
+        return elapsed, close_was_pending
+
+    elapsed, close_was_pending = asyncio.run(run())
+
+    assert elapsed < 0.05
+    assert close_was_pending is True
+
+
+def test_mcp_toolset_fencing_hook_cancellation_fails_closed_without_reclassification() -> None:
+    class CancellingFenceSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(list_tools_error=McpIdleTimeoutError("discovery idle timeout"))
+
+        def _fence_before_retained_close(self) -> bool:
+            raise asyncio.CancelledError("extension hook cancelled internally")
+
+    async def run() -> tuple[bool, int]:
+        session = CancellingFenceSession()
+        with pytest.raises(McpIdleTimeoutError, match="idle timeout"):
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        current = asyncio.current_task()
+        assert current is not None
+        return session.closed, current.cancelling()
+
+    closed, cancelling = asyncio.run(run())
+
+    assert closed is True
+    assert cancelling == 0
+
+
+@pytest.mark.parametrize("fatal_type", [SystemExit, GeneratorExit])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_mcp_toolset_fencing_hook_fatal_signal_fails_closed_and_finishes_cleanup(
+    fatal_type: type[BaseException],
+    cleanup_fails: bool,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    secret = "mcp-fencing-hook-fatal-secret-canary"
+
+    class FatalFenceSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(
+                list_tools_error=McpIdleTimeoutError("discovery idle timeout"),
+                close_error=(
+                    RuntimeError(f"discovery cleanup exposed {secret}") if cleanup_fails else None
+                ),
+            )
+            self._secret_redactor = SecretRedactor(secret)
+
+        def _fence_before_retained_close(self) -> bool:
+            raise fatal_type(f"fencing probe exposed {secret}")
+
+    async def run() -> tuple[BaseException, bool]:
+        session = FatalFenceSession()
+        with pytest.raises(McpIdleTimeoutError, match="idle timeout") as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        return exc_info.value, session.closed
+
+    with caplog.at_level(logging.DEBUG):
+        error, closed = asyncio.run(run())
+
+    assert closed is True
+    assert secret not in "".join(traceback.format_exception(error))
+    if cleanup_fails:
+        assert isinstance(error.__cause__, McpProtocolError)
+        assert REDACTED_SECRET in str(error.__cause__)
+    else:
+        assert error.__cause__ is None
+    _assert_traceback_does_not_retain_text(error, secret)
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert all(secret not in record.getMessage() for record in caplog.records)
+    assert all(secret not in str(warning.message) for warning in recwarn)
+
+
+def test_mcp_toolset_retained_close_failure_is_attached_and_redacted() -> None:
+    secret = "mcp-retained-close-secret-canary"
+
+    class FailingRetainedCloseSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(list_tools_error=McpIdleTimeoutError("discovery idle timeout"))
+            self._secret_redactor = SecretRedactor(secret)
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        def _fence_before_retained_close(self) -> bool:
+            self.closed = True
+            return True
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            raise RuntimeError(f"retained cleanup exposed {secret}")
+
+    async def run() -> tuple[BaseException, BaseException]:
+        session = FailingRetainedCloseSession()
+        with pytest.raises(McpIdleTimeoutError) as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        close_task = _mcp_session_close_task(exc_info.value)
+        assert close_task is not None
+        await session.close_started.wait()
+        session.release_close.set()
+        with pytest.raises(McpProtocolError) as close_exc_info:
+            await close_task
+        return exc_info.value, close_exc_info.value
+
+    primary_error, close_error = asyncio.run(run())
+
+    assert secret not in "".join(traceback.format_exception(primary_error))
+    assert secret not in "".join(traceback.format_exception(close_error))
+    assert REDACTED_SECRET in str(close_error)
+
+
+def test_retained_close_terminal_observer_consumes_mixed_failure_group() -> None:
+    raw_close_failure = BaseExceptionGroup(
+        "mixed retained close failure",
+        [
+            asyncio.CancelledError("historical close cancellation"),
+            RuntimeError("ordinary close failure"),
+        ],
+    )
+
+    async def run() -> tuple[BaseException, list[dict[str, Any]]]:
+        session = FakeMcpSession(close_error=raw_close_failure)
+        loop = asyncio.get_running_loop()
+        diagnostics: list[dict[str, Any]] = []
+        previous_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+        try:
+            primary_error = McpIdleTimeoutError("discovery idle timeout")
+            close_task = _retain_mcp_session_close(
+                session,
+                primary_error=primary_error,
+            )
+            outcome = (await asyncio.gather(close_task, return_exceptions=True))[0]
+            await asyncio.sleep(0)
+            return outcome, diagnostics
+        finally:
+            loop.set_exception_handler(previous_handler)
+
+    outcome, diagnostics = asyncio.run(run())
+
+    assert isinstance(outcome, BaseExceptionGroup)
+    assert diagnostics == []
+
+
+def test_mcp_toolset_discovery_timeout_waits_for_unfenced_extension_close() -> None:
+    definition = McpToolDefinition(name="echo", input_schema={"type": "object"})
+
+    class ReusedSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(definitions=(definition,))
+            self.list_attempts = 0
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+            self.list_attempts += 1
+            if self.closed:
+                raise McpProtocolError("extension session is closed")
+            if self.list_attempts == 1:
+                raise McpIdleTimeoutError("discovery idle timeout")
+            return self.definitions
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.closed = True
+
+    async def run() -> tuple[bool, bool, int]:
+        session = ReusedSession()
+        client = FakeMcpClient(session)
+        first_attempt = asyncio.create_task(connect_mcp_toolset(_fake_server_spec(), client=client))
+        await asyncio.wait_for(session.close_started.wait(), timeout=0.1)
+        returned_before_close = first_attempt.done()
+        session.release_close.set()
+        with pytest.raises(McpIdleTimeoutError, match="idle timeout"):
+            await first_attempt
+        with pytest.raises(McpProtocolError, match="session is closed"):
+            await connect_mcp_toolset(_fake_server_spec(), client=client)
+        return returned_before_close, session.closed, session.list_attempts
+
+    returned_before_close, closed, list_attempts = asyncio.run(run())
+
+    assert returned_before_close is False
+    assert closed is True
+    assert list_attempts == 2
+
+
+def test_mcp_toolset_builtin_subclasses_must_explicitly_prove_discovery_fencing() -> None:
+    initialize_result = McpInitializeResult(protocol_version=MCP_PROTOCOL_VERSION)
+
+    class ExtendedHttpSession(HttpMcpSession):
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.close_finished = False
+
+        @property
+        def initialize_result(self) -> McpInitializeResult:
+            return initialize_result
+
+        async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+            raise McpIdleTimeoutError("extended HTTP discovery timed out")
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.close_finished = True
+
+    class ExtendedStdioSession(StdioMcpSession):
+        def __init__(self) -> None:
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.close_finished = False
+
+        @property
+        def initialize_result(self) -> McpInitializeResult:
+            return initialize_result
+
+        async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+            raise McpIdleTimeoutError("extended stdio discovery timed out")
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.close_finished = True
+
+    async def exercise(session: ExtendedHttpSession | ExtendedStdioSession) -> None:
+        task = asyncio.create_task(
+            connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        )
+        await asyncio.wait_for(session.close_started.wait(), timeout=0.1)
+        assert session._closed is True
+        assert task.done() is False
+        session.release_close.set()
+        with pytest.raises(McpIdleTimeoutError, match="discovery timed out"):
+            await task
+        assert session.close_finished is True
+
+    async def run() -> None:
+        await exercise(ExtendedHttpSession())
+        await exercise(ExtendedStdioSession())
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel_discovery", [False, True])
+def test_mcp_toolset_descendant_cannot_inherit_discovery_fencing_proof(
+    cancel_discovery: bool,
+) -> None:
+    class OptedInSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discovery_started = asyncio.Event()
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+            self.close_finished = False
+
+        async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+            self.discovery_started.set()
+            if cancel_discovery:
+                await asyncio.Event().wait()
+            raise McpIdleTimeoutError("descendant discovery timed out")
+
+        def _fence_before_retained_close(self) -> bool:
+            self.closed = True
+            return True
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.close_finished = True
+
+    class DescendantSession(OptedInSession):
+        pass
+
+    async def run() -> tuple[int, bool]:
+        session = DescendantSession()
+        task = asyncio.create_task(
+            connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        )
+        await asyncio.wait_for(session.discovery_started.wait(), timeout=0.1)
+        cancelling = 0
+        if cancel_discovery:
+            task.cancel("cancel descendant discovery")
+            cancelling = task.cancelling()
+        await asyncio.wait_for(session.close_started.wait(), timeout=0.1)
+        assert task.done() is False
+        session.release_close.set()
+        if cancel_discovery:
+            with pytest.raises(asyncio.CancelledError, match="cancel descendant discovery"):
+                await task
+            assert task.cancelled() is True
+        else:
+            with pytest.raises(McpIdleTimeoutError, match="descendant discovery timed out"):
+                await task
+        return cancelling, session.close_finished
+
+    cancelling, close_finished = asyncio.run(run())
+
+    assert cancelling == int(cancel_discovery)
+    assert close_finished is True
+
+
+def test_mcp_toolset_real_cancellation_does_not_wait_for_retained_close() -> None:
+    class BlockingDiscoverySession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.discovery_started = asyncio.Event()
+            self.close_started = asyncio.Event()
+            self.close_finished = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def list_tools(self) -> tuple[McpToolDefinition, ...]:
+            self.discovery_started.set()
+            await asyncio.Event().wait()
+            return ()
+
+        def _fence_before_retained_close(self) -> bool:
+            self.closed = True
+            return True
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            self.close_finished.set()
+
+    async def run() -> tuple[int, bool, bool]:
+        session = BlockingDiscoverySession()
+        task = asyncio.create_task(
+            connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        )
+        await session.discovery_started.wait()
+        task.cancel("cancel discovery")
+        cancelling = task.cancelling()
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        returned_before_close = task in done and not session.close_finished.is_set()
+        await asyncio.wait_for(session.close_started.wait(), timeout=0.1)
+        session.release_close.set()
+        await asyncio.wait_for(session.close_finished.wait(), timeout=0.1)
+        with pytest.raises(asyncio.CancelledError, match="cancel discovery"):
+            await task
+        return cancelling, task.cancelled(), returned_before_close
+
+    cancelling, cancelled, returned_before_close = asyncio.run(run())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert returned_before_close is True
 
 
 def test_mcp_toolset_connect_closes_session_when_adapter_construction_fails() -> None:
@@ -4458,6 +5368,65 @@ def test_mcp_toolset_connect_preserves_original_error_when_cleanup_is_cancelled(
         return session.closed
 
     assert asyncio.run(run()) is True
+
+
+def test_mcp_toolset_connect_attaches_redacted_cleanup_failure() -> None:
+    secret = "mcp-discovery-close-secret-canary"
+
+    async def run() -> BaseException:
+        session = FakeMcpSession(
+            list_tools_error=McpProtocolError("discovery failed"),
+            close_error=RuntimeError(f"discovery cleanup exposed {secret}"),
+        )
+        session._secret_redactor = SecretRedactor(secret)
+        with pytest.raises(McpProtocolError, match="discovery failed") as exc_info:
+            await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        return exc_info.value
+
+    error = asyncio.run(run())
+
+    assert isinstance(error.__cause__, McpProtocolError)
+    assert secret not in "".join(traceback.format_exception(error))
+    assert REDACTED_SECRET in str(error.__cause__)
+
+
+def test_mcp_toolset_cleanup_cancellation_detaches_prior_failures() -> None:
+    secret = "mcp-discovery-cleanup-cancellation-secret-canary"
+
+    class BlockingFailingCloseSession(FakeMcpSession):
+        def __init__(self) -> None:
+            super().__init__(list_tools_error=McpProtocolError(f"discovery exposed {secret}"))
+            self._secret_redactor = SecretRedactor(secret)
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_started.set()
+            await self.release_close.wait()
+            raise RuntimeError(f"cleanup exposed {secret}")
+
+    async def run() -> tuple[int, bool, asyncio.CancelledError]:
+        session = BlockingFailingCloseSession()
+        task = asyncio.create_task(
+            connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        )
+        await session.close_started.wait()
+        task.cancel(f"cancel cleanup {secret}")
+        cancelling = task.cancelling()
+        await asyncio.sleep(0)
+        session.release_close.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await task
+        return cancelling, task.cancelled(), exc_info.value
+
+    cancelling, cancelled, error = asyncio.run(run())
+
+    assert cancelling == 1
+    assert cancelled is True
+    assert error.__context__ is None
+    assert isinstance(error.__cause__, BaseExceptionGroup)
+    assert secret not in "".join(traceback.format_exception(error))
+    assert REDACTED_SECRET in "".join(traceback.format_exception(error.__cause__))
 
 
 def test_mcp_toolset_connect_redacts_discovery_failure_before_propagation() -> None:
@@ -4500,7 +5469,7 @@ def test_mcp_toolset_connect_detaches_safe_discovery_error_from_secret_definitio
     _assert_mcp_traceback_does_not_retain_secret(error, secret)
 
 
-def test_mcp_toolset_connect_preserves_original_cancellation_when_cleanup_fails() -> None:
+def test_mcp_toolset_internal_cancellation_preserves_redacted_cleanup_failure() -> None:
     secret = "mcp-cancel-cleanup-canary"
 
     async def run():
@@ -4509,14 +5478,17 @@ def test_mcp_toolset_connect_preserves_original_cancellation_when_cleanup_fails(
             close_error=RuntimeError(f"cleanup failed {secret}"),
         )
         session._secret_redactor = SecretRedactor(secret)
-        with pytest.raises(asyncio.CancelledError) as excinfo:
+        with pytest.raises(McpProtocolError, match="cancelled unexpectedly") as excinfo:
             await connect_mcp_toolset(_fake_server_spec(), client=FakeMcpClient(session))
+        await asyncio.sleep(0)
         return session.closed, excinfo.value
 
     closed, error = asyncio.run(run())
 
     assert closed is True
-    assert secret not in repr(error)
+    assert isinstance(error.__cause__, McpProtocolError)
+    assert secret not in "".join(traceback.format_exception(error))
+    assert REDACTED_SECRET in str(error.__cause__)
 
 
 def test_mcp_tool_adapter_runs_through_cayu_runtime() -> None:
