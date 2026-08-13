@@ -12,9 +12,13 @@ from urllib.parse import parse_qs
 import pytest
 
 from cayu.cli import _cloud_auth as cloud_auth
+from cayu.cli import cloud as cloud_cli
 from cayu.cli import main
+from cayu.cli._cloud_api import CloudApiClient
 from cayu.cli._cloud_auth import (
+    CloudAuthCredentials,
     CloudAuthError,
+    CloudAuthStore,
     DeviceAuthorization,
     WorkOSDeviceAuthClient,
 )
@@ -91,14 +95,14 @@ def test_cloud_help_exposes_workos_session_commands(
     assert "whoami" in help_text
 
 
-def test_cloud_login_without_endpoint_configuration_uses_production(
+def test_cloud_login_uses_production_despite_environment_endpoint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setenv("CAYU_CLOUD_AUTH", str(tmp_path / "missing-auth.json"))
     monkeypatch.setenv("CAYU_CLOUD_CONFIG", str(tmp_path / "missing-config.json"))
-    monkeypatch.delenv("CAYU_CLOUD_API_URL", raising=False)
+    monkeypatch.setenv("CAYU_CLOUD_API_URL", "https://staging-cloud.example.test")
     monkeypatch.delenv("CAYU_CLOUD_CONTEXT", raising=False)
 
     selected_api_urls: list[str] = []
@@ -121,6 +125,168 @@ def test_cloud_login_without_endpoint_configuration_uses_production(
         },
         "ok": False,
     }
+
+
+def test_cloud_login_without_endpoint_configuration_ignores_saved_nonproduction_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    auth_path = tmp_path / "cloud-auth.json"
+    CloudAuthStore(auth_path).save(
+        CloudAuthCredentials(
+            api_url="https://staging-cloud.example.test",
+            workos_api_hostname="auth.example.test",
+            workos_client_id="client_test",
+            access_token=_jwt(expires_at=time.time() + 3600, marker="staging"),
+            refresh_token="private-refresh-token",
+            expires_at=time.time() + 3600,
+            organization_id="org_test",
+            user_id="user_test",
+        )
+    )
+    monkeypatch.setenv("CAYU_CLOUD_AUTH", str(auth_path))
+    monkeypatch.setenv("CAYU_CLOUD_CONFIG", str(tmp_path / "missing-config.json"))
+    monkeypatch.setenv("CAYU_CLOUD_API_URL", "https://staging-cloud.example.test")
+    monkeypatch.delenv("CAYU_CLOUD_CONTEXT", raising=False)
+
+    selected_api_urls: list[str] = []
+
+    def portal_config(client: WorkOSDeviceAuthClient) -> tuple[str, str]:
+        selected_api_urls.append(client.api_url)
+        raise CloudAuthError("login_unavailable", "Cayu Cloud login is unavailable.")
+
+    monkeypatch.setattr(WorkOSDeviceAuthClient, "portal_config", portal_config)
+
+    assert main(["cloud", "login", "--no-browser"]) == 2
+
+    assert selected_api_urls == ["https://cloud.cayu.dev"]
+    assert json.loads(capsys.readouterr().out)["error"]["category"] == "login_unavailable"
+
+
+def test_cloud_deploy_does_not_follow_saved_nonproduction_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    auth_path = tmp_path / "cloud-auth.json"
+    expiring_credentials = CloudAuthCredentials(
+        api_url="https://staging-cloud.example.test",
+        workos_api_hostname="auth.example.test",
+        workos_client_id="client_test",
+        access_token=_jwt(expires_at=time.time() + 30, marker="staging"),
+        refresh_token="private-refresh-token",
+        expires_at=time.time() + 30,
+        organization_id="org_test",
+        user_id="user_test",
+    )
+    CloudAuthStore(auth_path).save(expiring_credentials)
+    monkeypatch.setenv("CAYU_CLOUD_AUTH", str(auth_path))
+    monkeypatch.setenv("CAYU_CLOUD_CONFIG", str(tmp_path / "missing-config.json"))
+    monkeypatch.setenv("CAYU_CLOUD_API_URL", "https://staging-cloud.example.test")
+    monkeypatch.delenv("CAYU_CLOUD_CONTEXT", raising=False)
+    deployments: list[str] = []
+    refreshes: list[str] = []
+
+    def deploy(
+        _arguments: object,
+        *,
+        client: CloudApiClient,
+        recorder: object,
+        project: object,
+    ) -> dict[str, object]:
+        del recorder, project
+        deployments.append(client.api_url)
+        return {"operation": "deploy", "result": {}}
+
+    monkeypatch.setattr(cloud_cli, "resolve_project", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cloud_cli, "_deploy", deploy)
+    monkeypatch.setattr(
+        WorkOSDeviceAuthClient,
+        "refresh",
+        lambda _client, credentials: refreshes.append(credentials.api_url) or credentials,
+    )
+
+    assert (
+        main(
+            [
+                "cloud",
+                "--evidence-dir",
+                str(tmp_path / "evidence"),
+                "deploy",
+                "--no-wait",
+            ]
+        )
+        == 2
+    )
+
+    assert deployments == []
+    assert refreshes == []
+    assert json.loads(capsys.readouterr().out) == {
+        "error": {
+            "category": "login_api_mismatch",
+            "message": (
+                "The saved login belongs to another Cayu Cloud; run "
+                "`cayu cloud login` to sign in to production."
+            ),
+        },
+        "ok": False,
+    }
+
+
+def test_cloud_deploy_uses_production_despite_environment_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    auth_path = tmp_path / "cloud-auth.json"
+    CloudAuthStore(auth_path).save(
+        CloudAuthCredentials(
+            api_url="https://cloud.cayu.dev",
+            workos_api_hostname="auth.example.test",
+            workos_client_id="client_test",
+            access_token=_jwt(expires_at=time.time() + 3600, marker="production"),
+            refresh_token="private-refresh-token",
+            expires_at=time.time() + 3600,
+            organization_id="org_test",
+            user_id="user_test",
+        )
+    )
+    monkeypatch.setenv("CAYU_CLOUD_AUTH", str(auth_path))
+    monkeypatch.setenv("CAYU_CLOUD_CONFIG", str(tmp_path / "missing-config.json"))
+    monkeypatch.setenv("CAYU_CLOUD_API_URL", "https://staging-cloud.example.test")
+    monkeypatch.delenv("CAYU_CLOUD_CONTEXT", raising=False)
+    deployments: list[str] = []
+
+    def deploy(
+        _arguments: object,
+        *,
+        client: CloudApiClient,
+        recorder: object,
+        project: object,
+    ) -> dict[str, object]:
+        del recorder, project
+        deployments.append(client.api_url)
+        return {"operation": "deploy", "result": {}}
+
+    monkeypatch.setattr(cloud_cli, "resolve_project", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cloud_cli, "_deploy", deploy)
+
+    assert (
+        main(
+            [
+                "cloud",
+                "--evidence-dir",
+                str(tmp_path / "evidence"),
+                "deploy",
+                "--no-wait",
+            ]
+        )
+        == 0
+    )
+
+    assert deployments == ["https://cloud.cayu.dev"]
+    assert json.loads(capsys.readouterr().out)["operation"] == "deploy"
 
 
 def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
@@ -229,7 +395,8 @@ def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
     monkeypatch.delenv("CAYU_CLOUD_API_KEY", raising=False)
     monkeypatch.delenv("CAYU_CLOUD_API_KEY_FILE", raising=False)
     monkeypatch.delenv("CAYU_CLOUD_CONTEXT", raising=False)
-    monkeypatch.setenv("CAYU_CLOUD_API_URL", api_url)
+    monkeypatch.delenv("CAYU_CLOUD_API_URL", raising=False)
+    monkeypatch.setattr(cloud_cli, "_PRODUCTION_API_URL", api_url)
     try:
         assert main(["cloud", "login", "--no-browser"]) == 0
         login_streams = capsys.readouterr()
@@ -324,7 +491,7 @@ def test_workos_login_refresh_and_logout_power_normal_cloud_commands(
     assert ("GET", "/v1/me", f"Bearer {access_two}") in requests
 
 
-def test_cloud_login_uses_active_context_and_rejects_a_portal_without_workos(
+def test_cloud_login_uses_explicit_context_and_rejects_a_portal_without_workos(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -363,10 +530,8 @@ def test_cloud_login_uses_active_context_and_rejects_a_portal_without_workos(
             }
         )
     )
-    assert main(["cloud", "context", "use", str(context_path)]) == 0
-    capsys.readouterr()
     try:
-        result = main(["cloud", "login", "--no-browser"])
+        result = main(["cloud", "--context", str(context_path), "login", "--no-browser"])
     finally:
         server.shutdown()
         thread.join()

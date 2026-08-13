@@ -1,16 +1,24 @@
 # Cayu Cloud CLI
 
 The `cayu cloud` command group deploys and operates complete Cayu Agent applications.
-Cayu Cloud is currently invite-only. The CLI connects to the production service at
-`https://cloud.cayu.dev` by default. Then run the remaining commands from an Agent
-repository.
+Cayu Cloud is currently invite-only. Login-backed commands are pinned to the production
+service at `https://cloud.cayu.dev`; users never select an API URL. Run the remaining
+commands from an Agent repository.
 
 ```console
 cayu cloud login
 cayu cloud whoami
 cayu cloud deploy .
+cayu cloud deployment timeline DEPLOYMENT_ID --application my-agent
+cayu cloud deployment logs DEPLOYMENT_ID --application my-agent
 cayu cloud service status --application my-agent
 ```
+
+`deployment timeline` shows the release pipeline milestones and whether a failed
+release can be retried or an active release can be cancelled. `deployment logs`
+returns the Cloud-owned structured publication activity for that exact immutable
+release. Both commands use authenticated, tenant-scoped customer API responses and
+emit the same machine-readable JSON envelope as the rest of the Cloud CLI.
 
 `cayu cloud deploy` creates the 8-63 character application slug declared in
 `cayu-cloud.toml` when it does not exist, then updates it on later deploys. Slugs use
@@ -43,11 +51,10 @@ The `result` object above is abbreviated; the real response retains the redacted
 successful deployment result. An unusable evidence destination discovered during
 preflight instead exits `2` with `local_state_unavailable`, before Cloud mutation.
 
-Set `CAYU_CLOUD_API_URL` before login to use a staging or local service; the saved login
-remembers that endpoint. Login uses WorkOS device authorization. Cayu opens the complete
-verification URL when possible and prints the URL and one-time user code to standard
-error. Pass `--no-browser` on SSH, in a container, or when a coding agent should ask a
-human to complete authentication in another browser:
+Login uses WorkOS device authorization. Cayu opens the complete verification URL when
+possible and prints the URL and one-time user code to standard error. Pass
+`--no-browser` on SSH, in a container, or when a coding agent should ask a human to
+complete authentication in another browser:
 
 ```console
 cayu cloud login --no-browser
@@ -59,23 +66,16 @@ deletes that local login.
 
 Authentication selection is explicit: a successful `cayu cloud login` clears the
 persisted private-context selection, while `cayu cloud context use PATH` selects that
-context for later commands. Clearing the context falls back to the saved WorkOS login.
-An explicitly supplied context selects its own endpoint ahead of
-`CAYU_CLOUD_API_URL`; otherwise that environment variable selects a staging or local
-endpoint ahead of a saved login. Production is the final endpoint fallback. Command-line
-and environment API credentials remain the highest-priority credential override. A
-persisted context's API key remains bound to that context's endpoint: when
-`CAYU_CLOUD_API_URL` selects a different endpoint, also provide
-`CAYU_CLOUD_API_KEY` or `CAYU_CLOUD_API_KEY_FILE`. Without an explicit replacement
-credential, Cayu fails with `context_api_mismatch` before making a Cloud request.
+context for later commands. Clearing the context falls back to the saved WorkOS login
+and the fixed production endpoint. A saved login for any other endpoint is rejected;
+run `cayu cloud login` again to sign in to production.
 
-Private contexts and API keys remain the noninteractive path for CI, operational
-handoffs, and automation:
+Private contexts and API keys remain the internal noninteractive path for CI,
+operational handoffs, and automation:
 
 ```console
 cayu cloud context use /private/path/cloud-context.json
-CAYU_CLOUD_API_KEY_FILE=/private/path/key \
-  CAYU_CLOUD_API_URL=https://cloud.example.com cayu cloud doctor
+CAYU_CLOUD_API_KEY_FILE=/private/path/key cayu cloud doctor
 ```
 
 ## Agent environment variables

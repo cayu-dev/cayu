@@ -1528,6 +1528,84 @@ def test_cloud_inspection_commands_are_implemented_by_the_core_package(
         thread.join()
 
 
+def test_cloud_deployment_timeline_and_logs_are_public_cli_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    requests: list[tuple[str, str]] = []
+    timeline = {
+        "can_cancel": False,
+        "can_retry": True,
+        "deployment_id": "dep_one",
+        "items": [
+            {
+                "key": "image_building",
+                "label": "Image building",
+                "state": "failed",
+            }
+        ],
+        "status": "failed",
+    }
+    logs = {
+        "items": [
+            {
+                "level": "error",
+                "message": "Image build failed",
+                "phase": "image_built",
+            }
+        ],
+        "service_items": [],
+    }
+
+    def request(
+        _client: CloudApiClient,
+        method: str,
+        path: str,
+        **_kwargs: object,
+    ) -> dict[str, object]:
+        requests.append((method, path))
+        if path == "/v1/applications":
+            return {"items": [{"id": "app_research", "name": "Research Agent"}]}
+        if path.endswith("/timeline"):
+            return timeline
+        if path.endswith("/logs"):
+            return logs
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    monkeypatch.setenv("CAYU_CLOUD_CONFIG", str(tmp_path / "missing.json"))
+    monkeypatch.setenv("CAYU_CLOUD_API_KEY", "customer-secret-material")
+    monkeypatch.setattr(CloudApiClient, "request", request)
+
+    for action, expected in (("timeline", timeline), ("logs", logs)):
+        assert (
+            main(
+                [
+                    "cloud",
+                    "deployment",
+                    action,
+                    "dep_one",
+                    "--application",
+                    "research-agent",
+                ]
+            )
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out) == {
+            "ok": True,
+            "operation": f"deployment.{action}",
+            "result": expected,
+        }
+
+    assert requests == [
+        ("GET", "/v1/applications"),
+        ("GET", "/v1/applications/app_research/deployments/dep_one/timeline"),
+        ("GET", "/v1/applications"),
+        ("GET", "/v1/applications/app_research/deployments/dep_one/logs"),
+    ]
+    assert "customer-secret-material" not in capsys.readouterr().out
+
+
 def test_cloud_api_key_uses_production_endpoint_without_configuration(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1799,6 +1877,72 @@ def test_cloud_api_does_not_echo_credentials_from_error_responses(
         "message": "Cayu Cloud API returned HTTP 401.",
     }
     assert "customer-secret-material" not in rendered
+
+
+def test_cloud_api_surfaces_only_allowlisted_validation_detail(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    responses = [
+        {
+            "detail": {
+                "code": "agent_slug_invalid",
+                "message": "server-controlled customer-secret-material",
+            }
+        },
+        {
+            "detail": {
+                "code": "unknown_validation",
+                "message": "invalid manifest containing customer-secret-material",
+            }
+        },
+    ]
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            payload = json.dumps(responses.pop(0)).encode()
+            self.send_response(422)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        api_key_file = tmp_path / "api-key"
+        api_key_file.write_text("customer-secret-material\n")
+        context_path = tmp_path / "cloud-context.json"
+        _write_ready_context(
+            context_path,
+            api_key_file=api_key_file,
+            api_url=f"http://127.0.0.1:{server.server_port}",
+        )
+
+        assert main(["cloud", "--context", str(context_path), "doctor"]) == 2
+        safe = json.loads(capsys.readouterr().out)
+        assert main(["cloud", "--context", str(context_path), "doctor"]) == 2
+        unsafe_rendered = capsys.readouterr().out
+    finally:
+        server.shutdown()
+        thread.join()
+
+    assert safe["error"] == {
+        "category": "api_request_rejected",
+        "message": (
+            "Cayu Cloud API returned HTTP 422: Agent application slugs must be 8-63 "
+            "lowercase letters, digits, or interior hyphens."
+        ),
+    }
+    assert json.loads(unsafe_rendered)["error"] == {
+        "category": "api_request_rejected",
+        "message": "Cayu Cloud API returned HTTP 422.",
+    }
+    assert "customer-secret-material" not in unsafe_rendered
 
 
 def test_cloud_source_upload_reports_only_safe_object_store_error_fields() -> None:

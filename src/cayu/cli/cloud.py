@@ -224,7 +224,9 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         required=True,
     )
     deployment_descriptions = {
+        "logs": "Read structured publication logs for one release.",
         "status": "Show the current publication status of one release.",
+        "timeline": "Show the publication milestones for one release.",
         "wait": "Wait until one release is promotable or terminal.",
         "promote": "Select a smoke-tested release for its Agent application.",
     }
@@ -499,19 +501,8 @@ def _login(arguments: argparse.Namespace) -> dict[str, Any]:
 
 def _login_api_url(arguments: argparse.Namespace) -> str:
     context_path = _selected_context_path(arguments.context)
-    configured_api_url = _configured_cloud_api_url(
-        arguments,
-        context=None,
-        context_path=context_path,
-    )
-    if configured_api_url is not None:
-        return configured_api_url
-    try:
-        credentials = CloudAuthStore().load()
-    except CloudAuthError:
-        credentials = None
-    if credentials is not None:
-        return credentials.api_url
+    if context_path is not None and _context_source(arguments.context) != "persisted":
+        return str(_read_context(context_path)["api_url"]).rstrip("/")
     return _PRODUCTION_API_URL
 
 
@@ -836,6 +827,8 @@ def _deployment(
     base = f"/v1/applications/{application_id}/deployments/{arguments.deployment_id}"
     if arguments.deployment_command == "status":
         result = client.request("GET", base)
+    elif arguments.deployment_command in {"logs", "timeline"}:
+        result = client.request("GET", f"{base}/{arguments.deployment_command}")
     elif arguments.deployment_command == "wait":
         result = _wait_for_deployment(
             client,
@@ -1150,17 +1143,24 @@ def _cloud_client(
             timeout_seconds=arguments.timeout_seconds,
         )
 
-    credentials = fresh_cloud_credentials(
-        CloudAuthStore(),
-        timeout_seconds=arguments.timeout_seconds,
-    )
+    auth_store = CloudAuthStore()
+    credentials = auth_store.load()
     if credentials is not None:
-        api_url = str(configured_api_url or credentials.api_url).rstrip("/")
+        api_url = _PRODUCTION_API_URL
         if api_url != credentials.api_url:
             raise CloudAuthError(
                 "login_api_mismatch",
-                "The selected API URL differs from the saved login; run "
-                "`cayu cloud login` for that Cayu Cloud.",
+                "The saved login belongs to another Cayu Cloud; run "
+                "`cayu cloud login` to sign in to production.",
+            )
+        credentials = fresh_cloud_credentials(
+            auth_store,
+            timeout_seconds=arguments.timeout_seconds,
+        )
+        if credentials is None:
+            raise CloudAuthError(
+                "cloud_auth_unavailable",
+                "Could not read the local Cayu Cloud login.",
             )
         return CloudApiClient(
             api_url=api_url,

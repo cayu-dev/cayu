@@ -108,8 +108,8 @@ and keep its public test/eval seam intact.
 ### Deploy with Cayu Cloud
 
 Cloud commands ship in the same `cayu` package; no additional CLI package is
-required. Cayu Cloud is currently invite-only. The CLI connects to the production
-service at `https://cloud.cayu.dev` by default.
+required. Cayu Cloud is currently invite-only. Login-backed commands are pinned to
+the production service at `https://cloud.cayu.dev`; users never select an API URL.
 
 ```bash
 cayu cloud --help
@@ -119,17 +119,15 @@ cayu cloud init
 cayu cloud deploy
 ```
 
-Set `CAYU_CLOUD_API_URL` before login to use a staging or local service; the saved
-login remembers that endpoint. Login uses WorkOS device authorization. It opens the
-browser when possible and always prints a verification URL and one-time user code for
-SSH, containers, Cursor, Codex, and Claude Code. The resulting Organization-scoped
-session is stored privately and refreshed automatically; no WorkOS secret is embedded
-in Cayu. Use `--no-browser` when a human will open the displayed URL on another device.
-Login selects the WorkOS session over any previously persisted private context; a later
-`cayu cloud context use PATH` deliberately switches back to that automation context.
-The context API key is used only with its stored endpoint. To override that endpoint
-with `CAYU_CLOUD_API_URL`, provide an explicit `CAYU_CLOUD_API_KEY` or
-`CAYU_CLOUD_API_KEY_FILE`; otherwise Cayu rejects the mismatch before making a request.
+Login uses WorkOS device authorization. It opens the browser when possible and always
+prints a verification URL and one-time user code for SSH, containers, Cursor, Codex,
+and Claude Code. The resulting Organization-scoped session is stored privately and
+refreshed automatically; no WorkOS secret is embedded in Cayu. Use `--no-browser` when
+a human will open the displayed URL on another device. Login selects the WorkOS session
+over any previously persisted private context; a later `cayu cloud context use PATH`
+deliberately switches back to that internal automation context. Private contexts and
+explicit API credentials remain endpoint-bound operator mechanisms and do not change
+the default customer endpoint.
 
 `cayu cloud init` generates the small deployment descriptor from standard
 `pyproject.toml` metadata and a configured Cayu server, worker, or console

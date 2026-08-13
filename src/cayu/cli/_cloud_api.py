@@ -24,6 +24,11 @@ _SAFE_OBJECT_STORE_ERROR_CODES = frozenset(
         "SignatureDoesNotMatch",
     }
 )
+_SAFE_API_ERROR_DETAILS = {
+    (422, "agent_slug_invalid"): (
+        "Agent application slugs must be 8-63 lowercase letters, digits, or interior hyphens."
+    ),
+}
 
 
 class CloudApiError(RuntimeError):
@@ -119,9 +124,11 @@ class CloudApiClient:
                 "Cayu Cloud API is unavailable.",
             ) from None
         if not 200 <= response.status_code < 300:
+            detail = _safe_api_error_detail(response)
+            suffix = f": {detail}" if detail is not None else "."
             raise CloudApiError(
                 "api_request_rejected",
-                f"Cayu Cloud API returned HTTP {response.status_code}.",
+                f"Cayu Cloud API returned HTTP {response.status_code}{suffix}",
                 status_code=response.status_code,
             ) from None
         if response.status_code == 204:
@@ -198,6 +205,24 @@ def _object_store_error(content: bytes) -> str | None:
         return None
     normalized = code.strip()
     return normalized if normalized in _SAFE_OBJECT_STORE_ERROR_CODES else None
+
+
+def _safe_api_error_detail(response: httpx.Response) -> str | None:
+    """Return only a versioned, non-secret customer API validation message."""
+
+    try:
+        payload = response.json()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    detail = payload.get("detail")
+    if not isinstance(detail, dict):
+        return None
+    code = detail.get("code")
+    if type(code) is not str:
+        return None
+    return _SAFE_API_ERROR_DETAILS.get((response.status_code, code))
 
 
 def _is_loopback(hostname: str | None) -> bool:
