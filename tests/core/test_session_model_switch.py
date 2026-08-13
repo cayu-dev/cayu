@@ -5,6 +5,7 @@ import gc
 import weakref
 from collections.abc import AsyncIterator
 from copy import deepcopy
+from importlib.metadata import version
 from typing import Any
 
 import pytest
@@ -60,6 +61,7 @@ from cayu.providers.base import _preflight_provider_portable_messages
 from cayu.runtime import SessionStore
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime.approvals import PendingToolCallApproval
+from cayu.runtime.execution_profiles import build_execution_profile_identity
 
 
 class _NamedProvider(ModelProvider):
@@ -187,6 +189,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
         continued_interaction_id=None,
         defer_interaction_source=False,
         model_transition=None,
+        execution_profile=None,
     ):
         if self.inject_pending_round and model_transition is not None:
             self.inject_pending_round = False
@@ -219,6 +222,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
             continued_interaction_id=continued_interaction_id,
             defer_interaction_source=defer_interaction_source,
             model_transition=model_transition,
+            execution_profile=execution_profile,
         )
 
 
@@ -295,6 +299,32 @@ class _EchoTool(Tool):
         del ctx
         self.calls.append(dict(args))
         return ToolResult(content=str(args["value"]))
+
+
+def _profiled_source_identity(*, tool: Tool | None = None) -> SessionIdentity:
+    direct_tool = tool or _EchoTool()
+    spec = direct_tool.spec
+    return SessionIdentity(
+        provider_name="source",
+        model="source-model",
+        runtime_version=version("cayu"),
+        execution_profile=build_execution_profile_identity(
+            runtime_name="cayu",
+            runtime_version=version("cayu"),
+            provider_name="source",
+            model="source-model",
+            durable_system_prompt=None,
+            direct_tools=[
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "schema": direct_tool.schema,
+                    "parallel_safe": spec.parallel_safe,
+                    "effect": spec.effect.value,
+                }
+            ],
+        ),
+    )
 
 
 async def _collect(stream: AsyncIterator[Event]) -> list[Event]:
@@ -603,7 +633,7 @@ def test_sqlite_transcript_retention_cannot_invalidate_admitted_model_switch(
                 session_id="switch-retention",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.append_transcript_messages(
             "switch-retention",
@@ -657,7 +687,7 @@ def test_sqlite_model_switch_uses_absolute_cursor_after_prior_retention(tmp_path
                 session_id="switch-after-retention",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.append_transcript_messages(
             "switch-after-retention",
@@ -734,7 +764,7 @@ def test_sqlite_approval_continuation_uses_absolute_cursor_after_prior_retention
                 session_id="retained-approval",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(tool=tool),
         )
         await store.append_transcript_messages(
             "retained-approval",
@@ -818,7 +848,7 @@ def test_sqlite_pending_tool_recovery_uses_absolute_cursor_after_prior_retention
                 session_id="retained-tool-recovery",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(tool=tool),
         )
         await store.append_transcript_messages(
             "retained-tool-recovery",
@@ -1047,7 +1077,7 @@ def test_cross_provider_resume_drops_reasoning_only_assistant_shell() -> None:
                 session_id="switch-reasoning-only-shell",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.append_transcript_messages(
             "switch-reasoning-only-shell",
@@ -1123,7 +1153,7 @@ def test_reasoning_only_shell_does_not_break_pending_tool_round_recovery(tmp_pat
                 session_id="switch-reasoning-shell-recovery",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(tool=tool),
         )
         durable_prefix = [
             Message.text("user", "opening"),
@@ -1376,7 +1406,7 @@ def test_model_switch_rejects_unmatched_tool_history_without_mutation() -> None:
                 session_id="switch-unmatched-tool",
                 messages=[Message.text("user", "first")],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.append_transcript_messages(
             "switch-unmatched-tool",
@@ -1975,7 +2005,7 @@ def test_model_switch_preflight_receives_workload_redacted_projection() -> None:
                 session_id="switch-redacted-preflight",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.append_transcript_messages(
             "switch-redacted-preflight",
@@ -2018,7 +2048,7 @@ def test_model_switch_preflight_failure_does_not_retain_raw_workload_secret() ->
                 session_id="switch-preflight-traceback-redaction",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.append_transcript_messages(
             "switch-preflight-traceback-redaction",
@@ -2339,7 +2369,7 @@ def test_same_provider_model_override_fork_accepts_an_empty_retained_prefix() ->
                 session_id="empty-model-fork-source",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.update_status("empty-model-fork-source", SessionStatus.COMPLETED)
 
@@ -2379,7 +2409,7 @@ def test_sqlite_model_override_partial_fork_translates_absolute_retained_cursor(
                 session_id="model-override-retained-source",
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="source", model="source-model"),
+            identity=_profiled_source_identity(),
         )
         await store.append_transcript_messages(
             "model-override-retained-source",

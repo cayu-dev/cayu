@@ -99,7 +99,12 @@ from cayu.runtime._environment_allocation import (
     require_bounded_reconnect_metadata as _require_bounded_reconnect_metadata,
 )
 from cayu.runtime._event_writer import RuntimeEventWriter
-from cayu.runtime.sessions import CheckpointTransform, Session, SessionStore
+from cayu.runtime.sessions import (
+    CheckpointTransform,
+    Session,
+    SessionStore,
+    session_user_metadata,
+)
 from cayu.vaults import SecretRedactor
 
 FAILURE_DIAGNOSTIC_TEXT_MAX_BYTES = 4096
@@ -586,7 +591,7 @@ class EnvironmentLifecycle:
                 parent_session_id=session.parent_session_id,
                 causal_budget_id=session.causal_budget_id,
                 labels=session.labels,
-                metadata=session.metadata,
+                metadata=session_user_metadata(session.metadata),
                 reconnect_metadata=reconnect_metadata,
                 execution_requirements=registered_agent.execution_requirements,
             )

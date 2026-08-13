@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.provider_traceback_assertions import is_cayu_source_filename
 
 from cayu import (
@@ -738,7 +739,7 @@ def test_resume_completes_the_running_task_already_attached_to_the_session(
                 task_id=task.id,
                 messages=[Message.text("user", "original")],
             ),
-            identity=SessionIdentity(
+            identity=profiled_session_identity(
                 provider_name=provider.name,
                 model="scripted-model",
             ),

@@ -12,6 +12,7 @@ from cayu.runtime.checkpoints import (
     runtime_checkpoint_writer_view,
     validate_runtime_checkpoint_root_projection,
 )
+from cayu.runtime.execution_profiles import ExecutionProfileIdentity
 from cayu.runtime.sessions import (
     CheckpointRootFieldGuard,
     CheckpointTransform,
@@ -227,6 +228,24 @@ class _RuntimeCheckpointSessionStore:
                 session_id,
                 checkpoint_transform,
             ),
+            **kwargs,
+        )
+
+    async def admit_execution_profile_resume(
+        self,
+        session_id: str,
+        *,
+        checkpoint_transform: CheckpointTransform,
+        execution_profile: ExecutionProfileIdentity,
+        **kwargs: Any,
+    ) -> Session:
+        return await self._store.admit_execution_profile_resume(
+            session_id,
+            checkpoint_transform=_versioned_checkpoint_transform(
+                session_id,
+                checkpoint_transform,
+            ),
+            execution_profile=execution_profile,
             **kwargs,
         )
 

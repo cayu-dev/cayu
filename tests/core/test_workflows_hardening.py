@@ -3374,7 +3374,7 @@ def test_generated_workflow_child_collision_during_create_never_attaches_or_read
     foreign, workflow_events = asyncio.run(run())
 
     assert foreign is not None
-    assert foreign.metadata == {"owner": "foreign"}
+    assert foreign.metadata["owner"] == "foreign"
     assert foreign.parent_session_id is None
     assert foreign.causal_budget_id == "foreign-budget"
     assert foreign_reads == 1

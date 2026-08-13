@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._execution_unit_fixtures import tool_round_identity
 from tests.core._workload_secret_support import (
     FakeProvider,
@@ -1875,7 +1876,10 @@ def test_resume_rejects_legacy_secret_linkage_before_claiming_session(
                 session_id=session_id,
                 messages=[Message.text("user", "legacy")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_transcript_messages(
             session_id,
@@ -1969,7 +1973,10 @@ def test_resume_cleans_up_when_legacy_secret_linkage_arrives_after_preflight() -
                 session_id=session_id,
                 messages=[Message.text("user", "legacy")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_transcript_messages(
             session_id,

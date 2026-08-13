@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from tests.core._execution_profile_fixtures import profiled_session_identity
+
 from cayu import (
     AgentSpec,
     BeforeStopContext,
@@ -15,7 +17,6 @@ from cayu import (
     ResumeRequest,
     RunRequest,
     ScriptedModelProvider,
-    SessionIdentity,
     SessionStatus,
 )
 
@@ -50,7 +51,7 @@ def test_public_resume_preserves_non_deepcopyable_request_loop_policy() -> None:
                 session_id="stateful-policy-resume",
                 messages=[initial],
             ),
-            identity=SessionIdentity(
+            identity=profiled_session_identity(
                 provider_name=provider.name,
                 model="scripted-model",
             ),

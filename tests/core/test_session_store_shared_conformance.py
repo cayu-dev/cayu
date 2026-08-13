@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import pytest
 from pydantic import SecretStr, ValidationError
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._workload_secret_support import FakeProvider
 
 import cayu.runtime._model_step_executor as model_step_executor_module
@@ -896,7 +897,10 @@ def test_session_store_conformance_repairs_terminal_evidence_durably(
                         session_id=session_id,
                         messages=[Message.text("user", "finish")],
                     ),
-                    identity=_identity(),
+                    identity=profiled_session_identity(
+                        provider_name="fake",
+                        model="fake-model",
+                    ),
                 )
                 terminal = await store.update_status(session_id, status)
                 original_epochs[session_id] = terminal.run_epoch

@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 from cayu import (
     REDACTED_SECRET,
@@ -1316,7 +1317,7 @@ def test_replacement_worker_continues_abandoned_session_without_starting_over() 
                 session_id=reservation.operation.session_id,
                 task_id=reservation.operation.task_id,
             ),
-            identity=SessionIdentity(
+            identity=profiled_session_identity(
                 provider_name=provider.name,
                 model="scripted-model",
             ),

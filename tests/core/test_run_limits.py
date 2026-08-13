@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 import cayu.runtime._run_limits as run_limits_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
@@ -440,7 +441,10 @@ def test_session_run_limit_publishes_usage_beyond_int64_without_provider_call() 
                 session_id="sess_aggregate_run_limit",
                 messages=[Message.text("user", "initial")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_events(
             "sess_aggregate_run_limit",
@@ -598,7 +602,10 @@ def test_cayu_app_session_elapsed_limit_uses_injected_clock_before_provider_disp
                 session_id="sess_app_elapsed_clock",
                 messages=[Message.text("user", "initial")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         store._sessions[session.id].created_at = injected_now - timedelta(seconds=2)
         await store.update_status(session.id, SessionStatus.COMPLETED)

@@ -26,6 +26,7 @@ from cayu.runtime.sessions import (
     SessionIdentity,
     SessionOrder,
     SessionStatus,
+    session_metadata_for_creation,
 )
 from cayu.runtime.tasks import (
     TASK_TOPOLOGY_MAX_DISPLAY_TEXT_BYTES,
@@ -2441,7 +2442,7 @@ def session_from_request(request: RunRequest, *, identity: SessionIdentity) -> S
         created_at=now,
         updated_at=now,
         last_activity_at=now,
-        metadata=copy_durable_json_object(request.metadata, "metadata"),
+        metadata=session_metadata_for_creation(request.metadata, identity=identity),
         labels=copy_label_map(request.labels, "labels"),
     )
 

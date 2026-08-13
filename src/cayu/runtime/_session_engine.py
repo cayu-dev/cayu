@@ -36,6 +36,7 @@ from cayu._task_wait import (
 from cayu._validation import (
     MAX_DURABLE_JSON_INTEGER,
     MIN_DURABLE_JSON_INTEGER,
+    canonical_durable_json_bytes,
     copy_durable_json_value,
     copy_json_value,
     require_clean_nonblank,
@@ -237,6 +238,17 @@ from cayu.runtime.errors import (
     TerminalEventPublicationUncertain,
     _is_runtime_interaction_lifecycle_publication_rejection,
     _runtime_interaction_lifecycle_publication_rejected,
+)
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ExecutionProfileComponentClass,
+    ExecutionProfileIdentity,
+    ExecutionProfileMismatchError,
+    build_execution_profile_identity,
+    changed_execution_profile_components,
+    execution_profile_from_session_metadata,
+    execution_profile_with_component,
+    unavailable_execution_profile_components,
 )
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
@@ -1771,12 +1783,18 @@ def _require_native_structured_output_support(
     )
 
 
-def _session_identity(*, provider_name: str, model: str) -> SessionIdentity:
+def _session_identity(
+    *,
+    provider_name: str,
+    model: str,
+    execution_profile: ExecutionProfileIdentity | None = None,
+) -> SessionIdentity:
     return SessionIdentity(
         provider_name=provider_name,
         model=model,
         runtime_name="cayu",
         runtime_version=_runtime_version(),
+        execution_profile=execution_profile,
     )
 
 
@@ -1785,6 +1803,34 @@ def _runtime_version() -> str | None:
         return version("cayu")
     except PackageNotFoundError:
         return None
+
+
+def _execution_profile_identity(
+    *,
+    registered_agent: runtime_records.RegisteredAgentState,
+    provider_name: str,
+    model: str,
+    durable_system_prompt: str | None,
+) -> ExecutionProfileIdentity:
+    runtime_version = _runtime_version()
+    direct_tools = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "schema": tool.schema,
+            "parallel_safe": tool.parallel_safe,
+            "effect": tool.effect.value,
+        }
+        for tool in registered_agent.tools.values()
+    ]
+    return build_execution_profile_identity(
+        runtime_name="cayu",
+        runtime_version=runtime_version,
+        provider_name=provider_name,
+        model=model,
+        durable_system_prompt=durable_system_prompt,
+        direct_tools=direct_tools,
+    )
 
 
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
@@ -3446,10 +3492,6 @@ class SessionEngine:
                 field_name=field_name,
                 redactor=self._secret_redactor,
             )
-        # Checked before the session is created so it surfaces to the caller.
-        _require_native_structured_output_support(
-            request.structured_output, registered_provider=registered_provider
-        )
         registered_environment = self._get_registered_environment(request.environment_name)
         if registered_environment is not None:
             session_request_boundary.require_secret_free_session_authority(
@@ -3459,7 +3501,34 @@ class SessionEngine:
             )
         if request.environment_name is None and registered_environment is not None:
             request = _with_environment_name(request, registered_environment.spec.name)
-        workspace_instructions = None
+        workspace_instructions = await self._environment_lifecycle.load_workspace_instructions(
+            registered_environment,
+        )
+        (
+            rendered_system_prompt,
+            prompt_contributions,
+        ) = render_initial_system_prompt_with_contributions(
+            agent_system_prompt=registered_agent.spec.system_prompt,
+            workspace_instructions=workspace_instructions,
+        )
+        execution_profile = _execution_profile_identity(
+            registered_agent=registered_agent,
+            provider_name=registered_provider.name,
+            model=model,
+            durable_system_prompt=rendered_system_prompt,
+        )
+        unavailable_profile_components = unavailable_execution_profile_components(execution_profile)
+        if unavailable_profile_components:
+            names = ", ".join(component.value for component in unavailable_profile_components)
+            raise RuntimeError(
+                "Invocation execution profile has unavailable required components: " + names
+            )
+        # Native schema validation is provider-owned code, but it is not an
+        # execution attempt. Freeze the invocation profile first while retaining
+        # the established no-session-on-invalid-schema entry-point contract.
+        _require_native_structured_output_support(
+            request.structured_output, registered_provider=registered_provider
+        )
         if request.session_id is None:
             request = request.model_copy(update={"session_id": str(uuid4())})
         session_id = request.session_id
@@ -3475,6 +3544,7 @@ class SessionEngine:
         session_identity = _session_identity(
             provider_name=registered_provider.name,
             model=model,
+            execution_profile=execution_profile,
         )
         bind_runtime_session_create_claim(
             request,
@@ -3564,12 +3634,18 @@ class SessionEngine:
                     )
                 )
             (
-                rendered_system_prompt,
-                prompt_contributions,
+                resolved_system_prompt,
+                resolved_prompt_contributions,
             ) = render_initial_system_prompt_with_contributions(
                 agent_system_prompt=registered_agent.spec.system_prompt,
                 workspace_instructions=workspace_instructions,
             )
+            if resolved_system_prompt != rendered_system_prompt:
+                raise RuntimeError(
+                    "The durable system projection changed after the invocation profile "
+                    "was frozen; session setup fails closed."
+                )
+            prompt_contributions = resolved_prompt_contributions
             if self._request_footprint.enabled:
                 prompt_contribution_manifest = build_prompt_contribution_manifest(
                     rendered_system_prompt=rendered_system_prompt,
@@ -7841,6 +7917,11 @@ class SessionEngine:
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
+        if loaded_session.status not in _RESUMABLE_SESSION_STATUSES:
+            raise SessionStatusConflict(
+                "Session status transition not allowed: "
+                f"{loaded_session.status} -> {SessionStatus.RUNNING}"
+            )
         for field_name in (
             "agent_name",
             "provider_name",
@@ -7875,10 +7956,6 @@ class SessionEngine:
             requested_target.provider_name
             if target_changed and requested_target is not None
             else loaded_session.provider_name
-        )
-        # Checked before the status transition so it surfaces to the caller.
-        _require_native_structured_output_support(
-            request.structured_output, registered_provider=registered_provider
         )
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
@@ -8037,6 +8114,109 @@ class SessionEngine:
 
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         continuing_recovery_boundary = pending_round is not None or pending_model_completion
+        candidate_execution_profile: ExecutionProfileIdentity | None = None
+        # #906 owns baseline selection for derived sessions. Until that contract
+        # exists, preserve the pre-profile behavior only for fork records that do
+        # not yet carry profile authority; a malformed or present profile still
+        # enters the normal fail-closed path.
+        legacy_unprofiled_fork = (
+            loaded_session.parent_session_id is not None
+            and EXECUTION_PROFILE_METADATA_KEY not in loaded_session.metadata
+        )
+        if not continuing_recovery_boundary and not legacy_unprofiled_fork:
+            expected_execution_profile = execution_profile_from_session_metadata(
+                loaded_session.metadata
+            )
+            candidate_execution_profile = _execution_profile_identity(
+                registered_agent=registered_agent,
+                provider_name=registered_provider.name,
+                model=(
+                    requested_target.model
+                    if target_changed and requested_target is not None
+                    else loaded_session.model
+                ),
+                durable_system_prompt=None,
+            )
+            # A resumed session executes the already-durable system projection.
+            # The current AgentSpec prompt is not re-injected on resume.
+            candidate_execution_profile = execution_profile_with_component(
+                candidate_execution_profile,
+                expected_execution_profile.component(
+                    ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                ),
+            )
+            changed_profile_components = changed_execution_profile_components(
+                expected_execution_profile,
+                candidate_execution_profile,
+            )
+            existing_model_target_adoption = target_changed and changed_profile_components == (
+                ExecutionProfileComponentClass.PROVIDER_TARGET,
+            )
+            if changed_profile_components and not existing_model_target_adoption:
+                rejection_material = canonical_durable_json_bytes(
+                    {
+                        "session_id": loaded_session.id,
+                        "run_epoch": loaded_session.run_epoch,
+                        "expected_profile_fingerprint": expected_execution_profile.fingerprint,
+                        "candidate_profile_fingerprint": candidate_execution_profile.fingerprint,
+                    },
+                    "execution_profile_rejection",
+                )
+                rejection_event_id = "epr_" + hashlib.sha256(rejection_material).hexdigest()
+                rejection_event = event_with_runtime_nested_payload_authority(
+                    event_with_runtime_payload_authority(
+                        event_with_runtime_envelope_authority(
+                            event_with_runtime_generated_id(
+                                Event(
+                                    id=rejection_event_id,
+                                    type=EventType.SESSION_EXECUTION_PROFILE_REJECTED,
+                                    session_id=loaded_session.id,
+                                    timestamp=self._clock(),
+                                    agent_name=loaded_session.agent_name,
+                                    environment_name=loaded_session.environment_name,
+                                    payload={
+                                        "expected_profile_fingerprint": (
+                                            expected_execution_profile.fingerprint
+                                        ),
+                                        "candidate_profile_fingerprint": (
+                                            candidate_execution_profile.fingerprint
+                                        ),
+                                        "changed_component_classes": [
+                                            component.value
+                                            for component in changed_profile_components
+                                        ],
+                                    },
+                                )
+                            ),
+                            "session_id",
+                        ),
+                        "expected_profile_fingerprint",
+                        "candidate_profile_fingerprint",
+                    ),
+                    ("changed_component_classes", "*"),
+                )
+                rejection = await self.session_store.reject_execution_profile_resume(
+                    loaded_session.id,
+                    expected_statuses=_RESUMABLE_SESSION_STATUSES,
+                    expected_run_epoch=loaded_session.run_epoch,
+                    expected_profile=expected_execution_profile,
+                    candidate_profile=candidate_execution_profile,
+                    event=rejection_event,
+                )
+                if not rejection.replayed:
+                    await self._event_writer.fan_out_persisted([rejection.event])
+                raise ExecutionProfileMismatchError(
+                    session_id=loaded_session.id,
+                    expected_profile_fingerprint=expected_execution_profile.fingerprint,
+                    candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
+                    changed_component_classes=changed_profile_components,
+                )
+        # Provider-owned schema validation runs only after the current process's
+        # execution profile has been frozen and any ordinary-resume drift has
+        # been rejected. It remains before the durable status transition.
+        _require_native_structured_output_support(
+            request.structured_output, registered_provider=registered_provider
+        )
         existing_deferred_input = await self.session_store.load_deferred_interaction_input(
             loaded_session.id
         )
@@ -8196,8 +8376,15 @@ class SessionEngine:
         model_transition_kwargs: dict[str, Any] = {}
         if model_transition is not None:
             model_transition_kwargs["model_transition"] = model_transition
+        if candidate_execution_profile is not None:
+            model_transition_kwargs["execution_profile"] = candidate_execution_profile
         try:
-            session = await self.session_store.transition_status_and_checkpoint(
+            transition = (
+                self.session_store.admit_execution_profile_resume
+                if candidate_execution_profile is not None
+                else self.session_store.transition_status_and_checkpoint
+            )
+            session = await transition(
                 loaded_session.id,
                 from_statuses=_RESUMABLE_SESSION_STATUSES,
                 to_status=SessionStatus.RUNNING,
@@ -8753,7 +8940,6 @@ class SessionEngine:
             ),
             transcript_cursor=fork_projection_cursor,
         )
-
         runtime_generated_session_id: str | None = None
         destination_session_id = request.session_id
         if destination_session_id is None:

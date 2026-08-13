@@ -135,6 +135,16 @@ from cayu.runtime.checkpoints import (
     CURRENT_CHECKPOINT_SCHEMA_VERSION,
     decode_runtime_checkpoint,
 )
+from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_METADATA_KEY,
+    ExecutionProfileComponentClass,
+    ExecutionProfileIdentity,
+    ExecutionProfileRejectionResult,
+    changed_execution_profile_components,
+    execution_profile_from_session_metadata,
+    execution_profile_metadata_after_adoption,
+    execution_profile_session_metadata,
+)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -712,6 +722,21 @@ def copy_session_user_metadata(replacement: dict[str, Any]) -> dict[str, Any]:
     return copied_replacement
 
 
+def session_user_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Detach only caller-authored metadata from a durable session record."""
+
+    if type(metadata) is not dict:
+        raise TypeError("Session metadata must be an object.")
+    return copy_durable_json_object(
+        {
+            key: value
+            for key, value in metadata.items()
+            if not is_runtime_owned_session_metadata_key(key)
+        },
+        "session.user_metadata",
+    )
+
+
 def replace_session_user_metadata(
     current: dict[str, Any],
     replacement: dict[str, Any],
@@ -897,12 +922,24 @@ class RunRequest(BaseModel):
     @classmethod
     def copy_request_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
         copied = copy_durable_json_object(value, "metadata")
-        if MODEL_TARGET_PROJECTION_METADATA_KEY in copied:
+        reserved_key = next(
+            (
+                key
+                for key in (
+                    MODEL_TARGET_PROJECTION_METADATA_KEY,
+                    EXECUTION_PROFILE_METADATA_KEY,
+                )
+                if key in copied
+            ),
+            None,
+        )
+        if reserved_key is not None:
             copied.clear()
-            raise ValueError(
-                f"metadata[{MODEL_TARGET_PROJECTION_METADATA_KEY!r}] is runtime-owned "
-                "model-target authority."
-            )
+            if reserved_key == MODEL_TARGET_PROJECTION_METADATA_KEY:
+                authority_name = "model-target authority"
+            else:
+                authority_name = "execution-profile authority"
+            raise ValueError(f"metadata[{reserved_key!r}] is runtime-owned {authority_name}.")
         return copied
 
     @field_validator("labels", mode="before")
@@ -1559,6 +1596,7 @@ class SessionIdentity(BaseModel):
     model: str
     runtime_name: str = "cayu"
     runtime_version: str | None = None
+    execution_profile: ExecutionProfileIdentity | None = None
 
     @field_validator("provider_name", "model", "runtime_name")
     @classmethod
@@ -5499,6 +5537,7 @@ class SessionStore(ABC):
     supports_public_authority_aliases: ClassVar[bool] = False
     supports_terminal_session_evidence: ClassVar[bool] = False
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = False
+    supports_execution_profile_admission: ClassVar[bool] = False
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.UNVERIFIED
 
     @property
@@ -5645,8 +5684,58 @@ class SessionStore(ABC):
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
         model_transition: SessionModelTransition | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> Session:
-        """Atomically persist status, checkpoint, interaction, and target adoption."""
+        """Atomically persist status, checkpoint, interaction, target, and profile admission."""
+
+    async def admit_execution_profile_resume(
+        self,
+        session_id: str,
+        *,
+        from_statuses: set[SessionStatus],
+        to_status: SessionStatus,
+        checkpoint_transform: CheckpointTransform,
+        execution_profile: ExecutionProfileIdentity,
+        interaction_started_event: Event | None = None,
+        interaction_source_messages: list[Message] | None = None,
+        continued_interaction_id: str | None = None,
+        defer_interaction_source: bool = False,
+        model_transition: SessionModelTransition | None = None,
+    ) -> Session:
+        """Atomically compare a profile through the normal resume transition."""
+
+        if not self.supports_execution_profile_admission:
+            raise NotImplementedError(
+                "This SessionStore does not support atomic execution-profile admission."
+            )
+        return await self.transition_status_and_checkpoint(
+            session_id,
+            from_statuses=from_statuses,
+            to_status=to_status,
+            checkpoint_transform=checkpoint_transform,
+            interaction_started_event=interaction_started_event,
+            interaction_source_messages=interaction_source_messages,
+            continued_interaction_id=continued_interaction_id,
+            defer_interaction_source=defer_interaction_source,
+            model_transition=model_transition,
+            execution_profile=execution_profile,
+        )
+
+    async def reject_execution_profile_resume(
+        self,
+        session_id: str,
+        *,
+        expected_statuses: set[SessionStatus],
+        expected_run_epoch: int,
+        expected_profile: ExecutionProfileIdentity,
+        candidate_profile: ExecutionProfileIdentity,
+        event: Event,
+    ) -> ExecutionProfileRejectionResult:
+        """Atomically reject a changed resume profile without admitting work."""
+
+        raise NotImplementedError(
+            "This SessionStore does not support atomic execution-profile rejection."
+        )
 
     @abstractmethod
     async def transition_status_if_no_queued_messages(
@@ -6884,6 +6973,7 @@ class InMemorySessionStore(SessionStore):
     supports_public_authority_aliases: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
+    supports_execution_profile_admission: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DEVELOPMENT
 
     def __init__(
@@ -7355,7 +7445,7 @@ class InMemorySessionStore(SessionStore):
                 updated_at=now,
                 last_activity_at=now,
                 labels=request.labels,
-                metadata=deepcopy(request.metadata),
+                metadata=session_metadata_for_creation(request.metadata, identity=identity),
                 run_epoch=1 if admission is not None else 0,
             )
             self._register_private_authority_alias_unlocked(
@@ -7840,6 +7930,59 @@ class InMemorySessionStore(SessionStore):
                 _activate_session_run_fence(result)
             return result
 
+    async def reject_execution_profile_resume(
+        self,
+        session_id: str,
+        *,
+        expected_statuses: set[SessionStatus],
+        expected_run_epoch: int,
+        expected_profile: ExecutionProfileIdentity,
+        candidate_profile: ExecutionProfileIdentity,
+        event: Event,
+    ) -> ExecutionProfileRejectionResult:
+        (
+            session_id,
+            statuses,
+            expected_run_epoch,
+            expected_profile,
+            _candidate_profile,
+            copied_event,
+        ) = _prepare_execution_profile_rejection(
+            session_id,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_profile=expected_profile,
+            candidate_profile=candidate_profile,
+            event=event,
+        )
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                raise KeyError(f"Session not found: {session_id}")
+            _validate_execution_profile_rejection_session(
+                session,
+                expected_statuses=statuses,
+                expected_run_epoch=expected_run_epoch,
+                expected_profile=expected_profile,
+                event=copied_event,
+            )
+            for existing in self._events.get(session_id, []):
+                if existing.id != copied_event.id:
+                    continue
+                if not _execution_profile_rejection_events_equivalent(
+                    existing,
+                    copied_event,
+                ):
+                    raise ValueError(
+                        f"Execution-profile rejection id was reused: {copied_event.id}"
+                    )
+                return ExecutionProfileRejectionResult(event=existing, replayed=True)
+            self._sessions[session_id] = self._append_events_unlocked(
+                session,
+                [copied_event],
+            )
+            return ExecutionProfileRejectionResult(event=copied_event, replayed=False)
+
     async def transition_status_and_checkpoint(
         self,
         session_id: str,
@@ -7852,6 +7995,7 @@ class InMemorySessionStore(SessionStore):
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
         model_transition: SessionModelTransition | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -7872,6 +8016,7 @@ class InMemorySessionStore(SessionStore):
             interaction_id=(None if admission is None else admission[1]),
             interaction_is_new=(admission is not None and admission[0] is not None),
         )
+        prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
         async with self._lock:
@@ -7883,6 +8028,11 @@ class InMemorySessionStore(SessionStore):
                 raise SessionStatusConflict(
                     f"Session status transition not allowed: {session.status} -> {to_status}"
                 )
+            transition_profile_metadata = _validate_execution_profile_admission(
+                session,
+                candidate_profile=prepared_execution_profile,
+                model_transition=prepared_model_transition,
+            )
 
             current_checkpoint = self._checkpoints.get(session_id)
             transformed_checkpoint = checkpoint_transform(
@@ -7923,7 +8073,9 @@ class InMemorySessionStore(SessionStore):
                     provider_name=prepared_model_transition.target.provider_name,
                     model=prepared_model_transition.target.model,
                     metadata=_session_metadata_after_model_transition(
-                        session, prepared_model_transition
+                        session,
+                        prepared_model_transition,
+                        execution_profile_metadata=transition_profile_metadata,
                     ),
                 )
             updated = session.model_copy(update=session_updates)
@@ -11930,7 +12082,152 @@ def copy_session_identity(identity: SessionIdentity) -> SessionIdentity:
         model=identity.model,
         runtime_name=identity.runtime_name,
         runtime_version=identity.runtime_version,
+        execution_profile=(
+            None
+            if identity.execution_profile is None
+            else ExecutionProfileIdentity.model_validate(
+                identity.execution_profile.model_dump(mode="json")
+            )
+        ),
     )
+
+
+def session_metadata_for_creation(
+    metadata: dict[str, Any],
+    *,
+    identity: SessionIdentity,
+) -> dict[str, Any]:
+    """Combine caller metadata with runtime-owned creation authority."""
+
+    copied = copy_durable_json_object(metadata, "metadata")
+    if EXECUTION_PROFILE_METADATA_KEY in copied:
+        raise ValueError("Session metadata contains runtime-owned execution-profile authority.")
+    if identity.execution_profile is not None:
+        copied[EXECUTION_PROFILE_METADATA_KEY] = execution_profile_session_metadata(
+            identity.execution_profile
+        )
+    return copied
+
+
+def _copy_optional_execution_profile(
+    profile: ExecutionProfileIdentity | None,
+) -> ExecutionProfileIdentity | None:
+    if profile is None:
+        return None
+    if type(profile) is not ExecutionProfileIdentity:
+        raise TypeError("execution_profile must be an ExecutionProfileIdentity.")
+    return ExecutionProfileIdentity.model_validate(profile.model_dump(mode="json"))
+
+
+def _validate_execution_profile_admission(
+    session: Session,
+    *,
+    candidate_profile: ExecutionProfileIdentity | None,
+    model_transition: SessionModelTransition | None,
+) -> dict[str, Any] | None:
+    if candidate_profile is None:
+        return None
+    expected_profile = execution_profile_from_session_metadata(session.metadata)
+    changed = changed_execution_profile_components(expected_profile, candidate_profile)
+    if model_transition is None:
+        if changed:
+            changed_names = ", ".join(component.value for component in changed)
+            raise SessionStatusConflict(
+                "Session execution profile changed during admission: " + changed_names
+            )
+        return None
+    if changed != (ExecutionProfileComponentClass.PROVIDER_TARGET,):
+        raise SessionStatusConflict(
+            "Model-target adoption must change exactly the provider-target profile component."
+        )
+    return execution_profile_metadata_after_adoption(
+        session.metadata,
+        candidate_profile,
+    )
+
+
+def _prepare_execution_profile_rejection(
+    session_id: str,
+    *,
+    expected_statuses: set[SessionStatus],
+    expected_run_epoch: int,
+    expected_profile: ExecutionProfileIdentity,
+    candidate_profile: ExecutionProfileIdentity,
+    event: Event,
+) -> tuple[
+    str,
+    set[SessionStatus],
+    int,
+    ExecutionProfileIdentity,
+    ExecutionProfileIdentity,
+    Event,
+]:
+    session_id = require_clean_nonblank(session_id, "session_id")
+    statuses = _validate_status_set(expected_statuses, "expected_statuses")
+    if type(expected_run_epoch) is not int:
+        raise TypeError("expected_run_epoch must be an integer.")
+    if not 0 <= expected_run_epoch <= MAX_DURABLE_JSON_INTEGER:
+        raise ValueError("expected_run_epoch exceeds the durable integer limit.")
+    expected = ExecutionProfileIdentity.model_validate(expected_profile.model_dump(mode="json"))
+    candidate = ExecutionProfileIdentity.model_validate(candidate_profile.model_dump(mode="json"))
+    changed = changed_execution_profile_components(expected, candidate)
+    if not changed:
+        raise ValueError("Execution-profile rejection requires a changed candidate.")
+    _, copied_events = _copy_session_event_batch(session_id, [event])
+    copied_event = copied_events[0]
+    expected_payload = {
+        "expected_profile_fingerprint": expected.fingerprint,
+        "candidate_profile_fingerprint": candidate.fingerprint,
+        "changed_component_classes": [component.value for component in changed],
+    }
+    if copied_event.type is not EventType.SESSION_EXECUTION_PROFILE_REJECTED:
+        raise ValueError("Execution-profile rejection event has the wrong type.")
+    if copied_event.interaction_id is not None:
+        raise ValueError("Execution-profile rejection cannot belong to an admitted interaction.")
+    if copied_event.payload != expected_payload:
+        raise ValueError("Execution-profile rejection event payload does not match its profiles.")
+    return (
+        session_id,
+        statuses,
+        expected_run_epoch,
+        expected,
+        candidate,
+        copied_event,
+    )
+
+
+def _validate_execution_profile_rejection_session(
+    session: Session,
+    *,
+    expected_statuses: set[SessionStatus],
+    expected_run_epoch: int,
+    expected_profile: ExecutionProfileIdentity,
+    event: Event,
+) -> None:
+    if session.status not in expected_statuses:
+        raise SessionStatusConflict(
+            f"Session status no longer permits profile rejection: {session.status}."
+        )
+    if session.run_epoch != expected_run_epoch:
+        raise SessionRunFenced(
+            f"Session run epoch changed before profile rejection: expected "
+            f"{expected_run_epoch}, current {session.run_epoch}."
+        )
+    current_profile = execution_profile_from_session_metadata(session.metadata)
+    if current_profile != expected_profile:
+        raise RuntimeError("Session execution-profile expectation changed concurrently.")
+    if event.agent_name != session.agent_name or event.environment_name != session.environment_name:
+        raise ValueError("Execution-profile rejection event does not match session authority.")
+
+
+def _execution_profile_rejection_events_equivalent(left: Event, right: Event) -> bool:
+    """Compare one idempotent rejection request while retaining its first timestamp."""
+
+    left_document = left.model_dump(mode="json")
+    right_document = right.model_dump(mode="json")
+    left_document.pop("timestamp", None)
+    right_document.pop("timestamp", None)
+    return left_document == right_document
 
 
 def _validate_status_set(
@@ -15672,9 +15969,11 @@ def _validate_session_model_transition(
 def _session_metadata_after_model_transition(
     session: Session,
     transition: SessionModelTransition,
+    *,
+    execution_profile_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _session_metadata_with_model_projection(
-        session.metadata,
+        (session.metadata if execution_profile_metadata is None else execution_profile_metadata),
         target=transition.target,
         transcript_cursor=transition.source_transcript_cursor,
     )

@@ -98,6 +98,10 @@ from cayu.runtime.event_watchers import (
     copy_event_watcher_claim,
     copy_event_watcher_record,
 )
+from cayu.runtime.execution_profiles import (
+    ExecutionProfileIdentity,
+    ExecutionProfileRejectionResult,
+)
 from cayu.runtime.execution_units import (
     ModelAttemptIdentity,
     ToolRoundIdentity,
@@ -213,6 +217,7 @@ from cayu.runtime.sessions import (
     _checkpoint_after_initial_transcript_publication,
     _classify_terminal_session_evidence_records,
     _copy_mcp_manifest_publication,
+    _copy_optional_execution_profile,
     _copy_optional_interaction_admission,
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
@@ -225,6 +230,7 @@ from cayu.runtime.sessions import (
     _deactivate_session_interaction,
     _deactivate_session_run_fence,
     _event_input_contract_is_runtime_owned,
+    _execution_profile_rejection_events_equivalent,
     _initial_transcript_pending_checkpoint,
     _interaction_transition_receipt_record,
     _interaction_transition_spec_from_receipt,
@@ -238,6 +244,7 @@ from cayu.runtime.sessions import (
     _model_completion_terminal_advances_last_activity,
     _ModelCompletionStagePromotionContext,
     _next_runtime_publication_timestamp,
+    _prepare_execution_profile_rejection,
     _prepare_interaction_transition,
     _prepare_interaction_transition_receipt_lookup,
     _prepare_model_completion_stage_promotion,
@@ -269,6 +276,8 @@ from cayu.runtime.sessions import (
     _terminal_session_evidence_expected_event_type,
     _tool_round_publication_identity,
     _validate_equivalent_queued_session_message,
+    _validate_execution_profile_admission,
+    _validate_execution_profile_rejection_session,
     _validate_interaction_page,
     _validate_mcp_manifest_history_keys,
     _validate_mcp_manifest_publication_state,
@@ -317,6 +326,7 @@ from cayu.runtime.sessions import (
     replace_session_user_metadata,
     resolve_interaction_attribution,
     restore_persisted_event_authority,
+    session_metadata_for_creation,
     session_next_cursor,
     session_outcome,
     session_query_from_aggregate_filter,
@@ -5976,6 +5986,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
     supports_session_lineage: ClassVar[bool] = True
     supports_terminal_session_evidence: ClassVar[bool] = True
     supports_runner_owned_interrupted_evidence: ClassVar[bool] = True
+    supports_execution_profile_admission: ClassVar[bool] = True
     service_durability: RuntimeStoreDurability = RuntimeStoreDurability.DURABLE
     _min_required_revision = _POSTGRES_SESSION_MIN_REQUIRED_REVISION
     _supports_read_only = True
@@ -6526,7 +6537,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             created_at=now,
             updated_at=now,
             last_activity_at=now,
-            metadata=copy_durable_json_object(request.metadata, "metadata"),
+            metadata=session_metadata_for_creation(request.metadata, identity=identity),
             labels=request.labels,
         )
         admission = _copy_optional_interaction_admission(
@@ -7202,6 +7213,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         continued_interaction_id: str | None = None,
         defer_interaction_source: bool = False,
         model_transition: SessionModelTransition | None = None,
+        execution_profile: ExecutionProfileIdentity | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -7224,6 +7236,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             interaction_id=(None if admission is None else admission[1]),
             interaction_is_new=(admission is not None and admission[0] is not None),
         )
+        prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
         await self._ensure_ready()
@@ -7239,6 +7252,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         raise SessionStatusConflict(
                             f"Session status transition not allowed: {loaded.status} -> {to_status}"
                         )
+                    transition_profile_metadata = _validate_execution_profile_admission(
+                        loaded,
+                        candidate_profile=prepared_execution_profile,
+                        model_transition=prepared_model_transition,
+                    )
                     transformed_checkpoint = checkpoint_transform(
                         loaded,
                         await self._load_checkpoint(cur, session_id),
@@ -7263,7 +7281,9 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             prepared_model_transition,
                         )
                         transition_metadata = _session_metadata_after_model_transition(
-                            loaded, prepared_model_transition
+                            loaded,
+                            prepared_model_transition,
+                            execution_profile_metadata=transition_profile_metadata,
                         )
 
                     admission_events = []
@@ -7446,6 +7466,126 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(transitioned)
             return transitioned
+
+    async def reject_execution_profile_resume(
+        self,
+        session_id: str,
+        *,
+        expected_statuses: set[SessionStatus],
+        expected_run_epoch: int,
+        expected_profile: ExecutionProfileIdentity,
+        candidate_profile: ExecutionProfileIdentity,
+        event: Event,
+    ) -> ExecutionProfileRejectionResult:
+        from cayu.runtime.pending_actions import pending_action_event_storage_values
+
+        (
+            session_id,
+            statuses,
+            expected_run_epoch,
+            expected_profile,
+            _candidate_profile,
+            copied_event,
+        ) = _prepare_execution_profile_rejection(
+            session_id,
+            expected_statuses=expected_statuses,
+            expected_run_epoch=expected_run_epoch,
+            expected_profile=expected_profile,
+            candidate_profile=candidate_profile,
+            event=event,
+        )
+        await self._ensure_ready()
+        async with self._connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    session = await self._load_for_update(cur, session_id)
+                    if session is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    _validate_execution_profile_rejection_session(
+                        session,
+                        expected_statuses=statuses,
+                        expected_run_epoch=expected_run_epoch,
+                        expected_profile=expected_profile,
+                        event=copied_event,
+                    )
+                    await cur.execute(
+                        "SELECT event FROM cayu_events WHERE session_id = %s AND event_id = %s",
+                        (session_id, copied_event.id),
+                    )
+                    existing_row = await cur.fetchone()
+                    if existing_row is not None:
+                        existing = restore_persisted_event_authority(
+                            Event.model_validate(existing_row[0])
+                        )
+                        if not _execution_profile_rejection_events_equivalent(
+                            existing,
+                            copied_event,
+                        ):
+                            raise ValueError(
+                                f"Execution-profile rejection id was reused: {copied_event.id}"
+                            )
+                        await conn.commit()
+                        return ExecutionProfileRejectionResult(event=existing, replayed=True)
+
+                    activity_at = datetime.now(UTC)
+                    await cur.execute(
+                        "UPDATE cayu_sessions "
+                        "SET event_seq = event_seq + 1, last_activity_at = %s "
+                        "WHERE id = %s RETURNING event_seq",
+                        (activity_at, session_id),
+                    )
+                    order_row = await cur.fetchone()
+                    if order_row is None:
+                        raise KeyError(f"Session not found: {session_id}")
+                    await self._register_event_public_authorities(
+                        cur,
+                        session_id,
+                        [copied_event],
+                    )
+                    lookup_key, projection, projection_bytes = pending_action_event_storage_values(
+                        copied_event
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO cayu_events (
+                            session_id, session_order, event_id, interaction_id,
+                            event_type, timestamp, agent_name, environment_name,
+                            workflow_name, tool_name, payload, event,
+                            pending_action_lookup_key, pending_action_projection,
+                            pending_action_projection_bytes
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            session_id,
+                            order_row[0],
+                            copied_event.id,
+                            copied_event.interaction_id,
+                            str(copied_event.type),
+                            pg_support.to_utc(copied_event.timestamp),
+                            copied_event.agent_name,
+                            copied_event.environment_name,
+                            copied_event.workflow_name,
+                            copied_event.tool_name,
+                            _dumps(copied_event.payload),
+                            _dumps(copied_event.model_dump(mode="json")),
+                            lookup_key,
+                            projection,
+                            projection_bytes,
+                        ),
+                    )
+                    await self._enqueue_persisted_event_side_effects(
+                        cur,
+                        session_id,
+                        [copied_event],
+                    )
+                await conn.commit()
+                return ExecutionProfileRejectionResult(event=copied_event, replayed=False)
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def transition_status_if_no_queued_messages(
         self,

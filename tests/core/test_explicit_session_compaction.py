@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 import cayu.runtime._session_engine as session_engine_module
 from cayu._validation import MAX_DURABLE_JSON_INTEGER
@@ -2745,7 +2746,10 @@ def test_compact_session_replays_original_outcome_after_session_advances() -> No
                 session_id="sess_compact_advanced_replay",
                 messages=[Message.text("user", "create only")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         transcript = [
             Message.text("user", "old request"),
@@ -6350,7 +6354,10 @@ def test_expired_compaction_claim_does_not_block_resume() -> None:
                 session_id="sess_expired_compact_resume",
                 messages=[Message.text("user", "create only")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         transcript = [
             Message.text("user", "old request"),

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
+from tests.core._execution_profile_fixtures import profiled_session_identity
 
 from cayu.core import AgentSpec, Event, EventType, Message, MessageRole
 from cayu.core.tools import Tool, ToolContext, ToolResult, ToolSpec
@@ -1057,7 +1058,10 @@ def test_queued_message_survives_interruption_and_is_delivered_on_resume() -> No
                 session_id="sess_queue_resume",
                 messages=[Message.text("user", "original request")],
             ),
-            identity=SessionIdentity(provider_name="recording-one-shot", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="recording-one-shot",
+                model="fake-model",
+            ),
         )
         accepting_process = CayuApp(session_store=store, enable_logging=False)
         accepted = await accepting_process.enqueue_session_message(

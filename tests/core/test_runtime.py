@@ -19,6 +19,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from pydantic import SecretStr, ValidationError
+from tests.core._execution_profile_fixtures import profiled_session_identity
 from tests.core._execution_unit_fixtures import model_attempt_identity
 from tests.core._session_store_test_doubles import RecordingListSessionsStore
 from tests.provider_traceback_assertions import is_cayu_source_filename
@@ -10779,7 +10780,10 @@ def test_cayu_app_request_session_budget_uses_rolling_window():
                 session_id="sess_rolling_request_budget",
                 messages=[Message.text("user", "old")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_event(
             "sess_rolling_request_budget",
@@ -23668,7 +23672,10 @@ def test_cayu_app_resume_releases_run_fence_when_setup_is_cancelled():
                 session_id="sess_resume_setup_cancel",
                 messages=[Message.text("user", "hi")],
             ),
-            identity=_test_session_identity(),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status("sess_resume_setup_cancel", SessionStatus.INTERRUPTED)
         store.cancel_load = True
@@ -23732,7 +23739,10 @@ def test_cayu_app_resume_rejects_active_sessions():
                 session_id="sess_running",
                 messages=[Message.text("user", "hi")],
             ),
-            identity=_test_session_identity(),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status("sess_running", SessionStatus.RUNNING)
         await store.append_transcript_messages(
@@ -23782,7 +23792,10 @@ def test_cayu_app_resume_marks_session_failed_when_transcript_load_fails():
                 session_id="sess_broken_transcript",
                 messages=[Message.text("user", "hi")],
             ),
-            identity=_test_session_identity(),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status("sess_broken_transcript", SessionStatus.COMPLETED)
 
@@ -29722,7 +29735,10 @@ def test_cayu_app_resume_repairs_missing_initial_run_terminal_evidence() -> None
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.append_transcript_messages(
             session_id,
@@ -30152,7 +30168,10 @@ def test_cayu_app_repairs_resume_failure_before_lifecycle_boundary() -> None:
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(session_id, SessionStatus.COMPLETED)
         previous_terminal = Event(
@@ -30253,7 +30272,10 @@ def test_cayu_app_resume_reconciles_terminal_event_before_replacing_run_marker()
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(session_id, SessionStatus.COMPLETED)
         await store.append_event(
@@ -30442,7 +30464,10 @@ def test_cayu_app_terminal_evidence_repair_preserves_pending_interrupt_identity(
                 session_id=session_id,
                 messages=[Message.text("user", "start")],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         await store.update_status(session_id, SessionStatus.INTERRUPTED)
         pending_payload = {
@@ -37487,7 +37512,7 @@ def test_cayu_app_tool_policy_receives_run_request_metadata_copy():
     tool.contexts[0].metadata["tenant"]["id"] = "tool-mutated"
     session = asyncio.run(app.session_store.load("sess_policy_run_metadata"))
     assert session is not None
-    assert session.metadata == {"tenant": {"id": "tenant_1"}}
+    assert sessions_module.session_user_metadata(session.metadata) == {"tenant": {"id": "tenant_1"}}
 
 
 def test_cayu_app_taint_policy_requires_approval_from_prior_durable_tool_result():
@@ -37707,7 +37732,7 @@ def test_cayu_app_tool_policy_receives_resume_request_metadata_copy():
     tool.contexts[0].metadata["resume"]["id"] = "tool-mutated"
     session = asyncio.run(store.load("sess_policy_resume_metadata"))
     assert session is not None
-    assert session.metadata == {"original": {"id": "run"}}
+    assert sessions_module.session_user_metadata(session.metadata) == {"original": {"id": "run"}}
 
 
 def test_cayu_app_tool_policy_blocked_event_uses_default_reason_when_omitted():
@@ -43772,7 +43797,10 @@ def test_automatic_compaction_lost_checkpoint_ack_reconciles_effective_transform
                 session_id=session_id,
                 messages=[],
             ),
-            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
         transcript = [
             Message.text("user", "old"),
@@ -49633,7 +49661,10 @@ def test_cayu_app_checkpoint_compaction_ignores_cursor_without_valid_summary():
                 session_id="sess_bad_checkpoint_pair",
                 messages=[],
             ),
-            identity=_test_session_identity(),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
     )
     asyncio.run(store.update_status(session.id, SessionStatus.COMPLETED))
@@ -49725,7 +49756,10 @@ def test_cayu_app_checkpoint_compaction_ignores_summary_without_valid_cursor():
                 session_id="sess_bad_checkpoint_cursor",
                 messages=[],
             ),
-            identity=_test_session_identity(),
+            identity=profiled_session_identity(
+                provider_name="fake",
+                model="fake-model",
+            ),
         )
     )
     asyncio.run(store.update_status(session.id, SessionStatus.COMPLETED))
@@ -50819,7 +50853,7 @@ def test_workspace_instruction_file_config_rejects_paths_outside_workspace():
         WorkspaceInstructionsConfig(paths=("../AGENTS.md",))
 
 
-def test_workspace_instruction_failure_terminalizes_admitted_interaction(tmp_path):
+def test_workspace_instruction_failure_rejects_before_profile_admission(tmp_path):
     (tmp_path / "AGENTS.md").write_text("too long")
     provider = FakeProvider(
         [
@@ -50842,73 +50876,21 @@ def test_workspace_instruction_failure_terminalizes_admitted_interaction(tmp_pat
     )
     app.register_agent(AgentSpec(name="assistant", model="fake-model"))
 
-    async def run() -> list[Event]:
-        events = [
-            event
-            async for event in app.run(
+    with pytest.raises(ValueError, match="Workspace instructions file exceeds 3 bytes"):
+        asyncio.run(
+            collect_events(
+                app,
                 RunRequest(
                     agent_name="assistant",
                     session_id="sess_oversized_workspace_instructions",
                     messages=[Message.text("user", "hi")],
-                )
-            )
-        ]
-        with pytest.raises(
-            RuntimeError,
-            match="authoritative initial transcript.*resume fails closed",
-        ):
-            await collect_resume_events(
-                app,
-                ResumeRequest(
-                    session_id="sess_oversized_workspace_instructions",
-                    messages=[Message.text("user", "continue")],
                 ),
-            )
-        with pytest.raises(
-            RuntimeError,
-            match="authoritative initial transcript.*fork fails closed",
-        ):
-            await collect_fork_events(
-                app,
-                ForkSessionRequest(
-                    source_session_id="sess_oversized_workspace_instructions",
-                ),
-            )
-        return events
-
-    events = asyncio.run(run())
-
-    session = asyncio.run(app.session_store.load("sess_oversized_workspace_instructions"))
-    assert session is not None
-    assert session.status is SessionStatus.FAILED
-    assert provider.requests == []
-    lifecycle = [
-        event
-        for event in events
-        if event.type
-        in {
-            EventType.INTERACTION_STARTED,
-            EventType.INTERACTION_FAILED,
-        }
-    ]
-    assert [event.type for event in lifecycle] == [
-        EventType.INTERACTION_STARTED,
-        EventType.INTERACTION_FAILED,
-    ]
-    interaction_id = lifecycle[0].interaction_id
-    assert interaction_id is not None
-    assert lifecycle[1].interaction_id == interaction_id
-    transcript = asyncio.run(
-        app.session_store.query_transcript(
-            TranscriptQuery(
-                session_id=session.id,
-                interaction_id=interaction_id,
             )
         )
-    )
-    assert [record.message for record in transcript.records] == [Message.text("user", "hi")]
-    assert events[-1].type is EventType.SESSION_FAILED
-    assert events[-1].payload["error_type"] == "ValueError"
+
+    session = asyncio.run(app.session_store.load("sess_oversized_workspace_instructions"))
+    assert session is None
+    assert provider.requests == []
 
 
 @pytest.mark.parametrize("system_prompt", [None, "", "   "])
