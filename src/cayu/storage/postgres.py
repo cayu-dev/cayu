@@ -384,6 +384,8 @@ from cayu.storage.memory import (
     KnowledgeListItem,
     KnowledgeListQuery,
     KnowledgeListResult,
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
@@ -391,16 +393,20 @@ from cayu.storage.memory import (
     KnowledgeStore,
     KnowledgeVisibility,
     _knowledge_chunk_content_hash,
+    _knowledge_publication_operation_id,
     _score_entry,
     _search_result_from_scored_embeddings,
     _semantic_query_text,
+    _validate_knowledge_publication_replay,
     _validate_nonnegative_float,
     _validate_positive_int,
     _validate_unit_float,
     copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_list_query,
+    copy_knowledge_publication_receipt,
     copy_knowledge_query,
+    prepare_knowledge_publication,
 )
 
 # A fixed 63-bit advisory-lock key. Every Cayu store sharing a database takes this
@@ -1247,6 +1253,20 @@ _MIGRATION_STEPS: dict[int, tuple[str, ...]] = {
         "target_key, status, lease_expires_at, created_at ASC, run_id ASC)",
     ),
     34: ("ALTER TABLE cayu_tasks ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ",),
+    35: (
+        """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_publication_receipts (
+            operation_id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            entry_created_at TIMESTAMPTZ NOT NULL,
+            entry_updated_at TIMESTAMPTZ NOT NULL,
+            committed_at TIMESTAMPTZ NOT NULL
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_publication_receipts_entry "
+        "ON cayu_knowledge_publication_receipts(entry_id)",
+    ),
 }
 
 _REVISION_17_PENDING_TOOL_CALL_COUNT_SQL = """
@@ -4246,6 +4266,8 @@ class PostgresBudgetLedger(_PostgresStoreBase, BudgetLedger):
 class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
     """Postgres-backed durable knowledge store with full-text search."""
 
+    _min_required_revision = 35
+
     async def put_entry(self, entry: KnowledgeEntry) -> KnowledgeEntry:
         entry = copy_knowledge_entry(entry)
         await self._ensure_ready()
@@ -4475,6 +4497,77 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
                 raise
         return copy_knowledge_entry(entry)
 
+    async def publish_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt:
+        operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
+            entry, chunks, operation_id=operation_id
+        )
+        await self._ensure_ready()
+        async with self._pool.connection() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    for lock_identity in sorted(
+                        (
+                            f"knowledge-entry:{copied_entry.id}",
+                            f"knowledge-operation:{operation_id}",
+                        )
+                    ):
+                        await cur.execute(
+                            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                            (lock_identity,),
+                        )
+                    existing_receipt = await self._load_publication_receipt(
+                        cur,
+                        operation_id,
+                    )
+                    if existing_receipt is not None:
+                        _validate_knowledge_publication_replay(
+                            existing_receipt,
+                            entry=copied_entry,
+                            request_sha256=request_sha256,
+                        )
+                        await conn.commit()
+                        return copy_knowledge_publication_receipt(
+                            existing_receipt,
+                            replayed=True,
+                        )
+                    if await self._load_entry(cur, copied_entry.id) is not None:
+                        raise KnowledgePublicationConflict("entry_occupied")
+                    receipt = KnowledgePublicationReceipt(
+                        operation_id=operation_id,
+                        entry_id=copied_entry.id,
+                        request_sha256=request_sha256,
+                        entry_created_at=copied_entry.created_at,
+                        entry_updated_at=copied_entry.updated_at,
+                        committed_at=datetime.now(UTC),
+                    )
+                    await self._insert_entry(cur, copied_entry)
+                    await self._replace_chunks(cur, copied_entry.id, copied_chunks)
+                    await self._insert_publication_receipt(cur, receipt)
+                await conn.commit()
+                return copy_knowledge_publication_receipt(receipt)
+            except UniqueViolation:
+                await conn.rollback()
+                raise KnowledgePublicationConflict("concurrent_occupancy") from None
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def load_entry_publication_receipt(
+        self,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt | None:
+        operation_id = _knowledge_publication_operation_id(operation_id)
+        await self._ensure_ready()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            receipt = await self._load_publication_receipt(cur, operation_id)
+        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+
     async def read_chunks(
         self,
         entry_id: str,
@@ -4643,6 +4736,102 @@ class PostgresKnowledgeStore(_PostgresStoreBase, KnowledgeStore):
             _knowledge_entry_row_values(entry),
         )
         await self._replace_entry_lists(cur, entry)
+
+    async def _insert_entry(self, cur: Any, entry: KnowledgeEntry) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_entries (
+                id,
+                namespace,
+                text,
+                kind,
+                visibility,
+                status,
+                created_by_type,
+                created_by,
+                created_at,
+                updated_at,
+                source_type,
+                source_uri,
+                source_id,
+                source_hash,
+                importance,
+                importance_source,
+                confidence,
+                last_used_at,
+                expires_at,
+                title,
+                metadata
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """,
+            _knowledge_entry_row_values(entry),
+        )
+        await self._replace_entry_lists(cur, entry)
+
+    async def _load_publication_receipt(
+        self,
+        cur: Any,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt | None:
+        await cur.execute(
+            """
+            SELECT
+                operation_id,
+                entry_id,
+                request_sha256,
+                entry_created_at,
+                entry_updated_at,
+                committed_at
+            FROM cayu_knowledge_publication_receipts
+            WHERE operation_id = %s
+            """,
+            (operation_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        try:
+            return KnowledgePublicationReceipt(
+                operation_id=row[0],
+                entry_id=row[1],
+                request_sha256=row[2],
+                entry_created_at=row[3],
+                entry_updated_at=row[4],
+                committed_at=row[5],
+            )
+        except Exception:
+            raise KnowledgePublicationConflict("malformed_receipt") from None
+
+    async def _insert_publication_receipt(
+        self,
+        cur: Any,
+        receipt: KnowledgePublicationReceipt,
+    ) -> None:
+        await cur.execute(
+            """
+            INSERT INTO cayu_knowledge_publication_receipts (
+                operation_id,
+                entry_id,
+                request_sha256,
+                entry_created_at,
+                entry_updated_at,
+                committed_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                receipt.operation_id,
+                receipt.entry_id,
+                receipt.request_sha256,
+                receipt.entry_created_at,
+                receipt.entry_updated_at,
+                receipt.committed_at,
+            ),
+        )
 
     async def _replace_entry_lists(self, cur: Any, entry: KnowledgeEntry) -> None:
         for table in (
@@ -5235,16 +5424,25 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         await self._embed_entry_chunks_best_effort(stored.id)
         return stored
 
-    async def delete_entry(
+    async def publish_entry_with_chunks(
         self,
-        entry_id: str,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
         *,
-        hard: bool = False,
-    ) -> KnowledgeEntry | None:
-        deleted = await super().delete_entry(entry_id, hard=hard)
-        if hard and deleted is not None:
-            await self._delete_entry_embeddings(deleted.id)
-        return deleted
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt:
+        receipt = await super().publish_entry_with_chunks(
+            entry,
+            chunks,
+            operation_id=operation_id,
+        )
+        if receipt.replayed:
+            return receipt
+        # Owned publication exposes a bounded post-commit warning through the
+        # remember tool when derived work fails. Legacy writes retain their
+        # established best-effort behavior below.
+        await self._embed_entry_chunks(receipt.entry_id)
+        return receipt
 
     async def replace_chunks(
         self,
@@ -5774,7 +5972,7 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
             async with self._pool.connection() as conn, conn.cursor() as cur:
                 chunks = await self._load_chunks(cur, entry_id)
         await self._embed_chunks(chunks)
-        await self._drop_stale_entry_embeddings(entry_id, chunks)
+        await self._drop_stale_entry_embeddings(entry_id)
 
     async def _embed_entry_chunks_best_effort(
         self,
@@ -5869,6 +6067,10 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     _postgres_vector_literal(embedding.vector),
                     now,
                     now,
+                    chunk.id,
+                    chunk.entry_id,
+                    chunk.text,
+                    chunk.content_hash,
                 )
             )
         async with self._pool.connection() as conn, conn.cursor() as cur:
@@ -5885,7 +6087,12 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                     created_at,
                     updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s, %s)
+                SELECT %s, %s, %s, %s, %s, %s, %s::vector, %s, %s
+                FROM cayu_knowledge_chunks AS current_chunk
+                WHERE current_chunk.id = %s
+                  AND current_chunk.entry_id = %s
+                  AND current_chunk.text = %s
+                  AND current_chunk.content_hash IS NOT DISTINCT FROM %s
                 ON CONFLICT (chunk_id) DO UPDATE SET
                     entry_id = excluded.entry_id,
                     content_hash = excluded.content_hash,
@@ -5897,8 +6104,9 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
                 """,
                 rows,
             )
+            embedded_count = max(cur.rowcount, 0)
             await conn.commit()
-        return len(rows)
+        return embedded_count
 
     async def _missing_embedding_chunks(
         self,
@@ -5949,29 +6157,23 @@ class PostgresEmbeddingKnowledgeStore(PostgresKnowledgeStore):
         if len(vector) != self.embedding_dimensions:
             raise ValueError("Embedding provider returned a vector with unexpected dimension.")
 
-    async def _delete_entry_embeddings(self, entry_id: str) -> None:
-        await self._ensure_ready()
-        async with self._pool.connection() as conn, conn.cursor() as cur:
-            await cur.execute(
-                "DELETE FROM cayu_knowledge_embeddings WHERE entry_id = %s",
-                (entry_id,),
-            )
-            await conn.commit()
-
     async def _drop_stale_entry_embeddings(
         self,
         entry_id: str,
-        chunks: list[KnowledgeChunk],
     ) -> None:
-        current_ids = [chunk.id for chunk in chunks]
         async with self._pool.connection() as conn, conn.cursor() as cur:
             await cur.execute(
                 """
-                DELETE FROM cayu_knowledge_embeddings
-                WHERE entry_id = %s
-                  AND NOT (chunk_id = ANY(%s))
+                DELETE FROM cayu_knowledge_embeddings AS embedding
+                WHERE embedding.entry_id = %s
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM cayu_knowledge_chunks AS current_chunk
+                      WHERE current_chunk.id = embedding.chunk_id
+                        AND current_chunk.entry_id = embedding.entry_id
+                  )
                 """,
-                (entry_id, current_ids),
+                (entry_id,),
             )
             await conn.commit()
 

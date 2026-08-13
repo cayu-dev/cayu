@@ -38,6 +38,7 @@ def _pending_approval() -> PendingToolApproval:
         tool_call_id="call-1",
         tool_name="side_effect",
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[_pending_call()],
     )
 

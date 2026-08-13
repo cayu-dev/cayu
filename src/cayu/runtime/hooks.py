@@ -101,8 +101,7 @@ class _HookActionContext:
     def _require_publication_actions_allowed(self) -> None:
         if not self._publication_actions_allowed:
             raise RuntimeError(
-                "Before-tool hook publication actions are unavailable until "
-                "the invocation secret scope is complete."
+                "Hook publication actions are unavailable for this private tool-argument boundary."
             )
 
     async def fork_session(self, request: ForkSessionRequest) -> list[Event]:
@@ -241,12 +240,14 @@ class ToolCallHookContext(_HookActionContext):
         arguments: dict[str, Any],
         result: ToolResult,
         task_id: str | None,
+        publication_actions_allowed: bool = True,
     ) -> None:
         super().__init__(
             runtime=runtime,
             hook_name=hook_name,
             phase=phase,
             session=session,
+            publication_actions_allowed=publication_actions_allowed,
         )
         self._tool_event = copy_event(tool_event)
         self._tool_name = require_clean_nonblank(tool_name, "tool_name")

@@ -206,6 +206,11 @@ REVISIONS: tuple[Revision, ...] = (
     # selection. Pre-34 task workers ignore the gate and could claim future work
     # early, so they must not share a revision-34 database.
     Revision(revision=34, kind=RevisionKind.BREAKING, compatible_from=34),
+    # Model-authored knowledge publication now commits an immutable operation
+    # receipt beside its entry and chunks. Pre-35 workers can still compensate
+    # ambiguous writes by deleting a shared deterministic entry id, so they must
+    # not share a database with revision-35 knowledge writers.
+    Revision(revision=35, kind=RevisionKind.BREAKING, compatible_from=35),
 )
 
 #: The revision an empty database is initialized to.

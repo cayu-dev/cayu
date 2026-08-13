@@ -109,6 +109,8 @@ def started_arguments_match_private_call(
 
 def pause_checkpoint_validation_view(
     value: Any,
+    *,
+    pause_kind: Literal["approval", "user-input"],
 ) -> tuple[dict[str, Any], bool]:
     """Return a model-compatible copy of one durable pause descriptor.
 
@@ -140,14 +142,24 @@ def pause_checkpoint_validation_view(
 
     if any(quarantined) and not all(quarantined):
         raise ValueError("Pause checkpoint mixes private and quarantined arguments.")
-    if "input_id" in checkpoint and "question" not in checkpoint:
+    arguments_quarantined = bool(quarantined and quarantined[0])
+    if pause_kind == "approval":
+        if "publish_arguments" in checkpoint:
+            raise ValueError("Approval event exposes private publication authority.")
+        # Publication authority is private checkpoint state and is therefore
+        # absent from current approval events. Supply only the model-compatible
+        # value implied by the event's validated argument state. Durable
+        # checkpoint parsing does not use this helper and still requires the
+        # original explicit authority field.
+        checkpoint["publish_arguments"] = not arguments_quarantined
+    elif "question" not in checkpoint:
         # Dynamic-secret user-input events withhold their prompt.  Recovery
         # validates only durable pause identity here; the private checkpoint,
         # not this fixed model-compatible placeholder, remains authoritative
         # for the actual question and options.
         checkpoint["question"] = "Input required"
         checkpoint["options"] = []
-    return checkpoint, bool(quarantined and quarantined[0])
+    return checkpoint, arguments_quarantined
 
 
 def terminal_argument_projection(

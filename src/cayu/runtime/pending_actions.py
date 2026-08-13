@@ -582,6 +582,8 @@ def _approval_event_matches_checkpoint(
 
     if checkpoint_pending is None:
         return False
+    if arguments_quarantined != (checkpoint_pending.publish_arguments is False):
+        return False
 
     def authority_view(
         approval: PendingToolApproval | PendingToolApprovalEventView,
@@ -592,6 +594,7 @@ def _approval_event_matches_checkpoint(
         payload.pop("metadata", None)
         payload.pop("reason", None)
         payload.pop("arguments_state", None)
+        payload.pop("publish_arguments", None)
         payload.pop("secret_resolution_scope", None)
         if omit_arguments:
             payload.pop("arguments", None)
@@ -788,7 +791,7 @@ def _pending_approval_checkpoint_call(
     if tool_call_id is None:
         return {
             "tool_name": pending.tool_name,
-            "arguments": pending.arguments,
+            "arguments": pending.arguments if pending.publish_arguments else {},
             "tool_call_id": pending.tool_call_id,
             "tool_round_id": pending.tool_round_id,
             "reason": approval_support.public_pending_approval_reason(pending),
@@ -804,7 +807,7 @@ def _pending_approval_checkpoint_call(
         if call.tool_call_id == tool_call_id:
             return {
                 "tool_name": call.tool_name,
-                "arguments": call.arguments,
+                "arguments": call.arguments if pending.publish_arguments else {},
                 "tool_call_id": call.tool_call_id,
                 "tool_round_id": pending.tool_round_id,
                 "reason": approval_support.public_pending_approval_reason(

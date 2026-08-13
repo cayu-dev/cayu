@@ -954,6 +954,7 @@ def test_session_show_reports_approval_and_user_input_pending_actions(
                         "tool_name": "deploy",
                         "arguments": {},
                         "agent_name": "operator",
+                        "publish_arguments": True,
                         "tool_calls": [pending_call("call-approval", "deploy")],
                     }
                 },

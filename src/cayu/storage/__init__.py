@@ -30,12 +30,15 @@ from cayu.storage.memory import (
     KnowledgeListItem,
     KnowledgeListQuery,
     KnowledgeListResult,
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    prepare_knowledge_publication,
 )
 from cayu.storage.sqlite import SQLiteSessionStore, SQLiteTaskStore
 
@@ -63,6 +66,8 @@ __all__ = [
     "KnowledgeListItem",
     "KnowledgeListQuery",
     "KnowledgeListResult",
+    "KnowledgePublicationConflict",
+    "KnowledgePublicationReceipt",
     "KnowledgeQuery",
     "KnowledgeReviewWorkflow",
     "KnowledgeSearchMode",
@@ -84,6 +89,7 @@ __all__ = [
     "SQLiteKnowledgeStore",
     "SQLiteSessionStore",
     "SQLiteTaskStore",
+    "prepare_knowledge_publication",
 ]
 
 

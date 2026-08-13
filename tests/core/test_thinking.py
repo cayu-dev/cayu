@@ -846,6 +846,7 @@ def test_thinking_threads_through_request_copies() -> None:
         tool_call_id="t",
         tool_name="x",
         agent_name="ag",
+        publish_arguments=True,
         tool_calls=[PendingToolCallApproval(tool_call_id="t", tool_name="x")],
         thinking=cfg,
     )

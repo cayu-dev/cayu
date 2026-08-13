@@ -1008,6 +1008,10 @@ class ToolRoundExecutor:
             environment_name=_environment_name(registered_environment),
             workspace_id=_workspace_id(registered_environment),
             task_id=task_id,
+            publish_arguments=_tool_round_publishes_arguments(
+                registered_agent,
+                tool_calls,
+            ),
             secret_resolution_scope=(
                 approval_support.tool_round_secret_resolution_scope(pending_round)
             ),
@@ -1682,6 +1686,8 @@ class ToolRoundExecutor:
 
         started_event: Event | None = None
         registered_tool = registered_agent.tools.get(tool_call.name)
+        if registered_tool is not None and not registered_tool.publish_arguments:
+            publish_arguments_as_unavailable = True
         if taint_labels is None:
             taint_labels = frozenset(
                 await self.prior_taint_labels_for_policy(
@@ -1786,6 +1792,7 @@ class ToolRoundExecutor:
                 public_policy_result = approval_support.public_policy_denial_result(
                     secret_resolution_scope=policy_output_secret_resolution_scope,
                     policy_result=resolved_policy_result,
+                    publish_arguments=registered_tool.publish_arguments,
                 )
                 reason = tool_execution.policy_denial_reason(public_policy_result)
                 result = tool_execution.blocked_tool_result(public_policy_result, reason=reason)
@@ -1864,7 +1871,10 @@ class ToolRoundExecutor:
             payload={"tool_call_id": tool_call.id, **identity_payload},
         )
         before_resolution = _BeforeToolCallResolution(arguments=deepcopy(tool_call.arguments))
-        quarantine_pre_execution_publication = policy_output_secret_resolution_scope != "static"
+        quarantine_pre_execution_publication = (
+            policy_output_secret_resolution_scope != "static"
+            or not registered_tool.publish_arguments
+        )
         async for hook_event in self._run_before_tool_call_hooks(
             session=session,
             registered_agent=registered_agent,
@@ -1890,15 +1900,20 @@ class ToolRoundExecutor:
         )
         if before_resolution.block_reason is not None:
             publication_snapshot = await record_static_publication_scope()
+            block_reason = (
+                before_resolution.block_reason
+                if registered_tool.publish_arguments
+                else "Tool call blocked by a before_tool_call hook."
+            )
             async for event in self._emit_terminal_tool_result(
                 session=session,
                 registered_agent=registered_agent,
                 registered_environment=registered_environment,
                 tool_call=effective_tool_call,
                 event_type=EventType.TOOL_CALL_BLOCKED,
-                result=ToolResult(content=before_resolution.block_reason, is_error=True),
+                result=ToolResult(content=block_reason, is_error=True),
                 extra_payload={
-                    "reason": before_resolution.block_reason,
+                    "reason": block_reason,
                     "blocked_by": "before_tool_call_hook",
                     "idempotency_key": idempotency_key,
                     **effective_arguments_payload,
@@ -1917,7 +1932,11 @@ class ToolRoundExecutor:
             return
         if before_resolution.short_circuit_result is not None:
             publication_snapshot = await record_static_publication_scope()
-            short_result = before_resolution.short_circuit_result
+            short_result = (
+                before_resolution.short_circuit_result
+                if registered_tool.publish_arguments
+                else _private_argument_short_circuit_result(before_resolution.short_circuit_result)
+            )
             async for event in self._emit_terminal_tool_result(
                 session=session,
                 registered_agent=registered_agent,
@@ -1938,7 +1957,7 @@ class ToolRoundExecutor:
                 tool_round_identity=tool_round_identity,
                 approval_id=approval_id,
                 input_id=input_id,
-                allow_modification=True,
+                allow_modification=registered_tool.publish_arguments,
                 redactor=invocation_redactor,
                 output_redactor=provisional_output_redactor,
                 deferred_terminal_stager=deferred_terminal_stager,
@@ -1965,6 +1984,7 @@ class ToolRoundExecutor:
                     public_reauthorization = approval_support.public_policy_denial_result(
                         secret_resolution_scope=policy_output_secret_resolution_scope,
                         policy_result=reauthorization,
+                        publish_arguments=registered_tool.publish_arguments,
                     )
                     reason = tool_execution.policy_denial_reason(public_reauthorization)
                     metadata = public_reauthorization.metadata
@@ -1972,12 +1992,14 @@ class ToolRoundExecutor:
                     metadata = (
                         reauthorization.metadata
                         if policy_output_secret_resolution_scope == "static"
+                        and registered_tool.publish_arguments
                         else {}
                     )
                     reason = (
                         (
                             reauthorization.reason
                             if policy_output_secret_resolution_scope == "static"
+                            and registered_tool.publish_arguments
                             else None
                         )
                         or "Modified tool arguments require approval, which before_tool_call "
@@ -2313,6 +2335,7 @@ class ToolRoundExecutor:
                 redactor=redactor,
                 output_redactor=output_redactor,
                 allow_modification=False,
+                quarantine_output=not registered_tool.publish_arguments,
             ):
                 if modified is not None:
                     raise AssertionError(
@@ -2984,6 +3007,12 @@ class ToolRoundExecutor:
             raise ValueError("Deferred terminal staging requires a publication snapshot.")
         if deferred_terminal_projection_recorder is not None and not publish_before_hooks:
             raise ValueError("Deferred terminal projection recording requires observational hooks.")
+        registered_tool = registered_agent.tools.get(tool_call.name)
+        quarantine_hook_output = (
+            registered_tool is not None and not registered_tool.publish_arguments
+        )
+        if quarantine_hook_output:
+            allow_modification = False
         resolved_redactor = redactor if redactor is not None else self._secret_redactor
         resolved_output_redactor = resolved_redactor if output_redactor is None else output_redactor
         resolved_argument_projection = (
@@ -3098,6 +3127,7 @@ class ToolRoundExecutor:
                 redactor=resolved_redactor,
                 output_redactor=resolved_output_redactor,
                 allow_modification=False,
+                quarantine_output=quarantine_hook_output,
             ):
                 if modified is not None:
                     raise AssertionError(
@@ -3119,6 +3149,7 @@ class ToolRoundExecutor:
             redactor=resolved_redactor,
             output_redactor=resolved_output_redactor,
             allow_modification=allow_modification,
+            quarantine_output=quarantine_hook_output,
         ):
             yield hook_event, None
             if modified is not None:
@@ -3267,6 +3298,7 @@ class ToolRoundExecutor:
         redactor: SecretRedactor,
         output_redactor: SecretRedactor,
         allow_modification: bool = False,
+        quarantine_output: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
         current_result = result
         for hooks, scope in (
@@ -3286,6 +3318,7 @@ class ToolRoundExecutor:
                 redactor=redactor,
                 output_redactor=output_redactor,
                 allow_modification=allow_modification,
+                quarantine_output=quarantine_output,
             ):
                 yield hook_event, modified
                 if modified is not None:
@@ -3306,6 +3339,7 @@ class ToolRoundExecutor:
         redactor: SecretRedactor,
         output_redactor: SecretRedactor,
         allow_modification: bool = False,
+        quarantine_output: bool = False,
     ) -> AsyncIterator[tuple[Event, ToolResult | None]]:
         current_result = result
         for registered_hook in hooks:
@@ -3357,6 +3391,7 @@ class ToolRoundExecutor:
                     )
                 ),
                 task_id=task_id,
+                publication_actions_allowed=not quarantine_output,
             )
             try:
                 decision = await hook.after_tool_call(context)
@@ -3378,13 +3413,23 @@ class ToolRoundExecutor:
                                 payload={
                                     "tool_name": tool_call.name,
                                     "tool_call_id": tool_call.id,
-                                    **_hook_failure_payload(
-                                        exc,
-                                        redactor=output_redactor,
-                                    ),
-                                    **_hook_actions_payload(
-                                        context,
-                                        redactor=output_redactor,
+                                    **(
+                                        {
+                                            "error_type": "runtime_hook_failure",
+                                            "actions": [],
+                                            "actions_omitted": True,
+                                        }
+                                        if quarantine_output
+                                        else {
+                                            **_hook_failure_payload(
+                                                exc,
+                                                redactor=output_redactor,
+                                            ),
+                                            **_hook_actions_payload(
+                                                context,
+                                                redactor=output_redactor,
+                                            ),
+                                        }
                                     ),
                                 },
                             ),
@@ -3411,9 +3456,13 @@ class ToolRoundExecutor:
                             payload={
                                 "tool_name": tool_call.name,
                                 "tool_call_id": tool_call.id,
-                                **_hook_actions_payload(
-                                    context,
-                                    redactor=output_redactor,
+                                **(
+                                    {"actions": [], "actions_omitted": True}
+                                    if quarantine_output
+                                    else _hook_actions_payload(
+                                        context,
+                                        redactor=output_redactor,
+                                    )
                                 ),
                             },
                         ),
@@ -5413,6 +5462,19 @@ def _tool_effect(
     return registered_tool.effect
 
 
+def _tool_round_publishes_arguments(
+    registered_agent: runtime_records.RegisteredAgentState,
+    tool_calls: list[runtime_records.ToolCallRequest],
+) -> bool:
+    """Require every paused call to permit one shared argument projection."""
+
+    for tool_call in tool_calls:
+        registered_tool = registered_agent.tools.get(tool_call.name)
+        if registered_tool is None or not registered_tool.publish_arguments:
+            return False
+    return True
+
+
 def _taint_labels_for_source_tool(
     policy: ToolPolicy,
     tool_name: str,
@@ -5431,6 +5493,16 @@ class _BeforeToolCallResolution:
     arguments: dict[str, Any]
     short_circuit_result: ToolResult | None = None
     block_reason: str | None = None
+
+
+def _private_argument_short_circuit_result(result: ToolResult) -> ToolResult:
+    """Project one hook-controlled result without argument-derived content."""
+
+    return ToolResult(
+        content="Tool execution was short-circuited by a before_tool_call hook.",
+        structured={"outcome": "short_circuited"},
+        is_error=result.is_error,
+    )
 
 
 def _resolve_before_tool_call_decision(

@@ -1203,6 +1203,7 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
         tool_name="reader",
         arguments={"path": "README.md"},
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[pending_call],
     )
     user_input = PendingUserInput(
@@ -1260,6 +1261,7 @@ def test_typed_pause_payload_keys_survive_exact_short_secret_collisions() -> Non
             "assistant_publication",
             "assistant_message_state",
             "quarantined_assistant_message",
+            "publish_arguments",
             "secret_resolution_scope",
         }
         for field_name in field_names:

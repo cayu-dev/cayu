@@ -4408,6 +4408,7 @@ def test_legacy_pending_approval_rejects_secret_authority_before_recovery() -> N
         tool_call_id="call-safe",
         tool_name="safe-tool",
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[
             PendingToolCallApproval(
                 tool_call_id="call-safe",
@@ -4441,6 +4442,7 @@ def test_legacy_pending_approval_rejects_secret_argument_key_without_mutating_in
         tool_name="safe-tool",
         arguments={secret_key: "top-level"},
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[
             PendingToolCallApproval(
                 tool_call_id="call-safe",
@@ -4555,6 +4557,7 @@ def test_explicit_compaction_rejects_secret_bearing_legacy_pending_checkpoint() 
         tool_call_id="call-safe",
         tool_name="safe-tool",
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[
             PendingToolCallApproval(
                 tool_call_id="call-safe",
@@ -4604,6 +4607,7 @@ def test_explicit_compaction_public_flow_rejects_legacy_secret_without_traceback
             tool_call_id="call-safe",
             tool_name="safe-tool",
             agent_name="assistant",
+            publish_arguments=True,
             tool_calls=[
                 PendingToolCallApproval(
                     tool_call_id="call-safe",
@@ -5097,6 +5101,7 @@ def test_business_approval_rejects_legacy_secret_before_routing_or_traceback_exp
             tool_call_id="call-safe",
             tool_name="safe-tool",
             agent_name="assistant",
+            publish_arguments=True,
             metadata=business_approval_routing_metadata(
                 required_tier="team",
                 chain=("team",),

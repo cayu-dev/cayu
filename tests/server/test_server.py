@@ -4094,6 +4094,7 @@ def test_server_pending_actions_lists_blocking_session_work() -> None:
                 "tool_name": tool_name,
                 "arguments": arguments or {},
                 "agent_name": "assistant",
+                "publish_arguments": True,
                 "reason": reason,
                 "tool_calls": [pending_call],
             },
@@ -4586,6 +4587,7 @@ def test_control_plane_redacts_legacy_session_event_transcript_pending_and_task_
                     "tool_name": "deploy",
                     "arguments": {secret: f"checkpoint value {secret}"},
                     "agent_name": "assistant",
+                    "publish_arguments": True,
                     "tool_calls": [
                         {
                             "tool_call_id": "legacy_call",

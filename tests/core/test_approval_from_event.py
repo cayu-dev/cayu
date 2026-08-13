@@ -22,12 +22,15 @@ def _pending() -> PendingToolApproval:
         tool_call_id="call_1",
         tool_name="send_email",
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="send_email")],
     )
 
 
 def _approval_event() -> Event:
     pending = _pending()
+    approval_payload = pending.model_dump(mode="json")
+    approval_payload.pop("publish_arguments")
     return Event(
         type=EventType.TOOL_CALL_APPROVAL_REQUESTED,
         payload={
@@ -36,7 +39,7 @@ def _approval_event() -> Event:
             "model_step_id": pending.model_step_id,
             "model_attempt_id": pending.model_attempt_id,
             "tool_round_id": pending.tool_round_id,
-            "approval": pending.model_dump(mode="json"),
+            "approval": approval_payload,
         },
         session_id="sess_1",
         agent_name=pending.agent_name,
@@ -49,6 +52,7 @@ def test_from_event_reads_the_nested_approval() -> None:
     got = PendingToolApproval.from_event(event)
     assert got.approval_id == "ap_1"
     assert got.tool_call_id == "call_1"
+    assert got.publish_arguments is True
     assert event.payload["approval_id"] == got.approval_id
     assert event.payload["tool_call_id"] == got.tool_call_id
 
@@ -90,6 +94,14 @@ def test_event_view_distinguishes_genuinely_empty_finalized_arguments() -> None:
     assert got.arguments == {}
     assert got.tool_calls[0].arguments_state == "finalized"
     assert got.tool_calls[0].arguments == {}
+
+
+def test_from_event_rejects_private_publication_authority() -> None:
+    event = _approval_event()
+    event.payload["approval"]["publish_arguments"] = True
+
+    with pytest.raises(ValueError, match="private publication authority"):
+        PendingToolApproval.from_event(event)
 
 
 @pytest.mark.parametrize(

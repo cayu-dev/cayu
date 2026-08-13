@@ -8,6 +8,13 @@ from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
 )
+from tests.core.knowledge_publication_conformance import (
+    assert_concurrent_publication_conformance,
+    assert_failed_publication_left_no_state,
+    assert_owned_publication_conformance,
+    assert_stale_operation_cannot_replace_newer_publication,
+    publication_material,
+)
 
 from cayu.embeddings import (
     TextEmbedding,
@@ -32,6 +39,7 @@ pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
     "cayu_knowledge_embeddings",
+    "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
@@ -108,7 +116,7 @@ def _new_store(dsn: str):
 
 def _new_embedding_store(
     dsn: str,
-    provider: KeywordEmbeddingProvider,
+    provider: TextEmbeddingProvider,
     *,
     max_size: int = 4,
 ):
@@ -124,6 +132,385 @@ def _new_embedding_store(
         embedding_dimensions=3,
         semantic_min_score=0.70,
     )
+
+
+def test_postgres_knowledge_store_owned_publication_conformance(postgres_dsn: str) -> None:
+    async def run() -> None:
+        await _drop_all(postgres_dsn)
+        store = _new_store(postgres_dsn)
+        try:
+            await assert_owned_publication_conformance(store)
+            await assert_concurrent_publication_conformance(store)
+            await assert_stale_operation_cannot_replace_newer_publication(store)
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_owned_publication_does_not_apply_stale_derived_embeddings(
+    postgres_dsn: str,
+) -> None:
+    class FirstCallBlockingEmbeddingProvider(TextEmbeddingProvider):
+        name = "blocking-keyword-test"
+
+        def __init__(self) -> None:
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            if self.call_count == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            return TextEmbeddingResult(
+                model=request.model,
+                embeddings=[
+                    TextEmbedding(index=index, vector=_test_embedding_vector(text))
+                    for index, text in enumerate(request.texts)
+                ],
+            )
+
+    async def run() -> tuple[str, list[tuple[str, str]]]:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = FirstCallBlockingEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        old_task: asyncio.Task | None = None
+        try:
+            old_entry, old_chunks = publication_material(
+                entry_id="reused_embedding_publication",
+                text="GitHub credential proxy policy.",
+            )
+            old_chunks = [old_chunks[0].model_copy(update={"id": "old-publication-chunk"})]
+            old_task = asyncio.create_task(
+                store.publish_entry_with_chunks(
+                    old_entry,
+                    old_chunks,
+                    operation_id="old-embedding-publication",
+                )
+            )
+            await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+            await store.delete_entry(old_entry.id, hard=True)
+            new_entry, new_chunks = publication_material(
+                entry_id=old_entry.id,
+                text="Invoice payment refund policy.",
+                timestamp_offset=1,
+            )
+            new_chunks = [new_chunks[0].model_copy(update={"id": "new-publication-chunk"})]
+            await store.publish_entry_with_chunks(
+                new_entry,
+                new_chunks,
+                operation_id="new-embedding-publication",
+            )
+            provider.release_first.set()
+            await old_task
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute(
+                    """
+                    SELECT chunk_id, content_hash
+                    FROM cayu_knowledge_embeddings
+                    WHERE entry_id = %s
+                    ORDER BY chunk_id
+                    """,
+                    (old_entry.id,),
+                )
+                rows = [(str(row[0]), str(row[1])) for row in await cur.fetchall()]
+            return new_chunks[0].content_hash or "", rows
+        finally:
+            provider.release_first.set()
+            if old_task is not None and not old_task.done():
+                await asyncio.gather(old_task, return_exceptions=True)
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    expected_hash, rows = asyncio.run(run())
+
+    assert rows == [("new-publication-chunk", expected_hash)]
+
+
+def test_postgres_hard_delete_cannot_remove_same_id_republication_embeddings(
+    postgres_dsn: str,
+) -> None:
+    from cayu import PostgresEmbeddingKnowledgeStore
+
+    class DelayedDeleteCleanupStore(PostgresEmbeddingKnowledgeStore):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.cleanup_started = asyncio.Event()
+            self.release_cleanup = asyncio.Event()
+
+        async def _delete_entry_embeddings(self, entry_id: str) -> None:
+            self.cleanup_started.set()
+            await self.release_cleanup.wait()
+            async with self._pool.connection() as conn, conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM cayu_knowledge_embeddings WHERE entry_id = %s",
+                    (entry_id,),
+                )
+                await conn.commit()
+
+    async def run() -> tuple[bool, str, list[tuple[str, str]]]:
+        import psycopg
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        store = DelayedDeleteCleanupStore(
+            postgres_dsn,
+            embedding_provider=KeywordEmbeddingProvider(),
+            embedding_model="test-embedding",
+            embedding_dimensions=3,
+            semantic_min_score=0.70,
+            schema_mode=SchemaMode.CREATE,
+        )
+        delete_task: asyncio.Task | None = None
+        cleanup_wait: asyncio.Task | None = None
+        try:
+            old_entry, old_chunks = publication_material(
+                entry_id="delete-republication",
+                text="Old GitHub credential policy.",
+            )
+            old_chunks = [old_chunks[0].model_copy(update={"id": "old-delete-chunk"})]
+            await store.publish_entry_with_chunks(
+                old_entry,
+                old_chunks,
+                operation_id="old-delete-operation",
+            )
+            delete_task = asyncio.create_task(store.delete_entry(old_entry.id, hard=True))
+            cleanup_wait = asyncio.create_task(store.cleanup_started.wait())
+            done, _ = await asyncio.wait(
+                {delete_task, cleanup_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            new_entry, new_chunks = publication_material(
+                entry_id=old_entry.id,
+                text="New invoice payment policy.",
+                timestamp_offset=1,
+            )
+            new_chunks = [new_chunks[0].model_copy(update={"id": "new-delete-chunk"})]
+            if cleanup_wait in done:
+                # Reproduce the historical race: the source delete committed,
+                # then its redundant derived cleanup stalled while a new source
+                # and embedding were published under the same entry identity.
+                await store.publish_entry_with_chunks(
+                    new_entry,
+                    new_chunks,
+                    operation_id="new-delete-operation",
+                )
+                store.release_cleanup.set()
+                await delete_task
+            else:
+                await delete_task
+                await store.publish_entry_with_chunks(
+                    new_entry,
+                    new_chunks,
+                    operation_id="new-delete-operation",
+                )
+
+            async with (
+                await psycopg.AsyncConnection.connect(postgres_dsn) as conn,
+                conn.cursor() as cur,
+            ):
+                await cur.execute(
+                    """
+                    SELECT chunk_id, content_hash
+                    FROM cayu_knowledge_embeddings
+                    WHERE entry_id = %s
+                    ORDER BY chunk_id
+                    """,
+                    (old_entry.id,),
+                )
+                rows = [(str(row[0]), str(row[1])) for row in await cur.fetchall()]
+            return (
+                store.cleanup_started.is_set(),
+                new_chunks[0].content_hash or "",
+                rows,
+            )
+        finally:
+            store.release_cleanup.set()
+            if cleanup_wait is not None and not cleanup_wait.done():
+                cleanup_wait.cancel()
+                await asyncio.gather(cleanup_wait, return_exceptions=True)
+            if delete_task is not None and not delete_task.done():
+                await asyncio.gather(delete_task, return_exceptions=True)
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    cleanup_started, expected_hash, rows = asyncio.run(run())
+
+    assert cleanup_started is False
+    assert rows == [("new-delete-chunk", expected_hash)]
+
+
+def test_postgres_remember_knowledge_reconciles_ack_loss_and_restart(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore, RememberKnowledgeTool, ToolContext
+
+        class AcknowledgementLossPostgresStore(PostgresKnowledgeStore):
+            async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+                await super().publish_entry_with_chunks(
+                    entry,
+                    chunks,
+                    operation_id=operation_id,
+                )
+                raise RuntimeError("secret canary acknowledgement failure")
+
+        await _drop_all(postgres_dsn)
+        context_options = {
+            "session_id": "session_1",
+            "idempotency_key": "postgres-durable-remember-operation",
+        }
+        store = AcknowledgementLossPostgresStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+        )
+        first = await RememberKnowledgeTool().run(
+            ToolContext(knowledge_store=store, **context_options),
+            {"text": "PostgreSQL knowledge survives acknowledgement loss."},
+        )
+        await store.close()
+
+        reopened = _new_store(postgres_dsn)
+        try:
+            replay = await RememberKnowledgeTool().run(
+                ToolContext(knowledge_store=reopened, **context_options),
+                {"text": "PostgreSQL knowledge survives acknowledgement loss."},
+            )
+            assert first.is_error is False
+            assert first.structured["post_write_error"] == ("publication_acknowledgement_lost")
+            assert "secret canary" not in first.content
+            assert "secret canary" not in repr(first.structured)
+            assert replay.is_error is False
+            assert replay.structured["written"] is False
+            assert replay.structured["already_known"] is None
+            assert replay.structured["publication_replayed"] is True
+            assert replay.structured["status"] is None
+        finally:
+            await reopened.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
+
+
+def test_postgres_remember_knowledge_reports_failed_embedding_without_repeating_it(
+    postgres_dsn: str,
+) -> None:
+    class CountingFailingEmbeddingProvider(TextEmbeddingProvider):
+        name = "counting-failing-test"
+
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            raise RuntimeError("secret canary embedding failure")
+
+    async def run() -> tuple[object, object, int]:
+        from cayu import RememberKnowledgeTool, ToolContext
+
+        await _drop_all(postgres_dsn)
+        await _skip_if_pgvector_unavailable(postgres_dsn)
+        provider = CountingFailingEmbeddingProvider()
+        store = _new_embedding_store(postgres_dsn, provider)
+        try:
+            context = ToolContext(
+                session_id="session_1",
+                idempotency_key="postgres-failed-derived-operation",
+                knowledge_store=store,
+            )
+            arguments = {
+                "text": "PostgreSQL source publication survives derived embedding failure."
+            }
+            first = await RememberKnowledgeTool().run(context, arguments)
+            replay = await RememberKnowledgeTool().run(context, arguments)
+            return first, replay, provider.call_count
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    first, replay, call_count = asyncio.run(run())
+
+    assert first.is_error is False
+    assert first.structured is not None
+    assert first.structured["post_write_error"] == "publication_acknowledgement_lost"
+    assert "secret canary" not in first.content
+    assert "secret canary" not in repr(first.structured)
+    assert replay.is_error is False
+    assert replay.structured is not None
+    assert replay.structured["written"] is False
+    assert replay.structured["already_known"] is None
+    assert replay.structured["publication_replayed"] is True
+    assert replay.structured["status"] is None
+    assert call_count == 1
+
+
+def test_postgres_knowledge_publication_rolls_back_each_material_write(
+    postgres_dsn: str,
+) -> None:
+    async def run() -> None:
+        from cayu import PostgresKnowledgeStore
+
+        class FailingPublicationStore(PostgresKnowledgeStore):
+            failure_phase: str | None = None
+
+            async def _insert_entry(self, cur, entry) -> None:
+                await super()._insert_entry(cur, entry)
+                self._fail_after("entry")
+
+            async def _replace_chunks(self, cur, entry_id, chunks) -> None:
+                await super()._replace_chunks(cur, entry_id, chunks)
+                self._fail_after("chunks")
+
+            async def _insert_publication_receipt(self, cur, receipt) -> None:
+                await super()._insert_publication_receipt(cur, receipt)
+                self._fail_after("receipt")
+
+            def _fail_after(self, phase: str) -> None:
+                if self.failure_phase == phase:
+                    raise RuntimeError(f"injected {phase}-boundary failure")
+
+        await _drop_all(postgres_dsn)
+        store = FailingPublicationStore(
+            postgres_dsn,
+            min_size=1,
+            max_size=4,
+            schema_mode=SchemaMode.CREATE,
+        )
+        try:
+            for index, failure_phase in enumerate(("entry", "chunks", "receipt")):
+                entry, chunks = publication_material(
+                    entry_id=f"postgres-rollback-{failure_phase}",
+                    timestamp_offset=index,
+                )
+                store.failure_phase = failure_phase
+                with pytest.raises(RuntimeError, match=rf"{failure_phase}-boundary"):
+                    await store.publish_entry_with_chunks(
+                        entry,
+                        chunks,
+                        operation_id=f"postgres-rollback-{failure_phase}",
+                    )
+                await assert_failed_publication_left_no_state(
+                    store,
+                    entry_id=entry.id,
+                    operation_id=f"postgres-rollback-{failure_phase}",
+                )
+        finally:
+            await store.close()
+            await _drop_all(postgres_dsn)
+
+    asyncio.run(run())
 
 
 async def _skip_if_pgvector_unavailable(dsn: str) -> None:
@@ -1430,14 +1817,19 @@ def test_postgres_knowledge_schema_migrates_and_coexists_with_session_store(
             chunks_row = await cur.fetchone()
             assert chunks_row is not None
             chunks_table = chunks_row[0]
-        return result, revisions, knowledge_table, chunks_table
+            await cur.execute("SELECT to_regclass('cayu_knowledge_publication_receipts')")
+            receipts_row = await cur.fetchone()
+            assert receipts_row is not None
+            receipts_table = receipts_row[0]
+        return result, revisions, knowledge_table, chunks_table, receipts_table
 
-    result, revisions, knowledge_table, chunks_table = asyncio.run(ops())
+    result, revisions, knowledge_table, chunks_table, receipts_table = asyncio.run(ops())
 
     assert [hit.entry.id for hit in result.hits] == ["entry"]
     assert revisions[-1] == (LATEST_REVISION, MIN_SUPPORTED_REVISION)
     assert knowledge_table == "cayu_knowledge_entries"
     assert chunks_table == "cayu_knowledge_chunks"
+    assert receipts_table == "cayu_knowledge_publication_receipts"
 
 
 def test_postgres_knowledge_store_batches_multi_entry_hit_hydration(postgres_dsn: str) -> None:

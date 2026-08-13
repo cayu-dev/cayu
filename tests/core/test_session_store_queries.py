@@ -83,6 +83,7 @@ def _pending_approval_payload(
         "tool_name": "deploy",
         "arguments": effective_arguments,
         "agent_name": "assistant",
+        "publish_arguments": True,
         "secret_resolution_scope": secret_resolution_scope,
         "reason": reason,
         "tool_calls": [
@@ -452,6 +453,7 @@ def test_in_memory_pending_action_index_is_pruned_after_resolution() -> None:
                 "tool_call_id": "pruned_call",
                 "tool_name": "deploy",
                 "agent_name": "assistant",
+                "publish_arguments": True,
                 "tool_calls": [
                     {
                         "tool_call_id": "pruned_call",
@@ -637,6 +639,10 @@ def test_session_stores_query_pending_actions_without_unrelated_history(
             action.event.event.type == EventType.TOOL_CALL_APPROVAL_REQUESTED
             for action in first.actions
         )
+        # Pending-action listings are public projections: explicit checkpoint
+        # authority makes the action executable, but does not expose its
+        # arguments through the listing surface.
+        assert all(action.arguments is None for action in first.actions)
         assert all("metadata" not in action.session.model_fields_set for action in first.actions)
         assert all(not hasattr(action.session, "metadata") for action in first.actions)
 

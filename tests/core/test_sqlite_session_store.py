@@ -568,6 +568,7 @@ def test_sqlite_pending_action_query_uses_persisted_projection_not_original_payl
                     "tool_name": "deploy",
                     "arguments": {},
                     "agent_name": "assistant",
+                    "publish_arguments": True,
                     "tool_calls": [
                         {
                             "tool_call_id": "persisted_pending_projection_call",
@@ -2598,6 +2599,7 @@ def test_sqlite_session_store_migrates_revision_one_database_to_latest_schema(tm
         (32, 31),
         (33, 31),
         (34, 34),
+        (35, 35),
     ]
     assert version == schema_migrations.LATEST_REVISION
 

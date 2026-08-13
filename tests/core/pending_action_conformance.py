@@ -69,6 +69,7 @@ def _approval_checkpoint(
             "tool_name": tool_name,
             "arguments": arguments or {},
             "agent_name": "assistant",
+            "publish_arguments": True,
             "tool_calls": [pending_call],
         }
     }
@@ -698,6 +699,7 @@ async def assert_pending_action_store_conformance(store: SessionStore) -> None:
                 "tool_name": "deploy",
                 "arguments": {},
                 "agent_name": "assistant",
+                "publish_arguments": True,
                 "tool_calls": [
                     _pending_call("conformance_gating_approval_call", "deploy"),
                     _pending_call("conformance_sibling_call", "rollback"),

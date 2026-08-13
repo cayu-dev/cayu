@@ -53,6 +53,7 @@ class RegisteredTool:
     schema: dict[str, Any]
     parallel_safe: bool
     effect: ToolEffect
+    publish_arguments: bool
     tool: Tool
     child_session_recovery: ChildSessionRecoveryMatcher | None = None
 

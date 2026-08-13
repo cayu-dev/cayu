@@ -939,6 +939,8 @@ from cayu.storage import (
     KnowledgeListItem,
     KnowledgeListQuery,
     KnowledgeListResult,
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeReviewWorkflow,
     KnowledgeSearchMode,
@@ -952,6 +954,7 @@ from cayu.storage import (
     SQLiteKnowledgeStore,
     SQLiteSessionStore,
     SQLiteTaskStore,
+    prepare_knowledge_publication,
 )
 from cayu.tools import (
     ArtifactReader,
@@ -1511,6 +1514,8 @@ __all__ = [
     "KnowledgeListItem",
     "KnowledgeListQuery",
     "KnowledgeListResult",
+    "KnowledgePublicationConflict",
+    "KnowledgePublicationReceipt",
     "KnowledgeQuery",
     "KnowledgeReviewWorkflow",
     "KnowledgeSearchMode",
@@ -2053,6 +2058,7 @@ __all__ = [
     "parallel",
     "parse_public_authority_alias",
     "pipeline",
+    "prepare_knowledge_publication",
     "pricing_profile_identity",
     "project_assertion_evidence_view",
     "promotable_run_input",

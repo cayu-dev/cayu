@@ -68,6 +68,7 @@ from cayu.runtime.sessions import (
 pytestmark = pytest.mark.usefixtures("postgres_dsn")
 
 _TABLES = (
+    "cayu_knowledge_publication_receipts",
     "cayu_knowledge_labels",
     "cayu_knowledge_aspects",
     "cayu_knowledge_impact_targets",
@@ -881,6 +882,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
             "reason": "latest request",
             "arguments": {"service": "api"},
             "agent_name": "assistant",
+            "publish_arguments": True,
             "tool_calls": [
                 {
                     "tool_call_id": "call_pg",
@@ -893,6 +895,8 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                 }
             ],
         }
+        approval_event_payload = dict(approval_payload)
+        approval_event_payload.pop("publish_arguments")
         await store.append_events(
             session.id,
             [
@@ -925,7 +929,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                         **_tool_round_identity_payload(),
                         "approval_id": "approval_pg",
                         "tool_call_id": "call_pg",
-                        "approval": approval_payload,
+                        "approval": approval_event_payload,
                     },
                 ),
                 Event(
@@ -938,7 +942,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                         **_tool_round_identity_payload(),
                         "approval_id": "approval_pg",
                         "tool_call_id": "call_pg",
-                        "approval": approval_payload,
+                        "approval": approval_event_payload,
                     },
                 ),
             ],
@@ -1130,6 +1134,7 @@ def test_postgres_session_store_queries_checkpoint_backed_pending_actions(postgr
                     "tool_name": "deploy",
                     "arguments": {},
                     "agent_name": "assistant",
+                    "publish_arguments": True,
                     "tool_calls": [
                         {
                             "tool_call_id": "long_identifier_call",

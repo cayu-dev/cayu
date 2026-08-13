@@ -688,7 +688,7 @@ Tool policy is Cayu's first scoped-authority primitive. It is separate from prov
 
 `AllowAllToolPolicy` is the default so existing simple agents continue to run without extra configuration. `StaticToolPolicy` provides a small allow/deny scope for common cases. Deny rules win over allow rules. `ParameterConstrainedToolPolicy` validates selected tool arguments with per-tool rules before the tool implementation runs. Built-in rules include `RequiredFieldRule`, `AllowlistRule`, `RequiredAllowlistRule`, and `DenyPatternRule`; they cover required fields, optional string allowlists, required string allowlists, and denied regex patterns over dotted JSON argument paths such as `request.url`. Use `RequiredAllowlistRule` for a security-sensitive field that must be present and allowed; it rejects missing, empty, non-string, and disallowed values atomically. `AllowlistRule` preserves the optional-field contract and does not reject a missing path. Violations return either `DENY` or `REQUIRE_APPROVAL`; they never silently rewrite tool arguments, and required-allowlist denials identify the failure as `missing`, `empty`, `wrong_type`, or `disallowed_value` in policy metadata. `TaintAwareToolPolicy` protects sensitive tools after configured untrusted source tools have produced output in the same session. It is origin-based, not a prompt-injection scanner: apps label source tools such as `read_email`, `fetch_url`, or `read_pdf` with taint labels, then protect outbound tools such as `send_email`, `make_payment`, or `execute_sql` from those labels. Cayu derives prior taint from durable terminal tool events and also applies taint within one model tool-call round before any tool implementation runs. A generic `ForkSessionRequest` derives the source session's active labels before creating the child, unions them with any explicitly supplied child labels, and persists the effective set in child metadata. The `session.forked` event reports only the source-derived set as `inherited_taint_labels`; a fork cannot clear source taint merely by omitting request metadata or changing agents. Resume and tool execution seed policy state from that durable session metadata, so the boundary remains enforced after restart. Custom policies implement `authorize(ToolPolicyRequest) -> ToolPolicyResult`.
 
-Denied tool calls are recoverable by default. The runtime emits one terminal `tool.call.blocked`, does not run the protected operation, appends an error `tool_result` to the provider-neutral transcript, and lets the model continue. A direct `ToolPolicy` refusal discovered while planning a paused multi-call round has no `tool.call.started`; direct refusals checked at the per-call execution boundary and the nested `CommandPolicy` used by `ExecCommandTool` occur after `tool.call.started`. The terminal event is canonical for both refusal paths: its payload carries `denied_by` (`tool_policy` or `command_policy`), `decision`, a safe `reason`, `metadata`, `tool_name`, `tool_call_id`, the complete `model_step_id` / `model_attempt_id` / `tool_round_id` execution identity, `idempotency_key`, and the redacted model-facing `result`. `metadata` contains the `ToolPolicyResult` metadata for a tool-policy refusal and is an empty object for a command-policy refusal, whose result type has no metadata surface. Policy-denial reasons and model-facing refusal text are bounded to 4 KiB of UTF-8; longer values end with `[policy denial reason truncated]` without splitting a Unicode scalar. A command refusal never also emits `tool.call.failed`, so event queries, SSE replay, logging, tracing, and recovery count one terminal outcome. The denial payload does not copy command arguments, environment values, stdin, credentials, or hook-modified effective arguments; policy authors must likewise keep reasons and `ToolPolicy.metadata` free of secrets. Configured secret redaction still applies, but bounding is not semantic sanitization. A before-tool hook block still uses `tool.call.blocked` with `blocked_by=before_tool_call_hook`, but it is not a policy refusal and therefore has no `denied_by`. If a before-tool hook modifies arguments and policy reauthorization refuses them, the event remains a policy denial with `denied_by=tool_policy` and also carries `blocked_by=tool_policy_reauthorization` to identify the second gate. Tool policy implementation errors are not policy refusals and retain their existing failure behavior. Existing stored events and checkpoints are not rewritten.
+Denied tool calls are recoverable by default. The runtime emits one terminal `tool.call.blocked`, does not run the protected operation, appends an error `tool_result` to the provider-neutral transcript, and lets the model continue. A direct `ToolPolicy` refusal discovered while planning a paused multi-call round has no `tool.call.started`; direct refusals checked at the per-call execution boundary and the nested `CommandPolicy` used by `ExecCommandTool` occur after `tool.call.started`. The terminal event is canonical for both refusal paths: its payload carries `denied_by` (`tool_policy` or `command_policy`), `decision`, a safe `reason`, `metadata`, `tool_name`, `tool_call_id`, the complete `model_step_id` / `model_attempt_id` / `tool_round_id` execution identity, `idempotency_key`, and the redacted model-facing `result`. `metadata` contains the `ToolPolicyResult` metadata for a tool-policy refusal and is an empty object for a command-policy refusal, whose result type has no metadata surface. Policy-denial reasons and model-facing refusal text are bounded to 4 KiB of UTF-8; longer values end with `[policy denial reason truncated]` without splitting a Unicode scalar. A command refusal never also emits `tool.call.failed`, so event queries, SSE replay, logging, tracing, and recovery count one terminal outcome. The denial payload does not copy command arguments, environment values, stdin, credentials, or hook-modified effective arguments; policy authors must likewise keep reasons and `ToolPolicy.metadata` free of secrets. Configured secret redaction still applies, but bounding is not semantic sanitization. Tools whose registered contract disables argument publication apply a stronger rule: policy reasons and metadata plus before/after-hook outputs, diagnostics, and actions are replaced with fixed operational classifications because an extension can derive them from withheld input even when no configured secret matches it. A before-tool hook block still uses `tool.call.blocked` with `blocked_by=before_tool_call_hook`, but it is not a policy refusal and therefore has no `denied_by`. If a before-tool hook modifies arguments and policy reauthorization refuses them, the event remains a policy denial with `denied_by=tool_policy` and also carries `blocked_by=tool_policy_reauthorization` to identify the second gate. Tool policy implementation errors are not policy refusals and retain their existing failure behavior. Existing stored events and checkpoints are not rewritten.
 
 Policies may also return `ToolPolicyDecision.REQUIRE_APPROVAL`. This is a durable interrupt, not an in-memory UI callback. The runtime authorizes the model's whole tool-call round before execution and durably replaces the unplanned round with its policy-evaluated call records. Each call records explicit policy evidence: `authoritative` for a durable policy decision, `unregistered` when no registered tool existed at planning time, and `ambiguous` when recovery cannot prove the result of an interrupted evaluation. If any authoritative call requires approval, the same checkpoint transaction retains that planned `pending_tool_round` and adds its matching `pending_tool_approval`; there is no state in which the policy-required round has been removed but its approval has not been published. The runtime then emits `session.checkpointed`, emits `tool.call.approval_requested`, marks the session `interrupted`, and emits `session.interrupted` with `interruption_type="tool_approval_required"`. No tool implementation in that round runs before approval. If a process stops before policy publication, recovery does not replay `authorize()`: stateful or time-sensitive policy evaluation is not guaranteed to reproduce the lost result. Instead, every registered call without a complete recognized durable decision is recorded as non-authoritative `ambiguous`, and the claimed recovery atomically publishes a manual gate before it may close the round. Approving that gate acknowledges recovery but records each ambiguous call as `tool.call.blocked`; it never emits `tool.call.approved` or `tool.call.started` and never dispatches the tool. A call recorded as `unregistered` also remains non-executable if a later deployment registers that name. Recovery validates transcript integrity and routes structured-output rounds before publishing the gate, so malformed or runtime-owned rounds cannot expose an executable approval surface. The same rule applies to unversioned legacy rounds, while recognized legacy decisions remain authoritative: recovery cannot downgrade a lost or recorded `DENY`, a policy exception, or missing evidence into executable approval. A versioned round marked `planned` is rejected if its evidence and decision conflict; the marker or absence of a decision is never authorization.
 
@@ -5487,6 +5487,12 @@ await store.transition_entry_status(
 await store.delete_entry(entry_id, hard=False)
 await store.replace_chunks(entry_id, chunks)
 await store.put_entry_with_chunks(entry, chunks)
+receipt = await store.publish_entry_with_chunks(
+    entry,
+    chunks,
+    operation_id="tool-attempt-identity",
+)
+receipt = await store.load_entry_publication_receipt("tool-attempt-identity")
 await store.read_chunks(entry_id, chunk_index=3, around=1)
 result = await store.search(query)
 listing = await store.list_entries(list_query)
@@ -5585,8 +5591,46 @@ so apps explicitly choose which agents can recall durable knowledge.
 Apps may also register `RememberKnowledgeTool` when an agent should be allowed
 to propose new durable knowledge. The tool is create-only: it does not accept an
 `entry_id` and cannot edit, archive, or delete existing entries. It writes
-through `KnowledgeIndexer` / `put_entry_with_chunks` so entry text, chunks, and
-source hashes stay consistent across stores. `RememberKnowledgePolicy` controls
+through `KnowledgeIndexer` and the store's operation-owned publication boundary
+so entry text, chunks, and immutable receipt evidence become visible atomically.
+The runtime tool-call idempotency key is the publication operation identity.
+Exact retries return the existing receipt; reuse with different entry or chunk
+material fails as a conflict, and an occupied deterministic entry id is never
+overwritten. Built-in memory, SQLite, and PostgreSQL stores implement this
+boundary. Existing custom stores remain importable, but `remember_knowledge`
+fails closed with a fixed, content-free error unless both owned-publication
+hooks are implemented; it never calls legacy `put_entry_with_chunks` as a
+fallback. This prevents a check-then-upsert race from overwriting an unrelated
+writer that concurrently occupies the deterministic entry id.
+
+`publish_entry_with_chunks` and `load_entry_publication_receipt` are optional,
+non-abstract `KnowledgeStore` extension hooks. A custom implementation must
+create the entry, its complete ordered chunk set, and one immutable receipt in a
+single atomic mutation; retain the receipt across entry deletion; reject an
+occupied entry id; bind the receipt digest to the complete normalized entry and
+chunks; keep receipt operation and entry identities within 256 UTF-8 bytes; and
+return the same committed timestamps with `replayed=true` for an exact operation
+replay (`replayed=false` is reserved for the transaction that inserted it).
+Custom stores must call the public `prepare_knowledge_publication(...)` helper
+before their transaction and persist the returned copied entry, ordered chunks,
+and canonical request digest. The helper is available from both `cayu` and
+`cayu.storage`; independently reproducing its serialization envelope is not part
+of the extension contract.
+The receipt is historical commit evidence: later review, chunk replacement, or
+hard deletion does not invalidate an exact replay and an old replay never
+rewrites the entry's current state. A replay reports
+`publication_replayed=true`, `written=false`, `already_known=null`, and
+`status=null`; it confirms the historical commit without claiming that the entry
+still exists or retains its original lifecycle status.
+Derived embedding work may occur after that source transaction and does not
+change publication ownership. A delayed derived write is admitted only while
+its source chunk identity and material still match current source state, so it
+cannot overwrite or remove embeddings produced for a newer publication.
+Exact source-publication replays do not redispatch derived embedding work.
+Revision 35 adds durable receipt storage and is a breaking mixed-worker boundary
+because older workers can perform unsafe identity-based compensation.
+
+`RememberKnowledgePolicy` controls
 the actual stored status, namespace, visibility, required labels, and allowed
 kinds. When `allowed_kinds` is configured, the registered tool instance exposes
 those values as the model-facing `kind` enum while still enforcing them at
@@ -5607,15 +5651,36 @@ approve/reject. The server exposes `GET /api/knowledge/pending` plus
 `POST /api/knowledge/{entry_id}/approve` and `/reject` for that dashboard flow.
 Active writes require `allow_active_writes=True`. The accepted text size is
 configured when the app registers the tool and is not exposed as a
-model-controlled argument. If
-persistence fails after the tool has generated an entry id but the complete
-durable entry and chunks match the intended write, including an embedding hook
-failure in an embedding-backed store, the tool preserves the knowledge and
-returns success with a structured `post_write_error` warning for app/event
-consumers; the model-facing tool content still reports only that the knowledge
-was stored. If the durable entry/chunks are not present or do not match the
-intended write, the tool returns an error and attempts to hard-delete the
-generated entry id.
+model-controlled argument. If persistence acknowledgement fails after the store
+committed a matching receipt, entry, and chunks—including a derived embedding
+hook failure—the tool preserves the knowledge and returns success with a bounded
+structured `post_write_error="publication_acknowledgement_lost"` warning;
+provider or store exception text is not copied into the model-facing result. If
+no matching owned receipt is available, the tool returns a bounded
+ambiguous/conflict error and does not delete any entry or chunks. Caller
+cancellation and the runtime tool deadline stop waiting promptly without
+cancelling an opaque store mutation. The registered tool retains and fences the
+exact in-flight operation until it settles; an identical in-process retry joins
+that operation instead of dispatching another write, and later retries reconcile
+its durable receipt. Caller cancellation stops waiting for read-only receipt and
+entry lookups without treating task cancellation as proof that opaque work
+stopped: Cayu retains and observes the detached lookup in a separate bounded
+registry until it naturally settles. Stored provenance such as the workspace identity is part of
+both the in-flight intent and durable publication identity. Conflicting reuse
+fails closed, and the bounded retained operation set rejects new mutation
+dispatch before capacity can grow without limit while permitting read-only
+receipt reconciliation.
+`remember_knowledge` also disables terminal argument publication. Its raw
+knowledge arguments and stored entry metadata remain in the private
+invocation/store boundary; approval and terminal events, pending-action views,
+policy and hook decisions, and the durable provider-facing tool-call projection
+retain only fixed or bounded operational classifications. Argument-derived
+policy reasons, metadata, hook results, hook diagnostics, and hook actions are
+quarantined rather than treated as safe merely because normal secret redaction
+did not recognize the knowledge content. Approval checkpoints carry required,
+explicit two-state publication authority. Checkpoints without that field fail
+closed as invalid across this prerelease contract boundary; public approval
+events never supply executable checkpoint authority.
 
 Filters are retrieval hints, not an authorization boundary. Production apps
 should attach a store already scoped to the active tenant/user/project, or

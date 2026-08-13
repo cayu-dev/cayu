@@ -1052,6 +1052,7 @@ _PENDING_APPROVAL_FIELD_NAMES = frozenset(
         "metadata",
         "model_attempt_id",
         "model_step_id",
+        "publish_arguments",
         "reason",
         "retry_policy",
         "secret_resolution_scope",
@@ -2442,6 +2443,7 @@ def _quarantine_pre_execution_tool_arguments(
         value.pop("quarantined_assistant_message", None)
         value.pop("assistant_message_state", None)
         value.pop("secret_resolution_scope", None)
+        value.pop("publish_arguments", None)
         value.pop("arguments", None)
         value.pop("effective_arguments", None)
         if had_private_arguments or had_quarantine_marker:

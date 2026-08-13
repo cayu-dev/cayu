@@ -41,6 +41,7 @@ def _call(
             tool_name="deploy",
             arguments={"target": "production"},
             agent_name="assistant",
+            publish_arguments=True,
             tool_calls=calls,
         ),
         lambda calls: PendingUserInput(
@@ -75,6 +76,7 @@ def test_pending_tool_round_state_rejects_duplicate_call_identity(build) -> None
             tool_name="deploy",
             arguments={"target": "production"},
             agent_name="assistant",
+            publish_arguments=True,
             tool_calls=[_call()],
         ),
         lambda: PendingUserInput(
@@ -104,6 +106,7 @@ def test_pending_pause_state_requires_its_gating_call_in_the_round(build) -> Non
             tool_name="rollback",
             arguments={"target": "production"},
             agent_name="assistant",
+            publish_arguments=True,
             tool_calls=[_call()],
         ),
         lambda: PendingUserInput(
@@ -136,6 +139,7 @@ def test_pending_approval_scope_requires_matching_paired_round_evidence() -> Non
         tool_name="deploy",
         arguments={"target": "production"},
         agent_name="assistant",
+        publish_arguments=True,
         secret_resolution_scope="static",
         tool_calls=[_call()],
     )
@@ -158,6 +162,7 @@ def test_approval_closure_policy_output_requires_static_scope() -> None:
         tool_name="deploy",
         arguments={"target": "production"},
         agent_name="assistant",
+        publish_arguments=True,
         secret_resolution_scope="dynamic",
         tool_calls=[_call()],
     )

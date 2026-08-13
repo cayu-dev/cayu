@@ -4,7 +4,15 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002 - Pydantic needs this at runtime.
 
 from cayu._validation import (
@@ -412,6 +420,11 @@ class PendingToolApproval(BaseModel):
     environment_name: str | None = None
     workspace_id: str | None = None
     task_id: str | None = None
+    # Required private checkpoint authority indicating whether any executable
+    # argument or argument-derived policy output may be copied into the public
+    # approval event. Checkpoints without positive two-state evidence are not
+    # executable across this prerelease contract boundary.
+    publish_arguments: SkipJsonSchema[StrictBool]
     secret_resolution_scope: Literal["static", "dynamic", "unknown"] = "unknown"
     reason: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -685,6 +698,9 @@ class PendingToolApprovalEventView(BaseModel):
             "quarantined" if arguments_quarantined else "finalized"
         )
         payload = pending.model_dump(mode="python")
+        # This is private checkpoint authority, not part of the public event
+        # view. The event carries only the resulting argument availability.
+        payload.pop("publish_arguments", None)
         payload.pop("secret_resolution_scope", None)
         payload["arguments_state"] = state
         payload["arguments"] = None if arguments_quarantined else pending.arguments
@@ -715,7 +731,10 @@ def _validated_pending_tool_approval_event(
             "Event payload has no 'approval' object; expected a "
             "tool.call.approval_requested event payload."
         )
-    validation_view, arguments_quarantined = pause_checkpoint_validation_view(approval)
+    validation_view, arguments_quarantined = pause_checkpoint_validation_view(
+        approval,
+        pause_kind="approval",
+    )
     pending = PendingToolApproval.model_validate(validation_view)
     expected = {
         "approval_id": pending.approval_id,
@@ -805,6 +824,7 @@ def copy_pending_tool_approval(approval: PendingToolApproval) -> PendingToolAppr
         environment_name=approval.environment_name,
         workspace_id=approval.workspace_id,
         task_id=approval.task_id,
+        publish_arguments=approval.publish_arguments,
         secret_resolution_scope=approval.secret_resolution_scope,
         reason=approval.reason,
         metadata=copy_durable_json_value(approval.metadata, "metadata"),

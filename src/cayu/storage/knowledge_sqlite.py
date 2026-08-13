@@ -29,21 +29,27 @@ from cayu.storage.memory import (
     KnowledgeListItem,
     KnowledgeListQuery,
     KnowledgeListResult,
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeSearchResult,
     KnowledgeStatus,
     KnowledgeStore,
     KnowledgeVisibility,
+    _knowledge_publication_operation_id,
+    _validate_knowledge_publication_replay,
     copy_knowledge_chunk,
     copy_knowledge_entry,
     copy_knowledge_list_query,
+    copy_knowledge_publication_receipt,
     copy_knowledge_query,
+    prepare_knowledge_publication,
 )
 
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
 _SEARCH_PAGE_SIZE = 500
-_SQLITE_MIN_REQUIRED_REVISION = 18
+_SQLITE_MIN_REQUIRED_REVISION = 35
 
 
 class SQLiteKnowledgeStore(KnowledgeStore):
@@ -295,6 +301,59 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             except Exception:
                 self._connection.rollback()
                 raise
+
+    async def publish_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt:
+        operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
+            entry, chunks, operation_id=operation_id
+        )
+        async with self._lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing_receipt = self._load_publication_receipt_unlocked(operation_id)
+                if existing_receipt is not None:
+                    _validate_knowledge_publication_replay(
+                        existing_receipt,
+                        entry=copied_entry,
+                        request_sha256=request_sha256,
+                    )
+                    self._connection.commit()
+                    return copy_knowledge_publication_receipt(
+                        existing_receipt,
+                        replayed=True,
+                    )
+                if self._load_entry_unlocked(copied_entry.id) is not None:
+                    raise KnowledgePublicationConflict("entry_occupied")
+                receipt = KnowledgePublicationReceipt(
+                    operation_id=operation_id,
+                    entry_id=copied_entry.id,
+                    request_sha256=request_sha256,
+                    entry_created_at=copied_entry.created_at,
+                    entry_updated_at=copied_entry.updated_at,
+                    committed_at=datetime.now(UTC),
+                )
+                self._insert_entry_unlocked(copied_entry)
+                self._insert_chunks_unlocked(copied_entry, copied_chunks)
+                self._insert_publication_receipt_unlocked(receipt)
+                self._connection.commit()
+                return copy_knowledge_publication_receipt(receipt)
+            except Exception:
+                self._connection.rollback()
+                raise
+
+    async def load_entry_publication_receipt(
+        self,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt | None:
+        operation_id = _knowledge_publication_operation_id(operation_id)
+        async with self._lock:
+            receipt = self._load_publication_receipt_unlocked(operation_id)
+        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     async def read_chunks(
         self,
@@ -653,6 +712,38 @@ class SQLiteKnowledgeStore(KnowledgeStore):
         )
         self._replace_entry_lists_unlocked(entry)
 
+    def _insert_entry_unlocked(self, entry: KnowledgeEntry) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_entries (
+                id,
+                namespace,
+                text,
+                kind,
+                visibility,
+                status,
+                created_by_type,
+                created_by,
+                created_at,
+                updated_at,
+                source_type,
+                source_uri,
+                source_id,
+                source_hash,
+                importance,
+                importance_source,
+                confidence,
+                last_used_at,
+                expires_at,
+                title,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            _entry_row_values(entry),
+        )
+        self._replace_entry_lists_unlocked(entry)
+
     def _replace_entry_lists_unlocked(self, entry: KnowledgeEntry) -> None:
         for table in (
             "cayu_knowledge_labels",
@@ -703,6 +794,95 @@ class SQLiteKnowledgeStore(KnowledgeStore):
             [_chunk_row_values(chunk) for chunk in chunks],
         )
         self._refresh_entry_fts_unlocked(entry_id)
+
+    def _insert_chunks_unlocked(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+    ) -> None:
+        self._connection.executemany(
+            """
+            INSERT INTO cayu_knowledge_chunks (
+                id,
+                entry_id,
+                chunk_index,
+                text,
+                content_hash,
+                source_uri,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [_chunk_row_values(chunk) for chunk in chunks],
+        )
+        self._connection.executemany(
+            """
+            INSERT INTO cayu_knowledge_chunks_fts (entry_id, chunk_id, title, text)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (entry.id, chunk.id, entry.title or "", _fts_text_for_entry_chunk(entry, chunk))
+                for chunk in chunks
+            ],
+        )
+
+    def _load_publication_receipt_unlocked(
+        self,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt | None:
+        row = self._connection.execute(
+            """
+            SELECT
+                operation_id,
+                entry_id,
+                request_sha256,
+                entry_created_at,
+                entry_updated_at,
+                committed_at
+            FROM cayu_knowledge_publication_receipts
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return KnowledgePublicationReceipt(
+                operation_id=row["operation_id"],
+                entry_id=row["entry_id"],
+                request_sha256=row["request_sha256"],
+                entry_created_at=sqlite_support.parse_datetime(row["entry_created_at"]),
+                entry_updated_at=sqlite_support.parse_datetime(row["entry_updated_at"]),
+                committed_at=sqlite_support.parse_datetime(row["committed_at"]),
+            )
+        except Exception:
+            raise KnowledgePublicationConflict("malformed_receipt") from None
+
+    def _insert_publication_receipt_unlocked(
+        self,
+        receipt: KnowledgePublicationReceipt,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO cayu_knowledge_publication_receipts (
+                operation_id,
+                entry_id,
+                request_sha256,
+                entry_created_at,
+                entry_updated_at,
+                committed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                receipt.operation_id,
+                receipt.entry_id,
+                receipt.request_sha256,
+                sqlite_support.format_datetime(receipt.entry_created_at),
+                sqlite_support.format_datetime(receipt.entry_updated_at),
+                sqlite_support.format_datetime(receipt.committed_at),
+            ),
+        )
 
     def _delete_chunks_unlocked(self, entry_id: str) -> None:
         self._connection.execute(

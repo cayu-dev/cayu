@@ -45,6 +45,7 @@ _FROZEN_VERSIONLESS_ROOT_CHECKPOINTS = {
             "tool_name": "charge",
             "arguments": {},
             "agent_name": "assistant",
+            "publish_arguments": True,
             "tool_calls": [
                 {
                     "tool_call_id": "call-frozen",

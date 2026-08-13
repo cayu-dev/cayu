@@ -17,6 +17,7 @@ from cayu.core.events import (
 from cayu.core.tools import ToolResult
 from cayu.runtime import _resume_ledger as resume_ledger
 from cayu.runtime import _runtime_records as runtime_records
+from cayu.runtime import _tool_argument_publication as tool_argument_publication
 from cayu.runtime import _tool_results as tool_results
 from cayu.runtime import _tool_round_recovery as tool_round_recovery
 from cayu.runtime._checkpoint_redaction import durable_value_contains_secret
@@ -325,12 +326,22 @@ def bounded_pending_approval_event_payload(
     otherwise turn an audit event into an unbounded storage surface.
     """
 
-    payload = approval.model_dump(mode="json")
+    if type(approval) is not PendingToolApproval:
+        raise TypeError("approval must be a PendingToolApproval.")
+    publish_arguments = approval.publish_arguments is True
+    payload = approval.model_dump(
+        mode="json",
+        exclude={"publish_arguments"},
+        warnings=False,
+    )
     # Secret-scope provenance is private checkpoint evidence, not public
     # approval content.  Only a positively static scope proves that a policy's
     # argument-derived output cannot become a late-resolved workload secret.
     payload.pop("secret_resolution_scope", None)
-    publish_policy_output = approval.secret_resolution_scope == "static"
+    publish_policy_output = approval.secret_resolution_scope == "static" and publish_arguments
+    if not publish_arguments:
+        payload.pop("arguments", None)
+        payload[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
     if not publish_policy_output:
         payload.pop("reason", None)
         payload.pop("metadata", None)
@@ -349,6 +360,9 @@ def bounded_pending_approval_event_payload(
         raw_call = tool_calls[index]
         if type(raw_call) is not dict:
             raise TypeError("Pending approval event tool calls must be objects.")
+        if not publish_arguments:
+            raw_call.pop("arguments", None)
+            raw_call[tool_argument_publication.ARGUMENTS_STATE_FIELD] = "quarantined"
         if not publish_policy_output:
             raw_call.pop("reason", None)
             raw_call.pop("metadata", None)
@@ -403,7 +417,7 @@ def public_pending_approval_reason(
 
     if type(approval) is not PendingToolApproval:
         raise TypeError("approval must be a PendingToolApproval.")
-    if approval.secret_resolution_scope != "static":
+    if approval.publish_arguments is not True or approval.secret_resolution_scope != "static":
         return None
     if tool_call_id is None or tool_call_id == approval.tool_call_id:
         return approval.reason
@@ -417,6 +431,7 @@ def public_policy_denial_result(
     *,
     secret_resolution_scope: Literal["static", "dynamic", "unknown"],
     policy_result: ToolPolicyResult,
+    publish_arguments: bool = True,
 ) -> ToolPolicyResult:
     """Remove argument-derived denial output without positive static evidence."""
 
@@ -424,9 +439,11 @@ def public_policy_denial_result(
         raise ValueError("secret_resolution_scope must be static, dynamic, or unknown.")
     if type(policy_result) is not ToolPolicyResult:
         raise TypeError("policy_result must be a ToolPolicyResult.")
+    if type(publish_arguments) is not bool:
+        raise TypeError("publish_arguments must be a bool.")
     if policy_result.decision is not ToolPolicyDecision.DENY:
         raise ValueError("Public policy result must be a denial.")
-    if secret_resolution_scope == "static":
+    if secret_resolution_scope == "static" and publish_arguments:
         return policy_result.model_copy(deep=True)
     return ToolPolicyResult(decision=ToolPolicyDecision.DENY)
 

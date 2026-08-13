@@ -41,6 +41,7 @@ def _pending_approval(**kwargs) -> PendingToolApproval:
         tool_call_id="call_1",
         tool_name="side_effect",
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
         **kwargs,
     )

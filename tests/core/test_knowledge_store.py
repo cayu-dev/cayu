@@ -9,6 +9,12 @@ from pydantic import ValidationError
 from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
 )
+from tests.core.knowledge_publication_conformance import (
+    assert_concurrent_publication_conformance,
+    assert_owned_publication_conformance,
+    assert_stale_operation_cannot_replace_newer_publication,
+    publication_material,
+)
 
 from cayu._validation import DurableValueError, extract_durable_value_error
 from cayu.embeddings import (
@@ -271,6 +277,21 @@ def test_in_memory_knowledge_store_rejects_out_of_range_chunk_index_atomically()
         assert await store.read_chunks(entry.id) == []
 
     asyncio.run(run())
+
+
+def test_in_memory_knowledge_store_owned_publication_conformance() -> None:
+    async def run() -> None:
+        store = InMemoryKnowledgeStore()
+        await assert_owned_publication_conformance(store)
+        await assert_concurrent_publication_conformance(store)
+        await assert_stale_operation_cannot_replace_newer_publication(store)
+
+    asyncio.run(run())
+
+
+def test_knowledge_store_owned_publication_hooks_are_not_abstract() -> None:
+    assert "publish_entry_with_chunks" not in KnowledgeStore.__abstractmethods__
+    assert "load_entry_publication_receipt" not in KnowledgeStore.__abstractmethods__
 
 
 def test_knowledge_hit_owns_copies() -> None:
@@ -543,6 +564,110 @@ def test_in_memory_embedding_store_prune_expired_drops_embeddings() -> None:
     assert pruned == 1
     assert embeddings_after == 0
     assert entry is None
+
+
+def test_in_memory_owned_publication_does_not_apply_stale_derived_embeddings() -> None:
+    class FirstCallBlockingEmbeddingProvider(TextEmbeddingProvider):
+        name = "blocking-keyword-test"
+
+        def __init__(self) -> None:
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            if self.call_count == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            return TextEmbeddingResult(
+                model=request.model,
+                embeddings=[
+                    TextEmbedding(index=index, vector=_test_embedding_vector(text))
+                    for index, text in enumerate(request.texts)
+                ],
+            )
+
+    async def run():
+        provider = FirstCallBlockingEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        old_entry, old_chunks = publication_material(
+            entry_id="reused_embedding_publication",
+            text="GitHub credential proxy policy.",
+        )
+        old_chunks = [old_chunks[0].model_copy(update={"id": "old-publication-chunk"})]
+        old_task = asyncio.create_task(
+            store.publish_entry_with_chunks(
+                old_entry,
+                old_chunks,
+                operation_id="old-embedding-publication",
+            )
+        )
+        await asyncio.wait_for(provider.first_started.wait(), timeout=2)
+        await store.delete_entry(old_entry.id, hard=True)
+        new_entry, new_chunks = publication_material(
+            entry_id=old_entry.id,
+            text="Invoice payment refund policy.",
+            timestamp_offset=1,
+        )
+        new_chunks = [new_chunks[0].model_copy(update={"id": "new-publication-chunk"})]
+        await store.publish_entry_with_chunks(
+            new_entry,
+            new_chunks,
+            operation_id="new-embedding-publication",
+        )
+        provider.release_first.set()
+        await old_task
+        return dict(store._chunk_embeddings), new_chunks[0]
+
+    embeddings, new_chunk = asyncio.run(run())
+
+    assert "old-publication-chunk" not in embeddings
+    assert embeddings["new-publication-chunk"]["content_hash"] == new_chunk.content_hash
+
+
+def test_in_memory_owned_publication_replay_does_not_repeat_failed_embedding() -> None:
+    class CountingFailingEmbeddingProvider(TextEmbeddingProvider):
+        name = "counting-failing-test"
+
+        def __init__(self) -> None:
+            self.call_count = 0
+
+        async def embed_texts(self, request: TextEmbeddingRequest) -> TextEmbeddingResult:
+            self.call_count += 1
+            raise RuntimeError("embedding provider is unavailable")
+
+    async def run():
+        provider = CountingFailingEmbeddingProvider()
+        store = InMemoryEmbeddingKnowledgeStore(
+            embedding_provider=provider,
+            embedding_model="test-embedding",
+        )
+        entry, chunks = publication_material(
+            entry_id="failed-derived-replay",
+            text="Durable source publication survives derived work failure.",
+        )
+        with pytest.raises(RuntimeError, match="embedding provider is unavailable"):
+            await store.publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id="failed-derived-replay-operation",
+            )
+        receipt = await store.publish_entry_with_chunks(
+            entry,
+            chunks,
+            operation_id="failed-derived-replay-operation",
+        )
+        return provider.call_count, receipt, await store.get_entry(entry.id)
+
+    call_count, receipt, stored_entry = asyncio.run(run())
+
+    assert call_count == 1
+    assert receipt.replayed is True
+    assert stored_entry is not None
 
 
 def test_knowledge_store_prune_expired_is_not_abstract() -> None:

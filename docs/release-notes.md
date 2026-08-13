@@ -138,6 +138,10 @@ supports deploying and operating Cayu Cloud applications.
   post-identity work in its `provision` callback.
 - Provider, approval, budget, usage, vault, and eval evidence is detached from
   caller-owned mutable inputs, and HTTP/retry metadata is validated before use.
+- Model-authored knowledge publication is atomic and operation-owned across the
+  built-in stores; acknowledgement loss is reconciled through immutable receipts
+  and never compensated by deleting a shared deterministic entry identity.
+  Knowledge text is also withheld from terminal tool-event argument projections.
 
 ### Upgrade from v0.1.0
 
@@ -146,12 +150,15 @@ application-consistent backup, and upgrade independently deployed Cayu servers,
 dashboards, generated clients, and workers together. Do not run mixed `v0.1.0`
 and `v0.2.0` processes against the same stores.
 
-The storage schema advances from revision 29 to revision 34. Run
+The storage schema advances from revision 29 to revision 35. Run
 `cayu storage status` followed by `cayu storage migrate` against every
 explicitly configured SQLite or PostgreSQL session store, budget ledger, eval
-store, and task store, then confirm revision 34 with no pending migrations
-before starting `v0.2.0` workers. Revision 34 includes the durable eval catalog,
-run lifecycle, and delayed task availability contracts.
+store, task store, and knowledge store, then confirm revision 35 with no pending
+migrations before starting `v0.2.0` workers. Revisions 34–35 include the durable
+eval catalog, run lifecycle, delayed task availability contract, and immutable
+knowledge-publication receipts. Revision 35 is a breaking mixed-worker boundary:
+stop older workers before migrating because they do not honor operation-owned
+knowledge publication.
 
 ### Verification
 

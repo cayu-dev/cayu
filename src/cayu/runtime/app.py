@@ -3267,6 +3267,7 @@ def _copy_registered_tool(tool: runtime_records.RegisteredTool) -> runtime_recor
         schema=deepcopy(tool.schema),
         parallel_safe=tool.parallel_safe,
         effect=tool.effect,
+        publish_arguments=tool.publish_arguments,
         tool=tool.tool,
         child_session_recovery=tool.child_session_recovery,
     )
@@ -3336,6 +3337,9 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
     schema = copy_json_value(tool.schema, "schema")
     if type(schema) is not dict:
         raise TypeError(f"{type(tool).__name__}.schema must return a JSON Schema object.")
+    publish_arguments = tool._publish_arguments
+    if type(publish_arguments) is not bool:
+        raise TypeError(f"{type(tool).__name__} argument publication policy must be a bool.")
     validated_spec = ToolSpec(
         name=name,
         description=spec.description,
@@ -3349,6 +3353,7 @@ def _validate_registered_tool(tool: Tool) -> runtime_records.RegisteredTool:
         schema=validated_spec.input_schema,
         parallel_safe=validated_spec.parallel_safe,
         effect=validated_spec.effect,
+        publish_arguments=publish_arguments,
         tool=tool,
         child_session_recovery=(
             tool if isinstance(tool, runtime_records.ChildSessionRecoveryMatcher) else None

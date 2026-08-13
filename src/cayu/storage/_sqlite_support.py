@@ -1442,6 +1442,19 @@ _MIGRATION_STEPS: dict[int, str] = {
         CREATE INDEX IF NOT EXISTS idx_cayu_tasks_claim_availability
             ON cayu_tasks(status, session_id, created_at, id, available_at);
     """,
+    35: """
+        CREATE TABLE IF NOT EXISTS cayu_knowledge_publication_receipts (
+            operation_id TEXT PRIMARY KEY,
+            entry_id TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            entry_created_at TEXT NOT NULL,
+            entry_updated_at TEXT NOT NULL,
+            committed_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_cayu_knowledge_publication_receipts_entry
+            ON cayu_knowledge_publication_receipts(entry_id);
+    """,
 }
 
 # Per-revision ``ALTER TABLE ADD COLUMN`` steps, keyed by revision. SQLite has no

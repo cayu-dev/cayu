@@ -720,12 +720,15 @@ async def _receiptless_pause_tail(
             tool_name=assistant_call.tool_name,
             arguments=assistant_call.arguments,
             agent_name="assistant",
+            publish_arguments=True,
             tool_calls=pending_calls,
         )
+        approval_event_payload = pending_pause.model_dump(mode="json")
+        approval_event_payload.pop("publish_arguments")
         interruption_payload = {
             **identity.payload(),
             "interruption_type": "tool_approval_required",
-            "approval": pending_pause.model_dump(mode="json"),
+            "approval": approval_event_payload,
         }
     else:
         pending_pause = PendingUserInput(

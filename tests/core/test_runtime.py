@@ -32461,6 +32461,7 @@ def test_cayu_app_interrupts_session_when_tool_policy_requires_approval():
     checkpoint = asyncio.run(store.load_checkpoint("sess_tool_approval"))
     assert checkpoint is not None
     assert checkpoint["pending_tool_approval"]["approval_id"] == approval["approval_id"]
+    assert checkpoint["pending_tool_approval"]["publish_arguments"] is True
     assert checkpoint["pending_tool_approval"]["arguments"] == {"value": "secret"}
 
     transcript = asyncio.run(store.load_transcript("sess_tool_approval"))
@@ -58287,6 +58288,7 @@ def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
         tool_call_id="call_1",
         tool_name="side_effect",
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
         max_steps=7,
         limits=RunLimits(max_tool_calls=3, scope="session"),
@@ -58305,6 +58307,9 @@ def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
     assert restored.expires_at == pending.expires_at
 
     copied = copy_pending_tool_approval(pending)
+    assert pending.publish_arguments is True
+    assert restored.publish_arguments is True
+    assert copied.publish_arguments is True
     assert copied.max_steps == 7
     assert copied.limits == pending.limits
     assert copied.budget_limits == pending.budget_limits
@@ -58312,7 +58317,7 @@ def test_pending_tool_approval_run_config_round_trips_json_checkpoint():
     assert copied.expires_at == pending.expires_at
 
 
-def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
+def test_pending_tool_approval_loads_checkpoint_without_run_config():
     from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
 
     legacy = PendingToolApproval(
@@ -58321,6 +58326,7 @@ def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
         tool_call_id="call_1",
         tool_name="side_effect",
         agent_name="assistant",
+        publish_arguments=True,
         tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
     )
     payload = legacy.model_dump(mode="json")
@@ -58328,11 +58334,43 @@ def test_pending_tool_approval_loads_legacy_checkpoint_without_run_config():
         payload.pop(key)
 
     restored = PendingToolApproval(**payload)
+    assert restored.publish_arguments is True
     assert restored.max_steps is None
     assert restored.limits is None
     assert restored.budget_limits is None
     assert restored.retry_policy is None
     assert restored.expires_at is None
+
+
+@pytest.mark.parametrize("authority", ["missing", None, 0, 1, "true"])
+def test_pending_tool_approval_rejects_checkpoint_without_explicit_publication_authority(
+    authority: object,
+):
+    from cayu.runtime.approvals import PendingToolApproval, PendingToolCallApproval
+
+    pending = PendingToolApproval(
+        approval_id="appr_missing_publication_authority",
+        **_tool_round_identity().payload(),
+        tool_call_id="call_1",
+        tool_name="side_effect",
+        agent_name="assistant",
+        publish_arguments=True,
+        tool_calls=[PendingToolCallApproval(tool_call_id="call_1", tool_name="side_effect")],
+    )
+    payload = pending.model_dump(mode="json")
+    if authority == "missing":
+        payload.pop("publish_arguments")
+    else:
+        payload["publish_arguments"] = authority
+
+    with pytest.raises(
+        ValueError,
+        match="Pending tool approval checkpoint is invalid and cannot be executed",
+    ):
+        approval_support_module.pending_approval_from_checkpoint(
+            {"pending_tool_approval": payload},
+            redactor=SecretRedactor(),
+        )
 
 
 def _run_config_approval_app() -> tuple[InMemorySessionStore, SideEffectTool, CayuApp]:

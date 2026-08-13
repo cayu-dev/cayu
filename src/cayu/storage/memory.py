@@ -12,6 +12,7 @@ from typing import Any, TypedDict
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_durable_json_object,
     copy_durable_json_value,
     copy_json_value,
@@ -36,6 +37,7 @@ DEFAULT_KNOWLEDGE_LIMIT = 10
 DEFAULT_KNOWLEDGE_MAX_BYTES = 20_000
 MAX_KNOWLEDGE_CHUNK_INDEX = 2**31 - 1
 _SEARCH_TOKEN_RE = re.compile(r"\w+")
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 BUILTIN_KNOWLEDGE_KINDS = (
     "fact",
@@ -717,6 +719,63 @@ class KnowledgeListResult(BaseModel):
         return self
 
 
+class KnowledgePublicationConflict(RuntimeError):
+    """An idempotent knowledge publication conflicts with durable state."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = require_clean_nonblank(reason, "reason")
+        super().__init__("Knowledge publication conflicts with durable state.")
+
+
+class KnowledgePublicationReceipt(BaseModel):
+    """Bounded immutable evidence for one atomic entry-and-chunks publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    operation_id: str = Field(max_length=256)
+    entry_id: str = Field(max_length=256)
+    request_sha256: str
+    entry_created_at: datetime
+    entry_updated_at: datetime
+    committed_at: datetime
+    replayed: bool = False
+
+    @field_validator("operation_id", "entry_id")
+    @classmethod
+    def validate_clean_ids(cls, value: str, info) -> str:
+        value = require_clean_nonblank(value, info.field_name)
+        if len(value.encode("utf-8")) > 256:
+            raise ValueError(f"`{info.field_name}` must be at most 256 UTF-8 bytes.")
+        return value
+
+    @field_validator("request_sha256")
+    @classmethod
+    def validate_request_sha256(cls, value: str) -> str:
+        if type(value) is not str or _SHA256_HEX_RE.fullmatch(value) is None:
+            raise ValueError("`request_sha256` must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("entry_created_at", "entry_updated_at", "committed_at")
+    @classmethod
+    def validate_receipt_datetime(cls, value: datetime, info) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"`{info.field_name}` must be timezone-aware.")
+        return value.astimezone(UTC)
+
+    @field_validator("replayed")
+    @classmethod
+    def validate_replayed(cls, value: bool) -> bool:
+        if type(value) is not bool:
+            raise ValueError("`replayed` must be a boolean.")
+        return value
+
+    @model_validator(mode="after")
+    def validate_entry_timestamp_order(self) -> KnowledgePublicationReceipt:
+        if self.entry_updated_at < self.entry_created_at:
+            raise ValueError("`entry_updated_at` cannot precede `entry_created_at`.")
+        return self
+
+
 class KnowledgeStore(ABC):
     """Searchable knowledge contract."""
 
@@ -776,6 +835,36 @@ class KnowledgeStore(ABC):
     ) -> KnowledgeEntry:
         """Atomically write one entry and its complete chunk set."""
 
+    async def publish_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt:
+        """Create one entry exactly once and retain immutable replay evidence.
+
+        This optional extension hook is non-abstract so existing out-of-tree
+        stores remain importable. Implementations must commit the entry, chunks,
+        and receipt atomically and must never overwrite an occupied entry id.
+        Use :func:`prepare_knowledge_publication` to copy and bind the canonical
+        authority tuple before entering the store transaction.
+        """
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support owned knowledge publication."
+        )
+
+    async def load_entry_publication_receipt(
+        self,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt | None:
+        """Load immutable publication evidence for one operation id."""
+
+        raise NotImplementedError(
+            "This KnowledgeStore does not support knowledge publication receipts."
+        )
+
     @abstractmethod
     async def read_chunks(
         self,
@@ -814,6 +903,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     def __init__(self, entries: list[KnowledgeEntry] | None = None) -> None:
         self._entries: dict[str, KnowledgeEntry] = {}
         self._chunks: dict[str, list[KnowledgeChunk]] = {}
+        self._publication_receipts: dict[str, KnowledgePublicationReceipt] = {}
         if entries:
             for entry in entries:
                 copied = copy_knowledge_entry(entry)
@@ -944,6 +1034,47 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._entries[copied_entry.id] = copied_entry
         self._chunks[copied_entry.id] = copied_chunks
         return copy_knowledge_entry(copied_entry)
+
+    async def publish_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt:
+        operation_id, copied_entry, copied_chunks, request_sha256 = prepare_knowledge_publication(
+            entry, chunks, operation_id=operation_id
+        )
+        existing_receipt = self._publication_receipts.get(operation_id)
+        if existing_receipt is not None:
+            _validate_knowledge_publication_replay(
+                existing_receipt,
+                entry=copied_entry,
+                request_sha256=request_sha256,
+            )
+            return copy_knowledge_publication_receipt(existing_receipt, replayed=True)
+        if copied_entry.id in self._entries:
+            raise KnowledgePublicationConflict("entry_occupied")
+        receipt = KnowledgePublicationReceipt(
+            operation_id=operation_id,
+            entry_id=copied_entry.id,
+            request_sha256=request_sha256,
+            entry_created_at=copied_entry.created_at,
+            entry_updated_at=copied_entry.updated_at,
+            committed_at=datetime.now(UTC),
+        )
+        self._entries[copied_entry.id] = copied_entry
+        self._chunks[copied_entry.id] = copied_chunks
+        self._publication_receipts[operation_id] = receipt
+        return copy_knowledge_publication_receipt(receipt)
+
+    async def load_entry_publication_receipt(
+        self,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt | None:
+        operation_id = _knowledge_publication_operation_id(operation_id)
+        receipt = self._publication_receipts.get(operation_id)
+        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
 
     async def read_chunks(
         self,
@@ -1174,7 +1305,7 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
     ) -> list[KnowledgeChunk]:
         stored_chunks = await super().replace_chunks(entry_id, chunks)
         await self._embed_chunks(stored_chunks)
-        self._drop_stale_entry_embeddings(entry_id, stored_chunks)
+        self._drop_stale_entry_embeddings(entry_id)
         return stored_chunks
 
     async def put_entry_with_chunks(
@@ -1185,8 +1316,27 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         stored = await super().put_entry_with_chunks(entry, chunks)
         stored_chunks = self._chunks.get(stored.id, [])
         await self._embed_chunks(stored_chunks)
-        self._drop_stale_entry_embeddings(stored.id, stored_chunks)
+        self._drop_stale_entry_embeddings(stored.id)
         return stored
+
+    async def publish_entry_with_chunks(
+        self,
+        entry: KnowledgeEntry,
+        chunks: list[KnowledgeChunk],
+        *,
+        operation_id: str,
+    ) -> KnowledgePublicationReceipt:
+        receipt = await super().publish_entry_with_chunks(
+            entry,
+            chunks,
+            operation_id=operation_id,
+        )
+        if receipt.replayed:
+            return receipt
+        stored_chunks = self._chunks.get(receipt.entry_id, [])
+        await self._embed_chunks(stored_chunks)
+        self._drop_stale_entry_embeddings(receipt.entry_id)
+        return receipt
 
     async def search(self, query: KnowledgeQuery) -> KnowledgeSearchResult:
         knowledge_query = copy_knowledge_query(query)
@@ -1308,6 +1458,8 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
             if embedding is None:
                 raise ValueError("Embedding provider did not return every requested index.")
             self._validate_embedding_dimension(embedding.vector)
+            if not self._chunk_is_current(chunk):
+                continue
             self._chunk_embeddings[chunk.id] = {
                 "entry_id": chunk.entry_id,
                 "content_hash": _knowledge_chunk_content_hash(chunk),
@@ -1375,9 +1527,8 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
     def _drop_stale_entry_embeddings(
         self,
         entry_id: str,
-        chunks: list[KnowledgeChunk],
     ) -> None:
-        current_ids = {chunk.id for chunk in chunks}
+        current_ids = {chunk.id for chunk in self._chunks.get(entry_id, [])}
         stale_ids = [
             chunk_id
             for chunk_id, embedding in self._chunk_embeddings.items()
@@ -1385,6 +1536,9 @@ class InMemoryEmbeddingKnowledgeStore(InMemoryKnowledgeStore):
         ]
         for chunk_id in stale_ids:
             self._chunk_embeddings.pop(chunk_id, None)
+
+    def _chunk_is_current(self, chunk: KnowledgeChunk) -> bool:
+        return any(current == chunk for current in self._chunks.get(chunk.entry_id, []))
 
 
 def copy_knowledge_entry(entry: KnowledgeEntry) -> KnowledgeEntry:
@@ -1430,6 +1584,71 @@ def copy_knowledge_chunk(chunk: KnowledgeChunk) -> KnowledgeChunk:
         source_uri=chunk.source_uri,
         metadata=copy_durable_json_object(chunk.metadata, "metadata"),
     )
+
+
+def copy_knowledge_publication_receipt(
+    receipt: KnowledgePublicationReceipt,
+    *,
+    replayed: bool | None = None,
+) -> KnowledgePublicationReceipt:
+    if type(receipt) is not KnowledgePublicationReceipt:
+        raise TypeError("KnowledgePublicationReceipt instances must not be subclasses.")
+    return KnowledgePublicationReceipt(
+        operation_id=receipt.operation_id,
+        entry_id=receipt.entry_id,
+        request_sha256=receipt.request_sha256,
+        entry_created_at=receipt.entry_created_at,
+        entry_updated_at=receipt.entry_updated_at,
+        committed_at=receipt.committed_at,
+        replayed=receipt.replayed if replayed is None else replayed,
+    )
+
+
+def prepare_knowledge_publication(
+    entry: KnowledgeEntry,
+    chunks: list[KnowledgeChunk],
+    *,
+    operation_id: str,
+) -> tuple[str, KnowledgeEntry, list[KnowledgeChunk], str]:
+    """Copy and bind the complete create-only publication authority tuple."""
+
+    clean_operation_id = _knowledge_publication_operation_id(operation_id)
+    copied_entry = copy_knowledge_entry(entry)
+    copied_chunks = _copy_entry_chunks(copied_entry.id, chunks)
+    request_sha256 = sha256(
+        canonical_durable_json_bytes(
+            {
+                "contract": "cayu-knowledge-publication-v1",
+                "entry": copied_entry.model_dump(mode="json"),
+                "chunks": [chunk.model_dump(mode="json") for chunk in copied_chunks],
+            },
+            "knowledge publication",
+        )
+    ).hexdigest()
+    return clean_operation_id, copied_entry, copied_chunks, request_sha256
+
+
+def _knowledge_publication_operation_id(operation_id: str) -> str:
+    clean = require_clean_nonblank(operation_id, "operation_id")
+    if len(clean.encode("utf-8")) > 256:
+        raise ValueError("`operation_id` must be at most 256 UTF-8 bytes.")
+    return clean
+
+
+def _validate_knowledge_publication_replay(
+    receipt: KnowledgePublicationReceipt,
+    *,
+    entry: KnowledgeEntry,
+    request_sha256: str,
+) -> None:
+    receipt = copy_knowledge_publication_receipt(receipt)
+    if (
+        receipt.entry_id != entry.id
+        or receipt.request_sha256 != request_sha256
+        or receipt.entry_created_at != entry.created_at
+        or receipt.entry_updated_at != entry.updated_at
+    ):
+        raise KnowledgePublicationConflict("operation_mismatch")
 
 
 def copy_knowledge_query(query: KnowledgeQuery) -> KnowledgeQuery:

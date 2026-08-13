@@ -214,6 +214,7 @@ async def _seed(store: SessionStore) -> None:
                 "tool_name": "deploy",
                 "arguments": {"environment": "test"},
                 "agent_name": "parity-agent",
+                "publish_arguments": True,
                 "tool_calls": [
                     {
                         "tool_call_id": "call-2",

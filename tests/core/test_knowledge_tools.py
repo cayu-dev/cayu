@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -15,8 +17,12 @@ from cayu import (
     KnowledgeEntry,
     KnowledgeIndexer,
     KnowledgeIndexRequest,
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeStatus,
+    KnowledgeStore,
+    KnowledgeVisibility,
     ListKnowledgeTool,
     ReadKnowledgeTool,
     RememberKnowledgePolicy,
@@ -25,6 +31,7 @@ from cayu import (
     SecretRedactor,
     ToolContext,
     ToolSpec,
+    prepare_knowledge_publication,
 )
 from cayu.core.tools import Tool, ToolEffect, ToolResult
 from cayu.embeddings import (
@@ -36,6 +43,11 @@ from cayu.embeddings import (
 from cayu.environments import copy_environment
 from cayu.runtime._invocation_secrets import InvocationSecretTracker
 from cayu.runtime._tool_execution import run_tool
+from cayu.storage.knowledge_indexer import (
+    content_knowledge_entry_id,
+    knowledge_source_hash,
+)
+from cayu.tools import knowledge as knowledge_module
 from cayu.vaults import ResolvedSecret
 
 
@@ -85,26 +97,33 @@ class FailingEmbeddingProvider(TextEmbeddingProvider):
         raise RuntimeError("embedding service unavailable")
 
 
-class PartialWriteKnowledgeStore(InMemoryKnowledgeStore):
-    async def put_entry_with_chunks(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk],
-    ) -> KnowledgeEntry:
-        if not chunks:
-            raise AssertionError("test requires chunks")
-        await super().put_entry_with_chunks(entry, chunks[:1])
-        raise RuntimeError("partial write failure")
+class AcknowledgementLossKnowledgeStore(InMemoryKnowledgeStore):
+    async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+        await super().publish_entry_with_chunks(
+            entry,
+            chunks,
+            operation_id=operation_id,
+        )
+        raise RuntimeError("secret canary acknowledgement failure")
 
 
-class CorruptingWriteKnowledgeStore(InMemoryKnowledgeStore):
-    async def put_entry_with_chunks(
-        self,
-        entry: KnowledgeEntry,
-        chunks: list[KnowledgeChunk],
-    ) -> KnowledgeEntry:
-        await super().put_entry_with_chunks(entry.model_copy(update={"labels": {}}), chunks)
-        raise RuntimeError("corrupt write failure")
+class CompetingLegacyKnowledgeStore(InMemoryKnowledgeStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.legacy_put_calls = 0
+
+    async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+        raise NotImplementedError
+
+    async def load_entry_publication_receipt(self, operation_id):
+        raise NotImplementedError
+
+    async def put_entry_with_chunks(self, entry, chunks):
+        self.legacy_put_calls += 1
+        return await super().put_entry_with_chunks(entry, chunks)
+
+    async def seed_competing_publication(self, entry, chunks) -> None:
+        await super().put_entry_with_chunks(entry, chunks)
 
 
 def _weighted_embedding_vector(text: str) -> list[float]:
@@ -614,7 +633,7 @@ def test_remember_knowledge_preserves_entry_on_embedding_write_failure() -> None
     result, entry, chunks = asyncio.run(run())
 
     assert result.is_error is False
-    assert result.structured["post_write_error"] == "embedding service unavailable"
+    assert result.structured["post_write_error"] == "publication_acknowledgement_lost"
     assert "embedding service unavailable" not in result.content
     assert "Knowledge stored as pending" in result.content
     assert entry is not None
@@ -622,58 +641,899 @@ def test_remember_knowledge_preserves_entry_on_embedding_write_failure() -> None
     assert len(chunks) == 1
 
 
-def test_remember_knowledge_rejects_partial_write_failure() -> None:
+def test_remember_knowledge_reconciles_acknowledgement_loss_without_exposing_error() -> None:
     async def run():
-        store = PartialWriteKnowledgeStore()
-        result = await RememberKnowledgeTool(chunk_target_bytes=1_000).run(
-            ToolContext(session_id="session_1", knowledge_store=store),
-            {"text": "alpha " * 400},
+        store = AcknowledgementLossKnowledgeStore()
+        ctx = ToolContext(
+            session_id="session_1",
+            idempotency_key="remember-operation-1",
+            knowledge_store=store,
         )
-        assert result.structured is not None
-        entry = await store.get_entry(result.structured["entry_id"])
-        chunks = await store.read_chunks(
-            result.structured["entry_id"],
-            max_chunks=5,
-            max_bytes=20_000,
-        )
-        return result, entry, chunks
+        first = await RememberKnowledgeTool().run(ctx, {"text": "Rotate credentials weekly."})
+        replay = await RememberKnowledgeTool().run(ctx, {"text": "Rotate credentials weekly."})
+        receipt = await store.load_entry_publication_receipt("remember-operation-1")
+        return first, replay, receipt
 
-    result, entry, chunks = asyncio.run(run())
+    first, replay, receipt = asyncio.run(run())
+
+    assert first.is_error is False
+    assert first.structured["post_write_error"] == "publication_acknowledgement_lost"
+    assert "secret canary" not in first.content
+    assert "secret canary" not in repr(first.structured)
+    assert replay.is_error is False
+    assert replay.structured["written"] is False
+    assert replay.structured["already_known"] is None
+    assert replay.structured["publication_replayed"] is True
+    assert replay.structured["status"] is None
+    assert receipt is not None
+
+
+def test_remember_knowledge_never_dispatches_legacy_upsert_over_competing_winner() -> None:
+    async def run():
+        text = "Concurrent publication must survive unsupported legacy writes."
+        source_hash = knowledge_source_hash(text)
+        entry_id = content_knowledge_entry_id(
+            namespace="default",
+            kind="fact",
+            source_hash=source_hash,
+        )
+        store = CompetingLegacyKnowledgeStore()
+        winner = KnowledgeEntry(
+            id=entry_id,
+            text=text,
+            source_hash=source_hash,
+            created_by="concurrent-writer",
+            metadata={"concurrent_owner": True},
+        )
+        winner_chunks = [
+            KnowledgeChunk(
+                id=f"{entry_id}:0",
+                entry_id=entry_id,
+                chunk_index=0,
+                text=text,
+                metadata={"concurrent_owner": True},
+            )
+        ]
+        await store.seed_competing_publication(winner, winner_chunks)
+        result = await RememberKnowledgeTool().run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": text, "title": "A legacy writer must not replace this title."},
+        )
+        entry = await store.get_entry(entry_id)
+        chunks = await store.read_chunks(entry_id)
+        return result, entry, chunks, store.legacy_put_calls
+
+    result, entry, chunks, legacy_put_calls = asyncio.run(run())
 
     assert result.is_error is True
-    assert result.structured["error"] == "knowledge_write_failed"
-    assert result.structured["cleanup"] == "completed"
-    assert "partial write failure" in result.content
-    assert entry is None
-    assert chunks == []
+    assert result.structured == {
+        "error": "knowledge_write_failed",
+        "outcome": "owned_publication_unsupported",
+        "cleanup": "not_attempted_unowned",
+    }
+    assert legacy_put_calls == 0
+    assert entry is not None
+    assert entry.created_by == "concurrent-writer"
+    assert entry.title is None
+    assert entry.metadata["concurrent_owner"] is True
+    assert chunks[0].metadata["concurrent_owner"] is True
 
 
-def test_remember_knowledge_rejects_corrupt_post_write_failure() -> None:
+def test_remember_knowledge_rejects_store_with_only_receipt_lookup_support() -> None:
+    class ReceiptOnlyKnowledgeStore(InMemoryKnowledgeStore):
+        publish_entry_with_chunks = KnowledgeStore.publish_entry_with_chunks
+
     async def run():
-        store = CorruptingWriteKnowledgeStore()
-        result = await RememberKnowledgeTool(
-            policy=RememberKnowledgePolicy(require_labels={"project": "cayu"})
-        ).run(
+        store = ReceiptOnlyKnowledgeStore()
+        result = await RememberKnowledgeTool().run(
             ToolContext(session_id="session_1", knowledge_store=store),
-            {"text": "Sandbox Git pushes use brokered credentials."},
+            {"text": "This must not reach a legacy publication path."},
         )
-        assert result.structured is not None
-        entry = await store.get_entry(result.structured["entry_id"])
-        chunks = await store.read_chunks(
-            result.structured["entry_id"],
-            max_chunks=5,
-            max_bytes=20_000,
+        return result, await store.search(
+            KnowledgeQuery(text="legacy", statuses=[KnowledgeStatus.PENDING])
         )
-        return result, entry, chunks
 
-    result, entry, chunks = asyncio.run(run())
+    result, search = asyncio.run(run())
 
     assert result.is_error is True
-    assert result.structured["error"] == "knowledge_write_failed"
-    assert result.structured["cleanup"] == "completed"
-    assert "corrupt write failure" in result.content
-    assert entry is None
-    assert chunks == []
+    assert result.structured == {
+        "error": "knowledge_write_failed",
+        "outcome": "owned_publication_unsupported",
+        "cleanup": "not_attempted_unowned",
+    }
+    assert search.hits == []
+
+
+def test_remember_knowledge_rejects_invalid_operation_id_before_store_dispatch() -> None:
+    class TrackingKnowledgeStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_reads = 0
+            self.publications = 0
+
+        async def load_entry_publication_receipt(self, operation_id):
+            self.receipt_reads += 1
+            return await super().load_entry_publication_receipt(operation_id)
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publications += 1
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+    async def run():
+        store = TrackingKnowledgeStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="x" * 257,
+                knowledge_store=store,
+            ),
+            {"text": "Invalid operation identity must not reach the store."},
+        )
+        return result, store.receipt_reads, store.publications
+
+    result, receipt_reads, publications = asyncio.run(run())
+
+    assert result.is_error is True
+    assert receipt_reads == 0
+    assert publications == 0
+
+
+def test_remember_knowledge_bounds_store_internal_entry_read_cancellation() -> None:
+    class InternallyCancelledReadStore(InMemoryKnowledgeStore):
+        async def get_entry(self, entry_id):
+            del entry_id
+            raise asyncio.CancelledError("private store cancellation")
+
+    async def run():
+        store = InternallyCancelledReadStore()
+        task = asyncio.create_task(
+            RememberKnowledgeTool().run(
+                ToolContext(
+                    session_id="session_1",
+                    idempotency_key="internally-cancelled-read-operation",
+                    knowledge_store=store,
+                ),
+                {"text": "An internal read cancellation does not cancel the caller."},
+            )
+        )
+        result = await task
+        return result, task.cancelling(), task.cancelled()
+
+    result, cancelling, cancelled = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured["written"] is True
+    assert cancelling == 0
+    assert cancelled is False
+
+
+def test_remember_knowledge_entry_read_preserves_real_caller_cancellation() -> None:
+    class BlockingReadStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.read_started = asyncio.Event()
+            self.release_read = asyncio.Event()
+            self.read_finished = asyncio.Event()
+            self.publish_calls = 0
+
+        async def get_entry(self, entry_id):
+            del entry_id
+            self.read_started.set()
+            try:
+                await self.release_read.wait()
+                return None
+            finally:
+                self.read_finished.set()
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publish_calls += 1
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+    async def run() -> None:
+        store = BlockingReadStore()
+        tool = RememberKnowledgeTool()
+        task = asyncio.create_task(
+            tool.run(
+                ToolContext(
+                    session_id="session_1",
+                    idempotency_key="caller-cancelled-read-operation",
+                    knowledge_store=store,
+                ),
+                {"text": "Caller cancellation stays authoritative."},
+            )
+        )
+        await asyncio.wait_for(store.read_started.wait(), timeout=2)
+        task.cancel("authoritative caller cancellation")
+        with pytest.raises(asyncio.CancelledError, match="authoritative caller cancellation"):
+            await task
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        assert store.publish_calls == 0
+        assert store.read_finished.is_set() is False
+        assert len(tool._read_operations) == 1
+        store.release_read.set()
+        await asyncio.wait_for(store.read_finished.wait(), timeout=1)
+        while tool._read_operations:
+            await asyncio.sleep(0)
+        assert len(tool._read_operations) == 0
+
+    asyncio.run(run())
+
+
+def test_remember_knowledge_cancellation_during_post_commit_confirmation_reconciles() -> None:
+    class ConfirmationBarrierStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.confirmation_started = asyncio.Event()
+            self.release_confirmation = asyncio.Event()
+            self.reconciliation_started = asyncio.Event()
+            self.release_reconciliation = asyncio.Event()
+            self.reconciliation_completed = asyncio.Event()
+
+        async def load_entry_publication_receipt(self, operation_id):
+            receipt = await super().load_entry_publication_receipt(operation_id)
+            if receipt is None:
+                return None
+            if not self.confirmation_started.is_set():
+                self.confirmation_started.set()
+                await self.release_confirmation.wait()
+            self.reconciliation_started.set()
+            await self.release_reconciliation.wait()
+            self.reconciliation_completed.set()
+            return receipt
+
+    async def run() -> None:
+        store = ConfirmationBarrierStore()
+        operation_id = "post-commit-confirmation-cancellation"
+        task = asyncio.create_task(
+            RememberKnowledgeTool().run(
+                ToolContext(
+                    session_id="session_1",
+                    idempotency_key=operation_id,
+                    knowledge_store=store,
+                ),
+                {"text": "Post-commit cancellation still reconciles the receipt."},
+            )
+        )
+        await asyncio.wait_for(store.confirmation_started.wait(), timeout=2)
+        task.cancel("caller cancelled during receipt confirmation")
+        with pytest.raises(
+            asyncio.CancelledError,
+            match="caller cancelled during receipt confirmation",
+        ):
+            await asyncio.wait_for(task, timeout=2)
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        # Cancellation stops waiting but the retained publication remains its
+        # sole owner and finishes receipt reconciliation in the background.
+        store.release_confirmation.set()
+        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=2)
+        store.release_reconciliation.set()
+        await asyncio.wait_for(store.reconciliation_completed.wait(), timeout=2)
+        assert await store.load_entry_publication_receipt(operation_id) is not None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("commit_before_release", [False, True])
+def test_remember_knowledge_cancellation_retains_opaque_dispatch_and_preserves_retry(
+    commit_before_release: bool,
+) -> None:
+    class OpaquePublicationStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dispatched = threading.Event()
+            self.release = threading.Event()
+            self.publish_calls = 0
+            self.retry_receipt_reads = 0
+            self.block_retry_reads = False
+
+        async def load_entry_publication_receipt(self, operation_id):
+            if self.block_retry_reads and self.dispatched.is_set() and not self.release.is_set():
+                self.retry_receipt_reads += 1
+                await asyncio.to_thread(self.release.wait)
+            return await super().load_entry_publication_receipt(operation_id)
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publish_calls += 1
+            if commit_before_release:
+                receipt = await super().publish_entry_with_chunks(
+                    entry,
+                    chunks,
+                    operation_id=operation_id,
+                )
+            await asyncio.to_thread(self._blocking_dispatch)
+            if commit_before_release:
+                return receipt
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+        def _blocking_dispatch(self) -> None:
+            self.dispatched.set()
+            if not self.release.wait(timeout=5):
+                raise RuntimeError("test publication barrier timed out")
+
+    async def run():
+        store = OpaquePublicationStore()
+        ctx = ToolContext(
+            session_id="session_1",
+            idempotency_key="cancelled-remember-operation",
+            knowledge_store=store,
+        )
+        tool = RememberKnowledgeTool()
+        task = asyncio.create_task(tool.run(ctx, {"text": "Committed before caller cancellation."}))
+        assert await asyncio.to_thread(store.dispatched.wait, 2)
+        task.cancel("caller cancelled")
+        with pytest.raises(asyncio.CancelledError, match="caller cancelled"):
+            await asyncio.wait_for(task, timeout=2)
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        early_receipt = await store.load_entry_publication_receipt("cancelled-remember-operation")
+        assert (early_receipt is not None) is commit_before_release
+        store.block_retry_reads = True
+        conflict = await tool.run(
+            ctx,
+            {"text": "Different material cannot reuse the active operation identity."},
+        )
+        assert conflict.is_error is True
+        assert conflict.structured["outcome"] == "operation_conflict"
+        assert store.publish_calls == 1
+        retry = asyncio.create_task(
+            tool.run(ctx, {"text": "Committed before caller cancellation."})
+        )
+        await asyncio.sleep(0)
+        assert retry.done() is False
+        assert store.publish_calls == 1
+        store.release.set()
+        replay = await asyncio.wait_for(retry, timeout=2)
+        receipt = await store.load_entry_publication_receipt("cancelled-remember-operation")
+        return receipt, replay, store.publish_calls, store.retry_receipt_reads
+
+    receipt, replay, publish_calls, retry_receipt_reads = asyncio.run(run())
+
+    assert receipt is not None
+    assert publish_calls == 1
+    assert retry_receipt_reads == 0
+    assert replay.is_error is False
+    assert replay.structured["written"] is True
+    assert replay.structured["already_known"] is False
+    assert "publication_replayed" not in replay.structured
+
+
+def test_remember_knowledge_workspace_identity_is_consistent_across_commit() -> None:
+    class BarrierPublicationStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publish_started = asyncio.Event()
+            self.release_publish = asyncio.Event()
+            self.publish_calls = 0
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publish_calls += 1
+            self.publish_started.set()
+            await self.release_publish.wait()
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+    async def run():
+        store = BarrierPublicationStore()
+        tool = RememberKnowledgeTool()
+        context_a = ToolContext(
+            session_id="session_1",
+            idempotency_key="workspace-authority-operation",
+            workspace_id="workspace-a",
+            knowledge_store=store,
+        )
+        context_b = context_a.model_copy(update={"workspace_id": "workspace-b"})
+        arguments = {"text": "Workspace provenance is publication authority."}
+
+        first = asyncio.create_task(tool.run(context_a, arguments))
+        await asyncio.wait_for(store.publish_started.wait(), timeout=2)
+        in_flight_conflict = await tool.run(context_b, arguments)
+        store.release_publish.set()
+        written = await asyncio.wait_for(first, timeout=2)
+        await asyncio.sleep(0)
+        settled_conflict = await tool.run(context_b, arguments)
+        receipt = await store.load_entry_publication_receipt("workspace-authority-operation")
+        assert receipt is not None
+        entry = await store.get_entry(receipt.entry_id)
+        return written, in_flight_conflict, settled_conflict, entry, store.publish_calls
+
+    written, in_flight_conflict, settled_conflict, entry, publish_calls = asyncio.run(run())
+
+    assert written.is_error is False
+    assert in_flight_conflict.is_error is True
+    assert in_flight_conflict.structured["outcome"] == "operation_conflict"
+    assert settled_conflict.is_error is True
+    assert settled_conflict.structured["outcome"] == "receipt_conflict"
+    assert entry is not None
+    assert entry.metadata["workspace_id"] == "workspace-a"
+    assert publish_calls == 1
+
+
+def test_remember_knowledge_capacity_allows_receipt_reconciliation_but_blocks_new_dispatch(
+    monkeypatch,
+) -> None:
+    class SelectiveBarrierStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.active_started = asyncio.Event()
+            self.release_active = asyncio.Event()
+            self.published_operations: list[str] = []
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.published_operations.append(operation_id)
+            if operation_id == "capacity-active-operation":
+                self.active_started.set()
+                await self.release_active.wait()
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+    async def run():
+        store = SelectiveBarrierStore()
+        replay_context = ToolContext(
+            session_id="session_1",
+            idempotency_key="capacity-replay-operation",
+            workspace_id="workspace-1",
+            knowledge_store=store,
+        )
+        replay_arguments = {"text": "This publication already committed."}
+        seeded = await RememberKnowledgeTool().run(replay_context, replay_arguments)
+        assert seeded.is_error is False
+
+        monkeypatch.setattr(
+            knowledge_module,
+            "MAX_RETAINED_REMEMBER_KNOWLEDGE_PUBLICATIONS",
+            1,
+        )
+        tool = RememberKnowledgeTool()
+        active_context = replay_context.model_copy(
+            update={"idempotency_key": "capacity-active-operation"}
+        )
+        active = asyncio.create_task(
+            tool.run(active_context, {"text": "This publication is still active."})
+        )
+        await asyncio.wait_for(store.active_started.wait(), timeout=2)
+
+        replayed = await tool.run(replay_context, replay_arguments)
+        rejected = await tool.run(
+            replay_context.model_copy(update={"idempotency_key": "capacity-new-operation"}),
+            {"text": "This would require another publication."},
+        )
+        store.release_active.set()
+        active_result = await asyncio.wait_for(active, timeout=2)
+        return replayed, rejected, active_result, store.published_operations
+
+    replayed, rejected, active_result, published_operations = asyncio.run(run())
+
+    assert replayed.is_error is False
+    assert replayed.structured["publication_replayed"] is True
+    assert rejected.is_error is True
+    assert rejected.structured["outcome"] == "publication_capacity_exhausted"
+    assert active_result.is_error is False
+    assert published_operations == [
+        "capacity-replay-operation",
+        "capacity-active-operation",
+    ]
+
+
+def test_remember_knowledge_cancelled_waiters_share_one_retained_publication() -> None:
+    class ReconciliationBarrierStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publish_started = asyncio.Event()
+            self.release_publish = asyncio.Event()
+            self.reconciliation_started = asyncio.Event()
+            self.release_reconciliation = asyncio.Event()
+            self.reconciliation_completed = asyncio.Event()
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publish_started.set()
+            await self.release_publish.wait()
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+        async def load_entry_publication_receipt(self, operation_id):
+            receipt = await super().load_entry_publication_receipt(operation_id)
+            if receipt is not None:
+                self.reconciliation_started.set()
+                await self.release_reconciliation.wait()
+                self.reconciliation_completed.set()
+            return receipt
+
+    async def run() -> None:
+        store = ReconciliationBarrierStore()
+        context = ToolContext(
+            session_id="session_1",
+            idempotency_key="repeated-cancellation-operation",
+            knowledge_store=store,
+        )
+        tool = RememberKnowledgeTool()
+        first = asyncio.create_task(
+            tool.run(
+                context,
+                {"text": "Receipt reconciliation survives repeated caller cancellation."},
+            )
+        )
+        await asyncio.wait_for(store.publish_started.wait(), timeout=2)
+        second = asyncio.create_task(
+            tool.run(
+                context,
+                {"text": "Receipt reconciliation survives repeated caller cancellation."},
+            )
+        )
+        await asyncio.sleep(0)
+        first.cancel("first cancellation")
+        second.cancel("second cancellation")
+        with pytest.raises(asyncio.CancelledError, match="first cancellation"):
+            await asyncio.wait_for(first, timeout=2)
+        with pytest.raises(asyncio.CancelledError, match="second cancellation"):
+            await asyncio.wait_for(second, timeout=2)
+        assert first.cancelling() == 1
+        assert second.cancelling() == 1
+        assert first.cancelled() is True
+        assert second.cancelled() is True
+        store.release_publish.set()
+        await asyncio.wait_for(store.reconciliation_started.wait(), timeout=2)
+        store.release_reconciliation.set()
+        await asyncio.wait_for(store.reconciliation_completed.wait(), timeout=2)
+        receipt = await store.load_entry_publication_receipt("repeated-cancellation-operation")
+        assert receipt is not None
+
+    asyncio.run(run())
+
+
+def test_remember_knowledge_reconciles_grouped_store_failure() -> None:
+    class GroupedFailureStore(InMemoryKnowledgeStore):
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+            raise BaseExceptionGroup(
+                "extension failures",
+                [
+                    asyncio.CancelledError("child cancellation"),
+                    RuntimeError("private grouped failure canary"),
+                ],
+            )
+
+    async def run():
+        store = GroupedFailureStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="grouped-failure-operation",
+                knowledge_store=store,
+            ),
+            {"text": "Grouped extension failures still reconcile committed knowledge."},
+        )
+        receipt = await store.load_entry_publication_receipt("grouped-failure-operation")
+        return result, receipt
+
+    result, receipt = asyncio.run(run())
+
+    assert result.is_error is False
+    assert result.structured["post_write_error"] == "publication_acknowledgement_lost"
+    assert "canary" not in result.content
+    assert "canary" not in repr(result.structured)
+    assert receipt is not None
+
+
+def test_remember_knowledge_keeps_caller_cancellation_authoritative_over_grouped_failure() -> None:
+    class GroupedFailureBarrierStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.committed = asyncio.Event()
+            self.release_failure = asyncio.Event()
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+            self.committed.set()
+            await self.release_failure.wait()
+            raise BaseExceptionGroup(
+                "extension failures",
+                [
+                    asyncio.CancelledError("child cancellation"),
+                    RuntimeError("private grouped cancellation canary"),
+                ],
+            )
+
+    async def run() -> None:
+        store = GroupedFailureBarrierStore()
+        operation_id = "cancelled-grouped-failure-operation"
+        task = asyncio.create_task(
+            RememberKnowledgeTool().run(
+                ToolContext(
+                    session_id="session_1",
+                    idempotency_key=operation_id,
+                    knowledge_store=store,
+                ),
+                {"text": "Caller cancellation remains authoritative after commit."},
+            )
+        )
+        await asyncio.wait_for(store.committed.wait(), timeout=2)
+        task.cancel("authoritative caller cancellation")
+        store.release_failure.set()
+        with pytest.raises(asyncio.CancelledError, match="authoritative caller cancellation"):
+            await task
+        assert task.cancelling() == 1
+        assert task.cancelled() is True
+        assert await store.load_entry_publication_receipt(operation_id) is not None
+
+    asyncio.run(run())
+
+
+def test_remember_knowledge_bounds_grouped_receipt_lookup_failure() -> None:
+    class GroupedReceiptFailureStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publish_calls = 0
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publish_calls += 1
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+        async def load_entry_publication_receipt(self, operation_id):
+            raise BaseExceptionGroup(
+                "receipt failures",
+                [
+                    asyncio.CancelledError("child cancellation"),
+                    RuntimeError("private receipt failure canary"),
+                ],
+            )
+
+    async def run():
+        store = GroupedReceiptFailureStore()
+        result = await RememberKnowledgeTool().run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="grouped-receipt-operation",
+                knowledge_store=store,
+            ),
+            {"text": "Receipt failures remain bounded."},
+        )
+        return result, store.publish_calls
+
+    result, publish_calls = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "knowledge_write_failed",
+        "outcome": "receipt_read_failed",
+        "cleanup": "not_attempted_unowned",
+    }
+    assert "canary" not in result.content
+    assert "canary" not in repr(result.structured)
+    assert publish_calls == 0
+
+
+@pytest.mark.parametrize(
+    "conflicting_arguments",
+    [
+        {"text": "Different knowledge."},
+        {"text": "Original knowledge.", "title": "Different title"},
+    ],
+)
+def test_remember_knowledge_rejects_reused_operation_with_different_content(
+    conflicting_arguments: dict[str, str],
+) -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        ctx = ToolContext(
+            session_id="session_1",
+            idempotency_key="conflicting-remember-operation",
+            knowledge_store=store,
+        )
+        first = await RememberKnowledgeTool().run(ctx, {"text": "Original knowledge."})
+        conflict = await RememberKnowledgeTool().run(ctx, conflicting_arguments)
+        original_id = first.structured["entry"]["entry_id"]
+        return first, conflict, await store.get_entry(original_id)
+
+    first, conflict, original = asyncio.run(run())
+
+    assert first.is_error is False
+    assert conflict.is_error is True
+    assert conflict.structured["outcome"] == "receipt_conflict"
+    assert conflict.structured["cleanup"] == "not_attempted_unowned"
+    assert original is not None
+    assert original.text == "Original knowledge."
+
+
+def test_remember_knowledge_concurrent_exact_operation_reconciles_one_receipt() -> None:
+    class BarrierPublicationStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.arrivals = 0
+            self.ready = asyncio.Event()
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.arrivals += 1
+            if self.arrivals == 2:
+                self.ready.set()
+            await self.ready.wait()
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+    async def run():
+        store = BarrierPublicationStore()
+        ctx = ToolContext(
+            session_id="session_1",
+            idempotency_key="concurrent-exact-operation",
+            knowledge_store=store,
+        )
+        results = await asyncio.gather(
+            RememberKnowledgeTool().run(ctx, {"text": "One exact concurrent operation."}),
+            RememberKnowledgeTool().run(ctx, {"text": "One exact concurrent operation."}),
+        )
+        receipt = await store.load_entry_publication_receipt("concurrent-exact-operation")
+        return results, receipt
+
+    results, receipt = asyncio.run(run())
+
+    assert receipt is not None
+    assert all(result.is_error is False for result in results)
+    assert sorted(result.structured["written"] for result in results) == [False, True]
+    assert sum(result.structured.get("publication_replayed") is True for result in results) == 1
+    assert sum(result.structured["already_known"] is False for result in results) == 1
+    assert sum(result.structured["already_known"] is None for result in results) == 1
+    assert {result.structured["entry"]["entry_id"] for result in results} == {receipt.entry_id}
+
+
+def test_remember_knowledge_concurrent_exact_operation_converges_after_id_collision() -> None:
+    class BarrierPublicationStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.arrivals = 0
+            self.ready = asyncio.Event()
+            self.masked_entry_id: str | None = None
+            self.masked_reads = 0
+
+        async def get_entry(self, entry_id):
+            if entry_id == self.masked_entry_id and self.masked_reads == 0:
+                # Give the two exact deliveries different pre-publication
+                # snapshots: one sees the identity as free while the other sees
+                # the incompatible occupant.
+                self.masked_reads += 1
+                return None
+            return await super().get_entry(entry_id)
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.arrivals += 1
+            if self.arrivals == 2:
+                self.ready.set()
+            await self.ready.wait()
+            return await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+
+    async def run():
+        text = "Exact concurrent operations survive a deterministic-id collision."
+        source_hash = knowledge_source_hash(text)
+        deterministic_id = content_knowledge_entry_id(
+            namespace="default",
+            kind="fact",
+            source_hash=source_hash,
+        )
+        occupant_text = "Unrelated material occupying the content-derived identity."
+        store = BarrierPublicationStore()
+        await store.put_entry(
+            KnowledgeEntry(
+                id=deterministic_id,
+                text=occupant_text,
+                source_hash=knowledge_source_hash(occupant_text),
+                created_by="unrelated-writer",
+            )
+        )
+        store.masked_entry_id = deterministic_id
+        operation_id = "concurrent-collision-operation"
+        context = ToolContext(
+            session_id="session_1",
+            idempotency_key=operation_id,
+            knowledge_store=store,
+        )
+        results = await asyncio.gather(
+            RememberKnowledgeTool().run(context, {"text": text}),
+            RememberKnowledgeTool().run(context, {"text": text}),
+        )
+        receipt = await store.load_entry_publication_receipt(operation_id)
+        occupant = await store.get_entry(deterministic_id)
+        return results, receipt, occupant
+
+    results, receipt, occupant = asyncio.run(run())
+
+    assert receipt is not None
+    assert all(result.is_error is False for result in results)
+    assert {result.structured["entry"]["entry_id"] for result in results} == {receipt.entry_id}
+    assert receipt.entry_id != occupant.id
+    assert occupant.text == "Unrelated material occupying the content-derived identity."
+    assert occupant.created_by == "unrelated-writer"
+
+
+@pytest.mark.parametrize("later_state", ["archived", "deleted", "replaced"])
+def test_remember_knowledge_exact_retry_reports_only_historical_commit(
+    later_state: str,
+) -> None:
+    async def run():
+        store = InMemoryKnowledgeStore()
+        ctx = ToolContext(
+            session_id="session_1",
+            idempotency_key="reviewed-remember-operation",
+            knowledge_store=store,
+        )
+        first = await RememberKnowledgeTool().run(ctx, {"text": "Review this knowledge."})
+        entry_id = first.structured["entry"]["entry_id"]
+        if later_state == "archived":
+            await store.update_entry_status(entry_id, KnowledgeStatus.ARCHIVED)
+        elif later_state == "deleted":
+            await store.delete_entry(entry_id, hard=True)
+        else:
+            await store.delete_entry(entry_id, hard=True)
+            replacement_text = "A different publication now occupies this entry identity."
+            await store.put_entry(
+                KnowledgeEntry(
+                    id=entry_id,
+                    text=replacement_text,
+                    source_hash=knowledge_source_hash(replacement_text),
+                    status=KnowledgeStatus.ACTIVE,
+                )
+            )
+        replay = await RememberKnowledgeTool().run(ctx, {"text": "Review this knowledge."})
+        return first, replay, await store.get_entry(entry_id)
+
+    first, replay, current = asyncio.run(run())
+
+    assert first.is_error is False
+    assert replay.is_error is False
+    assert replay.content.endswith("Its current lifecycle state was not checked.")
+    assert replay.structured["entry"] == {"entry_id": first.structured["entry"]["entry_id"]}
+    assert replay.structured["written"] is False
+    assert replay.structured["already_known"] is None
+    assert replay.structured["publication_replayed"] is True
+    assert replay.structured["status"] is None
+    if later_state == "archived":
+        assert current is not None
+        assert current.status is KnowledgeStatus.ARCHIVED
+    elif later_state == "deleted":
+        assert current is None
+    else:
+        assert current is not None
+        assert current.status is KnowledgeStatus.ACTIVE
+        assert current.text == "A different publication now occupies this entry identity."
 
 
 def test_remember_knowledge_validates_chunk_configuration() -> None:
@@ -1937,10 +2797,13 @@ def test_knowledge_tools_name_missing_store_methods() -> None:
 
     ctx = ToolContext(session_id="session_1", knowledge_store=ReadOnlyStore())
 
-    # Write-path tools still name the write methods a read-only store lacks.
+    # Write-path tools name the owned-publication methods a read-only store lacks.
     with pytest.raises(
         TypeError,
-        match=r"remember_knowledge: get_entry, put_entry_with_chunks, delete_entry",
+        match=(
+            r"remember_knowledge: get_entry, publish_entry_with_chunks, "
+            r"load_entry_publication_receipt"
+        ),
     ):
         asyncio.run(RememberKnowledgeTool().run(ctx, {"text": "fact"}))
 
@@ -2060,6 +2923,264 @@ def test_remember_knowledge_dedupes_identical_text() -> None:
     assert second.structured["source_hash"] == first.structured["source_hash"]
     assert "already known" in second.content
     assert len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    "stored_updates",
+    [
+        {"text": "Different material with a copied source hash."},
+        {"labels": {"tenant": "other"}},
+        {"visibility": KnowledgeVisibility.USER},
+    ],
+)
+def test_remember_knowledge_fails_closed_on_incompatible_existing_material_or_scope(
+    stored_updates: dict[str, Any],
+) -> None:
+    async def run():
+        text = "Policy-scoped knowledge must match before deduplication."
+        source_hash = knowledge_source_hash(text)
+        entry_id = content_knowledge_entry_id(
+            namespace="default",
+            kind="fact",
+            source_hash=source_hash,
+        )
+        store = InMemoryKnowledgeStore()
+        existing = KnowledgeEntry(
+            id=entry_id,
+            text=text,
+            source_hash=source_hash,
+            labels={"tenant": "expected"},
+            visibility=KnowledgeVisibility.GLOBAL,
+            status=KnowledgeStatus.PENDING,
+        ).model_copy(update=stored_updates)
+        existing = KnowledgeEntry.model_validate(existing.model_dump())
+        await store.put_entry(existing)
+        result = await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(require_labels={"tenant": "expected"})
+        ).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": text},
+        )
+        return result, existing, await store.get_entry(entry_id)
+
+    result, existing, stored = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured == {
+        "error": "knowledge_write_failed",
+        "outcome": "publication_conflict",
+        "cleanup": "not_attempted_unowned",
+        "entry_id": existing.id,
+    }
+    assert stored == existing
+
+
+def test_remember_knowledge_rejects_incompatible_concurrent_winner() -> None:
+    class ConcurrentScopedWinnerStore(InMemoryKnowledgeStore):
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            winner = KnowledgeEntry.model_validate(
+                entry.model_copy(update={"labels": {"tenant": "other"}}).model_dump()
+            )
+            await super().put_entry_with_chunks(winner, chunks)
+            raise KnowledgePublicationConflict("entry_occupied")
+
+    async def run():
+        store = ConcurrentScopedWinnerStore()
+        result = await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(require_labels={"tenant": "expected"})
+        ).run(
+            ToolContext(session_id="session_1", knowledge_store=store),
+            {"text": "A concurrent winner must satisfy the active policy scope."},
+        )
+        assert result.structured is not None
+        return result, await store.get_entry(result.structured["entry_id"])
+
+    result, winner = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == "publication_conflict"
+    assert result.structured["cleanup"] == "not_attempted_unowned"
+    assert winner is not None
+    assert winner.labels == {"tenant": "other"}
+
+
+def test_remember_knowledge_uses_one_policy_snapshot_across_publication() -> None:
+    class ConcurrentScopedWinnerStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.publish_started = asyncio.Event()
+            self.release_publish = asyncio.Event()
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            self.publish_started.set()
+            await self.release_publish.wait()
+            winner = KnowledgeEntry.model_validate(
+                entry.model_copy(update={"labels": {"tenant": "other"}}).model_dump()
+            )
+            await super().put_entry_with_chunks(winner, chunks)
+            raise KnowledgePublicationConflict("entry_occupied")
+
+    async def run():
+        caller_policy = RememberKnowledgePolicy(require_labels={"tenant": "expected"})
+        tool = RememberKnowledgeTool(policy=caller_policy)
+        store = ConcurrentScopedWinnerStore()
+        task = asyncio.create_task(
+            tool.run(
+                ToolContext(session_id="session_1", knowledge_store=store),
+                {"text": "Publication authority must remain stable across awaits."},
+            )
+        )
+        await asyncio.wait_for(store.publish_started.wait(), timeout=2)
+        caller_policy.require_labels.clear()
+        caller_policy.require_labels["tenant"] = "other"
+        tool._policy.require_labels.clear()
+        tool._policy.require_labels["tenant"] = "other"
+        store.release_publish.set()
+        result = await task
+        assert result.structured is not None
+        winner = await store.get_entry(result.structured["entry_id"])
+        return result, winner
+
+    result, winner = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == "publication_conflict"
+    assert winner is not None
+    assert winner.labels == {"tenant": "other"}
+
+
+def test_remember_knowledge_revalidates_forged_policy_before_use() -> None:
+    forged = RememberKnowledgePolicy().model_copy(update={"require_labels": {"tenant": 7}})
+
+    with pytest.raises(ValidationError):
+        RememberKnowledgeTool(policy=forged)
+
+
+def test_custom_store_can_use_public_knowledge_publication_canonicalizer() -> None:
+    class PublicCanonicalizerStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self._custom_publication_lock = asyncio.Lock()
+            self._custom_receipts: dict[str, KnowledgePublicationReceipt] = {}
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            operation_id, entry, chunks, request_sha256 = prepare_knowledge_publication(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+            async with self._custom_publication_lock:
+                receipt = self._custom_receipts.get(operation_id)
+                if receipt is not None:
+                    if receipt.entry_id != entry.id or receipt.request_sha256 != request_sha256:
+                        raise KnowledgePublicationConflict("operation_mismatch")
+                    return receipt.model_copy(update={"replayed": True})
+                if await self.get_entry(entry.id) is not None:
+                    raise KnowledgePublicationConflict("entry_occupied")
+                await super().put_entry_with_chunks(entry, chunks)
+                receipt = KnowledgePublicationReceipt(
+                    operation_id=operation_id,
+                    entry_id=entry.id,
+                    request_sha256=request_sha256,
+                    entry_created_at=entry.created_at,
+                    entry_updated_at=entry.updated_at,
+                    committed_at=datetime.now(UTC),
+                )
+                self._custom_receipts[operation_id] = receipt
+                return receipt
+
+        async def load_entry_publication_receipt(self, operation_id):
+            async with self._custom_publication_lock:
+                return self._custom_receipts.get(operation_id)
+
+    async def run():
+        store = PublicCanonicalizerStore()
+        context = ToolContext(
+            session_id="session_1",
+            idempotency_key="custom-canonical-publication",
+            knowledge_store=store,
+        )
+        first = await RememberKnowledgeTool().run(
+            context,
+            {"text": "Custom stores use Cayu's public publication canonicalizer."},
+        )
+        replay = await RememberKnowledgeTool().run(
+            context,
+            {"text": "Custom stores use Cayu's public publication canonicalizer."},
+        )
+        return first, replay
+
+    first, replay = asyncio.run(run())
+
+    assert first.is_error is False
+    assert first.structured is not None
+    assert first.structured["written"] is True
+    assert replay.is_error is False
+    assert replay.structured is not None
+    assert replay.structured["entry"]["entry_id"] == first.structured["entry"]["entry_id"]
+    assert replay.structured["written"] is False
+    assert replay.structured["already_known"] is None
+    assert replay.structured["publication_replayed"] is True
+    assert replay.structured["status"] is None
+
+
+def test_remember_knowledge_does_not_authenticate_custom_store_input_mutation() -> None:
+    class MutatingCanonicalizerStore(InMemoryKnowledgeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self._custom_receipts: dict[str, KnowledgePublicationReceipt] = {}
+
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            entry.labels.clear()
+            entry.labels["tenant"] = "other"
+            entry.metadata["mutated_by_store"] = True
+            chunks[0].metadata["mutated_by_store"] = True
+            operation_id, entry, chunks, request_sha256 = prepare_knowledge_publication(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+            await super().put_entry_with_chunks(entry, chunks)
+            receipt = KnowledgePublicationReceipt(
+                operation_id=operation_id,
+                entry_id=entry.id,
+                request_sha256=request_sha256,
+                entry_created_at=entry.created_at,
+                entry_updated_at=entry.updated_at,
+                committed_at=datetime.now(UTC),
+            )
+            self._custom_receipts[operation_id] = receipt
+            return receipt
+
+        async def load_entry_publication_receipt(self, operation_id):
+            return self._custom_receipts.get(operation_id)
+
+    async def run():
+        store = MutatingCanonicalizerStore()
+        result = await RememberKnowledgeTool(
+            policy=RememberKnowledgePolicy(require_labels={"tenant": "expected"})
+        ).run(
+            ToolContext(
+                session_id="session_1",
+                idempotency_key="mutated-custom-publication",
+                knowledge_store=store,
+            ),
+            {"text": "Custom store mutation cannot redefine publication authority."},
+        )
+        assert result.structured is not None
+        stored_entry = await store.get_entry(result.structured["entry_id"])
+        stored_chunks = await store.read_chunks(result.structured["entry_id"])
+        return result, stored_entry, stored_chunks
+
+    result, stored_entry, stored_chunks = asyncio.run(run())
+
+    assert result.is_error is True
+    assert result.structured["outcome"] == "invalid_publication_result"
+    assert result.structured["cleanup"] == "not_attempted_unowned"
+    assert stored_entry is not None
+    assert stored_entry.labels == {"tenant": "other"}
+    assert stored_entry.metadata["mutated_by_store"] is True
+    assert stored_chunks[0].metadata["mutated_by_store"] is True
 
 
 def test_remember_knowledge_does_not_dedupe_archived_entry() -> None:

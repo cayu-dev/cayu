@@ -641,6 +641,12 @@ class Tool(ABC):
         return self.spec.name
 
     @property
+    def _publish_arguments(self) -> bool:
+        """Whether terminal events may publish redacted invocation arguments."""
+
+        return True
+
+    @property
     def description(self) -> str:
         return self.spec.description
 

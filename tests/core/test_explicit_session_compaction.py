@@ -2843,6 +2843,7 @@ def test_compact_session_replays_legacy_terminal_record_before_later_pending_sta
             tool_call_id="call-safe",
             tool_name="safe-tool",
             agent_name="assistant",
+            publish_arguments=True,
             tool_calls=[
                 PendingToolCallApproval(
                     tool_call_id="call-safe",

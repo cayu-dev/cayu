@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from cayu._exception_groups import exception_group_children
 from cayu._validation import (
+    canonical_durable_json_bytes,
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
@@ -19,6 +24,7 @@ from cayu.storage.knowledge_indexer import (
     KnowledgeIndexer,
     KnowledgeIndexRequest,
     content_knowledge_entry_id,
+    copy_knowledge_index_result,
     knowledge_source_hash,
 )
 from cayu.storage.memory import (
@@ -33,12 +39,23 @@ from cayu.storage.memory import (
     KnowledgeListGroup,
     KnowledgeListItem,
     KnowledgeListQuery,
+    KnowledgePublicationConflict,
+    KnowledgePublicationReceipt,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeStatus,
+    KnowledgeStore,
     KnowledgeVisibility,
+    _knowledge_publication_operation_id,
+    copy_knowledge_entry,
+    copy_knowledge_publication_receipt,
+    prepare_knowledge_publication,
 )
 from cayu.tools._errors import structured_invalid_arguments, tool_argument_validation
+from cayu.tools._operation_boundary import (
+    BoundedInvocationOperationRegistry,
+    await_invocation_operation,
+)
 from cayu.tools._redaction import (
     await_revision_stable_secret_output,
     record_ambiguous_secret_output,
@@ -74,6 +91,8 @@ DEFAULT_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES = 4_000
 MAX_REMEMBER_KNOWLEDGE_CHUNK_TARGET_BYTES = 32 * 1024
 DEFAULT_REMEMBER_KNOWLEDGE_MAX_CHUNKS = 100
 MAX_REMEMBER_KNOWLEDGE_MAX_CHUNKS = 1_000
+MAX_RETAINED_REMEMBER_KNOWLEDGE_PUBLICATIONS = 64
+MAX_RETAINED_REMEMBER_KNOWLEDGE_READS = 64
 # Each knowledge tool only requires the store methods it actually calls, so
 # read-only stores can back the read tools without implementing the write API.
 _SEARCH_KNOWLEDGE_STORE_METHODS = ("search",)
@@ -81,9 +100,8 @@ _LIST_KNOWLEDGE_STORE_METHODS = ("list_entries",)
 _READ_KNOWLEDGE_STORE_METHODS = ("read_chunks",)
 _REMEMBER_KNOWLEDGE_STORE_METHODS = (
     "get_entry",
-    "put_entry_with_chunks",
-    "read_chunks",
-    "delete_entry",
+    "publish_entry_with_chunks",
+    "load_entry_publication_receipt",
 )
 
 
@@ -140,6 +158,30 @@ class RememberKnowledgePolicy(BaseModel):
         if self.allowed_kinds is not None and self.default_kind not in self.allowed_kinds:
             raise ValueError("default_kind must be included in allowed_kinds.")
         return self
+
+
+def _copy_remember_knowledge_policy(
+    policy: RememberKnowledgePolicy | dict[str, Any],
+) -> RememberKnowledgePolicy:
+    """Revalidate and detach application-owned publication authority."""
+
+    if type(policy) is RememberKnowledgePolicy:
+        return RememberKnowledgePolicy(
+            default_status=policy.default_status,
+            allow_active_writes=policy.allow_active_writes,
+            default_namespace=policy.default_namespace,
+            default_visibility=policy.default_visibility,
+            allowed_kinds=policy.allowed_kinds,
+            default_kind=policy.default_kind,
+            default_created_by=policy.default_created_by,
+            # Let the model's field validator perform the defensive copy so
+            # malformed forged instances retain the public ValidationError
+            # contract instead of leaking a helper-level ValueError.
+            require_labels=policy.require_labels,
+        )
+    if type(policy) is not dict:
+        raise TypeError("policy must be a RememberKnowledgePolicy or dictionary.")
+    return RememberKnowledgePolicy.model_validate(policy)
 
 
 class SearchKnowledgeTool(Tool):
@@ -496,9 +538,7 @@ class RememberKnowledgeTool(Tool):
     ) -> None:
         super().__init__(spec=spec)
         self._policy = (
-            RememberKnowledgePolicy()
-            if policy is None
-            else RememberKnowledgePolicy.model_validate(policy)
+            RememberKnowledgePolicy() if policy is None else _copy_remember_knowledge_policy(policy)
         )
         if self._policy.allowed_kinds is not None:
             schema = copy_json_value(self.spec.input_schema, "input_schema")
@@ -529,6 +569,24 @@ class RememberKnowledgeTool(Tool):
             "max_chunks",
             maximum=MAX_REMEMBER_KNOWLEDGE_MAX_CHUNKS,
         )
+        # Opaque stores are not required to abort a dispatched mutation when
+        # their awaiting task is cancelled. Retain those exact operations so a
+        # caller timeout/cancellation can finish without abandoning ownership,
+        # and so an identical retry joins the original mutation instead of
+        # dispatching a competing write.
+        self._owned_publications: dict[str, _OwnedKnowledgePublication] = {}
+        # Read-only receipt and entry lookups may be abandoned after authentic
+        # caller cancellation even when an opaque adapter ignores cancellation.
+        # Retain every dispatched lookup in a bounded registry until it settles.
+        self._read_operations = BoundedInvocationOperationRegistry(
+            max_operations=MAX_RETAINED_REMEMBER_KNOWLEDGE_READS
+        )
+
+    @property
+    def _publish_arguments(self) -> bool:
+        """Keep knowledge material out of terminal audit/transcript projections."""
+
+        return False
 
     @structured_invalid_arguments
     async def run(self, ctx: ToolContext, args: dict) -> ToolResult:
@@ -540,59 +598,142 @@ class RememberKnowledgeTool(Tool):
         if store is None:
             return _missing_knowledge_store_result()
         with tool_argument_validation():
+            policy = _copy_remember_knowledge_policy(self._policy)
             text = _require_arg_string(args, "text")
             if len(text.encode("utf-8")) > self._max_text_bytes:
                 raise ValueError(f"`text` must be at most {self._max_text_bytes} bytes.")
-            kind = _optional_arg_string(args, "kind") or self._policy.default_kind
-            self._validate_kind(kind)
+            kind = _optional_arg_string(args, "kind") or policy.default_kind
+            self._validate_kind(kind, policy=policy)
+            aspects = _optional_string_list(args, "aspects") or []
+            title = _optional_arg_string(args, "title")
             metadata = _remember_metadata(ctx)
         source_hash = knowledge_source_hash(text)
-        entry_id = content_knowledge_entry_id(
-            namespace=self._policy.default_namespace,
-            kind=kind,
-            source_hash=source_hash,
-        )
-        try:
-            existing_entry = await store.get_entry(entry_id)
-        except Exception:
-            # Deduplication is best-effort; fall through to the normal write
-            # path, which has its own failure handling.
-            existing_entry = None
-        if existing_entry is not None:
-            if existing_entry.source_hash == source_hash and _remember_existing_entry_is_live(
-                existing_entry
-            ):
-                return _remember_knowledge_already_known_result(existing_entry)
-            if existing_entry.source_hash == source_hash:
-                replacement_entry = await _remember_live_or_next_replacement_entry(
-                    store,
-                    entry_id=entry_id,
-                    source_hash=source_hash,
+        with tool_argument_validation():
+            operation_id = _knowledge_publication_operation_id(
+                ctx.idempotency_key or f"remember_{uuid4().hex}"
+            )
+            intent_sha256 = _remember_request_intent_sha256(
+                text=text,
+                namespace=policy.default_namespace,
+                labels=policy.require_labels,
+                kind=kind,
+                visibility=policy.default_visibility,
+                status=policy.default_status,
+                created_by=ctx.agent_name or policy.default_created_by,
+                session_id=ctx.session_id,
+                aspects=aspects,
+                title=title,
+                metadata=metadata,
+                chunk_target_bytes=self._chunk_target_bytes,
+                max_chunks=self._max_chunks,
+            )
+        owned = self._owned_publications.get(operation_id)
+        if owned is not None:
+            if owned.intent_sha256 != intent_sha256:
+                return _knowledge_write_failed_result(
+                    entry_id=None,
+                    outcome="operation_conflict",
                 )
-                if isinstance(replacement_entry, KnowledgeEntry):
-                    return _remember_knowledge_already_known_result(replacement_entry)
-                entry_id = replacement_entry
-            elif existing_entry.source_hash != source_hash:
-                # A different payload occupies the content-derived id (for
-                # example a truncated-hash collision); write under a unique id
-                # instead of overwriting the existing entry.
-                entry_id = f"knowledge_{uuid4().hex}"
+            return await asyncio.shield(owned.task)
+        if not _remember_store_supports_owned_publication(store):
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="owned_publication_unsupported",
+            )
+        try:
+            prior_receipt = await _remember_load_publication_receipt(
+                store,
+                operation_id,
+                operation_registry=self._read_operations,
+            )
+        except NotImplementedError:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="owned_publication_unsupported",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="receipt_read_failed",
+            )
+        entry_id = (
+            prior_receipt.entry_id
+            if prior_receipt is not None
+            else content_knowledge_entry_id(
+                namespace=policy.default_namespace,
+                kind=kind,
+                source_hash=source_hash,
+            )
+        )
+        if prior_receipt is None:
+            # Deduplication is best-effort, but the extension read still needs
+            # an owned task boundary so store-originated cancellation cannot
+            # impersonate cancellation of this run.
+            existing_entry = await _remember_load_entry(
+                store,
+                entry_id,
+                operation_registry=self._read_operations,
+            )
+            if existing_entry is not None:
+                if _remember_entry_matches_material_and_scope(
+                    existing_entry,
+                    expected_entry_id=entry_id,
+                    text=text,
+                    source_hash=source_hash,
+                    namespace=policy.default_namespace,
+                    kind=kind,
+                    visibility=policy.default_visibility,
+                    required_labels=policy.require_labels,
+                ):
+                    if _remember_existing_entry_is_live(existing_entry):
+                        return _remember_knowledge_already_known_result(existing_entry)
+                    replacement_entry = await _remember_live_or_next_replacement_entry(
+                        store,
+                        entry_id=entry_id,
+                        operation_id=operation_id,
+                        text=text,
+                        source_hash=source_hash,
+                        namespace=policy.default_namespace,
+                        kind=kind,
+                        visibility=policy.default_visibility,
+                        required_labels=policy.require_labels,
+                        operation_registry=self._read_operations,
+                    )
+                    if isinstance(replacement_entry, KnowledgeEntry):
+                        return _remember_knowledge_already_known_result(replacement_entry)
+                    entry_id = replacement_entry
+                elif existing_entry.source_hash == source_hash:
+                    return _knowledge_write_failed_result(
+                        entry_id=entry_id,
+                        outcome="publication_conflict",
+                    )
+                elif existing_entry.source_hash != source_hash:
+                    # A different payload occupies the content-derived id (for
+                    # example a truncated-hash collision). Use an operation-bound
+                    # fallback so concurrent delivery of one exact operation
+                    # converges instead of choosing independent random identities.
+                    entry_id = _remember_operation_fallback_entry_id(
+                        entry_id,
+                        operation_id,
+                    )
         with tool_argument_validation():
             request = KnowledgeIndexRequest(
                 text=text,
                 entry_id=entry_id,
-                namespace=self._policy.default_namespace,
-                labels=self._policy.require_labels,
+                namespace=policy.default_namespace,
+                labels=policy.require_labels,
                 kind=kind,
-                visibility=self._policy.default_visibility,
-                status=self._policy.default_status,
+                visibility=policy.default_visibility,
+                status=policy.default_status,
                 created_by_type=KnowledgeActorType.MODEL,
-                created_by=ctx.agent_name or self._policy.default_created_by,
+                created_by=ctx.agent_name or policy.default_created_by,
                 source_type="tool",
                 source_uri=f"cayu://sessions/{ctx.session_id}",
                 source_id=ctx.session_id,
-                aspects=_optional_string_list(args, "aspects") or [],
-                title=_optional_arg_string(args, "title"),
+                aspects=aspects,
+                title=title,
                 metadata=metadata,
                 chunk_metadata=metadata,
                 chunk_target_bytes=self._chunk_target_bytes,
@@ -602,45 +743,673 @@ class RememberKnowledgeTool(Tool):
             result = KnowledgeIndexer().build(request)
             if result.truncated:
                 raise ValueError("`text` exceeds the configured remember_knowledge chunk capacity.")
-        try:
-            stored_entry = await store.put_entry_with_chunks(result.entry, result.chunks)
-        except Exception as exc:
-            inspection_error = None
-            try:
-                stored_entry = await store.get_entry(result.entry.id)
-                stored_chunks = await store.read_chunks(
-                    result.entry.id,
-                    max_chunks=len(result.chunks) + 1,
-                    max_bytes=_remember_chunk_read_max_bytes(result.chunks),
-                )
-            except Exception as inspect_exc:
-                stored_entry = None
-                stored_chunks = []
-                inspection_error = str(inspect_exc)
-            if not _remember_write_matches(result, stored_entry, stored_chunks):
-                cleanup_error = None
-                try:
-                    await store.delete_entry(result.entry.id, hard=True)
-                except Exception as cleanup_exc:
-                    cleanup_error = str(cleanup_exc)
+        if prior_receipt is not None:
+            result = _remember_result_with_receipt_identity(result, prior_receipt)
+            if not await _remember_confirm_owned_publication(
+                store,
+                result=result,
+                operation_id=operation_id,
+                receipt=prior_receipt,
+                operation_registry=self._read_operations,
+            ):
                 return _knowledge_write_failed_result(
-                    exc,
-                    entry_id=result.entry.id,
-                    cleanup_error=cleanup_error,
-                    inspection_error=inspection_error,
+                    # The receipt is extension-owned and has not authenticated
+                    # its identity against the requested publication. Keep its
+                    # entry id out of model-visible failure evidence.
+                    entry_id=None,
+                    outcome="receipt_conflict",
                 )
-            result = result.model_copy(update={"entry": stored_entry, "written": True})
-            return _remember_knowledge_success_result(
-                result,
-                post_write_error=str(exc),
-            )
-        result = result.model_copy(update={"entry": stored_entry, "written": True})
-        return _remember_knowledge_success_result(result)
+            return _remember_knowledge_replayed_result(result)
 
-    def _validate_kind(self, kind: str) -> None:
-        if self._policy.allowed_kinds is not None and kind not in self._policy.allowed_kinds:
-            allowed = ", ".join(self._policy.allowed_kinds)
+        return await self._await_owned_publication(
+            store=store,
+            result=result,
+            operation_id=operation_id,
+            source_hash=source_hash,
+            namespace=policy.default_namespace,
+            kind=kind,
+            visibility=policy.default_visibility,
+            required_labels=policy.require_labels,
+            intent_sha256=intent_sha256,
+        )
+
+    async def _await_owned_publication(
+        self,
+        *,
+        store: Any,
+        result: Any,
+        operation_id: str,
+        source_hash: str,
+        namespace: str,
+        kind: str,
+        visibility: KnowledgeVisibility,
+        required_labels: dict[str, str],
+        intent_sha256: str,
+    ) -> ToolResult:
+        owned = self._owned_publications.get(operation_id)
+        if owned is not None and owned.intent_sha256 != intent_sha256:
+            return _knowledge_write_failed_result(
+                entry_id=None,
+                outcome="operation_conflict",
+            )
+        if owned is None:
+            if len(self._owned_publications) >= MAX_RETAINED_REMEMBER_KNOWLEDGE_PUBLICATIONS:
+                return _knowledge_write_failed_result(
+                    entry_id=None,
+                    outcome="publication_capacity_exhausted",
+                )
+            task = asyncio.create_task(
+                _remember_publish_owned(
+                    store,
+                    result=result,
+                    operation_id=operation_id,
+                    source_hash=source_hash,
+                    namespace=namespace,
+                    kind=kind,
+                    visibility=visibility,
+                    required_labels=required_labels,
+                    operation_registry=self._read_operations,
+                )
+            )
+            owned = _OwnedKnowledgePublication(
+                intent_sha256=intent_sha256,
+                task=task,
+            )
+            self._owned_publications[operation_id] = owned
+            task.add_done_callback(
+                lambda completed, operation_id=operation_id, owned=owned: (
+                    self._release_owned_publication(
+                        operation_id,
+                        owned,
+                        completed,
+                    )
+                )
+            )
+        # Shield only the retained task. The invoking task remains normally
+        # cancellable, while the exact store operation keeps one owner until it
+        # settles and consumes its result through the completion callback.
+        return await asyncio.shield(owned.task)
+
+    def _release_owned_publication(
+        self,
+        operation_id: str,
+        owned: _OwnedKnowledgePublication,
+        completed: asyncio.Task[ToolResult],
+    ) -> None:
+        if self._owned_publications.get(operation_id) is owned:
+            self._owned_publications.pop(operation_id, None)
+        # An invocation may have timed out or been cancelled. Always observe a
+        # detached task's terminal state so extension failures do not become
+        # unhandled event-loop diagnostics.
+        if not completed.cancelled():
+            completed.exception()
+
+    def _validate_kind(self, kind: str, *, policy: RememberKnowledgePolicy) -> None:
+        if policy.allowed_kinds is not None and kind not in policy.allowed_kinds:
+            allowed = ", ".join(policy.allowed_kinds)
             raise ValueError(f"`kind` must be one of: {allowed}.")
+
+
+@dataclass(frozen=True)
+class _OwnedKnowledgePublication:
+    intent_sha256: str
+    task: asyncio.Task[ToolResult]
+
+
+def _remember_request_intent_sha256(
+    *,
+    text: str,
+    namespace: str,
+    labels: dict[str, str],
+    kind: str,
+    visibility: KnowledgeVisibility,
+    status: KnowledgeStatus,
+    created_by: str,
+    session_id: str,
+    aspects: list[str],
+    title: str | None,
+    metadata: dict[str, Any],
+    chunk_target_bytes: int,
+    max_chunks: int,
+) -> str:
+    """Fingerprint caller authority before any retry-side store operation."""
+
+    material = {
+        "contract": "cayu.remember_knowledge.request_intent.v1",
+        "text": text,
+        "namespace": namespace,
+        "labels": labels,
+        "kind": kind,
+        "visibility": visibility.value,
+        "status": status.value,
+        "created_by_type": KnowledgeActorType.MODEL.value,
+        "created_by": created_by,
+        "source_type": "tool",
+        "source_uri": f"cayu://sessions/{session_id}",
+        "source_id": session_id,
+        "aspects": aspects,
+        "title": title,
+        "metadata": metadata,
+        "chunk_metadata": metadata,
+        "chunk_target_bytes": chunk_target_bytes,
+        "max_chunks": max_chunks,
+    }
+    return sha256(
+        canonical_durable_json_bytes(material, "remember knowledge publication intent")
+    ).hexdigest()
+
+
+async def _remember_load_publication_receipt(
+    store: Any,
+    operation_id: str,
+    *,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> KnowledgePublicationReceipt | None:
+    async def operation_factory(
+        store: Any = store,
+        operation_id: str = operation_id,
+    ) -> KnowledgePublicationReceipt | None:
+        receipt = await store.load_entry_publication_receipt(operation_id)
+        return None if receipt is None else copy_knowledge_publication_receipt(receipt)
+
+    pending = await_invocation_operation(
+        operation_factory,
+        request_child_cancellation=False,
+        abandon_on_caller_cancellation=True,
+        operation_registry=operation_registry,
+    )
+    del operation_factory
+    outcome = await pending
+    del pending
+    uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
+    if uncontainable_failure is not None:
+        raise uncontainable_failure
+    if outcome.cancellation is not None:
+        cause = _remember_cancellation_cause(outcome.error, settled=False)
+        raise outcome.cancellation from cause
+    if isinstance(outcome.error, asyncio.CancelledError):
+        raise RuntimeError(
+            "Knowledge receipt lookup was cancelled without caller cancellation."
+        ) from None
+    if isinstance(outcome.error, BaseExceptionGroup):
+        raise RuntimeError("Knowledge receipt lookup reported multiple failures.") from None
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.result
+
+
+async def _remember_load_entry(
+    store: Any,
+    entry_id: str,
+    *,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> KnowledgeEntry | None:
+    """Load one entry without trusting extension-owned cancellation or output."""
+
+    async def operation_factory(
+        store: Any = store,
+        entry_id: str = entry_id,
+    ) -> KnowledgeEntry | None:
+        entry = await store.get_entry(entry_id)
+        return None if entry is None else copy_knowledge_entry(entry)
+
+    pending = await_invocation_operation(
+        operation_factory,
+        request_child_cancellation=False,
+        abandon_on_caller_cancellation=True,
+        operation_registry=operation_registry,
+    )
+    del operation_factory
+    outcome = await pending
+    del pending
+    uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
+    if uncontainable_failure is not None:
+        raise uncontainable_failure
+    if outcome.cancellation is not None:
+        raise outcome.cancellation from None
+    if outcome.error is not None or outcome.result is None:
+        # These reads only optimize deduplication and conflict recovery. A
+        # bounded extension failure must not abort or redefine publication.
+        return None
+    return outcome.result
+
+
+def _remember_store_supports_owned_publication(store: Any) -> bool:
+    store_type = type(store)
+    return (
+        getattr(store_type, "publish_entry_with_chunks", None)
+        is not KnowledgeStore.publish_entry_with_chunks
+        and getattr(store_type, "load_entry_publication_receipt", None)
+        is not KnowledgeStore.load_entry_publication_receipt
+    )
+
+
+def _remember_publication_conflict(
+    failure: BaseException | None,
+) -> tuple[bool, str | None]:
+    """Detach bounded conflict evidence from an extension-owned exception."""
+
+    # Subclasses can override attribute access. Exact-type admission plus
+    # object-level state lookup prevents extension code from running while the
+    # runtime classifies the failure.
+    if type(failure) is not KnowledgePublicationConflict:
+        return False, None
+    try:
+        state = object.__getattribute__(failure, "__dict__")
+    except BaseException:
+        return False, None
+    if type(state) is not dict:
+        return False, None
+    reason = state.get("reason")
+    if type(reason) is not str:
+        return False, None
+    try:
+        reason = require_clean_nonblank(reason, "reason")
+    except (TypeError, ValueError):
+        return False, None
+    return True, reason
+
+
+async def _remember_publish_owned(
+    store: Any,
+    *,
+    result: Any,
+    operation_id: str,
+    source_hash: str,
+    namespace: str,
+    kind: str,
+    visibility: KnowledgeVisibility,
+    required_labels: dict[str, str],
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> ToolResult:
+    # Keep reconciliation authority detached from mutable objects handed to an
+    # extension store. The public store hook receives its own normalized copies,
+    # so in-place adapter normalization cannot redefine the operation Cayu later
+    # authenticates from the receipt.
+    result = copy_knowledge_index_result(result)
+    _, publication_entry, publication_chunks, _ = prepare_knowledge_publication(
+        result.entry,
+        result.chunks,
+        operation_id=operation_id,
+    )
+
+    async def operation_factory(
+        store: Any = store,
+        entry: KnowledgeEntry = publication_entry,
+        chunks: list[KnowledgeChunk] = publication_chunks,
+        operation_id: str = operation_id,
+    ) -> KnowledgePublicationReceipt:
+        return copy_knowledge_publication_receipt(
+            await store.publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+        )
+
+    pending = await_invocation_operation(
+        operation_factory,
+        request_child_cancellation=False,
+    )
+    del operation_factory
+    outcome = await pending
+    del pending
+    uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
+    if uncontainable_failure is not None:
+        raise uncontainable_failure
+    if outcome.cancellation is not None:
+        settled, cancellation = await _remember_confirm_owned_publication_after_cancellation(
+            store,
+            result=result,
+            operation_id=operation_id,
+            cancellation=outcome.cancellation,
+            operation_registry=operation_registry,
+        )
+        cause = _remember_cancellation_cause(outcome.error, settled=settled)
+        raise cancellation from cause
+
+    failure = (
+        RuntimeError("Knowledge publication reported multiple failures.")
+        if isinstance(outcome.error, BaseExceptionGroup)
+        else outcome.error
+    )
+    failure_is_conflict, conflict_reason = _remember_publication_conflict(failure)
+    returned_receipt: KnowledgePublicationReceipt | None = None
+    if failure is None:
+        try:
+            if not isinstance(outcome.result, KnowledgePublicationReceipt):
+                raise TypeError("Publication result is not a knowledge receipt.")
+            returned_receipt = copy_knowledge_publication_receipt(outcome.result)
+        except (TypeError, ValueError):
+            failure = RuntimeError("Knowledge store returned an invalid publication receipt.")
+    operation_receipt_present = False
+    try:
+        confirmed = await _remember_confirm_owned_publication(
+            store,
+            result=result,
+            operation_id=operation_id,
+            receipt=returned_receipt,
+            operation_registry=operation_registry,
+        )
+        if not confirmed:
+            try:
+                durable_receipt = await _remember_load_publication_receipt(
+                    store,
+                    operation_id,
+                    operation_registry=operation_registry,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                durable_receipt = None
+            if durable_receipt is not None:
+                operation_receipt_present = True
+                reconciled_result = _remember_result_with_receipt_identity(
+                    result,
+                    durable_receipt,
+                )
+                confirmed = await _remember_confirm_owned_publication(
+                    store,
+                    result=reconciled_result,
+                    operation_id=operation_id,
+                    receipt=durable_receipt,
+                    operation_registry=operation_registry,
+                )
+                if confirmed:
+                    result = reconciled_result
+    except asyncio.CancelledError as cancellation:
+        (
+            settled,
+            retained_cancellation,
+        ) = await _remember_confirm_owned_publication_after_cancellation(
+            store,
+            result=result,
+            operation_id=operation_id,
+            cancellation=cancellation,
+            operation_registry=operation_registry,
+        )
+        cause = _remember_cancellation_cause(failure, settled=settled)
+        raise retained_cancellation from cause
+    if confirmed:
+        replayed_publication = (returned_receipt is not None and returned_receipt.replayed) or (
+            failure_is_conflict and conflict_reason == "operation_mismatch"
+        )
+        if replayed_publication:
+            return _remember_knowledge_replayed_result(result)
+        return _remember_knowledge_success_result(
+            result.model_copy(update={"written": True}),
+            post_write_error=(
+                None
+                if failure is None or failure_is_conflict
+                else "publication_acknowledgement_lost"
+            ),
+        )
+    if failure_is_conflict and operation_receipt_present:
+        outcome_code = "operation_conflict"
+    elif failure_is_conflict and conflict_reason in {
+        "entry_occupied",
+        "concurrent_occupancy",
+    }:
+        winner = await _remember_live_matching_entry(
+            store,
+            entry_id=result.entry.id,
+            text=result.entry.text,
+            source_hash=source_hash,
+            namespace=namespace,
+            kind=kind,
+            visibility=visibility,
+            required_labels=required_labels,
+            operation_registry=operation_registry,
+        )
+        if winner is not None:
+            return _remember_knowledge_already_known_result(winner)
+        outcome_code = "publication_conflict"
+    elif failure_is_conflict:
+        outcome_code = "publication_conflict"
+    elif isinstance(failure, asyncio.CancelledError):
+        outcome_code = "store_cancelled"
+    elif failure is None:
+        outcome_code = "invalid_publication_result"
+    else:
+        outcome_code = "ambiguous_publication"
+    return _knowledge_write_failed_result(
+        entry_id=result.entry.id,
+        outcome=outcome_code,
+    )
+
+
+async def _remember_confirm_owned_publication(
+    store: Any,
+    *,
+    result: Any,
+    operation_id: str,
+    receipt: KnowledgePublicationReceipt | None = None,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> bool:
+    try:
+        durable_receipt = await _remember_load_publication_receipt(
+            store,
+            operation_id,
+            operation_registry=operation_registry,
+        )
+        if durable_receipt is None:
+            return False
+        if receipt is not None and _remember_receipt_identity(
+            receipt
+        ) != _remember_receipt_identity(durable_receipt):
+            return False
+        _, expected_entry, _, request_sha256 = prepare_knowledge_publication(
+            result.entry,
+            result.chunks,
+            operation_id=operation_id,
+        )
+        return (
+            durable_receipt.operation_id == operation_id
+            and durable_receipt.entry_id == expected_entry.id
+            and durable_receipt.request_sha256 == request_sha256
+            and durable_receipt.entry_created_at == expected_entry.created_at
+            and durable_receipt.entry_updated_at == expected_entry.updated_at
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+async def _remember_confirm_owned_publication_after_cancellation(
+    store: Any,
+    *,
+    result: Any,
+    operation_id: str,
+    cancellation: asyncio.CancelledError,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> tuple[bool, asyncio.CancelledError]:
+    """Finish receipt reconciliation while retaining the first caller signal."""
+
+    def operation_factory(
+        store: Any = store,
+        result: Any = result,
+        operation_id: str = operation_id,
+    ):
+        return _remember_reconcile_owned_publication(
+            store,
+            result=result,
+            operation_id=operation_id,
+            operation_registry=operation_registry,
+        )
+
+    pending = await_invocation_operation(
+        operation_factory,
+        request_child_cancellation=False,
+        cancellation=cancellation,
+    )
+    del operation_factory
+    outcome = await pending
+    del pending
+    uncontainable_failure = _remember_uncontainable_store_failure(outcome.error)
+    if uncontainable_failure is not None:
+        raise uncontainable_failure
+    retained_cancellation = outcome.cancellation or cancellation
+    if outcome.error is not None or type(outcome.result) is not bool:
+        return False, retained_cancellation
+    return outcome.result, retained_cancellation
+
+
+async def _remember_reconcile_owned_publication(
+    store: Any,
+    *,
+    result: Any,
+    operation_id: str,
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> bool:
+    """Confirm current or receipt-reconstructed publication authority."""
+
+    if await _remember_confirm_owned_publication(
+        store,
+        result=result,
+        operation_id=operation_id,
+        operation_registry=operation_registry,
+    ):
+        return True
+    try:
+        durable_receipt = await _remember_load_publication_receipt(
+            store,
+            operation_id,
+            operation_registry=operation_registry,
+        )
+        if durable_receipt is None:
+            return False
+        reconciled_result = _remember_result_with_receipt_identity(result, durable_receipt)
+        return await _remember_confirm_owned_publication(
+            store,
+            result=reconciled_result,
+            operation_id=operation_id,
+            receipt=durable_receipt,
+            operation_registry=operation_registry,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+
+
+def _remember_uncontainable_store_failure(
+    error: BaseException | None,
+) -> BaseException | None:
+    """Return a fatal/unclassifiable extension signal, if one is present."""
+
+    if error is None:
+        return None
+    pending = [error]
+    visited: set[int] = set()
+    while pending:
+        candidate = pending.pop()
+        if id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(candidate, (GeneratorExit, KeyboardInterrupt, SystemExit)):
+            return error
+        if isinstance(candidate, BaseExceptionGroup):
+            children = exception_group_children(candidate)
+            if children is None:
+                return error
+            pending.extend(children)
+        elif not isinstance(candidate, Exception | asyncio.CancelledError):
+            return error
+    return None
+
+
+def _remember_receipt_identity(receipt: KnowledgePublicationReceipt) -> tuple[object, ...]:
+    copied = copy_knowledge_publication_receipt(receipt)
+    return (
+        copied.operation_id,
+        copied.entry_id,
+        copied.request_sha256,
+        copied.entry_created_at,
+        copied.entry_updated_at,
+        copied.committed_at,
+    )
+
+
+def _remember_result_with_receipt_identity(
+    result: Any,
+    receipt: KnowledgePublicationReceipt,
+) -> Any:
+    replay_entry = copy_knowledge_entry(
+        result.entry.model_copy(
+            update={
+                "id": receipt.entry_id,
+                "created_at": receipt.entry_created_at,
+                "updated_at": receipt.entry_updated_at,
+            }
+        )
+    )
+    replay_chunks = [
+        chunk.model_copy(
+            update={
+                "id": f"{receipt.entry_id}:{chunk.chunk_index}",
+                "entry_id": receipt.entry_id,
+            }
+        )
+        for chunk in result.chunks
+    ]
+    return copy_knowledge_index_result(
+        result.model_copy(
+            update={
+                "entry": replay_entry,
+                "chunks": replay_chunks,
+            }
+        )
+    )
+
+
+async def _remember_live_matching_entry(
+    store: Any,
+    *,
+    entry_id: str,
+    text: str,
+    source_hash: str,
+    namespace: str,
+    kind: str,
+    visibility: KnowledgeVisibility,
+    required_labels: dict[str, str],
+    operation_registry: BoundedInvocationOperationRegistry,
+) -> KnowledgeEntry | None:
+    entry = await _remember_load_entry(
+        store,
+        entry_id,
+        operation_registry=operation_registry,
+    )
+    if (
+        entry is not None
+        and _remember_entry_matches_material_and_scope(
+            entry,
+            expected_entry_id=entry_id,
+            text=text,
+            source_hash=source_hash,
+            namespace=namespace,
+            kind=kind,
+            visibility=visibility,
+            required_labels=required_labels,
+        )
+        and _remember_existing_entry_is_live(entry)
+    ):
+        return copy_knowledge_entry(entry)
+    return None
+
+
+def _remember_cancellation_cause(
+    failure: BaseException | None,
+    *,
+    settled: bool,
+) -> RuntimeError | None:
+    if failure is None:
+        return None
+    if settled and isinstance(failure, asyncio.CancelledError):
+        return None
+    if settled:
+        return RuntimeError("Knowledge publication committed before cancellation settled.")
+    return RuntimeError("Knowledge publication outcome remained ambiguous after cancellation.")
 
 
 def _remember_knowledge_success_result(
@@ -671,6 +1440,25 @@ def _remember_knowledge_success_result(
     )
 
 
+def _remember_knowledge_replayed_result(result: Any) -> ToolResult:
+    entry = result.entry
+    return ToolResult(
+        content=(
+            f"Knowledge publication previously committed: {entry.id}. "
+            "Its current lifecycle state was not checked."
+        ),
+        structured={
+            "entry": {"entry_id": entry.id},
+            "chunk_count": result.chunk_count,
+            "written": False,
+            "already_known": None,
+            "source_hash": result.source_hash,
+            "status": None,
+            "publication_replayed": True,
+        },
+    )
+
+
 def _remember_existing_entry_is_live(entry: KnowledgeEntry) -> bool:
     if entry.status not in {KnowledgeStatus.ACTIVE, KnowledgeStatus.PENDING}:
         return False
@@ -681,26 +1469,69 @@ async def _remember_live_or_next_replacement_entry(
     store: Any,
     *,
     entry_id: str,
+    operation_id: str,
+    text: str,
     source_hash: str,
+    namespace: str,
+    kind: str,
+    visibility: KnowledgeVisibility,
+    required_labels: dict[str, str],
+    operation_registry: BoundedInvocationOperationRegistry,
 ) -> KnowledgeEntry | str:
     for index in range(1, 11):
         replacement_entry_id = _remember_stale_replacement_entry_id(entry_id, index)
-        try:
-            replacement_entry = await store.get_entry(replacement_entry_id)
-        except Exception:
-            return replacement_entry_id
+        replacement_entry = await _remember_load_entry(
+            store,
+            replacement_entry_id,
+            operation_registry=operation_registry,
+        )
         if replacement_entry is None:
             return replacement_entry_id
-        if replacement_entry.source_hash == source_hash and _remember_existing_entry_is_live(
-            replacement_entry
-        ):
+        if _remember_entry_matches_material_and_scope(
+            replacement_entry,
+            expected_entry_id=replacement_entry_id,
+            text=text,
+            source_hash=source_hash,
+            namespace=namespace,
+            kind=kind,
+            visibility=visibility,
+            required_labels=required_labels,
+        ) and _remember_existing_entry_is_live(replacement_entry):
             return replacement_entry
-    return f"knowledge_{uuid4().hex}"
+    return _remember_operation_fallback_entry_id(entry_id, operation_id)
 
 
 def _remember_stale_replacement_entry_id(entry_id: str, index: int) -> str:
     suffix = "_live" if index == 1 else f"_live_{index}"
     return f"{entry_id}{suffix}"
+
+
+def _remember_operation_fallback_entry_id(entry_id: str, operation_id: str) -> str:
+    material = f"cayu-remember-operation-entry-v1\0{entry_id}\0{operation_id}".encode()
+    return f"knowledge_{sha256(material).hexdigest()}"
+
+
+def _remember_entry_matches_material_and_scope(
+    entry: KnowledgeEntry,
+    *,
+    expected_entry_id: str,
+    text: str,
+    source_hash: str,
+    namespace: str,
+    kind: str,
+    visibility: KnowledgeVisibility,
+    required_labels: dict[str, str],
+) -> bool:
+    return (
+        entry.id == expected_entry_id
+        and entry.text == text
+        and entry.source_hash == source_hash
+        and knowledge_source_hash(entry.text) == source_hash
+        and entry.namespace == namespace
+        and entry.kind == kind
+        and entry.visibility is visibility
+        and all(entry.labels.get(key) == value for key, value in required_labels.items())
+    )
 
 
 def _remember_knowledge_already_known_result(entry: KnowledgeEntry) -> ToolResult:
@@ -723,66 +1554,6 @@ def _remember_knowledge_already_known_result(entry: KnowledgeEntry) -> ToolResul
             "status": entry.status.value,
         },
     )
-
-
-def _remember_chunk_read_max_bytes(chunks: list[KnowledgeChunk]) -> int:
-    chunk_bytes = sum(len(chunk.text.encode("utf-8")) for chunk in chunks)
-    separator_bytes = max(len(chunks) - 1, 0) * len(b"\n\n")
-    return max(chunk_bytes + separator_bytes + 1, 1)
-
-
-def _remember_write_matches(
-    result: Any,
-    stored_entry: KnowledgeEntry | None,
-    stored_chunks: list[KnowledgeChunk],
-) -> bool:
-    if stored_entry is None:
-        return False
-    expected_entry = result.entry
-    if _remember_entry_write_payload(stored_entry) != _remember_entry_write_payload(expected_entry):
-        return False
-    if len(stored_chunks) != len(result.chunks):
-        return False
-    for expected_chunk, stored_chunk in zip(result.chunks, stored_chunks, strict=True):
-        if stored_chunk.id != expected_chunk.id:
-            return False
-        if stored_chunk.entry_id != expected_chunk.entry_id:
-            return False
-        if stored_chunk.chunk_index != expected_chunk.chunk_index:
-            return False
-        if stored_chunk.content_hash != expected_chunk.content_hash:
-            return False
-        if stored_chunk.text != expected_chunk.text:
-            return False
-    return True
-
-
-def _remember_entry_write_payload(entry: KnowledgeEntry) -> dict[str, Any]:
-    """Fields that must survive a create write before recovery can treat it as stored."""
-
-    return {
-        "id": entry.id,
-        "text": entry.text,
-        "namespace": entry.namespace,
-        "labels": entry.labels,
-        "kind": entry.kind,
-        "visibility": entry.visibility,
-        "status": entry.status,
-        "created_by_type": entry.created_by_type,
-        "created_by": entry.created_by,
-        "source_type": entry.source_type,
-        "source_uri": entry.source_uri,
-        "source_id": entry.source_id,
-        "source_hash": entry.source_hash,
-        "aspects": entry.aspects,
-        "impact_targets": entry.impact_targets,
-        "importance": entry.importance,
-        "importance_source": entry.importance_source,
-        "confidence": entry.confidence,
-        "expires_at": entry.expires_at,
-        "title": entry.title,
-        "metadata": entry.metadata,
-    }
 
 
 class ListKnowledgeTool(Tool):
@@ -1161,23 +1932,19 @@ def _missing_knowledge_store_result() -> ToolResult:
 
 
 def _knowledge_write_failed_result(
-    exc: Exception,
     *,
-    entry_id: str,
-    cleanup_error: str | None,
-    inspection_error: str | None = None,
+    entry_id: str | None,
+    outcome: str,
 ) -> ToolResult:
     structured: dict[str, Any] = {
         "error": "knowledge_write_failed",
-        "entry_id": entry_id,
-        "cleanup": "failed" if cleanup_error is not None else "completed",
+        "outcome": require_clean_nonblank(outcome, "outcome"),
+        "cleanup": "not_attempted_unowned",
     }
-    if inspection_error is not None:
-        structured["inspection_error"] = inspection_error
-    if cleanup_error is not None:
-        structured["cleanup_error"] = cleanup_error
+    if entry_id is not None:
+        structured["entry_id"] = require_clean_nonblank(entry_id, "entry_id")
     return ToolResult(
-        content=f"Failed to store knowledge: {exc}",
+        content="Failed to store knowledge safely. No unowned cleanup was attempted.",
         structured=structured,
         is_error=True,
     )
@@ -1410,26 +2177,11 @@ def _knowledge_hit_payload(
 
 
 def _remembered_entry_payload(entry: KnowledgeEntry) -> dict[str, Any]:
+    """Project only operational entry identity/status into the model-visible result."""
+
     return {
         "entry_id": entry.id,
-        "namespace": entry.namespace,
-        "kind": entry.kind,
-        "visibility": entry.visibility.value,
         "status": entry.status.value,
-        "title": entry.title,
-        "labels": dict(entry.labels),
-        "aspects": list(entry.aspects),
-        "impact_targets": list(entry.impact_targets),
-        "source_type": entry.source_type,
-        "source_uri": entry.source_uri,
-        "source_id": entry.source_id,
-        "source_hash": entry.source_hash,
-        "created_by_type": entry.created_by_type.value,
-        "created_by": entry.created_by,
-        "importance": entry.importance,
-        "importance_source": entry.importance_source,
-        "confidence": entry.confidence,
-        "metadata": copy_json_value(entry.metadata, "metadata"),
     }
 
 

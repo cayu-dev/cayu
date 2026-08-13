@@ -116,9 +116,8 @@ def _write_summary(structured: Mapping[str, Any] | None) -> dict[str, Any]:
     return {
         "entry_id": entry["entry_id"],
         "status": structured["status"],
-        "namespace": entry["namespace"],
-        "labels": entry["labels"],
-        "aspects": entry["aspects"],
+        "written": structured["written"],
+        "already_known": structured["already_known"],
     }
 
 

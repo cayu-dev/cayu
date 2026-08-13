@@ -1620,7 +1620,8 @@ class RecoveryCoordinator:
             try:
                 pause_checkpoint, origin_arguments_quarantined = (
                     tool_argument_publication.pause_checkpoint_validation_view(
-                        event.payload.get(expected_origin_field)
+                        event.payload.get(expected_origin_field),
+                        pause_kind=pause_kind,
                     )
                 )
                 if origin_arguments_quarantined:
@@ -3127,6 +3128,7 @@ class RecoveryCoordinator:
                     continue
 
                 pending_call = pending_by_id[tool_call.id]
+                registered_tool = registered_agent.tools.get(tool_call.name)
                 policy_evidence = approval_support.effective_tool_policy_evidence(pending_call)
                 policy_result = approval_support.policy_result_from_pending_tool_call(pending_call)
                 if tool_call.id == pending.tool_call_id:
@@ -3134,7 +3136,6 @@ class RecoveryCoordinator:
                         raise RuntimeError(
                             "Pending user-input call has no authoritative policy decision."
                         )
-                    registered_tool = registered_agent.tools.get(tool_call.name)
                     idempotency_key = tool_execution.tool_idempotency_key(
                         session_id=session.id,
                         tool_round_id=tool_round_identity.tool_round_id,
@@ -3238,6 +3239,9 @@ class RecoveryCoordinator:
                     public_policy_result = approval_support.public_policy_denial_result(
                         secret_resolution_scope=pause_secret_resolution_scope,
                         policy_result=policy_result,
+                        publish_arguments=(
+                            registered_tool is not None and registered_tool.publish_arguments
+                        ),
                     )
                     reason = tool_execution.policy_denial_reason(public_policy_result)
                     blocked_result = tool_execution.blocked_tool_result(
@@ -4287,6 +4291,7 @@ class RecoveryCoordinator:
                 round_tool_calls,
                 strict=True,
             ):
+                registered_tool = registered_agent.tools.get(tool_call.name)
                 policy_result = approval_support.policy_result_from_pending_tool_call(
                     pending_tool_call
                 )
@@ -4314,6 +4319,9 @@ class RecoveryCoordinator:
                     public_policy_result = approval_support.public_policy_denial_result(
                         secret_resolution_scope=pause_secret_resolution_scope,
                         policy_result=policy_result,
+                        publish_arguments=(
+                            registered_tool is not None and registered_tool.publish_arguments
+                        ),
                     )
                     reason = tool_execution.policy_denial_reason(public_policy_result)
                     result = tool_execution.blocked_tool_result(

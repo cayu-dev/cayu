@@ -10,14 +10,23 @@ from tests.core.knowledge_none_terms_conformance import (
     assert_entry_wide_none_terms_conformance,
     assert_entry_wide_none_terms_precede_chunk_pagination,
 )
+from tests.core.knowledge_publication_conformance import (
+    assert_concurrent_publication_conformance,
+    assert_failed_publication_left_no_state,
+    assert_owned_publication_conformance,
+    assert_stale_operation_cannot_replace_newer_publication,
+    publication_material,
+)
 
 from cayu._validation import DurableValueError, extract_durable_value_error
+from cayu.core.tools import ToolContext
 from cayu.storage import (
     MAX_KNOWLEDGE_CHUNK_INDEX,
     KnowledgeChunk,
     KnowledgeEntry,
     KnowledgeListGroup,
     KnowledgeListQuery,
+    KnowledgePublicationConflict,
     KnowledgeQuery,
     KnowledgeSearchMode,
     KnowledgeStatus,
@@ -26,6 +35,7 @@ from cayu.storage import (
     SQLiteSessionStore,
 )
 from cayu.storage import migrations as schema_migrations
+from cayu.tools import RememberKnowledgeTool
 
 
 async def _close(store) -> None:
@@ -53,6 +63,211 @@ def test_sqlite_knowledge_store_rejects_out_of_range_chunk_index_atomically(tmp_
             assert await store.read_chunks(entry.id) == []
         finally:
             await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_knowledge_store_owned_publication_conformance(tmp_path) -> None:
+    async def run() -> None:
+        store = SQLiteKnowledgeStore(tmp_path / "owned-publication.sqlite")
+        try:
+            await assert_owned_publication_conformance(store)
+            await assert_concurrent_publication_conformance(store)
+            await assert_stale_operation_cannot_replace_newer_publication(store)
+        finally:
+            await _close(store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_knowledge_publication_serializes_independent_writers(tmp_path) -> None:
+    async def run() -> None:
+        path = tmp_path / "concurrent-publication.sqlite"
+        first_store = SQLiteKnowledgeStore(path)
+        second_store = SQLiteKnowledgeStore(path)
+        entry_a, chunks_a = publication_material(entry_id="cross-connection-publication")
+        entry_b, chunks_b = publication_material(
+            entry_id="cross-connection-publication",
+            text="A different SQLite connection owns this candidate.",
+            timestamp_offset=1,
+        )
+
+        def publish(store, operation_id, entry, chunks):
+            try:
+                return (
+                    operation_id,
+                    asyncio.run(
+                        store.publish_entry_with_chunks(
+                            entry,
+                            chunks,
+                            operation_id=operation_id,
+                        )
+                    ),
+                )
+            except Exception as exc:
+                return operation_id, exc
+
+        try:
+            outcomes = await asyncio.gather(
+                asyncio.to_thread(
+                    publish,
+                    first_store,
+                    "cross-connection-a",
+                    entry_a,
+                    chunks_a,
+                ),
+                asyncio.to_thread(
+                    publish,
+                    second_store,
+                    "cross-connection-b",
+                    entry_b,
+                    chunks_b,
+                ),
+            )
+            successes = [outcome for outcome in outcomes if not isinstance(outcome[1], Exception)]
+            conflicts = [outcome for outcome in outcomes if isinstance(outcome[1], Exception)]
+            assert len(successes) == 1
+            assert len(conflicts) == 1
+            assert isinstance(conflicts[0][1], KnowledgePublicationConflict)
+            expected_entry, expected_chunks = (
+                (entry_a, chunks_a)
+                if successes[0][0] == "cross-connection-a"
+                else (entry_b, chunks_b)
+            )
+            assert await first_store.get_entry(expected_entry.id) == expected_entry
+            assert await first_store.read_chunks(expected_entry.id) == expected_chunks
+        finally:
+            await _close(first_store)
+            await _close(second_store)
+
+    asyncio.run(run())
+
+
+def test_sqlite_knowledge_publication_receipt_survives_restart(tmp_path) -> None:
+    async def run() -> None:
+        path = tmp_path / "publication-restart.sqlite"
+        entry, chunks = publication_material(entry_id="restart-publication")
+        store = SQLiteKnowledgeStore(path)
+        receipt = await store.publish_entry_with_chunks(
+            entry,
+            chunks,
+            operation_id="restart-operation",
+        )
+        reviewed = await store.update_entry_status(entry.id, KnowledgeStatus.ARCHIVED)
+        await _close(store)
+
+        reopened = SQLiteKnowledgeStore(path)
+        try:
+            replay = await reopened.publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id="restart-operation",
+            )
+            assert replay.replayed is True
+            assert replay.committed_at == receipt.committed_at
+            assert await reopened.get_entry(entry.id) == reviewed
+            assert await reopened.read_chunks(entry.id) == chunks
+        finally:
+            await _close(reopened)
+
+    asyncio.run(run())
+
+
+def test_sqlite_remember_knowledge_reconciles_ack_loss_and_restart(tmp_path) -> None:
+    class AcknowledgementLossSQLiteStore(SQLiteKnowledgeStore):
+        async def publish_entry_with_chunks(self, entry, chunks, *, operation_id):
+            await super().publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id=operation_id,
+            )
+            raise RuntimeError("secret canary acknowledgement failure")
+
+    async def run() -> None:
+        path = tmp_path / "remember-ack-loss.sqlite"
+        context_options = {
+            "session_id": "session_1",
+            "idempotency_key": "durable-remember-operation",
+        }
+        store = AcknowledgementLossSQLiteStore(path)
+        first = await RememberKnowledgeTool().run(
+            ToolContext(knowledge_store=store, **context_options),
+            {"text": "Durable knowledge publication survives acknowledgement loss."},
+        )
+        await _close(store)
+
+        reopened = SQLiteKnowledgeStore(path)
+        try:
+            replay = await RememberKnowledgeTool().run(
+                ToolContext(knowledge_store=reopened, **context_options),
+                {"text": "Durable knowledge publication survives acknowledgement loss."},
+            )
+            assert first.is_error is False
+            assert first.structured["post_write_error"] == ("publication_acknowledgement_lost")
+            assert "secret canary" not in first.content
+            assert "secret canary" not in repr(first.structured)
+            assert replay.is_error is False
+            assert replay.structured["written"] is False
+            assert replay.structured["already_known"] is None
+            assert replay.structured["publication_replayed"] is True
+            assert replay.structured["status"] is None
+        finally:
+            await _close(reopened)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure_phase", ["entry", "chunks", "receipt"])
+def test_sqlite_knowledge_publication_rolls_back_each_material_write(
+    tmp_path,
+    failure_phase: str,
+) -> None:
+    class FailingPublicationStore(SQLiteKnowledgeStore):
+        def _insert_entry_unlocked(self, entry) -> None:
+            super()._insert_entry_unlocked(entry)
+            self._fail_after("entry")
+
+        def _insert_chunks_unlocked(self, entry, chunks) -> None:
+            super()._insert_chunks_unlocked(entry, chunks)
+            self._fail_after("chunks")
+
+        def _insert_publication_receipt_unlocked(self, receipt) -> None:
+            super()._insert_publication_receipt_unlocked(receipt)
+            self._fail_after("receipt")
+
+        def _fail_after(self, phase: str) -> None:
+            if phase == failure_phase:
+                raise RuntimeError(f"injected {phase}-boundary failure")
+
+    async def run() -> None:
+        path = tmp_path / "publication-rollback.sqlite"
+        entry, chunks = publication_material(entry_id="rollback-publication")
+        failing = FailingPublicationStore(path)
+        try:
+            with pytest.raises(RuntimeError, match=rf"{failure_phase}-boundary"):
+                await failing.publish_entry_with_chunks(
+                    entry,
+                    chunks,
+                    operation_id="rollback-operation",
+                )
+            await assert_failed_publication_left_no_state(
+                failing,
+                entry_id=entry.id,
+                operation_id="rollback-operation",
+            )
+        finally:
+            await _close(failing)
+
+        reopened = SQLiteKnowledgeStore(path)
+        try:
+            receipt = await reopened.publish_entry_with_chunks(
+                entry,
+                chunks,
+                operation_id="rollback-operation",
+            )
+            assert receipt.replayed is False
+        finally:
+            await _close(reopened)
 
     asyncio.run(run())
 
@@ -883,6 +1098,10 @@ def test_sqlite_knowledge_schema_migrates_and_coexists_with_session_store(tmp_pa
             "SELECT 1 FROM sqlite_master WHERE type = 'table' "
             "AND name = 'cayu_knowledge_chunks_fts'"
         ).fetchone()
+        publication_receipts = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'cayu_knowledge_publication_receipts'"
+        ).fetchone()
     finally:
         connection.close()
 
@@ -893,3 +1112,4 @@ def test_sqlite_knowledge_schema_migrates_and_coexists_with_session_store(tmp_pa
     )
     assert knowledge_table is not None
     assert knowledge_fts is not None
+    assert publication_receipts is not None
