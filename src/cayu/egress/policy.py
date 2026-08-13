@@ -7,6 +7,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from cayu._validation import require_clean_nonblank
+from cayu.egress.destinations import normalize_egress_hostname
 from cayu.proxies import ProxyAuthorizationResult
 
 
@@ -17,7 +18,7 @@ class EgressRequest(BaseModel):
     path, query, body metadata, and never needs to see the credential.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     method: str
     host: str
@@ -41,7 +42,7 @@ class EgressRequest(BaseModel):
     @field_validator("host")
     @classmethod
     def normalize_host(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name).lower()
+        return normalize_egress_hostname(value, field_name=info.field_name)
 
     @field_validator("path")
     @classmethod
@@ -119,7 +120,9 @@ class HttpEgressPolicy(EgressPolicy):
 
 
 def _normalize_hosts(hosts: Iterable[str]) -> frozenset[str]:
-    normalized = frozenset(require_clean_nonblank(host, "allowed_hosts").lower() for host in hosts)
+    normalized = frozenset(
+        normalize_egress_hostname(host, field_name="allowed_hosts") for host in hosts
+    )
     if not normalized:
         raise ValueError("HttpEgressPolicy requires at least one allowed host.")
     return normalized

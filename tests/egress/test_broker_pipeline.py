@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import gzip
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
@@ -465,7 +466,7 @@ def test_httpx_upstream_routes_logical_host_to_private_service() -> None:
 
     async def run() -> CapturedResponse:
         upstream = HttpxUpstream(
-            routes={"receiver.internal": "http://receiver.service.local:8080"},
+            routes={"RECEIVER.Internal.": "http://receiver.service.local:8080"},
             transport=httpx.MockTransport(handler),
             destination_resolver=_destination_resolver("10.0.0.10"),
         )
@@ -599,6 +600,23 @@ class _RevokingResolver:
         return ResolvedSecret(name=ref.name, value=SecretStr(REAL_SECRET))
 
 
+class _SuspendingResolver:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    async def resolve(
+        self,
+        ref: SecretRef,
+        *,
+        scope: dict[str, Any] | None = None,
+    ) -> ResolvedSecret:
+        del scope
+        self.started.set()
+        await self.resume.wait()
+        return ResolvedSecret(name=ref.name, value=SecretStr(REAL_SECRET))
+
+
 def test_resolver_failure_is_labeled_distinctly() -> None:
     upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
     registry = VirtualCredentialRegistry()
@@ -647,6 +665,72 @@ def test_revoked_after_resolution_is_not_forwarded_upstream() -> None:
     assert REAL_SECRET not in response.body.decode()
     assert decisions[-1].allowed is False
     _no_real_secret(decisions)
+
+
+def test_request_mutation_during_resolution_cannot_redirect_real_credential() -> None:
+    async def run() -> tuple[CapturedResponse, CapturedRequest | None]:
+        upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
+        registry = VirtualCredentialRegistry()
+        resolver = _SuspendingResolver()
+        broker = TransparentEgressBroker(
+            registry=registry,
+            resolver=resolver,
+            policies={"stripe-example": _stripe_example_policy()},
+            upstream=upstream,
+        )
+        grant = _mint(registry)
+        request = _request(grant.presented_value, "/v1/customers")
+
+        pending = asyncio.create_task(broker.handle_request(request))
+        await resolver.started.wait()
+        request.host = "evil.example.com"
+        resolver.resume.set()
+        return await pending, upstream.sent
+
+    response, sent = asyncio.run(run())
+
+    assert response.status_code == 200
+    assert sent is not None
+    assert sent.host == "api.stripe.com"
+    assert sent.headers["Authorization"] == f"Bearer {REAL_SECRET}"
+
+
+def test_mutated_request_validation_diagnostics_do_not_expose_hostile_repr(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    canary = "MUTATED_HOST_SECRET_CANARY"
+
+    class HostileHost:
+        def __repr__(self) -> str:
+            return canary
+
+    upstream = _FakeUpstream(CapturedResponse(status_code=200, body=b"{}"))
+    broker, registry, resolver, _decisions = _build(upstream=upstream)
+    grant = _mint(registry)
+    request = _request(grant.presented_value, "/v1/customers")
+    object.__setattr__(request, "host", HostileHost())
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError) as excinfo:
+            asyncio.run(broker.handle_request(request))
+
+    captured = capsys.readouterr()
+    diagnostics = "\n".join(
+        [
+            str(excinfo.value),
+            captured.out,
+            captured.err,
+            *(str(item.message) for item in caught),
+            *(record.getMessage() for record in caplog.records),
+        ]
+    )
+    assert caught == []
+    assert canary not in diagnostics
+    assert len(diagnostics) < 500
+    assert resolver.resolve_count == 0
+    assert upstream.sent is None
 
 
 LIVE_SECRET = "sk_live_51ProductionKeyBoundByMistake"

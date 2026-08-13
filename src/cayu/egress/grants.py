@@ -15,6 +15,7 @@ from cayu.egress.credential_kinds import (
     validate_presented_value,
     virtual_credential_entropy_bytes,
 )
+from cayu.egress.destinations import normalize_egress_hostname
 from cayu.egress.errors import VirtualCredentialError
 from cayu.vaults import SecretRef, copy_secret_ref
 
@@ -54,7 +55,7 @@ class VirtualCredentialGrant(BaseModel):
     @field_validator("destination")
     @classmethod
     def validate_destination(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name).lower()
+        return normalize_egress_hostname(value, field_name=info.field_name)
 
     @field_validator("policy_name")
     @classmethod

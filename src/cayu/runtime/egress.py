@@ -65,7 +65,7 @@ from cayu.egress.adapter import (
     _await_bounded_cleanup_task,
 )
 from cayu.egress.credential_kinds import validate_credential_kind
-from cayu.egress.destinations import validate_approved_destinations
+from cayu.egress.destinations import normalize_egress_hostname, validate_approved_destinations
 from cayu.environments.admission import (
     ExecutionAdmissionCandidate,
     evaluate_execution_admission,
@@ -148,6 +148,11 @@ class VirtualCredentialSpec:
     ttl_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "destination",
+            normalize_egress_hostname(self.destination, field_name="destination"),
+        )
         object.__setattr__(self, "credential_kind", validate_credential_kind(self.credential_kind))
 
 

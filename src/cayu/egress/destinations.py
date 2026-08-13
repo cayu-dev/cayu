@@ -29,7 +29,10 @@ class ApprovedEgressDestination:
     port: int = 443
 
     def __post_init__(self) -> None:
-        destination = _validated_hostname(self.destination)
+        destination = normalize_egress_hostname(
+            self.destination,
+            field_name="Approved egress destination",
+        )
         policy_name = require_clean_nonblank(self.policy_name, "policy_name")
         if self.protocol != "https":
             raise ValueError("Approved egress destinations only support protocol='https'.")
@@ -45,22 +48,26 @@ class ApprovedEgressDestination:
         return (self.destination, self.protocol, self.port)
 
 
-def _validated_hostname(value: str) -> str:
-    hostname = require_clean_nonblank(value, "destination").lower().rstrip(".")
+def normalize_egress_hostname(value: str, *, field_name: str) -> str:
+    """Return one canonical bare hostname for every egress authority surface."""
+
+    hostname = require_clean_nonblank(value, field_name).lower()
+    if hostname.endswith("."):
+        hostname = hostname[:-1]
     if any(character in hostname for character in "/:@?#") or any(
         character.isspace() for character in hostname
     ):
-        raise ValueError("Approved egress destination must be a bare hostname.")
+        raise ValueError(f"{field_name} must be a bare hostname.")
     try:
         ipaddress.ip_address(hostname)
     except ValueError:
         pass
     else:
-        raise ValueError("Approved egress destination must not be an IP address.")
+        raise ValueError(f"{field_name} must not be an IP address.")
     if len(hostname) > 253 or "." not in hostname:
-        raise ValueError("Approved egress destination must be a fully qualified hostname.")
+        raise ValueError(f"{field_name} must be a fully qualified hostname.")
     if any(_HOST_LABEL.fullmatch(label) is None for label in hostname.split(".")):
-        raise ValueError("Approved egress destination is not a valid hostname.")
+        raise ValueError(f"{field_name} is not a valid hostname.")
     return hostname
 
 

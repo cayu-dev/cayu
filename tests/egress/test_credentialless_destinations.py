@@ -138,11 +138,9 @@ def test_virtual_namespace_under_unknown_authorization_scheme_cannot_fall_throug
             path="/sdk/index.json",
             port=8443,
         ),
-        CapturedRequest(method="GET", host="169.254.169.254", path="/latest/meta-data/"),
-        CapturedRequest(method="GET", host="203.0.113.10", path="/sdk/index.json"),
     ],
 )
-def test_credentialless_route_denies_unapproved_destination_port_and_direct_ip(
+def test_credentialless_route_denies_unapproved_destination_or_port(
     captured_request: CapturedRequest,
 ) -> None:
     upstream = _RecordingUpstream()
@@ -155,6 +153,12 @@ def test_credentialless_route_denies_unapproved_destination_port_and_direct_ip(
     assert upstream.requests == []
     assert decisions[-1].allowed is False
     assert decisions[-1].authorization_kind == "credentialless"
+
+
+@pytest.mark.parametrize("host", ["169.254.169.254", "203.0.113.10"])
+def test_captured_request_rejects_direct_ip_destination(host: str) -> None:
+    with pytest.raises(ValueError, match="must not be an IP address"):
+        CapturedRequest(method="GET", host=host, path="/sdk/index.json")
 
 
 def test_redirect_target_is_reauthorized_instead_of_inherited() -> None:

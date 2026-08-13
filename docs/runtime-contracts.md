@@ -3756,6 +3756,18 @@ deny path even when its scheme is missing or unrecognized; it cannot fall
 through to a credentialless destination. Header scheme selection is therefore
 part of the credential grant, not a caller-owned rewrite hint.
 
+Virtual-egress destinations are canonical bare hostnames. Credential specs,
+grants, captured requests, HTTP policy allowlists, CONNECT targets, and default
+upstream route aliases lowercase the hostname and remove a trailing DNS dot
+before comparison or routing. They reject schemes, user information, paths,
+queries, fragments, embedded ports, IP literals, whitespace, and invalid DNS
+labels before policy evaluation or vault resolution. Private upstream routing
+remains an explicit mapping from one validated logical hostname to a separately
+validated HTTP(S) origin; route targets do not weaken the credential destination
+contract. The direct broker accepts an exact `CapturedRequest` and takes an
+owned validated snapshot before authorization, so caller mutation while vault
+resolution is pending cannot redirect a secret-bearing request.
+
 A native Python `Tool.run()` executes inside the trusted Cayu application
 process. Registering a native tool therefore grants its implementation the same
 host-process access as other application code. `ToolPolicy` authorizes the

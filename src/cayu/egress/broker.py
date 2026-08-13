@@ -26,6 +26,7 @@ from cayu.egress.credential_kinds import (
 from cayu.egress.destinations import (
     ApprovedEgressDestination,
     EgressProtocol,
+    normalize_egress_hostname,
     validate_approved_destinations,
 )
 from cayu.egress.errors import VirtualCredentialError
@@ -54,7 +55,7 @@ _HOP_BY_HOP = frozenset(
 class CapturedRequest(BaseModel):
     """One outbound request captured outside the sandbox by the egress proxy."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     method: str
     host: str
@@ -73,7 +74,7 @@ class CapturedRequest(BaseModel):
     @field_validator("host")
     @classmethod
     def normalize_host(cls, value: str, info) -> str:
-        return require_clean_nonblank(value, info.field_name).lower()
+        return normalize_egress_hostname(value, field_name=info.field_name)
 
     @field_validator("path")
     @classmethod
@@ -241,11 +242,10 @@ def _format_authority(host: str, port: int, scheme: str) -> str:
 def _validated_upstream_routes(routes: Mapping[str, str]) -> dict[str, str]:
     validated: dict[str, str] = {}
     for logical_host, target in routes.items():
-        host = require_clean_nonblank(logical_host, "HttpxUpstream route host").lower()
-        if any(character in host for character in "/:@") or any(
-            character.isspace() for character in host
-        ):
-            raise ValueError("HttpxUpstream route host must be a bare hostname.")
+        host = normalize_egress_hostname(
+            logical_host,
+            field_name="HttpxUpstream route host",
+        )
         split = urlsplit(target)
         if (
             split.scheme not in {"http", "https"}
@@ -317,6 +317,9 @@ class TransparentEgressBroker:
         return bool(self._approved_destinations)
 
     async def handle_request(self, request: CapturedRequest) -> CapturedResponse:
+        if type(request) is not CapturedRequest:
+            raise TypeError("request must be a CapturedRequest instance.")
+        request = CapturedRequest(**request.model_dump(mode="python", warnings=False))
         presented = extract_presented_credential(request.headers)
         if presented is None:
             if self._approved_destinations:

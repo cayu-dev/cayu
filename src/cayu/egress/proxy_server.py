@@ -5,7 +5,6 @@ import base64
 import contextlib
 import datetime as _dt
 import hashlib
-import ipaddress
 import logging
 import os
 import secrets
@@ -23,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
 from cayu.egress.broker import CapturedRequest, CapturedResponse, TransparentEgressBroker
+from cayu.egress.destinations import normalize_egress_hostname
 
 _ONE_DAY = _dt.timedelta(days=1)
 _CA_VALIDITY = _dt.timedelta(days=825)
@@ -161,13 +161,7 @@ def _validated_connect_target(target: str) -> tuple[str, int]:
         or port != 443
     ):
         raise ValueError("CONNECT target must be a hostname on port 443.")
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        pass
-    else:
-        raise ValueError("CONNECT target must not be an IP address.")
-    return host.lower().rstrip("."), port
+    return normalize_egress_hostname(host, field_name="CONNECT target"), port
 
 
 class TransparentEgressProxyServer:

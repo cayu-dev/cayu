@@ -151,6 +151,14 @@ Credential `env_name` values must be unique. Duplicate names are rejected at
 factory construction so the sandbox cannot receive one virtual value while the
 broker minted several ambiguous grants.
 
+Credential destinations and policy hosts are bare hostnames, not URL or
+authority strings. Cayu canonicalizes case and a trailing DNS dot consistently
+across configuration, capture, policy, DNS, TLS SNI, and the HTTP `Host` header.
+Schemes, user information, paths, queries, fragments, embedded ports, IP
+literals, whitespace, and invalid DNS labels are rejected before any vault
+secret is resolved. Use the explicit upstream route mapping when a logical
+credential hostname must reach a private service origin.
+
 ```python
 from cayu import (
     AgentSpec, CayuApp, EnvironmentSpec, ExecutionRequirements, HttpEgressPolicy,
