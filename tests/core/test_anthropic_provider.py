@@ -502,6 +502,88 @@ async def test_anthropic_provider_emits_text_and_completed_events() -> None:
 
 
 @pytest.mark.anyio
+async def test_anthropic_replays_only_its_configured_protocol_version() -> None:
+    transport = RecordingTransport(
+        [
+            {
+                "id": "msg_reasoning",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "thinking", "thinking": "custom thought", "signature": "custom-sig"},
+                    {"type": "text", "text": "first answer"},
+                ],
+                "usage": {},
+            },
+            {
+                "id": "msg_continue",
+                "model": "claude-test",
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "continued"}],
+                "usage": {},
+            },
+        ]
+    )
+    provider = AnthropicProvider(
+        api_key="test-key",
+        transport=transport,
+        anthropic_version="custom-version",
+    )
+    version_attribute = "anthropic_version"
+    with pytest.raises(AttributeError):
+        setattr(provider, version_attribute, "mutated-version")
+
+    first_events = [
+        event
+        async for event in provider.stream(
+            ModelRequest(
+                model="claude-test",
+                messages=[Message.text("user", "first")],
+            )
+        )
+    ]
+    state = first_events[0].payload["provider_state"]
+    assert state == {
+        "provider": "anthropic",
+        "protocol": "messages",
+        "protocol_version": "custom-version",
+        "type": "thinking",
+        "signature": "custom-sig",
+    }
+    assert transport.calls[0]["headers"]["anthropic-version"] == "custom-version"
+
+    continuation = ModelRequest(
+        model="claude-test",
+        messages=[
+            Message.text("user", "first"),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingPart(text="custom thought", provider_state=state),
+                    ThinkingPart(
+                        text="wrong version thought",
+                        provider_state={
+                            **state,
+                            "protocol_version": "other-version",
+                            "signature": "wrong-version-sig",
+                        },
+                    ),
+                    TextPart(text="first answer"),
+                ],
+            ),
+            Message.text("user", "continue"),
+        ],
+    )
+
+    _ = [event async for event in provider.stream(continuation)]
+
+    assert transport.calls[1]["payload"]["messages"][1]["content"] == [
+        {"type": "thinking", "thinking": "custom thought", "signature": "custom-sig"},
+        {"type": "text", "text": "first answer"},
+    ]
+
+
+@pytest.mark.anyio
 async def test_anthropic_provider_counts_input_tokens_with_official_endpoint() -> None:
     transport = RecordingTransport([], count_responses=[{"input_tokens": 37}])
     provider = AnthropicProvider(api_key="test-key", transport=transport)
@@ -1663,7 +1745,13 @@ def test_anthropic_request_cache_policy_drops_unapplied_thinking_boundary() -> N
                 content=(
                     ThinkingPart(
                         text="reasoning",
-                        provider_state={"type": "thinking", "signature": "signature"},
+                        provider_state={
+                            "provider": "anthropic",
+                            "protocol": "messages",
+                            "protocol_version": "2023-06-01",
+                            "type": "thinking",
+                            "signature": "signature",
+                        },
                     ),
                 ),
             ),
@@ -1827,7 +1915,13 @@ async def test_anthropic_provider_streams_sse_events_incrementally() -> None:
     # The thinking block is emitted whole so its signature round-trips over the
     # complete text (a partial block would be rejected on the next turn).
     assert events[2].delta == "Let me reason."
-    assert events[2].payload["provider_state"] == {"type": "thinking", "signature": "sig-abc"}
+    assert events[2].payload["provider_state"] == {
+        "provider": "anthropic",
+        "protocol": "messages",
+        "protocol_version": "2023-06-01",
+        "type": "thinking",
+        "signature": "sig-abc",
+    }
     assert events[3].payload == {"id": "toolu_9", "name": "echo", "arguments": {"text": "hi"}}
     completed = events[4].payload
     assert completed["id"] == "msg_s1"
@@ -1875,6 +1969,9 @@ async def test_anthropic_stream_events_emits_redacted_thinking_and_empty_tool_in
     ]
     assert translated[0].delta == ""
     assert translated[0].payload["provider_state"] == {
+        "provider": "anthropic",
+        "protocol": "messages",
+        "protocol_version": "2023-06-01",
         "type": "redacted_thinking",
         "data": "opaque-blob",
     }

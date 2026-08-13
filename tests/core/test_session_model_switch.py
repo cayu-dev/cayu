@@ -1002,6 +1002,187 @@ def test_cross_provider_resume_keeps_complete_neutral_tool_history() -> None:
     assert roles == ["user", "assistant", "tool", "assistant", "user"]
 
 
+def test_cross_provider_resume_drops_reasoning_only_assistant_shell() -> None:
+    async def run() -> None:
+        source = _NamedProvider("source", [])
+        target = _NamedProvider(
+            "target",
+            [[ModelStreamEvent.text_delta("continued"), ModelStreamEvent.completed()]],
+        )
+        app, store = _app(source, target)
+        neutral_tool_call = Message.tool_call(
+            tool_call_id="portable-call",
+            tool_name="echo",
+            arguments={"value": "portable"},
+        )
+        neutral_tool_result = Message.tool_result(
+            tool_call_id="portable-call",
+            tool_name="echo",
+            content="portable",
+        )
+        durable_prefix = [
+            Message.text("user", "opening"),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(ThinkingPart(text="source-only reasoning"),),
+            ),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(
+                    TextPart(text="portable answer"),
+                    ProviderStatePart(
+                        provider="source",
+                        state={"type": "response_ref", "id": "source-state"},
+                    ),
+                ),
+            ),
+            Message.text("user", "use the tool"),
+            neutral_tool_call,
+            neutral_tool_result,
+            Message.text("assistant", "tool complete"),
+        ]
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="switch-reasoning-only-shell",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="source", model="source-model"),
+        )
+        await store.append_transcript_messages(
+            "switch-reasoning-only-shell",
+            durable_prefix,
+        )
+        await store.update_status(
+            "switch-reasoning-only-shell",
+            SessionStatus.COMPLETED,
+        )
+        durable_before = await store.load_transcript("switch-reasoning-only-shell")
+
+        events = await _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id="switch-reasoning-only-shell",
+                    messages=[Message.text("user", "continue")],
+                    target=ModelTarget(provider_name="target", model="target-model"),
+                )
+            )
+        )
+
+        expected_request = [
+            Message.text("user", "opening"),
+            Message.text("assistant", "portable answer"),
+            Message.text("user", "use the tool"),
+            neutral_tool_call,
+            neutral_tool_result,
+            Message.text("assistant", "tool complete"),
+            Message.text("user", "continue"),
+        ]
+        assert events[-1].type is EventType.SESSION_COMPLETED
+        assert target.preflight_messages == expected_request
+        assert len(target.requests) == 1
+        assert target.requests[0].messages == expected_request
+        durable_after = await store.load_transcript("switch-reasoning-only-shell")
+        assert durable_after[: len(durable_before)] == durable_before
+
+    asyncio.run(run())
+
+
+def test_reasoning_only_shell_does_not_break_pending_tool_round_recovery(tmp_path) -> None:
+    async def run() -> None:
+        store = _FailingToolRoundPublicationSQLiteStore(
+            tmp_path / "model-switch-reasoning-shell-recovery.sqlite"
+        )
+        tool = _EchoTool()
+        target = _NamedProvider(
+            "target",
+            [
+                [
+                    ModelStreamEvent.tool_call(
+                        id="call-after-shell",
+                        name="echo",
+                        arguments={"value": "portable"},
+                    ),
+                    ModelStreamEvent.completed({"finish_reason": "tool_calls"}),
+                ],
+                [
+                    ModelStreamEvent.text_delta("recovered"),
+                    ModelStreamEvent.completed({"finish_reason": "stop"}),
+                ],
+            ],
+        )
+        app, _ = _app(
+            _NamedProvider("source", []),
+            target,
+            store=store,
+            tool=tool,
+        )
+        await store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="switch-reasoning-shell-recovery",
+                messages=[],
+            ),
+            identity=SessionIdentity(provider_name="source", model="source-model"),
+        )
+        durable_prefix = [
+            Message.text("user", "opening"),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=(ThinkingPart(text="source-only reasoning"),),
+            ),
+            Message.text("assistant", "portable answer"),
+        ]
+        await store.append_transcript_messages(
+            "switch-reasoning-shell-recovery",
+            durable_prefix,
+        )
+        await store.update_status(
+            "switch-reasoning-shell-recovery",
+            SessionStatus.COMPLETED,
+        )
+
+        first_events = await _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id="switch-reasoning-shell-recovery",
+                    messages=[Message.text("user", "switch and call")],
+                    target=ModelTarget(provider_name="target", model="target-model"),
+                )
+            )
+        )
+        assert first_events[-1].type is EventType.SESSION_FAILED
+        assert tool.calls == [{"value": "portable"}]
+        checkpoint = await store.load_checkpoint("switch-reasoning-shell-recovery")
+        assert checkpoint is not None and "pending_tool_round" in checkpoint
+
+        recovery_events = await _collect(
+            app.resume(
+                ResumeRequest(
+                    session_id="switch-reasoning-shell-recovery",
+                    messages=[Message.text("user", "continue")],
+                )
+            )
+        )
+
+        assert recovery_events[-1].type is EventType.SESSION_COMPLETED
+        assert tool.calls == [{"value": "portable"}]
+        assert len(target.requests) == 2
+        assert all(
+            type(part) not in {ProviderStatePart, ThinkingPart}
+            for message in target.requests[1].messages[:2]
+            for part in message.content
+        )
+        assert "pending_tool_round" not in (
+            await store.load_checkpoint("switch-reasoning-shell-recovery") or {}
+        )
+        durable_after = await store.load_transcript("switch-reasoning-shell-recovery")
+        assert durable_after[: len(durable_prefix)] == durable_prefix
+        await store.close()
+
+    asyncio.run(run())
+
+
 def test_post_switch_tool_round_cannot_restore_source_provider_state() -> None:
     source = _NamedProvider(
         "source",

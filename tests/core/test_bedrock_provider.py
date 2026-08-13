@@ -573,10 +573,19 @@ def test_bedrock_provider_round_trips_reasoning_content_through_converse() -> No
                 content=[
                     ThinkingPart(
                         text="earlier thought",
-                        provider_state={"type": "reasoning_text", "signature": "prior-sig"},
+                        provider_state={
+                            "provider": "bedrock",
+                            "protocol": "converse",
+                            "protocol_version": "1",
+                            "type": "reasoning_text",
+                            "signature": "prior-sig",
+                        },
                     ),
                     ThinkingPart(
                         provider_state={
+                            "provider": "bedrock",
+                            "protocol": "converse",
+                            "protocol_version": "1",
                             "type": "redacted_content",
                             "data_base64": "AgM=",
                         }
@@ -598,11 +607,23 @@ def test_bedrock_provider_round_trips_reasoning_content_through_converse() -> No
     ]
     assert events[0].delta == "think hard"
     assert events[0].payload == {
-        "provider_state": {"type": "reasoning_text", "signature": "signed"}
+        "provider_state": {
+            "provider": "bedrock",
+            "protocol": "converse",
+            "protocol_version": "1",
+            "type": "reasoning_text",
+            "signature": "signed",
+        }
     }
     assert events[1].delta == ""
     assert events[1].payload == {
-        "provider_state": {"type": "redacted_content", "data_base64": "AAE="}
+        "provider_state": {
+            "provider": "bedrock",
+            "protocol": "converse",
+            "protocol_version": "1",
+            "type": "redacted_content",
+            "data_base64": "AAE=",
+        }
     }
     assert client.converse_calls[0]["messages"][1] == {
         "role": "assistant",

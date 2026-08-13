@@ -4235,7 +4235,6 @@ class SessionEngine:
                 )
             else:
                 transcript = _transcript_snapshot_messages(transcript_snapshot)
-            retained_transcript_count = len(transcript_snapshot.records)
         finally:
             del transcript_snapshot
         transcript, transcript_is_valid = session_request_boundary.redact_transcript(
@@ -4249,9 +4248,6 @@ class SessionEngine:
                 "Session transcript contains a workload secret in execution authority "
                 "and cannot be compacted."
             ) from None
-        if len(transcript) != retained_transcript_count:
-            raise AssertionError("Session transcript projection changed its message count.")
-
         candidate_app_policy_budget_limits = budget_limits_for_session(
             policy=self._get_budget_policy(),
             agent_name=registered_agent.spec.name,
@@ -9125,6 +9121,7 @@ class SessionEngine:
 
         provider = registered_provider.provider
         model_projection_cursor = session_model_projection_cursor(session)
+        model_projection_source_prefix_count = 0
         model_projection_prefix_count = 0
         if model_projection_cursor:
             model_projection_snapshot = await self.session_store.load_transcript_snapshot(
@@ -9137,16 +9134,20 @@ class SessionEngine:
                     )
                 deferred_tail_count = len(messages_to_append) if messages_deferred else 0
                 retained_message_count = len(messages) - deferred_tail_count
-                if retained_message_count < 0 or retained_message_count != len(
-                    model_projection_snapshot.records
+                model_projection = _project_model_target_snapshot(
+                    model_projection_snapshot,
+                    model_projection_cursor,
+                )
+                model_projection_source_prefix_count = model_projection.source_prefix_count
+                model_projection_prefix_count = model_projection.projected_prefix_count
+                expected_retained_message_count = len(model_projection.messages)
+                if (
+                    retained_message_count < 0
+                    or retained_message_count != expected_retained_message_count
                 ):
                     raise RuntimeError(
                         "Model-facing transcript does not match the retained durable transcript."
                     )
-                model_projection_prefix_count = sum(
-                    record.index < model_projection_cursor
-                    for record in model_projection_snapshot.records
-                )
             finally:
                 del model_projection_snapshot
         # Resume admission already supplied the model-facing projection. A new
@@ -9390,7 +9391,24 @@ class SessionEngine:
                     pending_result_position = pending_snapshot.retained_position(
                         pending_result_cursor
                     )
-                    expected_resume_message_count = len(pending_snapshot.records) + (
+                    if model_projection_cursor:
+                        pending_projection = _project_model_target_snapshot(
+                            pending_snapshot,
+                            model_projection_cursor,
+                        )
+                        if pending_result_position < model_projection_source_prefix_count:
+                            raise RuntimeError(
+                                "Pending tool round predates the model-target projection boundary."
+                            )
+                        pending_result_position = (
+                            pending_projection.projected_prefix_count
+                            + pending_result_position
+                            - model_projection_source_prefix_count
+                        )
+                        retained_pending_message_count = len(pending_projection.messages)
+                    else:
+                        retained_pending_message_count = len(pending_snapshot.records)
+                    expected_resume_message_count = retained_pending_message_count + (
                         len(messages_to_append) if messages_deferred else 0
                     )
                     if len(messages) != expected_resume_message_count:

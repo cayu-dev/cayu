@@ -150,7 +150,10 @@ class ThinkingPart(BaseModel):
     `text` may be empty (the provider returned the reasoning in an omitted/redacted
     form). `provider_state` carries the opaque round-trip payload — the Anthropic
     `signature` or `redacted_thinking` data, or an OpenAI encrypted reasoning blob —
-    needed to send the block back to the provider on a later turn.
+    needed to send the block back to the provider on a later turn. Built-in providers
+    tag opaque reasoning state with its provider family, protocol, and protocol version;
+    request adapters replay it only when all three match. Legacy untagged state remains
+    readable in the durable transcript but is not authoritative for opaque replay.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)

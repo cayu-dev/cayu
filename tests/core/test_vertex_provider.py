@@ -19,6 +19,7 @@ from cayu import (
     RunRequest,
     StructuredOutputSpec,
 )
+from cayu.core.messages import TextPart, ThinkingPart
 from cayu.providers import (
     HttpxVertexTransport,
     InputTokenCountConfidence,
@@ -171,6 +172,72 @@ async def test_vertex_provider_emits_text_and_completed_events() -> None:
     # The model lives in the URL, not the body; the version moves into the body.
     assert "model" not in call["payload"]
     assert call["payload"]["anthropic_version"] == "vertex-2023-10-16"
+
+
+@pytest.mark.anyio
+async def test_vertex_replays_only_its_matching_anthropic_protocol_state() -> None:
+    transport = RecordingTransport(
+        [
+            {
+                "id": "msg_reasoning",
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "thinking", "thinking": "vertex thought", "signature": "vertex-sig"},
+                    {"type": "text", "text": "first answer"},
+                ],
+                "usage": {},
+            },
+            _OK_RESPONSE,
+        ]
+    )
+    provider = _provider(transport)
+    version_attribute = "anthropic_version"
+    with pytest.raises(AttributeError):
+        setattr(provider, version_attribute, "mutated-version")
+
+    first_events = [event async for event in provider.stream(_request())]
+    state = first_events[0].payload["provider_state"]
+    assert state == {
+        "provider": "vertex",
+        "protocol": "messages",
+        "protocol_version": "vertex-2023-10-16",
+        "type": "thinking",
+        "signature": "vertex-sig",
+    }
+    assert transport.calls[0]["payload"]["anthropic_version"] == "vertex-2023-10-16"
+
+    continuation = ModelRequest(
+        model="claude-sonnet-4-6",
+        messages=[
+            Message.text("user", "first"),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingPart(text="vertex thought", provider_state=state),
+                    ThinkingPart(
+                        text="direct Anthropic thought",
+                        provider_state={
+                            "provider": "anthropic",
+                            "protocol": "messages",
+                            "protocol_version": "2023-06-01",
+                            "type": "thinking",
+                            "signature": "anthropic-sig",
+                        },
+                    ),
+                    TextPart(text="first answer"),
+                ],
+            ),
+            Message.text("user", "continue"),
+        ],
+    )
+
+    _ = [event async for event in provider.stream(continuation)]
+
+    assert transport.calls[1]["payload"]["messages"][1]["content"] == [
+        {"type": "thinking", "thinking": "vertex thought", "signature": "vertex-sig"},
+        {"type": "text", "text": "first answer"},
+    ]
 
 
 @pytest.mark.anyio

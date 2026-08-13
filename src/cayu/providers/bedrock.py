@@ -37,6 +37,13 @@ from cayu.providers._credential_boundary import (
 from cayu.providers._http import (
     sanitize_provider_cancellation,
 )
+from cayu.providers._reasoning_state import (
+    BEDROCK_REASONING_PROTOCOL,
+    BEDROCK_REASONING_PROTOCOL_VERSION,
+    ReasoningStateProvenance,
+    reasoning_state,
+    reasoning_state_matches,
+)
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -67,6 +74,11 @@ BedrockProfileScope = Literal["global", "geographic"]
 _BEDROCK_RESOURCE_TYPES = frozenset(get_args(BedrockResourceType))
 _BEDROCK_PROFILE_SCOPES = frozenset(get_args(BedrockProfileScope))
 _BEDROCK_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_BEDROCK_REASONING_PROVENANCE = ReasoningStateProvenance(
+    provider="bedrock",
+    protocol=BEDROCK_REASONING_PROTOCOL,
+    protocol_version=BEDROCK_REASONING_PROTOCOL_VERSION,
+)
 _SAFE_BEDROCK_STRUCTURED_FIELDS = frozenset(
     {
         "AccessDeniedException",
@@ -800,14 +812,20 @@ async def bedrock_converse_stream_events(
                         )
                     yield ModelStreamEvent.thinking(
                         provider_state={
-                            "type": "redacted_content",
+                            **reasoning_state(
+                                "redacted_content",
+                                provenance=_BEDROCK_REASONING_PROVENANCE,
+                            ),
                             "data_base64": base64.b64encode(
                                 b"".join(reasoning.redacted_parts)
                             ).decode("ascii"),
                         }
                     )
                 else:
-                    provider_state: dict[str, Any] = {"type": "reasoning_text"}
+                    provider_state = reasoning_state(
+                        "reasoning_text",
+                        provenance=_BEDROCK_REASONING_PROVENANCE,
+                    )
                     signature = "".join(reasoning.signature_parts)
                     if signature:
                         provider_state["signature"] = signature
@@ -994,6 +1012,11 @@ def _bedrock_message_content(
 
 def _bedrock_reasoning_block(part: ThinkingPart) -> dict[str, Any] | None:
     state = part.provider_state or {}
+    if not reasoning_state_matches(
+        state,
+        provenance=_BEDROCK_REASONING_PROVENANCE,
+    ):
+        return None
     if state.get("type") == "reasoning_text":
         signature = state.get("signature")
         if isinstance(signature, str) and signature:

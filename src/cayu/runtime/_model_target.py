@@ -19,6 +19,8 @@ class PortableTranscriptProjection:
     messages: tuple[Message, ...]
     provider_state_parts_dropped: int
     thinking_parts_dropped: int
+    source_prefix_count: int
+    projected_prefix_count: int
 
 
 def project_portable_transcript(messages: list[Message]) -> PortableTranscriptProjection:
@@ -37,8 +39,9 @@ def project_portable_transcript_prefix(
 
     Text, neutral tool calls/results, and Cayu file references remain intact.
     Opaque response ids, cache handles, encrypted reasoning, and signed thinking
-    blocks are removed. Message positions remain stable so durable transcript
-    cursors and publication receipts continue to address immutable source rows.
+    blocks are removed. Assistant shells left with no portable parts are omitted
+    from the model-facing copy; durable cursors continue to address the unchanged
+    source rows rather than positions in this shorter projection.
     """
 
     if type(messages) is not list:
@@ -48,11 +51,14 @@ def project_portable_transcript_prefix(
     projected: list[Message] = []
     provider_state_parts_dropped = 0
     thinking_parts_dropped = 0
+    projected_prefix_count = 0
     for index, message in enumerate(messages):
         if type(message) is not Message:
             raise TypeError("Transcript messages must contain exact Message instances.")
         if index >= transcript_cursor or message.role is not MessageRole.ASSISTANT:
             projected.append(detach_message(message))
+            if index < transcript_cursor:
+                projected_prefix_count += 1
             continue
         parts = []
         for part in message.content:
@@ -64,13 +70,13 @@ def project_portable_transcript_prefix(
                 continue
             parts.append(copy_message_part(part))
         if not parts:
-            raise ValueError(
-                "Session transcript assistant message at index "
-                f"{index} contains no portable text or tool calls."
-            )
+            continue
         projected.append(Message(role=message.role, content=tuple(parts)))
+        projected_prefix_count += 1
     return PortableTranscriptProjection(
         messages=tuple(projected),
         provider_state_parts_dropped=provider_state_parts_dropped,
         thinking_parts_dropped=thinking_parts_dropped,
+        source_prefix_count=transcript_cursor,
+        projected_prefix_count=projected_prefix_count,
     )

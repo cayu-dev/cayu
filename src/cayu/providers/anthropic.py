@@ -49,6 +49,12 @@ from cayu.providers._http import (
     validate_base_url,
     validate_url,
 )
+from cayu.providers._reasoning_state import (
+    ANTHROPIC_REASONING_PROTOCOL,
+    ReasoningStateProvenance,
+    reasoning_state,
+    reasoning_state_matches,
+)
 from cayu.providers.base import (
     InputTokenCountConfidence,
     InputTokenCountMethod,
@@ -83,6 +89,11 @@ DEFAULT_ANTHROPIC_TIMEOUT_SECONDS = 60.0
 DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 ANTHROPIC_CONTEXT_PRESSURE_IMAGE_MIN_TOKENS = 100
 ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS = 1800
+_DEFAULT_ANTHROPIC_REASONING_PROVENANCE = ReasoningStateProvenance(
+    provider="anthropic",
+    protocol=ANTHROPIC_REASONING_PROTOCOL,
+    protocol_version=DEFAULT_ANTHROPIC_VERSION,
+)
 
 _RESERVED_ANTHROPIC_OPTIONS = {
     "model",
@@ -337,6 +348,12 @@ class AnthropicProvider(ModelProvider):
             document_min_tokens=ANTHROPIC_CONTEXT_PRESSURE_DOCUMENT_MIN_TOKENS,
         )
 
+    @property
+    def anthropic_version(self) -> str:
+        """Return the immutable wire and reasoning-state protocol version."""
+
+        return self._reasoning_state_provenance.protocol_version
+
     def request_cache_policy(self, request: ModelRequest) -> CachePolicy | None:
         projection = self._request_cache_projection(
             request,
@@ -363,6 +380,7 @@ class AnthropicProvider(ModelProvider):
             request,
             default_max_tokens=self.max_tokens,
             cache_policy=policy,
+            reasoning_provenance=self._reasoning_state_provenance,
         )
         applied: list[CacheBreakpoint] = []
         system = payload.get("system")
@@ -458,9 +476,14 @@ class AnthropicProvider(ModelProvider):
         self.api_key_ref = None if api_key_ref is None else copy_secret_ref(api_key_ref)
         self.credential_proxy = credential_proxy
         self.base_url = _validate_base_url(base_url)
-        self.anthropic_version = require_clean_nonblank(
+        validated_anthropic_version = require_clean_nonblank(
             anthropic_version,
             "anthropic_version",
+        )
+        self._reasoning_state_provenance = ReasoningStateProvenance(
+            provider="anthropic",
+            protocol=ANTHROPIC_REASONING_PROTOCOL,
+            protocol_version=validated_anthropic_version,
         )
         if type(max_tokens) is not int:
             raise TypeError("max_tokens must be an integer.")
@@ -514,6 +537,7 @@ class AnthropicProvider(ModelProvider):
                 request,
                 default_max_tokens=self.max_tokens,
                 cache_policy=policy,
+                reasoning_provenance=self._reasoning_state_provenance,
             )
             stream_transport = getattr(self.transport, "stream_message_events", None)
             if stream_transport is None:
@@ -525,7 +549,10 @@ class AnthropicProvider(ModelProvider):
                     payload=payload,
                     timeout_s=self.timeout_s,
                 )
-                for event in anthropic_response_events(response):
+                for event in anthropic_response_events(
+                    response,
+                    reasoning_provenance=self._reasoning_state_provenance,
+                ):
                     completion_emitted = event.type == ModelStreamEventType.COMPLETED
                     yield event
                     if completion_emitted:
@@ -539,7 +566,10 @@ class AnthropicProvider(ModelProvider):
                     timeout_s=self.timeout_s,
                     stream_idle_timeout_s=self.stream_idle_timeout_s,
                 )
-                events = anthropic_stream_events(raw_events)
+                events = anthropic_stream_events(
+                    raw_events,
+                    reasoning_provenance=self._reasoning_state_provenance,
+                )
                 async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
                     async for event in events:
                         completion_emitted = event.type == ModelStreamEventType.COMPLETED
@@ -631,6 +661,7 @@ class AnthropicProvider(ModelProvider):
             request,
             default_max_tokens=self.max_tokens,
             cache_policy=policy,
+            reasoning_provenance=self._reasoning_state_provenance,
         )
         response = await self._safe_count_message_tokens(payload)
         return InputTokenCountResult(
@@ -754,6 +785,7 @@ def build_anthropic_payload(
     *,
     default_max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
     cache_policy: CachePolicy | None = None,
+    reasoning_provenance: ReasoningStateProvenance = _DEFAULT_ANTHROPIC_REASONING_PROVENANCE,
 ) -> dict[str, Any]:
     if type(request) is not ModelRequest:
         raise TypeError("request must be a ModelRequest.")
@@ -771,7 +803,11 @@ def build_anthropic_payload(
 
     resolved_attachments = resolved_file_attachments_from_options(request.options)
     messages = [
-        _anthropic_message(message, resolved_attachments=resolved_attachments)
+        _anthropic_message(
+            message,
+            resolved_attachments=resolved_attachments,
+            reasoning_provenance=reasoning_provenance,
+        )
         for message in request.messages
     ]
     payload["messages"] = [message for message in messages if message is not None]
@@ -791,11 +827,13 @@ def build_anthropic_token_count_payload(
     *,
     default_max_tokens: int = DEFAULT_ANTHROPIC_MAX_TOKENS,
     cache_policy: CachePolicy | None = None,
+    reasoning_provenance: ReasoningStateProvenance = _DEFAULT_ANTHROPIC_REASONING_PROVENANCE,
 ) -> dict[str, Any]:
     payload = build_anthropic_payload(
         request,
         default_max_tokens=default_max_tokens,
         cache_policy=cache_policy,
+        reasoning_provenance=reasoning_provenance,
     )
     payload.pop("max_tokens", None)
     return payload
@@ -928,6 +966,8 @@ def _marked_anthropic_conversation_prefix(
 
 def anthropic_response_events(
     response: Mapping[str, Any],
+    *,
+    reasoning_provenance: ReasoningStateProvenance = _DEFAULT_ANTHROPIC_REASONING_PROVENANCE,
 ) -> list[ModelStreamEvent]:
     if not isinstance(response, Mapping):
         raise AnthropicProtocolError("Anthropic response must be a JSON object.")
@@ -956,7 +996,10 @@ def anthropic_response_events(
                 raise AnthropicProtocolError(
                     f"Anthropic thinking block {index} requires string thinking."
                 )
-            provider_state: dict[str, Any] = {"type": "thinking"}
+            provider_state = reasoning_state(
+                "thinking",
+                provenance=reasoning_provenance,
+            )
             signature = block.get("signature")
             if isinstance(signature, str) and signature:
                 provider_state["signature"] = signature
@@ -969,7 +1012,13 @@ def anthropic_response_events(
                 )
             events.append(
                 ModelStreamEvent.thinking(
-                    provider_state={"type": "redacted_thinking", "data": data}
+                    provider_state={
+                        **reasoning_state(
+                            "redacted_thinking",
+                            provenance=reasoning_provenance,
+                        ),
+                        "data": data,
+                    }
                 )
             )
         elif block_type == "tool_use":
@@ -1034,6 +1083,7 @@ async def anthropic_stream_events(
     api_error: Callable[..., Exception] = AnthropicAPIError,
     protocol_error: type[Exception] = AnthropicProtocolError,
     context_overflow_error: Callable[..., Exception] = AnthropicContextOverflowError,
+    reasoning_provenance: ReasoningStateProvenance = _DEFAULT_ANTHROPIC_REASONING_PROVENANCE,
 ) -> AsyncIterator[ModelStreamEvent]:
     """Translate Anthropic Messages SSE events into Cayu model stream events.
 
@@ -1181,7 +1231,10 @@ async def anthropic_stream_events(
                     f"{provider_label} content_block_stop arrived before content_block_start."
                 )
             if pending.type == "thinking":
-                provider_state: dict[str, Any] = {"type": "thinking"}
+                provider_state = reasoning_state(
+                    "thinking",
+                    provenance=reasoning_provenance,
+                )
                 signature = "".join(pending.signature_parts)
                 if signature:
                     provider_state["signature"] = signature
@@ -1191,7 +1244,13 @@ async def anthropic_stream_events(
                 )
             elif pending.type == "redacted_thinking":
                 yield ModelStreamEvent.thinking(
-                    provider_state={"type": "redacted_thinking", "data": pending.data}
+                    provider_state={
+                        **reasoning_state(
+                            "redacted_thinking",
+                            provenance=reasoning_provenance,
+                        ),
+                        "data": pending.data,
+                    }
                 )
             elif pending.type == "tool_use":
                 joined = "".join(pending.json_parts)
@@ -1426,6 +1485,7 @@ def _anthropic_message(
     message: Message,
     *,
     resolved_attachments: dict[str, dict[str, Any]],
+    reasoning_provenance: ReasoningStateProvenance = _DEFAULT_ANTHROPIC_REASONING_PROVENANCE,
 ) -> dict[str, Any] | None:
     if message.role == MessageRole.SYSTEM:
         return None
@@ -1446,7 +1506,10 @@ def _anthropic_message(
             if type(part) is ProviderStatePart:
                 continue
             if type(part) is ThinkingPart:
-                thinking_block = _assistant_thinking_block(part)
+                thinking_block = _assistant_thinking_block(
+                    part,
+                    reasoning_provenance=reasoning_provenance,
+                )
                 if thinking_block is not None:
                     content.append(thinking_block)
                 continue
@@ -1510,15 +1573,25 @@ def _assistant_block(
     raise AnthropicProtocolError("Assistant messages can only contain text and tool_call blocks.")
 
 
-def _assistant_thinking_block(part: ThinkingPart) -> dict[str, Any] | None:
+def _assistant_thinking_block(
+    part: ThinkingPart,
+    *,
+    reasoning_provenance: ReasoningStateProvenance = _DEFAULT_ANTHROPIC_REASONING_PROVENANCE,
+) -> dict[str, Any] | None:
     """Round-trip a thinking block back to Anthropic, or drop it when not echoable.
 
     Anthropic requires a tool-use loop's prior thinking/redacted_thinking blocks to be
-    echoed verbatim with their ``signature``/``data``. A `ThinkingPart` lacking that
-    opaque state (another provider's reasoning, or a cross-model switch) cannot be
-    echoed, so it is dropped rather than triggering a 400.
+    echoed verbatim with their ``signature``/``data``. A `ThinkingPart` lacking matching
+    provider/protocol/version provenance (including legacy state, another provider's
+    reasoning, or a cross-model switch) cannot be echoed, so it is dropped rather than
+    triggering a 400.
     """
     state = part.provider_state or {}
+    if not reasoning_state_matches(
+        state,
+        provenance=reasoning_provenance,
+    ):
+        return None
     if state.get("type") == "redacted_thinking":
         data = state.get("data")
         if isinstance(data, str) and data:

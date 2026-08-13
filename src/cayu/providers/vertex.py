@@ -28,6 +28,10 @@ from cayu.providers._http import (
     validate_base_url,
     validate_url,
 )
+from cayu.providers._reasoning_state import (
+    ANTHROPIC_REASONING_PROTOCOL,
+    ReasoningStateProvenance,
+)
 from cayu.providers.anthropic import (
     _anthropic_overflow_message,
     _anthropic_tool,
@@ -312,6 +316,12 @@ class VertexProvider(ModelProvider):
             )
         }
 
+    @property
+    def anthropic_version(self) -> str:
+        """Return the immutable wire and reasoning-state protocol version."""
+
+        return self._reasoning_state_provenance.protocol_version
+
     def __init__(
         self,
         *,
@@ -331,7 +341,15 @@ class VertexProvider(ModelProvider):
         self.name = require_clean_nonblank(name, "name")
         self.project_id = require_clean_nonblank(project_id, "project_id")
         self.region = require_clean_nonblank(region, "region")
-        self.anthropic_version = require_clean_nonblank(anthropic_version, "anthropic_version")
+        validated_anthropic_version = require_clean_nonblank(
+            anthropic_version,
+            "anthropic_version",
+        )
+        self._reasoning_state_provenance = ReasoningStateProvenance(
+            provider="vertex",
+            protocol=ANTHROPIC_REASONING_PROTOCOL,
+            protocol_version=validated_anthropic_version,
+        )
         self.base_url = _validate_base_url(base_url) if base_url is not None else None
         if type(max_tokens) is not int:
             raise TypeError("max_tokens must be an integer.")
@@ -378,6 +396,7 @@ class VertexProvider(ModelProvider):
             payload = build_anthropic_payload(
                 request,
                 default_max_tokens=self.max_tokens,
+                reasoning_provenance=self._reasoning_state_provenance,
             )
             payload.pop("model", None)
             payload["anthropic_version"] = self.anthropic_version
@@ -392,7 +411,10 @@ class VertexProvider(ModelProvider):
                     payload=payload,
                     timeout_s=self.timeout_s,
                 )
-                for event in anthropic_response_events(response):
+                for event in anthropic_response_events(
+                    response,
+                    reasoning_provenance=self._reasoning_state_provenance,
+                ):
                     completion_emitted = event.type == ModelStreamEventType.COMPLETED
                     yield event
                     if completion_emitted:
@@ -412,6 +434,7 @@ class VertexProvider(ModelProvider):
                     api_error=VertexAPIError,
                     protocol_error=VertexProtocolError,
                     context_overflow_error=VertexContextOverflowError,
+                    reasoning_provenance=self._reasoning_state_provenance,
                 )
                 async with aclosing_provider_stream(raw_events), aclosing_provider_stream(events):
                     async for event in events:
@@ -495,6 +518,7 @@ class VertexProvider(ModelProvider):
         payload = build_anthropic_token_count_payload(
             request,
             default_max_tokens=self.max_tokens,
+            reasoning_provenance=self._reasoning_state_provenance,
         )
         payload["anthropic_version"] = self.anthropic_version
         response = await self._safe_count_message_tokens(count_transport, payload)

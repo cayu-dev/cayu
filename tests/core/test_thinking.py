@@ -24,6 +24,7 @@ from cayu.providers.anthropic import (
     build_anthropic_payload,
 )
 from cayu.providers.base import ModelCompletion, ModelFinishReason
+from cayu.providers.bedrock import build_bedrock_converse_payload
 from cayu.providers.chat_completions import (
     _assistant_message as chat_assistant_message,
 )
@@ -49,6 +50,16 @@ from cayu.runtime.sessions import (
     filter_transcript_records,
 )
 from cayu.runtime.usage import normalize_usage_metrics
+
+
+def _anthropic_state(state_type: str, **opaque: str) -> dict[str, str]:
+    return {
+        "provider": "anthropic",
+        "protocol": "messages",
+        "protocol_version": "2023-06-01",
+        "type": state_type,
+        **opaque,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -325,17 +336,22 @@ def test_anthropic_parses_thinking_blocks_without_crashing() -> None:
     events = anthropic_response_events(response)
     thinking = [e for e in events if e.type == ModelStreamEventType.THINKING]
     assert [e.delta for e in thinking] == ["step by step", ""]
-    assert thinking[0].payload["provider_state"] == {"type": "thinking", "signature": "SIG"}
-    assert thinking[1].payload["provider_state"] == {"type": "redacted_thinking", "data": "BLOB"}
+    assert thinking[0].payload["provider_state"] == _anthropic_state("thinking", signature="SIG")
+    assert thinking[1].payload["provider_state"] == _anthropic_state(
+        "redacted_thinking", data="BLOB"
+    )
 
 
 def test_anthropic_round_trips_thinking_verbatim_first() -> None:
     message = Message(
         role=MessageRole.ASSISTANT,
         content=[
-            ThinkingPart(text="reason", provider_state={"type": "thinking", "signature": "SIG"}),
             ThinkingPart(
-                provider_state={"type": "redacted_thinking", "data": "BLOB"},
+                text="reason",
+                provider_state=_anthropic_state("thinking", signature="SIG"),
+            ),
+            ThinkingPart(
+                provider_state=_anthropic_state("redacted_thinking", data="BLOB"),
             ),
             TextPart(text="answer"),
         ],
@@ -357,6 +373,116 @@ def test_anthropic_drops_thinking_without_signature() -> None:
     rendered = _anthropic_message(message, resolved_attachments={})
     assert rendered is not None
     assert rendered["content"] == [{"type": "text", "text": "answer"}]
+
+
+@pytest.mark.parametrize(
+    "provider_state",
+    [
+        {
+            "provider": "bedrock",
+            "protocol": "converse",
+            "protocol_version": "1",
+            "type": "reasoning_text",
+            "signature": "bedrock-signature",
+        },
+        {
+            "provider": "unknown",
+            "protocol": "messages",
+            "protocol_version": "2023-06-01",
+            "type": "thinking",
+            "signature": "unknown-signature",
+        },
+        {
+            "provider": "anthropic",
+            "protocol": "messages",
+            "protocol_version": "unsupported",
+            "type": "thinking",
+            "signature": "wrong-version-signature",
+        },
+        {
+            "provider": ["anthropic"],
+            "protocol": "messages",
+            "protocol_version": "2023-06-01",
+            "type": "thinking",
+            "signature": "malformed-provider-signature",
+        },
+        {"type": "thinking", "signature": "legacy-signature"},
+    ],
+    ids=["bedrock", "unknown-provider", "wrong-version", "malformed", "legacy"],
+)
+def test_anthropic_drops_opaque_reasoning_without_matching_provenance(
+    provider_state: dict[str, object],
+) -> None:
+    message = Message(
+        role=MessageRole.ASSISTANT,
+        content=[
+            ThinkingPart(text="foreign reasoning", provider_state=provider_state),
+            TextPart(text="portable answer"),
+        ],
+    )
+
+    rendered = _anthropic_message(message, resolved_attachments={})
+
+    assert rendered is not None
+    assert rendered["content"] == [{"type": "text", "text": "portable answer"}]
+
+
+@pytest.mark.parametrize(
+    "provider_state",
+    [
+        {
+            "provider": "anthropic",
+            "protocol": "messages",
+            "protocol_version": "2023-06-01",
+            "type": "thinking",
+            "signature": "anthropic-signature",
+        },
+        {
+            "provider": "unknown",
+            "protocol": "converse",
+            "protocol_version": "1",
+            "type": "reasoning_text",
+            "signature": "unknown-signature",
+        },
+        {
+            "provider": "bedrock",
+            "protocol": "converse",
+            "protocol_version": "unsupported",
+            "type": "reasoning_text",
+            "signature": "wrong-version-signature",
+        },
+        {
+            "provider": ["bedrock"],
+            "protocol": "converse",
+            "protocol_version": "1",
+            "type": "reasoning_text",
+            "signature": "malformed-provider-signature",
+        },
+        {"type": "reasoning_text", "signature": "legacy-signature"},
+    ],
+    ids=["anthropic", "unknown-provider", "wrong-version", "malformed", "legacy"],
+)
+def test_bedrock_drops_opaque_reasoning_without_matching_provenance(
+    provider_state: dict[str, object],
+) -> None:
+    request = ModelRequest(
+        model="anthropic.claude-test",
+        messages=[
+            Message.text("user", "first"),
+            Message(
+                role=MessageRole.ASSISTANT,
+                content=[
+                    ThinkingPart(text="foreign reasoning", provider_state=provider_state),
+                    TextPart(text="portable answer"),
+                ],
+            ),
+            Message.text("user", "continue"),
+        ],
+    )
+
+    payload = build_bedrock_converse_payload(request)
+
+    assert payload["messages"][1]["content"] == [{"text": "portable answer"}]
 
 
 def test_anthropic_request_passes_thinking_options_through() -> None:
@@ -496,7 +622,8 @@ class _ThinkingProvider(ModelProvider):
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         self.options = request.options
         yield ModelStreamEvent.thinking(
-            "let me think", provider_state={"type": "thinking", "signature": "SIG"}
+            "let me think",
+            provider_state=_anthropic_state("thinking", signature="SIG"),
         )
         yield ModelStreamEvent.text_delta("42")
         yield ModelStreamEvent.completed(
@@ -558,7 +685,7 @@ def test_run_request_thinking_overrides_agentspec() -> None:
 def test_thinking_part_persisted_with_signature() -> None:
     _provider, _events, transcript = asyncio.run(_run(agent_thinking=ThinkingConfig(effort="high")))
     parts = _thinking_parts(transcript)
-    assert parts[0].provider_state == {"type": "thinking", "signature": "SIG"}
+    assert parts[0].provider_state == _anthropic_state("thinking", signature="SIG")
 
 
 def test_include_in_transcript_false_keeps_signed_block_intact() -> None:
@@ -570,7 +697,7 @@ def test_include_in_transcript_false_keeps_signed_block_intact() -> None:
     parts = _thinking_parts(transcript)
     assert len(parts) == 1
     assert parts[0].text == "let me think"
-    assert parts[0].provider_state == {"type": "thinking", "signature": "SIG"}
+    assert parts[0].provider_state == _anthropic_state("thinking", signature="SIG")
 
 
 def test_model_thinking_delta_event_emitted() -> None:
@@ -581,6 +708,12 @@ def test_model_thinking_delta_event_emitted() -> None:
         if event.type == EventType.MODEL_THINKING_DELTA
     ]
     assert deltas == ["let me think"]
+
+
+def test_public_runtime_events_do_not_expose_opaque_reasoning_state() -> None:
+    _provider, events, _transcript = asyncio.run(_run(agent_thinking=ThinkingConfig(effort="high")))
+
+    assert "SIG" not in repr(events)
 
 
 def test_no_thinking_config_leaves_options_unchanged() -> None:
