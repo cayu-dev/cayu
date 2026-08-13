@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
+    UUID4,
     BaseModel,
     ConfigDict,
     Field,
@@ -57,6 +58,7 @@ from cayu.runtime.costs import (
     SessionCostSummary,
 )
 from cayu.runtime.interactions import InteractionSummaryEvidence
+from cayu.runtime.invocation import InvocationOriginTrust, SessionExecutionSource
 from cayu.runtime.sessions import (
     MAX_USAGE_ROLLUP_WINDOW,
     SESSION_TOPOLOGY_DEFAULT_CHILD_LIMIT,
@@ -1073,8 +1075,26 @@ class ApiSessionBase(ApiBaseModel):
     labels: dict[str, str]
 
 
+class ApiInvocationOrigin(ApiBaseModel):
+    trust: InvocationOriginTrust
+    subject: str | None
+    tenant: str | None
+
+
+class ApiSessionInvocation(ApiBaseModel):
+    schema_version: Literal[1]
+    origin: ApiInvocationOrigin
+    root_invocation_id: UUID4
+    root_session_id: str
+    source: SessionExecutionSource
+
+
 class ApiSession(ApiSessionBase):
     metadata: dict[str, Any]
+
+
+class ApiSessionDetail(ApiSession):
+    invocation: ApiSessionInvocation
 
 
 class ListSessionsResponse(ApiBaseModel):
@@ -1769,6 +1789,17 @@ BOUNDED_STREAMING_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
     **STREAMING_ENDPOINT_RESPONSES,
     413: {
         "description": "The control-plane request exceeds its encoded byte limit.",
+        "model": ApiErrorResponse,
+    },
+}
+
+RUN_ENDPOINT_RESPONSES: dict[int | str, dict[str, Any]] = {
+    **BOUNDED_STREAMING_ENDPOINT_RESPONSES,
+    400: {
+        "description": (
+            "The authenticated caller identity cannot be represented as durable "
+            "invocation provenance."
+        ),
         "model": ApiErrorResponse,
     },
 }

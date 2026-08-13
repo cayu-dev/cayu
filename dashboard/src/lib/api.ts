@@ -9,6 +9,7 @@ import type {
   ApiPendingAction,
   ApiPendingActionIssue,
   ApiReviewedKnowledgeEntry,
+  ApiSession,
   ApiSessionBase,
   ApiTaskDetail,
   ApiTaskListItem,
@@ -118,6 +119,7 @@ export type Session = ApiSessionBase
 export type SessionEvent = SseEventEnvelope
 export type TranscriptMessage = ApiTranscriptMessage
 export type SessionDetail = GetSessionApiSessionsSessionIdGetResponse
+export type SessionUpdate = ApiSession
 export type SessionState = GetSessionStateApiSessionsSessionIdStateGetResponse
 export type SessionSummary = GetSessionSummaryApiSessionsSessionIdSummaryGetResponse
 export type SessionTopology = GetSessionTopologyApiSessionsSessionIdTopologyPostResponse
@@ -586,7 +588,7 @@ function evaluationPromotionFilename(contentDisposition: string | null): string 
 export async function updateSessionLabels(
   id: string,
   body: SessionLabelsUpdate,
-): Promise<SessionDetail> {
+): Promise<SessionUpdate> {
   return patchJson<UpdateSessionLabelsApiSessionsSessionIdLabelsPatchResponse>(
     `/sessions/${encodeURIComponent(id)}/labels`,
     body,
@@ -596,7 +598,7 @@ export async function updateSessionLabels(
 export async function updateSessionMetadata(
   id: string,
   body: SessionMetadataUpdate,
-): Promise<SessionDetail> {
+): Promise<SessionUpdate> {
   return patchJson<UpdateSessionMetadataApiSessionsSessionIdMetadataPatchResponse>(
     `/sessions/${encodeURIComponent(id)}/metadata`,
     body,

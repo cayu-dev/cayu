@@ -7,6 +7,27 @@ this off?*
 Applications can call these entry points directly or enqueue Cayu tasks; an
 external workflow engine is optional.
 
+When trusted in-process application code has already authenticated a root
+caller, it can retain that identity across the complete delegated session tree:
+
+```python
+RunRequest(
+    agent_name="assistant",
+    messages=[Message.text("user", prompt)],
+    invocation_origin=InvocationOriginClaim(
+        subject=authenticated_user_id,
+        tenant=authenticated_tenant_id,
+    ),
+)
+```
+
+This is a host assertion, not authentication performed by Cayu. The protected
+HTTP `/api/run` boundary instead stamps its verified `AuthContext` itself, and
+open or unattributed SDK calls remain explicitly unattributed. Child sessions
+inherit both the root origin and Cayu-minted `root_invocation_id`
+automatically; applications must not copy either into child requests. That
+invocation ID remains unique even if a deleted root's session ID is reused.
+
 | Your trigger | Use | Notes |
 | --- | --- | --- |
 | A synchronous request you can await in-process | `app.run(RunRequest(...))` | The base case. Returns an async event stream. No durability beyond the session stores. |

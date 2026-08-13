@@ -974,6 +974,43 @@
       "title": "ApiInteractionSummary",
       "type": "object"
     },
+    "ApiInvocationOrigin": {
+      "additionalProperties": false,
+      "properties": {
+        "subject": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Subject"
+        },
+        "tenant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tenant"
+        },
+        "trust": {
+          "$ref": "#/components/schemas/InvocationOriginTrust"
+        }
+      },
+      "required": [
+        "trust",
+        "subject",
+        "tenant"
+      ],
+      "title": "ApiInvocationOrigin",
+      "type": "object"
+    },
     "ApiKnowledgeChunk": {
       "additionalProperties": false,
       "properties": {
@@ -1891,6 +1928,169 @@
         "labels"
       ],
       "title": "ApiSessionBase",
+      "type": "object"
+    },
+    "ApiSessionDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_name": {
+          "title": "Agent Name",
+          "type": "string"
+        },
+        "causal_budget_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Causal Budget Id"
+        },
+        "created_at": {
+          "title": "Created At",
+          "type": "string"
+        },
+        "environment_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Environment Name"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "invocation": {
+          "$ref": "#/components/schemas/ApiSessionInvocation"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "title": "Labels",
+          "type": "object"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "title": "Metadata",
+          "type": "object"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Model"
+        },
+        "parent_session_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Parent Session Id"
+        },
+        "provider_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Provider Name"
+        },
+        "runtime_name": {
+          "title": "Runtime Name",
+          "type": "string"
+        },
+        "runtime_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Runtime Version"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        },
+        "updated_at": {
+          "title": "Updated At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "agent_name",
+        "provider_name",
+        "model",
+        "parent_session_id",
+        "causal_budget_id",
+        "runtime_name",
+        "runtime_version",
+        "environment_name",
+        "created_at",
+        "updated_at",
+        "labels",
+        "metadata",
+        "invocation"
+      ],
+      "title": "ApiSessionDetail",
+      "type": "object"
+    },
+    "ApiSessionInvocation": {
+      "additionalProperties": false,
+      "properties": {
+        "origin": {
+          "$ref": "#/components/schemas/ApiInvocationOrigin"
+        },
+        "root_invocation_id": {
+          "format": "uuid4",
+          "title": "Root Invocation Id",
+          "type": "string"
+        },
+        "root_session_id": {
+          "title": "Root Session Id",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "source": {
+          "$ref": "#/components/schemas/SessionExecutionSource"
+        }
+      },
+      "required": [
+        "schema_version",
+        "origin",
+        "root_invocation_id",
+        "root_session_id",
+        "source"
+      ],
+      "title": "ApiSessionInvocation",
       "type": "object"
     },
     "ApiSessionOutcome": {
@@ -4242,6 +4442,16 @@
       "title": "InterruptSessionBody",
       "type": "object"
     },
+    "InvocationOriginTrust": {
+      "description": "How Cayu obtained the root invocation identity.",
+      "enum": [
+        "server_verified",
+        "host_asserted",
+        "unattributed"
+      ],
+      "title": "InvocationOriginTrust",
+      "type": "string"
+    },
     "KnowledgeVisibility": {
       "enum": [
         "global",
@@ -5680,7 +5890,7 @@
           "$ref": "#/components/schemas/ClientGenerationContract"
         },
         "contract_version": {
-          "default": "9",
+          "default": "10",
           "title": "Contract Version",
           "type": "string"
         },
@@ -5864,6 +6074,18 @@
         "interruption"
       ],
       "title": "SessionDebugState",
+      "type": "string"
+    },
+    "SessionExecutionSource": {
+      "description": "The runtime boundary that created one session.",
+      "enum": [
+        "http_run",
+        "sdk_run",
+        "fork",
+        "subagent",
+        "workflow_step"
+      ],
+      "title": "SessionExecutionSource",
       "type": "string"
     },
     "SessionMessageDeliveryMode": {
@@ -8965,7 +9187,7 @@
           "type": "string"
         },
         "contract_version": {
-          "default": "9",
+          "default": "10",
           "title": "Contract Version",
           "type": "string"
         }
@@ -10222,6 +10444,13 @@
               }
             }
           },
+          "400": {
+            "content": {
+              "application/json": {
+                "$ref": "#/components/schemas/ApiErrorResponse"
+              }
+            }
+          },
           "404": {
             "content": {
               "application/json": {
@@ -10836,7 +11065,7 @@
           "200": {
             "content": {
               "application/json": {
-                "$ref": "#/components/schemas/ApiSession"
+                "$ref": "#/components/schemas/ApiSessionDetail"
               }
             }
           },

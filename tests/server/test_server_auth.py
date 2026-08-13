@@ -13,7 +13,13 @@ pytest.importorskip("sse_starlette")
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 
-from cayu import AgentSpec, CayuApp, InMemoryTaskStore
+from cayu import (
+    AgentSpec,
+    CayuApp,
+    InMemoryTaskStore,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+)
 from cayu.core.events import Event, EventType
 from cayu.providers import ModelProvider, ModelRequest, ModelStreamEvent
 from cayu.server import (
@@ -616,6 +622,118 @@ def test_local_development_server_keeps_routes_open() -> None:
     with client.stream("POST", "/api/run", json={"prompt": "hello"}) as response:
         assert response.status_code == 200
         list(response.iter_lines())
+
+    sessions = asyncio.run(app.session_store.list_sessions())
+    assert len(sessions.sessions) == 1
+    invocation = sessions.sessions[0].invocation
+    assert invocation.source is SessionExecutionSource.HTTP_RUN
+    assert invocation.origin.trust is InvocationOriginTrust.UNATTRIBUTED
+
+
+def test_authenticated_run_persists_only_the_verified_root_identity() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
+
+    forged = client.post(
+        "/api/run",
+        headers=_AUTH_HEADERS,
+        json={
+            "prompt": "hello",
+            "invocation_origin": {
+                "subject": "forged-user",
+                "tenant": "forged-tenant",
+            },
+        },
+    )
+    assert forged.status_code == 422
+    assert asyncio.run(app.session_store.list_sessions()).sessions == []
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        headers=_AUTH_HEADERS,
+        json={
+            "prompt": "hello",
+            "session_id": "unknown-field-compatible",
+            "future_client_hint": "ignored as before",
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    with client.stream(
+        "POST",
+        "/api/run",
+        headers=_AUTH_HEADERS,
+        json={"prompt": "hello", "session_id": "verified-http-root"},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    sessions = asyncio.run(app.session_store.list_sessions())
+    assert len(sessions.sessions) == 2
+    session = asyncio.run(app.session_store.load("verified-http-root"))
+    assert session is not None
+    assert session.invocation.source is SessionExecutionSource.HTTP_RUN
+    assert session.invocation.origin.trust is InvocationOriginTrust.SERVER_VERIFIED
+    assert session.invocation.origin.subject == "test-user"
+    assert session.invocation.origin.tenant == "tenant-a"
+    detail = client.get(f"/api/sessions/{session.id}", headers=_AUTH_HEADERS)
+    assert detail.status_code == 200
+    assert detail.json()["invocation"] == {
+        "schema_version": 1,
+        "origin": {
+            "trust": "server_verified",
+            "subject": "test-user",
+            "tenant": "tenant-a",
+        },
+        "root_invocation_id": str(session.invocation.root_invocation_id),
+        "root_session_id": session.id,
+        "source": "http_run",
+    }
+    listed = client.get("/api/sessions", headers=_AUTH_HEADERS)
+    assert listed.status_code == 200
+    assert "invocation" not in listed.json()["sessions"][0]
+    summarized = client.post(
+        "/api/sessions/summary",
+        headers=_AUTH_HEADERS,
+        json={},
+    )
+    assert summarized.status_code == 200
+    assert all("invocation" not in item["session"] for item in summarized.json()["sessions"])
+    updated = client.patch(
+        f"/api/sessions/{session.id}/labels",
+        headers=_AUTH_HEADERS,
+        json={"labels": {"reviewed": "true"}},
+    )
+    assert updated.status_code == 200
+    assert "invocation" not in updated.json()
+
+
+def test_authenticated_run_rejects_identity_that_cannot_be_persisted() -> None:
+    def invalid_durable_identity(_request: Request) -> AuthContext:
+        return AuthContext(subject="invalid\x00identity")
+
+    app = CayuApp(task_store=InMemoryTaskStore())
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(
+        create_server(
+            app,
+            config=ServerConfig.protected(invalid_durable_identity),
+        ),
+        raise_server_exceptions=False,
+    )
+
+    response = client.post("/api/run", json={"prompt": "hello"})
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Authenticated identity is not valid durable invocation provenance."
+    }
+    assert asyncio.run(app.session_store.list_sessions()).sessions == []
 
 
 def _approval_capture_app() -> tuple[CayuApp, list]:

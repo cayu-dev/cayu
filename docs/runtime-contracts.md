@@ -1370,6 +1370,40 @@ Session stores expose two read surfaces:
   implementation composes public paginated store queries with a 100,000-record
   safety ceiling; custom stores may provide an equivalent native aggregate.
 
+Every new `Session` also carries immutable `SessionInvocation` provenance. The
+record separates the root origin from the immediate creation boundary:
+
+- protected `/api/run` requests use `server_verified` origin trust derived from
+  `AuthContext.subject` and its optional tenant; request bodies cannot supply or
+  override that identity;
+- direct `app.run(...)` calls may supply `InvocationOriginClaim` when trusted
+  host code already authenticated the caller, producing `host_asserted` trust;
+- direct runs without either identity are explicitly `unattributed` rather than
+  guessed;
+- every root receives an immutable `root_invocation_id`; forks, subagents, and
+  anchored workflow children inherit that ID, the root origin, and the
+  historical `root_session_id` exactly, while their `source` records the
+  immediate fork, subagent, or workflow-step boundary. The invocation ID keeps
+  the tree unambiguous if a deleted root's session ID is later reused.
+
+`parent_session_id`, `causal_budget_id`, task IDs, and workflow journal evidence
+remain the canonical structural relationships. Invocation provenance neither
+replaces them nor turns `AuthContext.tenant` into an authorization scope. Auth
+claims are not persisted. Origin identity fields are bounded, rejected if they
+collide with configured workload secrets, and exposed only by the single-session
+detail API; list projections omit them.
+
+Breaking schema revision 36 adds the required immutable invocation record to
+SQLite and PostgreSQL sessions. This is a clean prerelease boundary: populated
+pre-36 session databases are rejected rather than assigned invented origins;
+empty databases migrate normally. Custom `SessionStore` implementations must
+load any parent inside their atomic create boundary, call
+`session_invocation_for_run_request(...)`, and persist the returned
+`SessionInvocation` with the new session. They must preserve that value on
+subsequent updates and loads. In particular, `root_invocation_id`, not the
+reusable `root_session_id`, is the permanent identity of the invocation tree;
+reimplementing the private runtime-attestation logic is not supported.
+
 The read-only `cayu session` CLI composes these public contracts for `list`,
 `show`, `interactions`, `usage`, `tools`, `events`, and `transcript`. SQLite opens in read-only
 `validate` mode and PostgreSQL uses `validate` mode, so inspection never creates

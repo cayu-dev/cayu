@@ -140,7 +140,11 @@ test("confirmed edits refresh affected bounded projections without touching hist
   const environmentSummaryKey = ["sessions-summary", "environment-related", "local"]
   const eventKey = ["session-events", "session-1", "latest"]
   const transcriptKey = ["session-transcript", "session-1", "latest"]
-  client.setQueryData(sessionKey, { id: "session-1", labels: { stage: "old" } })
+  client.setQueryData(sessionKey, {
+    id: "session-1",
+    labels: { stage: "old" },
+    invocation: { root_invocation_id: "stable-root" },
+  })
   client.setQueryData(otherSessionKey, { id: "session-2", labels: { stage: "other" } })
   client.setQueryData(stateKey, { status: "completed" })
   client.setQueryData(otherStateKey, { status: "completed" })
@@ -192,6 +196,9 @@ test("confirmed edits refresh affected bounded projections without touching hist
     await waitForRefetches([stateRefetched, summaryRefetched])
 
     assert.deepEqual(client.getQueryData(sessionKey).labels, { stage: "review" })
+    assert.deepEqual(client.getQueryData(sessionKey).invocation, {
+      root_invocation_id: "stable-root",
+    })
     assert.deepEqual(client.getQueryData(otherSessionKey).labels, { stage: "other" })
     assert.equal(stateRefetches, 1)
     assert.equal(summaryRefetches, 1)

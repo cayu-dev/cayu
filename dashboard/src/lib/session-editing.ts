@@ -1,5 +1,5 @@
 import type { QueryClient } from "@tanstack/react-query"
-import type { SessionDetail } from "./api.ts"
+import type { SessionDetail, SessionUpdate } from "./api.ts"
 
 const MAX_LABEL_KEY_LENGTH = 128
 const MAX_LABEL_VALUE_LENGTH = 512
@@ -199,8 +199,10 @@ export function sessionEditErrorMessage(error: unknown, fieldName: "labels" | "m
   return `The session ${fieldName} could not be saved. Your draft has been preserved.`
 }
 
-export function applyConfirmedSessionEdit(queryClient: QueryClient, session: SessionDetail): void {
-  queryClient.setQueryData(["session", session.id], session)
+export function applyConfirmedSessionEdit(queryClient: QueryClient, session: SessionUpdate): void {
+  queryClient.setQueryData<SessionDetail>(["session", session.id], (current) =>
+    current === undefined ? undefined : { ...current, ...session },
+  )
   void queryClient.invalidateQueries({ queryKey: ["session-state", session.id] })
   void queryClient.invalidateQueries({ queryKey: ["session-summary", session.id] })
   void queryClient.invalidateQueries({ queryKey: ["sessions-summary"] })

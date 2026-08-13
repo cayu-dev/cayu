@@ -8,7 +8,7 @@ import contextlib
 import hashlib
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import isfinite
@@ -155,6 +155,11 @@ from cayu.runtime.interactions import (
     INTERACTION_TERMINAL_EVENT_TYPES,
     InteractionSummaryEvidence,
 )
+from cayu.runtime.invocation import (
+    InvocationOrigin,
+    InvocationOriginTrust,
+    SessionExecutionSource,
+)
 from cayu.runtime.loop_policies import LoopPolicy, validate_loop_policies
 from cayu.runtime.provider_operations import inspect_provider_operation
 from cayu.runtime.retry_policy import RetryPolicy
@@ -196,6 +201,7 @@ from cayu.runtime.sessions import (
     decode_session_topology_cursor,
     event_summary_from_records,
     run_request_with_runtime_generated_authority,
+    run_request_with_runtime_invocation,
     session_outcome_from_records,
 )
 from cayu.runtime.stop_policy import RunLimits
@@ -250,6 +256,7 @@ from cayu.server.contracts import (
     MAX_USAGE_ROLLUP_REQUEST_BYTES,
     MAX_USAGE_ROLLUP_RESULT_BYTES,
     PENDING_ACTION_ENDPOINT_RESPONSES,
+    RUN_ENDPOINT_RESPONSES,
     SERVER_API_PREFIX,
     SESSION_TOPOLOGY_ENDPOINT_RESPONSES,
     STREAMING_ENDPOINT_RESPONSES,
@@ -258,6 +265,7 @@ from cayu.server.contracts import (
     ApiInteractionSummary,
     ApiReviewedKnowledgeEntry,
     ApiSession,
+    ApiSessionDetail,
     ApiTaskDetail,
     ApiTaskListItem,
     ArtifactReadResponse,
@@ -1442,6 +1450,13 @@ class RunBody(_BoundedControlPlanePromptBody):
     structured_output: StructuredOutputSpec | None = None
     thinking: ThinkingConfig | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_client_invocation_provenance(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and "invocation_origin" in value:
+            raise ValueError("invocation_origin is server-owned at the HTTP run boundary.")
+        return value
+
     @field_validator("budget_limits", mode="before")
     @classmethod
     def copy_budget_limits(cls, value) -> tuple[BudgetLimit, ...]:
@@ -2072,6 +2087,33 @@ def _serialize_session(cayu_app: Any, session: Session) -> dict[str, Any]:
             session.metadata,
             "session.metadata",
         ),
+    }
+
+
+def _serialize_session_detail(cayu_app: Any, session: Session) -> dict[str, Any]:
+    return {
+        **_serialize_session(cayu_app, session),
+        "invocation": {
+            "schema_version": session.invocation.schema_version,
+            "origin": {
+                "trust": session.invocation.origin.trust.value,
+                "subject": _redact_control_plane_json(
+                    cayu_app,
+                    session.invocation.origin.subject,
+                    "session.invocation.origin.subject",
+                ),
+                "tenant": _redact_control_plane_json(
+                    cayu_app,
+                    session.invocation.origin.tenant,
+                    "session.invocation.origin.tenant",
+                ),
+            },
+            "root_invocation_id": session.invocation.root_invocation_id,
+            "root_session_id": cayu_app.project_session_id_for_exposure(
+                session.invocation.root_session_id
+            ),
+            "source": session.invocation.source.value,
+        },
     }
 
 
@@ -4896,15 +4938,15 @@ def create_router(
 
     @bounded_control_plane_router.post(
         "/run",
-        dependencies=protected,
         response_class=EventSourceResponse,
-        responses=BOUNDED_STREAMING_ENDPOINT_RESPONSES,
+        responses=RUN_ENDPOINT_RESPONSES,
     )
     async def run_agent(
         body: RunBody,
         http_request: Request,
         trace_metadata: TraceContextMetadata,
         mutation_id: MutationIdHeader = None,
+        auth_context: AuthContext | None = optional_auth_context,
     ):
         replay = await _replay_events_response(
             http_request,
@@ -4987,6 +5029,26 @@ def create_router(
                 request,
                 *runtime_authority_fields,
             )
+        try:
+            verified_origin = (
+                None
+                if auth_context is None
+                else InvocationOrigin(
+                    trust=InvocationOriginTrust.SERVER_VERIFIED,
+                    subject=auth_context.subject,
+                    tenant=auth_context.tenant,
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Authenticated identity is not valid durable invocation provenance.",
+            ) from exc
+        request = run_request_with_runtime_invocation(
+            request,
+            source=SessionExecutionSource.HTTP_RUN,
+            verified_origin=verified_origin,
+        )
         return await _accepted_event_stream_response(
             cayu_app.run(request),
             cayu_app=cayu_app,
@@ -7007,7 +7069,7 @@ def create_router(
 
     @router.get(
         "/sessions/{session_id}",
-        response_model=ApiSession,
+        response_model=ApiSessionDetail,
         dependencies=protected,
     )
     async def get_session(session_id: NonBlankString):
@@ -7015,7 +7077,7 @@ def create_router(
         session = await session_store.load(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="Session not found")
-        return _serialize_session(cayu_app, session)
+        return _serialize_session_detail(cayu_app, session)
 
     @router.delete("/sessions/{session_id}", status_code=204, dependencies=protected)
     async def delete_session(session_id: NonBlankString):

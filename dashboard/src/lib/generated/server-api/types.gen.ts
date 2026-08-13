@@ -605,6 +605,21 @@ export type ApiInteractionSummary = {
 };
 
 /**
+ * ApiInvocationOrigin
+ */
+export type ApiInvocationOrigin = {
+    /**
+     * Subject
+     */
+    subject: string | null;
+    /**
+     * Tenant
+     */
+    tenant: string | null;
+    trust: InvocationOriginTrust;
+};
+
+/**
  * ApiKnowledgeChunk
  */
 export type ApiKnowledgeChunk = {
@@ -1058,6 +1073,93 @@ export type ApiSessionBase = {
      * Updated At
      */
     updated_at: string;
+};
+
+/**
+ * ApiSessionDetail
+ */
+export type ApiSessionDetail = {
+    /**
+     * Agent Name
+     */
+    agent_name: string;
+    /**
+     * Causal Budget Id
+     */
+    causal_budget_id: string | null;
+    /**
+     * Created At
+     */
+    created_at: string;
+    /**
+     * Environment Name
+     */
+    environment_name: string | null;
+    /**
+     * Id
+     */
+    id: string;
+    invocation: ApiSessionInvocation;
+    /**
+     * Labels
+     */
+    labels: {
+        [key: string]: string;
+    };
+    /**
+     * Metadata
+     */
+    metadata: {
+        [key: string]: unknown;
+    };
+    /**
+     * Model
+     */
+    model: string | null;
+    /**
+     * Parent Session Id
+     */
+    parent_session_id: string | null;
+    /**
+     * Provider Name
+     */
+    provider_name: string | null;
+    /**
+     * Runtime Name
+     */
+    runtime_name: string;
+    /**
+     * Runtime Version
+     */
+    runtime_version: string | null;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Updated At
+     */
+    updated_at: string;
+};
+
+/**
+ * ApiSessionInvocation
+ */
+export type ApiSessionInvocation = {
+    origin: ApiInvocationOrigin;
+    /**
+     * Root Invocation Id
+     */
+    root_invocation_id: string;
+    /**
+     * Root Session Id
+     */
+    root_session_id: string;
+    /**
+     * Schema Version
+     */
+    schema_version: 1;
+    source: SessionExecutionSource;
 };
 
 /**
@@ -3516,6 +3618,13 @@ export type InterruptSessionBody = {
 };
 
 /**
+ * InvocationOriginTrust
+ *
+ * How Cayu obtained the root invocation identity.
+ */
+export type InvocationOriginTrust = 'server_verified' | 'host_asserted' | 'unattributed';
+
+/**
  * KnowledgeVisibility
  */
 export type KnowledgeVisibility = 'global' | 'organization' | 'project' | 'workspace' | 'user' | 'session' | 'task';
@@ -5180,6 +5289,13 @@ export type SessionCostSummary = {
  * SessionDebugState
  */
 export type SessionDebugState = 'needs_attention' | 'session_failure' | 'tool_issue' | 'interruption';
+
+/**
+ * SessionExecutionSource
+ *
+ * The runtime boundary that created one session.
+ */
+export type SessionExecutionSource = 'http_run' | 'sdk_run' | 'fork' | 'subagent' | 'workflow_step';
 
 /**
  * SessionMessageDeliveryMode
@@ -8513,6 +8629,10 @@ export type RunAgentApiRunPostData = {
 
 export type RunAgentApiRunPostErrors = {
     /**
+     * The authenticated caller identity cannot be represented as durable invocation provenance.
+     */
+    400: ApiErrorResponse;
+    /**
      * The replay session or mutation target does not exist.
      */
     404: ApiErrorResponse;
@@ -8769,7 +8889,7 @@ export type GetSessionApiSessionsSessionIdGetResponses = {
     /**
      * Successful Response
      */
-    200: ApiSession;
+    200: ApiSessionDetail;
 };
 
 export type GetSessionApiSessionsSessionIdGetResponse = GetSessionApiSessionsSessionIdGetResponses[keyof GetSessionApiSessionsSessionIdGetResponses];
