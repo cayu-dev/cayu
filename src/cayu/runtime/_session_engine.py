@@ -192,6 +192,8 @@ from cayu.runtime._workflow_structured_output_handoff import (
 )
 from cayu.runtime.approvals import (
     PendingToolApproval,
+    ResolutionActor,
+    ResolutionActorSource,
     ToolApprovalDecision,
     resolution_actor_payload,
 )
@@ -241,11 +243,24 @@ from cayu.runtime.errors import (
 )
 from cayu.runtime.execution_profiles import (
     EXECUTION_PROFILE_METADATA_KEY,
+    ExecutionProfileAdoptionIntent,
+    ExecutionProfileAdoptionRejected,
+    ExecutionProfileAuthorityDecision,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
+    ExecutionProfileMigrationRequired,
     ExecutionProfileMismatchError,
+    ExecutionProfilePolicy,
+    ExecutionProfilePolicyAction,
+    ExecutionProfilePolicyError,
+    ExecutionProfilePolicyRequest,
+    ExecutionProfilePolicyResult,
     build_execution_profile_identity,
     changed_execution_profile_components,
+    copy_execution_profile_policy_result,
+    execution_profile_decision_payload,
     execution_profile_from_session_metadata,
     execution_profile_with_component,
     unavailable_execution_profile_components,
@@ -358,6 +373,7 @@ from cayu.runtime.sessions import (
     _initial_transcript_pending_interaction_id,
     _latest_session_invocation_interaction_is_settled,
     _mark_session_interaction_settled,
+    _runtime_resume_transport_metadata,
     _session_metadata_with_model_projection,
     _session_run_operation_from_checkpoint,
     _set_session_interaction_recovered_active_through,
@@ -370,6 +386,7 @@ from cayu.runtime.sessions import (
     copy_interaction_transition_spec,
     copy_resume_request,
     copy_run_request,
+    execution_profile_adoption_request_fingerprint,
     runtime_publication_checkpoint_mutation,
     runtime_publication_checkpoint_value_digest,
     session_input_contract_evidence,
@@ -1833,6 +1850,141 @@ def _execution_profile_identity(
     )
 
 
+_EXACT_PROFILE_POLICY_ID = "cayu:execution-profile-exact-reuse:v1"
+_DEFAULT_PROFILE_POLICY_ID = "cayu:execution-profile-default-reject:v1"
+_MODEL_TARGET_PROFILE_POLICY_ID = "cayu:model-target-adoption:v1"
+
+
+def _model_target_profile_actor() -> ResolutionActor:
+    return ResolutionActor(
+        subject="cayu:model-target-adoption",
+        source=ResolutionActorSource.SYSTEM,
+    )
+
+
+def _execution_profile_decision_event_id(
+    *,
+    session_id: str,
+    run_epoch: int,
+    expected_profile: ExecutionProfileIdentity,
+    candidate_profile: ExecutionProfileIdentity,
+    intent: ExecutionProfileAdoptionIntent | None,
+    policy_identity: str | None = None,
+) -> tuple[str, str]:
+    if intent is not None:
+        idempotency_identity = intent.idempotency_key
+        material = {
+            "session_id": session_id,
+            "idempotency_identity": idempotency_identity,
+        }
+    else:
+        if policy_identity is None:
+            raise ValueError(
+                "A runtime-generated execution-profile decision requires policy authority."
+            )
+        policy_identity_digest = hashlib.sha256(policy_identity.encode("utf-8")).hexdigest()
+        idempotency_identity = (
+            f"run-epoch:{run_epoch}:{expected_profile.fingerprint}:"
+            f"{candidate_profile.fingerprint}:{policy_identity_digest}"
+        )
+        material = {
+            "session_id": session_id,
+            "run_epoch": run_epoch,
+            "expected_profile_fingerprint": expected_profile.fingerprint,
+            "candidate_profile_fingerprint": candidate_profile.fingerprint,
+            "policy_identity": policy_identity,
+        }
+    event_material = canonical_durable_json_bytes(material, "execution_profile_decision")
+    return "epd_" + hashlib.sha256(event_material).hexdigest(), idempotency_identity
+
+
+def _execution_profile_decision_event(
+    *,
+    session: Session,
+    expected_profile: ExecutionProfileIdentity,
+    candidate_profile: ExecutionProfileIdentity,
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...],
+    kind: ExecutionProfileDecisionKind,
+    policy_identity: str,
+    policy_reason: str,
+    authority_decision: ExecutionProfileAuthorityDecision,
+    intent: ExecutionProfileAdoptionIntent | None,
+    adoption_request_fingerprint: str | None,
+    fallback_actor: ResolutionActor | None,
+    fallback_reason: str,
+    clock: Callable[[], datetime],
+) -> ExecutionProfileDecision:
+    if (intent is None) != (adoption_request_fingerprint is None):
+        raise ValueError(
+            "Explicit execution-profile adoption intent and request fingerprint must "
+            "be supplied together."
+        )
+    event_id, idempotency_identity = _execution_profile_decision_event_id(
+        session_id=session.id,
+        run_epoch=session.run_epoch,
+        expected_profile=expected_profile,
+        candidate_profile=candidate_profile,
+        intent=intent,
+        policy_identity=policy_identity,
+    )
+    actor = intent.requested_by if intent is not None else fallback_actor
+    reason = intent.reason if intent is not None else fallback_reason
+    event = Event(
+        id=event_id,
+        type=(
+            EventType.SESSION_EXECUTION_PROFILE_REJECTED
+            if kind is ExecutionProfileDecisionKind.REJECTED
+            else EventType.SESSION_EXECUTION_PROFILE_DECIDED
+        ),
+        session_id=session.id,
+        timestamp=clock(),
+        agent_name=session.agent_name,
+        environment_name=session.environment_name,
+        payload=execution_profile_decision_payload(
+            kind=kind,
+            expected_profile=expected_profile,
+            candidate_profile=candidate_profile,
+            changed_component_classes=changed_component_classes,
+            policy_identity=policy_identity,
+            policy_reason=policy_reason,
+            authority_decision=authority_decision,
+            idempotency_identity=idempotency_identity,
+            adoption_request_fingerprint=adoption_request_fingerprint,
+            actor=actor,
+            reason=reason,
+        ),
+    )
+    authority_fields = [
+        "decision",
+        "policy_identity",
+        "authority_decision",
+        "idempotency_identity",
+    ]
+    if adoption_request_fingerprint is not None:
+        authority_fields.append("adoption_request_fingerprint")
+    event = event_with_runtime_payload_authority(
+        event_with_runtime_envelope_authority(
+            event_with_runtime_generated_id(event),
+            "session_id",
+        ),
+        *authority_fields,
+    )
+    return ExecutionProfileDecision(
+        kind=kind,
+        expected_profile=expected_profile,
+        candidate_profile=candidate_profile,
+        changed_component_classes=changed_component_classes,
+        policy_identity=policy_identity,
+        policy_reason=policy_reason,
+        authority_decision=authority_decision,
+        idempotency_identity=idempotency_identity,
+        adoption_request_fingerprint=adoption_request_fingerprint,
+        actor=actor,
+        reason=reason,
+        event=event,
+    )
+
+
 def _with_environment_name(request: RunRequest, environment_name: str) -> RunRequest:
     # ``copy_run_request`` deliberately preserves the request's private runtime
     # authority provenance. Reconstructing a fresh model here would silently
@@ -2275,6 +2427,8 @@ class SessionEngine:
             [str | None], runtime_records.RegisteredEnvironment | None
         ],
         effective_retry_policy: Callable[[RetryPolicy | None], RetryPolicy],
+        execution_profile_policy: ExecutionProfilePolicy | None,
+        execution_profile_policy_identity: str | None,
     ) -> None:
         self.session_store = session_store
         self.task_store = task_store
@@ -2311,6 +2465,8 @@ class SessionEngine:
         self._get_registered_environment = get_registered_environment
         self._get_registered_environment_for_session = get_registered_environment_for_session
         self._effective_retry_policy = effective_retry_policy
+        self._execution_profile_policy = execution_profile_policy
+        self._execution_profile_policy_identity = execution_profile_policy_identity
         self._detached_session_operation_tasks: set[asyncio.Task[Any]] = set()
 
     def prepare_workflow_structured_output(self, session_id: str) -> None:
@@ -2322,6 +2478,288 @@ class SessionEngine:
         """Consume a live raw output without making it part of durable session state."""
 
         return self._workflow_structured_output_handoff.take(session_id)
+
+    async def _classify_execution_profile(
+        self,
+        *,
+        session: Session,
+        expected_profile: ExecutionProfileIdentity,
+        candidate_profile: ExecutionProfileIdentity,
+        changed_component_classes: tuple[ExecutionProfileComponentClass, ...],
+        intent: ExecutionProfileAdoptionIntent | None,
+        adoption_request_fingerprint: str | None,
+        target_changed: bool,
+        target_provider_name: str,
+        target_model: str,
+    ) -> ExecutionProfileDecision:
+        if not changed_component_classes:
+            return _execution_profile_decision_event(
+                session=session,
+                expected_profile=expected_profile,
+                candidate_profile=candidate_profile,
+                changed_component_classes=changed_component_classes,
+                kind=ExecutionProfileDecisionKind.EXACT_REUSE,
+                policy_identity=_EXACT_PROFILE_POLICY_ID,
+                policy_reason="The execution profile is exactly equal.",
+                authority_decision=ExecutionProfileAuthorityDecision.NOT_REQUIRED,
+                intent=intent,
+                adoption_request_fingerprint=adoption_request_fingerprint,
+                fallback_actor=None,
+                fallback_reason="The execution profile is exactly equal.",
+                clock=self._clock,
+            )
+
+        model_target_only = target_changed and changed_component_classes == (
+            ExecutionProfileComponentClass.PROVIDER_TARGET,
+        )
+        fallback_actor = _model_target_profile_actor() if model_target_only else None
+        fallback_reason = (
+            "The caller explicitly requested a model-target transition."
+            if model_target_only
+            else "The execution profile changed without authorized adoption."
+        )
+        policy_identity = (
+            _MODEL_TARGET_PROFILE_POLICY_ID if model_target_only else _DEFAULT_PROFILE_POLICY_ID
+        )
+        policy_reason = fallback_reason
+        authority_decision = ExecutionProfileAuthorityDecision.NOT_REQUIRED
+        action = (
+            ExecutionProfilePolicyAction.ADOPT
+            if model_target_only
+            else ExecutionProfilePolicyAction.REJECT
+        )
+
+        policy = self._execution_profile_policy
+        if policy is not None:
+            stable_identity = self._execution_profile_policy_identity
+            try:
+                current_policy_identity = policy.identity
+            except Exception as exc:
+                raise ExecutionProfilePolicyError(
+                    "The configured execution-profile policy identity could not be read."
+                ) from exc
+            if stable_identity is None or current_policy_identity != stable_identity:
+                raise ExecutionProfilePolicyError(
+                    "The configured execution-profile policy identity changed."
+                )
+            policy_request = ExecutionProfilePolicyRequest(
+                session_id=session.id,
+                expected_profile=expected_profile,
+                candidate_profile=candidate_profile,
+                changed_component_classes=changed_component_classes,
+                intent=intent,
+                authority_review_required=(
+                    ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
+                ),
+                source_provider_name=session.provider_name,
+                source_model=session.model,
+                target_provider_name=target_provider_name,
+                target_model=target_model,
+            )
+            try:
+                raw_result = await policy.decide(policy_request)
+                result = copy_execution_profile_policy_result(raw_result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise ExecutionProfilePolicyError(
+                    "The execution-profile policy failed before admission."
+                ) from exc
+            try:
+                current_policy_identity = policy.identity
+            except Exception as exc:
+                raise ExecutionProfilePolicyError(
+                    "The configured execution-profile policy identity could not be re-read."
+                ) from exc
+            if current_policy_identity != stable_identity:
+                raise ExecutionProfilePolicyError(
+                    "The configured execution-profile policy identity changed during review."
+                )
+            try:
+                result = ExecutionProfilePolicyResult(
+                    action=result.action,
+                    reason=self._secret_redactor.redact_text(result.reason),
+                    authority_decision=result.authority_decision,
+                )
+            except (TypeError, ValueError) as exc:
+                raise ExecutionProfilePolicyError(
+                    "The execution-profile policy result could not be made durable."
+                ) from exc
+            action = result.action
+            policy_identity = stable_identity
+            policy_reason = result.reason
+            authority_decision = result.authority_decision
+
+        broadens_authority = (
+            ExecutionProfileComponentClass.DIRECT_TOOLS in changed_component_classes
+        )
+        if action is ExecutionProfilePolicyAction.COMPATIBLE_REUSE:
+            changes_persistent_target = (
+                ExecutionProfileComponentClass.PROVIDER_TARGET in changed_component_classes
+            )
+            kind = (
+                ExecutionProfileDecisionKind.REJECTED
+                if (
+                    authority_decision is ExecutionProfileAuthorityDecision.DENIED
+                    or broadens_authority
+                    or changes_persistent_target
+                )
+                else ExecutionProfileDecisionKind.COMPATIBLE_REUSE
+            )
+            if (
+                authority_decision is not ExecutionProfileAuthorityDecision.DENIED
+                and broadens_authority
+            ):
+                policy_reason = (
+                    "A compatibility decision cannot authorize broader execution authority."
+                )
+            elif (
+                authority_decision is not ExecutionProfileAuthorityDecision.DENIED
+                and changes_persistent_target
+            ):
+                policy_reason = (
+                    "A provider-target change must be adopted because it changes the "
+                    "session's persistent execution target."
+                )
+        elif action is ExecutionProfilePolicyAction.ADOPT:
+            has_explicit_adoption = intent is not None or model_target_only
+            authority_is_sufficient = (
+                authority_decision is not ExecutionProfileAuthorityDecision.DENIED
+                and (
+                    not broadens_authority
+                    or authority_decision is ExecutionProfileAuthorityDecision.AUTHORIZED
+                )
+            )
+            kind = (
+                ExecutionProfileDecisionKind.ADOPTED
+                if has_explicit_adoption and authority_is_sufficient
+                else ExecutionProfileDecisionKind.REJECTED
+            )
+            if not has_explicit_adoption:
+                policy_reason = "Explicit execution-profile adoption intent is required."
+            elif (
+                not authority_is_sufficient
+                and authority_decision is not ExecutionProfileAuthorityDecision.DENIED
+            ):
+                policy_reason = "Authority-broadening adoption requires explicit authorization."
+        elif action is ExecutionProfilePolicyAction.MIGRATION_REQUIRED:
+            # Migration is a non-admitting classification, not an adoption.
+            # A policy may require migration for ordinary drift even when the
+            # caller did not ask Cayu to adopt the candidate profile.
+            kind = ExecutionProfileDecisionKind.MIGRATION_REQUIRED
+        else:
+            kind = ExecutionProfileDecisionKind.REJECTED
+
+        return _execution_profile_decision_event(
+            session=session,
+            expected_profile=expected_profile,
+            candidate_profile=candidate_profile,
+            changed_component_classes=changed_component_classes,
+            kind=kind,
+            policy_identity=policy_identity,
+            policy_reason=policy_reason,
+            authority_decision=authority_decision,
+            intent=intent,
+            adoption_request_fingerprint=adoption_request_fingerprint,
+            fallback_actor=fallback_actor,
+            fallback_reason=fallback_reason,
+            clock=self._clock,
+        )
+
+    async def _replay_execution_profile_decision(
+        self,
+        *,
+        session: Session,
+        candidate_profile: ExecutionProfileIdentity,
+        intent: ExecutionProfileAdoptionIntent,
+        adoption_request_fingerprint: str | None,
+    ) -> Event | None:
+        if adoption_request_fingerprint is None:
+            raise AssertionError("Adoption replay requires a request fingerprint.")
+        event_id, _ = _execution_profile_decision_event_id(
+            session_id=session.id,
+            run_epoch=session.run_epoch,
+            expected_profile=candidate_profile,
+            candidate_profile=candidate_profile,
+            intent=intent,
+        )
+        records = await self.session_store.query_events(
+            EventQuery(session_id=session.id, event_id=event_id, limit=1)
+        )
+        if not records:
+            return None
+        event = records[0].event
+        payload = event.payload
+        try:
+            kind = ExecutionProfileDecisionKind(payload["decision"])
+            expected_profile = ExecutionProfileIdentity.model_validate(payload["expected_profile"])
+            persisted_candidate = ExecutionProfileIdentity.model_validate(
+                payload["candidate_profile"]
+            )
+            changed = tuple(
+                ExecutionProfileComponentClass(component)
+                for component in payload["changed_component_classes"]
+            )
+            authority_decision = ExecutionProfileAuthorityDecision(payload["authority_decision"])
+            persisted_actor = payload["actor"]
+            policy_identity = payload["policy_identity"]
+            policy_reason = payload["policy_reason"]
+            reason = payload["reason"]
+            idempotency_identity = payload["idempotency_identity"]
+            persisted_request_fingerprint = payload["adoption_request_fingerprint"]
+        except (KeyError, TypeError, ValueError):
+            raise RuntimeError(
+                "Durable execution-profile adoption evidence is malformed."
+            ) from None
+        if (
+            event.session_id != session.id
+            or event.agent_name != session.agent_name
+            or event.environment_name != session.environment_name
+            or persisted_candidate != candidate_profile
+            or changed
+            != changed_execution_profile_components(expected_profile, persisted_candidate)
+            or persisted_actor != resolution_actor_payload(intent.requested_by)
+            or reason != intent.reason
+            or idempotency_identity != intent.idempotency_key
+            or persisted_request_fingerprint != adoption_request_fingerprint
+            or type(policy_identity) is not str
+            or not policy_identity.strip()
+            or type(policy_reason) is not str
+        ):
+            raise ValueError(
+                "Execution-profile adoption idempotency key was already used for a "
+                "different request."
+            )
+        replayed = ExecutionProfileDecision(
+            kind=kind,
+            expected_profile=expected_profile,
+            candidate_profile=persisted_candidate,
+            changed_component_classes=changed,
+            policy_identity=policy_identity,
+            policy_reason=policy_reason,
+            authority_decision=authority_decision,
+            idempotency_identity=idempotency_identity,
+            adoption_request_fingerprint=persisted_request_fingerprint,
+            actor=ResolutionActor.model_validate(persisted_actor),
+            reason=reason,
+            event=event,
+        )
+        if replayed.kind in {
+            ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+            ExecutionProfileDecisionKind.REJECTED,
+        }:
+            error_type = (
+                ExecutionProfileMigrationRequired
+                if replayed.kind is ExecutionProfileDecisionKind.MIGRATION_REQUIRED
+                else ExecutionProfileAdoptionRejected
+            )
+            raise error_type(
+                session_id=session.id,
+                expected_profile_fingerprint=expected_profile.fingerprint,
+                candidate_profile_fingerprint=persisted_candidate.fingerprint,
+                changed_component_classes=changed,
+            )
+        return copy_event(event)
 
     def discard_workflow_structured_output(self, session_id: str) -> None:
         self._workflow_structured_output_handoff.discard(session_id)
@@ -3852,6 +4290,7 @@ class SessionEngine:
                 thinking=request.thinking,
                 request_loop_policies=request.loop_policies,
                 request_metadata=request.metadata,
+                request_trace_metadata=request.metadata,
                 task_id=request.task_id,
                 task_worker_id=request.task_worker_id,
                 start_event_type=EventType.SESSION_STARTED,
@@ -7914,14 +8353,17 @@ class SessionEngine:
             redactor=self._secret_redactor,
             field_name="ResumeRequest.structured_output",
         )
+        adoption_request_fingerprint = (
+            None
+            if request.profile_adoption is None
+            else execution_profile_adoption_request_fingerprint(
+                request,
+                redactor=self._secret_redactor,
+            )
+        )
         loaded_session = await self.session_store.load(request.session_id)
         if loaded_session is None:
             raise KeyError(f"Session not found: {request.session_id}")
-        if loaded_session.status not in _RESUMABLE_SESSION_STATUSES:
-            raise SessionStatusConflict(
-                "Session status transition not allowed: "
-                f"{loaded_session.status} -> {SessionStatus.RUNNING}"
-            )
         for field_name in (
             "agent_name",
             "provider_name",
@@ -7960,6 +8402,43 @@ class SessionEngine:
         registered_environment = self._get_registered_environment_for_session(
             loaded_session.environment_name
         )
+        if (
+            request.profile_adoption is not None
+            and EXECUTION_PROFILE_METADATA_KEY in loaded_session.metadata
+        ):
+            replay_expected_profile = execution_profile_from_session_metadata(
+                loaded_session.metadata
+            )
+            replay_candidate_profile = _execution_profile_identity(
+                registered_agent=registered_agent,
+                provider_name=registered_provider.name,
+                model=(
+                    requested_target.model
+                    if target_changed and requested_target is not None
+                    else loaded_session.model
+                ),
+                durable_system_prompt=None,
+            )
+            replay_candidate_profile = execution_profile_with_component(
+                replay_candidate_profile,
+                replay_expected_profile.component(
+                    ExecutionProfileComponentClass.DURABLE_SYSTEM_PROJECTION
+                ),
+            )
+            replayed_profile_decision = await self._replay_execution_profile_decision(
+                session=loaded_session,
+                candidate_profile=replay_candidate_profile,
+                intent=request.profile_adoption,
+                adoption_request_fingerprint=adoption_request_fingerprint,
+            )
+            if replayed_profile_decision is not None:
+                yield replayed_profile_decision
+                return
+        if loaded_session.status not in _RESUMABLE_SESSION_STATUSES:
+            raise SessionStatusConflict(
+                "Session status transition not allowed: "
+                f"{loaded_session.status} -> {SessionStatus.RUNNING}"
+            )
         if loaded_projection_cursor or self._secret_redactor.has_values:
             preflight_snapshot = await self.session_store.load_transcript_snapshot(
                 loaded_session.id
@@ -8114,7 +8593,12 @@ class SessionEngine:
 
         pending_round = tool_round_recovery.pending_tool_round_from_checkpoint(checkpoint)
         continuing_recovery_boundary = pending_round is not None or pending_model_completion
+        if continuing_recovery_boundary and request.profile_adoption is not None:
+            raise RuntimeError(
+                "An execution profile cannot be adopted while model or tool recovery is pending."
+            )
         candidate_execution_profile: ExecutionProfileIdentity | None = None
+        execution_profile_decision: ExecutionProfileDecision | None = None
         # #906 owns baseline selection for derived sessions. Until that contract
         # exists, preserve the pre-profile behavior only for fork records that do
         # not yet carry profile authority; a malformed or present profile still
@@ -8123,6 +8607,10 @@ class SessionEngine:
             loaded_session.parent_session_id is not None
             and EXECUTION_PROFILE_METADATA_KEY not in loaded_session.metadata
         )
+        if legacy_unprofiled_fork and request.profile_adoption is not None:
+            raise RuntimeError(
+                "A legacy fork without a durable execution profile cannot adopt a new profile."
+            )
         if not continuing_recovery_boundary and not legacy_unprofiled_fork:
             expected_execution_profile = execution_profile_from_session_metadata(
                 loaded_session.metadata
@@ -8149,63 +8637,47 @@ class SessionEngine:
                 expected_execution_profile,
                 candidate_execution_profile,
             )
-            existing_model_target_adoption = target_changed and changed_profile_components == (
-                ExecutionProfileComponentClass.PROVIDER_TARGET,
+            execution_profile_decision = await self._classify_execution_profile(
+                session=loaded_session,
+                expected_profile=expected_execution_profile,
+                candidate_profile=candidate_execution_profile,
+                changed_component_classes=changed_profile_components,
+                intent=request.profile_adoption,
+                adoption_request_fingerprint=adoption_request_fingerprint,
+                target_changed=target_changed,
+                target_provider_name=registered_provider.name,
+                target_model=(
+                    requested_target.model
+                    if target_changed and requested_target is not None
+                    else loaded_session.model
+                ),
             )
-            if changed_profile_components and not existing_model_target_adoption:
-                rejection_material = canonical_durable_json_bytes(
-                    {
-                        "session_id": loaded_session.id,
-                        "run_epoch": loaded_session.run_epoch,
-                        "expected_profile_fingerprint": expected_execution_profile.fingerprint,
-                        "candidate_profile_fingerprint": candidate_execution_profile.fingerprint,
-                    },
-                    "execution_profile_rejection",
-                )
-                rejection_event_id = "epr_" + hashlib.sha256(rejection_material).hexdigest()
-                rejection_event = event_with_runtime_nested_payload_authority(
-                    event_with_runtime_payload_authority(
-                        event_with_runtime_envelope_authority(
-                            event_with_runtime_generated_id(
-                                Event(
-                                    id=rejection_event_id,
-                                    type=EventType.SESSION_EXECUTION_PROFILE_REJECTED,
-                                    session_id=loaded_session.id,
-                                    timestamp=self._clock(),
-                                    agent_name=loaded_session.agent_name,
-                                    environment_name=loaded_session.environment_name,
-                                    payload={
-                                        "expected_profile_fingerprint": (
-                                            expected_execution_profile.fingerprint
-                                        ),
-                                        "candidate_profile_fingerprint": (
-                                            candidate_execution_profile.fingerprint
-                                        ),
-                                        "changed_component_classes": [
-                                            component.value
-                                            for component in changed_profile_components
-                                        ],
-                                    },
-                                )
-                            ),
-                            "session_id",
-                        ),
-                        "expected_profile_fingerprint",
-                        "candidate_profile_fingerprint",
-                    ),
-                    ("changed_component_classes", "*"),
-                )
+            if execution_profile_decision.kind in {
+                ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+                ExecutionProfileDecisionKind.REJECTED,
+            }:
                 rejection = await self.session_store.reject_execution_profile_resume(
                     loaded_session.id,
                     expected_statuses=_RESUMABLE_SESSION_STATUSES,
                     expected_run_epoch=loaded_session.run_epoch,
                     expected_profile=expected_execution_profile,
                     candidate_profile=candidate_execution_profile,
-                    event=rejection_event,
+                    event=execution_profile_decision.event,
+                    decision=execution_profile_decision,
                 )
                 if not rejection.replayed:
                     await self._event_writer.fan_out_persisted([rejection.event])
-                raise ExecutionProfileMismatchError(
+                error_type = (
+                    ExecutionProfileMigrationRequired
+                    if execution_profile_decision.kind
+                    is ExecutionProfileDecisionKind.MIGRATION_REQUIRED
+                    else (
+                        ExecutionProfileAdoptionRejected
+                        if request.profile_adoption is not None
+                        else ExecutionProfileMismatchError
+                    )
+                )
+                raise error_type(
                     session_id=loaded_session.id,
                     expected_profile_fingerprint=expected_execution_profile.fingerprint,
                     candidate_profile_fingerprint=candidate_execution_profile.fingerprint,
@@ -8378,6 +8850,8 @@ class SessionEngine:
             model_transition_kwargs["model_transition"] = model_transition
         if candidate_execution_profile is not None:
             model_transition_kwargs["execution_profile"] = candidate_execution_profile
+        if execution_profile_decision is not None:
+            model_transition_kwargs["execution_profile_decision"] = execution_profile_decision
         try:
             transition = (
                 self.session_store.admit_execution_profile_resume
@@ -8395,6 +8869,22 @@ class SessionEngine:
                 defer_interaction_source=continuing_recovery_boundary,
                 **model_transition_kwargs,
             )
+        except (SessionStatusConflict, ValueError):
+            if request.profile_adoption is not None and candidate_execution_profile is not None:
+                current_session = await self.session_store.load(loaded_session.id)
+                if current_session is not None:
+                    replayed_profile_decision = await self._replay_execution_profile_decision(
+                        session=current_session,
+                        candidate_profile=candidate_execution_profile,
+                        intent=request.profile_adoption,
+                        adoption_request_fingerprint=adoption_request_fingerprint,
+                    )
+                    if replayed_profile_decision is not None:
+                        yield replayed_profile_decision
+                        return
+            if continuing_recovery_boundary:
+                _deactivate_session_interaction(loaded_session.id)
+            raise
         except BaseException:
             if continuing_recovery_boundary:
                 _deactivate_session_interaction(loaded_session.id)
@@ -8406,12 +8896,31 @@ class SessionEngine:
         try:
             admission_events = [
                 event
-                for event in (model_transition_event, interaction_started_event)
+                for event in (
+                    (
+                        None
+                        if execution_profile_decision is None
+                        else execution_profile_decision.event
+                    ),
+                    model_transition_event,
+                    interaction_started_event,
+                )
                 if event is not None
             ]
             if admission_events:
                 await self._event_writer.fan_out_persisted(admission_events)
                 for admission_event in admission_events:
+                    # Exact reuse is durable audit evidence but not a new public
+                    # resume-stream boundary. Keep the long-standing stream
+                    # ordering for ordinary exact resumes while still exposing
+                    # changed-profile decisions and explicit idempotent replays.
+                    if (
+                        execution_profile_decision is not None
+                        and execution_profile_decision.kind
+                        is ExecutionProfileDecisionKind.EXACT_REUSE
+                        and admission_event.id == execution_profile_decision.event.id
+                    ):
+                        continue
                     yield admission_event
             model_boundary = await self._recovery_coordinator.reconcile_model_completion_boundary(
                 session
@@ -8606,6 +9115,9 @@ class SessionEngine:
             thinking=request.thinking,
             request_loop_policies=request.loop_policies,
             request_metadata=request.metadata,
+            request_trace_metadata=(
+                _runtime_resume_transport_metadata(request) or request.metadata
+            ),
             task_id=task_id,
             task_worker_id=None,
             start_event_type=EventType.SESSION_RESUMED,
@@ -9267,6 +9779,7 @@ class SessionEngine:
         thinking: ThinkingConfig | None,
         request_loop_policies: tuple[LoopPolicy, ...],
         request_metadata: dict[str, Any],
+        request_trace_metadata: dict[str, Any],
         task_id: str | None,
         task_worker_id: str | None,
         start_event_type: EventType | None,
@@ -9535,7 +10048,7 @@ class SessionEngine:
                     environment_name=environment_name,
                     payload={
                         **start_event_payload,
-                        **_session_trace_event_fields(session, request_metadata),
+                        **_session_trace_event_fields(session, request_trace_metadata),
                     },
                 )
                 lineage_fields = tuple(

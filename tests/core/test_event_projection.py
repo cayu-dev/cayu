@@ -165,6 +165,25 @@ def test_event_payload_policies_cover_every_exact_builtin_type() -> None:
             } <= policy.owned_nested_paths
 
 
+def test_fingerprint_only_profile_rejection_remains_projectable() -> None:
+    payload = {
+        "expected_profile_fingerprint": "a" * 64,
+        "candidate_profile_fingerprint": "b" * 64,
+        "changed_component_classes": ["direct_tools"],
+    }
+    event = Event(
+        type=EventType.SESSION_EXECUTION_PROFILE_REJECTED,
+        session_id="profile-rejection",
+        payload=payload,
+    )
+
+    prepared = prepare_new_runtime_event(event, redactor=SecretRedactor())
+    projected = _project_runtime_event(prepared, sequence=1, redactor=SecretRedactor())
+
+    assert prepared.payload == payload
+    assert projected.payload == payload
+
+
 def test_pause_projection_schemas_track_the_typed_checkpoint_models() -> None:
     assert (
         frozenset(PendingToolCallApproval.model_fields) | {"arguments_state"}

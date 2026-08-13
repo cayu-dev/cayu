@@ -21,6 +21,7 @@ from cayu._validation import (
     copy_json_value,
     copy_label_map,
     require_clean_nonblank,
+    require_durable_clean_nonblank,
     require_unicode_scalar_text,
 )
 from cayu.artifacts import (
@@ -184,6 +185,7 @@ from cayu.runtime.event_watchers import (
     event_watcher_error_payload,
     run_event_watcher_handler,
 )
+from cayu.runtime.execution_profiles import ExecutionProfilePolicy
 from cayu.runtime.hooks import (
     RuntimeHook,
     RuntimeHookPhase,
@@ -453,6 +455,7 @@ class CayuApp:
         loop_policies: Iterable[LoopPolicy] | None = None,
         mcp_manifest_policy: McpManifestPolicy | None = None,
         tool_result_projection_policy: ToolResultProjectionPolicy | None = None,
+        execution_profile_policy: ExecutionProfilePolicy | None = None,
         context_counting: ContextCountingConfig | None = None,
         request_footprint: RequestFootprintConfig | None = None,
         event_sinks: Iterable[EventSink] | None = None,
@@ -491,6 +494,11 @@ class CayuApp:
             PublicAuthorityAliasKeyring,
         ):
             raise TypeError("public_authority_alias_keyring must be a PublicAuthorityAliasKeyring.")
+        if execution_profile_policy is not None and not isinstance(
+            execution_profile_policy,
+            ExecutionProfilePolicy,
+        ):
+            raise TypeError("execution_profile_policy must be an ExecutionProfilePolicy.")
         if type(enable_logging) is not bool:
             raise TypeError("enable_logging must be a bool.")
         hooks = _validate_runtime_hooks(runtime_hooks, field_name="runtime_hooks")
@@ -504,6 +512,28 @@ class CayuApp:
         resolved_secret_redactor = (
             secret_redactor if secret_redactor is not None else SecretRedactor()
         )
+        execution_profile_policy_identity = None
+        if execution_profile_policy is not None:
+            execution_profile_policy_identity = require_durable_clean_nonblank(
+                execution_profile_policy.identity,
+                "execution_profile_policy.identity",
+            )
+            require_unicode_scalar_text(
+                execution_profile_policy_identity,
+                "execution_profile_policy.identity",
+            )
+            if len(execution_profile_policy_identity.encode("utf-8")) > 256:
+                raise ValueError(
+                    "execution_profile_policy.identity must be at most 256 UTF-8 bytes."
+                )
+            if (
+                resolved_secret_redactor.redact_text(execution_profile_policy_identity)
+                != execution_profile_policy_identity
+            ):
+                raise ValueError(
+                    "execution_profile_policy.identity contains a workload secret and cannot "
+                    "be used as durable policy authority."
+                )
         configured_alias_codec = (
             None
             if public_authority_alias_keyring is None
@@ -743,6 +773,8 @@ class CayuApp:
             get_registered_environment=self._get_registered_environment,
             get_registered_environment_for_session=(self._get_registered_environment_for_session),
             effective_retry_policy=self._effective_retry_policy,
+            execution_profile_policy=execution_profile_policy,
+            execution_profile_policy_identity=execution_profile_policy_identity,
         )
 
     def redact_json(self, value: Any) -> Any:
@@ -1756,10 +1788,11 @@ class CayuApp:
     async def resume(self, request: ResumeRequest) -> AsyncIterator[Event]:
         if type(request) is not ResumeRequest:
             raise TypeError("Runtime resume requires a ResumeRequest.")
+        request = copy_resume_request(request)
         session_id, store_resolved_session_id = await self._resolve_public_session_authority(
             request.session_id
         )
-        request = copy_resume_request(request).model_copy(update={"session_id": session_id})
+        request = request.model_copy(update={"session_id": session_id})
         stream = self._resume_private(
             request,
             store_resolved_session_id=store_resolved_session_id,
@@ -2910,6 +2943,7 @@ class CayuApp:
             thinking=thinking,
             request_loop_policies=request_loop_policies,
             request_metadata=request_metadata,
+            request_trace_metadata=request_metadata,
             task_id=task_id,
             task_worker_id=task_worker_id,
             start_event_type=start_event_type,

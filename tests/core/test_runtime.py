@@ -23620,7 +23620,8 @@ def test_cayu_app_resume_model_updates_session_active_model():
     session_after_update = asyncio.run(store.load("sess_model_update"))
     assert session_after_update is not None
     assert session_after_update.model == "upgraded-model"
-    assert second_events[0].type == EventType.SESSION_MODEL_SWITCHED
+    assert second_events[0].type == EventType.SESSION_EXECUTION_PROFILE_DECIDED
+    assert second_events[1].type == EventType.SESSION_MODEL_SWITCHED
     model_started = next(event for event in second_events if event.type == EventType.MODEL_STARTED)
     assert model_started.payload["model"] == "upgraded-model"
 

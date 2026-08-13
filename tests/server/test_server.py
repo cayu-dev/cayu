@@ -1797,6 +1797,81 @@ def test_resume_threads_inbound_traceparent_into_session_metadata() -> None:
     assert resumed["payload"]["traceparent"] == traceparent
 
 
+def test_open_server_resume_constructs_explicit_profile_adoption_intent() -> None:
+    app = CayuApp(task_store=InMemoryTaskStore(), enable_logging=False)
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+    client = TestClient(create_server(app, config=_LOCAL_SERVER_CONFIG))
+    started = _session_started_event(client, "/api/run", {"prompt": "hello"}, {})
+
+    captured: list[ResumeRequest] = []
+    original_resume = app.resume
+
+    def capture(request: ResumeRequest):
+        captured.append(request)
+        return original_resume(request)
+
+    app.resume = capture  # type: ignore[method-assign]
+    adoption_body = {
+        "session_id": started["session_id"],
+        "prompt": "again",
+        "profile_adoption": {
+            "idempotency_key": "server-adoption-v1",
+            "reason": "Explicit operator adoption.",
+            "requested_by": {
+                "subject": "operator",
+                "source": "request",
+                "claims": {"role": "maintainer"},
+            },
+        },
+    }
+    first_traceparent = "00-11111111111111111111111111111111-2222222222222222-01"
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json=adoption_body,
+        headers={"traceparent": first_traceparent},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    assert len(captured) == 1
+    adoption = captured[0].profile_adoption
+    assert adoption is not None
+    assert adoption.idempotency_key == "server-adoption-v1"
+    assert adoption.reason == "Explicit operator adoption."
+    assert adoption.requested_by.subject == "operator"
+    assert adoption.requested_by.source.value == "request"
+    assert captured[0].metadata == {}
+
+    retry_traceparent = "00-33333333333333333333333333333333-4444444444444444-01"
+    with client.stream(
+        "POST",
+        "/api/resume",
+        json=adoption_body,
+        headers={"traceparent": retry_traceparent},
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    assert len(captured) == 2
+    assert captured[1].metadata == {}
+
+    response = client.post(
+        "/api/resume",
+        json={
+            "session_id": started["session_id"],
+            "prompt": "invalid adoption",
+            "profile_adoption": {
+                "idempotency_key": "server-adoption-without-actor",
+                "reason": "Missing open-server provenance.",
+            },
+        },
+    )
+    assert response.status_code == 400
+    assert "requested_by is required" in response.json()["detail"]
+    assert len(captured) == 2
+
+
 def test_server_task_list_exposes_worker_lease_state() -> None:
     task_store = InMemoryTaskStore()
 

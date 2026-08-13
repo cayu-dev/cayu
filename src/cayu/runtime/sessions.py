@@ -136,11 +136,17 @@ from cayu.runtime.checkpoints import (
     decode_runtime_checkpoint,
 )
 from cayu.runtime.execution_profiles import (
+    EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS,
     EXECUTION_PROFILE_METADATA_KEY,
+    ExecutionProfileAdoptionIntent,
     ExecutionProfileComponentClass,
+    ExecutionProfileDecision,
+    ExecutionProfileDecisionKind,
     ExecutionProfileIdentity,
     ExecutionProfileRejectionResult,
     changed_execution_profile_components,
+    copy_execution_profile_adoption_intent,
+    copy_execution_profile_decision,
     execution_profile_from_session_metadata,
     execution_profile_metadata_after_adoption,
     execution_profile_session_metadata,
@@ -168,6 +174,7 @@ from cayu.runtime.structured_output import (
     copy_structured_output_spec,
 )
 from cayu.runtime.usage import UsageMetrics
+from cayu.vaults.redaction import SecretRedactor
 
 
 class SessionStatusConflict(ValueError):
@@ -668,6 +675,8 @@ SESSION_RUNTIME_METADATA_KEYS = frozenset({"subagent"})
 SESSION_RUNTIME_METADATA_PREFIX = "cayu:"
 
 _RUNTIME_SESSION_CREATE_CLAIM_TOKEN = object()
+_RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN = object()
+_RUNTIME_RESUME_TRANSPORT_METADATA_KEYS = frozenset({"traceparent", "tracestate"})
 
 
 class _RuntimeSessionCreateClaim:
@@ -702,6 +711,14 @@ class _RuntimeSessionCreateClaim:
         # runtime authority. The explicit RunRequest copier authenticates and
         # preserves the original handoff instead.
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeResumeTransportMetadataAuthority:
+    """Positive provenance for per-attempt metadata kept outside semantic input."""
+
+    token: object
+    values: tuple[tuple[str, str], ...]
 
 
 def is_runtime_owned_session_metadata_key(key: str) -> bool:
@@ -1083,6 +1100,7 @@ class ResumeRequest(BaseModel):
     session_id: str
     messages: list[Message]
     target: ModelTarget | None = None
+    profile_adoption: ExecutionProfileAdoptionIntent | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     max_steps: StrictInt = Field(default=16, ge=1, le=256)
     limits: RunLimits = Field(default_factory=RunLimits)
@@ -1094,6 +1112,7 @@ class ResumeRequest(BaseModel):
         default_factory=tuple,
         exclude=True,
     )
+    _runtime_transport_metadata_authority: object | None = PrivateAttr(default=None)
 
     @field_validator("messages")
     @classmethod
@@ -1115,6 +1134,18 @@ class ResumeRequest(BaseModel):
         value: StructuredOutputSpec | None,
     ) -> StructuredOutputSpec | None:
         return copy_structured_output_spec(value)
+
+    @field_validator("profile_adoption", mode="before")
+    @classmethod
+    def copy_profile_adoption(
+        cls,
+        value: object,
+    ) -> ExecutionProfileAdoptionIntent | None:
+        if value is None:
+            return None
+        if isinstance(value, ExecutionProfileAdoptionIntent):
+            return copy_execution_profile_adoption_intent(value)
+        return ExecutionProfileAdoptionIntent.model_validate(value)
 
     @field_validator("budget_limits", mode="before")
     @classmethod
@@ -5685,6 +5716,7 @@ class SessionStore(ABC):
         defer_interaction_source: bool = False,
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        execution_profile_decision: ExecutionProfileDecision | None = None,
     ) -> Session:
         """Atomically persist status, checkpoint, interaction, target, and profile admission."""
 
@@ -5696,6 +5728,7 @@ class SessionStore(ABC):
         to_status: SessionStatus,
         checkpoint_transform: CheckpointTransform,
         execution_profile: ExecutionProfileIdentity,
+        execution_profile_decision: ExecutionProfileDecision | None = None,
         interaction_started_event: Event | None = None,
         interaction_source_messages: list[Message] | None = None,
         continued_interaction_id: str | None = None,
@@ -5719,6 +5752,7 @@ class SessionStore(ABC):
             defer_interaction_source=defer_interaction_source,
             model_transition=model_transition,
             execution_profile=execution_profile,
+            execution_profile_decision=execution_profile_decision,
         )
 
     async def reject_execution_profile_resume(
@@ -5730,6 +5764,7 @@ class SessionStore(ABC):
         expected_profile: ExecutionProfileIdentity,
         candidate_profile: ExecutionProfileIdentity,
         event: Event,
+        decision: ExecutionProfileDecision | None = None,
     ) -> ExecutionProfileRejectionResult:
         """Atomically reject a changed resume profile without admitting work."""
 
@@ -7939,6 +7974,7 @@ class InMemorySessionStore(SessionStore):
         expected_profile: ExecutionProfileIdentity,
         candidate_profile: ExecutionProfileIdentity,
         event: Event,
+        decision: ExecutionProfileDecision | None = None,
     ) -> ExecutionProfileRejectionResult:
         (
             session_id,
@@ -7954,6 +7990,7 @@ class InMemorySessionStore(SessionStore):
             expected_profile=expected_profile,
             candidate_profile=candidate_profile,
             event=event,
+            decision=decision,
         )
         async with self._lock:
             session = self._sessions.get(session_id)
@@ -7996,6 +8033,7 @@ class InMemorySessionStore(SessionStore):
         defer_interaction_source: bool = False,
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        execution_profile_decision: ExecutionProfileDecision | None = None,
     ) -> Session:
         session_id = require_clean_nonblank(session_id, "session_id")
         allowed_statuses = _validate_status_set(from_statuses, "from_statuses")
@@ -8017,6 +8055,11 @@ class InMemorySessionStore(SessionStore):
             interaction_is_new=(admission is not None and admission[0] is not None),
         )
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
+        prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
+            execution_profile_decision
+        )
+        if prepared_execution_profile_decision is not None and admission is None:
+            raise ValueError("An execution-profile decision requires atomic interaction admission.")
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
         async with self._lock:
@@ -8032,6 +8075,7 @@ class InMemorySessionStore(SessionStore):
                 session,
                 candidate_profile=prepared_execution_profile,
                 model_transition=prepared_model_transition,
+                decision=prepared_execution_profile_decision,
             )
 
             current_checkpoint = self._checkpoints.get(session_id)
@@ -8078,9 +8122,13 @@ class InMemorySessionStore(SessionStore):
                         execution_profile_metadata=transition_profile_metadata,
                     ),
                 )
+            elif transition_profile_metadata is not None:
+                session_updates["metadata"] = transition_profile_metadata
             updated = session.model_copy(update=session_updates)
             prepared_events: _PreparedInMemoryEventAppend | None = None
             admission_events = []
+            if prepared_execution_profile_decision is not None:
+                admission_events.append(prepared_execution_profile_decision.event)
             if prepared_model_transition is not None:
                 admission_events.append(prepared_model_transition.event)
             if admission is not None and admission[0] is not None:
@@ -11942,7 +11990,7 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
     messages = getattr(request, "messages", None)
     if type(messages) is not list:
         raise ValueError("ResumeRequest messages must be a list.")
-    return ResumeRequest(
+    copied = ResumeRequest(
         session_id=request.session_id,
         messages=[detach_message(message) for message in messages],
         target=(
@@ -11953,15 +12001,133 @@ def copy_resume_request(request: ResumeRequest) -> ResumeRequest:
                 model=request.target.model,
             )
         ),
+        profile_adoption=(
+            None
+            if request.profile_adoption is None
+            else copy_execution_profile_adoption_intent(request.profile_adoption)
+        ),
         metadata=copy_durable_json_object(request.metadata, "metadata"),
         max_steps=request.max_steps,
         limits=copy_run_limits(request.limits),
         budget_limits=copy_request_budget_limits(request.budget_limits),
         retry_policy=copy_retry_policy(request.retry_policy) if request.retry_policy else None,
         structured_output=copy_structured_output_spec(request.structured_output),
-        thinking=request.thinking,
+        thinking=(
+            None
+            if request.thinking is None
+            else ThinkingConfig(
+                enabled=request.thinking.enabled,
+                effort=request.thinking.effort,
+                max_tokens=request.thinking.max_tokens,
+                include_in_transcript=request.thinking.include_in_transcript,
+            )
+        ),
         loop_policies=validate_loop_policies(request.loop_policies, field_name="loop_policies"),
     )
+    authority = request._runtime_transport_metadata_authority
+    if (
+        type(authority) is _RuntimeResumeTransportMetadataAuthority
+        and authority.token is _RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN
+    ):
+        copied._runtime_transport_metadata_authority = authority
+    return copied
+
+
+def _with_runtime_resume_transport_metadata(
+    request: ResumeRequest,
+    metadata: dict[str, Any],
+) -> ResumeRequest:
+    """Detach and attest exact server-owned tracing metadata as transport-only input."""
+
+    copied = copy_resume_request(request)
+    owned_metadata = copy_durable_json_object(metadata, "transport_metadata")
+    if not owned_metadata:
+        copied._runtime_transport_metadata_authority = None
+        return copied
+    if any(key not in _RUNTIME_RESUME_TRANSPORT_METADATA_KEYS for key in owned_metadata):
+        raise ValueError("Runtime resume transport metadata contains an unsupported field.")
+    values: list[tuple[str, str]] = []
+    semantic_metadata = copy_durable_json_object(copied.metadata, "metadata")
+    for key in sorted(owned_metadata):
+        value = owned_metadata[key]
+        if type(value) is not str or semantic_metadata.get(key) != value:
+            raise ValueError("Runtime resume transport metadata does not match the request.")
+        values.append((key, value))
+        semantic_metadata.pop(key)
+    copied = copied.model_copy(update={"metadata": semantic_metadata})
+    copied._runtime_transport_metadata_authority = _RuntimeResumeTransportMetadataAuthority(
+        token=_RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN,
+        values=tuple(values),
+    )
+    return copied
+
+
+def _runtime_resume_transport_metadata(request: ResumeRequest) -> dict[str, str]:
+    """Return an owned transport-only trace context from runtime-attested authority."""
+
+    if type(request) is not ResumeRequest:
+        raise TypeError("Runtime resume transport metadata requires a ResumeRequest.")
+    authority = request._runtime_transport_metadata_authority
+    if (
+        type(authority) is not _RuntimeResumeTransportMetadataAuthority
+        or authority.token is not _RUNTIME_RESUME_TRANSPORT_METADATA_TOKEN
+    ):
+        return {}
+    return dict(authority.values)
+
+
+def execution_profile_adoption_request_fingerprint(
+    request: ResumeRequest,
+    *,
+    redactor: SecretRedactor,
+) -> str:
+    """Bind an adoption idempotency key to the complete admitted resume request."""
+
+    if not isinstance(redactor, SecretRedactor):
+        raise TypeError("Execution-profile adoption fingerprint requires a SecretRedactor.")
+    copied = copy_resume_request(request)
+    if copied.profile_adoption is None:
+        raise ValueError("Execution-profile adoption request fingerprint requires adoption intent.")
+    document = copied.model_dump(mode="json", warnings=False)
+    loop_policy_identities: list[dict[str, str]] = []
+    for policy in copied.loop_policies:
+        replay_identity = policy.adoption_replay_identity
+        if replay_identity is None:
+            raise ValueError(
+                "Request loop policies used with explicit execution-profile adoption must "
+                "provide a stable adoption_replay_identity."
+            )
+        replay_identity = require_clean_nonblank(
+            replay_identity,
+            "loop_policies.adoption_replay_identity",
+        )
+        if redactor.redact_text(replay_identity) != replay_identity:
+            raise ValueError(
+                "loop_policies.adoption_replay_identity contains a workload secret and "
+                "cannot be used as durable replay authority."
+            )
+        if len(replay_identity) > EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS:
+            raise ValueError(
+                "loop_policies.adoption_replay_identity must not exceed "
+                f"{EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS} characters."
+            )
+        loop_policy_identities.append(
+            {
+                "name": require_clean_nonblank(policy.name, "loop_policies.name"),
+                "implementation": (
+                    f"{require_clean_nonblank(type(policy).__module__, 'loop_policies.module')}:"
+                    f"{require_clean_nonblank(type(policy).__qualname__, 'loop_policies.qualname')}"
+                ),
+                "adoption_replay_identity": replay_identity,
+            }
+        )
+    document["loop_policies"] = loop_policy_identities
+    return sha256(
+        canonical_durable_json_bytes(
+            document,
+            "execution_profile_adoption_resume_request",
+        )
+    ).hexdigest()
 
 
 def copy_compact_session_request(request: CompactSessionRequest) -> CompactSessionRequest:
@@ -12119,16 +12285,67 @@ def _copy_optional_execution_profile(
     return ExecutionProfileIdentity.model_validate(profile.model_dump(mode="json"))
 
 
+def _copy_optional_execution_profile_decision(
+    decision: ExecutionProfileDecision | None,
+) -> ExecutionProfileDecision | None:
+    if decision is None:
+        return None
+    if type(decision) is not ExecutionProfileDecision:
+        raise TypeError("execution_profile_decision must be an ExecutionProfileDecision.")
+    return copy_execution_profile_decision(decision)
+
+
 def _validate_execution_profile_admission(
     session: Session,
     *,
     candidate_profile: ExecutionProfileIdentity | None,
     model_transition: SessionModelTransition | None,
+    decision: ExecutionProfileDecision | None,
 ) -> dict[str, Any] | None:
     if candidate_profile is None:
+        if decision is not None:
+            raise ValueError("An execution-profile decision requires a candidate profile.")
         return None
     expected_profile = execution_profile_from_session_metadata(session.metadata)
     changed = changed_execution_profile_components(expected_profile, candidate_profile)
+    if decision is not None:
+        if decision.expected_profile != expected_profile:
+            raise SessionStatusConflict(
+                "Session execution-profile expectation changed before admission."
+            )
+        if decision.candidate_profile != candidate_profile:
+            raise ValueError("Execution-profile decision has a conflicting candidate profile.")
+        if decision.changed_component_classes != changed:
+            raise ValueError("Execution-profile decision has conflicting changed components.")
+        if decision.event.session_id != session.id:
+            raise ValueError("Execution-profile decision event has a conflicting session.")
+        if (
+            decision.event.agent_name != session.agent_name
+            or decision.event.environment_name != session.environment_name
+        ):
+            raise ValueError("Execution-profile decision event has conflicting authority.")
+        if decision.kind not in {
+            ExecutionProfileDecisionKind.EXACT_REUSE,
+            ExecutionProfileDecisionKind.COMPATIBLE_REUSE,
+            ExecutionProfileDecisionKind.ADOPTED,
+        }:
+            raise ValueError("Only accepted execution-profile decisions can admit work.")
+        if (
+            decision.kind is ExecutionProfileDecisionKind.COMPATIBLE_REUSE
+            and ExecutionProfileComponentClass.DIRECT_TOOLS in changed
+        ):
+            raise ValueError("Generic compatible reuse cannot broaden direct-tool authority.")
+        provider_target_changed = ExecutionProfileComponentClass.PROVIDER_TARGET in changed
+        if provider_target_changed != (model_transition is not None):
+            raise ValueError(
+                "Provider-target profile changes require the matching model transition."
+            )
+        if decision.kind is ExecutionProfileDecisionKind.ADOPTED:
+            return execution_profile_metadata_after_adoption(
+                session.metadata,
+                candidate_profile,
+            )
+        return None
     if model_transition is None:
         if changed:
             changed_names = ", ".join(component.value for component in changed)
@@ -12154,6 +12371,7 @@ def _prepare_execution_profile_rejection(
     expected_profile: ExecutionProfileIdentity,
     candidate_profile: ExecutionProfileIdentity,
     event: Event,
+    decision: ExecutionProfileDecision | None = None,
 ) -> tuple[
     str,
     set[SessionStatus],
@@ -12175,6 +12393,27 @@ def _prepare_execution_profile_rejection(
         raise ValueError("Execution-profile rejection requires a changed candidate.")
     _, copied_events = _copy_session_event_batch(session_id, [event])
     copied_event = copied_events[0]
+    copied_decision = _copy_optional_execution_profile_decision(decision)
+    if copied_decision is not None:
+        if copied_decision.kind not in {
+            ExecutionProfileDecisionKind.MIGRATION_REQUIRED,
+            ExecutionProfileDecisionKind.REJECTED,
+        }:
+            raise ValueError("Only non-admitting decisions can use profile rejection.")
+        if (
+            copied_decision.expected_profile != expected
+            or copied_decision.candidate_profile != candidate
+            or copied_decision.event != copied_event
+        ):
+            raise ValueError("Execution-profile rejection decision is inconsistent.")
+        return (
+            session_id,
+            statuses,
+            expected_run_epoch,
+            expected,
+            candidate,
+            copied_event,
+        )
     expected_payload = {
         "expected_profile_fingerprint": expected.fingerprint,
         "candidate_profile_fingerprint": candidate.fingerprint,

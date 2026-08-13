@@ -10,6 +10,7 @@ from cayu.runtime._message_redaction import (
     redact_untrusted_message_for_boundary,
 )
 from cayu.runtime.approvals import ResolutionActor
+from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.runtime.public_authority import public_authority_alias_is_reserved
 from cayu.runtime.sessions import (
     MODEL_TARGET_PROJECTION_METADATA_KEY,
@@ -159,6 +160,26 @@ def prepare_resume_request(
             field_name="target.model",
             redactor=redactor,
         )
+    profile_adoption = request.profile_adoption
+    if profile_adoption is not None:
+        require_secret_free_session_authority(
+            profile_adoption.idempotency_key,
+            field_name="profile_adoption.idempotency_key",
+            redactor=redactor,
+            authority_kind="durable execution-profile adoption authority",
+        )
+        requested_by = redact_resolution_actor(
+            profile_adoption.requested_by,
+            field_name="profile_adoption.requested_by",
+            redactor=redactor,
+        )
+        if requested_by is None:
+            raise AssertionError("Execution-profile adoption lost its required actor.")
+        profile_adoption = ExecutionProfileAdoptionIntent(
+            idempotency_key=profile_adoption.idempotency_key,
+            reason=redactor.redact_text(profile_adoption.reason),
+            requested_by=requested_by,
+        )
     return request.model_copy(
         update={
             "messages": redact_messages(
@@ -171,6 +192,7 @@ def prepare_resume_request(
                 field_name="metadata",
                 redactor=redactor,
             ),
+            "profile_adoption": profile_adoption,
         },
     )
 

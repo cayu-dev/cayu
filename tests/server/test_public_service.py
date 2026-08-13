@@ -1277,6 +1277,110 @@ def test_product_approval_continuation_records_receipt_before_terminal_settlemen
     asyncio.run(scenario())
 
 
+def test_product_continuation_adoption_retry_survives_product_state_changes() -> None:
+    provider = ScriptedModelProvider(
+        [
+            [
+                ModelStreamEvent.text_delta("initial answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+            [
+                ModelStreamEvent.text_delta("continued answer"),
+                ModelStreamEvent.completed({"finish_reason": "stop"}),
+            ],
+        ]
+    )
+    service, store, _provider = _build_service(provider=provider)
+
+    async def prepare() -> ProductOperation:
+        operation = (
+            await store.reserve(
+                tenant_id="tenant-a",
+                idempotency_key="continuation-adoption-retry-operation",
+                request_fingerprint=_product_request_fingerprint("original work"),
+                public_id="op_continuation_adoption_retry",
+                work_id="work_continuation_adoption_retry",
+                session_id="session_continuation_adoption_retry",
+                task_id="task_continuation_adoption_retry",
+                request_text="original work",
+            )
+        ).operation
+        outcome = await run_to_completion(
+            service.cayu_app,
+            RunRequest(
+                agent_name="assistant",
+                session_id=operation.session_id,
+                messages=[Message.text("user", "initial")],
+            ),
+        )
+        assert outcome.ok
+        return operation
+
+    operation = asyncio.run(prepare())
+    client = TestClient(service.asgi_app)
+    body = {
+        "session_id": operation.session_id,
+        "prompt": "continue",
+        "profile_adoption": {
+            "idempotency_key": "continuation-adoption-retry-v1",
+            "reason": "Adopt this exact product continuation.",
+        },
+    }
+
+    with client.stream(
+        "POST",
+        "/cayu/api/resume",
+        auth=("operator", "operator-secret"),
+        json=body,
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    pending_with_receipt = store.by_work_id[operation.work_id]
+    assert pending_with_receipt.result_receipt is not None
+    assert len(provider.requests) == 2
+
+    with client.stream(
+        "POST",
+        "/cayu/api/resume",
+        auth=("operator", "operator-secret"),
+        json=body,
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    assert len(provider.requests) == 2
+
+    terminal = ProductOperation.model_validate(
+        {
+            **pending_with_receipt.model_dump(mode="python"),
+            "status": "completed",
+            "result": pending_with_receipt.result_receipt.result,
+            "recovery_status": None,
+        }
+    )
+    store.by_work_id[terminal.work_id] = terminal
+    store.by_public_id[terminal.public_id] = terminal
+    store.by_idempotency_key[terminal.idempotency_key] = terminal
+
+    with client.stream(
+        "POST",
+        "/cayu/api/resume",
+        auth=("operator", "operator-secret"),
+        json=body,
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+    assert len(provider.requests) == 2
+
+    conflict = client.post(
+        "/cayu/api/resume",
+        auth=("operator", "operator-secret"),
+        json={**body, "prompt": "different continuation"},
+    )
+    assert conflict.status_code == 409
+    assert "idempotency key" in conflict.json()["detail"]
+    assert len(provider.requests) == 2
+
+
 def test_replacement_worker_continues_abandoned_session_without_starting_over() -> None:
     async def scenario() -> None:
         store = MemoryProductStore()

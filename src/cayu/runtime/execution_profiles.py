@@ -2,19 +2,32 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from hashlib import sha256
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
-from cayu._validation import canonical_durable_json_bytes, copy_durable_json_value
+from cayu._validation import (
+    canonical_durable_json_bytes,
+    copy_durable_json_value,
+    require_durable_clean_nonblank,
+    require_durable_nonblank,
+)
 from cayu.core.events import Event, copy_event
+from cayu.runtime.approvals import (
+    ResolutionActor,
+    copy_resolution_actor,
+    resolution_actor_payload,
+)
 
 EXECUTION_PROFILE_SCHEMA_VERSION = 1
 EXECUTION_PROFILE_METADATA_KEY = "cayu:execution_profile"
 _EXECUTION_PROFILE_RECORD_TYPE = "cayu.execution-profile"
+EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS = 4096
+EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS = 256
 
 
 class ExecutionProfileComponentClass(StrEnum):
@@ -39,6 +52,305 @@ class ExecutionProfileIdentityAvailability(StrEnum):
 
     AVAILABLE = "available"
     UNAVAILABLE = "unavailable"
+
+
+class ExecutionProfileDecisionKind(StrEnum):
+    """Typed outcome of one execution-profile admission decision."""
+
+    EXACT_REUSE = "exact_reuse"
+    COMPATIBLE_REUSE = "compatible_reuse"
+    ADOPTED = "adopted"
+    MIGRATION_REQUIRED = "migration_required"
+    REJECTED = "rejected"
+
+
+class ExecutionProfilePolicyAction(StrEnum):
+    """Application decision for one non-equal execution profile."""
+
+    COMPATIBLE_REUSE = "compatible_reuse"
+    ADOPT = "adopt"
+    MIGRATION_REQUIRED = "migration_required"
+    REJECT = "reject"
+
+
+class ExecutionProfileAuthorityDecision(StrEnum):
+    """Distinct authorization for a potentially authority-broadening change."""
+
+    NOT_REQUIRED = "not_required"
+    AUTHORIZED = "authorized"
+    DENIED = "denied"
+
+
+class ExecutionProfileAdoptionIntent(BaseModel):
+    """Explicit caller intent to adopt the current application's profile."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    idempotency_key: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
+    reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    requested_by: ResolutionActor
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        return require_durable_clean_nonblank(value, "idempotency_key")
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return require_durable_nonblank(value, "reason")
+
+    @field_validator("requested_by")
+    @classmethod
+    def copy_requested_by(cls, value: ResolutionActor) -> ResolutionActor:
+        copied = copy_resolution_actor(value)
+        if copied is None:
+            raise ValueError("requested_by is required for execution-profile adoption.")
+        if copied.source is None:
+            raise ValueError(
+                "requested_by.source is required for execution-profile adoption provenance."
+            )
+        return copied
+
+
+def copy_execution_profile_adoption_intent(
+    intent: ExecutionProfileAdoptionIntent,
+) -> ExecutionProfileAdoptionIntent:
+    """Copy caller-owned adoption intent without serializing unvalidated fields."""
+
+    if type(intent) is not ExecutionProfileAdoptionIntent:
+        raise TypeError("Execution-profile adoption requires ExecutionProfileAdoptionIntent.")
+    requested_by = copy_resolution_actor(intent.requested_by)
+    if requested_by is None:
+        raise ValueError("requested_by is required for execution-profile adoption.")
+    return ExecutionProfileAdoptionIntent(
+        idempotency_key=intent.idempotency_key,
+        reason=intent.reason,
+        requested_by=requested_by,
+    )
+
+
+class ExecutionProfilePolicyRequest(BaseModel):
+    """Bounded application-policy input for one profile difference."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    session_id: str
+    expected_profile: ExecutionProfileIdentity
+    candidate_profile: ExecutionProfileIdentity
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
+    intent: ExecutionProfileAdoptionIntent | None = None
+    authority_review_required: StrictBool = False
+    source_provider_name: str
+    source_model: str
+    target_provider_name: str
+    target_model: str
+
+    @field_validator(
+        "session_id",
+        "source_provider_name",
+        "source_model",
+        "target_provider_name",
+        "target_model",
+    )
+    @classmethod
+    def validate_identity_text(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("expected_profile", "candidate_profile", mode="before")
+    @classmethod
+    def copy_profile(cls, value: object) -> ExecutionProfileIdentity:
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json")
+        return ExecutionProfileIdentity.model_validate(value)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def copy_intent(cls, value: object) -> ExecutionProfileAdoptionIntent | None:
+        if value is None:
+            return None
+        if isinstance(value, ExecutionProfileAdoptionIntent):
+            return copy_execution_profile_adoption_intent(value)
+        return ExecutionProfileAdoptionIntent.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_changed_components(self) -> ExecutionProfilePolicyRequest:
+        expected = changed_execution_profile_components(
+            self.expected_profile,
+            self.candidate_profile,
+        )
+        if self.changed_component_classes != expected:
+            raise ValueError("changed_component_classes do not match the supplied profiles.")
+        if self.authority_review_required != (
+            ExecutionProfileComponentClass.DIRECT_TOOLS in expected
+        ):
+            raise ValueError(
+                "authority_review_required does not match the changed profile authority."
+            )
+        return self
+
+
+class ExecutionProfilePolicyResult(BaseModel):
+    """Defensively copied result returned by an application policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    action: ExecutionProfilePolicyAction
+    reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    authority_decision: ExecutionProfileAuthorityDecision = (
+        ExecutionProfileAuthorityDecision.NOT_REQUIRED
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        return require_durable_nonblank(value, "reason")
+
+
+class ExecutionProfilePolicy(ABC):
+    """Application-owned compatibility and adoption authority."""
+
+    @property
+    @abstractmethod
+    def identity(self) -> str:
+        """Return a stable, versioned, non-secret policy identity."""
+
+    @abstractmethod
+    async def decide(
+        self,
+        request: ExecutionProfilePolicyRequest,
+    ) -> ExecutionProfilePolicyResult:
+        """Classify one non-equal profile before governed work begins."""
+
+
+class ExecutionProfileDecision(BaseModel):
+    """Complete runtime-owned decision committed at profile admission."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    kind: ExecutionProfileDecisionKind
+    expected_profile: ExecutionProfileIdentity
+    candidate_profile: ExecutionProfileIdentity
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...]
+    policy_identity: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
+    policy_reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    authority_decision: ExecutionProfileAuthorityDecision
+    idempotency_identity: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_ID_MAX_CHARS)
+    adoption_request_fingerprint: str | None = None
+    actor: ResolutionActor | None = None
+    reason: str = Field(max_length=EXECUTION_PROFILE_ADOPTION_TEXT_MAX_CHARS)
+    event: Event
+
+    @field_validator("policy_identity", "idempotency_identity")
+    @classmethod
+    def validate_identity_text(cls, value: str, info) -> str:
+        return require_durable_clean_nonblank(value, info.field_name)
+
+    @field_validator("adoption_request_fingerprint")
+    @classmethod
+    def validate_adoption_request_fingerprint(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError("adoption_request_fingerprint must be a lowercase SHA-256 digest.")
+        return value
+
+    @field_validator("policy_reason", "reason")
+    @classmethod
+    def validate_reason_text(cls, value: str, info) -> str:
+        return require_durable_nonblank(value, info.field_name)
+
+    @field_validator("expected_profile", "candidate_profile", mode="before")
+    @classmethod
+    def copy_decision_profile(cls, value: object) -> ExecutionProfileIdentity:
+        if isinstance(value, ExecutionProfileIdentity):
+            value = value.model_dump(mode="json")
+        return ExecutionProfileIdentity.model_validate(value)
+
+    @field_validator("actor")
+    @classmethod
+    def copy_actor(cls, value: ResolutionActor | None) -> ResolutionActor | None:
+        return copy_resolution_actor(value)
+
+    @field_validator("event", mode="before")
+    @classmethod
+    def copy_decision_event(cls, value: object) -> Event:
+        if isinstance(value, Event):
+            return copy_event(value)
+        return Event.model_validate(value)
+
+    @model_validator(mode="after")
+    def validate_decision(self) -> ExecutionProfileDecision:
+        changed = changed_execution_profile_components(
+            self.expected_profile,
+            self.candidate_profile,
+        )
+        if changed != self.changed_component_classes:
+            raise ValueError("Execution-profile decision changed components are inconsistent.")
+        if self.kind is ExecutionProfileDecisionKind.EXACT_REUSE and changed:
+            raise ValueError("Exact profile reuse cannot contain changed components.")
+        if self.kind is not ExecutionProfileDecisionKind.EXACT_REUSE and not changed:
+            raise ValueError("A non-exact profile decision requires changed components.")
+        if (
+            self.kind is ExecutionProfileDecisionKind.EXACT_REUSE
+            and self.authority_decision is not ExecutionProfileAuthorityDecision.NOT_REQUIRED
+        ):
+            raise ValueError("Exact profile reuse cannot carry an authority decision.")
+        if (
+            self.kind
+            in {
+                ExecutionProfileDecisionKind.COMPATIBLE_REUSE,
+                ExecutionProfileDecisionKind.ADOPTED,
+            }
+            and self.authority_decision is ExecutionProfileAuthorityDecision.DENIED
+        ):
+            raise ValueError("A denied authority decision cannot admit an execution profile.")
+        if self.kind is ExecutionProfileDecisionKind.COMPATIBLE_REUSE and any(
+            component
+            in {
+                ExecutionProfileComponentClass.DIRECT_TOOLS,
+                ExecutionProfileComponentClass.PROVIDER_TARGET,
+            }
+            for component in changed
+        ):
+            raise ValueError(
+                "Compatible reuse cannot change direct-tool or persistent provider authority."
+            )
+        if (
+            self.kind is ExecutionProfileDecisionKind.ADOPTED
+            and ExecutionProfileComponentClass.DIRECT_TOOLS in changed
+            and self.authority_decision is not ExecutionProfileAuthorityDecision.AUTHORIZED
+        ):
+            raise ValueError("Direct-tool adoption requires explicit authority.")
+        if self.kind is ExecutionProfileDecisionKind.ADOPTED:
+            if self.actor is None:
+                raise ValueError("Adopted execution profiles require an attributable actor.")
+            if self.actor.source is None:
+                raise ValueError("Adopted execution profiles require an actor provenance source.")
+        expected_type = (
+            "session.execution_profile.rejected"
+            if self.kind is ExecutionProfileDecisionKind.REJECTED
+            else "session.execution_profile.decided"
+        )
+        if str(self.event.type) != expected_type:
+            raise ValueError("Execution-profile decision event has the wrong type.")
+        if self.event.interaction_id is not None:
+            raise ValueError("Execution-profile decisions cannot belong to an interaction.")
+        if self.event.payload != execution_profile_decision_payload(
+            kind=self.kind,
+            expected_profile=self.expected_profile,
+            candidate_profile=self.candidate_profile,
+            changed_component_classes=self.changed_component_classes,
+            policy_identity=self.policy_identity,
+            policy_reason=self.policy_reason,
+            authority_decision=self.authority_decision,
+            idempotency_identity=self.idempotency_identity,
+            adoption_request_fingerprint=self.adoption_request_fingerprint,
+            actor=self.actor,
+            reason=self.reason,
+        ):
+            raise ValueError("Execution-profile decision event payload is inconsistent.")
+        return self
 
 
 class ExecutionProfileComponentIdentity(BaseModel):
@@ -126,10 +438,37 @@ class ExecutionProfileMismatchError(RuntimeError):
         self.candidate_profile_fingerprint = candidate_profile_fingerprint
         self.changed_component_classes = changed_component_classes
         changed = ", ".join(component.value for component in changed_component_classes)
-        super().__init__(
+        super().__init__(self._message(session_id=session_id, changed=changed))
+
+    def _message(self, *, session_id: str, changed: str) -> str:
+        return (
             f"Session {session_id} execution profile changed in: {changed}. "
             "Start a new session or use an explicit profile-adoption flow."
         )
+
+
+class ExecutionProfileAdoptionRejected(ExecutionProfileMismatchError):
+    """Raised after policy durably rejects an explicit adoption request."""
+
+    def _message(self, *, session_id: str, changed: str) -> str:
+        return (
+            f"Session {session_id} execution-profile adoption was rejected for changes in: "
+            f"{changed}. Inspect the durable decision evidence or start a new session."
+        )
+
+
+class ExecutionProfileMigrationRequired(ExecutionProfileMismatchError):
+    """Raised after policy records that an explicit migration is required."""
+
+    def _message(self, *, session_id: str, changed: str) -> str:
+        return (
+            f"Session {session_id} requires an execution-profile migration before changes in: "
+            f"{changed}. No resumed work was admitted."
+        )
+
+
+class ExecutionProfilePolicyError(RuntimeError):
+    """Raised when configured profile policy cannot produce an authoritative decision."""
 
 
 class ExecutionProfileRejectionResult(BaseModel):
@@ -138,12 +477,82 @@ class ExecutionProfileRejectionResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     event: Event
-    replayed: bool = False
+    replayed: StrictBool = False
 
     @field_validator("event", mode="before")
     @classmethod
     def copy_rejection_event(cls, value: Event) -> Event:
         return copy_event(value)
+
+
+def copy_execution_profile_policy_result(
+    result: ExecutionProfilePolicyResult,
+) -> ExecutionProfilePolicyResult:
+    """Defensively validate one result returned across the policy trust boundary."""
+
+    if type(result) is not ExecutionProfilePolicyResult:
+        raise TypeError("Execution-profile policies must return ExecutionProfilePolicyResult.")
+    return ExecutionProfilePolicyResult(
+        action=result.action,
+        reason=result.reason,
+        authority_decision=result.authority_decision,
+    )
+
+
+def copy_execution_profile_decision(
+    decision: ExecutionProfileDecision,
+) -> ExecutionProfileDecision:
+    """Copy a runtime decision without erasing its event authority provenance."""
+
+    if type(decision) is not ExecutionProfileDecision:
+        raise TypeError("decision must be an ExecutionProfileDecision.")
+    return ExecutionProfileDecision(
+        kind=decision.kind,
+        expected_profile=decision.expected_profile,
+        candidate_profile=decision.candidate_profile,
+        changed_component_classes=decision.changed_component_classes,
+        policy_identity=decision.policy_identity,
+        policy_reason=decision.policy_reason,
+        authority_decision=decision.authority_decision,
+        idempotency_identity=decision.idempotency_identity,
+        adoption_request_fingerprint=decision.adoption_request_fingerprint,
+        actor=decision.actor,
+        reason=decision.reason,
+        event=copy_event(decision.event),
+    )
+
+
+def execution_profile_decision_payload(
+    *,
+    kind: ExecutionProfileDecisionKind,
+    expected_profile: ExecutionProfileIdentity,
+    candidate_profile: ExecutionProfileIdentity,
+    changed_component_classes: tuple[ExecutionProfileComponentClass, ...],
+    policy_identity: str,
+    policy_reason: str,
+    authority_decision: ExecutionProfileAuthorityDecision,
+    idempotency_identity: str,
+    adoption_request_fingerprint: str | None = None,
+    actor: ResolutionActor | None,
+    reason: str,
+) -> dict[str, Any]:
+    """Build the complete bounded durable evidence payload for one decision."""
+
+    payload = {
+        "decision": kind.value,
+        "expected_profile": expected_profile.model_dump(mode="json"),
+        "candidate_profile": candidate_profile.model_dump(mode="json"),
+        "changed_component_classes": [component.value for component in changed_component_classes],
+        "actor": resolution_actor_payload(actor),
+        "policy_identity": policy_identity,
+        "policy_reason": policy_reason,
+        "authority_decision": authority_decision.value,
+        "reason": reason,
+        "idempotency_identity": idempotency_identity,
+    }
+    if adoption_request_fingerprint is not None:
+        payload["adoption_request_fingerprint"] = adoption_request_fingerprint
+    return payload
 
 
 def build_execution_profile_identity(
@@ -285,7 +694,12 @@ def execution_profile_from_session_metadata(
         or raw["schema_version"] != EXECUTION_PROFILE_SCHEMA_VERSION
     ):
         raise ValueError("Session execution-profile metadata version is unsupported.")
-    # Revalidate after every backend round trip. No raw component material is stored.
+    # Revalidate both identities after every backend round trip. The immutable
+    # baseline is durable audit authority even though admission returns the
+    # current expectation. No raw component material is stored in either value.
+    ExecutionProfileIdentity.model_validate(
+        copy_durable_json_value(raw["baseline"], "execution_profile.baseline")
+    )
     return ExecutionProfileIdentity.model_validate(
         copy_durable_json_value(raw["expected"], "execution_profile.expected")
     )

@@ -155,6 +155,19 @@ class LoopPolicy:
     def name(self) -> str:
         return type(self).__name__
 
+    @property
+    def adoption_replay_identity(self) -> str | None:
+        """Return stable, versioned identity for explicit profile-adoption replay.
+
+        Stateful request policies must override this property when they can be
+        used with ``ResumeRequest.profile_adoption``. The identity must change
+        whenever configuration that can affect policy behavior changes. A
+        missing identity fails that combination closed without affecting
+        ordinary run or resume requests.
+        """
+
+        return None
+
     async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
         """Run when the model step has no tool calls and Cayu is about to complete."""
 

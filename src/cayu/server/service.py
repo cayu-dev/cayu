@@ -906,8 +906,6 @@ class CayuService:
             source="find_by_session_id",
             expected={"session_id": session_id},
         )
-        if operation.status != "pending":
-            return ()
         if operation.request_fingerprint != _product_request_fingerprint(
             agent_name=self.agent_name,
             request_text=operation.request_text,
@@ -1365,6 +1363,21 @@ def _bounded_public_result_text(value: str) -> str:
     return value[:MAX_PUBLIC_RESULT_CHARS]
 
 
+def _product_operation_loop_policy_authority(operation: ProductOperation) -> dict[str, str]:
+    """Return immutable product authority used by continuation policy behavior."""
+
+    return {
+        "tenant_id": operation.tenant_id,
+        "public_id": operation.public_id,
+        "work_id": operation.work_id,
+        "idempotency_key": operation.idempotency_key,
+        "request_fingerprint": operation.request_fingerprint,
+        "session_id": operation.session_id,
+        "task_id": operation.task_id,
+        "request_text": operation.request_text,
+    }
+
+
 class _ProductResultReceiptPolicy(LoopPolicy):
     """Publish the final public result before Cayu commits session completion."""
 
@@ -1385,6 +1398,19 @@ class _ProductResultReceiptPolicy(LoopPolicy):
     @property
     def name(self) -> str:
         return "product-result-publication"
+
+    @property
+    def adoption_replay_identity(self) -> str:
+        material = json.dumps(
+            {
+                "claim_id": self._claim_id,
+                "operation_authority": _product_operation_loop_policy_authority(self._operation),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return f"product-result-publication:v1:sha256:{hashlib.sha256(material).hexdigest()}"
 
     @property
     def receipt(self) -> ProductResultReceipt | None:
@@ -1449,6 +1475,18 @@ class _ProductContinuationReceiptPolicy(LoopPolicy):
     @property
     def name(self) -> str:
         return "product-continuation-publication"
+
+    @property
+    def adoption_replay_identity(self) -> str:
+        material = json.dumps(
+            {
+                "operation_authority": _product_operation_loop_policy_authority(self._operation),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return f"product-continuation-publication:v1:sha256:{hashlib.sha256(material).hexdigest()}"
 
     async def before_stop(self, context: BeforeStopContext) -> BeforeStopDecision:
         if context.session.id != self._operation.session_id:

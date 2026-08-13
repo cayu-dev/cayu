@@ -19,6 +19,7 @@ from cayu import (
     Event,
     EventQuery,
     EventType,
+    ExecutionProfileAdoptionIntent,
     FileAttachment,
     FileAttachmentKind,
     FilePart,
@@ -28,6 +29,8 @@ from cayu import (
     MessageRole,
     ModelTarget,
     ProviderStatePart,
+    ResolutionActor,
+    ResolutionActorSource,
     ResumeRequest,
     RunRequest,
     ScriptedModelProvider,
@@ -190,6 +193,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
         defer_interaction_source=False,
         model_transition=None,
         execution_profile=None,
+        execution_profile_decision=None,
     ):
         if self.inject_pending_round and model_transition is not None:
             self.inject_pending_round = False
@@ -223,6 +227,7 @@ class _PendingRoundRaceStore(InMemorySessionStore):
             defer_interaction_source=defer_interaction_source,
             model_transition=model_transition,
             execution_profile=execution_profile,
+            execution_profile_decision=execution_profile_decision,
         )
 
 
@@ -428,8 +433,10 @@ def test_cross_provider_resume_durably_projects_opaque_state() -> None:
         )
     )
 
-    assert events[0].type == EventType.SESSION_MODEL_SWITCHED
-    assert events[0].payload == {
+    assert events[0].type == EventType.SESSION_EXECUTION_PROFILE_DECIDED
+    assert events[0].payload["decision"] == "adopted"
+    assert events[1].type == EventType.SESSION_MODEL_SWITCHED
+    assert events[1].payload == {
         "source_provider_name": "source",
         "source_model": "source-model",
         "target_provider_name": "target",
@@ -469,7 +476,7 @@ def test_cross_provider_resume_durably_projects_opaque_state() -> None:
         )
     )
     assert len(stored_switches) == 1
-    assert stored_switches[0].event.payload == events[0].payload
+    assert stored_switches[0].event.payload == events[1].payload
 
     asyncio.run(
         _collect(
@@ -529,7 +536,9 @@ def test_model_switch_releases_transcript_snapshots_before_streaming() -> None:
             )
         )
         first_event = await stream.__anext__()
-        assert first_event.type is EventType.SESSION_MODEL_SWITCHED
+        assert first_event.type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+        second_event = await stream.__anext__()
+        assert second_event.type is EventType.SESSION_MODEL_SWITCHED
         gc.collect()
         assert store.snapshot_refs
         assert all(snapshot_ref() is None for snapshot_ref in store.snapshot_refs)
@@ -652,6 +661,7 @@ def test_sqlite_transcript_retention_cannot_invalidate_admitted_model_switch(
             )
         )
         try:
+            assert (await anext(stream)).type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
             assert (await anext(stream)).type is EventType.SESSION_MODEL_SWITCHED
             assert (await anext(stream)).type is EventType.INTERACTION_STARTED
 
@@ -871,6 +881,29 @@ def test_sqlite_pending_tool_recovery_uses_absolute_cursor_after_prior_retention
         assert checkpoint is not None and "pending_tool_round" in checkpoint
         assert tool.calls == [{"value": "retained"}]
 
+        with pytest.raises(
+            RuntimeError,
+            match="execution profile cannot be adopted while model or tool recovery is pending",
+        ):
+            await _collect(
+                app.resume(
+                    ResumeRequest(
+                        session_id="retained-tool-recovery",
+                        messages=[Message.text("user", "unsafe adoption")],
+                        profile_adoption=ExecutionProfileAdoptionIntent(
+                            idempotency_key="pending-recovery-adoption-v1",
+                            reason="Attempt adoption during recovery.",
+                            requested_by=ResolutionActor(
+                                subject="maintainer",
+                                source=ResolutionActorSource.REQUEST,
+                            ),
+                        ),
+                    )
+                )
+            )
+        assert "pending_tool_round" in (await store.load_checkpoint("retained-tool-recovery") or {})
+        assert len(target.requests) == 1
+
         recovery_events = await _collect(
             app.resume(
                 ResumeRequest(
@@ -965,7 +998,8 @@ def test_switching_again_advances_projection_and_drops_all_earlier_native_state(
         )
     )
 
-    switch_event = events[0]
+    assert events[0].type is EventType.SESSION_EXECUTION_PROFILE_DECIDED
+    switch_event = events[1]
     assert switch_event.type is EventType.SESSION_MODEL_SWITCHED
     assert switch_event.payload["provider_state_parts_dropped"] == 2
     assert switch_event.payload["source_transcript_cursor"] == 4

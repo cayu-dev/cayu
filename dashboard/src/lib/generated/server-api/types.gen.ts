@@ -3367,6 +3367,21 @@ export type ExecutionEvidenceOverride = {
 };
 
 /**
+ * ExecutionProfileAdoptionBody
+ */
+export type ExecutionProfileAdoptionBody = {
+    /**
+     * Idempotency Key
+     */
+    idempotency_key: string;
+    /**
+     * Reason
+     */
+    reason: string;
+    requested_by?: ResolutionActor | null;
+};
+
+/**
  * ExecutionRequirements
  *
  * Provider-neutral security and lifecycle requirements for one workload.
@@ -4788,6 +4803,7 @@ export type ResumeBody = {
      * Max Steps
      */
     max_steps?: number;
+    profile_adoption?: ExecutionProfileAdoptionBody | null;
     /**
      * Prompt
      */

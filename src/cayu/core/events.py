@@ -65,6 +65,7 @@ class EventType(StrEnum):
     SESSION_MESSAGE_QUEUED = "session.message.queued"
     SESSION_MESSAGE_DELIVERED = "session.message.delivered"
     SESSION_MODEL_SWITCHED = "session.model.switched"
+    SESSION_EXECUTION_PROFILE_DECIDED = "session.execution_profile.decided"
     SESSION_EXECUTION_PROFILE_REJECTED = "session.execution_profile.rejected"
     SESSION_RUN_FENCED = "session.run_fenced"
     TURN_COMPLETED = "turn.completed"

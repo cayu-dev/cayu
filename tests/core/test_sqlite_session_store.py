@@ -2911,6 +2911,7 @@ def test_cayu_app_can_resume_with_sqlite_session_store(tmp_path):
             EventType.INTERACTION_COMPLETED,
             EventType.TURN_COMPLETED,
             EventType.SESSION_COMPLETED,
+            EventType.SESSION_EXECUTION_PROFILE_DECIDED,
             EventType.INTERACTION_STARTED,
             EventType.SESSION_RESUMED,
             EventType.REQUEST_FOOTPRINT_RECORDED,

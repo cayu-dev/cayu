@@ -99,6 +99,7 @@ from cayu.runtime.event_watchers import (
     copy_event_watcher_record,
 )
 from cayu.runtime.execution_profiles import (
+    ExecutionProfileDecision,
     ExecutionProfileIdentity,
     ExecutionProfileRejectionResult,
 )
@@ -218,6 +219,7 @@ from cayu.runtime.sessions import (
     _classify_terminal_session_evidence_records,
     _copy_mcp_manifest_publication,
     _copy_optional_execution_profile,
+    _copy_optional_execution_profile_decision,
     _copy_optional_interaction_admission,
     _copy_queued_interaction_started_event,
     _copy_runner_owned_interruption_proof,
@@ -7416,6 +7418,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         defer_interaction_source: bool = False,
         model_transition: SessionModelTransition | None = None,
         execution_profile: ExecutionProfileIdentity | None = None,
+        execution_profile_decision: ExecutionProfileDecision | None = None,
     ) -> Session:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -7439,6 +7442,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             interaction_is_new=(admission is not None and admission[0] is not None),
         )
         prepared_execution_profile = _copy_optional_execution_profile(execution_profile)
+        prepared_execution_profile_decision = _copy_optional_execution_profile_decision(
+            execution_profile_decision
+        )
+        if prepared_execution_profile_decision is not None and admission is None:
+            raise ValueError("An execution-profile decision requires atomic interaction admission.")
         if admission is not None and to_status is not SessionStatus.RUNNING:
             raise ValueError("Interaction admission requires a transition to running.")
         await self._ensure_ready()
@@ -7458,6 +7466,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         loaded,
                         candidate_profile=prepared_execution_profile,
                         model_transition=prepared_model_transition,
+                        decision=prepared_execution_profile_decision,
                     )
                     transformed_checkpoint = checkpoint_transform(
                         loaded,
@@ -7468,7 +7477,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             transformed_checkpoint, "checkpoint"
                         )
 
-                    transition_metadata = None
+                    transition_metadata = transition_profile_metadata
                     if prepared_model_transition is not None:
                         await cur.execute(
                             "SELECT message FROM cayu_transcript_messages "
@@ -7489,6 +7498,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         )
 
                     admission_events = []
+                    if prepared_execution_profile_decision is not None:
+                        admission_events.append(prepared_execution_profile_decision.event)
                     if prepared_model_transition is not None:
                         admission_events.append(prepared_model_transition.event)
                     if admission is not None and admission[0] is not None:
@@ -7501,7 +7512,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         1 if to_status == SessionStatus.RUNNING else 0,
                         len(admission_events),
                     )
-                    if prepared_model_transition is None:
+                    if prepared_model_transition is None and transition_metadata is None:
                         await cur.execute(
                             """
                             UPDATE cayu_sessions
@@ -7513,7 +7524,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                             """,
                             (*transition_values, session_id),
                         )
-                    else:
+                    elif prepared_model_transition is not None:
                         await cur.execute(
                             """
                             UPDATE cayu_sessions
@@ -7531,6 +7542,18 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                 _dumps(transition_metadata),
                                 session_id,
                             ),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE cayu_sessions
+                            SET status = %s, updated_at = %s, last_activity_at = %s,
+                                run_epoch = run_epoch + %s,
+                                event_seq = event_seq + %s, metadata = %s
+                            WHERE id = %s
+                            RETURNING event_seq
+                            """,
+                            (*transition_values, _dumps(transition_metadata), session_id),
                         )
                     order_row = await cur.fetchone()
                     if order_row is None:
@@ -7577,7 +7600,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                                     session_id,
                                     order_row[0] - len(admission_events) + event_offset + 1,
                                     admission_event.id,
-                                    interaction_id,
+                                    admission_event.interaction_id,
                                     str(admission_event.type),
                                     pg_support.to_utc(admission_event.timestamp),
                                     admission_event.agent_name,
@@ -7637,6 +7660,11 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                         session_id,
                         [
                             *(
+                                [prepared_execution_profile_decision.event.id]
+                                if prepared_execution_profile_decision is not None
+                                else []
+                            ),
+                            *(
                                 [prepared_model_transition.event.id]
                                 if prepared_model_transition is not None
                                 else []
@@ -7664,6 +7692,8 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
                     model=prepared_model_transition.target.model,
                     metadata=transition_metadata,
                 )
+            elif transition_metadata is not None:
+                transition_updates["metadata"] = transition_metadata
             transitioned = loaded.model_copy(update=transition_updates)
             if to_status == SessionStatus.RUNNING:
                 _activate_session_run_fence(transitioned)
@@ -7678,6 +7708,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
         expected_profile: ExecutionProfileIdentity,
         candidate_profile: ExecutionProfileIdentity,
         event: Event,
+        decision: ExecutionProfileDecision | None = None,
     ) -> ExecutionProfileRejectionResult:
         from cayu.runtime.pending_actions import pending_action_event_storage_values
 
@@ -7695,6 +7726,7 @@ class PostgresSessionStore(_PostgresStoreBase, SessionStore):
             expected_profile=expected_profile,
             candidate_profile=candidate_profile,
             event=event,
+            decision=decision,
         )
         await self._ensure_ready()
         async with self._connection() as conn:

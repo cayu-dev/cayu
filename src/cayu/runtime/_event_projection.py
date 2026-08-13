@@ -1954,6 +1954,47 @@ def _event_policies() -> dict[EventType, EventPayloadPolicy]:
     )
     policies[EventType.SESSION_MESSAGE_QUEUED] = message_policy
     policies[EventType.SESSION_MESSAGE_DELIVERED] = message_policy
+    profile_paths = {
+        (profile_key, path)
+        for profile_key in ("expected_profile", "candidate_profile")
+        for path in ("schema_version", "fingerprint")
+    } | {
+        (profile_key, "components", "*", path)
+        for profile_key in ("expected_profile", "candidate_profile")
+        for path in ("component_class", "strength", "availability", "fingerprint")
+    }
+    profile_decision_policy = _observed_policy(
+        "actor adoption_request_fingerprint authority_decision candidate_profile "
+        "changed_component_classes decision "
+        "candidate_profile_fingerprint expected_profile expected_profile_fingerprint "
+        "idempotency_identity policy_identity policy_reason reason",
+        owned_nested_paths=(
+            profile_paths
+            | _resolution_actor_nested_paths("actor")
+            | {("changed_component_classes", "*")}
+        ),
+        authority_keys={
+            "adoption_request_fingerprint",
+            "authority_decision",
+            "decision",
+            "idempotency_identity",
+            "policy_identity",
+            "candidate_profile_fingerprint",
+            "expected_profile_fingerprint",
+        },
+        internal_authority_keys={"adoption_request_fingerprint"},
+        public_authority_keys={
+            "authority_decision",
+            "decision",
+            "idempotency_identity",
+            "policy_identity",
+            "candidate_profile_fingerprint",
+            "expected_profile_fingerprint",
+        },
+        untrusted_container_keys={"actor", "candidate_profile", "expected_profile"},
+    )
+    policies[EventType.SESSION_EXECUTION_PROFILE_DECIDED] = profile_decision_policy
+    policies[EventType.SESSION_EXECUTION_PROFILE_REJECTED] = profile_decision_policy
     policies[EventType.SESSION_MODEL_SWITCHED] = _observed_policy(
         "cache_state_dropped full_transcript_projection model_changed "
         "provider_changed provider_state_parts_dropped source_model "
@@ -2353,6 +2394,11 @@ def _prepare_runtime_event(
         redactor=redactor,
         reject_malformed=True,
     )
+    _restore_publication_safe_execution_profile_decision(
+        event,
+        redacted_payload=redacted_payload,
+        reject_malformed=True,
+    )
     _restore_publication_safe_request_option_categories(
         event,
         redacted_payload=redacted_payload,
@@ -2615,6 +2661,11 @@ def _project_runtime_event(
         redactor=redactor,
         reject_malformed=False,
     )
+    _restore_publication_safe_execution_profile_decision(
+        event,
+        redacted_payload=redacted_payload,
+        reject_malformed=False,
+    )
     _restore_publication_safe_request_option_categories(
         event,
         redacted_payload=redacted_payload,
@@ -2760,6 +2811,82 @@ def _restore_publication_safe_request_fingerprints(
                 redactor=redactor,
                 reject_malformed=reject_malformed,
             )
+
+
+def _restore_publication_safe_execution_profile_decision(
+    event: Event,
+    *,
+    redacted_payload: dict[str, Any],
+    reject_malformed: bool,
+) -> None:
+    """Retain complete typed profile identities only after validating the decision."""
+
+    if event.type not in {
+        EventType.SESSION_EXECUTION_PROFILE_DECIDED,
+        EventType.SESSION_EXECUTION_PROFILE_REJECTED,
+    }:
+        return
+    typed_keys = {
+        "adoption_request_fingerprint",
+        "authority_decision",
+        "candidate_profile",
+        "changed_component_classes",
+        "decision",
+        "expected_profile",
+    }
+    # A store may still expose the older fingerprint-only rejection shape. It
+    # carries no complete typed decision to restore through this boundary.
+    if not {
+        "authority_decision",
+        "candidate_profile",
+        "decision",
+        "expected_profile",
+    }.intersection(event.payload):
+        return
+
+    from cayu.runtime.execution_profiles import ExecutionProfileDecision
+
+    payload = event.payload
+    try:
+        decision = ExecutionProfileDecision(
+            kind=payload["decision"],
+            expected_profile=payload["expected_profile"],
+            candidate_profile=payload["candidate_profile"],
+            changed_component_classes=payload["changed_component_classes"],
+            policy_identity=payload["policy_identity"],
+            policy_reason=payload["policy_reason"],
+            authority_decision=payload["authority_decision"],
+            idempotency_identity=payload["idempotency_identity"],
+            adoption_request_fingerprint=payload.get("adoption_request_fingerprint"),
+            actor=payload["actor"],
+            reason=payload["reason"],
+            event=event,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        if reject_malformed:
+            raise ValueError("Execution-profile decision evidence is malformed.") from exc
+        for key in typed_keys:
+            redacted_payload.pop(key, None)
+        return
+
+    redacted_payload.update(
+        {
+            **(
+                {}
+                if decision.adoption_request_fingerprint is None
+                else {
+                    "adoption_request_fingerprint": decision.adoption_request_fingerprint,
+                }
+            ),
+            "authority_decision": decision.authority_decision.value,
+            "candidate_profile": decision.candidate_profile.model_dump(mode="json"),
+            "changed_component_classes": [
+                component.value for component in decision.changed_component_classes
+            ],
+            "decision": decision.kind.value,
+            "expected_profile": decision.expected_profile.model_dump(mode="json"),
+        }
+    )
 
 
 def _nested_payload_slots(

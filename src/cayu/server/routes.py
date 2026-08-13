@@ -149,6 +149,7 @@ from cayu.runtime.costs import (
     estimate_session_cost as build_session_cost_summary,
 )
 from cayu.runtime.errors import TerminalEventPublicationUncertain
+from cayu.runtime.execution_profiles import ExecutionProfileAdoptionIntent
 from cayu.runtime.interactions import (
     INTERACTION_LIFECYCLE_EVENT_TYPES,
     INTERACTION_TERMINAL_EVENT_TYPES,
@@ -190,6 +191,7 @@ from cayu.runtime.sessions import (
     TerminalSessionEvidenceErrorCode,
     TranscriptQuery,
     UsageRollupQuery,
+    _with_runtime_resume_transport_metadata,
     decode_session_cursor,
     decode_session_topology_cursor,
     event_summary_from_records,
@@ -1451,9 +1453,18 @@ class RunBody(_BoundedControlPlanePromptBody):
         return copy_label_map(value, "labels", allow_reserved=False)
 
 
+class ExecutionProfileAdoptionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    idempotency_key: PersistableNonBlankString = Field(max_length=256)
+    reason: PersistableNonBlankString = Field(max_length=4096)
+    requested_by: ResolutionActor | None = None
+
+
 class ResumeBody(_BoundedControlPlanePromptBody):
     session_id: NonBlankString
     prompt: NonBlankString
+    profile_adoption: ExecutionProfileAdoptionBody | None = None
     max_steps: StrictInt = Field(default=_DEFAULT_RUN_MAX_STEPS, ge=1, le=_MAX_RUN_STEPS)
     limits: RunLimits = Field(default_factory=RunLimits)
     budget_limits: tuple[BudgetLimit, ...] = Field(default_factory=tuple)
@@ -4998,6 +5009,7 @@ def create_router(
         body: ResumeBody,
         http_request: Request,
         trace_metadata: TraceContextMetadata,
+        auth_context: AuthContext | None = optional_auth_context,
         mutation_id: MutationIdHeader = None,
     ):
         replay = await _replay_events_response(
@@ -5014,9 +5026,28 @@ def create_router(
                 detail=f"Session not found: {body.session_id}",
             )
 
+        profile_adoption = None
+        if body.profile_adoption is not None:
+            requested_by = _request_actor(
+                auth_context,
+                body.profile_adoption.requested_by,
+                field_name="requested_by",
+            )
+            if requested_by is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="profile_adoption.requested_by is required when authentication is not configured.",
+                )
+            profile_adoption = ExecutionProfileAdoptionIntent(
+                idempotency_key=body.profile_adoption.idempotency_key,
+                reason=body.profile_adoption.reason,
+                requested_by=requested_by,
+            )
+
         request = ResumeRequest(
             session_id=body.session_id,
             messages=[Message.text("user", body.prompt)],
+            profile_adoption=profile_adoption,
             max_steps=body.max_steps,
             limits=body.limits,
             budget_limits=body.budget_limits,
@@ -5026,6 +5057,7 @@ def create_router(
             thinking=body.thinking,
             loop_policies=await _continuation_loop_policies(session_id),
         )
+        request = _with_runtime_resume_transport_metadata(request, trace_metadata)
 
         return await _accepted_event_stream_response(
             cayu_app.resume(request),

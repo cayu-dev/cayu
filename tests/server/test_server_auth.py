@@ -732,6 +732,95 @@ def test_authenticated_resolution_rejects_body_resolved_by() -> None:
     assert captured == []
 
 
+def _resume_capture_app() -> tuple[CayuApp, list]:
+    from cayu import Message, ResumeRequest, RunRequest, SessionIdentity, SessionStatus
+
+    app = CayuApp()
+    app.register_provider(OneShotProvider(), default=True)
+    app.register_agent(AgentSpec(name="assistant", model="fake-model"))
+
+    async def create_completed_session() -> None:
+        await app.session_store.create(
+            RunRequest(
+                agent_name="assistant",
+                session_id="session_profile_adoption_actor",
+                messages=[Message.text("user", "hello")],
+            ),
+            identity=SessionIdentity(provider_name="fake", model="fake-model"),
+        )
+        await app.session_store.update_status(
+            "session_profile_adoption_actor",
+            SessionStatus.COMPLETED,
+        )
+
+    asyncio.run(create_completed_session())
+    captured: list[ResumeRequest] = []
+
+    async def resume(request: ResumeRequest):
+        captured.append(request)
+        yield Event(
+            type=EventType.SESSION_RESUMED,
+            session_id=request.session_id,
+            agent_name="assistant",
+        )
+
+    app.resume = resume  # type: ignore[method-assign]
+    return app, captured
+
+
+def test_authenticated_profile_adoption_derives_actor_from_auth_context() -> None:
+    from cayu import ResolutionActorSource
+
+    app, captured = _resume_capture_app()
+    client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
+
+    with client.stream(
+        "POST",
+        "/api/resume",
+        headers=_AUTH_HEADERS,
+        json={
+            "session_id": "session_profile_adoption_actor",
+            "prompt": "resume",
+            "profile_adoption": {
+                "idempotency_key": "authenticated-profile-adoption-v1",
+                "reason": "Deploy the reviewed execution profile.",
+            },
+        },
+    ) as response:
+        assert response.status_code == 200
+        list(response.iter_lines())
+
+    intent = captured[0].profile_adoption
+    assert intent is not None
+    assert intent.requested_by.subject == "test-user"
+    assert intent.requested_by.tenant == "tenant-a"
+    assert intent.requested_by.source is ResolutionActorSource.HTTP_AUTH
+    assert intent.requested_by.claims == {"scheme": "bearer"}
+
+
+def test_authenticated_profile_adoption_rejects_body_actor() -> None:
+    app, captured = _resume_capture_app()
+    client = TestClient(create_server(app, config=ServerConfig.protected(_require_bearer_token)))
+
+    response = client.post(
+        "/api/resume",
+        headers=_AUTH_HEADERS,
+        json={
+            "session_id": "session_profile_adoption_actor",
+            "prompt": "resume",
+            "profile_adoption": {
+                "idempotency_key": "spoofed-profile-adoption-v1",
+                "reason": "Attempt to spoof the operator.",
+                "requested_by": {"subject": "someone-else"},
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert "derived from the authenticated caller" in response.json()["detail"]
+    assert captured == []
+
+
 def _interrupt_capture_app() -> tuple[CayuApp, list]:
     import asyncio
 

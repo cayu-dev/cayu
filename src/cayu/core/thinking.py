@@ -35,7 +35,11 @@ class ThinkingConfig(BaseModel):
     provider request can be built.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+    )
 
     enabled: StrictBool = True
     effort: ThinkingEffort | None = None

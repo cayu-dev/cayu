@@ -6617,6 +6617,41 @@
         "title": "ExecutionEvidenceOverride",
         "type": "object"
       },
+      "ExecutionProfileAdoptionBody": {
+        "additionalProperties": false,
+        "properties": {
+          "idempotency_key": {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[^\\x00]+$",
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "pattern": "^[^\\x00]+$",
+            "title": "Reason",
+            "type": "string"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResolutionActor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "idempotency_key",
+          "reason"
+        ],
+        "title": "ExecutionProfileAdoptionBody",
+        "type": "object"
+      },
       "ExecutionRequirements": {
         "additionalProperties": false,
         "description": "Provider-neutral security and lifecycle requirements for one workload.",
@@ -9240,6 +9275,16 @@
             "minimum": 1.0,
             "title": "Max Steps",
             "type": "integer"
+          },
+          "profile_adoption": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutionProfileAdoptionBody"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "prompt": {
             "minLength": 1,
