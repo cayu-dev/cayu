@@ -191,6 +191,8 @@ def test_cayu_new_service_emits_the_supported_secure_product_shell(
         "redact",
         "background",
         "oversized",
+        "profiled_session_identity",
+        "build_execution_profile_identity",
     ):
         assert phrase in security_test
 

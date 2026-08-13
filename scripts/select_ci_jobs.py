@@ -34,6 +34,7 @@ _RELEASE_EXACT_PATHS = {
     "NOTICE",
     "README.md",
     "docs/release-notes.md",
+    "examples/dashboard_behavior_live.py",
     "pyproject.toml",
     "scripts/check_release_artifacts.py",
     "scripts/build_dashboard_source_bundle.py",

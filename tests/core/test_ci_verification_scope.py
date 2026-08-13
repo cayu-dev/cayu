@@ -74,6 +74,7 @@ def test_release_input_selects_only_release_artifact_lane() -> None:
     assert select_pull_request_jobs(["LICENSE"]) == expected
     assert select_pull_request_jobs(["README.md"]) == expected
     assert select_pull_request_jobs(["docs/release-notes.md"]) == expected
+    assert select_pull_request_jobs(["examples/dashboard_behavior_live.py"]) == expected
     assert select_pull_request_jobs(["scripts/extract_release_notes.py"]) == expected
     assert select_pull_request_jobs(["scripts/verify_release_state.py"]) == expected
     assert select_pull_request_jobs(

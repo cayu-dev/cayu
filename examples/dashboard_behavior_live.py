@@ -12,6 +12,7 @@ import sys
 import tempfile
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -59,6 +60,7 @@ from cayu.providers import (
     completed_bedrock_billing_identity,
 )
 from cayu.runtime import EventQuery, InMemorySessionStore, SessionIdentity, SessionStatus
+from cayu.runtime.execution_profiles import build_execution_profile_identity
 from cayu.server import (
     BasicAuth,
     DashboardConfig,
@@ -311,6 +313,42 @@ class MutationDisconnectFaults:
         await self.app(scope, receive, fault_send)
 
 
+def _profiled_session_identity(
+    app: CayuApp,
+    *,
+    provider_name: str,
+    model: str,
+) -> SessionIdentity:
+    """Build the exact profile used by low-level resumable dashboard fixtures."""
+
+    runtime_version = version("cayu")
+    registered_agent = app.get_agent(AGENT_NAME)
+    direct_tools = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "schema": tool.schema,
+            "parallel_safe": tool.parallel_safe,
+            "effect": tool.effect.value,
+        }
+        for tool in registered_agent.tools.values()
+    ]
+    return SessionIdentity(
+        provider_name=provider_name,
+        model=model,
+        runtime_name="cayu",
+        runtime_version=runtime_version,
+        execution_profile=build_execution_profile_identity(
+            runtime_name="cayu",
+            runtime_version=runtime_version,
+            provider_name=provider_name,
+            model=model,
+            durable_system_prompt=registered_agent.spec.system_prompt,
+            direct_tools=direct_tools,
+        ),
+    )
+
+
 async def main() -> None:
     require_equal(
         DashboardContractTool.spec.effect,
@@ -482,6 +520,11 @@ async def _seed_app() -> tuple[
         tools=[DashboardContractTool()],
         tool_policy=AlwaysRequireApprovalToolPolicy(tools=["dashboard_contract_tool"]),
     )
+    contract_session_identity = _profiled_session_identity(
+        app,
+        provider_name=PROVIDER_NAME,
+        model=MODEL_NAME,
+    )
     await store.create(
         RunRequest(
             agent_name=AGENT_NAME,
@@ -493,7 +536,7 @@ async def _seed_app() -> tuple[
             },
             messages=[Message.text("user", "Show the dashboard contract session.")],
         ),
-        identity=SessionIdentity(provider_name=PROVIDER_NAME, model=MODEL_NAME),
+        identity=contract_session_identity,
     )
     await store.append_events(
         SESSION_ID,
@@ -652,7 +695,7 @@ async def _seed_app() -> tuple[
                 labels=labels or {},
                 messages=[Message.text("user", prompt)],
             ),
-            identity=SessionIdentity(provider_name=PROVIDER_NAME, model=MODEL_NAME),
+            identity=contract_session_identity,
         )
         await store.append_transcript_messages(session_id, [Message.text("user", prompt)])
         await store.append_events(
@@ -684,7 +727,7 @@ async def _seed_app() -> tuple[
                 session_id=session_id,
                 messages=[Message.text("user", "Wait for a dashboard interruption.")],
             ),
-            identity=SessionIdentity(provider_name=PROVIDER_NAME, model=MODEL_NAME),
+            identity=contract_session_identity,
         )
 
     approval_events = []

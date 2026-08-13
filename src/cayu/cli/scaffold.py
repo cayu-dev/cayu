@@ -1293,6 +1293,7 @@ _SERVICE_SECURITY_TEST_PY = """from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from importlib.metadata import version
 
 import pytest
 from fastapi import HTTPException, Request
@@ -1315,6 +1316,7 @@ from cayu import (
     TaskCreate,
     TaskStatus,
 )
+from cayu.runtime.execution_profiles import build_execution_profile_identity
 from cayu.server import (
     AuthenticatedAccess,
     AuthenticatedProductAccess,
@@ -1344,6 +1346,42 @@ def product_request_fingerprint(request_text: str, *, agent_name: str) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def profiled_session_identity(
+    app: CayuApp,
+    *,
+    agent_name: str,
+    provider_name: str,
+    model: str,
+) -> SessionIdentity:
+    # Mirror the runtime-owned identity for this manually seeded resume fixture.
+    runtime_version = version("cayu")
+    registered_agent = app.get_agent(agent_name)
+    direct_tools = [
+        {
+            "name": tool.name,
+            "description": tool.description,
+            "schema": tool.schema,
+            "parallel_safe": tool.parallel_safe,
+            "effect": tool.effect.value,
+        }
+        for tool in registered_agent.tools.values()
+    ]
+    return SessionIdentity(
+        provider_name=provider_name,
+        model=model,
+        runtime_name="cayu",
+        runtime_version=runtime_version,
+        execution_profile=build_execution_profile_identity(
+            runtime_name="cayu",
+            runtime_version=runtime_version,
+            provider_name=provider_name,
+            model=model,
+            durable_system_prompt=registered_agent.spec.system_prompt,
+            direct_tools=direct_tools,
+        ),
+    )
 
 
 async def customer_auth(request: Request) -> ProductPrincipal:
@@ -2063,7 +2101,9 @@ def test_replacement_worker_continues_same_durable_session(tmp_path) -> None:
                 task_id=reservation.operation.task_id,
                 messages=[original_message],
             ),
-            identity=SessionIdentity(
+            identity=profiled_session_identity(
+                first_service.cayu_app,
+                agent_name=first_service.agent_name,
                 provider_name=provider.name,
                 model="scripted-model",
             ),
